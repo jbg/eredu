@@ -38,6 +38,8 @@ mod control;
 mod controlled_speculative;
 pub use controlled_speculative::*;
 mod inspection;
+mod memory_estimation;
+pub use memory_estimation::*;
 mod loaded;
 mod observed;
 mod parameters;

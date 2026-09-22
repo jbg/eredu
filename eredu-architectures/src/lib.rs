@@ -57,6 +57,8 @@ mod inspection_validation;
 mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;
+/// Request memory geometry projected from normalized architectures.
+pub mod memory_estimation;
 /// Architecture-aware total artifact inspection and preparation retention.
 pub mod model_inspection;
 pub use model_inspection::{

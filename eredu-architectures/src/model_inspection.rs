@@ -27,6 +27,8 @@ use crate::{
 pub struct SelectedModelInspection {
     inspection: ArtifactInspection<ArtifactArchitecturePlan>,
     preparation: SelectedPreparation,
+    memory_materialization_workspace:
+        eredu_core::Observed<eredu_core::ParameterMaterializationWorkspace>,
 }
 
 impl SelectedModelInspection {
@@ -38,6 +40,13 @@ impl SelectedModelInspection {
     /// Returns the exact selection retained from report generation.
     pub const fn preparation(&self) -> &SelectedPreparation {
         &self.preparation
+    }
+
+    /// Cold recipe and conversion buffers for request memory planning.
+    pub const fn memory_materialization_workspace(
+        &self,
+    ) -> &eredu_core::Observed<eredu_core::ParameterMaterializationWorkspace> {
+        &self.memory_materialization_workspace
     }
 
     /// Consumes both retained inputs for later source preparation and materialization.
@@ -215,11 +224,39 @@ where
             );
             record_gguf_media(&mut report, &inspection, media);
             record_discovery(&mut report, descriptor, Some(&preparation), mechanisms);
+            let memory_materialization_workspace =
+                if let Some(rank) = report.resources.selected_rank.value() {
+                    rank.materialization_workspace.clone()
+                } else if preparation.execution().parallel_topology().is_some() {
+                    eredu_core::Observed::unavailable(
+                        "rank-local conversion workspace is not projected for this architecture",
+                    )
+                } else {
+                    let workspace = crate::replicated_text::inspection_recipe_source(&inspection)
+                        .map_err(|error| error.to_string())
+                        .and_then(|source| {
+                            preparation.execution().parameter_materialization_workspace(
+                                source.as_ref(),
+                                None,
+                                mechanisms,
+                            )
+                        });
+                    match workspace {
+                        Ok(value) => eredu_core::Observed::Available {
+                            value,
+                            kind: eredu_core::ObservationKind::Conservative,
+                            source: "selected checkpoint recipes and backend materialization facts"
+                                .into(),
+                        },
+                        Err(reason) => eredu_core::Observed::unavailable(reason),
+                    }
+                };
             ModelInspectionOutcome {
                 report,
                 selected: Some(SelectedModelInspection {
                     inspection,
                     preparation,
+                    memory_materialization_workspace,
                 }),
             }
         }
