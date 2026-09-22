@@ -99,6 +99,39 @@ input's model-position count. Workspace coverage is independent: a chunk-capable
 routed decoder may still have an unknown workspace bound. Smaller chunks never
 claim savings for a selection that requires a full pass.
 
+## JSON wire format
+
+Forecast requests, estimates and CLI JSON reports use snake_case enum values.
+Rust enum variant names are separate from these serialized values:
+
+| Field | JSON values |
+|---|---|
+| `fit`, `generation_fit` | `"likely_fit"`, `"likely_shortfall"`, `"insufficient_information"` |
+| `phase` | `"loading"`, `"prefill"`, `"decode"` |
+| `cache_update` | `"in_place"`, `"copy_state"`, `"unknown"` |
+| `logits` | `"final_position"`, `"every_position"` |
+
+Domains always use a tagged object, preserving device identity as a separate
+field without normalizing the identifier:
+
+| Domain | JSON value |
+|---|---|
+| Unified | `{"kind":"unified"}` |
+| Host | `{"kind":"host"}` |
+| Device | `{"kind":"device","device":"cuda:0"}` |
+
+Attention workspace also uses a tagged object: `{"kind":"materialized"}`,
+`{"kind":"score_matrix_upper_bound"}`, `{"kind":"unknown"}`, or
+`{"kind":"fused","scratch":{...}}`, where `scratch` is a `MemoryBytes` record.
+Consumers can switch on `kind` for every variant; device identifiers and scratch
+estimates are never discarded to make a payload-bearing enum into a string.
+
+This replaces the initial PascalCase and externally tagged representation.
+Previously saved reports require migration: for example, `"LikelyFit"` becomes
+`"likely_fit"`, `"Unified"` becomes `{"kind":"unified"}`, and
+`{"Device":"cuda:0"}` becomes `{"kind":"device","device":"cuda:0"}`.
+Deserialization uses the new format as well.
+
 ## API and ownership
 
 Prefer `LoadedModel::forecast_prepared_generation(&request, &options)` for a

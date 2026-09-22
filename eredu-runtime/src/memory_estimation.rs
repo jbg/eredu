@@ -106,7 +106,9 @@ impl MemoryBytes {
 }
 
 /// Disjoint physical capacity pool. Shared backing belongs to one pool once.
+/// JSON uses a `kind` tag and a `device` identifier for independent devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "device", rename_all = "snake_case")]
 pub enum MemoryDomain {
     /// Host and accelerators share one physical pool.
     Unified,
@@ -135,6 +137,7 @@ pub struct WorkspaceGeometry {
 
 /// Selected attention implementation's workspace behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttentionWorkspace {
     /// Score and probability matrices materialized in float32.
     Materialized,
@@ -153,6 +156,7 @@ pub enum AttentionWorkspace {
 
 /// Whether cache update overlaps an old and replacement state allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheUpdateWorkspace {
     /// Updates existing storage; no additional whole-cache copy.
     InPlace,
@@ -164,6 +168,7 @@ pub enum CacheUpdateWorkspace {
 
 /// Actual output-projection behavior selected for prefill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LogitsWorkspace {
     /// Only the final position of each invocation is projected. Nonfinal chunks
     /// still retain one row to satisfy the existing output/completion contract.
@@ -300,6 +305,7 @@ pub struct GenerationMemoryRequest {
 
 /// Lifetime phase whose contributions overlap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryPhase {
     /// Artifact loading and conversion before generation.
     Loading,
@@ -336,6 +342,7 @@ pub struct PhaseMemoryEstimate {
 
 /// Planning conclusion, never an allocation guarantee or execution gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryFit {
     /// Known estimated upper end plus reserve is within every supplied limit.
     LikelyFit,

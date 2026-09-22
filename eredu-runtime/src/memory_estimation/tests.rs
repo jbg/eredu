@@ -515,3 +515,117 @@ fn unified_capacity_is_not_assumed_to_mean_shared_backing() {
     assert_eq!(separate[0].1.lower_bytes, 100);
     assert_eq!(separate[1].1.lower_bytes, 100);
 }
+
+#[test]
+fn forecast_wire_enums_use_snake_case_and_preserve_payloads() {
+    use serde::{de::DeserializeOwned, Serialize};
+    use serde_json::{json, Value};
+
+    fn round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
+        value: T,
+        expected: Value,
+    ) {
+        assert_eq!(serde_json::to_value(&value).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<T>(expected).unwrap(), value);
+    }
+
+    for (value, name) in [
+        (MemoryFit::LikelyFit, "likely_fit"),
+        (MemoryFit::LikelyShortfall, "likely_shortfall"),
+        (
+            MemoryFit::InsufficientInformation,
+            "insufficient_information",
+        ),
+    ] {
+        round_trip(value, json!(name));
+    }
+    for (value, name) in [
+        (MemoryPhase::Loading, "loading"),
+        (MemoryPhase::Prefill, "prefill"),
+        (MemoryPhase::Decode, "decode"),
+    ] {
+        round_trip(value, json!(name));
+    }
+    for (value, name) in [
+        (CacheUpdateWorkspace::InPlace, "in_place"),
+        (CacheUpdateWorkspace::CopyState, "copy_state"),
+        (CacheUpdateWorkspace::Unknown, "unknown"),
+    ] {
+        round_trip(value, json!(name));
+    }
+    round_trip(LogitsWorkspace::FinalPosition, json!("final_position"));
+    round_trip(LogitsWorkspace::EveryPosition, json!("every_position"));
+    round_trip(MemoryDomain::Host, json!({"kind": "host"}));
+    round_trip(MemoryDomain::Unified, json!({"kind": "unified"}));
+    round_trip(
+        MemoryDomain::Device("CUDA:GPU-α/0".into()),
+        json!({"kind": "device", "device": "CUDA:GPU-α/0"}),
+    );
+    for (value, name) in [
+        (AttentionWorkspace::Materialized, "materialized"),
+        (
+            AttentionWorkspace::ScoreMatrixUpperBound,
+            "score_matrix_upper_bound",
+        ),
+        (AttentionWorkspace::Unknown, "unknown"),
+    ] {
+        round_trip(value, json!({"kind": name}));
+    }
+    round_trip(
+        AttentionWorkspace::Fused {
+            scratch: MemoryBytes::estimated(0, 64, "fixture"),
+        },
+        json!({"kind": "fused", "scratch": {
+            "lower_bytes": 0, "upper_bytes": 64, "kind": "estimated", "detail": "fixture"
+        }}),
+    );
+    assert!(serde_json::from_value::<MemoryDomain>(json!({"kind": "device"})).is_err());
+    assert!(serde_json::from_value::<AttentionWorkspace>(json!({"kind": "fused"})).is_err());
+}
+
+#[test]
+fn request_and_estimate_json_share_the_forecast_wire_contract() {
+    use serde_json::json;
+    let mut request = request();
+    request.domains[0].domain = MemoryDomain::Device("gpu:0".into());
+    request.domains[0].executions[0].attention = AttentionWorkspace::ScoreMatrixUpperBound;
+    request.domains[0].executions[0].cache_update = CacheUpdateWorkspace::CopyState;
+    let encoded = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        encoded["domains"][0]["domain"],
+        json!({"kind": "device", "device": "gpu:0"})
+    );
+    let execution = &encoded["domains"][0]["executions"][0];
+    assert_eq!(
+        execution["attention"],
+        json!({"kind": "score_matrix_upper_bound"})
+    );
+    assert_eq!(execution["cache_update"], "copy_state");
+    assert_eq!(execution["logits"], "final_position");
+    assert_eq!(
+        serde_json::from_value::<GenerationMemoryRequest>(encoded.clone()).unwrap(),
+        request
+    );
+
+    let report = estimate_generation_memory(&request).unwrap();
+    let encoded_report = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        encoded_report["domains"][0]["domain"],
+        encoded["domains"][0]["domain"]
+    );
+    assert_eq!(encoded_report["fit"], "likely_fit");
+    assert_eq!(encoded_report["domains"][0]["generation_fit"], "likely_fit");
+    assert_eq!(
+        encoded_report["domains"][0]["phases"][0]["phase"],
+        "prefill"
+    );
+    assert_eq!(encoded_report["domains"][0]["phases"][2]["phase"], "decode");
+    assert_eq!(
+        encoded_report["domains"][0]["phases"][3]["phase"],
+        "loading"
+    );
+    assert_eq!(
+        serde_json::from_value::<GenerationMemoryEstimate>(encoded_report).unwrap(),
+        report
+    );
+}

@@ -139,6 +139,14 @@ fn prepared_forecast_derives_contract_and_residency_without_execution() {
         Some(3)
     );
     assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+    let json = serde_json::to_value(&forecast).unwrap();
+    assert_eq!(json["execution"]["logits"], "final_position");
+    assert_eq!(json["estimate"]["fit"], "likely_fit");
+    assert_eq!(json["estimate"]["domains"][0]["domain"]["kind"], "unified");
+    let decoded: eredu::api::GenerationForecast = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.request, forecast.request);
+    assert_eq!(decoded.estimate, forecast.estimate);
+    assert_eq!(decoded.execution, forecast.execution);
     assert!(forecast.with_prefill_chunk(0).is_err());
     assert!(
         forecast.with_prefill_chunk(1).unwrap().estimate.domains[0]
