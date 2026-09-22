@@ -1170,6 +1170,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    chunked_prefill: bool,
     floating_state_source: Option<TensorDtype>,
     architecture_identity: String,
     /// Optional neural operations required by the architecture equations.
@@ -1196,6 +1197,17 @@ pub struct ReplicatedTextRequirements {
 }
 
 impl ReplicatedTextRequirements {
+    /// Declares parity of consecutive causal prefix passes with full prefill.
+    pub const fn with_chunked_prefill(mut self, supported: bool) -> Self {
+        self.chunked_prefill = supported;
+        self
+    }
+
+    /// Architecture support, before backend and execution-class restrictions.
+    pub const fn supports_chunked_prefill(&self) -> bool {
+        self.chunked_prefill
+    }
+
     /// Replaces architecture-authored state geometry before mechanism selection.
     ///
     /// Partitioned architectures use this for explicitly declared receiver
@@ -1284,6 +1296,7 @@ impl ReplicatedTextRequirements {
             ));
         }
         Ok(Self {
+            chunked_prefill: false,
             floating_state_source: None,
             architecture_identity,
             operators,
@@ -1713,6 +1726,7 @@ impl AddressableStorageCapabilities {
 /// Family- and execution-class-neutral backend mechanism report.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackendMechanismCapabilities {
+    chunked_prefill: bool,
     /// Optional neural operations implemented by the backend.
     operators: NeuralOperatorCapabilities,
     /// Exact admitted source-to-executable lowerings.
@@ -1733,6 +1747,12 @@ pub struct BackendMechanismCapabilities {
 }
 
 impl BackendMechanismCapabilities {
+    /// Declares settled prefix submission and compatible prompt slicing.
+    pub const fn with_chunked_prefill(mut self, supported: bool) -> Self {
+        self.chunked_prefill = supported;
+        self
+    }
+
     /// Creates a fail-closed mechanism report.
     pub fn new(
         operators: NeuralOperatorCapabilities,
@@ -1741,6 +1761,7 @@ impl BackendMechanismCapabilities {
         state: StateMechanismCapabilities,
     ) -> Self {
         Self {
+            chunked_prefill: false,
             operators,
             weight_lowerings,
             weight_residencies,
@@ -3402,6 +3423,7 @@ impl SelectedStateRealization {
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
+    backend_chunked_prefill: bool,
     max_cached_shards: usize,
     requirements: ReplicatedTextRequirements,
     /// Exact selected execution topology.
@@ -3430,6 +3452,18 @@ pub struct SelectedReplicatedTextRealization {
 }
 
 impl SelectedReplicatedTextRealization {
+    /// Ordinary prefix support from retained architecture and backend facts.
+    /// Outer preparation must still apply prediction, composite and partition restrictions.
+    pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
+        if !self.requirements.supports_chunked_prefill() {
+            Err("selected architecture does not implement chunked prefill")
+        } else if !self.backend_chunked_prefill {
+            Err("selected backend does not implement chunked prefill")
+        } else {
+            Ok(())
+        }
+    }
+
     /// Retained backend fact used before admitting an observer that requires
     /// completion even when ordinary execution did not request it.
     pub const fn exact_completion_available(&self) -> bool {
@@ -3739,6 +3773,7 @@ pub fn select_replicated_text_realization(
         return Err(ReplicatedTextSelectionError { issues });
     }
     let mut selected = SelectedReplicatedTextRealization {
+        backend_chunked_prefill: capabilities.chunked_prefill,
         max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),
         topology: request

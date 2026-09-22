@@ -67,6 +67,7 @@ impl StateLifecycleCapabilities {
 /// Exact backend facts independent of architecture parameter and state collections.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BackendMechanismFacts {
+    chunked_prefill: bool,
     operators: NeuralOperatorCapabilities,
     weight_residencies: Vec<WeightResidencyMechanism>,
     state: StateLifecycleCapabilities,
@@ -79,6 +80,12 @@ pub struct BackendMechanismFacts {
 }
 
 impl BackendMechanismFacts {
+    /// Declares settled causal-prefix submission and compatible prompt slicing.
+    pub const fn with_chunked_prefill(mut self, supported: bool) -> Self {
+        self.chunked_prefill = supported;
+        self
+    }
+
     /// Declares neural, ordinary residency, and state lifecycle mechanisms.
     /// Optional facilities remain absent until explicitly declared.
     pub fn new(
@@ -87,6 +94,7 @@ impl BackendMechanismFacts {
         state: StateLifecycleCapabilities,
     ) -> Self {
         Self {
+            chunked_prefill: false,
             operators,
             weight_residencies: weight_residencies.into_iter().collect(),
             state,
@@ -265,6 +273,7 @@ pub fn synthesize_replicated_text_capabilities(
     .with_session(facts.session)
     .with_prompt_cache(facts.prompt_cache)
     .with_exact_completion(facts.exact_completion)
+    .with_chunked_prefill(facts.chunked_prefill)
     .with_grouped_operations(facts.grouped_operations)
     .with_indexed_movement(facts.indexed_movement);
     match facts.addressable_storage {

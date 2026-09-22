@@ -353,28 +353,28 @@ pub fn forecast_inspected_generation(
     options: &GenerationMemoryOptions,
     calibration: &ForecastCalibration,
 ) -> Result<GenerationForecast, GenerationForecastError> {
-    let mut options = options.clone();
-    options.chunked_prefill_supported = true;
-    let mut request = inspected_generation_memory_request(inspection, &options)?;
+    let mut request = inspected_generation_memory_request(inspection, options)?;
     let selected = inspection
         .selected()
         .ok_or_else(|| failure("cold execution selection unavailable"))?;
-    let supported = request
-        .domains
-        .iter()
-        .flat_map(|d| &d.executions)
-        .all(|e| e.workspace.is_some())
-        && selected.preparation().prediction_realization().is_none()
-        && selected
-            .preparation()
-            .execution()
-            .parallel_topology()
-            .is_none()
-        && options.input.model_positions == options.input.text_tokens;
+    let full_pass_reason = selected
+        .preparation()
+        .prefill_chunking_support()
+        .err()
+        .map(str::to_owned)
+        .or_else(|| {
+            (options.input.model_positions != options.input.text_tokens)
+                .then(|| "prepared media input requires a complete prefill pass".into())
+        });
+    let modeled_final_position = full_pass_reason.is_none()
+        && request
+            .domains
+            .iter()
+            .flat_map(|d| &d.executions)
+            .all(|e| e.workspace.is_some());
     let execution = ForecastExecutionContract {
-        full_pass_reason: (!supported)
-            .then(|| "selected execution or input lacks a modeled bounded-prefill contract".into()),
-        logits: if supported {
+        full_pass_reason,
+        logits: if modeled_final_position {
             LogitsWorkspace::FinalPosition
         } else {
             LogitsWorkspace::EveryPosition

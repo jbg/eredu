@@ -921,6 +921,24 @@ pub struct SelectedPreparation {
 }
 
 impl SelectedPreparation {
+    /// Reports cold support for ordinary, unobserved plain-text prefix passes.
+    /// Prepared media, capture/intervention and external speculation can require
+    /// a full pass even when this selected execution supports chunking.
+    pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
+        if self.execution.parallel_topology().is_some() {
+            return Err("distributed execution retains a complete prefill pass");
+        }
+        if self.prediction_realization.is_some() {
+            return Err("selected prediction extension retains a complete prefill pass");
+        }
+        match self.execution.kind.as_ref() {
+            SelectedExecutionKind::Replicated(_) | SelectedExecutionKind::Routed(_) => {
+                self.text_realization().prefill_chunking_support()
+            }
+            _ => Err("selected execution class retains a complete prefill pass"),
+        }
+    }
+
     pub(crate) const fn new(
         admission_token: ArtifactAdmissionToken,
         execution: SelectedExecution,

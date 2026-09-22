@@ -747,6 +747,7 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub(crate) struct BoundedIndependentAdapter {
+        chunked_prefill: bool,
         counters: IndependentCounters,
         failure: IndependentFailure,
         fp8: bool,
@@ -801,6 +802,7 @@ pub(crate) mod tests {
             .with_session(SessionCapabilities::new(true, true, true))
             .with_prompt_cache(true)
             .with_exact_completion(true)
+            .with_chunked_prefill(self.chunked_prefill)
             .with_grouped_operations([
                 GroupedOperationRequirement::Linear,
                 GroupedOperationRequirement::GatedProduct,
@@ -1242,6 +1244,72 @@ pub(crate) mod tests {
             "routed_scaling_factor":1.0,"tie_word_embeddings":false,"attention_dropout":0.0,
             "hidden_act":"silu","num_nextn_predict_layers":1
         })
+    }
+
+    #[test]
+    fn cold_prefill_chunking_combines_architecture_backend_and_selected_path() {
+        let mechanisms = BoundedIndependentAdapter {
+            chunked_prefill: true,
+            ..Default::default()
+        };
+        let request = NormalizedLoadRequest::default();
+        // SmolLM2 uses the ordinary Llama architecture and execution path.
+        let (_root, llama) = inspected_llama();
+        let selected = select_preparation(&llama, &request, &mechanisms).unwrap();
+        assert_eq!(selected.prefill_chunking_support(), Ok(()));
+        let unsupported =
+            select_preparation(&llama, &request, &BoundedIndependentAdapter::default()).unwrap();
+        assert_eq!(
+            unsupported.prefill_chunking_support(),
+            Err("selected backend does not implement chunked prefill")
+        );
+        let partitioned = select_preparation(&llama, &parallel_request(), &mechanisms).unwrap();
+        assert_eq!(
+            partitioned.prefill_chunking_support(),
+            Err("distributed execution retains a complete prefill pass")
+        );
+
+        let (_root, lfm) = inspected_config(serde_json::json!({
+            "model_type": "lfm2", "vocab_size": 64, "hidden_size": 16,
+            "intermediate_size": 32, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "layer_types": ["conv", "full_attention"], "conv_L_cache": 3,
+            "block_multiple_of": 8, "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": true, "tie_word_embeddings": false
+        }));
+        let selected = select_preparation(&lfm, &request, &mechanisms).unwrap();
+        assert_eq!(
+            selected.prefill_chunking_support(),
+            Err("selected architecture does not implement chunked prefill")
+        );
+
+        // Routed Qwen uses the shared causal decoder even though its memory
+        // workspace has no finite projection. Coverage is not a support fact.
+        let (_root, routed) = inspected_config(routed_config());
+        let selected = select_preparation(&routed, &request, &mechanisms).unwrap();
+        assert_eq!(selected.prefill_chunking_support(), Ok(()));
+        assert!(
+            crate::memory_estimation::generation_memory_geometry(routed.architecture_plan())
+                .unwrap()
+                .workspace
+                .is_none()
+        );
+        for (config, reason) in [
+            (
+                composite_config(),
+                "selected execution class retains a complete prefill pass",
+            ),
+            (
+                prediction_config(),
+                "selected prediction extension retains a complete prefill pass",
+            ),
+        ] {
+            let (_root, inspection) = inspected_config(config);
+            let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
+            assert_eq!(selected.prefill_chunking_support(), Err(reason));
+        }
+        mechanisms.assert_cold_only();
     }
 
     struct SemanticExecutionProbe {

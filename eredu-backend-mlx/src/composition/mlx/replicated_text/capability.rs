@@ -42,6 +42,7 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
         )
         .with_prompt_cache(true)
         .with_exact_completion(true)
+        .with_chunked_prefill(true)
     }
 
     fn supports_direct(&self, descriptor: &WeightLoweringDescriptor) -> bool {

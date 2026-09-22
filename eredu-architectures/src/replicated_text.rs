@@ -2472,6 +2472,18 @@ enum EligibleConfig<'a> {
 }
 
 impl EligibleConfig<'_> {
+    fn supports_chunked_prefill(&self) -> bool {
+        match self {
+            Self::Llama(_)
+            | Self::Nanbeige(_)
+            | Self::Qwen(_)
+            | Self::Gemma2(_)
+            | Self::K2Horizon(_)
+            | Self::GptOss(_) => crate::decoder::CHUNKED_TEXT_PREFILL,
+            _ => false,
+        }
+    }
+
     fn partitioned_boundary_schema(
         &self,
         topology: eredu_core::ParallelRankTopology,
@@ -4348,6 +4360,7 @@ fn replicated_text_requirements_for_structure(
     )
     .and_then(|requirements| {
         requirements
+            .with_chunked_prefill(config.supports_chunked_prefill())
             .with_floating_state_source(floating_source.dtype().clone())
             .with_derived_recipes_and_shared_sources(
                 derived_recipes,

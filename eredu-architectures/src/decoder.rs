@@ -5,6 +5,9 @@
 
 use std::ops::Range;
 
+// Shared by cold architecture requirements and the concrete layered executor.
+pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
+
 pub(crate) mod attention_partition;
 /// Shared-weight repeated stacks with independent state for each invocation.
 pub(crate) mod repeated;
@@ -6569,7 +6572,7 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     fn supports_chunked_prefill() -> bool {
-        true
+        CHUNKED_TEXT_PREFILL
     }
 
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {

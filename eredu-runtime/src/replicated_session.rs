@@ -1745,6 +1745,9 @@ where
     A: ReplicatedTextArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
+    if selected.requirements().supports_chunked_prefill() && !A::supports_chunked_prefill() {
+        return Err("cold chunked-prefill declaration disagrees with constructed architecture".into());
+    }
     prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
         architecture,
         source_architecture,

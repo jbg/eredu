@@ -6392,6 +6392,17 @@ it when no proposed cold cache limit is supplied. This explicit local diagnostic
 may initialize the native allocator. The generic options constructor, portable
 estimator and cold architecture-selection driver do not perform native queries.
 
+Cold prefix support is an explicit architecture declaration in
+`ReplicatedTextRequirements`, combined with the backend's settled-prefix mechanism
+fact and retained in the selected realization. `SelectedPreparation` applies
+prediction, composite and distributed restrictions and exposes
+`prefill_chunking_support()`. The shared causal decoder's cold declaration and
+loaded trait use the same implementation constant; construction rejects a cold
+positive declaration that disagrees with the architecture trait. Cold forecasts
+consume this selection rather than a caller hint or workspace-coverage heuristic.
+This keeps model semantics out of the native capability provider and allows
+chunking support and estimator coverage to evolve independently.
+
 The neutral ordinary/controlled text driver requests bounded prefill through an
 optional backend prefix operation. Native adapters preserve compatible prompt
 slicing, positions and completion; an intermediate prefix is settled before the

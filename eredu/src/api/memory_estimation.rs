@@ -35,7 +35,10 @@ pub struct GenerationMemoryOptions {
     pub batch_size: u64,
     /// Maximum positions submitted by one prefill invocation.
     pub prefill_chunk_tokens: u64,
-    /// Backend prefix execution is available for this ordinary request.
+    /// Legacy hint, ignored: cold selection now determines prefix support.
+    #[deprecated(
+        note = "cold prefix support is derived from SelectedPreparation::prefill_chunking_support"
+    )]
     pub chunked_prefill_supported: bool,
     /// Physical backing relationship reported by the backend.
     pub placement: GenerationMemoryPlacement,
@@ -63,6 +66,7 @@ impl GenerationMemoryOptions {
     /// Creates an estimate with explicit unknown backend mechanisms and overhead.
     /// With the `mlx` feature, `Self::for_local_backend` instead samples the
     /// current local allocator-cache policy for its overhead allowance.
+    #[allow(deprecated)]
     pub fn new(input: InputTokenCount, placement: GenerationMemoryPlacement) -> Self {
         Self {
             input,
@@ -272,8 +276,7 @@ pub fn inspected_generation_memory_request(
             .max(materialization.ordinary_recipe_peak_bytes);
         loading_peak = MemoryBytes::estimated(resident_parameters.lower_bytes, add(add(parameters, *stored)?, conversion)?, "materialized destinations plus checkpoint source payload and conversion scratch; file pages may be reclaimable");
     }
-    let chunk_tokens = if options.chunked_prefill_supported
-        && workspace.is_some()
+    let chunk_tokens = if selected.preparation().prefill_chunking_support().is_ok()
         && options.input.model_positions == options.input.text_tokens
     {
         options.prefill_chunk_tokens

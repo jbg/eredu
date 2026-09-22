@@ -83,6 +83,22 @@ projection uses a full prompt for uncovered selected paths; it does not assume
 that asking for a smaller chunk makes every mechanism chunkable. Specialized
 workspace coverage is explicit rather than silently assigned zero.
 
+Cold callers can query `inspection.selected().unwrap().preparation()
+.prefill_chunking_support()` before loading. This reports ordinary unobserved
+plain-text support from retained architecture and backend facts, including
+prediction, composite and distributed restrictions. LFM2.5 currently reports
+unsupported; the Llama path used by SmolLM2 supports it. This describes current
+implementation coverage, not an inherent limitation of the LFM architecture.
+Prepared media, capture/intervention and external speculation can still require
+a full pass after selection.
+
+`inspected_generation_memory_request` derives chunk eligibility from that fact;
+`GenerationMemoryOptions::chunked_prefill_supported` is deprecated and ignored.
+To forecast an explicitly unchunked request, set `prefill_chunk_tokens` to the
+input's model-position count. Workspace coverage is independent: a chunk-capable
+routed decoder may still have an unknown workspace bound. Smaller chunks never
+claim savings for a selection that requires a full pass.
+
 ## API and ownership
 
 Prefer `LoadedModel::forecast_prepared_generation(&request, &options)` for a
@@ -133,8 +149,8 @@ and sample the allocator's current limit automatically. Applications can overrid
 individual calibration fields or `backend_overhead`; budget, reserve and
 warning/refusal decisions remain application policy. The CLI uses these same
 facade calls. `forecast_inspected_generation` applies the same calibration to
-cold selected geometry; its prefill contract describes the modeled ordinary text
-paths, before a native executor exists.
+cold selected geometry; its prefill contract comes from the selected preparation,
+before a native executor exists.
 
 `eredu::api::estimate_inspected_generation_memory` consumes a retained cold
 `ModelInspectionOutcome` and `GenerationMemoryOptions`.
@@ -296,6 +312,15 @@ fixture checks and portable domain tests do not establish those native results.
 
 ## Focused verification
 
+- Cold chunking follow-up: portable preparation tests cover supported and absent
+  backend mechanisms, Llama, LFM2, routed, composite, prediction and partitioned
+  selections. CPU/Metal fixture tests compare cold support with the loaded executor
+  across resident, host, disk and affine-quantized paths. Rebuilt CLI cold reports
+  on the pinned SmolLM and LFM2.5 checkpoints above used 2,000 input positions,
+  eight output positions, a requested 512-token chunk and zero allocator cache.
+  SmolLM retained 512 and recomputed smaller-chunk savings; LFM2.5 used all 2,000
+  positions, reported the architecture's full-pass reason and suggested no chunk
+  savings. The existing unknown workspace bound remained unknown.
 - Prepared-request facade forecasts are covered with a neutral mock backend:
   exact request settings, resident-byte deduction independent of allocator activity,
   calibration overrides, chunk recomputation, trace-only controlled parity,

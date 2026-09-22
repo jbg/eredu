@@ -155,6 +155,19 @@ fn run(device: DeviceType) {
                     },
                 ),
             };
+            let inspected = native::inspect_model_preparation(
+                root.path(),
+                native::MlxInspectionOptions::new(MlxLoadRequest::from_normalized(
+                    request.clone(),
+                )),
+            )
+            .unwrap();
+            let cold_chunking = inspected
+                .selected()
+                .unwrap()
+                .preparation()
+                .prefill_chunking_support();
+            assert_eq!(cold_chunking, Ok(()));
             let backend = native::backend(&stream, &weights_stream);
             let model = eredu_core::load_model(
                 &backend,
@@ -164,6 +177,10 @@ fn run(device: DeviceType) {
             .unwrap();
             let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
             assert!(MlxBackend::text_prefill_chunking_support(&runtime).is_ok());
+            assert_eq!(
+                cold_chunking.is_ok(),
+                MlxBackend::text_prefill_chunking_support(&runtime).is_ok()
+            );
             use eredu_runtime::memory_forecast::GenerationForecastBackend;
             use eredu_runtime::memory_estimation::LogitsWorkspace;
             let profile = MlxBackend::loaded_memory_profile(&runtime).unwrap();
