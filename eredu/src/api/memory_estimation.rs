@@ -61,6 +61,8 @@ pub struct GenerationMemoryOptions {
 
 impl GenerationMemoryOptions {
     /// Creates an estimate with explicit unknown backend mechanisms and overhead.
+    /// With the `mlx` feature, `Self::for_local_backend` instead samples the
+    /// current local allocator-cache policy for its overhead allowance.
     pub fn new(input: InputTokenCount, placement: GenerationMemoryPlacement) -> Self {
         Self {
             input,

@@ -85,7 +85,8 @@ else()
       mlx-cpu-softmax-reduction.patch
       mlx-cpu-argpartition-equal-keys.patch
       mlx-gpu-submission-progress.patch
-      mlx-submission-recovery.patch)
+      mlx-submission-recovery.patch
+      mlx-cache-limit-query.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")

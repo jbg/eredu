@@ -1,0 +1,112 @@
+diff --git a/mlx/memory.h b/mlx/memory.h
+--- a/mlx/memory.h
++++ b/mlx/memory.h
+@@ -60,6 +60,9 @@
+  * */
+ MLX_API size_t set_cache_limit(size_t limit);
+ 
++/* Get the current cache limit without changing cache retention. */
++MLX_API size_t get_cache_limit();
++
+ /* Clear the memory cache. */
+ MLX_API void clear_cache();
+ 
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -62,6 +62,10 @@
+ 
+   size_t get_cache_memory() const;
+   size_t set_cache_limit(size_t limit);
++  size_t get_cache_limit() {
++    std::unique_lock lk(mutex_);
++    return cache_limit_;
++  }
+   void clear_cache();
+ 
+  private:
+@@ -203,6 +207,10 @@
+ size_t get_cache_memory() {
+   return allocator::common_allocator().get_cache_memory();
+ }
++size_t get_cache_limit() {
++  return allocator::common_allocator().get_cache_limit();
++}
++
+ size_t set_cache_limit(size_t limit) {
+   return allocator::common_allocator().set_cache_limit(limit);
+ }
+diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -37,6 +37,7 @@
+     return buffer_cache_.cache_size();
+   };
+   size_t set_cache_limit(size_t limit);
++  size_t get_cache_limit();
+   size_t set_memory_limit(size_t limit);
+   size_t get_memory_limit();
+   size_t set_wired_limit(size_t limit);
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -78,6 +78,11 @@
+ 
+ MetalAllocator::~MetalAllocator() = default;
+ 
++size_t MetalAllocator::get_cache_limit() {
++  std::lock_guard lk(mutex_);
++  return max_pool_size_;
++}
++
+ size_t MetalAllocator::set_cache_limit(size_t limit) {
+   std::unique_lock lk(mutex_);
+   std::swap(limit, max_pool_size_);
+@@ -242,6 +247,10 @@
+ 
+ } // namespace metal
+ 
++size_t get_cache_limit() {
++  return metal::allocator().get_cache_limit();
++}
++
+ size_t set_cache_limit(size_t limit) {
+   return metal::allocator().set_cache_limit(limit);
+ }
+diff --git a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+--- a/mlx/backend/cuda/allocator.h
++++ b/mlx/backend/cuda/allocator.h
+@@ -65,6 +65,7 @@
+   size_t set_memory_limit(size_t limit);
+   size_t get_cache_memory() const;
+   size_t set_cache_limit(size_t limit);
++  size_t get_cache_limit();
+   void clear_cache();
+ 
+  private:
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -353,6 +353,11 @@
+   return buffer_cache_.cache_size();
+ }
+ 
++size_t CudaAllocator::get_cache_limit() {
++  std::lock_guard lk(mutex_);
++  return max_pool_size_;
++}
++
+ size_t CudaAllocator::set_cache_limit(size_t limit) {
+   std::lock_guard lk(mutex_);
+   std::swap(limit, max_pool_size_);
+@@ -422,6 +427,10 @@
+ size_t get_cache_memory() {
+   return cu::allocator().get_cache_memory();
+ }
++size_t get_cache_limit() {
++  return cu::allocator().get_cache_limit();
++}
++
+ size_t set_cache_limit(size_t limit) {
+   return cu::allocator().set_cache_limit(limit);
+ }

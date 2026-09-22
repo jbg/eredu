@@ -13,7 +13,7 @@ positions (including any chat-template positions):
 ```sh
 eredu --model /path/to/model --no-auto --estimate-memory-tokens 2000 \
   --max-tokens 32 --prefill-chunk-size 512 \
-  --memory-budget-bytes 2147483648 --mlx-cache-limit-bytes 0 > memory.json
+  --memory-budget-bytes 2147483648 > memory.json
 ```
 
 Omitting `--max-tokens` in cold inspection produces an explicitly labeled
@@ -27,7 +27,7 @@ Report the exact tokenized generation request:
 ```sh
 eredu --model /path/to/model --raw --max-tokens 32 \
   --memory-report request-memory.json --memory-budget-bytes 2147483648 \
-  --memory-policy refuse --mlx-cache-limit-bytes 0 'Explain memory locality.'
+  --memory-policy refuse 'Explain memory locality.'
 ```
 
 The request report runs after loading and tokenization, before generation. Use
@@ -43,9 +43,14 @@ available capacity is compared with **additional** request memory after subtract
 the declared resident portion. `--memory-reserve-bytes` defaults to 256 MiB per
 physical pool for other work and uncertainty. CLI overhead uses an explicit
 0–64 MiB graph/driver planning interval plus the configured allocator-cache
-limit, separately from this reserve. Without `--mlx-cache-limit-bytes`, allocator
-cache retention has no request-selected bound and fit remains uncertain; it is
-never silently treated as zero.
+limit, separately from this reserve. Without `--mlx-cache-limit-bytes`, reports
+query the allocator's actual current limit. The allowance uses the larger of
+that limit and already retained cache, because lowering the limit may defer
+eviction. An explicit cache limit during cold inspection describes the proposed
+policy; reports after loading observe the policy in force. Query failures and
+arithmetic overflow remain explicit unknowns. A large native default can produce
+a pessimistic forecast; `--mlx-cache-limit-bytes 0` disables retention when that
+is the desired runtime policy.
 
 On macOS, `discover_local_hardware()` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus
@@ -86,6 +91,32 @@ workspace coverage is explicit rather than silently assigned zero.
 cold backend mechanism facts. Neither function creates a native device or tensor.
 `inspected_generation_memory_request` exposes the descriptive request for
 recomputing supported alternatives.
+
+With the `mlx` feature, `GenerationMemoryOptions::for_local_backend(input,
+placement)` samples the current cache limit and retained bytes and defaults
+`backend_overhead` to their maximum plus the 64 MiB graph/driver planning allowance.
+This is an estimated allowance, not a measured upper bound on all graph or driver
+allocations. Callers can override `backend_overhead` with their own calibration;
+attention, cache-update and graph-overlap mechanisms still need explicit coverage.
+The generic `GenerationMemoryOptions::new` remains backend-neutral and leaves
+native overhead unknown. Local policy sampling can initialize the native allocator;
+the subsequent cold inspection and estimation remain free of native queries.
+
+`local_allocator_cache_limit()` reads the native value without changing policy or
+evicting cache. `set_local_allocator_cache_limit(bytes)` returns the previous value
+for restoration; the backend adapter's setter now also preserves that result:
+
+```rust,ignore
+let previous = eredu::api::set_local_allocator_cache_limit(32 * 1024 * 1024)?;
+let options = eredu::api::GenerationMemoryOptions::for_local_backend(input, placement);
+// Inspect or run the request, then restore policy when appropriate.
+eredu::api::set_local_allocator_cache_limit(previous)?;
+```
+
+Both policy and observations are process-global snapshots. Coordinate mutations
+with other users, restore policy on error paths as well, and recreate options
+after policy changes. The native getter also observes changes made outside Rust;
+there is no shadow configuration or mutation-based getter.
 
 Architecture projections reuse normalized state schedules and supply decoder
 workspace dimensions. Runtime planning combines those with selected residency,
@@ -213,6 +244,19 @@ fixture checks and portable domain tests do not establish those native results.
 
 ## Focused verification
 
+- Cache-policy follow-up: native getter/setter/restore tests passed on CPU and
+  Metal, including a native C setter bypassing the Rust wrapper and repeated
+  queries preserving populated cache. Local facade policy tests passed on both
+  builds; portable facade/conformance tests passed (19 and 82, one preexisting
+  ignored test). CUDA getter implementation is present but was not run locally.
+- On the pinned SmolLM checkpoint above, `target/debug/eredu --model
+  /tmp/eredu-memory-validation/SmolLM-135M --no-auto --estimate-memory-tokens 16
+  --max-tokens 4` observed the native default cache limit of 261,134,011,596 bytes
+  and produced a finite loading-inclusive upper of 262,616,979,148 bytes without
+  a cache flag. Its interval crossed available memory and honestly remained
+  `InsufficientInformation`; an explicit proposed zero-cache policy reported
+  `LikelyFit`. Metal tests and the default-policy CLI observation ran outside
+  the sandbox; a denied Metal query remained an explicit unknown.
 - `cargo test -p eredu-runtime --lib memory_estimation`: 20 tests, covering
   overlap, placement, state growth, unknowns, overflow and recomputed candidates.
 - `cargo test -p eredu-architectures --lib memory_estimation::tests`: 3 tests.

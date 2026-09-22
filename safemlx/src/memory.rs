@@ -78,6 +78,19 @@ pub fn set_cache_limit(bytes: usize) -> Result<usize> {
     Ok(previous)
 }
 
+/// Reads the current process-global MLX allocator-cache limit in bytes.
+///
+/// This may initialize the native allocator. It neither changes the limit nor
+/// evicts cached allocations. The value is a snapshot; another caller may change
+/// the limit later. Lowering the limit need not immediately evict existing cache.
+pub fn cache_limit() -> Result<usize> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    let mut bytes = 0;
+    check_status(unsafe { safemlx_sys::mlx_get_cache_limit(&mut bytes) })?;
+    Ok(bytes)
+}
+
 /// Sets the process-global MLX memory limit, in bytes.
 ///
 /// Returns the previous limit reported by MLX. This limit applies to
@@ -159,6 +172,39 @@ mod tests {
                     .contains("safemlx-sys/src/mlx-c/mlx/c/memory.cpp"));
             }
             Err(error) => panic!("clearing the MLX allocator cache failed unexpectedly: {error}"),
+        }
+    }
+
+    #[test]
+    fn allocator_cache_limit_query_reads_native_state_without_eviction() {
+        let _guard = runtime_lock::enter();
+        let original = match cache_limit() {
+            Ok(limit) => limit,
+            Err(error) if is_headless_metal_error(&error) => return,
+            Err(error) => panic!("querying allocator cache limit failed: {error}"),
+        };
+        let result = std::panic::catch_unwind(|| {
+            assert_eq!(set_cache_limit(1024 * 1024).unwrap(), original);
+            let array = crate::Array::from_slice(&vec![1.0f32; 4096], &[4096]);
+            drop(array);
+            let retained = cache_memory().unwrap();
+            assert!(retained > 0, "fixture must populate the allocator cache");
+            assert_eq!(cache_limit().unwrap(), 1024 * 1024);
+            assert_eq!(cache_limit().unwrap(), 1024 * 1024);
+            assert_eq!(cache_memory().unwrap(), retained);
+
+            // A native caller can change policy without using our Rust setter.
+            // The getter must observe it rather than a shadow Rust value.
+            let mut previous = 0;
+            check_status(unsafe { safemlx_sys::mlx_set_cache_limit(&mut previous, 0) }).unwrap();
+            assert_eq!(previous, 1024 * 1024);
+            assert_eq!(cache_limit().unwrap(), 0);
+            assert_eq!(set_cache_limit(original).unwrap(), 0);
+            assert_eq!(cache_limit().unwrap(), original);
+        });
+        set_cache_limit(original).expect("restore allocator policy after test");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 

@@ -98,6 +98,11 @@ path = "tests/selected_backend_api.rs"
 required-features = ["mlx"]
 
 [[test]]
+name = "local_memory_policy"
+path = "tests/local_memory_policy.rs"
+required-features = ["mlx"]
+
+[[test]]
 name = "native_execution_control"
 path = "tests/native_execution_control.rs"
 required-features = ["mlx"]

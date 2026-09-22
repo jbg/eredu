@@ -23,6 +23,8 @@ destruction. Ordinary native calls reclaim terminal records on their original
 owner thread; unresolved records and records whose owner has exited remain
 retained. Patch-content identities select fresh extracted source trees, so
 changing a native patch cannot silently reuse an older successful patch stamp.
+The cache-limit query patch provides a locked, non-mutating policy getter for
+CPU, Metal and CUDA allocators, exposed as `mlx_get_cache_limit` in the C API.
 
 ## Backends
 

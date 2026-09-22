@@ -47,8 +47,21 @@ pub(super) fn report(
             _ => GenerationMemoryPlacement::Unknown,
         }
     };
-    let mut options =
-        GenerationMemoryOptions::new(eredu_core::InputTokenCount::text(input_tokens), placement);
+    let input = eredu_core::InputTokenCount::text(input_tokens);
+    let mut options = if let Some(cache_limit) = args
+        .mlx_cache_limit_bytes
+        .filter(|_| already_resident.is_none())
+    {
+        // Cold explicit overrides describe the proposed policy without changing
+        // process-global allocator state. Loaded reports sample the actual policy.
+        let mut options = GenerationMemoryOptions::new(input, placement);
+        options.backend_overhead = MemoryBytes::estimated(0,
+            cache_limit.checked_add(64 * 1024 * 1024).context("memory overhead arithmetic overflow")?,
+            "proposed MLX allocator-cache limit plus 64 MiB graph/driver planning allowance; uncalibrated outside the documented matrix");
+        options
+    } else {
+        GenerationMemoryOptions::for_local_backend(input, placement)
+    };
     options.max_output_tokens = output_tokens;
     options.chunked_prefill_supported = true;
     options.prefill_chunk_tokens = if args.prefill_chunk_size == 0 {
@@ -61,12 +74,6 @@ pub(super) fn report(
     options.attention = AttentionWorkspace::ScoreMatrixUpperBound;
     options.cache_update = CacheUpdateWorkspace::CopyState;
     options.logits = LogitsWorkspace::FinalPosition;
-    options.backend_overhead = match args.mlx_cache_limit_bytes {
-        Some(cache_limit) => MemoryBytes::estimated(0,
-            cache_limit.checked_add(64 * 1024 * 1024).context("memory overhead arithmetic overflow")?,
-            "CLI planning allowance: up to 64 MiB for graph/driver overhead plus the configured MLX allocator-cache limit; uncalibrated outside the documented matrix"),
-        None => MemoryBytes::unknown("MLX allocator-cache retention is unbounded by this request; set --mlx-cache-limit-bytes to obtain a bounded forecast"),
-    };
     let host_available = observed_u64(&hardware.available_memory_bytes);
     options.budget = MemoryBudget {
         application_limit_bytes: args.memory_budget_bytes,
@@ -93,14 +100,11 @@ pub(super) fn report(
         estimate.assumptions.push("Point-in-time available host/unified memory is unavailable; a likely fit against an application budget does not establish current system headroom.".into());
     }
     estimate.assumptions.push("CLI uses full float32 score/probability matrices as a conservative attention fallback even when the selected MLX kernel avoids them; shortfall advice can be pessimistic.".into());
-    estimate.assumptions.push(format!("CLI reserve: {} bytes per physical pool; known allocator-cache limit {:?} bytes, plus a 64 MiB graph/driver planning allowance when bounded. These are planning assumptions, not total-process limits.", args.memory_reserve_bytes, args.mlx_cache_limit_bytes));
+    estimate.assumptions.push(format!("CLI reserve: {} bytes per physical pool; {}.", args.memory_reserve_bytes, options.backend_overhead.detail));
     if already_resident.is_some() {
         estimate.assumptions.push("Model already loaded: loading peak is excluded; availability is compared with additional request memory.".into());
     }
     let mut recommendations = Vec::new();
-    if args.mlx_cache_limit_bytes.is_none() {
-        recommendations.push("Set --mlx-cache-limit-bytes 0 (or an explicit cache budget) and recompute to bound allocator-cache retention.".into());
-    }
     for domain in &estimate.domains {
         if let Some(phase) = domain.phases.iter().max_by_key(|p| p.total.lower_bytes) {
             let contributions = [

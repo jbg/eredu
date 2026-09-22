@@ -6372,6 +6372,16 @@ same observation for host and unified Metal capacity. Runtime fit policy continu
 to compare additional request memory with that observation; native queries and
 unsafe calls remain in `safemlx`.
 
+Allocator-cache policy is also observed at the native boundary. A vendored MLX
+getter reads the CPU, Metal or CUDA allocator's limit under its allocator lock;
+the C API and `safemlx` expose it without temporary mutations or cache eviction.
+The MLX adapter and selected facade expose both the getter and a setter returning
+the previous value. `GenerationMemoryOptions::for_local_backend` composes this
+snapshot with retained cache and a labeled graph/driver allowance; the CLI uses
+it when no proposed cold cache limit is supplied. This explicit local diagnostic
+may initialize the native allocator. The generic options constructor, portable
+estimator and cold architecture-selection driver do not perform native queries.
+
 The neutral ordinary/controlled text driver requests bounded prefill through an
 optional backend prefix operation. Native adapters preserve compatible prompt
 slicing, positions and completion; an intermediate prefix is settled before the

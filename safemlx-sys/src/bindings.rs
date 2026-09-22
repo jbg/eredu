@@ -2628,6 +2628,9 @@ extern "C" {
     pub fn mlx_set_cache_limit(res: *mut usize, limit: usize) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn mlx_get_cache_limit(res: *mut usize) -> ::std::os::raw::c_int;
+}
+extern "C" {
     pub fn mlx_set_memory_limit(res: *mut usize, limit: usize) -> ::std::os::raw::c_int;
 }
 extern "C" {

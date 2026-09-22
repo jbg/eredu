@@ -11,6 +11,64 @@ pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
     eredu_backend_mlx::discover_hardware()
 }
 
+/// Reads the process-global allocator-cache limit in bytes without changing it.
+/// This snapshot may initialize the native allocator and can change later.
+pub fn local_allocator_cache_limit() -> Result<usize, eredu_core::BackendFailure> {
+    eredu_backend_mlx::allocator_cache_limit().map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache limit query")
+    })
+}
+
+/// Sets the process-global allocator-cache limit and returns the previous value
+/// for explicit restoration. Coordinate changes with other runtime users.
+pub fn set_local_allocator_cache_limit(bytes: usize) -> Result<usize, eredu_core::BackendFailure> {
+    eredu_backend_mlx::set_allocator_cache_limit(bytes).map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache configuration")
+    })
+}
+
+impl super::GenerationMemoryOptions {
+    /// Creates local-backend options with an observed allocator-cache allowance.
+    ///
+    /// Overhead uses the larger of the current cache limit and retained cache,
+    /// plus a 64 MiB graph/driver planning allowance. This is an estimated bound,
+    /// not a total-process limit. Other execution mechanisms remain explicit.
+    /// Query failure or an unrepresentable bound leaves overhead unknown.
+    ///
+    /// This diagnostic may initialize the native allocator; cold inspection
+    /// itself does not query native resources. Recreate options after changing
+    /// the process-global cache limit. Callers may override `backend_overhead`.
+    pub fn for_local_backend(
+        input: eredu_core::InputTokenCount,
+        placement: super::GenerationMemoryPlacement,
+    ) -> Self {
+        let mut options = Self::new(input, placement);
+        options.backend_overhead = match local_allocator_cache_limit()
+            .and_then(|limit| allocator_telemetry().map(|memory| (limit, memory.cache_bytes)))
+        {
+            Ok((limit, cached)) => local_allocator_overhead(limit, cached),
+            Err(error) => super::MemoryBytes::unknown(format!(
+                "local allocator-cache observation failed: {error}"
+            )),
+        };
+        options
+    }
+}
+
+fn local_allocator_overhead(limit: usize, cached: u64) -> super::MemoryBytes {
+    let upper = u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.max(cached).checked_add(64 * 1024 * 1024));
+    match upper {
+        Some(upper) => super::MemoryBytes::estimated(0, upper, format!(
+            "point-in-time MLX allocator-cache limit {limit} bytes, retained cache {cached} bytes; allowance uses their maximum plus 64 MiB for graph/driver overhead (planning assumption, not a total-process bound)"
+        )),
+        None => super::MemoryBytes::unknown(
+            "MLX allocator-cache limit plus graph/driver allowance exceeds representable bytes",
+        ),
+    }
+}
+
 use super::{DevicePlanError, ExpertCacheBenchmarkError};
 use eredu_core::BackendFailure;
 
@@ -221,9 +279,7 @@ pub fn configure_local_runtime(
         })?;
     }
     if let Some(bytes) = configuration.allocator_cache_limit {
-        eredu_backend_mlx::set_allocator_cache_limit(bytes).map_err(|error| {
-            BackendFailure::from_error(error).with_operation("allocator configuration")
-        })?;
+        set_local_allocator_cache_limit(bytes)?;
     }
     Ok(())
 }
@@ -502,6 +558,24 @@ mod tests {
         default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
         DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
     };
+
+    #[test]
+    fn local_overhead_covers_retained_cache_and_checks_overflow() {
+        let allowance = 64 * 1024 * 1024;
+        assert_eq!(
+            super::local_allocator_overhead(0, 0).upper_bytes,
+            Some(allowance)
+        );
+        assert_eq!(
+            super::local_allocator_overhead(1024, 4096).upper_bytes,
+            Some(4096 + allowance)
+        );
+        assert_eq!(
+            super::local_allocator_overhead(8192, 4096).upper_bytes,
+            Some(8192 + allowance)
+        );
+        assert_eq!(super::local_allocator_overhead(0, u64::MAX).upper_bytes, None);
+    }
 
     #[test]
     fn empty_benchmark_prompt_is_a_facade_input_error() {
