@@ -1375,6 +1375,24 @@ pub struct TextGenerationConfig {
     sampling: ResolvedGenerationConfig,
     seed: u64,
     strategy: TextSamplingStrategy,
+    prefill: PrefillChunkPolicy,
+}
+
+/// Bounds the number of prompt tokens processed together when the selected
+/// backend and request support incremental prefill. Media, instrumentation, or
+/// specialized execution may retain a complete pass to preserve their contracts.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PrefillChunkPolicy {
+    /// Process the prompt in one pass.
+    Unchunked,
+    /// Process at most this many tokens in each eligible prefill pass.
+    Bounded(std::num::NonZeroUsize),
+}
+
+impl Default for PrefillChunkPolicy {
+    fn default() -> Self {
+        Self::Bounded(std::num::NonZeroUsize::new(512).expect("512 is nonzero"))
+    }
 }
 
 /// Backend-neutral token-sampling strategy for one text-generation session.
@@ -1402,6 +1420,7 @@ impl TextGenerationConfig {
             sampling,
             seed: 0,
             strategy: TextSamplingStrategy::Standard,
+            prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(512).unwrap()),
         }
     }
 
@@ -1409,6 +1428,18 @@ impl TextGenerationConfig {
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
+    }
+
+    /// Selects prompt chunking for both ordinary and controlled generation.
+    pub const fn with_prefill_chunk_policy(mut self, policy: PrefillChunkPolicy) -> Self {
+        self.prefill = policy;
+        self
+    }
+
+    /// Returns the requested prefill policy; backends preserve unsupported input
+    /// and observation contracts by retaining an unchunked pass.
+    pub const fn prefill_chunk_policy(&self) -> PrefillChunkPolicy {
+        self.prefill
     }
 
     /// Selects adaptive Mirostat V2 sampling, requiring positive temperature.
@@ -1855,6 +1886,30 @@ pub trait TextGenerationBackend: BackendProvider {
         prompt_token_ids: Vec<u32>,
     ) -> Result<Self::Prompt, Self::Error>;
 
+    /// Reports whether this executable can chunk ordinary plain-text prefill.
+    /// Media/structured inputs and requested captures can still require the
+    /// complete pass; this capability does not describe those request contracts.
+    fn text_prefill_chunking_support(_runtime: &ModelRuntime<Self>) -> Result<(), &'static str> {
+        Err("backend retains a complete prefill pass")
+    }
+
+    /// Consumes and completes one nonfinal prompt prefix without sampling.
+    /// Returns true only after replacing `prompt` with the remaining suffix.
+    /// Returning false leaves the prompt intact for the final ordinary prefill.
+    ///
+    /// Implementations must preserve cache positions and settle native work
+    /// before returning true, so transient graphs do not accumulate across
+    /// chunks. Inputs with incompatible media or observation semantics retain
+    /// the full pass. The default backend does not split opaque prompts.
+    fn prefill_text_prefix(
+        _runtime: &mut ModelRuntime<Self>,
+        _prompt: &mut Self::Prompt,
+        _max_tokens: std::num::NonZeroUsize,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     /// Submits prompt prefill followed by sampling one token.
     fn submit_text_prefill(
         runtime: &mut ModelRuntime<Self>,
@@ -2036,6 +2091,8 @@ where
     step: Option<PendingTextInput<B::Prompt, B::Token>>,
     completions: Vec<B::TextCompletion>,
     remaining_tokens: Option<usize>,
+    prefill: PrefillChunkPolicy,
+    cancellation: Option<crate::GenerationCancellationToken>,
 }
 
 type ControlledGenerationResult<B, C> = Result<
@@ -2082,6 +2139,11 @@ where
     /// Mutably borrows the canonical constraint state.
     pub fn controller_mut(&mut self) -> &mut C {
         &mut self.inner.controller
+    }
+
+    /// Observes cancellation between completed prefill chunks and predictions.
+    pub fn set_cancellation_token(&mut self, cancellation: crate::GenerationCancellationToken) {
+        self.inner.cancellation = Some(cancellation);
     }
 
     /// Completes additional fallible host preparation before advancing this run.
@@ -2182,6 +2244,8 @@ where
             step: Some(PendingTextInput::Prefill(prompt)),
             completions: Vec::new(),
             remaining_tokens: config.sampling().max_new_tokens,
+            prefill: config.prefill_chunk_policy(),
+            cancellation: None,
         })
     }
 
@@ -2260,7 +2324,12 @@ where
         &mut self,
         runtime: &mut ModelRuntime<B>,
     ) -> Option<ControlledGenerationResult<B, C>> {
-        if self.remaining_tokens == Some(0) {
+        if self.remaining_tokens == Some(0)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
+        {
             self.step = None;
             return None;
         }
@@ -2275,7 +2344,30 @@ where
             Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
         };
         let submission = match step {
-            PendingTextInput::Prefill(prompt) => {
+            PendingTextInput::Prefill(mut prompt) => {
+                if let PrefillChunkPolicy::Bounded(max_tokens) = self.prefill {
+                    loop {
+                        if self
+                            .cancellation
+                            .as_ref()
+                            .is_some_and(crate::GenerationCancellationToken::is_cancelled)
+                        {
+                            return None;
+                        }
+                        match B::prefill_text_prefix(
+                            runtime,
+                            &mut prompt,
+                            max_tokens,
+                            &mut self.backend_state,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => {
+                                return Some(Err(ControlledTextGenerationError::Backend(error)))
+                            }
+                        }
+                    }
+                }
                 B::submit_text_prefill_decision(runtime, prompt, &decision, &mut self.backend_state)
             }
             PendingTextInput::Decode(token) => {
@@ -2587,6 +2679,8 @@ mod tests {
                 model: model.into_inner(),
                 tokens: vec![],
                 distributed: None,
+                prefill_lengths: Vec::new(),
+                cancel_on_prefill: None,
             })
         }
     }
@@ -2818,6 +2912,8 @@ mod tests {
         model: u32,
         tokens: Vec<u32>,
         distributed: Option<MockDistributed>,
+        prefill_lengths: Vec<usize>,
+        cancel_on_prefill: Option<crate::GenerationCancellationToken>,
     }
     impl BackendSession<Mock> for MockSession {
         type PrefillInput = Vec<u32>;
@@ -2832,7 +2928,11 @@ mod tests {
             _: &Mock,
             input: Vec<u32>,
         ) -> Result<Submission<u32, Done>, Infallible> {
+            self.prefill_lengths.push(input.len());
             self.tokens.extend(input);
+            if let Some(cancellation) = &self.cancel_on_prefill {
+                cancellation.cancel();
+            }
             Ok(Submission {
                 output: self.tokens.len() as u32 + self.model,
                 completion: Done,
@@ -2859,6 +2959,21 @@ mod tests {
     }
 
     impl TextGenerationBackend for Mock {
+        fn prefill_text_prefix(
+            runtime: &mut ModelRuntime<Self>,
+            prompt: &mut Self::Prompt,
+            maximum: std::num::NonZeroUsize,
+            _: &mut Self::TextGenerationState,
+        ) -> Result<bool, Self::Error> {
+            if prompt.len() <= maximum.get() {
+                return Ok(false);
+            }
+            let suffix = prompt.split_off(maximum.get());
+            let prefix = std::mem::replace(prompt, suffix);
+            runtime.prefill(prefix)?.completion.wait()?;
+            Ok(true)
+        }
+
         fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
             session.tokens.clear();
             Ok(())
@@ -3123,6 +3238,69 @@ mod tests {
         assert!(prefill.completion.is_complete().unwrap());
         assert_eq!(runtime.decode(3).unwrap().output, 13);
         assert_eq!(runtime.decode(4).unwrap().output, 14);
+    }
+
+    #[test]
+    fn shared_prefill_chunks_preserve_tokens_and_only_sample_the_final_chunk() {
+        for length in [1, 2, 5, 8] {
+            let config = continuation_config(4);
+            let prompt = (0..length)
+                .map(|index| index as u32 + 1)
+                .collect::<Vec<_>>();
+            let mut ordinary_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+            let ordinary = TextGeneration::new(
+                &mut ordinary_runtime,
+                prompt.clone(),
+                config.with_prefill_chunk_policy(PrefillChunkPolicy::Unchunked),
+            )
+            .unwrap()
+            .map(|token| token.unwrap())
+            .collect::<Vec<_>>();
+            let mut chunk_runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+            let chunked = ControlledTextGeneration::new(
+                &mut chunk_runtime,
+                prompt.clone(),
+                config.with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
+                    std::num::NonZeroUsize::new(2).unwrap(),
+                )),
+                FixedTokenFilter(TokenFilter::All),
+            )
+            .unwrap()
+            .map(|token| token.unwrap().token_id())
+            .collect::<Vec<_>>();
+            assert_eq!(ordinary, chunked);
+            assert_eq!(
+                ordinary_runtime.session().tokens,
+                chunk_runtime.session().tokens
+            );
+            assert_eq!(
+                chunk_runtime.session().prefill_lengths,
+                prompt.chunks(2).map(<[u32]>::len).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_a_prefill_chunk_does_not_sample_or_decode() {
+        let cancellation = crate::GenerationCancellationToken::new();
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        runtime.session_mut().cancel_on_prefill = Some(cancellation.clone());
+        let config = continuation_config(4).with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ));
+        let mut generation = ControlledTextGeneration::new(
+            &mut runtime,
+            vec![1, 2, 3, 4, 5],
+            config,
+            FixedTokenFilter(TokenFilter::All),
+        )
+        .unwrap();
+        generation.set_cancellation_token(cancellation);
+        assert!(generation.next().is_none());
+        assert!(generation.next().is_none());
+        drop(generation);
+        assert_eq!(runtime.session().tokens, [1, 2]);
+        assert_eq!(runtime.session().prefill_lengths, [2]);
     }
 
     #[test]
@@ -3538,6 +3716,8 @@ mod tests {
             model: 0,
             tokens: Vec::new(),
             distributed: Some(session.clone()),
+            prefill_lengths: Vec::new(),
+            cancel_on_prefill: None,
         };
         assert_eq!(
             Mock::distributed_session(&model_session)

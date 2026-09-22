@@ -751,6 +751,10 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn supports_chunked_prefill(&self) -> bool {
+        false
+    }
+
     fn prepared_input_plans(
         &self,
         input: input::ModelInput<'_>,

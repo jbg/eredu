@@ -103,12 +103,12 @@ pub use backend::{
     DistributedCommitPhase, DistributedSession, DistributedSessionDescriptor,
     InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PendingTextInput,
-    PreparedModel, SelectedModelPreparation, SessionCapabilities, SessionCapabilityError,
-    SpeculativeTokenFilterController, Submission, TextContinuationBoundary, TextContinuationError,
-    TextContinuationIdentity, TextDriverIdentity, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver, TextSamplingStrategy,
-    TokenFilter, TokenFilterController, TokenFilterError, TokenOutput, TokenSamplingDecision,
-    ValueDescriptor,
+    PrefillChunkPolicy, PreparedModel, SelectedModelPreparation, SessionCapabilities,
+    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextContinuationBoundary,
+    TextContinuationError, TextContinuationIdentity, TextDriverIdentity, TextGeneration,
+    TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver,
+    TextSamplingStrategy, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
+    TokenSamplingDecision, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

@@ -319,6 +319,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         std::mem::swap(&mut self.cursor, &mut branch.cursor);
         std::mem::swap(&mut self.lifecycle, &mut branch.lifecycle);
         std::mem::swap(&mut self.delivery, &mut branch.delivery);
+        self.state
+            .set_cancellation_token(self.delivery.control.cancellation().clone());
         self.lifecycle_record(&mut emit);
         self.delivery_result()
     }

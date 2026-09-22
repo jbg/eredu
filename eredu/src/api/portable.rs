@@ -313,6 +313,12 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {
+    /// Reports whether the selected executable can chunk ordinary plain-text
+    /// prefill. Prepared media, captures and interventions retain a full pass.
+    pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
+        B::text_prefill_chunking_support(&self.runtime)
+    }
+
     /// Settles prior work and clears request state for a fresh request.
     ///
     /// Retains loaded weights, tokenizer, model identity and execution placement.

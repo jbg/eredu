@@ -32,6 +32,13 @@ where
     /// Forms the architecture-owned borrowed input for one text pass.
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a>;
 
+    /// Whether consecutive causal text passes preserve the same state and
+    /// positions as one complete prompt. Families opt in after validating
+    /// incremental state updates, masks, and numerical parity.
+    fn supports_chunked_prefill() -> bool {
+        false
+    }
+
     /// Declares how a causal-text session projects a complete architecture output.
     fn text_output_selection(&self) -> ReplicatedTextOutputSelection {
         ReplicatedTextOutputSelection::LastSequencePosition

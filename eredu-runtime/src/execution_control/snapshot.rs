@@ -178,6 +178,13 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
             reservation: None,
         }
     }
+    /// Associates the active facade run's cancellation token after branch exchange.
+    pub fn set_cancellation_token(
+        &mut self,
+        cancellation: eredu_core::GenerationCancellationToken,
+    ) {
+        self.state.set_cancellation_token(cancellation);
+    }
     /// Advances the installed continuation using the existing ordinary driver.
     #[allow(clippy::type_complexity)]
     pub fn advance(

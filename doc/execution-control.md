@@ -28,6 +28,48 @@ ownership. Arbitrary disconnected low-level Ring memberships remain explicitly
 unsupported for independent status: their world-participation wave would require
 inactive pipeline peers to enter a separate coordinated protocol.
 
+## Prompt prefill
+
+Ordinary and controlled generation share prompt chunking in the core driver.
+`TextGenerationConfig::with_prefill_chunk_policy` and
+`PreparedChatGenerationSettings::prefill` select `PrefillChunkPolicy::Bounded`
+(512 tokens by default) or `Unchunked`. Each nonfinal chunk completes before the
+next begins, advances the model cache without sampling, and retains the original
+prompt identity. Only the final chunk predicts a token. The shared cancellation
+token is checked between completed chunks; cancellation can therefore leave a
+partial prompt cache, with no committed output. Reset the model before starting
+a different request. Chunk boundaries are internal to the first controlled step,
+so snapshots and pause/resume remain at completed-token boundaries.
+
+The MLX adapter enables chunking for ordinary replicated plain-text execution
+through the shared dense decoder architecture (including grouped-query and
+sliding attention). Other architecture drivers retain a complete pass until
+their incremental state semantics have conformance coverage.
+`LoadedModel::prefill_chunking_support()` reports the executable's support or a
+fallback reason. Prepared media/structured inputs, nonempty capture/intervention
+plans, prediction extensions and distributed sessions retain a complete prefill
+pass: their existing coordinates, transaction or publication contracts describe
+one whole prompt. Speculative execution also retains its existing prefill path.
+These are current implementation gaps, not architectural impossibilities. Memory
+estimates for these paths must use the complete prompt. Dense shared decoder
+readout projects only the last hidden position for an unobserved ordinary pass;
+observed and speculative full-output contracts remain unchanged.
+
+The focused native regression runs outside the sandbox:
+
+```sh
+cargo test -p eredu-backend-mlx --features metal --test chunked_prefill --locked -- --test-threads=1
+```
+
+Its nonzero two-layer Llama/Mistral fixtures cover CPU and Metal, grouped-query
+and four-position sliding attention, resident/host-layerwise/disk-streamed weights,
+and affine four-bit loading. Prompts of 1, 3 and 9 tokens use chunk sizes 1, 2, 4
+and 32. Prefill and three cached decode steps agree with full observed logits
+within `2e-4` maximum absolute error; four-token greedy output matches between
+ordinary unchunked and controlled chunked execution. The observed prefill retains
+all vocabulary rows. Portable tests additionally cover cancellation after a
+completed prefix, with no token sampling or commitment.
+
 ## Timing
 
 `ControlledGenerationSession::timing()` and every `ControlledGenerationRecord`

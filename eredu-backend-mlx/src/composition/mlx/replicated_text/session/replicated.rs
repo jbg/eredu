@@ -239,6 +239,46 @@ where
         + 'static,
     P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
+    fn supports_chunked_prefill(&self) -> bool {
+        !P::present() && A::supports_chunked_prefill()
+    }
+
+    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
+        if P::present() {
+            return self.prefill_result_with_observer(
+                Ok(input),
+                None,
+                None,
+                stream,
+                &mut eredu_runtime::NoopObserver,
+            );
+        }
+        let tokens = input::text_token_ids(input, stream)
+            .map(MlxTensor::from_array)
+            .map_err(eredu_nn::Error::backend_source);
+        let input = match tokens {
+            Ok(ref tokens) => Ok(A::text_input(tokens, None)),
+            Err(error) => Err(error),
+        };
+        #[cfg(test)]
+        if input.is_ok() {
+            crate::tests::support::path_instrumentation::forward();
+        }
+        let before = self.session.successful_state_restoration_generation();
+        let output = self
+            .session
+            .prefill_input_final_position(input, stream)
+            .map(MlxTensor::into_array)
+            .map_err(|error| {
+                Error::after_replicated_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
+        Ok(self.published(output))
+    }
+
     fn visit_loaded_parameters(
         &mut self,
         visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,

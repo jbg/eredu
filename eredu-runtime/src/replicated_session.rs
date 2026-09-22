@@ -9,8 +9,8 @@ use std::{
 };
 
 use eredu_core::cache::{
-    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-    PromptCacheOptions, PromptCacheTopology, validate_prompt_cache_model_identity,
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheError,
+    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
@@ -20,6 +20,8 @@ mod prediction;
 pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
 
 use crate::{
+    observe_model_logits, partitioned_replicated_text_materialization_tasks,
+    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
     ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
     ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, PreparedInputCacheIdentity,
@@ -27,8 +29,6 @@ use crate::{
     ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedExpertProvider,
     RoutedLayeredArchitecture, RuntimeState, SelectedReplicatedTextRealization,
     SelectedStateRealization, StateError, SubmissionBackend, WeightLoweringKind,
-    observe_model_logits, partitioned_replicated_text_materialization_tasks,
-    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
 };
 
 use crate::parameter_operations::LayeredParameterOwner;
@@ -366,6 +366,17 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn set_last_text_output_only(&mut self, enabled: bool) {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.set_last_text_output_only(enabled)
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => {
+                runtime.set_last_text_output_only(enabled)
+            }
+        }
+    }
+
     fn with_parameter_slots(
         &mut self,
         location: &crate::parameter_operations::PreparedParameterLocation,
@@ -572,6 +583,10 @@ where
         selected: &SelectedReplicatedTextRealization,
     ) -> ExecutionResidency;
 
+    /// Selects the optional final-position readout optimization for an
+    /// unobserved ordinary pass. Specialized strategies retain full output.
+    fn set_last_text_output_only(_runtime: &mut Self::Runtime, _enabled: bool) {}
+
     /// Executes one complete layered pass through the selected unit strategy.
     #[allow(clippy::too_many_arguments)]
     fn forward_with_observer<'a, O>(
@@ -712,6 +727,10 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn set_last_text_output_only(runtime: &mut Self::Runtime, enabled: bool) {
+        runtime.set_last_text_output_only(enabled);
+    }
+
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
 
     fn visit_loaded_parameters(
@@ -2531,6 +2550,21 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.prefill_input_with_observer(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs ordinary unobserved causal prefill with a final-position readout
+    /// where the architecture implements it. Full-output, capture, prediction,
+    /// and partition contracts continue through their existing entry points.
+    pub fn prefill_input_final_position<'a>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        D::set_last_text_output_only(&mut self.execution, true);
+        let output =
+            self.prefill_input_result_with_observer(input, None, context, &mut crate::NoopObserver);
+        D::set_last_text_output_only(&mut self.execution, false);
+        output
     }
 
     /// Runs one ordinary non-partitioned target pass and atomically retains an additive capture.

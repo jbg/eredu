@@ -954,6 +954,20 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Finishes an unobserved causal-text pass whose consumer needs only the
+    /// final position. Architectures with position-independent readout can
+    /// narrow hidden activations before vocabulary projection. The default
+    /// preserves the full-output implementation for other architectures.
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.finish_forward(hidden, state, forward, context)
+    }
+
     /// Applies the same final readout with architecture-owned internal hooks.
     fn finish_forward_observed<O>(
         &mut self,
@@ -2114,6 +2128,7 @@ where
     architecture: A,
     policy: P,
     executors: Option<Vec<B::OwnedExecutor>>,
+    last_text_output_only: bool,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
@@ -2147,6 +2162,7 @@ where
             architecture,
             policy,
             executors: None,
+            last_text_output_only: false,
             backend: std::marker::PhantomData,
         }
     }
@@ -2156,6 +2172,10 @@ where
     /// borrow the architecture's canonical unit constructor first.
     pub const fn new_policy_first(policy: P, architecture: A) -> Self {
         Self::new(architecture, policy)
+    }
+
+    pub(crate) fn set_last_text_output_only(&mut self, enabled: bool) {
+        self.last_text_output_only = enabled;
     }
 
     /// Borrows the concrete architecture instance.
@@ -3004,7 +3024,10 @@ where
             B::order_after(completion, context)
                 .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         }
-        let output = if hook.observes_activations() {
+        let output = if self.last_text_output_only {
+            self.architecture
+                .finish_text_forward(&hidden, state, &forward_context, context)
+        } else if hook.observes_activations() {
             self.architecture.finish_forward_observed(
                 &hidden,
                 state,

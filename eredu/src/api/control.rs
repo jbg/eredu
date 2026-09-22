@@ -1014,6 +1014,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 TokenChoiceController::new(controller, domain),
             )
             .map_err(TextContinuationError::Generation)?;
+        state.set_cancellation_token(delivery.control.cancellation().clone());
         match prepared.intervention {
             Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
             None => driver.enable_capture(&mut state, prepared.plan)?,

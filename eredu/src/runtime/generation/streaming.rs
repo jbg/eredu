@@ -1258,8 +1258,15 @@ impl CommittedGenerationCursor {
         }
         let token_id = source
             .next_token()
-            .map_err(CommittedGenerationError::Source)?
-            .ok_or(CommittedGenerationError::MissingTerminalToken)?;
+            .map_err(CommittedGenerationError::Source)?;
+        let Some(token_id) = token_id else {
+            if self.sequence.observe_cancellation(cancellation) {
+                pipeline.cancel(emit);
+                self.finish_reason = Some(FinishReason::Cancelled);
+                return Ok(());
+            }
+            return Err(CommittedGenerationError::MissingTerminalToken);
+        };
         let (stop_matched, cancelled_during_delivery) = pipeline
             .push_cancellable(token_id, cancellation, emit)
             .map_err(CommittedGenerationError::Pipeline)?;
@@ -1981,6 +1988,45 @@ mod tests {
                 reason: FinishReason::Cancelled
             }]
         );
+    }
+
+    #[test]
+    fn cancelled_prefill_can_finish_without_a_sampled_token() {
+        struct CancelDuringPrefill(GenerationCancellationToken);
+        impl CommittedTokenSource for CancelDuringPrefill {
+            type Error = Infallible;
+            fn next_token(&mut self) -> Result<Option<u32>, Infallible> {
+                self.0.cancel();
+                Ok(None)
+            }
+            fn grammar_is_complete(&mut self) -> Result<bool, Infallible> {
+                Ok(false)
+            }
+        }
+        let cancellation = GenerationCancellationToken::new();
+        let mut source = CancelDuringPrefill(cancellation.clone());
+        let parser = ToolRuntimeParser::new(
+            Box::new(SyntheticParser::default()),
+            std::iter::empty(),
+            std::iter::empty::<&str>(),
+        );
+        let mut pipeline = CommittedTokenPipeline::new(
+            RawTokenDecoder::new(SyntheticCommittedDecoder, []),
+            parser,
+        );
+        let mut events = Vec::new();
+        let (tokens, reason) = drive_committed_generation_cancellable(
+            &mut source,
+            &mut pipeline,
+            &[],
+            NonZeroUsize::new(4).unwrap(),
+            &cancellation,
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        assert!(tokens.is_empty());
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_exactly_one_finished(&events, FinishReason::Cancelled);
     }
 
     #[test]

@@ -79,6 +79,11 @@ where
         &mut self.inner.controller
     }
 
+    /// Observes the same monotone cancellation request between prefill chunks.
+    pub fn set_cancellation_token(&mut self, cancellation: crate::GenerationCancellationToken) {
+        self.inner.cancellation = Some(cancellation);
+    }
+
     /// Remaining ordinary token allowance, independent of facade EOS policy.
     pub fn remaining_tokens(&self) -> Option<usize> {
         self.inner.remaining_tokens
@@ -376,6 +381,8 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
                 step: pending,
                 completions: Vec::new(),
                 remaining_tokens,
+                prefill: self.state.inner.prefill,
+                cancellation: None,
             },
             failed: false,
             records_drained: true,

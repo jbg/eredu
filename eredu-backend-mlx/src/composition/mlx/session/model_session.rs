@@ -1732,6 +1732,78 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         )
     }
 
+    fn prefill_text_prefix(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: &mut Self::Prompt,
+        max_tokens: std::num::NonZeroUsize,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<bool, Error> {
+        // These contracts currently describe one complete forward operation.
+        // Keep their established observation, media, and agreement semantics.
+        if state.capture.is_some() || Self::text_prefill_chunking_support(runtime).is_err() {
+            return Ok(false);
+        }
+        let [part] = prompt.parts.as_slice() else {
+            return Ok(false);
+        };
+        if part.modality() != InputModality::Text
+            || !part.metadata().is_empty()
+            || !part.extents().is_empty()
+        {
+            return Ok(false);
+        }
+        let input::InputPayload::TokenIds(tokens) = part.payload() else {
+            return Ok(false);
+        };
+        let [_, sequence] = tokens.shape() else {
+            return Ok(false);
+        };
+        if usize::try_from(*sequence).unwrap_or(0) <= max_tokens.get() {
+            return Ok(false);
+        }
+        runtime
+            .session()
+            .validate_parameter_epoch(&mut state.sampling.parameter_epoch)?;
+        let split = i32::try_from(max_tokens.get())
+            .expect("chunk is shorter than the native sequence axis");
+        let (prefix, mut suffix) = super::recovery::detached(Vec::new(), || {
+            let stream = runtime.backend().stream();
+            let prefix = tokens.try_index_device((.., ..split), stream)?;
+            let suffix = tokens.try_index_device((.., split..), stream)?;
+            let make = |tokens| -> Result<MlxModelInput, Error> {
+                Ok(MlxModelInput {
+                    parts: vec![input::token_ids_part(&tokens)?],
+                    cache_identity: None,
+                })
+            };
+            Ok((make(prefix)?, make(suffix)?))
+        })?;
+        let submission = runtime.prefill(prefix)?;
+        submission.completion.wait()?;
+        // The final pass completes the original semantic input. Plain-text
+        // replicated adapters currently key prompt caches by exact token ids,
+        // but retain this identity rather than replacing it with a suffix key.
+        suffix.cache_identity = prompt.cache_identity.clone();
+        *prompt = suffix;
+        Ok(true)
+    }
+
+    fn text_prefill_chunking_support(runtime: &ModelRuntime<Self>) -> Result<(), &'static str> {
+        if runtime.session().distributed().is_some() {
+            Err("distributed execution retains a complete prefill pass")
+        } else if !runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .supports_chunked_prefill()
+        {
+            Err("selected architecture or prediction extension retains a complete prefill pass")
+        } else {
+            Ok(())
+        }
+    }
+
     fn submit_text_prefill_decision(
         runtime: &mut ModelRuntime<Self>,
         prompt: Self::Prompt,

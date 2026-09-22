@@ -145,7 +145,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             .max_new_tokens
             .and_then(NonZeroUsize::new)
             .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
-        let config = eredu_core::TextGenerationConfig::new(resolved).with_seed(settings.seed);
+        let config = eredu_core::TextGenerationConfig::new(resolved)
+            .with_seed(settings.seed)
+            .with_prefill_chunk_policy(settings.prefill);
         let config = match settings.strategy {
             eredu_core::TextSamplingStrategy::Standard => config,
             eredu_core::TextSamplingStrategy::MirostatV2 { tau, eta } => {
@@ -313,6 +315,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             control.controller,
         )
         .map_err(map_controlled_generation_error)?;
+        generator.set_cancellation_token(cancellation.clone());
         let (on_token, delivery_failure, capture_enabled) =
             if let Some((plan, intervention, on_token, delivery_failure)) = capture {
                 let enabled =

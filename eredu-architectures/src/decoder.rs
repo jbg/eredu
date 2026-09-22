@@ -6508,6 +6508,25 @@ where
         self.finish_hidden(hidden, context)
     }
 
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let sequence = hidden.dim(1);
+        let last = hidden.index(
+            &[
+                Index::Full,
+                Index::Range(sequence - 1, sequence),
+                Index::Full,
+            ],
+            context,
+        )?;
+        self.finish_hidden(&last, context)
+    }
+
     fn finish_forward_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -6545,6 +6564,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn supports_chunked_prefill() -> bool {
+        true
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }

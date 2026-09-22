@@ -64,6 +64,7 @@ fn mirostat() -> PreparedChatGenerationSettings {
             ..Default::default()
         },
         seed: 73,
+        prefill: Default::default(),
     }
 }
 
@@ -98,6 +99,7 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
                 ..Default::default()
             },
             seed: 73,
+            prefill: Default::default(),
         };
         let expected = model.resolve_generation_config(settings.overrides).unwrap();
         // The observed path shares the same strategy resolution and constraints.
