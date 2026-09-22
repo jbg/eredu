@@ -44,6 +44,8 @@ pub mod layered;
 pub mod load_request;
 /// Exact mechanism capability synthesis from neutral requirements.
 pub mod mechanism_synthesis;
+/// Request-specific generation-memory estimates and fit advice.
+pub mod memory_estimation;
 /// Architecture-declared parallel parameter semantics and local layouts.
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
