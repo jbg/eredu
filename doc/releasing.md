@@ -16,6 +16,16 @@ use the next patch. Leave unchanged crates at their published version and
 start new crates at `0.1.0`. A binary-only crate can take a patch for internal
 dependency updates when its command-line interface remains compatible.
 
+## Git lineage notices
+
+When retiring an API experiment or rewriting a branch used by consumers, preserve
+the displaced history under a named archive ref and add a dated
+[changelog entry](../CHANGELOG.md) linked from the README. Name the affected public
+APIs, the last previously published branch revision, the immutable archive snapshot,
+the base or replacement lineage, and the pinning or migration path. Distinguish an
+archival checkpoint from a validated release. Publish that notice with the branch
+change so consumers do not have to reconstruct the transition from diffs or reflogs.
+
 ## Automatic planning and LFM2 reply release set for 2026-09-07
 
 The latest stable crates.io versions and checksummed source archives were

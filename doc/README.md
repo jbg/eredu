@@ -4,6 +4,9 @@ This directory contains Eredu's user-facing technical documentation. Most
 applications should start with the [`eredu` crate](../eredu/) and follow the
 relevant model, execution, or platform guide here.
 
+See the [changelog and Git lineage notices](../CHANGELOG.md) for compatibility
+changes, archived APIs and exact revisions for applications pinned to old `main`.
+
 ## Models and applications
 
 - [Model and checkpoint support](model-support.md): supported families,

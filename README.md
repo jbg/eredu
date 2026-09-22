@@ -81,6 +81,8 @@ example application.
 
 ## Documentation
 
+- [Changelog and Git lineage notices](CHANGELOG.md), including the September 22
+  memory-accounting API archive and exact revisions for existing pins.
 - [Documentation index](doc/README.md)
 - [Model and checkpoint support](doc/model-support.md)
 - [Model loading, quantization, and memory](doc/model-loading.md)
