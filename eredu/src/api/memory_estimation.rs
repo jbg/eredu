@@ -160,48 +160,16 @@ pub fn inspected_generation_memory_request(
     let selected = inspection.selected().ok_or_else(|| CapabilityError::Observation("memory estimation requires a valid cold execution selection; inspect model issues for the admission failure".into()))?;
     let execution = selected.preparation().execution();
     let text = execution.text_realization();
-    let geometry = eredu_architectures::memory_estimation::generation_memory_geometry(
+    let geometry = eredu_architectures::memory_estimation::selected_generation_memory_geometry(
         selected.inspection().architecture_plan(),
+        execution,
     )?;
-    let scalar_bytes = text
-        .state()
-        .floating_dtype()
-        .ok_or_else(|| {
-            CapabilityError::Observation("selected floating state dtype is unavailable".into())
-        })?
-        .bytes();
+    let scalar_bytes = geometry.scalar_bytes;
     let resources = &inspection.report().resources;
     let partitioned = execution.parallel_topology().is_some();
     let mut workspace = geometry.workspace;
-    let mut state_layout = geometry.state_layout;
-    if !partitioned {
-        let state = text.state().layout();
-        state_layout = eredu_core::StateMemoryLayout::new(
-            state.layers().clone(),
-            state.layer_prefix_offsets(),
-            state_layout.hidden_size,
-            state_layout.allocation_granularity,
-            state_layout.completeness,
-        )?;
-    } else {
-        // Global state must not become a rank-local lower bound: that could
-        // falsely report a shortfall. Unknown workspace retains incomplete
-        // coverage until local state ownership is projected together.
-        state_layout = eredu_core::StateMemoryLayout::new(
-            eredu_core::LayerSchedule::empty(),
-            Vec::new(),
-            state_layout.hidden_size,
-            1,
-            state_layout.completeness,
-        )?;
-        workspace = None;
-    }
-    if selected.preparation().prediction_realization().is_some()
-        || !matches!(
-            text.state().policy(),
-            eredu_runtime::CacheResidencyPolicy::Device
-        )
-    {
+    let state_layout = geometry.state_layout;
+    if selected.preparation().prediction_realization().is_some() {
         workspace = None;
     }
     let total = if partitioned {

@@ -583,6 +583,9 @@ where
         selected: &SelectedReplicatedTextRealization,
     ) -> ExecutionResidency;
 
+    /// Whether this strategy forwards the optional final-position readout request.
+    const SELECTS_FINAL_TEXT_OUTPUT: bool = false;
+
     /// Selects the optional final-position readout optimization for an
     /// unobserved ordinary pass. Specialized strategies retain full output.
     fn set_last_text_output_only(_runtime: &mut Self::Runtime, _enabled: bool) {}
@@ -727,6 +730,8 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    const SELECTS_FINAL_TEXT_OUTPUT: bool = true;
+
     fn set_last_text_output_only(runtime: &mut Self::Runtime, enabled: bool) {
         runtime.set_last_text_output_only(enabled);
     }

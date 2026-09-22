@@ -751,6 +751,12 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn projects_final_prefill_position(&self) -> bool {
+        false
+    }
+    fn forecast_state_offset(&self) -> Result<Option<i32>, Exception> {
+        Ok(None)
+    }
     fn supports_chunked_prefill(&self) -> bool {
         false
     }

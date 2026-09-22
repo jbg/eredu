@@ -46,6 +46,7 @@ pub mod load_request;
 pub mod mechanism_synthesis;
 /// Request-specific generation-memory estimates and fit advice.
 pub mod memory_estimation;
+pub mod memory_forecast;
 /// Architecture-declared parallel parameter semantics and local layouts.
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.

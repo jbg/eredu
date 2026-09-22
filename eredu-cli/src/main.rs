@@ -2241,7 +2241,6 @@ fn main() -> Result<()> {
             &execution_plan,
             tokens,
             args.max_tokens.map(|n| n as u64),
-            None,
         )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         memory::advise(&args, &report)?;
@@ -2410,19 +2409,32 @@ fn main() -> Result<()> {
     if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
+    let settings = PreparedChatGenerationSettings {
+        prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
+            eredu::api::PrefillChunkPolicy::Unchunked,
+            eredu::api::PrefillChunkPolicy::Bounded,
+        ),
+        overrides: GenerationConfigOverrides {
+            max_new_tokens: Some(max_tokens),
+            ..generation_overrides
+        },
+        seed: args.seed,
+        strategy: if args.mirostat_v2 {
+            eredu::api::TextSamplingStrategy::MirostatV2 {
+                tau: args.mirostat_tau,
+                eta: args.mirostat_eta,
+            }
+        } else {
+            eredu::api::TextSamplingStrategy::Standard
+        },
+    };
     if memory::requested(&args) {
-        let already_resident = model
-            .static_memory()
-            .ok()
-            .and_then(|resident| observed_u64(&resident.current_device_resident_bytes))
-            .unwrap_or(0);
-        match memory::report(
+        match memory::report_loaded(
             &args,
-            &model_path,
-            &execution_plan,
-            prompt_token_ids.len() as u64,
-            Some(max_tokens as u64),
-            Some(already_resident),
+            &model,
+            &prompt_token_ids,
+            settings,
+            drafting.is_enabled(),
         ) {
             Ok(report) => memory::advise(&args, &report)?,
             Err(error) => {
@@ -2473,25 +2485,6 @@ fn main() -> Result<()> {
     let mut prepared_finish_reason = None;
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
-        let settings = PreparedChatGenerationSettings {
-            prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
-                eredu::api::PrefillChunkPolicy::Unchunked,
-                eredu::api::PrefillChunkPolicy::Bounded,
-            ),
-            overrides: GenerationConfigOverrides {
-                max_new_tokens: Some(max_tokens),
-                ..generation_overrides
-            },
-            seed: args.seed,
-            strategy: if args.mirostat_v2 {
-                eredu::api::TextSamplingStrategy::MirostatV2 {
-                    tau: args.mirostat_tau,
-                    eta: args.mirostat_eta,
-                }
-            } else {
-                eredu::api::TextSamplingStrategy::Standard
-            },
-        };
         let mut semantic_error = None;
         if drafting.is_enabled() {
             let cancellation = GenerationCancellationToken::new();

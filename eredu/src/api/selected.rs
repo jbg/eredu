@@ -56,16 +56,10 @@ impl super::GenerationMemoryOptions {
 }
 
 fn local_allocator_overhead(limit: usize, cached: u64) -> super::MemoryBytes {
-    let upper = u64::try_from(limit)
-        .ok()
-        .and_then(|limit| limit.max(cached).checked_add(64 * 1024 * 1024));
-    match upper {
-        Some(upper) => super::MemoryBytes::estimated(0, upper, format!(
-            "point-in-time MLX allocator-cache limit {limit} bytes, retained cache {cached} bytes; allowance uses their maximum plus 64 MiB for graph/driver overhead (planning assumption, not a total-process bound)"
-        )),
-        None => super::MemoryBytes::unknown(
-            "MLX allocator-cache limit plus graph/driver allowance exceeds representable bytes",
-        ),
+    match u64::try_from(limit) {
+        Ok(limit) => eredu_runtime::memory_forecast::ForecastCalibration::default()
+            .allocator_overhead(limit, cached),
+        Err(_) => super::MemoryBytes::unknown("allocator-cache limit exceeds representable bytes"),
     }
 }
 

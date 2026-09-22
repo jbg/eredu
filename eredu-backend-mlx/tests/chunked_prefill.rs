@@ -164,6 +164,16 @@ fn run(device: DeviceType) {
             .unwrap();
             let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
             assert!(MlxBackend::text_prefill_chunking_support(&runtime).is_ok());
+            use eredu_runtime::memory_forecast::GenerationForecastBackend;
+            use eredu_runtime::memory_estimation::LogitsWorkspace;
+            let profile = MlxBackend::loaded_memory_profile(&runtime).unwrap();
+            assert!(profile.geometry.workspace.is_some());
+            let ordinary = MlxBackend::forecast_execution_contract(&runtime, None, false);
+            assert_eq!(ordinary.logits, LogitsWorkspace::FinalPosition);
+            assert!(ordinary.full_pass_reason.is_none());
+            let captured = MlxBackend::forecast_execution_contract(&runtime, None, true);
+            assert_eq!(captured.logits, LogitsWorkspace::EveryPosition);
+            assert!(captured.full_pass_reason.is_some());
             for length in [1, 3, 9] {
                 let ids: Vec<_> = (0..length).map(|i| (i * 7 + 3) % 64).collect();
                 runtime.reset().unwrap();
@@ -186,6 +196,8 @@ fn run(device: DeviceType) {
                     &[1, length as i32, 64]
                 );
                 drop(submission);
+                assert!(MlxBackend::loaded_memory_profile(&runtime).unwrap()
+                    .geometry.workspace.is_none());
                 let mut decode_reference = Vec::new();
                 for token in [5_u32, 8, 13] {
                     let output = runtime
@@ -197,6 +209,8 @@ fn run(device: DeviceType) {
                 }
                 for chunk in [1, 2, 4, 32] {
                     runtime.reset().unwrap();
+                    assert!(MlxBackend::loaded_memory_profile(&runtime).unwrap()
+                        .geometry.workspace.is_some());
                     let mut prompt =
                         MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
                     let identity = prompt.cache_identity().cloned();

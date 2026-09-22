@@ -1,15 +1,17 @@
 //! Application memory advice; estimation never changes backend validity checks.
 use super::*;
 use eredu::api::{
-    inspected_generation_memory_request, AttentionWorkspace, CacheUpdateWorkspace,
-    GenerationMemoryEstimate, GenerationMemoryOptions, GenerationMemoryPlacement, LogitsWorkspace,
-    MemoryBudget, MemoryBytes, MemoryDomain, MemoryFit,
+    forecast_inspected_generation, ForecastCalibration, GenerationForecast,
+    GenerationForecastBackend, GenerationForecastOptions, GenerationMemoryEstimate,
+    GenerationMemoryOptions, GenerationMemoryPlacement, MemoryBudget, MemoryBytes, MemoryDomain,
+    MemoryFit,
 };
 use eredu_runtime::memory_estimation::{estimate_generation_memory, GenerationMemoryRequest};
 
 #[derive(Serialize)]
 pub(super) struct Report {
     pub estimate: GenerationMemoryEstimate,
+    pub execution: eredu::api::ForecastExecutionContract,
     pub requested_chunk_tokens: u64,
     pub effective_chunk_tokens: u64,
     pub reserve_bytes: u64,
@@ -27,7 +29,6 @@ pub(super) fn report(
     plan: &ExecutionPlan,
     input_tokens: u64,
     output_tokens: Option<u64>,
-    already_resident: Option<u64>,
 ) -> Result<Report> {
     let inspection = eredu_backend_mlx::native::inspect_model_preparation(
         path,
@@ -48,32 +49,22 @@ pub(super) fn report(
         }
     };
     let input = eredu_core::InputTokenCount::text(input_tokens);
-    let mut options = if let Some(cache_limit) = args
-        .mlx_cache_limit_bytes
-        .filter(|_| already_resident.is_none())
-    {
+    let mut options = if let Some(cache_limit) = args.mlx_cache_limit_bytes {
         // Cold explicit overrides describe the proposed policy without changing
         // process-global allocator state. Loaded reports sample the actual policy.
         let mut options = GenerationMemoryOptions::new(input, placement);
-        options.backend_overhead = MemoryBytes::estimated(0,
-            cache_limit.checked_add(64 * 1024 * 1024).context("memory overhead arithmetic overflow")?,
-            "proposed MLX allocator-cache limit plus 64 MiB graph/driver planning allowance; uncalibrated outside the documented matrix");
+        options.backend_overhead =
+            ForecastCalibration::default().allocator_overhead(cache_limit, 0);
         options
     } else {
         GenerationMemoryOptions::for_local_backend(input, placement)
     };
     options.max_output_tokens = output_tokens;
-    options.chunked_prefill_supported = true;
     options.prefill_chunk_tokens = if args.prefill_chunk_size == 0 {
         input_tokens
     } else {
         args.prefill_chunk_size as u64
     };
-    // Conservative fallback covers materialized attention as well as kernels that
-    // avoid those matrices. These are planning assumptions, not allocator facts.
-    options.attention = AttentionWorkspace::ScoreMatrixUpperBound;
-    options.cache_update = CacheUpdateWorkspace::CopyState;
-    options.logits = LogitsWorkspace::FinalPosition;
     let host_available = observed_u64(&hardware.available_memory_bytes);
     options.budget = MemoryBudget {
         application_limit_bytes: args.memory_budget_bytes,
@@ -91,19 +82,40 @@ pub(super) fn report(
         reserve_bytes: args.memory_reserve_bytes,
         ..MemoryBudget::default()
     };
-    options.already_resident_bytes = already_resident.unwrap_or(0);
-    let mut request = inspected_generation_memory_request(&inspection, &options)?;
-    apply_execution_assumptions(&mut request, already_resident.is_some())?;
-    let mut estimate = estimate_generation_memory(&request)?;
-    estimate.assumptions.push("Forecast covers model/request payloads and declared backend allowances, not executable/shared-library pages, unrelated requests, or total process footprint. Reserve these separately.".into());
-    if host_available.is_none() {
-        estimate.assumptions.push("Point-in-time available host/unified memory is unavailable; a likely fit against an application budget does not establish current system headroom.".into());
+    let forecast =
+        forecast_inspected_generation(&inspection, &options, &ForecastCalibration::default())?;
+    finish_report(args, forecast)
+}
+
+pub(super) fn report_loaded<B: GenerationForecastBackend>(
+    args: &Cli,
+    model: &LoadedModel<B>,
+    tokens: &[u32],
+    settings: PreparedChatGenerationSettings,
+    speculative: bool,
+) -> Result<Report> {
+    let options = GenerationForecastOptions {
+        budget: MemoryBudget {
+            application_limit_bytes: args.memory_budget_bytes,
+            reserve_bytes: args.memory_reserve_bytes,
+            ..MemoryBudget::default()
+        },
+        host_budget: MemoryBudget {
+            reserve_bytes: args.memory_reserve_bytes,
+            ..MemoryBudget::default()
+        },
+        ..GenerationForecastOptions::default()
+    };
+    let mut forecast = model.forecast_token_ids(tokens, settings, &options)?;
+    if speculative {
+        eredu::api::mark_speculative_forecast(&mut forecast)?;
     }
-    estimate.assumptions.push("CLI uses full float32 score/probability matrices as a conservative attention fallback even when the selected MLX kernel avoids them; shortfall advice can be pessimistic.".into());
-    estimate.assumptions.push(format!("CLI reserve: {} bytes per physical pool; {}.", args.memory_reserve_bytes, options.backend_overhead.detail));
-    if already_resident.is_some() {
-        estimate.assumptions.push("Model already loaded: loading peak is excluded; availability is compared with additional request memory.".into());
-    }
+    finish_report(args, forecast)
+}
+
+fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
+    let request = &forecast.request;
+    let estimate = &forecast.estimate;
     let mut recommendations = Vec::new();
     for domain in &estimate.domains {
         if let Some(phase) = domain.phases.iter().max_by_key(|p| p.total.lower_bytes) {
@@ -122,26 +134,24 @@ pub(super) fn report(
             }
         }
     }
-    if request.prefill_chunk_tokens == options.prefill_chunk_tokens {
+    if forecast.execution.full_pass_reason.is_none() {
         for chunk in [256, 128] {
             if chunk < request.prefill_chunk_tokens {
-                let mut candidate_options = options.clone();
-                candidate_options.prefill_chunk_tokens = chunk;
-                let mut candidate =
-                    inspected_generation_memory_request(&inspection, &candidate_options)?;
-                apply_execution_assumptions(&mut candidate, already_resident.is_some())?;
+                let candidate = forecast.with_prefill_chunk(chunk)?;
                 add_candidate_advice(
-                    &estimate,
-                    &candidate,
+                    estimate,
+                    &candidate.request,
                     &format!("--prefill-chunk-size {chunk}"),
                     &mut recommendations,
                 )?;
             }
         }
-    } else {
-        recommendations.push("Selected execution preserves a full prefill pass; changing chunk size provides no estimated saving on this path.".into());
+    } else if let Some(reason) = &forecast.execution.full_pass_reason {
+        recommendations.push(format!(
+            "Full prefill pass: {reason}; smaller chunks provide no estimated saving."
+        ));
     }
-    if let Some(output) = output_tokens.filter(|n| *n > 1) {
+    if let Some(output) = request.max_output_tokens.filter(|n| *n > 1) {
         let mut candidate = request.clone();
         candidate.max_output_tokens = Some(output / 2);
         add_candidate_advice(
@@ -155,8 +165,9 @@ pub(super) fn report(
         recommendations.push("When parameters dominate, inspect a supported quantization or residency plan separately; conversion and transfer costs can change the peak.".into());
     }
     let report = Report {
-        estimate,
-        requested_chunk_tokens: options.prefill_chunk_tokens,
+        estimate: estimate.clone(),
+        execution: forecast.execution.clone(),
+        requested_chunk_tokens: forecast.requested_chunk_tokens,
         effective_chunk_tokens: request.prefill_chunk_tokens,
         reserve_bytes: args.memory_reserve_bytes,
         capacity_comparisons: request
@@ -171,26 +182,6 @@ pub(super) fn report(
             .with_context(|| format!("failed to write memory report {}", path.display()))?;
     }
     Ok(report)
-}
-
-fn apply_execution_assumptions(request: &mut GenerationMemoryRequest, loaded: bool) -> Result<()> {
-    for domain in &mut request.domains {
-        if loaded {
-            domain.loading_peak = MemoryBytes::exact(0);
-        }
-        for execution in &mut domain.executions {
-            let layers = u64::try_from(execution.state_layout.layer_layout().len())?;
-            let upper = layers
-                .checked_add(layers.div_ceil(4))
-                .context("memory workspace overlap arithmetic overflow")?
-                .max(1);
-            execution.workspace_overlap = eredu::api::WorkspaceOverlap {
-                upper_live_copies: Some(upper),
-                detail: "CLI lazy-graph planning envelope: one linear activation set per local state layer plus 25% scratch margin; calibrated on SmolLM-135M Metal original/4-bit, not a universal bound".into(),
-            };
-        }
-    }
-    Ok(())
 }
 
 fn add_candidate_advice(

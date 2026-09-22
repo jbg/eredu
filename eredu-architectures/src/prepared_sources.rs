@@ -108,6 +108,7 @@ pub struct PreparedModelSourceGraph {
 /// Retained discovery declarations; content hashing happens only on discovery demand.
 #[derive(Debug, Clone)]
 pub struct PreparedModelDiscovery {
+    generation_memory: Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, String>,
     identity: DeferredArtifactIdentity,
     execution_identity: String,
     descriptor: eredu_core::ArchitectureDescriptor,
@@ -129,6 +130,14 @@ struct PreparedPredictionDiscovery {
 }
 
 impl PreparedModelDiscovery {
+    /// Retained selected geometry for loaded request forecasts; never resolves source identity.
+    pub fn generation_memory(
+        &self,
+    ) -> Result<&eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError> {
+        self.generation_memory
+            .as_ref()
+            .map_err(|reason| eredu_core::CapabilityError::Observation(reason.clone()))
+    }
     /// Retains hook facts projected from the actual constructed executor and
     /// architecture. Backend collectors cannot infer these from parameter shapes.
     pub fn bind_partition_observation_hooks(
@@ -584,6 +593,17 @@ impl PreparedModelSources {
         );
         support.capture = capture;
         PreparedModelDiscovery {
+            generation_memory: crate::memory_estimation::selected_generation_memory_geometry(
+                self.architecture(),
+                self.selected().execution(),
+            )
+            .map(|mut geometry| {
+                if self.prediction_extension().is_some() {
+                    geometry.workspace = None;
+                }
+                geometry
+            })
+            .map_err(|error| error.to_string()),
             identity: self.graph.source_identity().clone(),
             execution_identity: self.execution_identity().to_owned(),
             descriptor,

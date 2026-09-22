@@ -1018,3 +1018,19 @@ peers advance again. Already agreed failed steps do not submit another exit vote
 These agreements coordinate progress and failure; native completion ownership
 remains with the retained completion resources. Distributed callers still invoke
 snapshot, exchange and prospective edit operations in the same order.
+
+### Prepared-request memory forecasts
+
+`LoadedModel::forecast_prepared_generation` forecasts the same prepared request
+used by ordinary or controlled startup. `forecast_observed_generation` accepts
+`PreparedObservedGeneration`, verifies its session identity and uses its resolved
+settings and capture/intervention contract. Trace-only preparations retain ordinary
+chunking and final-row projection when the executor supports them. Instrumented
+prefill uses a full pass and all-row logits; unprojected native capture transforms
+and retained host records leave its upper bound unknown. Speculative forecasts
+likewise disclose the missing concurrent draft/verification resource projection.
+These are memory-accounting gaps, not execution capability rejections. Forecasts
+do not consume preparation, state, callbacks, capture budgets or submission
+authority. Forecast before startup from fresh/reset state; forecasting an already
+advanced continuation requires a current-state projection, which the MLX adapter
+currently reports as unbounded. See [generation memory](generation-memory.md).

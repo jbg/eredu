@@ -40,6 +40,8 @@ pub use controlled_speculative::*;
 mod inspection;
 mod memory_estimation;
 pub use memory_estimation::*;
+mod forecast;
+pub use forecast::*;
 mod loaded;
 mod observed;
 mod parameters;

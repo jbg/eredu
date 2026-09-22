@@ -28,6 +28,60 @@ fn dimension(value: i32) -> Result<u64, CapabilityError> {
         })
 }
 
+/// Projects the exact selected state geometry and retains explicit coverage gaps.
+pub fn selected_generation_memory_geometry(
+    plan: &ArtifactArchitecturePlan,
+    execution: &crate::SelectedExecution,
+) -> Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, CapabilityError> {
+    let mut geometry = generation_memory_geometry(plan)?;
+    let text = execution.text_realization();
+    if execution.parallel_topology().is_some() {
+        geometry.state_layout = eredu_core::StateMemoryLayout::new(
+            eredu_core::LayerSchedule::empty(),
+            Vec::new(),
+            geometry.state_layout.hidden_size,
+            1,
+            geometry.state_layout.completeness,
+        )?;
+        geometry.workspace = None;
+        geometry
+            .assumptions
+            .push("rank-local state and workspace projection unavailable".into());
+    } else {
+        let state = text.state().layout();
+        geometry.state_layout = eredu_core::StateMemoryLayout::new(
+            state.layers().clone(),
+            state.layer_prefix_offsets(),
+            geometry.state_layout.hidden_size,
+            geometry.state_layout.allocation_granularity,
+            geometry.state_layout.completeness,
+        )?;
+    }
+    if !matches!(
+        text.state().policy(),
+        eredu_runtime::CacheResidencyPolicy::Device
+    ) || !execution.bounded_residency_exclusions().is_empty()
+    {
+        geometry.workspace = None;
+    }
+    Ok(eredu_runtime::memory_forecast::LoadedMemoryGeometry {
+        state_layout: geometry.state_layout,
+        workspace: geometry.workspace,
+        scalar_bytes: text
+            .state()
+            .floating_dtype()
+            .ok_or_else(|| {
+                CapabilityError::Observation("selected floating state dtype unavailable".into())
+            })?
+            .bytes(),
+        fully_resident: matches!(
+            text.residency(),
+            eredu_runtime::LayerWeightResidency::FullyResident
+        ),
+        assumptions: geometry.assumptions,
+    })
+}
+
 fn dense(
     hidden: i32,
     intermediate: i32,

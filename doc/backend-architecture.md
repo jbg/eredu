@@ -6359,8 +6359,18 @@ native backend still establishes completion before releasing native resources.
 Architecture-owned memory projections describe workspace geometry using the
 normalized family configuration and exact state schedule. Runtime owns checked
 phase-overlap estimates, physical-capacity comparisons and candidate recomputation.
-The facade composes cold selected resources with explicit backend mechanism and
-overhead assumptions; the CLI owns warning/refusal policy. Unknown workspace or
+Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
+cache-copy overlap, layer workspace multiplier and graph allowance. Architecture
+preparation retains selected state/workspace geometry in `PreparedModelDiscovery`.
+The neutral `GenerationForecastBackend` supplies loaded residency, allocator and
+capacity observations plus the actual prompt/instrumentation execution contract.
+The MLX adapter derives final-row projection from architecture and execution-strategy
+capabilities, shares prompt eligibility with the prefix executor, and leaves existing
+unprojected mutable state unknown. It does not reconstruct family semantics.
+The facade's prepared-request forecast combines these facts with resolved generation
+settings, token counts and application budgets without reopening artifacts or
+submitting inference. Observed ordinary and controlled preparations share the same
+forecast path. The CLI consumes the facade and owns warning/refusal policy. Unknown workspace or
 overhead affects advice, never execution authorization. No allocation ledger or
 new funding protocol is involved. See [generation memory](generation-memory.md).
 

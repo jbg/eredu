@@ -41,7 +41,7 @@ admission; a forecast horizon can extend beyond the configured context limit.
 pool; it differs from the existing parameter-cache device/host budgets. Observed
 available capacity is compared with **additional** request memory after subtracting
 the declared resident portion. `--memory-reserve-bytes` defaults to 256 MiB per
-physical pool for other work and uncertainty. CLI overhead uses an explicit
+physical pool for other work and uncertainty. Shared library overhead uses an explicit
 0–64 MiB graph/driver planning interval plus the configured allocator-cache
 limit, separately from this reserve. Without `--mlx-cache-limit-bytes`, reports
 query the allocator's actual current limit. The allowance uses the larger of
@@ -85,6 +85,57 @@ workspace coverage is explicit rather than silently assigned zero.
 
 ## API and ownership
 
+Prefer `LoadedModel::forecast_prepared_generation(&request, &options)` for a
+prepared ordinary request. It derives encoded input positions, checkpoint-resolved
+output limits, prefill eligibility, the actual logits projection contract, selected
+state geometry, parameter residency, available capacity and allocator policy.
+It borrows the request without executing callbacks, advancing state or reopening
+checkpoint files:
+
+```rust,ignore
+use eredu::api::{GenerationForecastOptions, MemoryBudget};
+
+let options = GenerationForecastOptions {
+    budget: MemoryBudget {
+        application_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+        reserve_bytes: 256 * 1024 * 1024,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+let forecast = model.forecast_prepared_generation(&request, &options)?;
+println!("{:?}", forecast.estimate.fit);
+// Pass the same request to ordinary generation or controlled startup.
+```
+
+`forecast_token_ids` supports already encoded requests with the same prepared
+settings. `forecast_observed_generation` consumes the preparation shared by
+observed ordinary and controlled execution: trace-only requests preserve ordinary
+chunking, while capture/intervention requests report their full-pass reason and
+all-row logits contract. Capture transformations and retained records leave the
+upper bound unknown. `forecast_prepared_speculative_generation` similarly leaves
+concurrent draft and verification storage explicitly unbounded.
+
+`GenerationForecast` contains the estimate, descriptive request, full-pass reason
+and logits contract. `with_prefill_chunk` recomputes a candidate only when the
+request supports chunking; it preserves full-pass requirements. Loaded forecasts
+exclude completed loading and deduct only declared resident parameter backing
+from additional memory, never the process-global active allocator counter. Fresh
+requests should start from reset state. The MLX adapter detects nonempty or
+unavailable state and leaves its continuation peak unbounded rather than silently
+forecasting an empty cache. Prepared media, bounded transfers and unprojected
+families likewise retain explicit unknowns.
+
+`ForecastCalibration::default()` is the single library-owned source for the
+score-matrix fallback, copy-state cache update, one-set-per-layer plus 25 percent
+scratch envelope, and 64 MiB graph/driver allowance. Loaded forecasts apply it
+and sample the allocator's current limit automatically. Applications can override
+individual calibration fields or `backend_overhead`; budget, reserve and
+warning/refusal decisions remain application policy. The CLI uses these same
+facade calls. `forecast_inspected_generation` applies the same calibration to
+cold selected geometry; its prefill contract describes the modeled ordinary text
+paths, before a native executor exists.
+
 `eredu::api::estimate_inspected_generation_memory` consumes a retained cold
 `ModelInspectionOutcome` and `GenerationMemoryOptions`.
 `inspect_generation_memory` combines metadata inspection and estimation using
@@ -97,7 +148,8 @@ placement)` samples the current cache limit and retained bytes and defaults
 `backend_overhead` to their maximum plus the 64 MiB graph/driver planning allowance.
 This is an estimated allowance, not a measured upper bound on all graph or driver
 allocations. Callers can override `backend_overhead` with their own calibration;
-attention, cache-update and graph-overlap mechanisms still need explicit coverage.
+the lower-level estimator requires explicit attention, cache-update and graph-overlap
+coverage, while `forecast_inspected_generation` supplies the shared calibration.
 The generic `GenerationMemoryOptions::new` remains backend-neutral and leaves
 native overhead unknown. Local policy sampling can initialize the native allocator;
 the subsequent cold inspection and estimation remain free of native queries.
@@ -137,11 +189,11 @@ Dense workspace currently models residuals, Q/K/V, gated feed-forward arrays,
 logits/probabilities, selected attention scratch and cache-update overlap. Ordinary
 shared dense readout projects only the last hidden row in each chunk, including
 the full-prompt case; observed full-logit contracts retain all rows. The
-CLI conservatively assumes float32 score/probability matrices even when MLX
+shared calibration conservatively assumes float32 score/probability matrices even when MLX
 selects a fused kernel, and a whole extra state payload during cache replacement.
 Attention contributes an interval from zero to that score-matrix envelope, so
 a budget crossed only by its upper end yields insufficient information. The
-CLI linear-workspace upper envelope permits one activation set per local state
+shared calibration linear-workspace upper envelope permits one activation set per local state
 layer plus 25% scratch margin, calibrated against the small Metal matrix below.
 The lower end models one set. This accounts coarsely for lazy graph retention;
 it does not assert exact tensor lifetimes and is uncalibrated on other models
@@ -243,6 +295,18 @@ calibrations remain open. CUDA validation was explicitly deferred. The native
 fixture checks and portable domain tests do not establish those native results.
 
 ## Focused verification
+
+- Prepared-request facade forecasts are covered with a neutral mock backend:
+  exact request settings, resident-byte deduction independent of allocator activity,
+  calibration overrides, chunk recomputation, trace-only controlled parity,
+  capture uncertainty and foreign-session rejection. Native CPU/Metal tests compare
+  declared final-row/full-logit contracts with actual output shapes and check that
+  reset restores fresh-request forecast coverage.
+- The loaded CLI smoke test on the pinned SmolLM checkpoint used `--no-auto --raw
+  --max-tokens 4 --mlx-cache-limit-bytes 0 --memory-report report.json Hello`.
+  It reported `LikelyFit`, resident parameters of 538,060,032 bytes, a generation
+  upper of 607,219,820 bytes and additional upper of 69,159,788 bytes. The loaded
+  lifecycle upper equaled the generation upper, excluding completed loading.
 
 - Cache-policy follow-up: native getter/setter/restore tests passed on CPU and
   Metal, including a native C setter bypassing the Rust wrapper and repeated

@@ -6508,6 +6508,10 @@ where
         self.finish_hidden(hidden, context)
     }
 
+    fn projects_final_text_position() -> bool {
+        true
+    }
+
     fn finish_text_forward(
         &mut self,
         hidden: &B::Tensor,

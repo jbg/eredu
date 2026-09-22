@@ -71,6 +71,8 @@ mod control;
 mod controlled_speculative;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
+#[path = "backend_conformance/forecast.rs"]
+mod forecast;
 #[path = "backend_conformance/preparation.rs"]
 mod preparation;
 #[path = "backend_conformance/templates.rs"]

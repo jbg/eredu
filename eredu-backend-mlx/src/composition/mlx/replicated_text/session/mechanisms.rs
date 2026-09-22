@@ -47,6 +47,7 @@ pub(in crate::composition::mlx::replicated_text) struct MlxExecutionReport {
 }
 
 pub(in crate::composition::mlx::replicated_text) struct MlxStateReport {
+    pub(super) offset: i32,
     pub(super) residency: Option<CacheResidencyReport>,
     #[cfg(test)]
     pub(super) presence: StatePresenceSnapshot,
@@ -688,6 +689,7 @@ where
 
     fn state_report(&self, state: &S) -> Result<Self::StateReport, Error> {
         Ok(MlxStateReport {
+            offset: state.offset(),
             residency: state.residency_report()?,
             #[cfg(test)]
             presence: S::state_snapshot(state),

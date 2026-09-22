@@ -954,6 +954,11 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Whether `finish_text_forward` projects only the final hidden position.
+    fn projects_final_text_position() -> bool {
+        false
+    }
+
     /// Finishes an unobserved causal-text pass whose consumer needs only the
     /// final position. Architectures with position-independent readout can
     /// narrow hidden activations before vocabulary projection. The default

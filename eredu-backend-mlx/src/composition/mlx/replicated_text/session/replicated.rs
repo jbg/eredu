@@ -243,6 +243,17 @@ where
         !P::present() && A::supports_chunked_prefill()
     }
 
+    fn projects_final_prefill_position(&self) -> bool {
+        !P::present() && D::SELECTS_FINAL_TEXT_OUTPUT && A::projects_final_text_position()
+    }
+
+    fn forecast_state_offset(&self) -> Result<Option<i32>, Exception> {
+        self.session
+            .report()
+            .map(|report| Some(report.state_report().offset))
+            .map_err(Exception::from_source)
+    }
+
     fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
         if P::present() {
             return self.prefill_result_with_observer(

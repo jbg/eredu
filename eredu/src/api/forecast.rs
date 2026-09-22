@@ -1,0 +1,402 @@
+//! Request-aware forecasts shared by ordinary and controlled generation.
+use super::*;
+use eredu_core::{CapabilityError, InputTokenCount, Observed, PhysicalMemorySemantics};
+use eredu_runtime::memory_forecast::LoadedMemoryProfile;
+pub use eredu_runtime::memory_forecast::{
+    ForecastCalibration, ForecastExecutionContract, GenerationForecastBackend,
+    GenerationForecastError,
+};
+use serde::{Deserialize, Serialize};
+
+/// Application comparisons and optional calibration overrides. Missing available
+/// bytes are filled from backend observations, never from installed capacity.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationForecastOptions {
+    /// Execution-pool budget and reserve.
+    pub budget: MemoryBudget,
+    /// Independent host budget for a discrete accelerator.
+    pub host_budget: MemoryBudget,
+    /// Overrides the observed allocator plus graph/driver allowance.
+    pub backend_overhead: Option<MemoryBytes>,
+    /// Shared, labeled planning assumptions.
+    pub calibration: ForecastCalibration,
+}
+
+/// Estimate plus the exact descriptive request and execution contract used for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationForecast {
+    /// Computed interval and fit verdict.
+    pub estimate: GenerationMemoryEstimate,
+    /// Descriptive request for recomputation and inspection.
+    pub request: GenerationMemoryRequest,
+    /// Actual full-pass and vocabulary projection contract.
+    pub execution: ForecastExecutionContract,
+    /// Requested maximum positions per prefill invocation.
+    pub requested_chunk_tokens: u64,
+}
+
+impl GenerationForecast {
+    /// Recomputes a chunk alternative only when the actual request can be chunked.
+    pub fn with_prefill_chunk(&self, tokens: u64) -> Result<Self, GenerationForecastError> {
+        if tokens == 0 {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "prefill_chunk_tokens",
+                detail: "expected a positive chunk size".into(),
+            }
+            .into());
+        }
+        let mut candidate = self.clone();
+        candidate.requested_chunk_tokens = tokens;
+        if candidate.execution.full_pass_reason.is_none() {
+            candidate.request.prefill_chunk_tokens = tokens;
+        }
+        candidate.reestimate()?;
+        Ok(candidate)
+    }
+
+    fn reestimate(&mut self) -> Result<(), GenerationForecastError> {
+        let mut estimate =
+            eredu_runtime::memory_estimation::estimate_generation_memory(&self.request)?;
+        for assumption in &self.estimate.assumptions {
+            if !estimate.assumptions.contains(assumption) {
+                estimate.assumptions.push(assumption.clone());
+            }
+        }
+        self.estimate = estimate;
+        Ok(())
+    }
+}
+
+fn observed(value: &Observed<u64>) -> Option<u64> {
+    value.value().copied()
+}
+fn failure(error: impl std::fmt::Display) -> GenerationForecastError {
+    CapabilityError::Observation(error.to_string()).into()
+}
+fn chunk_tokens(policy: eredu_core::PrefillChunkPolicy, positions: u64) -> u64 {
+    match policy {
+        eredu_core::PrefillChunkPolicy::Unchunked => positions.max(1),
+        eredu_core::PrefillChunkPolicy::Bounded(n) => n.get() as u64,
+    }
+}
+
+impl<B: GenerationForecastBackend> LoadedModel<B> {
+    /// Forecasts the exact ordinary prepared request without consuming it,
+    /// advancing state, invoking callbacks, or reopening its checkpoint.
+    /// Start from fresh/reset state; backends must leave continuation peaks
+    /// unbounded unless they project the existing state as well.
+    pub fn forecast_prepared_generation<F>(
+        &self,
+        request: &PreparedChatGenerationRequest<'_, B, F>,
+        options: &GenerationForecastOptions,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        self.forecast_input(&request.input, request.settings, options, false)
+    }
+
+    /// Forecasts a speculative prepared request. Draft/verification storage is
+    /// explicitly unbounded until its concurrent state has a resource projection.
+    pub fn forecast_prepared_speculative_generation<D, F>(
+        &self,
+        request: &PreparedChatSpeculativeGenerationRequest<'_, B, D, F>,
+        options: &GenerationForecastOptions,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        let mut forecast = self.forecast_input(&request.input, request.settings, options, false)?;
+        mark_specialized(
+            &mut forecast,
+            "speculative draft and verification state overlap is not projected",
+        )?;
+        Ok(forecast)
+    }
+
+    fn forecast_input(
+        &self,
+        input: &PreparedChatInput<'_, B>,
+        settings: PreparedChatGenerationSettings,
+        options: &GenerationForecastOptions,
+        instrumented: bool,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        let count = match input {
+            PreparedChatInput::RenderedPrompt(chat) => self.count_prepared_chat(chat)?,
+            PreparedChatInput::TokenIds { token_ids, .. } => self.count_token_ids(token_ids)?,
+            PreparedChatInput::PreparedBackendInput { prompt, .. } => {
+                self.count_prepared_input(prompt)?
+            }
+        };
+        self.forecast_count(
+            count,
+            input.backend_prompt(),
+            settings,
+            options,
+            instrumented,
+        )
+    }
+
+    /// Forecasts an encoded ordinary request using checkpoint-resolved output
+    /// limits and the same settings as ordinary or controlled generation.
+    pub fn forecast_token_ids(
+        &self,
+        token_ids: &[u32],
+        settings: PreparedChatGenerationSettings,
+        options: &GenerationForecastOptions,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        self.forecast_count(
+            self.count_token_ids(token_ids)?,
+            None,
+            settings,
+            options,
+            false,
+        )
+    }
+
+    /// Forecasts a prepared observed request before uninterrupted execution or
+    /// `start_controlled_*`. Trace-only requests preserve ordinary chunking.
+    pub fn forecast_observed_generation(
+        &self,
+        prepared: &PreparedObservedGeneration,
+        options: &GenerationForecastOptions,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        if prepared.session_identity != self.session_identity {
+            return Err(failure(
+                "prepared forecast request belongs to a different loaded session",
+            ));
+        }
+        let instrumented = !prepared.plan.is_empty() || prepared.intervention.is_some();
+        let mut result = self.forecast_count(
+            self.count_token_ids(&prepared.prompt_token_ids)?,
+            None,
+            prepared.settings,
+            options,
+            instrumented,
+        )?;
+        if instrumented {
+            // Logits and full-pass contracts are known; capture transforms and
+            // retained host records still need a native peak-memory projection.
+            for domain in &mut result.request.domains {
+                domain.retained_input = MemoryBytes::unknown(
+                    "capture/intervention transform and retained-record peak is not projected",
+                );
+            }
+            result.reestimate()?;
+        }
+        Ok(result)
+    }
+
+    fn forecast_count(
+        &self,
+        input: InputTokenCount,
+        prompt: Option<&B::Prompt>,
+        settings: PreparedChatGenerationSettings,
+        options: &GenerationForecastOptions,
+        instrumented: bool,
+    ) -> Result<GenerationForecast, GenerationForecastError> {
+        let (_, output) = self.resolve_text_generation_settings(settings)?;
+        let profile = B::loaded_memory_profile(&self.runtime)?;
+        let contract = B::forecast_execution_contract(&self.runtime, prompt, instrumented);
+        loaded_forecast(
+            profile,
+            input,
+            output.get() as u64,
+            settings.prefill,
+            contract,
+            options,
+        )
+    }
+}
+
+/// Marks a target-only forecast incomplete when concurrent speculative resources
+/// have not been projected. Used by planned raw-token consumers as well.
+pub fn mark_speculative_forecast(
+    forecast: &mut GenerationForecast,
+) -> Result<(), GenerationForecastError> {
+    mark_specialized(
+        forecast,
+        "speculative draft and verification state overlap is not projected",
+    )
+}
+
+fn mark_specialized(
+    forecast: &mut GenerationForecast,
+    reason: &str,
+) -> Result<(), GenerationForecastError> {
+    forecast.execution.full_pass_reason = Some(reason.into());
+    forecast.execution.logits = LogitsWorkspace::EveryPosition;
+    forecast.request.prefill_chunk_tokens = forecast.request.input.model_positions.max(1);
+    for domain in &mut forecast.request.domains {
+        domain.staging = MemoryBytes::unknown(reason);
+        for execution in &mut domain.executions {
+            execution.logits = LogitsWorkspace::EveryPosition;
+        }
+    }
+    forecast.reestimate()?;
+    Ok(())
+}
+
+fn loaded_forecast(
+    mut profile: LoadedMemoryProfile,
+    input: InputTokenCount,
+    output: u64,
+    prefill: eredu_core::PrefillChunkPolicy,
+    contract: ForecastExecutionContract,
+    options: &GenerationForecastOptions,
+) -> Result<GenerationForecast, GenerationForecastError> {
+    if profile.host_execution {
+        profile.parameters.physical_semantics = PhysicalMemorySemantics::Unified;
+    }
+    let placements =
+        eredu_runtime::memory_estimation::static_parameter_placement(&profile.parameters, None)?;
+    let geometry = profile.geometry;
+    let overhead = options.backend_overhead.clone().unwrap_or_else(|| {
+        match (
+            observed(&profile.allocator_cache_limit),
+            observed(&profile.parameters.backend_allocator_cache_bytes),
+        ) {
+            (Some(limit), Some(retained)) => {
+                options.calibration.allocator_overhead(limit, retained)
+            }
+            _ => MemoryBytes::unknown("current allocator cache limit or retention unavailable"),
+        }
+    });
+    let mut domains = Vec::new();
+    let separate = profile.parameters.physical_semantics == PhysicalMemorySemantics::SeparateTiers;
+    for (mut domain, mut parameters) in placements {
+        let executes = !separate || matches!(domain, MemoryDomain::Device(_));
+        if profile.host_execution {
+            domain = MemoryDomain::Host;
+        }
+        let already_resident_bytes = parameters.lower_bytes;
+        if !geometry.fully_resident {
+            parameters.upper_bytes = observed(&profile.parameters.logical_parameter_bytes)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .map(|n| n.max(parameters.lower_bytes));
+            parameters.detail =
+                "current residency through possible host/device parameter copies".into();
+        }
+        let mut budget = if executes {
+            options.budget.clone()
+        } else {
+            options.host_budget.clone()
+        };
+        if budget.available_bytes.is_none() && (!separate || !executes) {
+            budget.available_bytes = observed(&profile.available.available_memory_bytes);
+        }
+        let retained_input = if input.model_positions != input.text_tokens {
+            MemoryBytes::unknown(
+                "prepared media retention and transformations are not fully projected",
+            )
+        } else {
+            MemoryBytes::exact(input.text_tokens.checked_mul(4).ok_or(
+                CapabilityError::ArithmeticOverflow {
+                    operation: "retained prompt bytes",
+                },
+            )?)
+        };
+        domains.push(DomainMemoryPlan {
+            domain,
+            resident_parameters: parameters,
+            already_resident_bytes,
+            retained_input,
+            staging: if geometry.fully_resident {
+                MemoryBytes::exact(0)
+            } else {
+                MemoryBytes::unknown("bounded transfer and materialization overlap")
+            },
+            backend_overhead: if executes {
+                overhead.clone()
+            } else {
+                MemoryBytes::exact(0)
+            },
+            loading_peak: MemoryBytes::exact(0),
+            executions: if executes {
+                vec![ExecutionMemoryPlan {
+                    state_layout: geometry.state_layout.clone(),
+                    workspace: geometry.workspace.clone(),
+                    attention: AttentionWorkspace::Unknown,
+                    cache_update: CacheUpdateWorkspace::Unknown,
+                    logits: contract.logits,
+                    workspace_overlap: WorkspaceOverlap::unknown(),
+                }]
+            } else {
+                vec![]
+            },
+            budget,
+        });
+    }
+    let requested_chunk_tokens = chunk_tokens(prefill, input.model_positions);
+    let mut request = GenerationMemoryRequest {
+        input,
+        max_output_tokens: Some(output),
+        forecast_output_tokens: output,
+        batch_size: 1,
+        prefill_chunk_tokens: if contract.full_pass_reason.is_some() {
+            input.model_positions.max(1)
+        } else {
+            requested_chunk_tokens
+        },
+        scalar_bytes: geometry.scalar_bytes,
+        domains,
+    };
+    options.calibration.apply(&mut request)?;
+    let mut estimate = eredu_runtime::memory_estimation::estimate_generation_memory(&request)?;
+    estimate.assumptions.extend(geometry.assumptions);
+    estimate.assumptions.push("Loaded request: loading is excluded; only declared resident parameter bytes are deducted, never process-global active allocation counters.".into());
+    Ok(GenerationForecast {
+        request,
+        estimate,
+        execution: contract,
+        requested_chunk_tokens,
+    })
+}
+
+/// Forecasts retained cold selection with the library's shared calibration.
+pub fn forecast_inspected_generation(
+    inspection: &eredu_architectures::ModelInspectionOutcome,
+    options: &GenerationMemoryOptions,
+    calibration: &ForecastCalibration,
+) -> Result<GenerationForecast, GenerationForecastError> {
+    let mut options = options.clone();
+    options.chunked_prefill_supported = true;
+    let mut request = inspected_generation_memory_request(inspection, &options)?;
+    let selected = inspection
+        .selected()
+        .ok_or_else(|| failure("cold execution selection unavailable"))?;
+    let supported = request
+        .domains
+        .iter()
+        .flat_map(|d| &d.executions)
+        .all(|e| e.workspace.is_some())
+        && selected.preparation().prediction_realization().is_none()
+        && selected
+            .preparation()
+            .execution()
+            .parallel_topology()
+            .is_none()
+        && options.input.model_positions == options.input.text_tokens;
+    let execution = ForecastExecutionContract {
+        full_pass_reason: (!supported)
+            .then(|| "selected execution or input lacks a modeled bounded-prefill contract".into()),
+        logits: if supported {
+            LogitsWorkspace::FinalPosition
+        } else {
+            LogitsWorkspace::EveryPosition
+        },
+    };
+    for domain in &mut request.domains {
+        for e in &mut domain.executions {
+            e.logits = execution.logits;
+        }
+    }
+    calibration.apply(&mut request)?;
+    let mut estimate = eredu_runtime::memory_estimation::estimate_generation_memory(&request)?;
+    estimate.assumptions.extend(
+        eredu_architectures::memory_estimation::generation_memory_geometry(
+            selected.inspection().architecture_plan(),
+        )?
+        .assumptions,
+    );
+    Ok(GenerationForecast {
+        request,
+        estimate,
+        execution,
+        requested_chunk_tokens: options.prefill_chunk_tokens,
+    })
+}

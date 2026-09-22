@@ -1,5 +1,6 @@
 use super::*;
 
+mod memory_forecast;
 mod partition_capture;
 mod speculative_capture;
 pub(in crate::composition::mlx) use speculative_capture::SpeculativePartitionBinding;
@@ -348,6 +349,24 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
 }
 
 impl MlxModelInput {
+    fn chunkable_text_tokens(&self) -> Option<&Array> {
+        let [part] = self.parts.as_slice() else {
+            return None;
+        };
+        if part.modality() != InputModality::Text
+            || !part.metadata().is_empty()
+            || !part.extents().is_empty()
+        {
+            return None;
+        }
+        let input::InputPayload::TokenIds(tokens) = part.payload() else {
+            return None;
+        };
+        if tokens.shape().len() != 2 {
+            return None;
+        }
+        Some(tokens)
+    }
     /// Converts processor-owned MLX values into an opaque backend prompt.
     #[cfg(any(feature = "image", feature = "audio"))]
     pub fn from_prepared(input: &PreparedModelInput) -> Self {
@@ -1743,16 +1762,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         if state.capture.is_some() || Self::text_prefill_chunking_support(runtime).is_err() {
             return Ok(false);
         }
-        let [part] = prompt.parts.as_slice() else {
-            return Ok(false);
-        };
-        if part.modality() != InputModality::Text
-            || !part.metadata().is_empty()
-            || !part.extents().is_empty()
-        {
-            return Ok(false);
-        }
-        let input::InputPayload::TokenIds(tokens) = part.payload() else {
+        let Some(tokens) = prompt.chunkable_text_tokens() else {
             return Ok(false);
         };
         let [_, sequence] = tokens.shape() else {
