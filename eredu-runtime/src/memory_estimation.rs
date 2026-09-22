@@ -172,6 +172,37 @@ pub enum LogitsWorkspace {
     EveryPosition,
 }
 
+/// Backend estimate for simultaneous residual/projection/MLP intermediates.
+/// Lazy execution may retain several layers' graphs at once. This is a coarse
+/// planning interval, not a claim about individual tensor lifetimes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOverlap {
+    /// Upper number of equivalent one-layer linear workspaces, at least one.
+    /// Absent when backend overlap is not known. The lower end is one copy.
+    pub upper_live_copies: Option<u64>,
+    /// Selected mechanism fact or empirical calibration assumption.
+    pub detail: String,
+}
+
+impl WorkspaceOverlap {
+    /// Explicit single-layer execution assumption, suitable when completion or
+    /// an established backend memory schedule bounds intermediate retention.
+    pub fn single_layer() -> Self {
+        Self {
+            upper_live_copies: Some(1),
+            detail: "one live layer workspace".into(),
+        }
+    }
+
+    /// Uncalibrated backend graph retention stays unavailable.
+    pub fn unknown() -> Self {
+        Self {
+            upper_live_copies: None,
+            detail: "backend intermediate retention is unavailable".into(),
+        }
+    }
+}
+
 /// One simultaneous rank or replica, described using its actual local geometry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionMemoryPlan {
@@ -185,6 +216,9 @@ pub struct ExecutionMemoryPlan {
     pub cache_update: CacheUpdateWorkspace,
     /// Selected vocabulary projection behavior.
     pub logits: LogitsWorkspace,
+    /// Simultaneous linear intermediates, independently of attention scratch,
+    /// vocabulary projection and persistent/cache-copy costs.
+    pub workspace_overlap: WorkspaceOverlap,
 }
 
 /// Independent application and observed-availability comparisons.
@@ -391,6 +425,12 @@ fn workspace(
     query: u64,
     persistent: u64,
 ) -> Result<MemoryBytes, CapabilityError> {
+    if execution.workspace_overlap.upper_live_copies == Some(0) {
+        return Err(invalid(
+            "workspace_overlap",
+            "upper live copies must be positive",
+        ));
+    }
     let Some(g) = &execution.workspace else {
         return Ok(MemoryBytes::unknown(
             "decoder workspace geometry unavailable",
@@ -418,11 +458,17 @@ fn workspace(
         g.vocabulary_size,
         add(u64::from(request.scalar_bytes.get()), 4)?,
     ])?;
-    let mut bytes = MemoryBytes::estimated(
-        add(linear, logits)?,
-        add(linear, logits)?,
-        "overlap of residuals, projections, gated MLP and logits/probabilities",
-    );
+    let linear_upper = execution
+        .workspace_overlap
+        .upper_live_copies
+        .map(|copies| mul(linear, copies))
+        .transpose()?;
+    let mut bytes = MemoryBytes {
+        lower_bytes: add(linear, logits)?,
+        upper_bytes: linear_upper.map(|upper| add(upper, logits)).transpose()?,
+        kind: ObservationKind::Estimated,
+        detail: execution.workspace_overlap.detail.clone(),
+    };
     let attention = match &execution.attention {
         AttentionWorkspace::Materialized | AttentionWorkspace::ScoreMatrixUpperBound => {
             let n = product(&[request.batch_size, g.query_heads, query, positions, 8])?;
@@ -692,6 +738,12 @@ pub fn estimate_generation_memory(
             if execution.workspace.is_none() {
                 uncertainties.push(format!("{prefix}: decoder workspace geometry unavailable"));
             }
+            if execution.workspace_overlap.upper_live_copies != Some(1) {
+                uncertainties.push(format!(
+                    "{prefix} linear workspace overlap: {}",
+                    execution.workspace_overlap.detail
+                ));
+            }
             if has_nonmonotonic_state(&execution.state_layout) {
                 uncertainties.push(format!(
                     "{prefix}: interior peaks of remainder-shaped state unavailable"
@@ -720,7 +772,7 @@ pub fn estimate_generation_memory(
         domains, fit: overall_fit, uncertainties, assumptions: vec![
             "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.".into(),
             "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.".into(),
-            "Decoder workspace conservatively overlaps four residual-width arrays, Q/K/V, three MLP intermediates and logits/probabilities; selected attention and cache-update costs are additional.".into(),
+            "One decoder-layer workspace includes four residual-width arrays, Q/K/V and three MLP intermediates. The selected backend overlap interval multiplies linear intermediates only; logits, attention scratch and cache-update costs remain separate.".into(),
             "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.".into(),
             "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately.".into(),
         ] })

@@ -42,6 +42,7 @@ fn request() -> GenerationMemoryRequest {
                 attention: AttentionWorkspace::Materialized,
                 cache_update: CacheUpdateWorkspace::InPlace,
                 logits: LogitsWorkspace::FinalPosition,
+                workspace_overlap: WorkspaceOverlap::single_layer(),
             }],
             budget: MemoryBudget {
                 application_limit_bytes: Some(1_000_000),
@@ -315,6 +316,53 @@ fn conservative_fused_fallback_does_not_claim_score_matrices_are_allocated() {
         .uncertainties
         .iter()
         .any(|detail| detail.contains("score-matrix")));
+}
+
+#[test]
+fn selected_graph_overlap_scales_linear_intermediates_only() {
+    let mut request = request();
+    let baseline = estimate_generation_memory(&request).unwrap();
+    request.domains[0].executions[0].workspace_overlap = WorkspaceOverlap {
+        upper_live_copies: Some(3),
+        detail: "three equivalent layer workspaces from a backend calibration".into(),
+    };
+    let estimate = estimate_generation_memory(&request).unwrap();
+    let before = &baseline.domains[0].phases[0];
+    let after = &estimate.domains[0].phases[0];
+    assert_eq!(after.workspace.lower_bytes, before.workspace.lower_bytes);
+    // Two extra copies of the selected local layer's linear intermediates.
+    // Vocabulary rows, score matrices and cache storage are counted separately.
+    let extra_linear = 2 * 8 * (4 * 32 + 3 * 64 + 32 + 2 * 8) * 2;
+    assert_eq!(
+        after.workspace.upper_bytes.unwrap(),
+        before.workspace.upper_bytes.unwrap() + extra_linear
+    );
+    assert_eq!(after.persistent_state, before.persistent_state);
+    assert!(estimate
+        .uncertainties
+        .iter()
+        .any(|detail| detail.contains("three equivalent")));
+}
+
+#[test]
+fn unknown_graph_retention_remains_unknown_and_overlap_math_is_checked() {
+    let mut request = request();
+    request.domains[0].executions[0].workspace_overlap = WorkspaceOverlap::unknown();
+    assert_eq!(
+        estimate_generation_memory(&request).unwrap().fit,
+        MemoryFit::InsufficientInformation
+    );
+    request.domains[0].executions[0]
+        .workspace_overlap
+        .upper_live_copies = Some(0);
+    assert!(estimate_generation_memory(&request).is_err());
+    request.domains[0].executions[0]
+        .workspace_overlap
+        .upper_live_copies = Some(u64::MAX);
+    assert!(matches!(
+        estimate_generation_memory(&request),
+        Err(CapabilityError::ArithmeticOverflow { .. })
+    ));
 }
 
 #[test]
