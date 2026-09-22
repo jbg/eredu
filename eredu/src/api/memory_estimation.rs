@@ -56,7 +56,15 @@ pub struct GenerationMemoryOptions {
     pub budget: MemoryBudget,
     /// Host capacity, used only for separate host/device memory.
     pub host_budget: MemoryBudget,
-    /// Known execution-domain memory already resident in this process.
+    /// Already-resident bytes included in this forecast's execution-domain costs.
+    /// Leave zero for a model that has not been loaded. On unified memory count
+    /// host/device parameter backing once: host + device - known shared bytes,
+    /// or `max(host, device)` when overlap is unknown. Use
+    /// [`static_parameter_placement`]'s lower end, not RSS or global allocator
+    /// counters. For separate host/device domains this field applies only to
+    /// the device; use explicit domain plans or a loaded-model forecast for
+    /// independently resident host bytes. This reduces additional-memory demand
+    /// against observed availability, never the total application-budget demand.
     pub already_resident_bytes: u64,
     /// Additional retained prepared input, excluding token IDs counted below.
     pub retained_input: MemoryBytes,

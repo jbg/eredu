@@ -266,7 +266,14 @@ pub struct DomainMemoryPlan {
     pub domain: MemoryDomain,
     /// Live parameter payloads, including quantization scales/biases and replicas.
     pub resident_parameters: MemoryBytes,
-    /// Already-allocated portion of the modeled total; not a free-capacity budget.
+    /// Already-allocated portion of this domain's modeled total, counted once
+    /// per backing allocation. Deducted only for available-capacity comparisons;
+    /// application limits still compare against the total peak plus reserve.
+    /// On unified memory use host + device - known shared backing, or the
+    /// conservative `max(host, device)` when overlap is unknown. The lower end
+    /// returned by [`static_parameter_placement`] supplies that parameter baseline.
+    /// Do not substitute process RSS, global allocator activity, planned disk
+    /// bytes, or other allocations absent from this plan. Use zero before loading.
     pub already_resident_bytes: u64,
     /// Additional retained host/media inputs, excluding embeddings modeled by state.
     pub retained_input: MemoryBytes,
@@ -805,6 +812,13 @@ pub fn estimate_prefill_candidates(
 /// implies shared capacity, not identical host/device backing. With unknown overlap
 /// the interval spans max(host, device)..host+device; no global allocator counter is
 /// added to parameter payloads (that would double-count live tensors).
+///
+/// `shared_backing_bytes` is the known intersection of the host and device
+/// resident parameter observations: `Some(0)` declares distinct allocations;
+/// `None` means overlap is unknown. Missing observations preserve an unknown
+/// upper end. Use the returned interval's `lower_bytes` as the conservative
+/// parameter contribution to [`DomainMemoryPlan::already_resident_bytes`].
+/// Loaded facade forecasts, including the CLI, use this rule with unknown overlap.
 pub fn static_parameter_placement(
     report: &StaticMemoryReport,
     shared_backing_bytes: Option<u64>,

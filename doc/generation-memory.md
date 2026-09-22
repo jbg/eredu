@@ -257,6 +257,51 @@ and device buffer. Separate devices are compared independently. The static-repor
 adapter accepts declared shared backing or reports an overlap interval; global
 allocator counters are never added on top of parameter tensors.
 
+## Declaring already-resident memory
+
+`already_resident_bytes` is the portion of the forecast's modeled costs that
+already occupies its physical capacity pool when available memory is observed.
+It is a baseline for additional demand, not a memory budget or another cost to
+add. The estimator compares `max(peak - already_resident_bytes, 0) + reserve`
+with observed available bytes. An application limit still compares with the
+whole modeled peak plus reserve, including already-loaded weights.
+
+The loaded-model facade and CLI derive this baseline from
+`StaticMemoryReport::current_host_resident_bytes` and
+`current_device_resident_bytes`, using `static_parameter_placement`. On unified
+memory, neither the device counter alone nor an unconditional sum describes
+all cases. Shared capacity does not mean host and device views share every
+allocation:
+
+| Known backing relationship | Resident parameter bytes to declare |
+|---|---|
+| Exact overlap of `S` bytes | `host + device - S` |
+| Host and device allocations are known to be distinct | `host + device` |
+| Overlap is unknown | `max(host, device)`, a conservative lower bound |
+| Separate host/device capacity pools | Host count in the host domain; each device count in its own domain |
+
+For example, 2 GiB host and 3 GiB device residency with unknown overlap gives a
+3–5 GiB parameter interval. The loaded facade declares 3 GiB already resident,
+so it may conservatively overestimate additional demand by up to 2 GiB. If 1 GiB
+of shared backing is known, the union is 4 GiB. Low-level callers express known
+overlap through `static_parameter_placement(&report, Some(shared_bytes))` and
+use the resulting `lower_bytes` as their parameter baseline; `Some(0)` means
+distinct allocations, while `None` means unknown overlap. The loaded facade
+currently uses `None`. Missing observations retain unknown upper bounds.
+
+Declare only bytes included in the same forecast and currently resident. Do not
+use `logical_parameter_bytes` for a partially loaded model, planned disk bytes,
+RSS, or process-global allocator counters: they can include unresident or
+unrelated storage, and allocator activity can already include the parameter
+tensors. The facade deducts parameter residency only; it does not deduct cache
+or unrelated process allocations. Sample residency and available capacity close
+together, and refresh both after loading or residency changes.
+
+Cold inspection defaults to zero already-resident bytes. With separate memory
+pools, `GenerationMemoryOptions::already_resident_bytes` applies only to the
+execution device. Use the loaded facade or explicit `DomainMemoryPlan` entries
+to account for independently resident host bytes too.
+
 ## Reproducing calibration
 
 Build the current source first. Old executables do not validate these changes.

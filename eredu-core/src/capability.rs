@@ -246,9 +246,13 @@ pub enum PhysicalMemorySemantics {
 pub struct StaticMemoryReport {
     /// Logical bytes in parameters or the complete residency plan.
     pub logical_parameter_bytes: Observed<u64>,
-    /// Current logical host-resident bytes.
+    /// Current logical host-resident parameter bytes. On unified memory these
+    /// may share backing with device-resident parameters; capacity sharing alone
+    /// does not establish the overlap or justify summing the two observations.
     pub current_host_resident_bytes: Observed<u64>,
-    /// Current logical device-resident bytes.
+    /// Current logical device-resident parameter bytes. These are not the total
+    /// already-resident bytes of a unified host/device pool; account for host
+    /// parameters and any shared backing when constructing a pool baseline.
     pub current_device_resident_bytes: Observed<u64>,
     /// Planned logical disk-backed bytes.
     pub planned_disk_backed_bytes: Observed<u64>,
