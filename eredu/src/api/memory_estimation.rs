@@ -41,6 +41,8 @@ pub struct GenerationMemoryOptions {
     pub placement: GenerationMemoryPlacement,
     /// Selected attention mechanism or an explicit conservative assumption.
     pub attention: AttentionWorkspace,
+    /// Simultaneously retained activation workspaces, including lazy graph overlap.
+    pub workspace_overlap: WorkspaceOverlap,
     /// Cache-update mechanism or an explicit conservative assumption.
     pub cache_update: CacheUpdateWorkspace,
     /// Actual prefill output contract.
@@ -69,6 +71,10 @@ impl GenerationMemoryOptions {
             chunked_prefill_supported: false,
             placement,
             attention: AttentionWorkspace::Unknown,
+            workspace_overlap: WorkspaceOverlap {
+                upper_live_copies: None,
+                detail: "backend lazy activation overlap has not been calibrated".into(),
+            },
             cache_update: CacheUpdateWorkspace::Unknown,
             logits: LogitsWorkspace::EveryPosition,
             backend_overhead: MemoryBytes::unknown(
@@ -316,6 +322,7 @@ pub fn inspected_generation_memory_request(
         state_layout,
         workspace,
         attention: options.attention.clone(),
+        workspace_overlap: options.workspace_overlap.clone(),
         cache_update: options.cache_update.clone(),
         logits: options.logits.clone(),
     };
@@ -342,17 +349,16 @@ pub fn inspected_generation_memory_request(
                 domain.backend_overhead =
                     MemoryBytes::unknown("physical host/device memory relationship unavailable");
             }
-            // Host parameter copies and token IDs share this physical capacity.
+            // Host parameter backing and retained token IDs share this capacity.
             if host_parameters > 0 {
                 domain.resident_parameters = MemoryBytes {
-                    lower_bytes: add(domain.resident_parameters.lower_bytes.max(host_parameters), token_bytes)?,
-                    upper_bytes: domain.resident_parameters.upper_bytes.map(|upper| add(upper, host_bytes)).transpose()?,
+                    lower_bytes: domain.resident_parameters.lower_bytes.max(host_parameters),
+                    upper_bytes: domain.resident_parameters.upper_bytes.map(|upper| add(upper, host_parameters)).transpose()?,
                     kind: eredu_core::ObservationKind::Estimated,
                     detail: "one shared backing at lower end; distinct host and execution parameter copies at upper end".into(),
                 };
-            } else {
-                domain.resident_parameters = sum_bytes(domain.resident_parameters, token_bytes)?;
             }
+            domain.retained_input = sum_bytes(domain.retained_input, token_bytes)?;
             vec![domain]
         }
         GenerationMemoryPlacement::Separate { device } => {
@@ -367,9 +373,9 @@ pub fn inspected_generation_memory_request(
             };
             let host = DomainMemoryPlan {
                 domain: MemoryDomain::Host,
-                resident_parameters: MemoryBytes::exact(host_bytes),
+                resident_parameters: MemoryBytes::exact(host_parameters),
                 already_resident_bytes: 0,
-                retained_input: MemoryBytes::exact(0),
+                retained_input: MemoryBytes::exact(token_bytes),
                 staging: MemoryBytes::unknown(
                     "host-side native conversion and transfer scratch is not separately attributed",
                 ),
@@ -400,9 +406,6 @@ fn sum_bytes(bytes: MemoryBytes, extra: u64) -> Result<MemoryBytes, CapabilityEr
             .map(|upper| add(upper, extra))
             .transpose()?,
         kind: bytes.kind,
-        detail: format!(
-            "{}; includes host parameter copies and token IDs",
-            bytes.detail
-        ),
+        detail: format!("{}; includes retained token IDs", bytes.detail),
     })
 }
