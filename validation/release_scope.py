@@ -238,8 +238,15 @@ def plan(base: str, head: str, packages: dict, force_full: bool = False) -> dict
     for path in paths:
         def read(revision):
             result = subprocess.run(["git", "show", f"{revision}:{path}"], cwd=ROOT,
-                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            return result.stdout if result.returncode == 0 else None
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if result.returncode != 0:
+                return None
+            try:
+                return result.stdout.decode("utf-8")
+            except UnicodeDecodeError:
+                # Binary fixtures cannot use the text-based scope guards.
+                # Treat them as unavailable source to require full verification.
+                return None
         if not scoped_change(path, read(base), read(head), members):
             reasons.append(path)
     changed_lines = sum(int(value) for row in git("diff", "--numstat", base, head).splitlines()

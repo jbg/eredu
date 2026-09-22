@@ -85,6 +85,41 @@ class ReleaseScopeTests(unittest.TestCase):
 
 
 class ReleaseArchiveSelectionTests(unittest.TestCase):
+    def test_binary_changes_require_full_verification(self):
+        for path in ("eredu-backend-mlx/validation/fixture.safetensors", PRIVATE):
+            for before, after in ((None, b"\x00\x81"), (b"\x00\x81", b"\x00\xff"),
+                                  (b"\x00\x81", None)):
+                with self.subTest(path=path, before=before, after=after), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+
+                    def git(*args):
+                        return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+
+                    def commit(contents):
+                        file = root / path
+                        file.parent.mkdir(parents=True, exist_ok=True)
+                        if contents is None:
+                            file.unlink(missing_ok=True)
+                        else:
+                            file.write_bytes(contents)
+                        git("add", ".")
+                        git("-c", "user.name=Test", "-c", "user.email=test@invalid",
+                            "commit", "--allow-empty", "-qm", "fixture")
+                        return git("rev-parse", "HEAD")
+
+                    git("init", "-q")
+                    base = commit(before)
+                    head = commit(after)
+                    packages = {"eredu-backend-mlx": {
+                        "manifest_path": str(root / "eredu-backend-mlx/Cargo.toml"),
+                        "version": "0.3.1",
+                    }}
+                    with patch("release_scope.ROOT", root):
+                        result = plan(base, head, packages)
+                    self.assertTrue(result["full"])
+                    self.assertIn(path, result["reasons"])
+                    self.assertEqual(result["packages"], ["eredu-backend-mlx"])
+
     def packages(self):
         return {"eredu-architectures": {"version": "0.3.1", "dependencies": []},
                 "eredu-backend-mlx": {"version": "0.3.1", "dependencies": [{"name": "eredu-architectures"}]},
