@@ -1,3 +1,5 @@
+mod memory;
+
 use std::{
     collections::HashSet,
     fmt, fs,
@@ -38,6 +40,15 @@ use eredu_core::{
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum MemoryPolicy {
+    /// Print estimates and continue ordinary generation.
+    #[default]
+    Warn,
+    /// Refuse when the estimate shows a likely budget shortfall.
+    Refuse,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExpertCacheEviction {
@@ -299,6 +310,27 @@ struct Cli {
     #[arg(short = 'n', long, value_name = "TOKENS")]
     max_tokens: Option<usize>,
 
+    /// Inspect memory for this many model input positions and exit before loading.
+    /// Includes any positions inserted by a chat template; no tokenization is performed.
+    #[arg(long, value_name = "POSITIONS")]
+    estimate_memory_tokens: Option<u64>,
+
+    /// Write the request memory forecast as JSON before generation.
+    #[arg(long, value_name = "PATH")]
+    memory_report: Option<PathBuf>,
+
+    /// Total model-plus-request application budget, distinct from parameter cache budgets.
+    #[arg(long, value_name = "BYTES")]
+    memory_budget_bytes: Option<u64>,
+
+    /// Extra headroom for uncertainty and other work, in addition to estimated payloads.
+    #[arg(long, default_value_t = 268_435_456, value_name = "BYTES")]
+    memory_reserve_bytes: u64,
+
+    /// Continue with a warning, or refuse a predicted memory shortfall.
+    #[arg(long, value_enum, default_value_t = MemoryPolicy::Warn)]
+    memory_policy: MemoryPolicy,
+
     /// Sampling temperature. Defaults to the checkpoint; zero selects greedy decoding.
     #[arg(short = 't', long, value_name = "FLOAT")]
     temperature: Option<f32>,
@@ -347,6 +379,11 @@ struct Cli {
     /// Random seed used when temperature is non-zero.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+
+    /// Maximum tokens per eligible text prefill pass; zero disables chunking.
+    /// Media, observations, distributed and speculative paths retain a full pass.
+    #[arg(long, default_value_t = 512, value_name = "TOKENS")]
+    prefill_chunk_size: usize,
 
     /// Quantize eligible dense weights to this bit width while loading.
     #[arg(long, value_name = "BITS")]
@@ -2159,14 +2196,21 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|_| discover_local_hardware())
         });
-    if let Some(bytes) = args.mlx_cache_limit_bytes {
+    if let Some(bytes) = args
+        .mlx_cache_limit_bytes
+        .filter(|_| args.estimate_memory_tokens.is_none())
+    {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
         configure_local_runtime(
             &LocalRuntimeConfiguration::default().with_allocator_cache_limit(bytes),
         )
         .context("failed to set the local allocator-cache limit")?;
     }
-    let prompt = read_prompt(args.prompt.as_deref())?;
+    let prompt = if args.estimate_memory_tokens.is_some() {
+        String::new()
+    } else {
+        read_prompt(args.prompt.as_deref())?
+    };
 
     let configured_embedded_mtp = if automatic_report.is_none()
         && draft_model_path.is_none()
@@ -2189,6 +2233,20 @@ fn main() -> Result<()> {
         Some(report) => report.plan.clone(),
         None => cli_execution_plan(&args, draft_model_path.as_deref(), configured_embedded_mtp)?,
     };
+
+    if let Some(tokens) = args.estimate_memory_tokens {
+        let report = memory::report(
+            &args,
+            &model_path,
+            &execution_plan,
+            tokens,
+            args.max_tokens.map(|n| n as u64),
+            None,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        memory::advise(&args, &report)?;
+        return Ok(());
+    }
 
     if args.verbose {
         eprintln!("--- Eredu MLX diagnostics (stderr) ---");
@@ -2239,6 +2297,11 @@ fn main() -> Result<()> {
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
+    if args.prefill_chunk_size > 0 && (args.verbose || memory::requested(&args)) {
+        if let Err(reason) = model.prefill_chunking_support() {
+            eprintln!("prefill uses one complete pass: {reason}");
+        }
+    }
     let generation_overrides = args.generation_overrides();
     let mut resolved_generation = model.resolve_generation_config(generation_overrides)?;
     let temperature = resolved_generation.temperature;
@@ -2347,6 +2410,26 @@ fn main() -> Result<()> {
     if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
+    if memory::requested(&args) {
+        let already_resident = model
+            .static_memory()
+            .ok()
+            .and_then(|resident| observed_u64(&resident.current_device_resident_bytes))
+            .unwrap_or(0);
+        match memory::report(
+            &args,
+            &model_path,
+            &execution_plan,
+            prompt_token_ids.len() as u64,
+            Some(max_tokens as u64),
+            Some(already_resident),
+        ) {
+            Ok(report) => memory::advise(&args, &report)?,
+            Err(error) => {
+                eprintln!("memory forecast unavailable: {error}; ordinary generation continues")
+            }
+        }
+    }
     if args.expert_cache_benchmark {
         let benchmark = benchmark_local_expert_cache(&mut model, &prompt_token_ids)?;
         print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
@@ -2391,6 +2474,10 @@ fn main() -> Result<()> {
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
         let settings = PreparedChatGenerationSettings {
+            prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
+                eredu::api::PrefillChunkPolicy::Unchunked,
+                eredu::api::PrefillChunkPolicy::Bounded,
+            ),
             overrides: GenerationConfigOverrides {
                 max_new_tokens: Some(max_tokens),
                 ..generation_overrides
@@ -2490,7 +2577,14 @@ fn main() -> Result<()> {
             "speculative generation requires a prepared template prompt; raw prompts use ordinary generation"
         );
     } else {
-        let config = TextGenerationConfig::new(resolved_generation).with_seed(args.seed);
+        let config = TextGenerationConfig::new(resolved_generation)
+            .with_seed(args.seed)
+            .with_prefill_chunk_policy(
+                std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
+                    eredu::api::PrefillChunkPolicy::Unchunked,
+                    eredu::api::PrefillChunkPolicy::Bounded,
+                ),
+            );
         let config = if args.mirostat_v2 {
             config.with_mirostat_v2(args.mirostat_tau, args.mirostat_eta)?
         } else {
@@ -2854,6 +2948,14 @@ fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkS
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    if args.estimate_memory_tokens.is_some()
+        && matches!(args.auto, Some(AutoMode::Plan | AutoMode::Benchmark))
+    {
+        bail!("--estimate-memory-tokens supports --auto quick or --no-auto; benchmarking would load models");
+    }
+    if args.estimate_memory_tokens == Some(0) {
+        bail!("--estimate-memory-tokens must be greater than zero");
+    }
     if args.max_tokens == Some(0) {
         bail!("--max-tokens must be greater than zero");
     }

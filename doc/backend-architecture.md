@@ -6353,3 +6353,20 @@ Final source adaptation and partition error wrappers preserve owned errors as
 `LayerwiseRuntimeError` variants. This changes diagnostic retention only; the
 architecture/runtime layers still own preparation and residency policy, and the
 native backend still establishes completion before releasing native resources.
+
+### Request memory forecasts and prefill chunks
+
+Architecture-owned memory projections describe workspace geometry using the
+normalized family configuration and exact state schedule. Runtime owns checked
+phase-overlap estimates, physical-capacity comparisons and candidate recomputation.
+The facade composes cold selected resources with explicit backend mechanism and
+overhead assumptions; the CLI owns warning/refusal policy. Unknown workspace or
+overhead affects advice, never execution authorization. No allocation ledger or
+new funding protocol is involved. See [generation memory](generation-memory.md).
+
+The neutral ordinary/controlled text driver requests bounded prefill through an
+optional backend prefix operation. Native adapters preserve compatible prompt
+slicing, positions and completion; an intermediate prefix is settled before the
+next is submitted. Requests with incompatible observation or specialized input
+contracts keep a full prefill pass. Sampling and commitment remain in the shared
+driver, and the prefill policy survives controlled continuation.

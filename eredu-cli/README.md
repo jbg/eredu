@@ -139,3 +139,15 @@ eredu --model /path/to/model \
 Visible text and canonical tool events are written to standard output. See
 [Native tool calling](https://github.com/jbg/eredu/blob/main/doc/tool-calling.md) for schemas and event
 semantics.
+
+## Request memory forecasts
+
+Use `--estimate-memory-tokens N --max-tokens M` to inspect input-dependent memory
+before loading, or `--memory-report PATH` to report the actual tokenized request
+before generation. `--memory-budget-bytes` is a total model-plus-request planning
+budget; `--memory-policy warn|refuse` controls predicted shortfalls. The default
+reserve is 256 MiB, configurable with `--memory-reserve-bytes`.
+
+Ordinary text prefill defaults to chunks of 512 tokens. Set
+`--prefill-chunk-size 0` for one pass. Reports preserve unknown costs and identify
+full-prompt fallbacks. See [formulas, coverage and calibration](../doc/generation-memory.md).
