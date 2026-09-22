@@ -47,6 +47,17 @@ limit, separately from this reserve. Without `--mlx-cache-limit-bytes`, allocato
 cache retention has no request-selected bound and fit remains uncertain; it is
 never silently treated as zero.
 
+On macOS, `discover_local_hardware()` observes available host memory from Mach
+host VM statistics: free pages (which already include speculative pages) plus
+inactive pages, multiplied by the host page size. Apple Silicon shares this
+observation between host and Metal in one unified capacity pool. This estimated,
+point-in-time reclaimable capacity can support a fit verdict without
+`--memory-budget-bytes` when the request's modeled upper bounds are known.
+It is not a reservation or process limit; reclaiming inactive pages may require
+work, and other processes can consume the capacity after observation. Failed
+queries remain unavailable, while a successful zero-capacity observation is zero.
+The calculation follows Apple's [VM statistics definitions](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h).
+
 Reports show phase contributions, interval bounds, missing coverage, state growth,
 effective prefill size, and the dominant contributor. Smaller chunk and output
 candidates are recomputed; recommendations are shown only when their modeled

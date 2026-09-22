@@ -403,7 +403,12 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
         |value| Observed::Available {
             value,
             kind: ObservationKind::Estimated,
-            source: "host available-memory observation".into(),
+            source: if cfg!(target_os = "macos") {
+                "point-in-time Mach host VM free (including speculative) plus inactive pages"
+            } else {
+                "point-in-time host available-memory observation"
+            }
+            .into(),
         },
     );
     Ok(AvailableMemory {

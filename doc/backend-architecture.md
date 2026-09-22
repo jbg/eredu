@@ -6364,6 +6364,14 @@ overhead assumptions; the CLI owns warning/refusal policy. Unknown workspace or
 overhead affects advice, never execution authorization. No allocation ledger or
 new funding protocol is involved. See [generation memory](generation-memory.md).
 
+The existing `safemlx::system` native observation boundary reads macOS Mach host
+VM statistics and releases the host port after querying. Available physical memory
+is estimated from free (including speculative) plus inactive pages, using the host
+page size. The MLX adapter labels this as a point-in-time estimate and exposes the
+same observation for host and unified Metal capacity. Runtime fit policy continues
+to compare additional request memory with that observation; native queries and
+unsafe calls remain in `safemlx`.
+
 The neutral ordinary/controlled text driver requests bounded prefill through an
 optional backend prefix operation. Native adapters preserve compatible prompt
 slicing, positions and completion; an intermediate prefix is settled before the

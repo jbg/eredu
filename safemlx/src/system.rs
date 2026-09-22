@@ -5,7 +5,8 @@
 pub struct SystemMemory {
     /// Installed physical memory, when available.
     pub total: Option<u64>,
-    /// Physical memory currently available to the process, when available.
+    /// Point-in-time estimate of available host physical memory, when available.
+    /// This is advisory capacity, not a reservation or a process allocation limit.
     pub available: Option<u64>,
 }
 
@@ -23,10 +24,6 @@ pub struct ProcessUsage {
 /// Observes host physical memory.
 #[cfg(target_os = "macos")]
 pub fn system_memory() -> std::io::Result<SystemMemory> {
-    unsafe extern "C" {
-        fn os_proc_available_memory() -> usize;
-    }
-
     let name = c"hw.memsize";
     let mut total = 0u64;
     let mut size = std::mem::size_of::<u64>();
@@ -40,10 +37,63 @@ pub fn system_memory() -> std::io::Result<SystemMemory> {
         )
     };
     let total = (status == 0 && size == std::mem::size_of::<u64>()).then_some(total);
-    let available = u64::try_from(unsafe { os_proc_available_memory() })
-        .ok()
-        .filter(|value| *value > 0);
+    let available = macos_available_memory();
     Ok(SystemMemory { total, available })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc's Mach port accessors avoid an additional FFI dependency.
+fn macos_available_memory() -> Option<u64> {
+    unsafe extern "C" {
+        fn host_page_size(host: libc::host_t, size: *mut libc::vm_size_t) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let mut page_size = 0;
+    // SAFETY: Both output buffers are valid for the declared sizes. The Mach
+    // host send right is released after both calls, including on query failure.
+    let (page_status, stats_status) = unsafe {
+        let host = libc::mach_host_self();
+        let page_status = host_page_size(host, &mut page_size);
+        let stats_status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (page_status, stats_status)
+    };
+    // Older kernels return a shorter revision than libc's current struct. Only
+    // the initial fields through inactive_count are needed, and the rest of the
+    // buffer was zero-initialized before the call.
+    let required_bytes = std::mem::offset_of!(libc::vm_statistics64, inactive_count)
+        + std::mem::size_of::<libc::natural_t>();
+    if page_status != libc::KERN_SUCCESS
+        || stats_status != libc::KERN_SUCCESS
+        || (count as usize) < required_bytes / std::mem::size_of::<libc::integer_t>()
+    {
+        return None;
+    }
+    // SAFETY: The integer-only struct was zeroed and the query filled the fields
+    // read below, as checked by the returned count.
+    let stats = unsafe { stats.assume_init() };
+    macos_available_bytes(&stats, u64::try_from(page_size).ok()?)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_available_bytes(stats: &libc::vm_statistics64, page_size: u64) -> Option<u64> {
+    if page_size == 0 {
+        return None;
+    }
+    // Mach free_count already includes speculative_count. Inactive pages are
+    // potentially reclaimable; this is an estimate, not guaranteed free space.
+    (u64::from(stats.free_count) + u64::from(stats.inactive_count)).checked_mul(page_size)
 }
 
 /// Observes host physical memory.
@@ -132,6 +182,41 @@ pub fn process_usage() -> Option<ProcessUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_available_memory_counts_reclaimable_pages_once() {
+        // SAFETY: The Mach statistics struct contains only integer fields.
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        stats.free_count = 7;
+        stats.speculative_count = 3; // Included in the seven free pages.
+        stats.inactive_count = 5;
+        stats.active_count = 11;
+        stats.wire_count = 13;
+        stats.compressor_page_count = 17;
+        for page_size in [4096, 16384] {
+            assert_eq!(
+                macos_available_bytes(&stats, page_size),
+                Some(12 * page_size)
+            );
+        }
+        assert_eq!(macos_available_bytes(&stats, 0), None);
+        assert_eq!(macos_available_bytes(&stats, u64::MAX), None);
+        stats.free_count = 0;
+        stats.inactive_count = 0;
+        assert_eq!(macos_available_bytes(&stats, 16384), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_host_memory_observation_is_available() {
+        let memory = system_memory().unwrap();
+        let total = memory.total.expect("macOS physical capacity");
+        let available = memory.available.expect("macOS host VM statistics");
+        assert!(total > 0);
+        assert!(available <= total);
+        eprintln!("macOS host memory: {available} available / {total} total bytes");
+    }
 
     #[test]
     fn system_memory_is_ordered_when_available() {

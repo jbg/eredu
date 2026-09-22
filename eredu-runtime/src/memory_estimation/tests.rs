@@ -206,6 +206,37 @@ fn loading_and_generation_fit_are_distinct() {
 }
 
 #[test]
+fn observed_availability_gives_a_verdict_without_an_application_budget() {
+    let mut request = request();
+    let mut available = AvailableMemory {
+        physical_memory_bytes: Observed::exact(2_000_000, "fixture"),
+        available_memory_bytes: Observed::Available {
+            value: 1_000_000,
+            kind: eredu_core::ObservationKind::Estimated,
+            source: "point-in-time host observation".into(),
+        },
+        physical_semantics: eredu_core::PhysicalMemorySemantics::Unified,
+    };
+    request.domains[0].budget = MemoryBudget::from_available_memory(&available, None, 1024);
+    assert_eq!(
+        estimate_generation_memory(&request).unwrap().fit,
+        MemoryFit::LikelyFit
+    );
+    available.available_memory_bytes = Observed::exact(0, "exhausted host capacity");
+    request.domains[0].budget = MemoryBudget::from_available_memory(&available, None, 1024);
+    assert_eq!(
+        estimate_generation_memory(&request).unwrap().fit,
+        MemoryFit::LikelyShortfall
+    );
+    available.available_memory_bytes = Observed::unavailable("host query failed");
+    request.domains[0].budget = MemoryBudget::from_available_memory(&available, None, 1024);
+    assert_eq!(
+        estimate_generation_memory(&request).unwrap().fit,
+        MemoryFit::InsufficientInformation
+    );
+}
+
+#[test]
 fn total_budget_and_incremental_availability_use_different_baselines() {
     let mut request = request();
     let peak = estimate_generation_memory(&request).unwrap().domains[0]

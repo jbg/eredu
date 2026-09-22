@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Discovers hardware available to the MLX backend.
+/// Available memory is a point-in-time estimate, not an allocation guarantee.
 pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
     eredu_backend_mlx::discover_hardware()
 }

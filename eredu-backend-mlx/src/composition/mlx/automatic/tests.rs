@@ -1,6 +1,25 @@
 use super::*;
 use eredu_core::BackendProvider as _;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_discovery_exposes_estimated_available_memory() {
+    let profile = discover_hardware();
+    let Observed::Available { value, kind, .. } = &profile.available_memory_bytes else {
+        panic!("macOS host availability must be observed");
+    };
+    assert_eq!(*kind, eredu_core::ObservationKind::Estimated);
+    assert!(*value <= *profile.physical_memory_bytes.value().unwrap());
+    for device in &profile.backends[0].devices {
+        if device.family == "cpu"
+            || (device.family == "metal"
+                && profile.physical_memory_semantics == HardwareMemorySemantics::Unified)
+        {
+            assert_eq!(device.available_memory_bytes, profile.available_memory_bytes);
+        }
+    }
+}
+
 #[test]
 fn plan_normalization_is_identical_through_native_and_foreign_adapters() {
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
