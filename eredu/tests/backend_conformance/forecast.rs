@@ -678,6 +678,12 @@ fn ordinary_continuation_observes_pending_decode_once_without_advancing_or_exten
         .forecast_remaining_generation(0, &Default::default())
         .unwrap();
     assert_eq!(zero.estimate.requested_positions, 17);
+    assert_eq!(zero.continuation.current_state.lower_bytes, 17 * 32);
+    assert_eq!(zero.continuation.peak_state.lower_bytes, 17 * 32);
+    assert_eq!(
+        zero.estimate.domains[0].phases[0].persistent_state,
+        zero.continuation.current_state
+    );
     assert_eq!(zero.estimate.domains[0].phases.len(), 1);
     assert_eq!(
         zero.estimate.domains[0].phases[0].workspace.upper_bytes,
@@ -784,9 +790,149 @@ fn continuation_native_envelope_bounds_interior_remainder_state() {
         result.domains[0].phases[1].persistent_state.upper_bytes,
         Some(128)
     );
+    assert_eq!(result.domains[0].phases[0].persistent_state.lower_bytes, 4);
+    // Endpoint remainder is zero, but the horizon includes the installed tensor.
+    assert_eq!(result.domains[0].phases[1].persistent_state.lower_bytes, 4);
     assert_eq!(result.requested_positions, 24);
     assert!(!result
         .uncertainties
         .iter()
         .any(|s| s.contains("interior peaks of remainder-shaped state unavailable")));
+}
+
+#[test]
+fn continuation_payload_floors_cover_installed_state_without_capacity_or_optional_tensors() {
+    use eredu::api::{estimate_continuation_memory, ContinuationMemoryPlan};
+    use eredu_core::cache::{
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension as Dim, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
+    };
+    use std::num::NonZeroU32;
+    let (model, _, settings) = setup();
+    let mut request = model
+        .forecast_token_ids(&[1; 39], settings, &Default::default())
+        .unwrap()
+        .request;
+    request.max_output_tokens = Some(2);
+    let native = ContinuationMemoryPlan {
+        current_positions: 39,
+        additional_input_tokens: 2,
+        current_state: MemoryBytes::estimated(0, 65536, "native installed capacity"),
+        peak_state: MemoryBytes::estimated(0, 131072, "native growth envelope"),
+    };
+    let fixed = StateTensorPolicy::new(
+        StateTensorRole::Recurrent,
+        vec![Dim::Batch, Dim::Fixed(NonZeroU32::new(16).unwrap())],
+        StateTensorDtype::Float32,
+        MutableStateResidency::LayerScopedOffloadable,
+    )
+    .unwrap();
+    let dense = request.domains[0].executions[0].state_layout.clone();
+    let sliding = StateMemoryLayout::new(
+        eredu_core::LayerSchedule::new(
+            1,
+            vec![LayerCachePolicy::key_only(
+                eredu_core::AttentionPolicy::Sliding {
+                    window: NonZeroU32::new(8).unwrap(),
+                },
+                1,
+                8,
+            )
+            .unwrap()],
+        )
+        .unwrap(),
+        vec![0],
+        32,
+        256,
+        EstimationCompleteness::Complete,
+    )
+    .unwrap();
+    let mixed = StateMemoryLayout::new(
+        eredu_core::LayerSchedule::new(
+            3,
+            vec![
+                LayerCachePolicy::key_only(eredu_core::AttentionPolicy::Full, 1, 8).unwrap(),
+                LayerCachePolicy::fixed_only(vec![fixed.clone()]).unwrap(),
+                LayerCachePolicy::fixed_only(vec![fixed.optional()]).unwrap(),
+            ],
+        )
+        .unwrap(),
+        vec![-3, 0, 0],
+        32,
+        256,
+        EstimationCompleteness::PersistentStateOnly,
+    )
+    .unwrap();
+    for (layout, current, peak) in [
+        (dense, 39 * 32, 41 * 32),
+        (sliding, 8 * 16, 8 * 16),
+        (mixed, 36 * 16 + 64, 38 * 16 + 64),
+    ] {
+        request.domains[0].executions[0].state_layout = layout;
+        let bounded = native.with_logical_state_bounds(&request).unwrap();
+        assert_eq!(bounded.current_state.lower_bytes, current);
+        assert_eq!(bounded.peak_state.lower_bytes, peak);
+        assert_eq!(
+            bounded.current_state.upper_bytes,
+            native.current_state.upper_bytes
+        );
+        assert_eq!(
+            bounded.peak_state.upper_bytes,
+            native.peak_state.upper_bytes
+        );
+        assert_eq!(
+            bounded.with_logical_state_bounds(&request).unwrap(),
+            bounded
+        );
+        let forecast = estimate_continuation_memory(&request, &native).unwrap();
+        assert_eq!(
+            forecast.domains[0].phases[0].persistent_state,
+            bounded.current_state
+        );
+        assert_eq!(
+            forecast.domains[0].phases[1].persistent_state,
+            bounded.peak_state
+        );
+        let mut zero = native.clone();
+        zero.additional_input_tokens = 0;
+        let mut zero_request = request.clone();
+        zero_request.max_output_tokens = Some(0);
+        let forecast = estimate_continuation_memory(&zero_request, &zero).unwrap();
+        assert_eq!(forecast.domains[0].phases.len(), 1);
+        assert_eq!(
+            forecast.domains[0].phases[0].persistent_state.lower_bytes,
+            current
+        );
+        assert_eq!(
+            forecast.domains[0].phases[0].persistent_state.upper_bytes,
+            Some(65536)
+        );
+        let mut unknown = native.clone();
+        unknown.current_state = MemoryBytes::unknown("capacity unavailable");
+        unknown.peak_state = MemoryBytes::unknown("growth unavailable");
+        let unknown = unknown.with_logical_state_bounds(&request).unwrap();
+        assert_eq!(unknown.current_state.lower_bytes, current);
+        assert_eq!(
+            unknown.current_state.kind,
+            eredu_core::ObservationKind::Estimated
+        );
+        assert_eq!(unknown.peak_state.lower_bytes, peak);
+        assert!(unknown.current_state.upper_bytes.is_none());
+        assert!(unknown.peak_state.upper_bytes.is_none());
+        let mut invalid = native.clone();
+        invalid.current_state.upper_bytes = Some(current - 1);
+        assert!(invalid.with_logical_state_bounds(&request).is_err());
+    }
+    // An upper-only architecture declaration cannot establish a floor, but
+    // neither does it erase an independent backend lower bound.
+    request.domains[0].executions[0].state_layout.completeness =
+        EstimationCompleteness::Conservative;
+    assert_eq!(native.with_logical_state_bounds(&request).unwrap(), native);
+    let mut backend_floor = native;
+    backend_floor.current_state.lower_bytes = 7;
+    backend_floor.peak_state.lower_bytes = 9;
+    assert_eq!(
+        backend_floor.with_logical_state_bounds(&request).unwrap(),
+        backend_floor
+    );
 }

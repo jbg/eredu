@@ -19,10 +19,91 @@ pub struct ContinuationMemoryPlan {
     pub current_positions: u64,
     /// Inputs submitted for the requested additional predictions, counted once.
     pub additional_input_tokens: u64,
-    /// Installed persistent-state storage allowance, including retained capacity.
+    /// Installed logical payload floor through native retained-capacity allowance.
     pub current_state: MemoryBytes,
     /// Persistent-state envelope throughout the horizon, including the start.
     pub peak_state: MemoryBytes,
+}
+
+impl ContinuationMemoryPlan {
+    /// Adds architecture-declared logical payload floors at the installed and
+    /// requested frontiers. Native capacity upper bounds are preserved, including
+    /// unknown bounds. This observes no allocations and grants no residency credit.
+    pub fn with_logical_state_bounds(
+        &self,
+        request: &GenerationMemoryRequest,
+    ) -> Result<Self, CapabilityError> {
+        self.current_state.validate()?;
+        self.peak_state.validate()?;
+        if self
+            .current_state
+            .upper_bytes
+            .zip(self.peak_state.upper_bytes)
+            .is_some_and(|(current, peak)| peak < current)
+        {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "continuation peak_state",
+                detail: "horizon envelope must include installed state".into(),
+            });
+        }
+        if request.input.model_positions != self.current_positions
+            || request.batch_size != 1
+            || request
+                .domains
+                .iter()
+                .map(|d| d.executions.len())
+                .sum::<usize>()
+                != 1
+            || request.max_output_tokens != Some(self.additional_input_tokens)
+        {
+            return Err(CapabilityError::InvalidConfiguration {
+                field: "continuation forecast",
+                detail: "requires one ordinary decode lane and a matching finite input horizon"
+                    .into(),
+            });
+        }
+        let frontier = self
+            .current_positions
+            .checked_add(self.additional_input_tokens)
+            .ok_or(CapabilityError::ArithmeticOverflow {
+                operation: "continuation frontier",
+            })?;
+
+        let execution = request
+            .domains
+            .iter()
+            .flat_map(|p| &p.executions)
+            .next()
+            .expect("validated single continuation execution");
+        let payload = |positions| {
+            let mut input = request.input;
+            input.model_positions = positions;
+            eredu_core::estimate_runtime_state_payload_lower_bound(
+                &execution.state_layout,
+                input,
+                request.batch_size,
+                request.scalar_bytes,
+            )
+        };
+        let mut result = self.clone();
+        let current = payload(self.current_positions)?;
+        let endpoint = payload(frontier)?;
+        raise_floor(&mut result.current_state, current)?;
+        // Remainder-shaped and sliding state can shrink: the horizon still
+        // includes the starting state. Interior capacity stays in the upper end.
+        let peak_floor = result.current_state.lower_bytes.max(endpoint);
+        raise_floor(&mut result.peak_state, peak_floor)?;
+        Ok(result)
+    }
+}
+
+fn raise_floor(bytes: &mut MemoryBytes, logical: u64) -> Result<(), CapabilityError> {
+    if logical > bytes.lower_bytes {
+        bytes.lower_bytes = logical;
+        bytes.kind = eredu_core::ObservationKind::Estimated;
+        bytes.detail.push_str("; lower bound includes required logical state payload, excluding optional tensors and allocation rounding");
+    }
+    bytes.validate()
 }
 
 /// Backend continuation observations never submit, settle or copy model state.
@@ -45,40 +126,11 @@ pub fn estimate_continuation_memory(
     request: &GenerationMemoryRequest,
     plan: &ContinuationMemoryPlan,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
-    plan.current_state.validate()?;
-    plan.peak_state.validate()?;
-    if plan
-        .current_state
-        .upper_bytes
-        .zip(plan.peak_state.upper_bytes)
-        .is_some_and(|(current, peak)| peak < current)
-    {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "continuation peak_state",
-            detail: "horizon envelope must include installed state".into(),
-        });
-    }
-    if request.input.model_positions != plan.current_positions
-        || request.batch_size != 1
-        || request
-            .domains
-            .iter()
-            .map(|d| d.executions.len())
-            .sum::<usize>()
-            != 1
-        || request.max_output_tokens != Some(plan.additional_input_tokens)
-    {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "continuation forecast",
-            detail: "requires one ordinary decode lane and a matching finite input horizon".into(),
-        });
-    }
+    let plan = plan.with_logical_state_bounds(request)?;
     let frontier = plan
         .current_positions
         .checked_add(plan.additional_input_tokens)
-        .ok_or(CapabilityError::ArithmeticOverflow {
-            operation: "continuation frontier",
-        })?;
+        .expect("validated continuation frontier");
     // Reuse ordinary validation/uncertainty reporting on a minimal request, then
     // replace every phase. It must not evaluate a fictitious full-context prefill.
     let mut validation = request.clone();
@@ -119,14 +171,9 @@ pub fn estimate_continuation_memory(
         if plan.additional_input_tokens > 0 {
             let mut decode = phase(&without_copy, request, MemoryPhase::Decode, frontier, 1)?;
             if executes {
-                // Native bounds include allocation rounding and remainder-shaped
-                // interior peaks absent from endpoint-only architecture formulas.
-                let logical_lower = decode.persistent_state.lower_bytes;
+                // The normalized plan includes logical endpoint/start floors;
+                // its native upper end covers capacity and interior peaks.
                 decode.persistent_state = plan.peak_state.clone();
-                decode.persistent_state.lower_bytes = logical_lower
-                    .max(plan.current_state.lower_bytes)
-                    .max(plan.peak_state.lower_bytes);
-                decode.persistent_state.validate()?;
                 let copy = match pool.executions[0].cache_update {
                     CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
                     CacheUpdateWorkspace::CopyState => {

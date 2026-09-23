@@ -6477,7 +6477,11 @@ comparisons and uncertainty. The MLX adapter validates idle session authority an
 uses the existing typed state geometry/capacity growth mechanism through
 `ReplicatedTextSession::estimate_installed_control_state_growth`; it never
 snapshots or submits work to obtain a forecast. Architecture state geometry stays
-in portable family declarations.
+in portable family declarations. Core's state estimator also supplies required
+logical payload floors, excluding allocation rounding and optional tensors.
+Runtime combines those floors with native upper envelopes for both the installed
+frontier and the continuation horizon. The facade returns the normalized plan used
+by phase estimation; backend snapshot reservations remain upper allowances.
 
 Core's ordinary iterator lends read-only sampler/pending-input observations and
 provides explicit completion settlement via `synchronize`. The facade composes

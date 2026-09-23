@@ -93,6 +93,21 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
         .forecast_remaining_generation(16, &Default::default())
         .unwrap();
     assert_eq!(forecast.continuation.current_positions, prompt);
+    assert!(forecast.continuation.current_state.lower_bytes > 0);
+    assert_eq!(
+        forecast.estimate.domains[0].phases[0].persistent_state,
+        forecast.continuation.current_state
+    );
+    let zero = run
+        .forecast_remaining_generation(0, &Default::default())
+        .unwrap();
+    assert_eq!(
+        zero.continuation.current_state,
+        forecast.continuation.current_state
+    );
+    assert!(
+        zero.continuation.peak_state.lower_bytes >= zero.continuation.current_state.lower_bytes
+    );
     assert_eq!(forecast.estimate.requested_positions, prompt + 16);
     assert_eq!(forecast.estimate.fit, expected_fit);
     // Includes a retained encoded trace and a distinct semantic history. The
@@ -134,6 +149,10 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
         .forecast_remaining_generation(16, &Default::default())
         .unwrap();
     assert_eq!(restored.continuation.current_positions, prompt);
+    assert_eq!(
+        restored.continuation.current_state.lower_bytes,
+        forecast.continuation.current_state.lower_bytes
+    );
     assert_eq!(restored.estimate.fit, expected_fit);
     eprintln!(
         "{}: prefix {}, horizon 16, retained upper {}, additional upper {:?}, measured active growth {}",
@@ -154,13 +173,18 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
             })
             .unwrap(),
     );
-    let mut tokens = model.generate_tokens(vec![1; 17], config).unwrap();
+    let mut tokens = model.generate_tokens(vec![1; 39], config).unwrap();
     tokens.next().unwrap().unwrap().token_id().unwrap();
     tokens.synchronize().unwrap();
     let forecast = tokens
         .forecast_remaining_generation(3, &Default::default())
         .unwrap();
-    assert_eq!(forecast.continuation.current_positions, 17);
+    assert_eq!(forecast.continuation.current_positions, 39);
+    assert!(forecast.continuation.current_state.lower_bytes > 0);
+    assert_eq!(
+        forecast.estimate.domains[0].phases[0].persistent_state,
+        forecast.continuation.current_state
+    );
     assert_eq!(forecast.estimate.fit, expected_fit);
     assert_eq!(tokens.count(), 3);
 }

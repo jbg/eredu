@@ -4,6 +4,15 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Installed continuation state lower bounds
+
+Continuation plans and phase reports now include the known required logical
+payload of installed state instead of a zero lower end. Native capacity upper
+bounds remain unchanged. The calculation honors sliding windows, layer offsets,
+fixed tensor dtypes and conditional state, excluding optional tensors and capacity
+rounding. Zero-token forecasts and restored continuations use the same accounting;
+no allocator observation, reservation or resident-memory credit is introduced.
+
 ## 2026-09-23 — Capture forecasts from selection geometry
 
 Loaded ordinary MLX logits captures now forecast admitted transform sizes and

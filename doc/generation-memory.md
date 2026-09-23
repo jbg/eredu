@@ -713,6 +713,16 @@ reach P + N cached positions. Phases are `continuation_start` and, for N > 0,
 `decode` with one query position. Completed loading and prefill are excluded.
 Zero predicts retained state without another model invocation.
 
+Continuation plans report a logical lower bound for installed state and for the
+horizon peak. The bound uses required architecture-declared tensors at the actual
+cache frontier, including sliding windows, per-layer prefix offsets and fixed-dtype
+recurrent state. It excludes optional tensors and allocation rounding. The peak
+floor includes the starting state even when a remainder-shaped tensor shrinks at
+the endpoint; zero-token forecasts still report the installed payload. Layouts
+marked only as conservative upper estimates do not establish a new lower bound.
+Known payload floors survive an unavailable native upper bound. These logical
+bytes are not measured distinct backing and grant no already-resident credit.
+
 MLX combines installed native state storage with its existing continuation-growth
 mechanism. That mechanism covers capacity rounding, sliding-cache retention and
 interior peaks of remainder-shaped state. These are conservative logical storage

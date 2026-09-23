@@ -660,6 +660,57 @@ pub fn estimate_runtime_state(
     batch_size: u64,
     floating_state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
+    estimate_runtime_state_impl(
+        layout,
+        input,
+        max_output_tokens,
+        batch_size,
+        floating_state_dtype_bytes,
+        false,
+    )
+}
+
+/// Minimum logical persistent payload at an installed frontier. Excludes optional
+/// tensors, allocation rounding, media inputs and workspaces. A layout declared
+/// only as a conservative upper estimate supplies no additional lower bound.
+pub fn estimate_runtime_state_payload_lower_bound(
+    layout: &StateMemoryLayout,
+    input: InputTokenCount,
+    batch_size: u64,
+    floating_state_dtype_bytes: NonZeroU8,
+) -> Result<u64, CapabilityError> {
+    if batch_size == 0 {
+        return Err(CapabilityError::InvalidConfiguration {
+            field: "batch_size",
+            detail: "must be positive".into(),
+        });
+    }
+    if layout.completeness == EstimationCompleteness::Conservative {
+        return Ok(0);
+    }
+    let state = estimate_runtime_state_impl(
+        layout,
+        InputTokenCount::text(input.model_positions),
+        0,
+        batch_size,
+        floating_state_dtype_bytes,
+        true,
+    )?;
+    checked_add(
+        state.fixed_state_bytes,
+        state.context_state_bytes,
+        "logical persistent state payload",
+    )
+}
+
+fn estimate_runtime_state_impl(
+    layout: &StateMemoryLayout,
+    input: InputTokenCount,
+    max_output_tokens: u64,
+    batch_size: u64,
+    floating_state_dtype_bytes: NonZeroU8,
+    payload_lower_bound: bool,
+) -> Result<RuntimeStateEstimate, CapabilityError> {
     if batch_size == 0 {
         return Err(CapabilityError::InvalidConfiguration {
             field: "batch_size",
@@ -698,6 +749,7 @@ pub fn estimate_runtime_state(
                     sliding_window_bounds.push(window);
                     layer_positions.min(window)
                 }
+                AttentionPolicy::Full if payload_lower_bound => layer_positions,
                 AttentionPolicy::Full => {
                     let adjustment = layout.allocation_granularity - 1;
                     checked_add(layer_positions, adjustment, "cache allocation rounding")?
@@ -729,6 +781,9 @@ pub fn estimate_runtime_state(
             }
         }
         for tensor in policy.fixed_state() {
+            if payload_lower_bound && tensor.presence == StateTensorPresence::Optional {
+                continue;
+            }
             let bytes = state_tensor_bytes(
                 tensor,
                 batch_size_usize,

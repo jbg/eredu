@@ -111,9 +111,9 @@ pub use backend::{
     TokenSamplingDecision, ValueDescriptor,
 };
 pub use capability::{
-    apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,
-    AdmissionRequest, AdmissionResult, AllocatorCachePolicyReport, AllocatorCachePolicySource,
-    AvailableMemory, CacheStateStrategy, CapabilityError,
+    apply_admission_policy, estimate_runtime_state, estimate_runtime_state_payload_lower_bound,
+    Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorCachePolicyReport,
+    AllocatorCachePolicySource, AvailableMemory, CacheStateStrategy, CapabilityError,
     EstimationCompleteness, InputModalities, InputTokenCount, ModelCapabilities,
     PhysicalMemorySemantics, RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions,
     StateMemoryLayout, StaticMemoryReport,

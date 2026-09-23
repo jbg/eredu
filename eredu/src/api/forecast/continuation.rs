@@ -64,7 +64,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
             "backend cannot bound the pending decode input".into(),
         )
     })?;
-    let profile = B::continuation_memory_profile(runtime, inputs)?.ok_or_else(|| {
+    let mut profile = B::continuation_memory_profile(runtime, inputs)?.ok_or_else(|| {
         GenerationForecastError::UnsupportedContinuation(
             "selected executable has no settled continuation state projection".into(),
         )
@@ -89,6 +89,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     forecast.request.input = InputTokenCount::text(profile.plan.current_positions);
     forecast.request.max_output_tokens = Some(additional_tokens);
     forecast.request.forecast_output_tokens = additional_tokens;
+    profile.plan = profile.plan.with_logical_state_bounds(&forecast.request)?;
     // The completed prompt no longer belongs to a raw token iterator. Controlled
     // facade retention, including its prompt and semantic buffers, is added below.
     for pool in &mut forecast.request.domains {
