@@ -2430,6 +2430,41 @@ pub struct TextGeneration<'a, B: TextGenerationBackend> {
 }
 
 impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
+    /// Establishes a healthy settled boundary without consuming pending input.
+    /// Completion failure closes the iterator; it must not resume unknown state.
+    pub fn synchronize(&mut self) -> Result<(), BackendFailure> {
+        let result = self
+            .inner
+            .resolve_completions_before_decode()
+            .map_err(BackendFailure::from_error)
+            .and_then(|()| self.runtime.synchronize());
+        if result.is_err() {
+            self.inner.step = None;
+        }
+        result
+    }
+
+    /// Borrows the installed sampler and pending input without executing or settling
+    /// work. Native observers must independently reject an in-flight session.
+    #[allow(clippy::type_complexity)]
+    pub fn observation_parts(
+        &self,
+    ) -> (
+        &ModelRuntime<B>,
+        &B::TextGenerationState,
+        Option<PendingTextInput<&B::Prompt, &B::Token>>,
+    ) {
+        (
+            self.runtime,
+            &self.inner.backend_state,
+            if self.inner.remaining_tokens == Some(0) {
+                None
+            } else {
+                self.inner.step.as_ref().map(PendingTextInput::as_ref)
+            },
+        )
+    }
+
     /// Starts generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,

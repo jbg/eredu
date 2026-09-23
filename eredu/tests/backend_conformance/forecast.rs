@@ -560,3 +560,195 @@ fn prepared_backend_contract_and_calibration_overrides_are_retained() {
         Some(1)
     );
 }
+
+impl eredu::api::ContinuationForecastBackend for MockBackend {
+    fn continuation_memory_profile(
+        runtime: &ModelRuntime<Self>,
+        additional_input_tokens: u64,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ContinuationMemoryProfile>,
+        GenerationForecastError,
+    > {
+        runtime
+            .session()
+            .authority
+            .require_idle()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let position = runtime.session().cache_positions;
+        Ok(Some(
+            eredu_runtime::memory_forecast::ContinuationMemoryProfile {
+                loaded: Self::loaded_memory_profile(runtime)?,
+                plan: eredu::api::ContinuationMemoryPlan {
+                    current_positions: position,
+                    additional_input_tokens,
+                    current_state: MemoryBytes::estimated(
+                        0,
+                        4096 + 32 * position,
+                        "fixture backing",
+                    ),
+                    peak_state: MemoryBytes::estimated(
+                        0,
+                        4096 + 32 * (position + additional_input_tokens),
+                        "fixture capacity envelope",
+                    ),
+                },
+            },
+        ))
+    }
+}
+
+#[test]
+fn ordinary_continuation_observes_pending_decode_once_without_advancing_or_extending_limit() {
+    let (mut model, _, _) = setup();
+    let config = eredu_core::TextGenerationConfig::new(
+        model
+            .resolve_generation_config(GenerationConfigOverrides {
+                max_new_tokens: Some(4),
+                ..Default::default()
+            })
+            .unwrap(),
+    );
+    let mut run = model.generate_tokens(vec![1; 17], config).unwrap();
+    assert!(run
+        .forecast_remaining_generation(3, &Default::default())
+        .is_err());
+    assert_eq!(run.next().unwrap().unwrap().token_id().unwrap(), 17);
+    // No implicit completion polling or settlement from forecasting.
+    assert!(run
+        .forecast_remaining_generation(3, &Default::default())
+        .is_err());
+    run.synchronize().unwrap();
+    let forecast = run
+        .forecast_remaining_generation(100, &Default::default())
+        .unwrap();
+    assert_eq!(forecast.continuation.current_positions, 17);
+    assert_eq!(forecast.estimate.requested_positions, 117);
+    assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(forecast.estimate.domains[0].phases.len(), 2);
+    assert_eq!(forecast.estimate.domains[0].phases[1].query_positions, 1);
+    assert_eq!(forecast.request.domains[0].already_resident_bytes, 4096);
+    assert_eq!(
+        forecast.estimate.domains[0]
+            .additional_generation_peak
+            .upper_bytes,
+        forecast.estimate.domains[0]
+            .overall_peak
+            .upper_bytes
+            .map(|n| n - 4096)
+    );
+    let zero = run
+        .forecast_remaining_generation(0, &Default::default())
+        .unwrap();
+    assert_eq!(zero.estimate.requested_positions, 17);
+    assert_eq!(zero.estimate.domains[0].phases.len(), 1);
+    assert_eq!(
+        zero.estimate.domains[0].phases[0].workspace.upper_bytes,
+        Some(0)
+    );
+    let remaining: Vec<_> = run
+        .by_ref()
+        .take(3)
+        .map(|t| t.unwrap().token_id().unwrap())
+        .collect();
+    assert_eq!(remaining, [18, 19, 20]);
+    assert!(run
+        .forecast_remaining_generation(1, &Default::default())
+        .is_err());
+}
+
+#[test]
+fn continuation_estimator_keeps_unknown_growth_and_checks_overflow() {
+    use eredu::api::{estimate_continuation_memory, ContinuationMemoryPlan};
+    let (model, _, settings) = setup();
+    let mut request = model
+        .forecast_token_ids(&[1; 17], settings, &Default::default())
+        .unwrap()
+        .request;
+    request.max_output_tokens = Some(3);
+    let mut plan = ContinuationMemoryPlan {
+        current_positions: 17,
+        additional_input_tokens: 3,
+        current_state: MemoryBytes::estimated(0, 65536, "retained backing after a longer prefix"),
+        peak_state: MemoryBytes::unknown("unsupported native growth"),
+    };
+    let unknown = estimate_continuation_memory(&request, &plan).unwrap();
+    assert_eq!(unknown.fit, MemoryFit::InsufficientInformation);
+    assert_eq!(
+        unknown.domains[0].phases[0].persistent_state.upper_bytes,
+        Some(65536)
+    );
+    assert!(unknown.domains[0].generation_peak.upper_bytes.is_none());
+    plan.peak_state = MemoryBytes::estimated(0, 131072, "interior cache/capacity envelope");
+    let bounded = estimate_continuation_memory(&request, &plan).unwrap();
+    assert_eq!(bounded.fit, MemoryFit::LikelyFit);
+    assert_eq!(
+        bounded.domains[0].phases[1].persistent_state.upper_bytes,
+        Some(131072)
+    );
+    assert!(bounded.domains[0].phases[1].workspace.upper_bytes.unwrap() >= 131072);
+    request.domains[0].budget.application_limit_bytes = Some(4096);
+    assert_eq!(
+        estimate_continuation_memory(&request, &plan).unwrap().fit,
+        MemoryFit::LikelyShortfall
+    );
+    plan.current_positions = u64::MAX;
+    request.input = eredu_core::InputTokenCount::text(u64::MAX);
+    assert!(matches!(
+        estimate_continuation_memory(&request, &plan),
+        Err(eredu_core::CapabilityError::ArithmeticOverflow { .. })
+    ));
+}
+
+#[test]
+fn continuation_native_envelope_bounds_interior_remainder_state() {
+    use eredu::api::{estimate_continuation_memory, ContinuationMemoryPlan};
+    use eredu_core::cache::{
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
+    };
+    let (model, _, settings) = setup();
+    let mut request = model
+        .forecast_token_ids(&[1; 17], settings, &Default::default())
+        .unwrap()
+        .request;
+    request.max_output_tokens = Some(7); // Endpoint is divisible by eight: remainder payload is zero.
+    let remainder = StateTensorPolicy::new(
+        StateTensorRole::Recurrent,
+        vec![
+            StateTensorDimension::Batch,
+            StateTensorDimension::PrefixTokensRem(std::num::NonZeroU32::new(8).unwrap()),
+        ],
+        StateTensorDtype::Float32,
+        MutableStateResidency::LayerScopedOffloadable,
+    )
+    .unwrap();
+    request.domains[0].executions[0].state_layout = StateMemoryLayout::new(
+        eredu_core::LayerSchedule::new(
+            1,
+            vec![LayerCachePolicy::fixed_only(vec![remainder]).unwrap()],
+        )
+        .unwrap(),
+        vec![0],
+        32,
+        8,
+        EstimationCompleteness::Complete,
+    )
+    .unwrap();
+    let plan = ContinuationMemoryPlan {
+        current_positions: 17,
+        additional_input_tokens: 7,
+        current_state: MemoryBytes::estimated(0, 64, "allocated capacity"),
+        peak_state: MemoryBytes::estimated(0, 128, "interior peak including retained capacity"),
+    };
+    let result = estimate_continuation_memory(&request, &plan).unwrap();
+    assert_eq!(result.fit, MemoryFit::LikelyFit);
+    assert_eq!(
+        result.domains[0].phases[1].persistent_state.upper_bytes,
+        Some(128)
+    );
+    assert_eq!(result.requested_positions, 24);
+    assert!(!result
+        .uncertainties
+        .iter()
+        .any(|s| s.contains("interior peaks of remainder-shaped state unavailable")));
+}

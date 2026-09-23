@@ -665,3 +665,6 @@ mod fp8_parameters;
 
 #[path = "native_execution_control/capture_failures.rs"]
 mod capture_failures;
+
+#[path = "native_execution_control/continuation.rs"]
+mod continuation;

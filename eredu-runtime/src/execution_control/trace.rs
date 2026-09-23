@@ -27,6 +27,10 @@ impl TraceBudget {
             emitted_bytes: 0,
         }
     }
+    /// Immutable admitted transport limits; observing them consumes no budget.
+    pub fn limits(&self) -> TraceLimits {
+        self.limits
+    }
     /// Bytes already delivered under this owner.
     pub fn emitted_bytes(&self) -> u64 {
         self.emitted_bytes

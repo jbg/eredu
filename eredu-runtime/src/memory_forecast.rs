@@ -7,6 +7,8 @@ use eredu_core::{
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
+mod continuation;
+pub use continuation::*;
 mod capture;
 pub use capture::apply_capture_memory_bound;
 mod speculative;
@@ -18,6 +20,9 @@ pub enum GenerationForecastError {
     /// Invalid or unavailable portable geometry/accounting.
     #[error(transparent)]
     Capability(#[from] CapabilityError),
+    /// The requested boundary cannot be observed without advancing execution.
+    #[error("continuation forecast unavailable: {0}")]
+    UnsupportedContinuation(String),
     /// Invalid resolved generation settings.
     #[error(transparent)]
     Generation(#[from] eredu_core::generation::GenerationError),

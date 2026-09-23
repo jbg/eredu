@@ -881,6 +881,9 @@ pub(crate) trait ErasedReplicatedTextExecutable {
             "native control state is unsupported".into(),
         ))
     }
+    fn estimate_installed_control_growth(&self, _additional: u64) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
     fn estimate_native_control_growth(
         &self,
         _saved: &dyn std::any::Any,

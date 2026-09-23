@@ -61,55 +61,7 @@ impl GenerationForecastBackend for MlxBackend<'_> {
     fn loaded_memory_profile(
         runtime: &ModelRuntime<Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        let session = runtime.session();
-        let mut geometry = session
-            .capture_discovery
-            .as_ref()
-            .ok_or_else(|| {
-                CapabilityError::Observation(
-                    "loaded executable has no retained architecture memory projection".into(),
-                )
-            })?
-            .generation_memory()?
-            .clone();
-        let offset = session
-            .payload
-            .model
-            .erased()
-            .forecast_state_offset()
-            .map_err(eredu_core::BackendFailure::from_error)?;
-        if offset != Some(0) {
-            geometry.workspace = None;
-            geometry.assumptions.push("existing or unavailable session state is not projected; reset before forecasting a fresh request".into());
-        }
-        let host_execution = runtime
-            .backend()
-            .stream()
-            .get_device()
-            .and_then(|d| d.get_type())
-            .map_err(|e| {
-                eredu_core::BackendFailure::from_error(e)
-                    .with_operation("forecast execution device")
-            })?
-            == safemlx::DeviceType::Cpu;
-        let allocator_cache_limit = match crate::allocator_cache_policy() {
-            Ok(policy) => {
-                let source = format!(
-                    "MLX allocator-cache policy {:?}: {} bytes",
-                    policy.source, policy.limit_bytes
-                );
-                geometry.assumptions.push(source.clone());
-                Observed::exact(policy.limit_bytes, source)
-            }
-            Err(error) => Observed::unavailable(error.to_string()),
-        };
-        Ok(LoadedMemoryProfile {
-            geometry,
-            parameters: crate::composition::mlx::capability::static_model_memory(session)?,
-            available: crate::composition::mlx::capability::available_memory()?,
-            host_execution,
-            allocator_cache_limit,
-        })
+        memory_profile(runtime, false)
     }
 
     fn forecast_execution_contract(
@@ -141,5 +93,113 @@ impl GenerationForecastBackend for MlxBackend<'_> {
                 LogitsWorkspace::EveryPosition
             },
         }
+    }
+}
+
+fn memory_profile(
+    runtime: &ModelRuntime<MlxBackend<'_>>,
+    continuation: bool,
+) -> Result<LoadedMemoryProfile, GenerationForecastError> {
+    let session = runtime.session();
+    let mut geometry = session
+        .capture_discovery
+        .as_ref()
+        .ok_or_else(|| {
+            CapabilityError::Observation(
+                "loaded executable has no retained architecture memory projection".into(),
+            )
+        })?
+        .generation_memory()?
+        .clone();
+    let offset = session
+        .payload
+        .model
+        .erased()
+        .forecast_state_offset()
+        .map_err(eredu_core::BackendFailure::from_error)?;
+    if !continuation && offset != Some(0) {
+        geometry.workspace = None;
+        geometry.assumptions.push("existing or unavailable session state is not projected; reset before forecasting a fresh request".into());
+    }
+    let host_execution = runtime
+        .backend()
+        .stream()
+        .get_device()
+        .and_then(|d| d.get_type())
+        .map_err(|e| {
+            eredu_core::BackendFailure::from_error(e).with_operation("forecast execution device")
+        })?
+        == safemlx::DeviceType::Cpu;
+    let allocator_cache_limit = match crate::allocator_cache_policy() {
+        Ok(policy) => {
+            let source = format!(
+                "MLX allocator-cache policy {:?}: {} bytes",
+                policy.source, policy.limit_bytes
+            );
+            geometry.assumptions.push(source.clone());
+            Observed::exact(policy.limit_bytes, source)
+        }
+        Err(error) => Observed::unavailable(error.to_string()),
+    };
+    Ok(LoadedMemoryProfile {
+        geometry,
+        parameters: crate::composition::mlx::capability::static_model_memory(session)?,
+        available: crate::composition::mlx::capability::available_memory()?,
+        host_execution,
+        allocator_cache_limit,
+    })
+}
+
+impl eredu_runtime::memory_forecast::ContinuationForecastBackend for MlxBackend<'_> {
+    fn continuation_memory_profile(
+        runtime: &ModelRuntime<Self>,
+        additional_input_tokens: u64,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::ContinuationMemoryProfile>,
+        GenerationForecastError,
+    > {
+        use eredu_core::execution_control::NativeTextStateBackend;
+        use eredu_runtime::memory_estimation::MemoryBytes;
+        // This read-only native observation validates backend identity and idle authority.
+        let Some(current) = Self::estimate_native_text_state(runtime, None)
+            .map_err(eredu_core::BackendFailure::from_error)?
+        else {
+            return Ok(None);
+        };
+        let model = runtime.session().payload.model.erased();
+        let Some(position) = model
+            .forecast_state_offset()
+            .map_err(eredu_core::BackendFailure::from_error)?
+            .and_then(|n| u64::try_from(n).ok())
+        else {
+            return Ok(None);
+        };
+        // Include the current capacity envelope even for a zero-token forecast;
+        // retained tensor views alone need not describe their backing capacity.
+        let current_capacity = model
+            .estimate_installed_control_growth(0)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let current_bound = current_capacity.and_then(|n| current.retained_bytes.checked_add(n));
+        let growth = model
+            .estimate_installed_control_growth(additional_input_tokens)
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let peak = growth.and_then(|n| current.retained_bytes.checked_add(n));
+        Ok(Some(eredu_runtime::memory_forecast::ContinuationMemoryProfile {
+            loaded: memory_profile(runtime, true)?,
+            plan: eredu_runtime::memory_forecast::ContinuationMemoryPlan {
+                current_positions: position,
+                additional_input_tokens,
+                current_state: match current_bound {
+                    Some(n) => MemoryBytes::estimated(0, n,
+                        "installed native logical state/capacity and materialization allowance; not measured distinct backing"),
+                    None => MemoryBytes::unknown("installed native capacity allowance unavailable or overflowing"),
+                },
+                peak_state: match peak {
+                    Some(n) => MemoryBytes::estimated(0, n,
+                        "installed state plus native growth envelope, including allocation capacity and interior peaks"),
+                    None => MemoryBytes::unknown("native continuation growth bound unavailable or overflowing"),
+                },
+            },
+        }))
     }
 }

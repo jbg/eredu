@@ -32,7 +32,15 @@ pub enum TextModelError {
 
 /// Asynchronous token generation with backend-independent errors.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
-    inner: eredu_core::TextGeneration<'a, B>,
+    pub(super) inner: eredu_core::TextGeneration<'a, B>,
+}
+
+impl<B: TextGenerationBackend> TextGeneration<'_, B> {
+    /// Settles retained submissions without consuming another token. Useful before
+    /// observing a continuation forecast; failures close the iterator.
+    pub fn synchronize(&mut self) -> Result<(), eredu_core::BackendFailure> {
+        self.inner.synchronize()
+    }
 }
 
 impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {

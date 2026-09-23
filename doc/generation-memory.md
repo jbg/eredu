@@ -285,8 +285,8 @@ request supports chunking; it preserves full-pass requirements. Loaded forecasts
 exclude completed loading and deduct only declared resident parameter backing
 from additional memory, never the process-global active allocator counter. Fresh
 requests should start from reset state. The MLX adapter detects nonempty or
-unavailable state and leaves its continuation peak unbounded rather than silently
-forecasting an empty cache. Prepared media, bounded transfers and unprojected
+unavailable state and leaves a **fresh-request** forecast unbounded rather than
+silently forecasting an empty cache. Use the continuation API for an active run. Prepared media, bounded transfers and unprojected
 families likewise retain explicit unknowns.
 
 `ForecastCalibration::default()` is the single library-owned source for the
@@ -655,3 +655,87 @@ fixture checks and portable domain tests do not establish those native results.
   and offline `cargo package --no-verify --allow-dirty` for core, runtime,
   architectures and facade passed. This verifies archive inclusion/resolution,
   not the full release script's extracted-package/all-target test matrix.
+
+
+## Mid-session continuation forecasts
+
+At a settled ordinary decode boundary, both `ControlledGenerationSession` and
+`TextGeneration` expose:
+
+```rust,ignore
+let forecast = session.forecast_remaining_generation(128, &options)?;
+```
+
+A controlled `step` settles the prediction and delivers its captures before
+returning. For an asynchronous token iterator, call `tokens.synchronize()?`
+first to settle retained submissions without consuming the next token. Forecasting
+itself never waits, submits, snapshots, advances randomness, charges capture or
+transport budgets, or changes the configured generation limit. The horizon is a
+what-if allowance and may exceed the remaining configured tokens. Request a new
+forecast after advancing, restoring, exchanging a branch, or changing the horizon.
+
+`ContinuationForecast` records the actual cached position and the additional
+pending inputs, plus a reproducible `ContinuationMemoryPlan`. The last emitted
+token is still pending decode: after prefill of P positions, N further predictions
+reach P + N cached positions. Phases are `continuation_start` and, for N > 0,
+`decode` with one query position. Completed loading and prefill are excluded.
+Zero predicts retained state without another model invocation.
+
+MLX combines installed native state storage with its existing continuation-growth
+mechanism. That mechanism covers capacity rounding, sliding-cache retention and
+interior peaks of remainder-shaped state. These are conservative logical storage
+allowances, not measured distinct backing. The same bound covers possible old and
+replacement cache overlap. Sampler/history/pending-input retention, admitted
+capture/intervention limits and the controlled facade's decoder, constraints,
+semantic records and trace are included. Live snapshots and branches contribute
+their reserved retention upper allowance, including reserved future growth.
+Unattributed host/native allowances are conservatively included in each separate
+physical pool. Unknown grammar, native growth, workspace or other storage keeps
+its upper end unknown.
+
+Only declared resident parameter backing is deducted when comparing additional
+memory with current available capacity. State, snapshot and branch allowances are
+not credited as observed allocations. This can overestimate incremental cost,
+especially with many large snapshots, but does not turn unused reservations into
+free capacity. Immutable shared tokenizer data, arbitrary consumer copies,
+external decoder state for raw iterators, unrelated sessions and total process
+memory remain outside the modeled request; reserve capacity for them.
+
+Initial prefill, failed/cancelled/terminal controlled sessions and unsettled
+submissions are rejected. Selected executables without an installed-state
+projection return `GenerationForecastError::UnsupportedContinuation`. Mid-flight
+speculative transactions are not ordinary continuations and remain unsupported;
+the existing prepared speculative forecast still covers fresh speculative runs.
+
+
+Continuation validation (2026-09-23): portable tests cover pending-token offsets,
+zero and extended horizons, overflow/shortfall/unknown growth, interior remainder
+peaks, unchanged output/copy/trace budgets, restore, branch exchange and failed
+iterator settlement. Native Metal validation used the nonzero Qwen2 dense and
+mixed sliding-window fixtures (`sliding_window = 2`), each with a 33-position
+prefill, a saved continuation, and 16 further forced ordinary tokens. Additional
+upper allowances were 339,639,607 and 339,627,319 bytes; measured incremental native
+active peaks were 16,854 and 7,636 bytes. The Gemma2 fixture confirmed bounded
+native state while preserving its independently unmodeled workspace.
+
+The pinned original-weight SmolLM-135M checkpoint at revision
+`1d461723eec654e65efdc40cf49301c89c0c92f4` also passed on Metal: four prompt
+positions, 16 further forced ordinary tokens, restore, and an ordinary iterator
+forecast after explicit settlement. The additional upper was 352,293,335 bytes;
+measured incremental native active peak was 3,102,774 bytes. Default allocator and
+graph allowances dominate these small runs; these observations do not calibrate
+all models or make the logical envelopes allocation guarantees. The local
+`/tmp/eredu-spec-validation/model` copy uses the same original weights and a
+literal content-only chat template added to tokenizer metadata. Reproduce with:
+
+```sh
+cargo test -p eredu --features mlx,metal --test native_execution_control \
+  native_continuation_forecasts -- --ignored --nocapture --test-threads=1
+EREDU_CONTINUATION_MODEL=/tmp/eredu-spec-validation/model \
+  cargo test -p eredu --features mlx,metal --test native_execution_control \
+  native_continuation_forecasts -- --ignored --nocapture --test-threads=1
+```
+
+The same fixture test can run without Metal using `--no-default-features
+--features mlx` and omitting `--ignored`; this change was validated natively on
+Metal, not CUDA or a CPU-only MLX build.

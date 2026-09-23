@@ -159,6 +159,15 @@ where
             .estimate_snapshot_growth(&saved.state, additional_input_tokens))
     }
 
+    /// Bounds growth of the installed state without copying or advancing it.
+    pub fn estimate_installed_control_state_growth(
+        &self,
+        additional_input_tokens: u64,
+    ) -> Option<u64> {
+        self.mechanisms
+            .estimate_snapshot_growth(&self.state, additional_input_tokens)
+    }
+
     fn estimate_control_state_parts(
         &self,
         state: &M::State,

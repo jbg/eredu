@@ -1039,3 +1039,23 @@ do not consume preparation, state, callbacks, capture budgets or submission
 authority. Forecast before startup from fresh/reset state; forecasting an already
 advanced continuation requires a current-state projection, which the MLX adapter
 currently reports as unbounded. See [generation memory](generation-memory.md).
+
+
+## Forecasting further tokens
+
+After an ordinary controlled step, call
+`session.forecast_remaining_generation(additional_tokens, &options)` to observe
+cache position, retained state and a decode-only memory envelope. The exclusive
+session owner supplies a quiescent boundary; forecasts consume no predictions,
+random draws, snapshots, captures or transport budget. Restore and branch exchange
+change which installed state is observed. Snapshot/branch reservations remain
+conservative retained upper costs, not resident-memory credits. Unknown native or
+host state retains an unknown upper end. The requested horizon is hypothetical
+and never extends the run's configured token limit.
+
+This API applies to advanced ordinary sessions. It rejects initial, terminal and
+unsettled boundaries. Controlled speculative sessions can retain tentative draft,
+verification and optimistic transaction state between actions; they require a
+phase-aware continuation projection and do not expose this ordinary forecast.
+For complete accounting and raw iterator settlement, see
+[mid-session memory forecasts](generation-memory.md#mid-session-continuation-forecasts).

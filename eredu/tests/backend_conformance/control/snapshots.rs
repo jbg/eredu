@@ -2,10 +2,10 @@ use super::*;
 use eredu_core::PendingTextInput;
 use eredu_runtime::{capture::CaptureSession, execution_control::TextSnapshotBackend};
 
-// This semantic fixture has no persistent model tensors: all model continuation
-// state is its pending canonical input. Native storage conformance runs separately
+// This semantic fixture has no persistent model tensors: its model continuation
+// retains only the consumed-input position and pending canonical input. Native storage conformance runs separately
 // against actual dense, convolution/recurrent and MoE fixtures.
-pub(crate) struct Native(String);
+pub(crate) struct Native(String, u64);
 impl NativeTextStateBackend for MockBackend {
     type NativeTextState = Native;
     fn estimate_native_text_growth(
@@ -35,14 +35,17 @@ impl NativeTextStateBackend for MockBackend {
     }
     fn capture_native_text_state(runtime: &mut ModelRuntime<Self>) -> Result<Native, MockError> {
         runtime.session().authority.require_idle()?;
-        Ok(Native(runtime.session().intervention_identity.clone()))
+        Ok(Native(
+            runtime.session().intervention_identity.clone(),
+            runtime.session().cache_positions,
+        ))
     }
     fn copy_native_text_state(
         runtime: &mut ModelRuntime<Self>,
         saved: &Native,
     ) -> Result<Native, MockError> {
         Self::validate_native_text_state(runtime, saved)?;
-        Ok(Native(saved.0.clone()))
+        Ok(Native(saved.0.clone(), saved.1))
     }
     fn validate_native_text_state(
         runtime: &ModelRuntime<Self>,
@@ -58,7 +61,9 @@ impl NativeTextStateBackend for MockBackend {
         runtime: &mut ModelRuntime<Self>,
         saved: &mut Native,
     ) -> Result<(), MockError> {
-        Self::validate_native_text_state(runtime, saved)
+        Self::validate_native_text_state(runtime, saved)?;
+        std::mem::swap(&mut runtime.session_mut().cache_positions, &mut saved.1);
+        Ok(())
     }
 }
 use observed_mock::Sampling;
@@ -735,4 +740,107 @@ fn explicit_intervention_removal_retains_its_empty_override_provenance() {
     assert!(start.generation.intervention_plan_id.is_none());
     run.exchange(&mut branch, collect(&mut records)).unwrap();
     run.step(collect(&mut records)).unwrap();
+}
+
+#[test]
+fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
+    use eredu::api::{GenerationBranchOptions, MemoryFit};
+    let (mut model, chat, settings, first) = snapshot_setup();
+    let trace = eredu::api::TraceLimits {
+        per_record_bytes: 16384,
+        total_bytes: 65536,
+    };
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, observed_mock::plan(), trace)
+        .unwrap();
+    let mut run = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    run.enable_snapshots(SnapshotLimits {
+        max_branches: 1,
+        retained_bytes: 128 << 20,
+        cumulative_copy_bytes: 512 << 20,
+        ..snapshot_limits()
+    })
+    .unwrap();
+    assert!(run
+        .forecast_remaining_generation(3, &Default::default())
+        .is_err());
+    run.step(|_| ControlFlow::Continue(())).unwrap();
+    let before_snapshot = run
+        .forecast_remaining_generation(3, &Default::default())
+        .unwrap();
+    assert_eq!(
+        before_snapshot.continuation.current_positions,
+        u64::from(first)
+    );
+    let saved = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
+    let checkpoint = run.output_checkpoint();
+    let usage = run.snapshot_usage().unwrap();
+    let transport = run.emitted_bytes();
+    let forecast = run
+        .forecast_remaining_generation(3, &Default::default())
+        .unwrap();
+    assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(forecast.estimate.requested_positions, u64::from(first) + 3);
+    assert_eq!(run.output_checkpoint(), checkpoint);
+    assert_eq!(run.snapshot_usage().unwrap(), usage);
+    assert_eq!(run.emitted_bytes(), transport);
+    assert!(
+        forecast.request.domains[0]
+            .retained_input
+            .upper_bytes
+            .unwrap()
+            >= before_snapshot.request.domains[0]
+                .retained_input
+                .upper_bytes
+                .unwrap()
+                + saved.metadata().retained_bytes
+    );
+    // The forecast allows hypothetical horizons beyond the run's configured limit.
+    let long = run
+        .forecast_remaining_generation(100, &Default::default())
+        .unwrap();
+    assert_eq!(long.continuation.additional_input_tokens, 100);
+    run.step(|_| ControlFlow::Continue(())).unwrap();
+    let advanced = run
+        .forecast_remaining_generation(2, &Default::default())
+        .unwrap();
+    assert_eq!(
+        advanced.continuation.current_positions,
+        u64::from(first) + 1
+    );
+    run.restore(&saved, |_| ControlFlow::Continue(())).unwrap();
+    let restored = run
+        .forecast_remaining_generation(3, &Default::default())
+        .unwrap();
+    assert_eq!(restored.continuation, forecast.continuation);
+    let mut branch = run
+        .fork(
+            &saved,
+            GenerationBranchOptions {
+                trace_limits: trace,
+                capture_limits: Some(observed_mock::plan().limits),
+                sampling: None,
+                intervention: None,
+            },
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+    run.exchange(&mut branch, |_| ControlFlow::Continue(()))
+        .unwrap();
+    let usage = run.snapshot_usage().unwrap();
+    let child = run
+        .forecast_remaining_generation(3, &Default::default())
+        .unwrap();
+    assert_eq!(child.estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(child.continuation, forecast.continuation);
+    assert_eq!(run.snapshot_usage().unwrap(), usage);
+    let wire = serde_json::to_value(child).unwrap();
+    assert_eq!(
+        wire["estimate"]["domains"][0]["phases"][0]["phase"],
+        "continuation_start"
+    );
 }

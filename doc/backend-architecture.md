@@ -6456,3 +6456,24 @@ slicing, positions and completion; an intermediate prefix is settled before the
 next is submitted. Requests with incompatible observation or specialized input
 contracts keep a full prefill pass. Sampling and commitment remain in the shared
 driver, and the prefill policy survives controlled continuation.
+
+
+### Settled continuation memory observations
+
+`eredu-runtime::memory_forecast::ContinuationForecastBackend` supplies neutral
+installed-state/frontier facts and horizon-specific native storage envelopes.
+Runtime owns decode-only phase composition, cache-copy overlap, physical-pool
+comparisons and uncertainty. The MLX adapter validates idle session authority and
+uses the existing typed state geometry/capacity growth mechanism through
+`ReplicatedTextSession::estimate_installed_control_state_growth`; it never
+snapshots or submits work to obtain a forecast. Architecture state geometry stays
+in portable family declarations.
+
+Core's ordinary iterator lends read-only sampler/pending-input observations and
+provides explicit completion settlement via `synchronize`. The facade composes
+those facts with sampling, constraints, semantic state, admitted capture/trace
+limits and live snapshot/branch reservation usage. Controlled forecasts borrow
+the shared quiescent continuation boundary. Neither path changes execution limits
+or refunds resource budgets. Native state/reservation estimates are upper
+allowances, never credits against observed available memory. See
+[generation memory](generation-memory.md#mid-session-continuation-forecasts).

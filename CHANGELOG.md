@@ -4,6 +4,17 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Mid-session memory forecasts
+
+Ordinary token iterators and controlled sessions now expose
+`forecast_remaining_generation`. Settled MLX continuations project the actual
+cache frontier, native growth/capacity, decode workspace, sampling and retained
+capture/control state without repeating completed prefill or loading. Iterator
+`synchronize` establishes a read-only observation boundary. Forecasting does not
+advance or extend generation, copy state, or consume observation budgets.
+Unsupported or unknown storage stays explicit; speculative continuations remain
+outside this ordinary API. See [continuation accounting](doc/generation-memory.md#mid-session-continuation-forecasts).
+
 ## 2026-09-23 — Device-aware cold memory forecasts
 
 `GenerationMemoryOptions::for_local_device(input, plan.device())` now derives

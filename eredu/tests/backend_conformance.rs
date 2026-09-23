@@ -69,10 +69,10 @@ const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
 mod controlled_speculative;
-#[path = "backend_conformance/observed_mock.rs"]
-mod observed_mock;
 #[path = "backend_conformance/forecast.rs"]
 mod forecast;
+#[path = "backend_conformance/observed_mock.rs"]
+mod observed_mock;
 #[path = "backend_conformance/preparation.rs"]
 mod preparation;
 #[path = "backend_conformance/templates.rs"]
@@ -109,6 +109,7 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 struct MockSession {
+    cache_positions: u64,
     authority: eredu_core::SessionAuthority,
     intervention_identity: String,
     distributed: MockDistributedSession,
@@ -218,6 +219,7 @@ impl BackendProvider for MockBackend {
         eredu_core::SessionAdmission::new(model.capabilities())
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
+            cache_positions: 0,
             authority: eredu_core::SessionAuthority::new(),
             intervention_identity: eredu_core::intervention::new_intervention_session_identity(),
             distributed: MockDistributedSession {
@@ -252,7 +254,10 @@ impl BackendSession<MockBackend> for MockSession {
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         let lease = self.authority.begin_submission()?;
         Ok(Submission {
-            output: input.len() as u32,
+            output: {
+                self.cache_positions += input.len() as u64;
+                input.len() as u32
+            },
             completion: MockSessionCompletion(lease),
         })
     }
@@ -264,7 +269,10 @@ impl BackendSession<MockBackend> for MockSession {
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         let lease = self.authority.begin_submission()?;
         Ok(Submission {
-            output: input + 1,
+            output: {
+                self.cache_positions += 1;
+                input + 1
+            },
             completion: MockSessionCompletion(lease),
         })
     }
@@ -406,6 +414,7 @@ impl TextGenerationBackend for MockBackend {
         session: &mut Self::Session,
     ) -> Result<(), eredu_core::BackendFailure> {
         session.authority.require_idle()?;
+        session.cache_positions = 0;
         Ok(())
     }
 

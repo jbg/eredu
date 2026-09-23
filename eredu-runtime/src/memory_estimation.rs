@@ -316,6 +316,8 @@ pub struct GenerationMemoryRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPhase {
+    /// Already installed continuation state; no model invocation.
+    ContinuationStart,
     /// Artifact loading and conversion before generation.
     Loading,
     /// Prompt execution, including growing persistent state.
@@ -742,6 +744,22 @@ pub fn estimate_generation_memory(
     } else {
         MemoryFit::InsufficientInformation
     };
+    let uncertainties = memory_uncertainties(request, false);
+    Ok(GenerationMemoryEstimate { requested_positions: positions, is_forecast: request.max_output_tokens.is_none(),
+        domains, fit: overall_fit, uncertainties, assumptions: vec![
+            "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.".into(),
+            "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.".into(),
+            "One decoder-layer workspace includes four residual-width arrays, Q/K/V and three MLP intermediates. The selected backend overlap interval multiplies linear intermediates only; logits, attention scratch and cache-update costs remain separate.".into(),
+            "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.".into(),
+            "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately.".into(),
+        ] })
+}
+
+/// Sources shared by fresh and native-state continuation projections.
+pub(crate) fn memory_uncertainties(
+    request: &GenerationMemoryRequest,
+    native_state_envelope: bool,
+) -> Vec<String> {
     let mut uncertainties = Vec::new();
     for plan in &request.domains {
         for (name, bytes) in [
@@ -766,7 +784,7 @@ pub fn estimate_generation_memory(
                     execution.workspace_overlap.detail
                 ));
             }
-            if has_nonmonotonic_state(&execution.state_layout) {
+            if !native_state_envelope && has_nonmonotonic_state(&execution.state_layout) {
                 uncertainties.push(format!(
                     "{prefix}: interior peaks of remainder-shaped state unavailable"
                 ));
@@ -790,14 +808,7 @@ pub fn estimate_generation_memory(
             }
         }
     }
-    Ok(GenerationMemoryEstimate { requested_positions: positions, is_forecast: request.max_output_tokens.is_none(),
-        domains, fit: overall_fit, uncertainties, assumptions: vec![
-            "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.".into(),
-            "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.".into(),
-            "One decoder-layer workspace includes four residual-width arrays, Q/K/V and three MLP intermediates. The selected backend overlap interval multiplies linear intermediates only; logits, attention scratch and cache-update costs remain separate.".into(),
-            "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.".into(),
-            "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately.".into(),
-        ] })
+    uncertainties
 }
 
 /// Recomputes supported chunk candidates independently, preserving the supplied

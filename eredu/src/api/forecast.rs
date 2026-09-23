@@ -7,6 +7,8 @@ pub use eredu_runtime::memory_forecast::{
     GenerationForecastError, SpeculativeForecastBackend, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
+mod continuation;
+pub use continuation::*;
 
 /// Application comparisons and optional calibration overrides. Missing available
 /// bytes are filled from backend observations, never from installed capacity.
@@ -344,7 +346,7 @@ fn mark_specialized(
     Ok(())
 }
 
-fn loaded_forecast(
+pub(super) fn loaded_forecast(
     mut profile: LoadedMemoryProfile,
     input: InputTokenCount,
     output: u64,

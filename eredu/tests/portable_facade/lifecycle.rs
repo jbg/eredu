@@ -353,3 +353,24 @@ fn reset_failure_reaches_the_generic_caller() {
     assert_eq!(error.source().unwrap().to_string(), "reset failed");
     assert_eq!(state.resets.get(), 0);
 }
+
+#[test]
+fn iterator_synchronize_failure_closes_generation_and_retains_unresolved_authority() {
+    let (mut model, state) = model();
+    let config = model.resolve_generation_config(Default::default()).unwrap();
+    let mut generation = model
+        .generate_tokens(vec![0], TextGenerationConfig::new(config))
+        .unwrap();
+    generation.next().unwrap().unwrap();
+    state.fail_wait.set(true);
+    let error = generation.synchronize().unwrap_err();
+    assert_eq!(error.source().unwrap().to_string(), "unresolved work");
+    assert!(generation.next().is_none());
+    assert!(state.pending.borrow().is_some());
+    drop(generation);
+    assert!(model.synchronize().is_err());
+    assert!(model.reset().is_err());
+    assert_eq!(state.resets.get(), 0);
+    drop(model);
+    assert!(state.pending.borrow().is_none());
+}

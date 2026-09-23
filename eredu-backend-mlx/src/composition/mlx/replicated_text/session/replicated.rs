@@ -535,6 +535,12 @@ where
             .map_err(|error| Error::Other(Box::new(error)))
     }
 
+    fn estimate_installed_control_growth(&self, additional: u64) -> Result<Option<u64>, Error> {
+        Ok(self
+            .session
+            .estimate_installed_control_state_growth(additional))
+    }
+
     fn estimate_native_control_growth(
         &self,
         saved: &dyn std::any::Any,
