@@ -130,12 +130,18 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         reset_local_allocator_peak().unwrap();
         let config =
             TextGenerationConfig::new(model.resolve_generation_config(settings.overrides).unwrap());
+        let generation_started = std::time::Instant::now();
         let mut tokens = model.generate_tokens(ids.clone(), config).unwrap();
         let mut generated = Vec::new();
+        let mut first_token_elapsed = std::time::Duration::ZERO;
         for _ in 0..4 {
             generated.push(tokens.next().unwrap().unwrap().token_id().unwrap());
+            if generated.len() == 1 {
+                first_token_elapsed = generation_started.elapsed();
+            }
         }
         tokens.synchronize().unwrap();
+        let first_four_elapsed = generation_started.elapsed();
         let continuation_baseline = eredu_backend_mlx::allocator_memory()
             .unwrap()
             .active_bytes();
@@ -149,10 +155,12 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         );
         let first_peak = eredu_backend_mlx::allocator_memory().unwrap().peak_bytes();
         reset_local_allocator_peak().unwrap();
+        let remainder_started = std::time::Instant::now();
         for token in tokens {
             generated.push(token.unwrap().token_id().unwrap());
         }
         model.synchronize().unwrap();
+        let generation_elapsed = first_four_elapsed + remainder_started.elapsed();
         let measured = eredu_backend_mlx::allocator_memory().unwrap();
         let measured_growth = first_peak
             .max(measured.peak_bytes())
@@ -208,5 +216,6 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         }
         assert_eq!(run.token_ids(), &generated[..run.token_ids().len()]);
         eprintln!("LFM2 memory: model={}, quantized={quantized}, positions={length}, scalar_bytes={}, cold_upper={}, loaded_additional_upper={upper}, measured_growth={measured_growth}, continuation_upper={continued_upper}, continuation_growth={continued_growth}, controlled_forecast={checked_controlled}", path.display(), loaded.request.scalar_bytes, cold.estimate.domains[0].overall_peak.upper_bytes.unwrap());
+        eprintln!("LFM2 timing: positions={length}, first_token_ms={:.3}, generation_ms={:.3}, generated_tokens={}", first_token_elapsed.as_secs_f64() * 1000.0, generation_elapsed.as_secs_f64() * 1000.0, generated.len());
     }
 }

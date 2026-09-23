@@ -471,70 +471,74 @@ fn independently_prepared_query_tiles(
 #[ignore = "requires MLX runtime execution; run with --test-threads=1"]
 fn prepared_input_score_tiles_preserve_gqa_masks_sinks_and_rounding() {
     use safemlx::Dtype;
-    let device = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
-        DeviceType::Gpu
+    let devices = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+        vec![DeviceType::Cpu, DeviceType::Gpu]
     } else {
-        DeviceType::Cpu
+        vec![DeviceType::Cpu]
     };
-    let context = ExecutionContext::new(Device::new(device, 0));
-    let stream = context.stream();
-    // Multiple batches, grouped heads, unequal key/value widths and a partial
-    // final query tile catch layout reuse across different row counts.
-    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
-        let tensor = |shape: &[i32], phase: f32| {
-            let size = shape.iter().product::<i32>();
-            Array::from_slice(
-                &(0..size)
-                    .map(|i| ((i as f32 * 0.07) + phase).sin())
+    for device in devices {
+        let context = ExecutionContext::new(Device::new(device, 0));
+        let stream = context.stream();
+        // Multiple batches, grouped heads, unequal key/value widths and a partial
+        // final query tile cross the live-graph batch boundary and catch layout reuse
+        // across different row counts.
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let tensor = |shape: &[i32], phase: f32| {
+                let size = shape.iter().product::<i32>();
+                Array::from_slice(
+                    &(0..size)
+                        .map(|i| ((i as f32 * 0.07) + phase).sin())
+                        .collect::<Vec<_>>(),
+                    shape,
+                )
+                .as_dtype(dtype, stream)
+                .unwrap()
+            };
+            let q = tensor(&[2, 4, 1027, 32], 0.1);
+            let k = tensor(&[2, 2, 257, 32], 0.3);
+            let v = tensor(&[2, 2, 257, 9], 0.7);
+            let boolean =
+                Array::from_slice(&(0..257).map(|i| i % 7 != 0).collect::<Vec<_>>(), &[257]);
+            let additive = Array::from_slice(
+                &(0..1027 * 257)
+                    .map(|i| {
+                        if i % 257 > i / 257 + 190 {
+                            -10000.0f32
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect::<Vec<_>>(),
-                shape,
-            )
-            .as_dtype(dtype, stream)
-            .unwrap()
-        };
-        let q = tensor(&[2, 4, 67, 32], 0.1);
-        let k = tensor(&[2, 2, 257, 32], 0.3);
-        let v = tensor(&[2, 2, 257, 9], 0.7);
-        let boolean = Array::from_slice(&(0..257).map(|i| i % 7 != 0).collect::<Vec<_>>(), &[257]);
-        let additive = Array::from_slice(
-            &(0..67 * 257)
-                .map(|i| {
-                    if i % 257 > i / 257 + 190 {
-                        -10000.0f32
-                    } else {
-                        0.0
-                    }
-                })
-                .collect::<Vec<_>>(),
-            &[67, 257],
-        );
-        let sinks = tensor(&[4], 0.4);
-        for (mask, sinks, cap) in [
-            (None, None, None),
-            (Some(&boolean), Some(&sinks), Some(2.0)),
-            (Some(&additive), None, None),
-        ] {
-            let reference =
-                independently_prepared_query_tiles(&q, &k, &v, mask, sinks, cap, stream);
-            let actual = super::attention_with_softcap(
-                &q,
-                &k,
-                &v,
-                0.125,
-                mask,
-                sinks,
-                cap,
-                eredu_nn::AttentionArithmetic::InputScores,
-                stream,
-            )
-            .unwrap();
-            assert!(
-                actual
-                    .all_close(&reference, 0.0, 0.0, None, stream)
-                    .unwrap()
-                    .item::<bool>(stream),
-                "dtype {dtype:?}"
+                &[1027, 257],
             );
+            let sinks = tensor(&[4], 0.4);
+            for (mask, sinks, cap) in [
+                (None, None, None),
+                (Some(&boolean), Some(&sinks), Some(2.0)),
+                (Some(&additive), None, None),
+            ] {
+                let reference =
+                    independently_prepared_query_tiles(&q, &k, &v, mask, sinks, cap, stream);
+                let actual = super::attention_with_softcap(
+                    &q,
+                    &k,
+                    &v,
+                    0.125,
+                    mask,
+                    sinks,
+                    cap,
+                    eredu_nn::AttentionArithmetic::InputScores,
+                    stream,
+                )
+                .unwrap();
+                assert!(
+                    actual
+                        .all_close(&reference, 0.0, 0.0, None, stream)
+                        .unwrap()
+                        .item::<bool>(stream),
+                    "device {device:?}, dtype {dtype:?}"
+                );
+            }
         }
     }
 }
@@ -647,5 +651,103 @@ fn input_score_preparation_preserves_full_key_and_blockwise_threshold() {
                 .item::<bool>(stream),
             "key tokens {tokens}"
         );
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+#[ignore = "isolated Metal memory/timing benchmark; run with --test-threads=1 --nocapture"]
+fn bounded_input_score_tile_graph_batches_release_temporaries() {
+    use safemlx::{memory, Dtype};
+    use std::time::Instant;
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = context.stream();
+    struct RestoreCache(usize);
+    impl Drop for RestoreCache {
+        fn drop(&mut self) {
+            memory::set_cache_limit(self.0).unwrap();
+        }
+    }
+    let _cache = RestoreCache(memory::set_cache_limit(0).unwrap());
+    let tensor = |shape: &[i32], phase: f32| {
+        let size = shape.iter().product::<i32>();
+        Array::from_slice(
+            &(0..size)
+                .map(|i| (i as f32 * 0.03 + phase).sin())
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .as_array()
+        .clone()
+    };
+    for (queries, heads, kv_heads) in [(513, 16, 4), (2000, 32, 8)] {
+        let q = tensor(&[1, heads, queries, 64], 0.1);
+        let k = tensor(&[1, kv_heads, 2000, 64], 0.3);
+        let v = tensor(&[1, kv_heads, 2000, 64], 0.7);
+        let mask = Array::from_slice(&(0..2000).map(|i| i % 7 != 0).collect::<Vec<_>>(), &[2000]);
+        let sinks = tensor(&[heads], 0.4);
+        let mut reference = None;
+        let mut lazy_peak = 0;
+        for tiles in [usize::MAX, 1, 4, 8, 16, 32] {
+            let mut elapsed = Vec::new();
+            let mut peak = 0;
+            // The first two calls warm kernels and dispatch machinery. Every sample
+            // includes graph construction, evaluation and completion on this stream.
+            for iteration in 0..7 {
+                stream.synchronize().unwrap();
+                let baseline = memory::active_memory().unwrap();
+                memory::reset_peak_memory().unwrap();
+                let start = Instant::now();
+                let output = super::input_score_attention_with_tile_batches(
+                    &q,
+                    &k,
+                    &v,
+                    0.125,
+                    Some(&mask),
+                    Some(&sinks),
+                    Some(2.0),
+                    tiles,
+                    stream,
+                )
+                .unwrap();
+                safemlx::transforms::eval([&output]).unwrap();
+                stream.synchronize().unwrap();
+                let duration = start.elapsed();
+                let growth = memory::peak_memory().unwrap().saturating_sub(baseline);
+                if iteration >= 2 {
+                    elapsed.push(duration.as_secs_f64() * 1000.0);
+                    peak = peak.max(growth);
+                }
+                if iteration == 6 {
+                    let output = output
+                        .as_dtype(Dtype::Float32, stream)
+                        .unwrap()
+                        .into_evaluated()
+                        .unwrap();
+                    if let Some(reference) = &reference {
+                        assert_eq!(output.as_slice::<f32>(), reference);
+                    } else {
+                        reference = Some(output.as_slice::<f32>().to_vec());
+                    }
+                }
+            }
+            elapsed.sort_by(f64::total_cmp);
+            eprintln!(
+            "input-score tile graphs: queries={queries}, heads={heads}, tiles={tiles}, peak_bytes={peak}, median_ms={:.3}, min_ms={:.3}, max_ms={:.3}",
+            elapsed[2], elapsed[0], elapsed[4],
+        );
+            if tiles == usize::MAX {
+                lazy_peak = peak;
+            } else if tiles == super::INPUT_SCORE_LIVE_TILE_BATCH {
+                assert!(
+                    peak < lazy_peak / 2,
+                    "bounded tile graphs peak {peak}, lazy peak {lazy_peak}"
+                );
+            }
+        }
     }
 }

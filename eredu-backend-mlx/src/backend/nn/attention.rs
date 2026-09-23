@@ -345,6 +345,11 @@ pub(crate) const INPUT_SCORE_WORKSPACE:
         score_bytes: 16,
     };
 
+// Keep only this many full-key tile graphs live at once. Completed outputs and
+// invocation-local K/V layouts survive each synchronous evaluation; score,
+// softmax and projection temporaries do not. Small invocations stay lazy.
+const INPUT_SCORE_LIVE_TILE_BATCH: usize = 32;
+
 /// Scaled attention with an optional score transform, before masks and sink logits.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_with_softcap(
@@ -547,9 +552,35 @@ fn bounded_input_score_attention(
     softcap: Option<f32>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    input_score_attention_with_tile_batches(
+        queries,
+        keys,
+        values,
+        scale,
+        mask,
+        sinks,
+        softcap,
+        INPUT_SCORE_LIVE_TILE_BATCH,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn input_score_attention_with_tile_batches(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    live_tile_batch: usize,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     use crate::backend::runtime::cache::kv::{
         BlockwiseAttentionAccumulator, KeyValueAttentionBlock,
     };
+    debug_assert!(live_tile_batch > 0);
     let mask = mask
         .map(|mask| {
             broadcast_to(
@@ -573,6 +604,9 @@ fn bounded_input_score_attention(
     let mut outputs = Vec::new();
     let query_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
         .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
+    let tile_count = (queries.dim(2) as usize).div_ceil(query_step as usize);
+    let evaluate_batches = prepared.is_some() && tile_count > live_tile_batch;
+    let mut completed_tiles = 0;
     for start in (0..queries.dim(2)).step_by(query_step as usize) {
         let end = (start + query_step).min(queries.dim(2));
         let query = queries.try_index_device((.., .., start..end, ..), stream)?;
@@ -590,6 +624,15 @@ fn bounded_input_score_attention(
                 softcap,
                 stream,
             )?);
+            if evaluate_batches
+                && (outputs.len() - completed_tiles == live_tile_batch || end == queries.dim(2))
+            {
+                // eval completes these arrays and detaches their dependency
+                // graphs, releasing tile-local temporaries before constructing
+                // the next group. Keep every finished output for concatenation.
+                safemlx::transforms::eval(&outputs[completed_tiles..])?;
+                completed_tiles = outputs.len();
+            }
             continue;
         }
         let mut accumulator = BlockwiseAttentionAccumulator::new(

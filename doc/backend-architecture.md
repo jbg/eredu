@@ -6378,10 +6378,13 @@ query tile thresholds and conservative temporary-copy allowances from the same
 constants used by its native attention mechanism; selection retains these facts
 and includes them in cached-selection validation. Within a full-key input-score
 attention invocation (at most 8,192 key positions), MLX prepares expanded K/V and
-contiguous BF16 RHS projection layouts once for all query tiles, preserving lazy
-execution and reduction order. This reuse is mechanism-owned and has no family
-condition. Longer rows retain the separate two-pass blockwise realization and
-its evaluated per-block state, without retaining every expanded block. Forecast
+contiguous BF16 RHS projection layouts once for all query tiles, preserving
+reduction order. Large tiled calls synchronously evaluate groups of at most 32 tile
+outputs before constructing the next group, keeping completed outputs and shared
+K/V while releasing temporary graphs. Small calls remain lazy. Batching is a
+native mechanism policy with no family condition. Longer rows retain the separate
+two-pass blockwise realization and its evaluated per-block state, without retaining
+every expanded block. Forecast
 copy allowances remain conservative until independently recalibrated. Runtime
 combines them with
 architecture geometry for repeated K/V projection buffers, score conversions,

@@ -4,6 +4,15 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Bounded input-score tile graphs
+
+MLX explicit input-score attention evaluates groups of at most 32 query tiles for
+large full-key calls, releasing temporary graphs while retaining completed outputs
+and shared K/V. Smaller calls remain lazy. Native numerical and allocation tests
+cover the change; memory and timing measurements are recorded in
+[generation memory](doc/generation-memory.md). Forecast allowances remain
+conservative pending recalibration.
+
 ## 2026-09-23 — Shared input-score attention layouts
 
 MLX explicit input-score attention now reuses expanded K/V and contiguous BF16

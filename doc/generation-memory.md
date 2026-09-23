@@ -483,9 +483,11 @@ contribution stays zero; these are conservative planning allowances.
 Explicit input-score attention needs more than a score-matrix allowance.
 For complete key rows of at most 8,192 positions, MLX now shares expanded K/V
 and contiguous BF16 projection layouts across query tiles in an invocation.
-Preparation stays lazy; this change adds no tile evaluation boundaries and does
-not bound the number of live score/softmax graphs. The backend supplies its actual
-tile thresholds (8,192 query-by-key elements, at most 32 query rows). The forecast
+Large tiled calls evaluate batches of at most 32 query-tile outputs and retain the
+completed outputs for final concatenation, releasing each batch's score/softmax
+graphs before building the next batch. Small calls remain lazy. The backend
+supplies its actual tile thresholds (8,192 query-by-key elements, at most 32 query
+rows). The forecast
 retains its conservative allowance of four expanded K/V copies per tile and
 16 working bytes per score element pending separate recalibration. These facts are
 retained during selection, including cold inspection, and participate in cached
@@ -749,7 +751,91 @@ preparation for every query tile: 22,683,712 versus 69,869,632 peak bytes, with
 bit-identical output. Numerical coverage also includes an independent PyTorch
 fixture on CPU and Metal, F32/F16/BF16, grouped heads, multiple batches, unequal
 K/V widths, boolean/additive masks, sinks, softcaps, partial query tiles and both
-sides of the 8,192-key threshold. No tile evaluation barriers were added.
+sides of the 8,192-key threshold. That change added no tile evaluation barriers;
+the subsequent bounded-batch change is measured separately below.
+
+### Bounded tile-graph validation (2026-09-23)
+
+The follow-up bounds live full-key tile graphs by evaluating 32-tile batches and
+keeping their completed output arrays for final concatenation. Shared prepared
+K/V stays resident across batches. Calls that fit within one batch remain lazy; the
+longer-than-8,192-key blockwise path is unchanged. This limits temporary graph
+retention, not total request memory: inputs, K/V, completed outputs and other
+model state still grow with request geometry. Forecast envelopes remain unchanged
+and conservative pending separate recalibration.
+
+Measurements used an Apple M3 Ultra with 256 GiB unified memory, Metal, the default
+Cargo test profile and allocator cache limit zero. The isolated BF16 benchmark
+uses head width 64, four query heads per KV head, 2,000 key positions, a boolean
+mask, sink logits and softcap. Each configuration has two warmups and five
+synchronized samples; timing includes graph construction, evaluation and stream
+completion. Peak growth is active allocator bytes above already evaluated inputs,
+not process RSS. All batch sizes produce bit-identical outputs to fully lazy
+shared-K/V execution.
+
+| Queries / heads | Live tile batch | Peak growth (MiB) | Median time (ms) |
+|---|---:|---:|---:|
+| 513 / 16 | Fully lazy | 463.6 | 125.9 |
+| 513 / 16 | 1 | 16.2 | 272.8 |
+| 513 / 16 | 8 | 40.8 | 221.8 |
+| 513 / 16 | 16 | 68.9 | 149.5 |
+| 513 / 16 | 32 | 125.0 | 148.6 |
+| 2000 / 32 | Fully lazy | 3507.9 | 591.7 |
+| 2000 / 32 | 1 | 38.2 | 1742.8 |
+| 2000 / 32 | 8 | 86.7 | 809.8 |
+| 2000 / 32 | 16 | 142.2 | 731.6 |
+| 2000 / 32 | 32 | 253.0 | 609.9 |
+
+The selected 32-tile batch reduces peak growth by 92.8% with 3.1% more elapsed
+time for the larger case. For the smaller case it reduces peak growth by 73.0%
+with 18.0% more elapsed time. Smaller batches save more memory but incur more
+synchronization overhead.
+
+These numbers expose the synchronization cost rather than assuming a throughput
+win. Timing depends on device, geometry, cache policy and host build profile.
+There is no timing assertion in the regression; it checks exact output parity
+and a broad reduction in peak active memory. Reproduce the sweep with:
+
+```sh
+cargo test -p eredu-backend-mlx --features metal --offline --lib \
+  bounded_input_score_tile_graph_batches_release_temporaries \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The pinned official SafeTensors BF16 model above was measured against
+`2776e4c5` (shared K/V, fully lazy tile graphs), using the same timing instrumentation
+in both binaries. For each prompt length, one warmup preceded three measured runs.
+Each run resets the model, supplies repeated token ID 1 and generates eight greedy
+tokens. The timing excludes loading, forecasting and the separate controlled
+parity run; total generation time includes synchronization after four and eight
+tokens. The first-token timer ends when the iterator returns the materialized
+prediction. All values below are warmed medians except peak active-memory growth.
+
+| Positions | Tile evaluation | Peak growth (MiB) | First token (ms) | Eight tokens (ms) |
+|---|---|---:|---:|---:|
+| 128 | Fully lazy | 525.0 | 308.0 | 509.3 |
+| 128 | Batches of 32 | 525.0 | 307.3 | 503.5 |
+| 2000 | Fully lazy | 20641.3 | 7700.9 | 7951.7 |
+| 2000 | Batches of 32 | 1516.7 | 7895.3 | 8149.6 |
+
+At 2,000 positions, peak growth fell 92.7% (20.16 to 1.48 GiB), with 2.5% longer
+median generation time. Effective prompt throughput through the first prediction
+was 259.7 versus 253.3 tokens/s. The measured eight-token ranges were
+7,947–8,035 ms before and 7,916–8,269 ms after; this short local experiment is not a
+cross-device performance guarantee. The 128-position case stays below the batching
+threshold, and its memory measurement is unchanged. Reproduce the full-model
+timing matrix with the preceding calibration command and
+`EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000,128,2000,128,2000`.
+
+The same 128/2,000-position validation passed for the pinned affine 4-bit
+SafeTensors and mixed-precision BF16 GGUF paths. Their 2,000-position peak growth
+was 1,516.7 and 4,908.4 MiB respectively, versus 20,641.3 and 16,922.5 MiB before
+batching. Continuation growth remained 175.1 and 4,705.7 MiB; GGUF parameter casts
+still dominate that continuation cost. Every source passed ordinary/controlled
+output parity and cold, loaded and continuation forecast checks. CPU and Metal
+F32/F16/BF16 numerical tests cross the 32-tile boundary with grouped heads,
+multiple batches, unequal K/V widths, masks, sinks, softcaps and a partial final
+group. The backend's Metal Clippy and portable feature check also pass.
 
 ## Focused verification
 
