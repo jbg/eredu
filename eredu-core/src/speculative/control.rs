@@ -82,13 +82,55 @@ pub struct SpeculativeModelMemoryObservation {
     pub allocator_cache_limit: crate::Observed<u64>,
 }
 
-/// Native observations for a settled external autoregressive transaction.
+/// Native prediction-state facts in ordinary local layer order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativePredictionMemoryObservation {
+    /// Actual installed frontiers, without assuming they equal the target frontier.
+    pub layer_positions: Vec<u64>,
+    /// Installed native state and backing-capacity allowance.
+    pub current_state_bytes: Option<u64>,
+    /// Native capacity envelope through the requested additional positions.
+    pub peak_state_bytes: Option<u64>,
+}
+
+/// Installed embedded state and separately retained target features.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddedContinuationObservation {
+    /// Canonical prediction state, not the separately retained assistant seed.
+    pub prediction: SpeculativePredictionMemoryObservation,
+    /// Native capture copy/descriptor allowance. A sliced view may retain larger
+    /// backing; runtime composition also includes the selected full-prefix feature
+    /// envelope. This observation alone is not a distinct resident-byte counter.
+    pub retained_feature_bytes: Option<u64>,
+}
+
+/// Read-only shared parameter and allocator facts from the native residency owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeParameterMemoryObservation {
+    /// Shared target and embedded parameter residency, charged once.
+    pub parameters: crate::StaticMemoryReport,
+    /// Point-in-time available capacity.
+    pub available: crate::AvailableMemory,
+    /// Current allocator-cache policy.
+    pub allocator_cache_limit: crate::Observed<u64>,
+    /// Current conversions with authoritative retaining bindings.
+    pub parameter_conversions: Option<Vec<crate::residency::ResidentParameterConversion>>,
+}
+
+/// Native observations for a settled speculative transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeculativeContinuationObservation {
     /// Installed target state and residency.
     pub target: SpeculativeModelMemoryObservation,
     /// Installed independent draft state and residency.
-    pub draft: SpeculativeModelMemoryObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<SpeculativeModelMemoryObservation>,
+    /// Installed embedded owner, mutually exclusive with an independent draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<EmbeddedContinuationObservation>,
+    /// Shared parameter conversion owners observed at this settled boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_conversions: Option<Vec<crate::residency::ResidentParameterConversion>>,
     /// Durable assistant seed retained alongside the installed caches.
     pub seed_bytes: Option<u64>,
 }
@@ -270,7 +312,7 @@ where
         None
     }
 
-    /// Observes a settled external draft without copying, submitting or polling work.
+    /// Observes settled speculative state without copying, submitting or polling work.
     pub fn continuation_memory_observation(
         &self,
         executor: &E,

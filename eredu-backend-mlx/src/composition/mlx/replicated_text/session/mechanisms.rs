@@ -701,6 +701,33 @@ where
         })
     }
 
+    fn parameter_memory_observation(
+        &self,
+        residency: eredu_runtime::LayerWeightResidency,
+        bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>, Error> {
+        let report = self.execution_report(residency, bounded)?.residency;
+        let parameter_conversions = report.device_parameter_conversions().map(<[_]>::to_vec);
+        let parameters =
+            crate::composition::mlx::capability::static_memory_from_residency(Some(report), None)
+                .map_err(|e| Error::Other(Box::new(e)))?;
+        Ok(Some(
+            eredu_core::speculative::SpeculativeParameterMemoryObservation {
+                parameters,
+                parameter_conversions,
+                available: crate::composition::mlx::capability::available_memory()
+                    .map_err(|e| Error::Other(Box::new(e)))?,
+                allocator_cache_limit: match crate::allocator_cache_policy() {
+                    Ok(policy) => eredu_core::Observed::exact(
+                        policy.limit_bytes,
+                        "current MLX allocator-cache policy",
+                    ),
+                    Err(error) => eredu_core::Observed::unavailable(error.to_string()),
+                },
+            },
+        ))
+    }
+
     fn execution_report(
         &self,
         _residency: eredu_runtime::LayerWeightResidency,

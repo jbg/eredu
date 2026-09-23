@@ -292,7 +292,8 @@ fn continuation_fixture(
         SpeculativeContinuationMemoryPlan {
             additional_tokens: tokens,
             target: state(17),
-            draft: state(19),
+            draft: Some(state(19)),
+            embedded: None,
             seed: MemoryBytes::estimated(0, 999, "seed"),
             host_retention: MemoryBytes::estimated(0, 888, "sampling and semantic state"),
             retained_snapshots: MemoryBytes::estimated(0, 777, "snapshots and branches"),
@@ -730,4 +731,174 @@ fn embedded_conversion_credit_uses_authoritative_backing_bindings_without_new_re
         Some(0)
     );
     assert_eq!(target.domains[0].resident_parameters, parameters);
+}
+
+fn embedded_continuation_fixture(
+    tokens: u64,
+    lookahead: bool,
+) -> (
+    GenerationMemoryRequest,
+    SpeculativeMemoryPlan,
+    SpeculativeContinuationMemoryPlan,
+) {
+    let (mut target, mut plan) = embedded_fixture();
+    plan.scheduler = plan.scheduler.with_lookahead(lookahead);
+    let extra =
+        speculative_continuation_positions(tokens, plan.max_draft_tokens, plan.scheduler).unwrap();
+    target.max_output_tokens = Some(extra);
+    target.forecast_output_tokens = extra;
+    target.domains[0].retained_input = MemoryBytes::exact(0);
+    target.domains[0].loading_peak = MemoryBytes::unknown("completed loading");
+    let continuation = SpeculativeContinuationMemoryPlan {
+        additional_tokens: tokens,
+        target: ContinuationMemoryPlan {
+            current_positions: 17,
+            additional_input_tokens: extra,
+            current_state: MemoryBytes::estimated(0, 100_000, "installed target capacity"),
+            peak_state: MemoryBytes::estimated(
+                0,
+                100_000 + extra * 100,
+                "target native horizon capacity",
+            ),
+        },
+        draft: None,
+        embedded: Some(EmbeddedContinuationMemoryPlan {
+            layer_positions: vec![13], // Actual owner wins over selected target-1 offset.
+            additional_input_tokens: extra,
+            current_state: MemoryBytes::estimated(0, 20_000, "installed prediction capacity"),
+            peak_state: MemoryBytes::estimated(
+                0,
+                20_000 + extra * 40,
+                "prediction native horizon capacity",
+            ),
+            retained_features: MemoryBytes::estimated(0, 128, "one-row view"),
+        }),
+        seed: MemoryBytes::estimated(0, 20_000, "current seed capacity"),
+        host_retention: MemoryBytes::estimated(0, 1000, "semantic state"),
+        retained_snapshots: MemoryBytes::exact(0),
+    };
+    (target, plan, continuation)
+}
+
+#[test]
+fn embedded_continuation_uses_installed_layers_and_native_capacity_without_completed_phases() {
+    let (target, plan, continuation) = embedded_continuation_fixture(7, false);
+    let before = (target.clone(), plan.clone(), continuation.clone());
+    let estimate = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(estimate.fit, MemoryFit::LikelyFit);
+    let start = &estimate.domains[0].phases[0];
+    assert_eq!(start.phase, MemoryPhase::ContinuationStart);
+    assert_eq!(start.persistent_state.lower_bytes, (17 + 13) * 8 * 4);
+    assert_eq!(start.persistent_state.upper_bytes, Some(120_000));
+    assert_eq!(start.workspace.upper_bytes, Some(0));
+    assert!(estimate.domains[0]
+        .phases
+        .iter()
+        .all(|p| p.phase != MemoryPhase::Loading && p.phase != MemoryPhase::Prefill));
+    assert!(estimate.domains[0]
+        .phases
+        .iter()
+        .all(|p| p.parameters == MemoryBytes::exact(4096)));
+    assert_eq!(estimate.requested_positions, 24);
+    let restored: SpeculativeContinuationMemoryPlan =
+        serde_json::from_str(&serde_json::to_string(&continuation).unwrap()).unwrap();
+    assert_eq!(
+        estimate,
+        estimate_speculative_continuation_memory(&target, &plan, &restored).unwrap()
+    );
+    assert_eq!((target, plan, continuation), before);
+}
+
+#[test]
+fn embedded_continuation_zero_horizon_retains_prefix_backing_and_user_snapshots() {
+    let (mut target, plan, mut continuation) = embedded_continuation_fixture(0, false);
+    target.input = InputTokenCount::text(4096);
+    continuation.target.current_positions = 4096;
+    continuation.target.current_state.upper_bytes = Some(1_000_000);
+    continuation.target.peak_state.upper_bytes = Some(1_000_000);
+    let result = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(result.fit, MemoryFit::LikelyFit);
+    assert_eq!(result.domains[0].phases.len(), 1);
+    // A retained last-row view may pin the complete prefill output. Its reported
+    // logical copy bytes alone must never collapse that current upper bound.
+    assert!(
+        result.domains[0].phases[0]
+            .retained_input
+            .upper_bytes
+            .unwrap()
+            >= 4096 * 128
+    );
+    continuation.retained_snapshots = MemoryBytes::exact(12345);
+    let reserved = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(upper(&reserved), upper(&result) + 12345);
+    assert_eq!(
+        reserved.domains[0].additional_generation_peak.upper_bytes,
+        Some(upper(&reserved) - 4096)
+    );
+}
+
+#[test]
+fn embedded_continuation_horizon_lookahead_and_unknowns_preserve_coverage() {
+    let run = |tokens, lookahead| {
+        let (target, plan, state) = embedded_continuation_fixture(tokens, lookahead);
+        estimate_speculative_continuation_memory(&target, &plan, &state).unwrap()
+    };
+    assert!(upper(&run(30, false)) > upper(&run(1, false)));
+    assert!(upper(&run(7, true)) > upper(&run(7, false)));
+    let (target, mut plan, mut state) = embedded_continuation_fixture(7, false);
+    state.embedded.as_mut().unwrap().peak_state =
+        MemoryBytes::unknown("native prediction capacity unavailable");
+    let estimate = estimate_speculative_continuation_memory(&target, &plan, &state).unwrap();
+    assert_eq!(estimate.fit, MemoryFit::InsufficientInformation);
+    assert!(estimate
+        .uncertainties
+        .iter()
+        .any(|u| u.contains("native prediction capacity unavailable")));
+    state.embedded.as_mut().unwrap().peak_state = MemoryBytes::estimated(0, 100_000, "capacity");
+    plan.embedded
+        .as_mut()
+        .unwrap()
+        .missing
+        .push("custom prediction mechanism scratch".into());
+    let estimate = estimate_speculative_continuation_memory(&target, &plan, &state).unwrap();
+    assert_eq!(estimate.fit, MemoryFit::InsufficientInformation);
+    assert!(estimate
+        .uncertainties
+        .iter()
+        .any(|u| u.contains("custom prediction mechanism scratch")));
+}
+
+#[test]
+fn embedded_continuation_rejects_mismatched_state_members_horizons_and_bounds() {
+    let (target, plan, state) = embedded_continuation_fixture(7, false);
+    for mutation in 0..5 {
+        let mut state = state.clone();
+        let embedded = state.embedded.as_mut().unwrap();
+        match mutation {
+            0 => embedded.layer_positions.push(0),
+            1 => embedded.additional_input_tokens += 1,
+            2 => embedded.layer_positions[0] = 18,
+            3 => embedded.current_state.upper_bytes = Some(1),
+            4 => {
+                embedded.peak_state.upper_bytes =
+                    Some(embedded.current_state.upper_bytes.unwrap() - 1)
+            }
+            _ => unreachable!(),
+        }
+        assert!(estimate_speculative_continuation_memory(&target, &plan, &state).is_err());
+    }
+}
+
+#[test]
+fn legacy_external_continuation_wire_remains_compatible_without_embedded_field() {
+    let (target, plan, state) = continuation_fixture(7, false);
+    let mut wire = serde_json::to_value(&state).unwrap();
+    assert!(wire["draft"].is_object());
+    wire.as_object_mut().unwrap().remove("embedded");
+    let decoded = serde_json::from_value(wire).unwrap();
+    assert_eq!(state, decoded);
+    assert_eq!(
+        estimate_speculative_continuation_memory(&target, &plan, &state).unwrap(),
+        estimate_speculative_continuation_memory(&target, &plan, &decoded).unwrap()
+    );
 }

@@ -235,6 +235,54 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         Ok(cache.clone())
     }
 
+    fn continuation_memory_observation(
+        &self,
+        cache: &Cache,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        use eredu_core::speculative::*;
+        use eredu_core::{Observed, PhysicalMemorySemantics};
+        let parameters = eredu_core::StaticMemoryReport {
+            logical_parameter_bytes: Observed::exact(32, "fixture"),
+            current_host_resident_bytes: Observed::exact(0, "fixture"),
+            current_device_resident_bytes: Observed::exact(32, "fixture"),
+            current_device_parameter_conversion_bytes: Observed::exact(0, "fixture"),
+            planned_disk_backed_bytes: Observed::exact(0, "fixture"),
+            backend_active_allocation_bytes: Observed::exact(32, "fixture"),
+            backend_allocator_cache_bytes: Observed::exact(0, "fixture"),
+            physical_semantics: PhysicalMemorySemantics::Unified,
+            currently_cached_shards: Observed::exact(0, "fixture"),
+        };
+        Ok(Some(SpeculativeContinuationObservation {
+            target: SpeculativeModelMemoryObservation {
+                current_positions: cache.target.len() as u64,
+                current_state_bytes: Some(cache.target.len() as u64 * 4),
+                peak_state_bytes: Some((cache.target.len() as u64 + additional) * 4),
+                parameters,
+                available: eredu_core::AvailableMemory {
+                    physical_memory_bytes: Observed::exact(100_000, "fixture"),
+                    available_memory_bytes: Observed::exact(90_000, "fixture"),
+                    physical_semantics: PhysicalMemorySemantics::Unified,
+                },
+                allocator_cache_limit: Observed::exact(0, "fixture"),
+            },
+            draft: None,
+            embedded: Some(EmbeddedContinuationObservation {
+                prediction: SpeculativePredictionMemoryObservation {
+                    layer_positions: vec![cache.prediction.len() as u64],
+                    current_state_bytes: Some(cache.prediction.len() as u64 * 4),
+                    peak_state_bytes: Some((cache.prediction.len() as u64 + additional) * 4),
+                },
+                retained_feature_bytes: None,
+            }),
+            parameter_conversions: Some(vec![]),
+            seed_bytes: None,
+        }))
+    }
+
     fn control_target_estimate(
         &self,
         cache: &Cache,
@@ -643,4 +691,43 @@ fn production_observers_reach_causal_embedded_boundaries_and_can_intervene() {
             EMBEDDED_TARGET_CAPTURE_PATH,
         ]
     );
+}
+
+#[test]
+fn settled_embedded_observation_keeps_installed_and_seed_owners_distinct() {
+    let mut strategy = Strategy {
+        fused_rows: None,
+        corrupt_capture: false,
+        failure: Failure::Advance,
+    };
+    let executor = EmbeddedPredictionExecutor::<_, Mechanisms>::new(&mut strategy);
+    let cache = Cache {
+        target: vec![2, 3, 5, 7],
+        prediction: vec![11, 13, 17],
+    };
+    let seed = EmbeddedPredictionTargetState {
+        capture: Tensor(vec![19]),
+        prediction_cache: vec![23, 29],
+    };
+    let before = cache.clone();
+    for additional in [0, 5] {
+        let observation = executor
+            .continuation_memory_observation(&cache, &seed, additional)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.target.current_positions, 4);
+        assert!(observation.draft.is_none());
+        let embedded = observation.embedded.unwrap();
+        assert_eq!(embedded.prediction.layer_positions, [3]);
+        assert_eq!(embedded.prediction.current_state_bytes, Some(12));
+        assert_eq!(
+            embedded.prediction.peak_state_bytes,
+            Some((3 + additional) * 4)
+        );
+        assert_eq!(embedded.retained_feature_bytes, Some(4));
+        assert_eq!(observation.seed_bytes, Some(8));
+        assert_eq!(cache, before);
+        assert_eq!(seed.capture, Tensor(vec![19]));
+        assert_eq!(seed.prediction_cache, [23, 29]);
+    }
 }

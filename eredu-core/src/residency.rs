@@ -20,6 +20,31 @@ pub use prefetch::{
     PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchWork,
 };
 
+/// One binding whose resident parameter owner retains a cached conversion.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResidentParameterConversionBinding {
+    /// Native-materialization lifetime identity, independent of an artifact name.
+    pub owner: crate::resources::ResourceIdentity,
+    /// Ordinary residency unit containing this binding.
+    pub unit: OffloadUnitId,
+    /// Exact executable binding name inside the unit.
+    pub name: String,
+    /// Architecture-logical destination, when supplied by ordinary preparation.
+    pub logical_target: Option<String>,
+}
+
+/// Existing reusable parameter conversion observed without populating a cache.
+///
+/// Shared aliases have one backing identity and all retaining owners/bindings.
+/// Capacity and physical placement remain unknown unless the backend knows them.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResidentParameterConversion {
+    /// The actual retained allocation, separate from its source parameters.
+    pub allocation: crate::resources::ResourceAllocation,
+    /// Ordinary bindings that retain this conversion; these are not extra bytes.
+    pub bindings: Vec<ResidentParameterConversionBinding>,
+}
+
 /// Current serialized residency-plan schema.
 pub const OFFLOAD_PLAN_SCHEMA_VERSION: u32 = 1;
 

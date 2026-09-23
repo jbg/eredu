@@ -1057,19 +1057,23 @@ host state retains an unknown upper end. The requested horizon is hypothetical
 and never extends the run's configured token limit.
 
 Ordinary sessions reject initial, terminal and unsettled boundaries. The object-safe
-`ControlledSpeculativeSession` exposes the same method name for **settled external
-autoregressive** lanes. It returns a `SpeculativeContinuationForecast` after prefill
+`ControlledSpeculativeSession` exposes the same method name for settled external
+autoregressive and embedded-prediction lanes. It returns a `SpeculativeContinuationForecast` after prefill
 or canonical verification/commit with no retained proposals, optimistic branch or
 pending verification. It never polls or settles work to make a boundary eligible.
 Before prefill, after termination/cancellation, on failed sessions, and during an
 uncommitted transaction it returns `UnsupportedContinuation` without changing state.
-Embedded and feature-conditioned prediction are not yet covered. Instrumentation
+Feature-conditioned external assistants remain unsupported. Embedded forecasts
+require installed prediction state and retained-feature observations; missing
+workspace mechanisms preserve an unknown upper end. Instrumentation
 or custom sampler/semantic growth without a complete bound preserves known native
 facts but leaves retention unbounded.
 
-Speculative outlooks observe both real cache frontiers and native capacity, the
-retained assistant seed, sampling/RNG/semantic storage, and live user snapshot/branch
-reservations. Completed loading and prefill are excluded. Further drafting,
+Speculative outlooks observe the target frontier and either the independent draft
+frontier or the installed prediction-layer frontiers, native state capacity,
+retained target features and assistant seed, sampling/RNG/semantic storage, and
+live user snapshot/branch reservations. Shared embedded parameters remain in the
+target residency report, including their cached conversions. Completed loading and prefill are excluded. Further drafting,
 verification and commit keep the configured proposal/lookahead ceilings. Request a
 new outlook after restore, branch exchange, advancement, or a horizon change.
 For complete accounting and raw iterator settlement, see

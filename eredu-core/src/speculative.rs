@@ -859,9 +859,9 @@ pub trait SpeculativeExecutor {
         }
     }
 
-    /// Pure observation of settled independent-model cache frontiers, capacity
+    /// Pure observation of settled model and prediction cache frontiers, capacity
     /// and residency. No polling, synchronization, copying or budget consumption.
-    /// Embedded and feature-conditioned prediction remain unsupported by default.
+    /// Executors without complete settled observations remain unsupported by default.
     fn continuation_memory_observation(
         &self,
         _cache: &Self::Cache,

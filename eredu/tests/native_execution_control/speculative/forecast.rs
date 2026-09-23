@@ -117,9 +117,9 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 let repeated = session.forecast_remaining_generation(remaining, &options).unwrap();
                 assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
                 assert_eq!(forecast.continuation.target.current_positions, prompt);
-                assert_eq!(forecast.continuation.draft.current_positions, prompt);
+                assert_eq!(forecast.continuation.draft.as_ref().unwrap().current_positions, prompt);
                 assert!(forecast.continuation.target.current_state.lower_bytes > 0);
-                assert!(forecast.continuation.draft.current_state.lower_bytes > 0);
+                assert!(forecast.continuation.draft.as_ref().unwrap().current_state.lower_bytes > 0);
                 assert_eq!(zero.continuation.target.current_state, forecast.continuation.target.current_state);
                 assert_eq!(forecast.continuation, repeated.continuation);
                 for pool in &forecast.estimate.domains {
@@ -166,12 +166,12 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 session.restore(&saved)?;
                 let restored = session.forecast_remaining_generation(remaining, &options).unwrap();
                 assert_eq!(restored.continuation.target.current_positions, prompt);
-                assert_eq!(restored.continuation.draft.current_positions, prompt);
+                assert_eq!(restored.continuation.draft.as_ref().unwrap().current_positions, prompt);
                 session.release_snapshot(&saved)?;
                 while session.step()?.is_some() {}
                 assert_eq!(session.token_ids(), committed);
                 eprintln!("Speculative continuation: model={}, prompt={prompt}, lookahead={lookahead}, horizon={remaining}, upper={upper}, measured_growth={growth}, target_current={:?}, draft_current={:?}",
-                    path.display(), forecast.continuation.target.current_state, forecast.continuation.draft.current_state);
+                    path.display(), forecast.continuation.target.current_state, forecast.continuation.draft.as_ref().unwrap().current_state);
                 Ok(())
             },
         ).unwrap();

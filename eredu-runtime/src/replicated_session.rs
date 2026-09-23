@@ -74,6 +74,17 @@ where
     /// Mechanism failure.
     type Error;
 
+    /// Projects existing native residency into portable memory observations.
+    /// Must not submit, settle, allocate execution resources, or consume budgets.
+    fn parameter_memory_observation(
+        &self,
+        _residency: LayerWeightResidency,
+        _bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>, Self::Error>
+    {
+        Ok(None)
+    }
+
     /// Takes the aggregate report produced while realizing the selected
     /// materialization tasks.
     ///
@@ -3630,6 +3641,21 @@ where
     /// Returns the prepared-input identity associated with the currently committed prompt state.
     pub const fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
         self.committed_prompt_input_identity.as_ref()
+    }
+
+    /// Observes the installed shared parameter owner without touching lane state.
+    pub fn parameter_memory_observation(
+        &self,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeParameterMemoryObservation>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        self.mechanisms
+            .parameter_memory_observation(
+                self.selected.residency(),
+                D::bounded_policy(&self.execution),
+            )
+            .map_err(ReplicatedTextSessionError::Mechanism)
     }
 
     /// Returns one coherent execution and state residency report.

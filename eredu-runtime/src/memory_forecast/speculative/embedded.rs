@@ -186,12 +186,101 @@ impl EmbeddedPredictionMemoryPlan {
         mul(state.bytes_per_position_per_batch, target.batch_size)
     }
 
-    pub(super) fn costs(
+    pub(crate) fn validate_continuation(
+        &self,
+        target: &GenerationMemoryRequest,
+        native: &mut EmbeddedContinuationMemoryPlan,
+    ) -> Result<(), CapabilityError> {
+        if native.layer_positions.len() != self.state.len() {
+            return Err(invalid(
+                "installed prediction frontiers do not match the selected state members",
+            ));
+        }
+        native.current_state.validate()?;
+        native.peak_state.validate()?;
+        native.retained_features.validate()?;
+        if native
+            .layer_positions
+            .iter()
+            .any(|&position| position > target.input.model_positions)
+        {
+            return Err(invalid(
+                "settled prediction state advances beyond the target frontier",
+            ));
+        }
+        // A sliced capture can pin its full prefix backing. Preserve that upper
+        // envelope even when the observed logical view is just one row.
+        let prefix = interval(
+            &self.target_feature_bytes_per_position,
+            target.input.model_positions,
+            "retained target capture may pin a complete prefix backing",
+        )?;
+        native.retained_features = native.retained_features.maximum(&prefix);
+        let mut current = 0;
+        let mut endpoint = 0;
+        for (layer, &positions) in self.state.iter().zip(&native.layer_positions) {
+            let layout = eredu_core::StateMemoryLayout::new(
+                eredu_core::LayerSchedule::new(1, vec![layer.policy.clone()])
+                    .map_err(|e| invalid(e.to_string()))?,
+                vec![0],
+                self.execution.state_layout.hidden_size,
+                self.allocation_granularity,
+                self.execution.state_layout.completeness,
+            )?;
+            let payload = |positions| {
+                eredu_core::estimate_runtime_state_payload_lower_bound(
+                    &layout,
+                    eredu_core::InputTokenCount::text(positions),
+                    target.batch_size,
+                    target.scalar_bytes,
+                )
+            };
+            current = add(current, payload(positions)?)?;
+            endpoint = add(
+                endpoint,
+                payload(add(positions, native.additional_input_tokens)?)?,
+            )?;
+        }
+        native.current_state.lower_bytes = native.current_state.lower_bytes.max(current);
+        native.peak_state.lower_bytes = native
+            .peak_state
+            .lower_bytes
+            .max(endpoint)
+            .max(native.current_state.lower_bytes);
+        native.current_state.kind = ObservationKind::Estimated;
+        native.peak_state.kind = ObservationKind::Estimated;
+        native.current_state.validate()?;
+        native.peak_state.validate()?;
+        if native
+            .current_state
+            .upper_bytes
+            .zip(native.peak_state.upper_bytes)
+            .is_some_and(|(current, peak)| current > peak)
+        {
+            return Err(invalid(
+                "prediction horizon capacity does not include installed state",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn costs(
         &self,
         target: &GenerationMemoryRequest,
         positions: u64,
         query: u64,
         prefill: bool,
+    ) -> Result<(MemoryBytes, MemoryBytes, MemoryBytes), CapabilityError> {
+        self.costs_with_state(target, positions, query, prefill, None)
+    }
+
+    pub(super) fn costs_with_state(
+        &self,
+        target: &GenerationMemoryRequest,
+        positions: u64,
+        query: u64,
+        prefill: bool,
+        installed: Option<&MemoryBytes>,
     ) -> Result<(MemoryBytes, MemoryBytes, MemoryBytes), CapabilityError> {
         if self.allocation_granularity == 0 {
             return Err(invalid(
@@ -265,6 +354,9 @@ impl EmbeddedPredictionMemoryPlan {
                     "prediction state component envelope including context offset, interior peaks and cache granularity",
                 ))?;
             }
+        }
+        if let Some(installed) = installed {
+            state = installed.clone();
         }
         let rows = if prefill {
             self.mode

@@ -64,8 +64,12 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
         Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
         GenerationForecastError,
     > {
-        if !matches!(drafting, eredu_core::SpeculativeDraft::External(_)) {
-            return Ok(None);
+        if matches!(drafting, eredu_core::SpeculativeDraft::Embedded) {
+            return <MockBackend as eredu_runtime::memory_forecast::SpeculativeForecastBackend<
+                embedded::EmbeddedFixture,
+            >>::speculative_memory_profile(
+                runtime, &eredu_core::SpeculativeDraft::Embedded
+            );
         }
         Ok(Some(
             eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
@@ -164,10 +168,16 @@ fn speculative_forecast_borrows_the_prepared_request_and_preserves_facts_on_reco
     );
 }
 
+struct UnsupportedForecastFixture;
+impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<UnsupportedForecastFixture>
+    for MockBackend
+{
+}
+
 #[test]
 fn unsupported_speculative_mechanisms_stay_unknown_and_capacity_is_enforced() {
     let (model, _, settings) = setup();
-    let embedded = eredu_core::SpeculativeDraft::<MockDrafter>::Embedded;
+    let embedded = eredu_core::SpeculativeDraft::<UnsupportedForecastFixture>::Embedded;
     let forecast = model
         .forecast_speculative_token_ids(
             &[1; 17],
@@ -961,112 +971,139 @@ fn settled_speculative_outlooks_are_read_only_and_follow_restore_and_branch_rete
     use eredu_core::{
         execution_control::SnapshotLimits, generation::SpeculativeRequestStatus as Status,
     };
-    for reject in [false, true] {
-        for lookahead in [false, true] {
-            let (mut model, chat, mut settings) = setup();
-            settings.overrides.max_new_tokens = Some(10);
-            let mut drafter = MockDrafter;
-            let input = if reject {
-                vec![CONTROL_REJECTION_PROMPT_TOKEN]
-            } else {
-                vec![3, 4]
-            };
-            let options = PreparedChatSpeculativeGenerationOptions {
-                scheduler: SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
-                ..Default::default()
-            };
-            let request = PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, input.clone()),
-                drafting: SpeculativeDraft::External(&mut drafter),
-                settings,
-                options,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_: SemanticEvent| {},
-            };
-            let controlled = model
-                .with_controlled_text_speculative(
-                    request,
-                    ControlledSpeculativeOptions {
-                        snapshots: Some(SnapshotLimits {
-                            max_snapshots: 2,
-                            max_branches: 1,
-                            retained_bytes: 32 << 20,
-                            cumulative_copy_bytes: 128 << 20,
-                        }),
-                        ..Default::default()
+    for is_embedded in [false, true] {
+        for reject in [false, true] {
+            for lookahead in [false, true] {
+                let (mut model, chat, mut settings) = setup();
+                settings.overrides.max_new_tokens = Some(10);
+                let mut drafter = MockDrafter;
+                let input = if reject {
+                    vec![CONTROL_REJECTION_PROMPT_TOKEN]
+                } else {
+                    vec![3, 4]
+                };
+                let options = PreparedChatSpeculativeGenerationOptions {
+                    scheduler: SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
+                    ..Default::default()
+                };
+                let request = PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::token_ids(&chat, input.clone()),
+                    drafting: if is_embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut drafter)
                     },
-                    |session| {
-                        let budget = GenerationForecastOptions::default();
-                        assert!(session.forecast_remaining_generation(4, &budget).is_err());
-                        session.step()?;
-                        let prefix = session.token_ids().to_vec();
-                        let usage = session.snapshot_usage();
-                        let timing = session.timing();
-                        let before = session.forecast_remaining_generation(4, &budget).unwrap();
-                        assert_eq!(before.estimate.fit, MemoryFit::LikelyFit);
-                        assert_eq!(
-                            before.continuation.target.current_positions,
-                            input.len() as u64
-                        );
-                        let repeated = session.forecast_remaining_generation(4, &budget).unwrap();
-                        assert_eq!(before.estimate, repeated.estimate);
-                        assert_eq!(session.token_ids(), prefix);
-                        assert_eq!(session.snapshot_usage(), usage);
-                        assert_eq!(session.timing(), timing);
-                        let saved = session.snapshot()?;
-                        let child = session.fork(&saved)?;
-                        let with_saved = session.forecast_remaining_generation(4, &budget).unwrap();
-                        assert!(
-                            with_saved
-                                .continuation
-                                .retained_snapshots
-                                .upper_bytes
-                                .unwrap()
-                                > 0
-                        );
-                        assert!(
-                            with_saved.estimate.domains[0].generation_peak.upper_bytes
-                                > before.estimate.domains[0].generation_peak.upper_bytes
-                        );
-                        session.step()?;
-                        assert!(session.forecast_remaining_generation(4, &budget).is_err());
-                        while session.status() != Status::ReadyToDraft
-                            && !matches!(session.status(), Status::Completed | Status::Cancelled)
-                        {
+                    settings,
+                    options,
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_: SemanticEvent| {},
+                };
+                let controlled = model
+                    .with_controlled_text_speculative(
+                        request,
+                        ControlledSpeculativeOptions {
+                            snapshots: Some(SnapshotLimits {
+                                max_snapshots: 2,
+                                max_branches: 1,
+                                retained_bytes: 32 << 20,
+                                cumulative_copy_bytes: 128 << 20,
+                            }),
+                            ..Default::default()
+                        },
+                        |session| {
+                            let budget = GenerationForecastOptions::default();
+                            assert!(session.forecast_remaining_generation(4, &budget).is_err());
                             session.step()?;
-                        }
-                        if session.status() == Status::ReadyToDraft {
-                            assert!(session.forecast_remaining_generation(2, &budget).is_ok());
-                            session.restore(&saved)?;
+                            let prefix = session.token_ids().to_vec();
+                            let usage = session.snapshot_usage();
+                            let timing = session.timing();
+                            let before = session.forecast_remaining_generation(4, &budget).unwrap();
+                            assert_eq!(before.estimate.fit, MemoryFit::LikelyFit);
+                            assert_eq!(before.continuation.embedded.is_some(), is_embedded);
+                            assert_eq!(before.continuation.draft.is_some(), !is_embedded);
+                            if let Some(embedded) = &before.continuation.embedded {
+                                assert_eq!(
+                                    embedded.layer_positions,
+                                    [input.len().saturating_sub(1) as u64]
+                                );
+                                assert!(
+                                    embedded.retained_features.upper_bytes.unwrap()
+                                        >= input.len() as u64 * 64
+                                );
+                            }
                             assert_eq!(
-                                session
-                                    .forecast_remaining_generation(4, &budget)
-                                    .unwrap()
-                                    .continuation
-                                    .target,
-                                before.continuation.target
+                                before.continuation.target.current_positions,
+                                input.len() as u64
                             );
-                        }
-                        session.release_branch(&child)?;
-                        session.release_snapshot(&saved)?;
-                        while session.step()?.is_some() {}
-                        assert!(session.forecast_remaining_generation(0, &budget).is_err());
-                        Ok(())
+                            let repeated =
+                                session.forecast_remaining_generation(4, &budget).unwrap();
+                            assert_eq!(before.estimate, repeated.estimate);
+                            assert_eq!(session.token_ids(), prefix);
+                            assert_eq!(session.snapshot_usage(), usage);
+                            assert_eq!(session.timing(), timing);
+                            let saved = session.snapshot()?;
+                            let child = session.fork(&saved)?;
+                            let with_saved =
+                                session.forecast_remaining_generation(4, &budget).unwrap();
+                            assert!(
+                                with_saved
+                                    .continuation
+                                    .retained_snapshots
+                                    .upper_bytes
+                                    .unwrap()
+                                    > 0
+                            );
+                            assert!(
+                                with_saved.estimate.domains[0].generation_peak.upper_bytes
+                                    > before.estimate.domains[0].generation_peak.upper_bytes
+                            );
+                            session.step()?;
+                            assert!(session.forecast_remaining_generation(4, &budget).is_err());
+                            while session.status() != Status::ReadyToDraft
+                                && !matches!(
+                                    session.status(),
+                                    Status::Completed | Status::Cancelled
+                                )
+                            {
+                                session.step()?;
+                            }
+                            if session.status() == Status::ReadyToDraft {
+                                assert!(session.forecast_remaining_generation(2, &budget).is_ok());
+                                session.restore(&saved)?;
+                                assert_eq!(
+                                    session
+                                        .forecast_remaining_generation(4, &budget)
+                                        .unwrap()
+                                        .continuation
+                                        .target,
+                                    before.continuation.target
+                                );
+                            }
+                            session.release_branch(&child)?;
+                            session.release_snapshot(&saved)?;
+                            while session.step()?.is_some() {}
+                            assert!(session.forecast_remaining_generation(0, &budget).is_err());
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                let request = PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::token_ids(&chat, input),
+                    drafting: if is_embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut drafter)
                     },
-                )
-                .unwrap();
-            let request = PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::token_ids(&chat, input),
-                drafting: SpeculativeDraft::External(&mut drafter),
-                settings,
-                options,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_: SemanticEvent| {},
-            };
-            let ordinary = model.generate_prepared_text_speculative(request).unwrap();
-            assert_eq!(controlled.token_ids(), ordinary.token_ids());
+                    settings,
+                    options,
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_: SemanticEvent| {},
+                };
+                let ordinary = model.generate_prepared_text_speculative(request).unwrap();
+                assert_eq!(controlled.token_ids(), ordinary.token_ids());
+            }
         }
     }
 }

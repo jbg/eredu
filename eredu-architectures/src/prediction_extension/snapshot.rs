@@ -27,3 +27,28 @@ pub(super) fn sequence_copy<T>(
 ) -> Result<Option<Vec<T>>, BackendFailure> {
     states.iter().map(copy).collect()
 }
+
+/// Composes ordinary state membership; native producers own capacity facts.
+pub(super) fn sequence_memory<T>(
+    states: &[T],
+    observe: impl Fn(&T) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation>,
+) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+    let mut result = eredu_core::speculative::SpeculativePredictionMemoryObservation {
+        layer_positions: Vec::new(),
+        current_state_bytes: Some(0),
+        peak_state_bytes: Some(0),
+    };
+    for state in states {
+        let observation = observe(state)?;
+        result.layer_positions.extend(observation.layer_positions);
+        result.current_state_bytes = result
+            .current_state_bytes
+            .zip(observation.current_state_bytes)
+            .and_then(|(a, b)| a.checked_add(b));
+        result.peak_state_bytes = result
+            .peak_state_bytes
+            .zip(observation.peak_state_bytes)
+            .and_then(|(a, b)| a.checked_add(b));
+    }
+    Some(result)
+}

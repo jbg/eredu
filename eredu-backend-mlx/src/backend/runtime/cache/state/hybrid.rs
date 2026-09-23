@@ -854,6 +854,11 @@ impl MlxHybridState {
         })
     }
 
+    /// Borrows ordinary layer state without changing native storage or frontiers.
+    pub fn layers(&self) -> &[MlxHybridLayerState] {
+        &self.layers
+    }
+
     /// Mutably borrows the ordinary per-layer states used by neutral units.
     pub fn layers_mut(&mut self) -> &mut [MlxHybridLayerState] {
         &mut self.layers

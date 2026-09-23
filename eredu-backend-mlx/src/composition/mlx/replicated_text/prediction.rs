@@ -561,6 +561,57 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
         Self::SequentialState::new()
     }
 
+    fn model_memory_observation(
+        state: &Self::ModelState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        use eredu_runtime::RuntimeStateComponents;
+        let retained = state.isolated_snapshot_estimate().map(|e| e.retained_bytes);
+        Some(
+            eredu_core::speculative::SpeculativePredictionMemoryObservation {
+                layer_positions: state
+                    .layers()
+                    .iter()
+                    .map(|layer| u64::try_from(layer.position()).ok())
+                    .collect::<Option<Vec<_>>>()?,
+                current_state_bytes: retained
+                    .and_then(|n| n.checked_add(state.isolated_snapshot_growth(0)?)),
+                peak_state_bytes: retained
+                    .and_then(|n| n.checked_add(state.isolated_snapshot_growth(additional)?)),
+            },
+        )
+    }
+
+    fn sequential_memory_observation(
+        state: &Self::SequentialState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        Some(
+            eredu_core::speculative::SpeculativePredictionMemoryObservation {
+                layer_positions: vec![u64::try_from(state.offset()).ok()?],
+                // Compact snapshot payloads can omit retained backing capacity.
+                // A complete native capacity envelope is not yet available here.
+                current_state_bytes: None,
+                peak_state_bytes: None,
+            },
+        )
+    }
+
+    fn pooling_memory_observation(
+        state: &Self::PoolingState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        Some(
+            eredu_core::speculative::SpeculativePredictionMemoryObservation {
+                layer_positions: vec![u64::try_from(state.offset()).ok()?],
+                // Compact snapshot payloads can omit retained backing capacity.
+                // A complete native capacity envelope is not yet available here.
+                current_state_bytes: None,
+                peak_state_bytes: None,
+            },
+        )
+    }
+
     fn pooling_snapshot_estimate(
         state: &Self::PoolingState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {

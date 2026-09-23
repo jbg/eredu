@@ -6,9 +6,9 @@ use eredu_runtime::prediction_resources::{
 };
 use eredu_runtime::{SpeculativeCaptureEntry, SpeculativeCaptureSchema, SpeculativeIdentity};
 
-struct EmbeddedFixture;
+pub(super) struct EmbeddedFixture;
 
-fn topology() -> EmbeddedPredictionTopology {
+pub(super) fn topology() -> EmbeddedPredictionTopology {
     let projection = |name, input, output| {
         serde_json::json!({
             "input": input, "output": output, "format": {"kind":"dense"}, "bias":false, "parameter":name,

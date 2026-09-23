@@ -408,11 +408,12 @@ Inside `with_controlled_text_speculative` or `with_controlled_chat_speculative`,
 `session.forecast_remaining_generation(additional_tokens, &options)` after prefill
 or a canonical commit. The object-safe operation returns
 `SpeculativeContinuationForecast`: target `request`, the existing `speculative`
-plan (including draft request), horizon-specific `continuation` observations, and
+plan (including a draft request or embedded prediction plan), horizon-specific
+`continuation` observations, and
 an `estimate`. It performs no native execution, completion polling, synchronization,
 cache copy or budget reservation. It does not change the configured output limit.
 
-The first implementation covers independent autoregressive drafters. It observes
+Independent autoregressive drafters expose
 both installed cache frontiers separately, current backing-capacity allowances,
 state growth through the horizon and speculative overshoot, and the retained
 assistant seed. It refreshes both parameter residency reports (including cached
@@ -441,8 +442,9 @@ external application copies retained outside these declared allowances are exclu
 
 Before prefill, terminal/cancelled/failed owners, retained proposals, optimistic
 transactions and in-flight verification are explicitly unsupported. The method
-does not make those states eligible by advancing execution. Embedded and
-feature-conditioned prediction remain unsupported. User snapshots and inactive
+does not make those states eligible by advancing execution. Embedded prediction
+uses the settled observations described in phase 9 below; feature-conditioned
+external assistants remain unsupported. User snapshots and inactive
 branches are included from live non-rewindable reservations; restore and exchange
 change the state observed by the next call without refunding those reservations.
 
@@ -1357,8 +1359,8 @@ Initial prefill, failed/cancelled/terminal controlled sessions and unsettled
 submissions are rejected. Selected executables without an installed-state
 projection return `GenerationForecastError::UnsupportedContinuation`. Mid-flight
 speculative transactions are not ordinary continuations. Settled external
-autoregressive lanes use the separate speculative continuation plan above; the
-existing prepared speculative forecast still covers fresh speculative runs.
+autoregressive and embedded lanes use the separate speculative continuation plan;
+the prepared speculative forecast still covers fresh speculative runs.
 
 
 Initial continuation validation (2026-09-23, before tightening the semantic-history
@@ -1681,7 +1683,7 @@ retain prediction costs. These operations do not allocate model tensors, populat
 conversion caches, advance lanes or consume capture/snapshot budgets. Startup
 forecasts describe a fresh isolated speculative lane even if an unrelated ordinary
 cache has advanced. They are shared by continuous and controlled execution;
-advanced embedded continuation outlooks still require phase 9's settled observations.
+advanced embedded continuation outlooks use phase 9's settled observations below.
 
 Native Metal startup tests use a nonzero, two-layer all-attention Qwen3.5 text
 fixture with two prediction modules, F32 or mixed BF16/F32 parameters, and lookahead
@@ -1717,3 +1719,93 @@ cargo test -p eredu-architectures --test reference_structural --locked
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_speculative_continuation_forecasts_cover_settled_state_without_advancement --locked -- --ignored --nocapture --test-threads=1
 cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
 ```
+
+### Embedded continuation forecasts (phase 9)
+
+`ControlledSpeculativeSession::forecast_remaining_generation` now supports
+embedded prediction at the same canonical settled boundaries as independent
+autoregressive drafters. The operation observes the installed target frontier,
+each prediction layer's frontier, current and horizon-specific native state
+capacity, retained target features and the durable prediction seed. It reuses the
+startup prediction topology and transaction envelopes for drafting, verification,
+rollback/replay and configured lookahead. It does not extrapolate an installed
+prediction frontier from the target's position or the cold context offsets.
+
+`SpeculativeContinuationMemoryPlan.embedded` retains those additional observations;
+`draft` is now optional and is present only for an independently resident drafter.
+Existing serialized external-drafter records retain their draft object and read
+without an embedded field. Rust consumers should handle the optional draft.
+Recomputation validates that exactly one mechanism has matching observations and
+that its horizon includes the requested tokens plus configured speculative
+overshoot. Request a new observation after advancement, restore, branch exchange,
+or changing the requested horizon.
+
+Current prediction state has a logical payload lower bound derived from its
+observed layer frontiers. Native backing-capacity allowances determine its upper
+bound. Retained capture views include a conservative full-prefix feature allowance:
+a small visible tensor cannot erase storage pinned by its parent allocation.
+The current seed allowance also covers observed prediction capacity. These costs
+remain in the zero-token outlook, which has no forward workspace. Positive
+horizons include current retention plus future feature/state copies. Completed
+loading and prefill are excluded in both cases. Snapshot and inactive-branch
+reservations remain live across restore and exchange, without resident credit.
+
+Each query refreshes parameter residency, available capacity, allocator-cache
+policy and cached conversion ownership. Target and prediction weights share one
+residency owner. Only exact complete conversion bindings replace their matching
+future conversion allowances; aggregate conversion bytes are not credited again.
+
+Coverage still depends on the ordinary selected mechanisms. The all-attention
+dense Qwen3.5 text fixture is covered; this does not establish coverage for released
+hybrid schedules or other missing prediction workspaces. Missing native capacity,
+unknown retained storage, or mechanism topology required by a forecast phase
+preserves an unknown upper bound. Feature-conditioned external assistants and instrumented speculative
+retention remain outside this coverage. Arbitrary in-flight outlooks are still
+unsupported: forecasting never polls, synchronizes, submits, copies caches,
+advances a lane or consumes observation/snapshot budgets to make a query eligible.
+
+Validation on macOS/aarch64 Metal uses the nonzero all-attention Qwen3.5 text
+fixture from phase 8: eight prompt positions, two prediction modules, a 15-token
+continuation horizon, F32 or mixed BF16/F32 weights, and lookahead off/on. With
+allocator caching disabled, graph-driver allowance zero, a 256 KiB trace limit,
+and one live snapshot, the additional upper bounds were:
+
+| Weights | Lookahead | Additional forecast upper, bytes |
+| --- | --- | ---: |
+| F32 | Disabled | 1,995,972 |
+| F32 | Enabled | 3,308,582 |
+| Mixed BF16/F32 | Disabled | 2,095,512 |
+| Mixed BF16/F32 | Enabled | 3,508,926 |
+
+Measured subsequent native growth was about 11 KiB in every case. These estimates
+include conservative current capacity, host storage and snapshot reservations,
+not just newly allocated bytes. Repeated queries preserved tokens, sampling state,
+epochs and snapshot usage, and did not increase native active allocations.
+Zero/short/long horizons, JSON recomputation, budget shortfalls, later settled
+frontiers, pending-work rejection, restore/fork/exchange and final token parity
+were exercised. V3 and DSpark retain explicit unknowns; sequential/pooling native
+cache capacity is unknown even at zero horizon until its reusable backing-capacity
+contract is available. Startup and external-drafter continuation regressions passed.
+
+Portable conformance runs the same read-only/restore/branch/parity loop for embedded
+and external mock mechanisms, including acceptance/rejection and lookahead. Runtime
+coverage includes unequal observed layer frontiers, native capacity, full-prefix
+feature retention, zero horizons, mismatched observations, unknowns, overflow,
+serialization and old external continuation records. The architecture observation
+test distinguishes canonical prediction state from the retained seed.
+
+Reproducible checks:
+
+```sh
+cargo test -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --locked
+cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
+cargo test -p eredu-architectures --test reference_conformance speculative_production --locked
+cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --tests --locked -- -D warnings
+cargo clippy -p eredu-backend-mlx --features metal --lib --tests --locked -- -D warnings
+cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_embedded_ --locked -- --ignored --nocapture --test-threads=1
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_speculative_continuation_forecasts --locked -- --ignored --nocapture --test-threads=1
+```
+
+These are synthetic fixture measurements, not released-checkpoint calibration.
+CUDA and native distributed embedded continuations were not exercised.

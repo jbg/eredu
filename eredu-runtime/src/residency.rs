@@ -65,30 +65,7 @@ impl WeightMaterializationReport {
     }
 }
 
-/// One binding whose resident parameter owner retains a cached conversion.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResidentParameterConversionBinding {
-    /// Native-materialization lifetime identity, independent of an artifact name.
-    pub owner: eredu_core::resources::ResourceIdentity,
-    /// Ordinary residency unit containing this binding.
-    pub unit: OffloadUnitId,
-    /// Exact executable binding name inside the unit.
-    pub name: String,
-    /// Architecture-logical destination, when supplied by ordinary preparation.
-    pub logical_target: Option<String>,
-}
-
-/// Existing reusable parameter conversion observed without populating a cache.
-///
-/// Shared aliases have one backing identity and all retaining owners/bindings.
-/// Capacity and physical placement remain unknown unless the backend knows them.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResidentParameterConversion {
-    /// The actual retained allocation, separate from its source parameters.
-    pub allocation: eredu_core::resources::ResourceAllocation,
-    /// Ordinary bindings that retain this conversion; these are not extra bytes.
-    pub bindings: Vec<ResidentParameterConversionBinding>,
-}
+pub use eredu_core::residency::{ResidentParameterConversion, ResidentParameterConversionBinding};
 
 pub(crate) fn conversion_payload_bytes(
     conversions: &[ResidentParameterConversion],

@@ -68,7 +68,22 @@ pub struct SpeculativeMemoryPlan {
     pub shared_allocator: bool,
 }
 
-/// Settled, horizon-specific observations for an external autoregressive lane.
+/// Installed embedded state with native capacity and retained capture observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedContinuationMemoryPlan {
+    /// Native layer frontiers in the ordinary prediction-state order.
+    pub layer_positions: Vec<u64>,
+    /// Native envelope horizon, including configured speculative overshoot.
+    pub additional_input_tokens: u64,
+    /// Current logical payload floor through the native capacity allowance.
+    pub current_state: MemoryBytes,
+    /// Native capacity envelope through the requested horizon.
+    pub peak_state: MemoryBytes,
+    /// Captured target features, including potentially pinned prefix backing.
+    pub retained_features: MemoryBytes,
+}
+
+/// Settled, horizon-specific observations for a speculative lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeculativeContinuationMemoryPlan {
     /// Requested additional committed decisions; this does not change the run limit.
@@ -76,7 +91,11 @@ pub struct SpeculativeContinuationMemoryPlan {
     /// Actual target state, including speculative overshoot in its peak horizon.
     pub target: ContinuationMemoryPlan,
     /// Actual draft state, which need not have the same installed frontier.
-    pub draft: ContinuationMemoryPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<ContinuationMemoryPlan>,
+    /// Installed prediction owner for embedded speculation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<EmbeddedContinuationMemoryPlan>,
     /// Current retained assistant seed; future copies use the draft-state envelope.
     pub seed: MemoryBytes,
     /// Current and future sampler, random, history and semantic storage allowance.
@@ -100,34 +119,32 @@ pub struct SpeculativeContinuationForecast {
     pub continuation: SpeculativeContinuationMemoryPlan,
 }
 
-/// Projects settled external autoregressive continuation from actual installed state.
+/// Projects settled speculative continuation from actual installed state.
 pub fn estimate_speculative_continuation_memory(
     target: &GenerationMemoryRequest,
     plan: &SpeculativeMemoryPlan,
     continuation: &SpeculativeContinuationMemoryPlan,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
-    if plan.embedded.is_some() {
-        return Err(CapabilityError::InvalidConfiguration { field: "speculative continuation", detail: "embedded prediction state and retained features require a settled native observation".into() });
-    }
-    let draft = plan
-        .draft
-        .as_ref()
-        .ok_or(CapabilityError::InvalidConfiguration {
-            field: "speculative continuation",
-            detail: "requires an independent autoregressive draft".into(),
-        })?;
     let mut continuation = continuation.clone();
     continuation.target = continuation.target.with_logical_state_bounds(target)?;
-    continuation.draft = continuation.draft.with_logical_state_bounds(draft)?;
     let extra = speculative_continuation_positions(
         continuation.additional_tokens,
         plan.max_draft_tokens,
         plan.scheduler,
     )?;
-    if continuation.target.additional_input_tokens != extra
-        || continuation.draft.additional_input_tokens != extra
-    {
+    if continuation.target.additional_input_tokens != extra {
         return Err(CapabilityError::InvalidConfiguration { field: "speculative continuation horizon", detail: "native state observations must include the requested horizon and configured speculative overshoot".into() });
+    }
+    match (&plan.draft, &plan.embedded, &mut continuation.draft, &mut continuation.embedded) {
+        (Some(draft), None, Some(state), None) if state.additional_input_tokens == extra => {
+            *state = state.with_logical_state_bounds(draft)?;
+        }
+        (None, Some(prediction), None, Some(state)) if state.additional_input_tokens == extra => {
+            prediction.validate_continuation(target, state)?;
+        }
+        _ => return Err(CapabilityError::InvalidConfiguration {
+            field: "speculative continuation", detail: "requires matching settled observations and horizon for exactly one selected draft mechanism".into(),
+        }),
     }
     estimate_speculative_inner(target, plan, Some(&continuation))
 }
@@ -403,7 +420,7 @@ fn estimate_speculative_inner(
                 .map(|p| get(target, p, continuation.map(|c| &c.target)))
                 .transpose()?;
             let dp = d
-                .map(|(r, p)| get(r, p, continuation.map(|c| &c.draft)))
+                .map(|(r, p)| get(r, p, continuation.and_then(|c| c.draft.as_ref())))
                 .transpose()?;
             let mut p = tp
                 .clone()
@@ -438,35 +455,66 @@ fn estimate_speculative_inner(
             }
             let execution_pool = t.is_some_and(|p| !p.executions.is_empty())
                 || d.is_some_and(|(_, p)| !p.executions.is_empty());
-            if execution_pool && !start {
+            if execution_pool {
                 if let Some(embedded) = &plan.embedded {
-                    let (state, workspace, features) =
-                        embedded.costs(target, positions, query, prefill)?;
+                    let native = continuation.and_then(|c| c.embedded.as_ref());
+                    let positions = if start {
+                        continuation.unwrap().target.current_positions
+                    } else {
+                        positions
+                    };
+                    let selected_state = native.map(|n| {
+                        if start {
+                            &n.current_state
+                        } else {
+                            &n.peak_state
+                        }
+                    });
+                    let (state, workspace, mut features) = embedded.costs_with_state(
+                        target,
+                        positions,
+                        if start { 0 } else { query },
+                        prefill,
+                        selected_state,
+                    )?;
+                    if let Some(native) = native {
+                        features = if start {
+                            native.retained_features.clone()
+                        } else {
+                            features.add(&native.retained_features)?
+                        };
+                    }
                     p.persistent_state = p.persistent_state.add(&state)?;
-                    p.workspace = p.workspace.add(&interval(
-                        &workspace,
-                        if prefill { 1 } else { add(1, lookahead)? },
-                        &format!(
-                            "embedded prediction invocation and optimistic graph overlap: {}",
-                            workspace.detail
-                        ),
-                    )?)?;
+                    if !start {
+                        p.workspace = p.workspace.add(&interval(
+                            &workspace,
+                            if prefill { 1 } else { add(1, lookahead)? },
+                            &format!(
+                                "embedded prediction invocation and optimistic graph overlap: {}",
+                                workspace.detail
+                            ),
+                        )?)?;
+                    }
                     p.retained_input = p.retained_input.add(&features)?;
-                    p.staging = p.staging.add(&interval(&state,
+                    if !start {
+                        p.staging = p.staging.add(&interval(&state,
                         if prefill { 2 } else { add(5, mul(3, lookahead)?)? },
                         "embedded seed, proposal restore/replacement, rollback/replay and optimistic prediction state copies",
                     )?)?;
-                    p.staging = p.staging.add(&interval(&features,
+                        p.staging = p.staging.add(&interval(&features,
                         if prefill { 2 } else { add(5, mul(3, lookahead)?)? },
                         "retained target feature views/copies through prediction, verification, rollback and lookahead",
                     )?)?;
-                    if workspace.upper_bytes.is_none() {
+                    }
+                    if !start && workspace.upper_bytes.is_none() {
                         result.uncertainties.push(workspace.detail);
                     }
                     if features.upper_bytes.is_none() {
                         result.uncertainties.push(features.detail);
                     }
                 }
+            }
+            if execution_pool && !start {
                 // The ordinary workspace already includes cache-update overlap.
                 // These *additional* copies envelope durable checkpoints, seed,
                 // proposal restore/replacement, rollback and optimistic branches.
@@ -620,7 +668,7 @@ fn estimate_speculative_inner(
         .push(plan.sampling_bytes_per_vocabulary_entry.detail.clone());
     result.assumptions.push("Speculative single-lane envelope: full-pass prefill; target and draft residency, rollback, proposal copies, verification and replay; configured lookahead is retained without assuming acceptance or adaptive disabling. User snapshots/branches are additional allocations.".into());
     if let Some(embedded) = &plan.embedded {
-        result.assumptions.push(format!("Embedded {:?} startup: prediction parameters remain in target residency; ordinary prediction components, retained target features, invocation workspace, state-copy and lookahead envelopes are composed without charging shared target weights twice.", embedded.mode));
+        result.assumptions.push(format!("Embedded {:?} execution: prediction parameters remain in target residency; ordinary prediction components, retained target features, invocation workspace, state-copy and lookahead envelopes are composed without charging shared target weights twice.", embedded.mode));
         result.uncertainties.extend(
             embedded
                 .missing
@@ -636,14 +684,25 @@ fn estimate_speculative_inner(
         result
             .assumptions
             .retain(|s| !s.starts_with("Speculative single-lane envelope:"));
-        result.assumptions.push("Settled external autoregressive continuation: actual target/draft frontiers and native capacity; no completed loading/prefill; configured proposal and lookahead ceilings, with no assumption of acceptance. Snapshot/branch and state bounds are allowances, never resident credit. Horizon does not change generation limits.".into());
+        result.assumptions.push("Settled speculative continuation: actual target/draft or prediction frontiers and native capacity; no completed loading/prefill; configured proposal and lookahead ceilings, with no assumption of acceptance. Snapshot/branch and state bounds are allowances, never resident credit. Horizon does not change generation limits.".into());
         result.uncertainties.extend([
             c.target.current_state.detail.clone(),
             c.target.peak_state.detail.clone(),
-            c.draft.current_state.detail.clone(),
-            c.draft.peak_state.detail.clone(),
             c.host_retention.detail.clone(),
         ]);
+        if let Some(draft) = &c.draft {
+            result.uncertainties.extend([
+                draft.current_state.detail.clone(),
+                draft.peak_state.detail.clone(),
+            ]);
+        }
+        if let Some(embedded) = &c.embedded {
+            result.uncertainties.extend([
+                embedded.current_state.detail.clone(),
+                embedded.peak_state.detail.clone(),
+                embedded.retained_features.detail.clone(),
+            ]);
+        }
     }
     result.fit = if result
         .domains

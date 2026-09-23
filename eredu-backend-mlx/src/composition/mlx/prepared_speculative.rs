@@ -127,6 +127,14 @@ where
         state.deep_checkpoint()
     }
 
+    fn state_memory_bounds(state: &S, additional: u64) -> (Option<u64>, Option<u64>) {
+        let retained = state.isolated_snapshot_estimate().map(|e| e.retained_bytes);
+        (
+            retained.and_then(|n| n.checked_add(state.isolated_snapshot_growth(0)?)),
+            retained.and_then(|n| n.checked_add(state.isolated_snapshot_growth(additional)?)),
+        )
+    }
+
     fn control_state_estimate(
         state: &S,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {

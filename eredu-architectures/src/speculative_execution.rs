@@ -554,6 +554,18 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     /// Optional component telemetry.
     type Telemetry: SpeculativeTelemetry;
 
+    /// Reads installed target/prediction state and shared parameter ownership.
+    fn continuation_memory_observation(
+        &self,
+        _cache: &Self::TargetCache,
+        _additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
     /// Complete durable target-lane estimate, including canonical prediction state.
     fn control_target_estimate(
         &self,
@@ -771,6 +783,11 @@ where
     fn target_context<'a>(context: M::Context<'a>) -> &'a <B::Tensor as eredu_nn::Tensor>::Context;
     /// Creates an exact native target-state checkpoint.
     fn checkpoint(state: &S) -> Result<S, M::Error>;
+    /// Current native state and horizon capacity allowances; no synchronization.
+    fn state_memory_bounds(_state: &S, _additional: u64) -> (Option<u64>, Option<u64>) {
+        (None, None)
+    }
+
     /// Complete isolated snapshot bound for the target's native state profile.
     fn control_state_estimate(
         _state: &S,
@@ -1059,6 +1076,53 @@ where
     type TargetCache = EmbeddedPredictionCache<S, P::LaneState>;
     type PredictionCache = EmbeddedPredictionDraftCache<P::LaneState>;
     type Telemetry = N::Telemetry;
+
+    fn continuation_memory_observation(
+        &self,
+        cache: &Self::TargetCache,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let Some(target) = cache.target.as_ref() else {
+            return Ok(None);
+        };
+        let Some(parameters) = self
+            .session
+            .parameter_memory_observation()
+            .map_err(eredu_core::BackendFailure::from_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(prediction) = self
+            .extension
+            .memory_observation(&cache.prediction, additional)
+        else {
+            return Ok(None);
+        };
+        let (current_state_bytes, peak_state_bytes) = N::state_memory_bounds(target, additional);
+        Ok(Some(
+            eredu_core::speculative::SpeculativeContinuationObservation {
+                target: eredu_core::speculative::SpeculativeModelMemoryObservation {
+                    current_positions: N::generation(target)
+                        .map_err(eredu_core::BackendFailure::from_error)?,
+                    current_state_bytes,
+                    peak_state_bytes,
+                    parameters: parameters.parameters,
+                    available: parameters.available,
+                    allocator_cache_limit: parameters.allocator_cache_limit,
+                },
+                draft: None,
+                embedded: Some(eredu_core::speculative::EmbeddedContinuationObservation {
+                    prediction,
+                    retained_feature_bytes: None,
+                }),
+                parameter_conversions: parameters.parameter_conversions,
+                seed_bytes: None,
+            },
+        ))
+    }
 
     fn control_target_estimate(
         &self,
@@ -1679,7 +1743,17 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
         &mut self,
         plan: AdmittedSpeculativeActivations,
     ) -> Result<(), SpeculativeControlError>;
-    /// Exact complete cache/seed cost from the typed executor.
+    /// Reads one settled lane without polling, copying, or evaluating native work.
+    fn continuation_memory_observation(
+        &self,
+        cache: &DynEmbeddedCache,
+        state: &DynEmbeddedTargetState,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    >;
+    /// Complete durable snapshot bound for the erased canonical lane.
     fn control_snapshot_estimate(
         &self,
         cache: &DynEmbeddedCache,
@@ -1832,6 +1906,26 @@ where
     ) -> Result<(), SpeculativeControlError> {
         SpeculativeExecutor::readmit_activation_interventions(self, plan)
     }
+    fn continuation_memory_observation(
+        &self,
+        cache: &DynEmbeddedCache,
+        state: &DynEmbeddedTargetState,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        SpeculativeExecutor::continuation_memory_observation(
+            self,
+            cache.0.downcast_ref().expect("paired embedded cache"),
+            state
+                .0
+                .downcast_ref()
+                .expect("paired embedded target state"),
+            additional,
+        )
+    }
+
     fn control_snapshot_estimate(
         &self,
         cache: &DynEmbeddedCache,
@@ -2144,6 +2238,19 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
         self.inner.readmit_activation_interventions(plan)
     }
 
+    fn continuation_memory_observation(
+        &self,
+        cache: &Self::Cache,
+        state: &Self::TargetState,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        self.inner
+            .continuation_memory_observation(cache, state, additional)
+    }
+
     fn control_snapshot_estimate(
         &self,
         cache: &Self::Cache,
@@ -2421,6 +2528,32 @@ where
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
+
+    fn continuation_memory_observation(
+        &self,
+        cache: &Self::Cache,
+        state: &Self::TargetState,
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let Some(mut observation) = self
+            .strategy
+            .continuation_memory_observation(cache, additional)?
+        else {
+            return Ok(None);
+        };
+        if let Some(embedded) = &mut observation.embedded {
+            embedded.retained_feature_bytes =
+                M::control_tensor_estimate(&state.capture).map(|e| e.retained_bytes);
+        }
+        observation.seed_bytes = self
+            .strategy
+            .control_prediction_estimate(&state.prediction_cache)
+            .map(|e| e.retained_bytes);
+        Ok(Some(observation))
+    }
 
     fn control_snapshot_estimate(
         &self,

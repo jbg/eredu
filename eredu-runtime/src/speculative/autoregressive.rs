@@ -378,7 +378,9 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         Ok(Some(
             eredu_core::speculative::SpeculativeContinuationObservation {
                 target,
-                draft,
+                draft: Some(draft),
+                embedded: None,
+                parameter_conversions: None,
                 seed_bytes: M::checkpoint_retained_bytes(state),
             },
         ))

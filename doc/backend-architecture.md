@@ -6764,7 +6764,8 @@ raw phase-4 storage contract as exact. Unsupported equation providers, missing
 rank-local topology and unsupported residency lifetimes retain named gaps.
 An embedded selection keeps ordinary request-only forecasts explicitly unbounded;
 startup forecasts retain target topology only alongside the prediction and
-transaction plan. Advanced embedded continuations still need settled observations.
+transaction plan. Advanced embedded continuations additionally use settled
+observations of installed prediction state and retained target features.
 Cold and loaded calls remain read-only and cannot materialize modules, populate
 parameter conversion caches or consume observation budgets.
 
@@ -6799,8 +6800,8 @@ weights, populate conversion caches, evaluate tensors or advance execution.
 Logical resource descriptions do not establish native capacity. Missing dtype,
 local geometry, target-feature backing, mechanism scratch and evaluation retention
 remain explicit. Startup forecasts now compose covered ordinary target and
-prediction invocations with the speculative transaction envelopes; advanced
-embedded continuations remain a separate capability.
+prediction invocations with the speculative transaction envelopes; settled
+embedded continuations substitute observed live state and feature retention.
 
 Qwen hybrid attention, dense feed-forward, shared prediction fusion and static
 readout construction expose their actual `LinearSpec`/`StaticModuleSpec` inputs
@@ -6821,3 +6822,28 @@ relative attention, hyper-connections, patterned operators) rather than acquirin
 a finite bound from the presence of an embedded head alone. Rank-local prediction
 invocation geometry remains unknown until ordinary partition contracts describe
 it.
+
+### Settled embedded continuation observations
+
+The speculative executor observes the installed target cache, prediction-layer
+frontiers and retained target features through neutral contracts in `eredu-core`.
+The architecture adapter forwards the ordinary prediction state's membership;
+it contains no forecast calibration or family-specific memory equations. Native
+mechanisms report state-capacity allowances and current parameter ownership.
+`ReplicatedTextSession` exposes a read-only parameter observation because the
+ordinary session is lent to the embedded executor during a controlled run.
+The MLX adapter projects its existing residency report through this operation.
+
+Resident parameter conversion allocation and binding records now live in
+`eredu-core::residency`, with their existing runtime paths reexported. This lets the
+neutral observation carry fresh native ownership after prefill without introducing
+a dependency from core to runtime. The runtime retains validation and forecast
+credit policy. Embedded conversions belong to the shared target parameter owner;
+prediction invocations never acquire a second parameter-residency charge.
+
+The portable runtime composes the phase-8 prediction/transaction plan with observed
+current frontiers and horizon-specific capacity. Current feature and seed retention
+survive a zero-token outlook. Loading and prefill do not reappear in continuation
+phases. Missing native bounds or ordinary invocation mechanisms remain explicit.
+Only canonical settled boundaries are eligible; observation cannot poll, submit,
+settle, snapshot, advance execution or consume capture/transport/copy budgets.

@@ -897,6 +897,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
 struct MockDrafter;
 
 struct MockSpeculativeExecutor {
+    embedded: bool,
     reject_second: bool,
     activations: Option<observed_mock::InternalCapture>,
 }
@@ -976,7 +977,21 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         Ok(Some(
             eredu_core::speculative::SpeculativeContinuationObservation {
                 target: state.clone(),
-                draft: state,
+                draft: (!self.embedded).then_some(state),
+                embedded: self.embedded.then(|| {
+                    eredu_core::speculative::EmbeddedContinuationObservation {
+                        prediction:
+                            eredu_core::speculative::SpeculativePredictionMemoryObservation {
+                                layer_positions: vec![(*cache as u64).saturating_sub(1)],
+                                current_state_bytes: Some(32768),
+                                peak_state_bytes: additional
+                                    .checked_mul(512)
+                                    .and_then(|n| n.checked_add(32768)),
+                            },
+                        retained_feature_bytes: Some(128),
+                    }
+                }),
+                parameter_conversions: Some(vec![]),
                 seed_bytes: Some(32),
             },
         ))
@@ -1386,10 +1401,7 @@ impl SpeculativeGenerationBackend for MockBackend {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        assert!(matches!(
-            request.take_drafting(),
-            SpeculativeDraft::Embedded | SpeculativeDraft::External(_)
-        ));
+        let embedded = matches!(request.take_drafting(), SpeculativeDraft::Embedded);
         let mut lanes = request.take_lanes();
         let result_cardinality = lanes
             .first()
@@ -1424,6 +1436,7 @@ impl SpeculativeGenerationBackend for MockBackend {
         let mut output = visitor
             .run(
                 &mut MockSpeculativeExecutor {
+                    embedded,
                     reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
                     activations: None,
                 },

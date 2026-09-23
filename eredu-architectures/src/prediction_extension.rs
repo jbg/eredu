@@ -949,6 +949,28 @@ where
     /// Constructs an empty sequential prediction-layer cache.
     fn sequential_state() -> Self::SequentialState;
 
+    /// Observes native per-layer frontiers and capacity without copying or settling.
+    fn sequential_memory_observation(
+        _state: &Self::SequentialState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        None
+    }
+    /// Observes native pooling state, preserving unknown capacity where unavailable.
+    fn pooling_memory_observation(
+        _state: &Self::PoolingState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        None
+    }
+    /// Observes the ordinary native model-state profile.
+    fn model_memory_observation(
+        _state: &Self::ModelState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        None
+    }
+
     /// Complete durable-copy bound for one sequential cache, including native
     /// storage and any auxiliary ownership. Unknown support is never zero cost.
     fn sequential_snapshot_estimate(
@@ -1086,6 +1108,15 @@ where
         &mut self,
         visitor: &mut V,
     ) -> Result<(), V::Error>;
+
+    /// Observes architecture-owned state membership through native mechanisms.
+    fn memory_observation(
+        &self,
+        _state: &Self::LaneState,
+        _additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        None
+    }
 
     /// Complete prediction-lane copy bound with architecture-owned membership.
     fn snapshot_estimate(
@@ -2381,6 +2412,15 @@ where
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         snapshot::sequence_estimate(state, M::sequential_snapshot_estimate)
     }
+    fn memory_observation(
+        &self,
+        state: &Self::LaneState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        snapshot::sequence_memory(state, |state| {
+            M::sequential_memory_observation(state, additional)
+        })
+    }
     fn snapshot(
         &self,
         state: &Self::LaneState,
@@ -2595,6 +2635,15 @@ where
         state: &Self::LaneState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         snapshot::sequence_estimate(state, M::pooling_snapshot_estimate)
+    }
+    fn memory_observation(
+        &self,
+        state: &Self::LaneState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        snapshot::sequence_memory(state, |state| {
+            M::pooling_memory_observation(state, additional)
+        })
     }
     fn snapshot(
         &self,
@@ -2983,6 +3032,13 @@ where
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::model_snapshot_estimate(state)
     }
+    fn memory_observation(
+        &self,
+        state: &Self::LaneState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        M::model_memory_observation(state, additional)
+    }
     fn snapshot(
         &self,
         state: &Self::LaneState,
@@ -3191,6 +3247,13 @@ where
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::model_snapshot_estimate(state)
     }
+    fn memory_observation(
+        &self,
+        state: &Self::LaneState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        M::model_memory_observation(state, additional)
+    }
     fn snapshot(
         &self,
         state: &Self::LaneState,
@@ -3391,6 +3454,13 @@ where
         state: &Self::LaneState,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         M::model_snapshot_estimate(state)
+    }
+    fn memory_observation(
+        &self,
+        state: &Self::LaneState,
+        additional: u64,
+    ) -> Option<eredu_core::speculative::SpeculativePredictionMemoryObservation> {
+        M::model_memory_observation(state, additional)
     }
     fn snapshot(
         &self,

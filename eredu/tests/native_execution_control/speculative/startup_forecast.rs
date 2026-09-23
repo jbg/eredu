@@ -1,7 +1,7 @@
 //! Startup projections through the public embedded speculative path.
 use super::*;
 
-fn attention_prediction_fixture(mixed: bool) -> Fixture {
+pub(super) fn attention_prediction_fixture(mixed: bool) -> Fixture {
     let root = fixture(false);
     let config = serde_json::json!({
         "model_type":"qwen3_5_text", "hidden_size":8, "vocab_size":64,

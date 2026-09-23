@@ -13,7 +13,8 @@ use eredu_core::{
     generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
 };
 pub use eredu_runtime::memory_forecast::{
-    SpeculativeContinuationForecast, SpeculativeContinuationMemoryPlan,
+    EmbeddedContinuationMemoryPlan, SpeculativeContinuationForecast,
+    SpeculativeContinuationMemoryPlan,
 };
 pub use eredu_runtime::speculative::{
     ControlledSpeculativeActivation, ControlledSpeculativeOptions, ControlledSpeculativeSession,
