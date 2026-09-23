@@ -693,6 +693,19 @@ Unattributed host/native allowances are conservatively included in each separate
 physical pool. Unknown grammar, native growth, workspace or other storage keeps
 its upper end unknown.
 
+Semantic history is bounded by its actual wire contract. Delivery charges a
+complete JSON record before retaining its semantic event; the record's fixed
+fields cover the event header, and JSON covers its string payload. Current
+history is counted directly. Future logical history is bounded by
+`trace_limit - emitted_bytes`, without multiplying bytes by an event-header size.
+Restore does not refund this allowance. Branch reservations use the fresh child's
+trace limit once; inherited history is already covered by the source reservation.
+A separate encoded-trace allowance remains for one consumer-retained JSON copy.
+With a 64 MiB trace budget, future semantic history therefore contributes at most
+64 MiB, plus the separately modeled encoded trace and other retained resources.
+These are logical storage bounds, excluding vector spare capacity and allocator
+overhead; they do not assert a physical process-memory ceiling.
+
 Only declared resident parameter backing is deducted when comparing additional
 memory with current available capacity. State, snapshot and branch allowances are
 not credited as observed allocations. This can overestimate incremental cost,
@@ -708,7 +721,8 @@ speculative transactions are not ordinary continuations and remain unsupported;
 the existing prepared speculative forecast still covers fresh speculative runs.
 
 
-Continuation validation (2026-09-23): portable tests cover pending-token offsets,
+Initial continuation validation (2026-09-23, before tightening the semantic-history
+allowance below): portable tests cover pending-token offsets,
 zero and extended horizons, overflow/shortfall/unknown growth, interior remainder
 peaks, unchanged output/copy/trace budgets, restore, branch exchange and failed
 iterator settlement. Native Metal validation used the nonzero Qwen2 dense and
@@ -739,3 +753,22 @@ EREDU_CONTINUATION_MODEL=/tmp/eredu-spec-validation/model \
 The same fixture test can run without Metal using `--no-default-features
 --features mlx` and omitting `--ignored`; this change was validated natively on
 Metal, not CUDA or a CPU-only MLX build.
+
+
+
+Semantic-history regression validation uses a 64 MiB trace budget, checks the
+logical-storage/charged-record relationship for every semantic event variant
+(including empty, escaped, Unicode and large string payloads), and exercises
+capture-enabled forecasts, restore and branch exchange. Doubling the budget adds
+one budget's worth to future semantic history and one to the separately retained
+encoded trace. Branch reservations grow only once with the fresh child budget.
+
+
+The updated native test uses a 64 MiB trace budget. On the same pinned original
+SmolLM-135M checkpoint, four prompt positions and 16 further forced tokens produced
+a retained upper of 136,357,159 bytes (about 130 MiB) and an additional generation
+upper of 482,707,361 bytes. The measured incremental native active peak remained
+3,102,774 bytes. Forecasting changed neither active native allocation nor snapshot
+usage. The earlier calibration above used a 64 KiB trace budget and the older
+semantic-history multiplier; use the commands above to reproduce the current
+64 MiB regression case.

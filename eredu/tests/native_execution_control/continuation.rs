@@ -68,7 +68,7 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
             CapturePlan::none(),
             TraceLimits {
                 per_record_bytes: 16384,
-                total_bytes: 65536,
+                total_bytes: 64 << 20,
             },
         )
         .unwrap();
@@ -95,6 +95,16 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
     assert_eq!(forecast.continuation.current_positions, prompt);
     assert_eq!(forecast.estimate.requested_positions, prompt + 16);
     assert_eq!(forecast.estimate.fit, expected_fit);
+    // Includes a retained encoded trace and a distinct semantic history. The
+    // 64 MiB trace must not become several GiB through per-byte event headers.
+    let retained_upper = forecast.request.domains[0]
+        .retained_input
+        .upper_bytes
+        .unwrap();
+    assert!(
+        retained_upper < 256 << 20,
+        "retained upper: {retained_upper}"
+    );
     assert_eq!(run.snapshot_usage(), usage);
     assert_eq!(
         eredu_backend_mlx::allocator_memory()
@@ -126,9 +136,10 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
     assert_eq!(restored.continuation.current_positions, prompt);
     assert_eq!(restored.estimate.fit, expected_fit);
     eprintln!(
-        "{}: prefix {}, horizon 16, additional upper {:?}, measured active growth {}",
+        "{}: prefix {}, horizon 16, retained upper {}, additional upper {:?}, measured active growth {}",
         path.display(),
         prompt,
+        retained_upper,
         upper,
         measured.peak_bytes().saturating_sub(before.active_bytes())
     );

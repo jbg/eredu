@@ -29,6 +29,7 @@ enum OutputMode {
 
 mod branch;
 mod forecast;
+mod retention;
 mod snapshot;
 pub use branch::{ControlledGenerationBranch, GenerationBranchMetadata, GenerationBranchOptions};
 pub use snapshot::{

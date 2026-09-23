@@ -4,6 +4,15 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Tighter continuation host allowances
+
+Continuation forecasts now bound future semantic history by unspent trace bytes,
+replacing the previous event-header-per-byte multiplier. Existing history is
+counted directly; a retained encoded trace remains a separate allowance. Branch
+reservations use the same bound with the fresh child's trace budget. Restore
+preserves consumed trace accounting. A 64 MiB trace budget now contributes at most
+64 MiB of future semantic history instead of several GiB.
+
 ## 2026-09-23 — Mid-session memory forecasts
 
 Ordinary token iterators and controlled sessions now expose

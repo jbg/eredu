@@ -769,6 +769,7 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
         .forecast_remaining_generation(3, &Default::default())
         .is_err());
     run.step(|_| ControlFlow::Continue(())).unwrap();
+    let before_snapshot_emitted = run.emitted_bytes();
     let before_snapshot = run
         .forecast_remaining_generation(3, &Default::default())
         .unwrap();
@@ -788,16 +789,20 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
     assert_eq!(run.output_checkpoint(), checkpoint);
     assert_eq!(run.snapshot_usage().unwrap(), usage);
     assert_eq!(run.emitted_bytes(), transport);
-    assert!(
+    // Snapshot metadata consumes trace without retaining another semantic event.
+    // Only unspent trace remains available for future history.
+    assert_eq!(
         forecast.request.domains[0]
             .retained_input
             .upper_bytes
             .unwrap()
-            >= before_snapshot.request.domains[0]
-                .retained_input
-                .upper_bytes
-                .unwrap()
-                + saved.metadata().retained_bytes
+            + transport,
+        before_snapshot.request.domains[0]
+            .retained_input
+            .upper_bytes
+            .unwrap()
+            + before_snapshot_emitted
+            + saved.metadata().retained_bytes,
     );
     // The forecast allows hypothetical horizons beyond the run's configured limit.
     let long = run
@@ -817,6 +822,19 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
         .forecast_remaining_generation(3, &Default::default())
         .unwrap();
     assert_eq!(restored.continuation, forecast.continuation);
+    assert_eq!(
+        restored.request.domains[0]
+            .retained_input
+            .upper_bytes
+            .unwrap()
+            + run.emitted_bytes(),
+        forecast.request.domains[0]
+            .retained_input
+            .upper_bytes
+            .unwrap()
+            + transport
+    );
+
     let mut branch = run
         .fork(
             &saved,
@@ -842,5 +860,103 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
     assert_eq!(
         wire["estimate"]["domains"][0]["phases"][0]["phase"],
         "continuation_start"
+    );
+}
+
+#[test]
+fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_header_multiplier() {
+    use eredu::api::{GenerationBranchOptions, GenerationForecastOptions, MemoryBudget, MemoryFit};
+    let mut retained_with_consumed_trace = Vec::new();
+    for trace_bytes in [32 << 20, 64 << 20] {
+        let (mut model, chat, settings, _) = snapshot_setup();
+        let trace = TraceLimits {
+            per_record_bytes: 16384,
+            total_bytes: trace_bytes,
+        };
+        let prepared = model
+            .prepare_observed_chat(&chat, settings, observed_mock::plan(), trace)
+            .unwrap();
+        let mut run = model
+            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        run.enable_snapshots(SnapshotLimits {
+            max_snapshots: 1,
+            max_branches: 1,
+            retained_bytes: 128 << 20,
+            cumulative_copy_bytes: 512 << 20,
+        })
+        .unwrap();
+        run.step(|_| ControlFlow::Continue(())).unwrap();
+        let options = GenerationForecastOptions {
+            budget: MemoryBudget {
+                application_limit_bytes: Some(256 << 20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checkpoint = run.output_checkpoint();
+        let transport = run.emitted_bytes();
+        let usage = run.snapshot_usage();
+        let forecast = run.forecast_remaining_generation(3, &options).unwrap();
+        assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+        assert_eq!(run.output_checkpoint(), checkpoint);
+        assert_eq!(run.emitted_bytes(), transport);
+        assert_eq!(run.snapshot_usage(), usage);
+        let retained = forecast.request.domains[0]
+            .retained_input
+            .upper_bytes
+            .unwrap();
+        // Two independent copies: encoded trace and logical semantic history.
+        // Admitted native/host captures, sampler and decoder add less than 4 MiB here.
+        assert!(
+            retained < 2 * trace_bytes + (4 << 20),
+            "retained upper: {retained}"
+        );
+        retained_with_consumed_trace.push(retained + transport);
+        let saved = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
+        let before_fork = run.snapshot_usage().unwrap().retained_bytes;
+        let mut branch = run
+            .fork(
+                &saved,
+                GenerationBranchOptions {
+                    trace_limits: trace,
+                    capture_limits: Some(observed_mock::plan().limits),
+                    sampling: None,
+                    intervention: None,
+                },
+                |_| ControlFlow::Continue(()),
+            )
+            .unwrap();
+        let branch_retained = run.snapshot_usage().unwrap().retained_bytes - before_fork;
+        // The branch's future semantic history is reserved once, alongside its
+        // existing source state, native growth and parser/sampler allowances.
+        assert!(branch_retained >= trace_bytes);
+        assert!(
+            branch_retained < trace_bytes + (4 << 20),
+            "branch reservation: {branch_retained}"
+        );
+        run.exchange(&mut branch, |_| ControlFlow::Continue(()))
+            .unwrap();
+        let before = run.snapshot_usage();
+        let child = run
+            .forecast_remaining_generation(3, &Default::default())
+            .unwrap();
+        assert_eq!(child.estimate.fit, MemoryFit::LikelyFit);
+        assert_eq!(run.snapshot_usage(), before);
+        run.step(|_| ControlFlow::Continue(())).unwrap();
+        run.exchange(&mut branch, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(run.token_ids(), saved.token_ids());
+        drop(branch);
+        assert_eq!(run.snapshot_usage().unwrap().retained_bytes, before_fork);
+    }
+    // Doubling the budget adds one budget's worth to each of the two copies,
+    // not one SemanticEvent header per trace byte. Identity lengths may vary.
+    let delta = retained_with_consumed_trace[1] - retained_with_consumed_trace[0];
+    assert!(
+        delta.abs_diff(2 * (32 << 20)) < 1024,
+        "retained delta: {delta}"
     );
 }

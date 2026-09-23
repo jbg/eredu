@@ -126,12 +126,13 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                 )
             })
             .and_then(|bytes| {
-                bytes.checked_add(
-                    options
-                        .trace_limits
-                        .total_bytes
-                        .checked_mul(std::mem::size_of::<SemanticEvent>() as u64 + 1)?,
-                )
+                // Inherited history is covered by the source reservation. The
+                // fresh child's trace bounds future history before delivery of
+                // BranchStarted consumes any of that non-rewindable budget.
+                bytes.checked_add(super::retention::semantic_history_growth_bound(
+                    options.trace_limits.total_bytes,
+                    0,
+                ))
             })
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         let growth = native_growth

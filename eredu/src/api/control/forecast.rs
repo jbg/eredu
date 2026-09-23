@@ -40,16 +40,13 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationS
                         .continuation_storage_bytes(predictions)?,
                 )
             })
-            // Semantic event vectors can contain many empty records; compact JSON
-            // limits bound their count, so allow one event header per encoded byte.
+            // Existing semantic history is counted above. Each future retained
+            // event is covered by its charged record, using only unspent trace.
             .and_then(|n| {
-                n.checked_add(
-                    self.delivery
-                        .budget
-                        .limits()
-                        .total_bytes
-                        .checked_mul(std::mem::size_of::<SemanticEvent>() as u64 + 1)?,
-                )
+                n.checked_add(super::retention::semantic_history_growth_bound(
+                    self.delivery.budget.limits().total_bytes,
+                    self.delivery.budget.emitted_bytes(),
+                ))
             });
         let retained_snapshots = self
             .snapshot_usage()
