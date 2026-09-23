@@ -1580,6 +1580,12 @@ pub(crate) mod tests {
             max_query_rows: 4,
             key_value_copies: 4,
             score_bytes: 16,
+            full_key_tiles: Some(eredu_runtime::memory_estimation::FullKeyAttentionTiles {
+                max_key_positions: 16,
+                shared_key_value_copies: 4,
+                max_live_query_tiles: 3,
+                retained_output_copies: 2,
+            }),
         });
         for _ in 0..2 {
             let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
@@ -1593,7 +1599,10 @@ pub(crate) mod tests {
             .input_score_workspace
             .as_mut()
             .unwrap()
-            .max_query_rows = 8;
+            .full_key_tiles
+            .as_mut()
+            .unwrap()
+            .max_live_query_tiles = 4;
         let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
         assert_eq!(
             selected.execution().input_score_attention_workspace(),

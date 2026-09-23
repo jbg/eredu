@@ -176,10 +176,30 @@ pub struct InputScoreAttentionMechanism {
     pub score_tile_elements: u64,
     /// Maximum query rows in one tile.
     pub max_query_rows: u64,
-    /// Expanded K/V plus contiguous projection copies retained per query tile.
+    /// Fallback expanded K/V and contiguous projection copies per query tile,
+    /// used when `full_key_tiles` is absent or does not cover the key length.
     pub key_value_copies: u64,
     /// Working bytes per score element, including precision conversions.
     pub score_bytes: u64,
+    /// Optional full-key layout reuse and bounded tile-graph retention. Missing
+    /// facts retain the legacy per-tile copy allowance for all key lengths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_key_tiles: Option<FullKeyAttentionTiles>,
+}
+
+/// Native retention contract for tiles that each attend to the entire key row.
+/// Beyond this contract's key limit, the mechanism's legacy allowances apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullKeyAttentionTiles {
+    /// Largest key row covered by shared preparation and bounded evaluation.
+    pub max_key_positions: u64,
+    /// Expanded K/V and native contiguous layouts, in query-width payloads.
+    /// This is charged once per invocation rather than once per query tile.
+    pub shared_key_value_copies: u64,
+    /// Largest number of unevaluated query tiles retained simultaneously.
+    pub max_live_query_tiles: u64,
+    /// Whole-query output payloads retained, including final concatenation.
+    pub retained_output_copies: u64,
 }
 
 /// Selected attention implementation's workspace behavior.
@@ -640,6 +660,17 @@ fn workspace(
                         "native tile and workspace allowances must be positive",
                     ));
                 }
+                if facts.full_key_tiles.is_some_and(|full| {
+                    full.max_key_positions == 0
+                        || full.shared_key_value_copies == 0
+                        || full.max_live_query_tiles == 0
+                        || full.retained_output_copies == 0
+                }) {
+                    return Err(invalid(
+                        "input_score_attention",
+                        "full-key retention limits and allowances must be positive",
+                    ));
+                }
                 let tile = if mul(query, positions)? <= facts.score_tile_elements {
                     query.max(1)
                 } else {
@@ -647,29 +678,54 @@ fn workspace(
                 };
                 let tiles = query.div_ceil(tile);
                 let live = copies.min(add(explicit.layers, copies.saturating_sub(layers))?);
-                // Each tile may retain its own expanded K/V and contiguous
-                // projection inputs. Beyond the score budget, whole-context
-                // copies also cover smaller key-block realizations conservatively.
+                let scalar_bytes = if g.mixed_precision_parameter_bytes.is_some() {
+                    u64::from(request.scalar_bytes.get()).max(4)
+                } else {
+                    u64::from(request.scalar_bytes.get())
+                };
+                let (key_value_copies, live_rows, output_copies, score_positions) = match facts
+                    .full_key_tiles
+                    .filter(|full| positions <= full.max_key_positions)
+                {
+                    Some(full) => (
+                        full.shared_key_value_copies,
+                        // Compare tile counts first: a huge but valid batch
+                        // limit must not overflow for a small invocation.
+                        if tiles <= full.max_live_query_tiles {
+                            query
+                        } else {
+                            mul(tile, full.max_live_query_tiles)?
+                        },
+                        full.retained_output_copies,
+                        // A sink adds one score column per query/head.
+                        add(positions, 1)?,
+                    ),
+                    None => (mul(facts.key_value_copies, tiles)?, query, 0, positions),
+                };
+                // Unknown reuse facts and out-of-range key rows retain the old
+                // per-tile whole-context envelope, including blockwise paths.
                 let expanded = product(&[
                     request.batch_size,
                     g.query_width,
                     positions,
-                    if g.mixed_precision_parameter_bytes.is_some() {
-                        u64::from(request.scalar_bytes.get()).max(4)
-                    } else {
-                        u64::from(request.scalar_bytes.get())
-                    },
-                    facts.key_value_copies,
-                    tiles,
+                    scalar_bytes,
+                    key_value_copies,
                 ])?;
                 let scores = product(&[
                     request.batch_size,
                     g.query_heads,
-                    query,
-                    positions,
+                    live_rows,
+                    score_positions,
                     facts.score_bytes,
                 ])?;
-                MemoryBytes::estimated(0, mul(add(expanded, scores)?, live)?, "tiled input-score attention: retained expanded K/V, contiguous projection copies and score conversions")
+                let outputs = product(&[
+                    request.batch_size,
+                    g.query_width,
+                    query,
+                    scalar_bytes,
+                    output_copies,
+                ])?;
+                MemoryBytes::estimated(0, mul(add(add(expanded, scores)?, outputs)?, live)?, "tiled input-score attention: selected K/V layout retention, live score conversions and completed outputs")
             }
             _ => MemoryBytes::unknown(
                 "input-score attention native workspace facts or overlap unavailable",

@@ -730,6 +730,7 @@ fn explicit_score_attention_retains_tiled_projection_copies_and_unknown_native_f
         max_query_rows: 4,
         key_value_copies: 4,
         score_bytes: 16,
+        full_key_tiles: None,
     };
     e.workspace.as_mut().unwrap().input_score_attention = Some(InputScoreAttentionWorkspace {
         layers: 1,
@@ -780,6 +781,144 @@ fn explicit_score_attention_retains_tiled_projection_copies_and_unknown_native_f
         .unwrap()
         .mechanism = Some(facts);
     assert!(workspace(&e, &r, u64::MAX, 3, 0).is_err());
+}
+
+#[test]
+fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() {
+    let mut r = request();
+    r.batch_size = 3;
+    r.scalar_bytes = NonZeroU8::new(4).unwrap();
+    let mut e = r.domains[0].executions[0].clone();
+    e.workspace_overlap.upper_live_copies = Some(3);
+    let plain = e.clone();
+    let full = FullKeyAttentionTiles {
+        max_key_positions: 32,
+        shared_key_value_copies: 4,
+        max_live_query_tiles: 3,
+        retained_output_copies: 2,
+    };
+    let facts = InputScoreAttentionMechanism {
+        score_tile_elements: 32,
+        max_query_rows: 4,
+        key_value_copies: 4,
+        score_bytes: 16,
+        full_key_tiles: Some(full),
+    };
+    e.workspace.as_mut().unwrap().input_score_attention = Some(InputScoreAttentionWorkspace {
+        layers: 1,
+        mechanism: Some(facts),
+    });
+    // Untiled, exactly one full batch, partial tile in a batch, multiple
+    // batches, a short final batch, and either side of the full-key limit.
+    for (positions, query, live_rows) in [
+        (2, 12, 12),
+        (8, 4, 4),
+        (8, 11, 11),
+        (8, 12, 12),
+        (8, 13, 12),
+        (8, 25, 12),
+        (32, 3, 3),
+        (32, 4, 3),
+        (33, 4, 4),
+    ] {
+        let base = workspace(&plain, &r, positions, query, 0).unwrap();
+        let projected = workspace(&e, &r, positions, query, 0).unwrap();
+        let g = e.workspace.as_ref().unwrap();
+        let expected = if positions <= full.max_key_positions {
+            let shared = g.query_width * positions * 4 * 4;
+            let scores = g.query_heads * live_rows * (positions + 1) * 16;
+            let retained = g.query_width * query * 4 * 2;
+            shared + scores + retained
+        } else {
+            // Blockwise and legacy mechanisms retain the old, intentionally
+            // conservative allowance; they do not inherit full-key promises.
+            g.query_width * positions * 4 * 4 * query + g.query_heads * query * positions * 16
+        };
+        assert_eq!(
+            projected.upper_bytes.unwrap() - base.upper_bytes.unwrap(),
+            expected * r.batch_size * 2,
+            "positions={positions}, query={query}"
+        );
+        assert_eq!(projected.lower_bytes, base.lower_bytes);
+    }
+
+    // Promotion changes shared K/V and retained outputs, while score scratch
+    // already includes conversion widths. Also include one parameter cast set
+    // plus the extra half-set from this fixture's layer overlap.
+    r.scalar_bytes = NonZeroU8::new(2).unwrap();
+    let base = workspace(&e, &r, 8, 13, 0).unwrap();
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .mixed_precision_parameter_bytes = Some(1024);
+    let projected = workspace(&e, &r, 8, 13, 0).unwrap();
+    let g = e.workspace.as_ref().unwrap();
+    assert_eq!(
+        projected.upper_bytes.unwrap() - base.upper_bytes.unwrap(),
+        (g.query_width * 8 * 2 * 4 + g.query_width * 13 * 2 * 2) * r.batch_size * 2 + 1024 + 512
+    );
+
+    let wire = serde_json::to_value(facts).unwrap();
+    assert_eq!(
+        serde_json::from_value::<InputScoreAttentionMechanism>(wire.clone()).unwrap(),
+        facts
+    );
+    let mut old_wire = wire;
+    old_wire.as_object_mut().unwrap().remove("full_key_tiles");
+    let legacy = serde_json::from_value::<InputScoreAttentionMechanism>(old_wire).unwrap();
+    assert!(legacy.full_key_tiles.is_none());
+    assert!(serde_json::to_value(legacy)
+        .unwrap()
+        .get("full_key_tiles")
+        .is_none());
+
+    for malformed in [
+        FullKeyAttentionTiles {
+            max_key_positions: 0,
+            ..full
+        },
+        FullKeyAttentionTiles {
+            shared_key_value_copies: 0,
+            ..full
+        },
+        FullKeyAttentionTiles {
+            max_live_query_tiles: 0,
+            ..full
+        },
+        FullKeyAttentionTiles {
+            retained_output_copies: 0,
+            ..full
+        },
+    ] {
+        e.workspace
+            .as_mut()
+            .unwrap()
+            .input_score_attention
+            .as_mut()
+            .unwrap()
+            .mechanism = Some(InputScoreAttentionMechanism {
+            full_key_tiles: Some(malformed),
+            ..facts
+        });
+        assert!(workspace(&e, &r, 8, 13, 0).is_err());
+    }
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .input_score_attention
+        .as_mut()
+        .unwrap()
+        .mechanism = Some(InputScoreAttentionMechanism {
+        full_key_tiles: Some(FullKeyAttentionTiles {
+            max_live_query_tiles: u64::MAX,
+            ..full
+        }),
+        ..facts
+    });
+    assert!(workspace(&e, &r, 8, 13, 0).is_ok());
+    assert!(workspace(&e, &r, 8, u64::MAX, 0).is_err());
+    e.workspace_overlap = WorkspaceOverlap::unknown();
+    assert!(workspace(&e, &r, 8, 13, 0).unwrap().upper_bytes.is_none());
 }
 
 #[test]

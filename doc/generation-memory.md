@@ -487,17 +487,21 @@ Large tiled calls evaluate batches of at most 32 query-tile outputs and retain t
 completed outputs for final concatenation, releasing each batch's score/softmax
 graphs before building the next batch. Small calls remain lazy. The backend
 supplies its actual tile thresholds (8,192 query-by-key elements, at most 32 query
-rows). The forecast
-retains its conservative allowance of four expanded K/V copies per tile and
-16 working bytes per score element pending separate recalibration. These facts are
+rows). For these full-key calls, the forecast charges four query-width K/V
+payloads per invocation, at most 32 live tiles of score scratch at 32 bytes per
+element (including a possible sink column), and two whole-query output payloads
+for completed tiles and concatenation. Mixed-width execution promotes K/V and
+output allowances to at least four bytes per scalar. These facts are
 retained during selection, including cold inspection, and participate in cached
 selection validation. Runtime adds their layer-overlap envelope to the ordinary
 attention fallback. Above 8,192 key positions, attention still uses the existing
 two-pass blockwise accumulator, which evaluates each block's running state and
 releases temporary layouts. Retaining all prepared blocks would undermine that
 bounded residency strategy; its FP32 accumulation also differs from full-key
-BF16 projection. The conservative whole-context K/V allowance also bounds those
-smaller key-block realizations. Missing native facts leave
+BF16 projection. Those rows retain the conservative per-tile whole-context K/V
+allowance with 32 working bytes per score element. Legacy serialized facts without
+`full_key_tiles` retain their declared per-tile copy and score allowances.
+Missing native facts leave
 an unknown upper end. Attention-free convolution schedules need no attention
 scratch declaration.
 
@@ -671,8 +675,9 @@ committed predictions it forecasts four more tokens at a synchronized boundary.
 It compares cold/loaded geometry, ordinary/controlled forecasts and output tokens,
 and verifies that forecasts allocate no active native bytes. The table records
 additional active-memory growth above loaded parameters, not process RSS. The
-256 GiB application budget makes these calibration cases observable; a separate
-16 GiB-budget check rejects `LikelyFit` for the 2,000-position request.
+256 GiB application budget makes these calibration cases observable. Before
+recalibration, a separate 16 GiB-budget check rejected `LikelyFit` for the
+2,000-position request; updated results appear below.
 
 The following measurements precede shared K/V preparation; updated measurements
 appear below. All values are MiB; upper ends are calibrated envelopes, not tight
@@ -691,10 +696,10 @@ The GGUF run used official `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` revision
 `6767265158422fb8a19c62ceb45f16f05363615b`, file
 `LFM2.5-1.2B-Instruct-BF16.gguf` (2,343,326,528 bytes), with verified SHA-256
 `3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b`.
-Pass that file as `EREDU_LFM2_MEMORY_MODEL` to reproduce. Its 128-position
-fresh/continuation forecasts report `LikelyFit`. The 2,000-position fresh forecast
-has a finite upper but remains `InsufficientInformation` because its interval
-crosses the host/application capacity. That is interval uncertainty rather than
+Pass that file as `EREDU_LFM2_MEMORY_MODEL` to reproduce. At this calibration stage,
+its 128-position fresh/continuation forecasts reported `LikelyFit`, while the
+2,000-position fresh forecast remained `InsufficientInformation` because its
+finite interval crossed host/application capacity. That was interval uncertainty rather than
 missing workspace coverage. Parameter casts explain much of the GGUF continuation
 cost; the broader envelope intentionally covers both promoted storage and casts.
 
@@ -729,7 +734,7 @@ rejections for incompatible source shapes and integer slots.
 
 Repeating the same pinned models, commands and 128/2,000-position matrix after
 sharing prepared K/V across query tiles produced these active-memory measurements
-(MiB). Forecast upper ends remain unchanged from the preceding table.
+(MiB). At that stage, forecast upper ends remained unchanged from the preceding table.
 
 | Source | Positions | Measured growth | Continuation growth |
 |---|---:|---:|---:|
@@ -761,8 +766,8 @@ keeping their completed output arrays for final concatenation. Shared prepared
 K/V stays resident across batches. Calls that fit within one batch remain lazy; the
 longer-than-8,192-key blockwise path is unchanged. This limits temporary graph
 retention, not total request memory: inputs, K/V, completed outputs and other
-model state still grow with request geometry. Forecast envelopes remain unchanged
-and conservative pending separate recalibration.
+model state still grow with request geometry. These measurements preceded the
+forecast recalibration below; their envelopes were unchanged and conservative.
 
 Measurements used an Apple M3 Ultra with 256 GiB unified memory, Metal, the default
 Cargo test profile and allocator cache limit zero. The isolated BF16 benchmark
@@ -836,6 +841,94 @@ output parity and cold, loaded and continuation forecast checks. CPU and Metal
 F32/F16/BF16 numerical tests cross the 32-tile boundary with grouped heads,
 multiple batches, unequal K/V widths, masks, sinks, softcaps and a partial final
 group. The backend's Metal Clippy and portable feature check also pass.
+
+### Forecast recalibration after tile retention improvements (2026-09-23)
+
+The native retention facts now distinguish full-key reuse/batching from legacy
+per-tile retention. For a batch size `B`, query width `W`, query-head count `H`,
+key positions `K`, query positions `Q` and scalar width `S`, the full-key extra
+allowance per live layer is:
+
+```text
+4 * B * W * K * S                         shared K/V and contiguous layouts
++ 32 * B * H * min(Q, tile_rows * 32) * (K + 1)  live score scratch, including a sink
++ 2 * B * W * Q * S                       completed outputs and concatenation
+```
+
+`tile_rows` follows the native 8,192-element/32-query-row policy. Mixed-width
+execution uses at least four bytes for `S`. Existing layer overlap, score-matrix
+fallback, convolution, parameter-cast and graph allowances remain in place. These
+are upper planning envelopes, not expected allocations. Above 8,192 keys the
+old per-tile whole-context envelope is retained. Old serialized mechanism records
+without `full_key_tiles` keep their declared copy/score allowances; an absent
+mechanism still leaves the workspace upper unknown.
+
+The isolated softcap/mask/sink benchmark showed that 16 working bytes per score
+element was insufficient on its own. The new 32-byte allowance covers that
+measured per-invocation peak without depending on model-wide overlap to hide the
+difference. The regression now checks the published bound against active allocator
+telemetry. This calibration changes no attention arithmetic or BF16 rounding.
+
+The same pinned checkpoints, Metal host, zero allocator cache and eight-token
+128/2,000-position matrix produced the following results (MiB):
+
+| Source | Positions | Cold lifecycle upper | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
+|---|---:|---:|---:|---:|---:|---:|
+| SafeTensors BF16 | 128 | 5296.5 | 818.2 | 525.0 | 125.0 | 15.5 |
+| SafeTensors BF16 | 2000 | 14916.7 | 12684.5 | 1516.7 | 875.0 | 175.1 |
+| SafeTensors affine 4-bit / BF16 | 128 | 3876.2 | 818.2 | 552.5 | 125.0 | 15.5 |
+| SafeTensors affine 4-bit / BF16 | 2000 | 13496.5 | 12684.5 | 1516.7 | 875.0 | 175.1 |
+| GGUF BF16/mixed | 128 | 8667.4 | 6434.9 | 4924.2 | 5739.4 | 4483.7 |
+| GGUF BF16/mixed | 2000 | 21014.5 | 18782.0 | 4908.4 | 6911.7 | 4705.7 |
+
+Every measured peak remains below its forecast upper. At 2,000 positions the
+SafeTensors loaded additional upper falls from 181.15 GiB to 12.39 GiB; both
+original and affine 4-bit runs now report `LikelyFit` with a 16 GiB application
+budget. The GGUF run still reports `InsufficientInformation` at that budget: its
+remaining conservative cast/activation envelope crosses capacity. Small or
+single-query upper ends can rise slightly because the corrected score allowance
+also applies there. Budgets below the lower bound still report `LikelyShortfall`.
+
+The native allowance regression also covers F16 and F32 short prefill, 2,000-row
+batched prefill and single-row cached decode. For the long case, measured peaks
+were 256,512,512 and 147,587,584 bytes against allowances of 311,427,072 and
+360,579,072 bytes respectively. These isolated checks include softcap, boolean
+mask and sink logits. They validate the per-invocation facts independently of
+the model's layer-overlap allowance.
+
+Full-model numerical validation compares revision `1aa87493` with the recalibrated
+implementation using the same native test harness and pinned BF16 checkpoint.
+For both 128 and 2,000 input positions, every one of the 65,536 logits at each
+of eight predictions matches bit-for-bit: prefill plus seven cached decode
+steps. All eight greedy tokens match raw generation, and explicit controlled
+stepping matches ordinary observed execution at every prediction. The comparison
+stores float32 host-logit bit patterns rather than decimal float approximations.
+The small F32 fixture additionally covers 17/513 positions. This is regression
+parity against the previous implementation; independent PyTorch attention
+fixtures continue to validate the BF16 rounding contract.
+
+To reproduce the before/after comparison, build the previous revision with the
+same `native_lfm2_forecast_recalibration_preserves_logits` test harness, then run
+it with `EREDU_LFM2_PARITY_WRITE=/tmp/lfm2-parity.json`. Run the current revision
+with `EREDU_LFM2_PARITY_REFERENCE=/tmp/lfm2-parity.json`:
+
+```sh
+EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct/snapshot \
+EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
+EREDU_LFM2_PARITY_REFERENCE=/tmp/lfm2-parity.json \
+cargo test -p eredu --features mlx,metal --offline \
+  --test native_execution_control native_lfm2_forecast_recalibration_preserves_logits \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Without a reference-file variable the test still checks raw/observed/controlled
+token parity and exact prefill/cached logits across ordinary and controlled runs.
+Native CUDA calibration remains unvalidated on this Metal host.
+
+Portable verification passed 28 memory-estimation tests, cold-selection cache
+invalidation, 96 backend-conformance tests and 27 portable-facade tests (one
+preexisting ignored case). Strict Clippy passed for the portable contracts,
+architectures, backend and native facade test harness.
 
 ## Focused verification
 

@@ -87,14 +87,21 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         let cold =
             forecast_inspected_generation(&inspection, &cold_options, &Default::default()).unwrap();
         let loaded = model.forecast_token_ids(&ids, settings, &options).unwrap();
-        if length >= 2000 {
-            let mut limited = loaded.request.clone();
-            limited.domains[0].budget.application_limit_bytes = Some(16 << 30);
-            assert_ne!(
-                estimate_generation_memory(&limited).unwrap().fit,
-                MemoryFit::LikelyFit
-            );
-        }
+        let mut limited = loaded.request.clone();
+        limited.domains[0].budget.application_limit_bytes = Some(16 << 30);
+        let budget_16_gib_fit = estimate_generation_memory(&limited).unwrap().fit;
+        // Large prompts can still exceed a budget after recalibration. Test
+        // shortfall against an actual lower bound instead of an obsolete peak.
+        limited.domains[0].budget.application_limit_bytes = Some(
+            loaded.estimate.domains[0]
+                .generation_peak
+                .lower_bytes
+                .saturating_sub(1),
+        );
+        assert_eq!(
+            estimate_generation_memory(&limited).unwrap().fit,
+            MemoryFit::LikelyShortfall
+        );
         assert!(cold.estimate.domains[0].overall_peak.upper_bytes.is_some());
         assert!(loaded.estimate.domains[0]
             .generation_peak
@@ -217,5 +224,230 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         assert_eq!(run.token_ids(), &generated[..run.token_ids().len()]);
         eprintln!("LFM2 memory: model={}, quantized={quantized}, positions={length}, scalar_bytes={}, cold_upper={}, loaded_additional_upper={upper}, measured_growth={measured_growth}, continuation_upper={continued_upper}, continuation_growth={continued_growth}, controlled_forecast={checked_controlled}", path.display(), loaded.request.scalar_bytes, cold.estimate.domains[0].overall_peak.upper_bytes.unwrap());
         eprintln!("LFM2 timing: positions={length}, first_token_ms={:.3}, generation_ms={:.3}, generated_tokens={}", first_token_elapsed.as_secs_f64() * 1000.0, generation_elapsed.as_secs_f64() * 1000.0, generated.len());
+        eprintln!(
+            "LFM2 recalibration: positions={length}, budget_16_gib_fit={budget_16_gib_fit:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run explicitly with an accessible Metal device"
+)]
+fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
+    let root = components::lfm2_fixture();
+    let path = std::env::var_os("EREDU_LFM2_MEMORY_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.0.clone());
+    let lengths: Vec<usize> = std::env::var("EREDU_LFM2_MEMORY_LENGTHS")
+        .map(|s| s.split(',').map(|s| s.parse().unwrap()).collect())
+        .unwrap_or(vec![17, 513]);
+    let quantized = std::env::var_os("EREDU_LFM2_MEMORY_QUANTIZED").is_some();
+    let device = if cfg!(feature = "metal") {
+        LocalDevice::Accelerator(0)
+    } else {
+        LocalDevice::Cpu
+    };
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap());
+    if quantized {
+        plan = plan.with_weight_transformation(WeightTransformationPlan::Affine {
+            bits: 4,
+            group_size: 64,
+        });
+    }
+    let previous = set_local_allocator_cache_limit(0).unwrap();
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_local_allocator_cache_limit(self.0).unwrap();
+        }
+    }
+    let _restore = Restore(previous);
+    let (mut model, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan)
+            .unwrap()
+            .into_parts();
+    let chat = model
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+            add_generation_prompt: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let settings = PreparedChatGenerationSettings {
+        overrides: GenerationConfigOverrides {
+            max_new_tokens: Some(8),
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut results = Vec::new();
+    for length in lengths {
+        let ids = vec![1; length];
+        model.reset().unwrap();
+        let config =
+            TextGenerationConfig::new(model.resolve_generation_config(settings.overrides).unwrap());
+        let raw: Vec<_> = model
+            .generate_tokens(ids.clone(), config)
+            .unwrap()
+            .map(|token| token.unwrap().token_id().unwrap())
+            .collect();
+        assert_eq!(
+            raw.len(),
+            8,
+            "exercise prefill and seven cached predictions"
+        );
+        let usage = CaptureUsage {
+            captures: 2,
+            // Admission also reserves the backing full-prompt logits tensor.
+            retained_bytes: 4 << 30,
+            host_bytes: 8 << 20,
+            encoded_bytes: 8 << 20,
+        };
+        let capture = CapturePlan {
+            schema_version: CAPTURE_SCHEMA_VERSION,
+            selections: vec![
+                CaptureSelection {
+                    id: "prefill-logits".into(),
+                    path: "model.logits".into(),
+                    schedule: CaptureSchedule {
+                        decode: false,
+                        ..Default::default()
+                    },
+                    slices: vec![CaptureSlice {
+                        axis: "sequence".into(),
+                        start: length as u64 - 1,
+                        end: length as u64,
+                        stride: 1,
+                    }],
+                    transform: CaptureTransform::Slice,
+                },
+                CaptureSelection {
+                    id: "decode-logits".into(),
+                    path: "model.logits".into(),
+                    schedule: CaptureSchedule {
+                        prefill: false,
+                        ..Default::default()
+                    },
+                    slices: vec![CaptureSlice {
+                        axis: "sequence".into(),
+                        start: 0,
+                        end: 1,
+                        stride: 1,
+                    }],
+                    transform: CaptureTransform::Slice,
+                },
+            ],
+            limits: CaptureLimits {
+                per_step: usage,
+                cumulative: CaptureUsage {
+                    captures: 16,
+                    retained_bytes: 32 << 30,
+                    host_bytes: 64 << 20,
+                    encoded_bytes: 64 << 20,
+                },
+                physical_native_bytes: None,
+                on_limit: CaptureLimitPolicy::Fail,
+            },
+        };
+        let trace = TraceLimits {
+            per_record_bytes: 8 << 20,
+            total_bytes: 64 << 20,
+        };
+        let mut reference = None;
+        for controlled in [false, true] {
+            model.reset().unwrap();
+            let prepared = model
+                .prepare_observed_token_ids(&chat, ids.clone(), settings, capture.clone(), trace)
+                .unwrap();
+            let mut decisions = Vec::new();
+            let mut collect = |record: ObservedGenerationRecord| {
+                if let ObservedGenerationEvent::Token {
+                    token_id,
+                    prediction_index,
+                    input_range,
+                    forced,
+                    captures,
+                    ..
+                } = record.event
+                {
+                    assert!(!forced);
+                    let captures = captures.unwrap();
+                    let records: Vec<_> = captures
+                        .records
+                        .iter()
+                        .filter(|r| r.outcome == CaptureOutcome::Captured)
+                        .collect();
+                    assert_eq!(records.len(), 1);
+                    let Some(CapturePayload::Tensor(tensor)) = &records[0].payload else {
+                        panic!("expected full-vocabulary logits");
+                    };
+                    let eredu_core::TensorObservationData::F32(values) = tensor.data() else {
+                        panic!("expected float32 host logits");
+                    };
+                    assert!(!values.is_empty());
+                    assert!(values.iter().all(|v| v.is_finite()));
+                    // Store exact bits so baseline JSON round trips preserve rounding.
+                    decisions.push(serde_json::json!({
+                        "token": token_id, "prediction": prediction_index, "input_range": input_range,
+                        "logit_bits": values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    }));
+                }
+                ControlFlow::Continue(())
+            };
+            if controlled {
+                let mut run = model
+                    .start_controlled_text(prepared, &[], Default::default(), |r| {
+                        collect(r.generation)
+                    })
+                    .unwrap();
+                // Stop at every committed boundary, including cached decode.
+                while run.finish_reason().is_none() {
+                    run.step(|r| collect(r.generation)).unwrap();
+                }
+                assert_eq!(run.token_ids(), raw);
+            } else {
+                model
+                    .generate_observed_text(prepared, &[], Default::default(), &mut collect)
+                    .unwrap();
+            }
+            assert_eq!(decisions.len(), raw.len());
+            for (i, (decision, token)) in decisions.iter().zip(&raw).enumerate() {
+                assert_eq!(decision["token"], *token);
+                assert_eq!(decision["prediction"], i);
+                assert_eq!(
+                    decision["input_range"],
+                    if i == 0 {
+                        serde_json::json!([0, length])
+                    } else {
+                        serde_json::json!([length + i - 1, length + i])
+                    }
+                );
+            }
+            if let Some(reference) = &reference {
+                assert!(
+                    &decisions == reference,
+                    "ordinary and controlled logits including cached decode"
+                );
+            } else {
+                reference = Some(decisions);
+            }
+        }
+        eprintln!("LFM2 logit parity: positions={length}, quantized={quantized}, predictions={}, controlled=true", raw.len());
+        results.push(serde_json::json!({"positions": length, "decisions": reference.unwrap()}));
+    }
+    let result = serde_json::json!({"quantized": quantized, "results": results});
+    if let Some(path) = std::env::var_os("EREDU_LFM2_PARITY_REFERENCE") {
+        let reference: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            result == reference,
+            "exact logits and tokens before/after forecast recalibration"
+        );
+    }
+    if let Some(path) = std::env::var_os("EREDU_LFM2_PARITY_WRITE") {
+        std::fs::write(path, serde_json::to_vec(&result).unwrap()).unwrap();
     }
 }

@@ -6384,11 +6384,15 @@ outputs before constructing the next group, keeping completed outputs and shared
 K/V while releasing temporary graphs. Small calls remain lazy. Batching is a
 native mechanism policy with no family condition. Longer rows retain the separate
 two-pass blockwise realization and its evaluated per-block state, without retaining
-every expanded block. Forecast
-copy allowances remain conservative until independently recalibrated. Runtime
-combines them with
-architecture geometry for repeated K/V projection buffers, score conversions,
+every expanded block. The optional neutral `FullKeyAttentionTiles` contract
+describes the covered key length, shared K/V layouts, maximum live tile count and
+retained outputs. MLX reports four shared query-width K/V payloads, 32 live tiles,
+two output payloads and 32 working bytes per score element. Runtime combines
+these facts with architecture geometry for K/V projection buffers, score conversions,
 convolution scratch and overlap. Missing native facts preserve an unknown bound.
+Legacy records lacking the full-key contract retain per-tile allowances; longer
+key rows keep that conservative fallback. Selection-cache identity includes the
+new retention facts. No native device is needed to select or estimate them.
 Persistent convolution history remains in the state layout. Mixed-width selected
 parameter metadata adds a float32 cast allowance and promoted-state/replacement
 storage above nominal state bytes; it is derived from task shapes and dtypes,

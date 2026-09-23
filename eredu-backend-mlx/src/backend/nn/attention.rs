@@ -335,14 +335,23 @@ pub fn sliding_window_prefill_attention_with_softcap(
 #[cfg(test)]
 mod tests;
 
+const INPUT_SCORE_TILE_ELEMENTS: u64 = 8192;
+
 /// Conservative native live-buffer facts shared with cold memory selection.
 pub(crate) const INPUT_SCORE_WORKSPACE:
     eredu_runtime::memory_estimation::InputScoreAttentionMechanism =
     eredu_runtime::memory_estimation::InputScoreAttentionMechanism {
-        score_tile_elements: 8192,
+        score_tile_elements: INPUT_SCORE_TILE_ELEMENTS,
         max_query_rows: 32,
         key_value_copies: 4,
-        score_bytes: 16,
+        // Calibrated with masks, sink logits, softcap and BF16/FP32 conversions.
+        score_bytes: 32,
+        full_key_tiles: Some(eredu_runtime::memory_estimation::FullKeyAttentionTiles {
+            max_key_positions: INPUT_SCORE_TILE_ELEMENTS,
+            shared_key_value_copies: 4,
+            max_live_query_tiles: INPUT_SCORE_LIVE_TILE_BATCH as u64,
+            retained_output_copies: 2,
+        }),
     };
 
 // Keep only this many full-key tile graphs live at once. Completed outputs and

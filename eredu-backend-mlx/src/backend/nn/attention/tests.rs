@@ -747,7 +747,99 @@ fn bounded_input_score_tile_graph_batches_release_temporaries() {
                     peak < lazy_peak / 2,
                     "bounded tile graphs peak {peak}, lazy peak {lazy_peak}"
                 );
+                // Validate the published per-invocation retention allowance in
+                // isolation; model-wide layer overlap must not hide a shortfall.
+                let facts = super::INPUT_SCORE_WORKSPACE;
+                let full = facts.full_key_tiles.unwrap();
+                let query_width = heads as u64 * 64;
+                let tile_rows = (facts.score_tile_elements / 2000).clamp(1, facts.max_query_rows);
+                let live_rows = (queries as u64).min(tile_rows * full.max_live_query_tiles);
+                let bound = query_width * 2000 * 2 * full.shared_key_value_copies
+                    + heads as u64 * live_rows * 2001 * facts.score_bytes
+                    + query_width * queries as u64 * 2 * full.retained_output_copies;
+                assert!(
+                    peak as u64 <= bound,
+                    "native peak {peak}, published bound {bound}"
+                );
             }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+#[ignore = "isolated Metal allocator validation; run with --test-threads=1"]
+fn published_input_score_allowance_covers_f16_and_f32_prefill_and_decode() {
+    use safemlx::{memory, Dtype};
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = context.stream();
+    struct RestoreCache(usize);
+    impl Drop for RestoreCache {
+        fn drop(&mut self) {
+            memory::set_cache_limit(self.0).unwrap();
+        }
+    }
+    let _cache = RestoreCache(memory::set_cache_limit(0).unwrap());
+    for dtype in [Dtype::Float16, Dtype::Float32] {
+        for (queries, keys) in [(128, 128), (2000, 2000), (1, 2000)] {
+            let tensor = |shape: &[i32], phase: f32| {
+                let n = shape.iter().product::<i32>();
+                Array::from_slice(
+                    &(0..n)
+                        .map(|i| (i as f32 * 0.03 + phase).sin())
+                        .collect::<Vec<_>>(),
+                    shape,
+                )
+                .as_dtype(dtype, stream)
+                .unwrap()
+                .into_evaluated()
+                .unwrap()
+                .as_array()
+                .clone()
+            };
+            let q = tensor(&[1, 32, queries, 64], 0.1);
+            let k = tensor(&[1, 8, keys, 64], 0.3);
+            let v = tensor(&[1, 8, keys, 64], 0.7);
+            let sinks = tensor(&[32], 0.4);
+            let mask =
+                Array::from_slice(&(0..keys).map(|i| i % 7 != 0).collect::<Vec<_>>(), &[keys]);
+            stream.synchronize().unwrap();
+            let baseline = memory::active_memory().unwrap();
+            memory::reset_peak_memory().unwrap();
+            let output = super::attention_with_softcap(
+                &q,
+                &k,
+                &v,
+                0.125,
+                Some(&mask),
+                Some(&sinks),
+                Some(2.0),
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )
+            .unwrap();
+            safemlx::transforms::eval([&output]).unwrap();
+            stream.synchronize().unwrap();
+            let peak = memory::peak_memory().unwrap().saturating_sub(baseline) as u64;
+            let facts = super::INPUT_SCORE_WORKSPACE;
+            let full = facts.full_key_tiles.unwrap();
+            let queries = queries as u64;
+            let keys = keys as u64;
+            let tile_rows = if queries * keys <= facts.score_tile_elements {
+                queries
+            } else {
+                (facts.score_tile_elements / keys).clamp(1, facts.max_query_rows)
+            };
+            let live_rows = queries.min(tile_rows * full.max_live_query_tiles);
+            let scalar = if dtype == Dtype::Float32 { 4 } else { 2 };
+            let bound = 2048 * keys * scalar * full.shared_key_value_copies
+                + 32 * live_rows * (keys + 1) * facts.score_bytes
+                + 2048 * queries * scalar * full.retained_output_copies;
+            assert!(
+                peak <= bound,
+                "dtype={dtype:?}, queries={queries}, keys={keys}, peak={peak}, bound={bound}"
+            );
+            eprintln!("input-score allowance: dtype={dtype:?}, queries={queries}, keys={keys}, peak={peak}, bound={bound}");
         }
     }
 }

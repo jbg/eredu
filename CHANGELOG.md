@@ -4,6 +4,17 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Recalibrated input-score memory forecasts
+
+Forecasts now account for shared K/V layouts, bounded live tile graphs and retained
+outputs using backend-declared `FullKeyAttentionTiles` facts. MLX's score allowance
+is calibrated at 32 working bytes per element. Longer-key and legacy records keep
+conservative per-tile allowances; missing mechanism facts remain unbounded.
+Existing JSON without `full_key_tiles` remains readable. Rust consumers constructing
+`InputScoreAttentionMechanism` literals must supply the new optional field (`None`
+preserves legacy sizing). Numerical and peak-memory validation is recorded in
+[generation memory](doc/generation-memory.md).
+
 ## 2026-09-23 — Bounded input-score tile graphs
 
 MLX explicit input-score attention evaluates groups of at most 32 query tiles for
