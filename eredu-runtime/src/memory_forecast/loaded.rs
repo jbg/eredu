@@ -52,6 +52,13 @@ pub fn loaded_generation_request(
             ));
         }
         if let Some(potential) = geometry
+            .execution_topology
+            .as_mut()
+            .and_then(|g| g.selected_parameter_promotion_bytes.as_mut())
+        {
+            *potential = potential.saturating_sub(cached);
+        }
+        if let Some(potential) = geometry
             .workspace
             .as_mut()
             .and_then(|g| g.mixed_precision_parameter_bytes.as_mut())
@@ -129,6 +136,8 @@ pub fn loaded_generation_request(
             loading_peak: MemoryBytes::exact(0),
             executions: if executes {
                 vec![ExecutionMemoryPlan {
+                    execution_topology: geometry.execution_topology.clone(),
+                    input_score_attention_mechanism: geometry.input_score_attention_mechanism,
                     state_layout: geometry.state_layout.clone(),
                     workspace: geometry.workspace.clone(),
                     attention: AttentionWorkspace::Unknown,

@@ -6368,11 +6368,14 @@ device IDs using the same parser as realization, without creating a native devic
 or stream. The CLI supplies its selected plan device and retains ownership of
 application limits and reserves. The explicit-placement constructor remains available.
 
-Architecture-owned memory projections describe workspace geometry using the
-normalized family configuration and exact state schedule. Runtime owns checked
-phase-overlap estimates, physical-capacity comparisons and candidate recomputation.
-Dense LFM2 projections include gated-convolution geometry and the count of
-explicit input-score attention layers. `PreparationMechanismProvider` supplies
+Ordinary architecture construction retains `TextExecutionTopology` beside exact
+parameter and state requirements. Shared decoder and gated-convolution builders
+consume the same projection specifications used by this topology; no family
+selects allocation multipliers or forecast equations. Runtime owns checked
+mechanism/lifetime composition, physical-capacity comparisons and candidate
+recomputation. The topology preserves each layer's selected attention arithmetic,
+convolution kernel, packed expert routing, physical projection format, explicit
+parameter owner and tied output head. `PreparationMechanismProvider` supplies
 neutral input-score workspace facts without family inspection. MLX reports its
 query tile thresholds and conservative temporary-copy allowances from the same
 constants used by its native attention mechanism; selection retains these facts
@@ -6417,7 +6420,10 @@ promoted activation/state sizing. Cold forecasts retain the full potential cast
 allowance; neither forecasts nor reports populate conversion caches.
 Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
 cache-copy overlap, layer workspace multiplier and graph allowance. Architecture
-preparation retains selected state/workspace geometry in `PreparedModelDiscovery`.
+preparation retains selected state, ordinary invocation topology and native
+input-score mechanism facts in `PreparedModelDiscovery`. Selected materialization
+formats replace checkpoint defaults, including load-time quantization; cached
+conversion credit reduces only the remaining selected promotion allowance.
 The neutral `GenerationForecastBackend` supplies loaded residency, allocator and
 capacity observations plus the actual prompt/instrumentation execution contract.
 The MLX adapter derives final-row projection from architecture and execution-strategy
@@ -6673,8 +6679,9 @@ physical pools, validates compatible facts for shared owners, and retains the
 original contract and storage-name bindings. Unknown owner/alias identity,
 placement, capacity and retention remain explicit. This bridge never sums a live
 peak or treats logical input/output shapes as allocation proof. The lifetime
-composer below consumes these descriptions; family workspace forecast migration
-remains a separate step.
+composer below consumes these descriptions. Production target forecasts now use
+ordinary module topology and explicitly labeled planning envelopes; opaque native
+scratch and allocator capacity in the raw mechanism contract remain unknown.
 
 ### Generic resource lifetime and peak composition
 
@@ -6727,5 +6734,35 @@ Overflow, conflicting shared facts, malformed descriptions and invalid release
 order are errors. Small synthetic schedules validate sequential/concurrent work,
 shared backing, independent pools, explicit evaluation batches, dynamic growth
 and shrinkage, and unknown facts. This is a read-only composer, not a native
-scheduler or budget verdict; existing generation forecast APIs and serialized
-reports remain unchanged until their separate migration.
+scheduler or budget verdict. The target-workspace evaluator below uses this
+composer while preserving the existing report format.
+
+
+### Generic target workspace forecasts
+
+`ReplicatedTextRequirements` retains optional `TextExecutionTopology` as an
+ordinary construction contract. Shared decoder attention, gated MLP and static
+output modules reuse their actual `LinearSpec`/`StaticModuleSpec` producers.
+Gated convolution uses its existing `GatedShortConvolutionSpec`; packed routing
+uses the same `TopKGroupSelectorSpec` and `GroupedGatedProductSpec` as execution.
+The topology contains invocation geometry and parameter identities, never byte
+calibration constants. Selected projection formats come from exact physical
+realizations, preserving tied owners and load-time quantization.
+
+Runtime composes target workspace by reusable mechanism kind and explicit lazy
+retention boundaries. Llama, dense Qwen, Nanbeige and dense LFM2 migrate through
+these contracts. Shared Gemma2 and packed Qwen/LFM routed experts inherit the
+same mechanism composition. New shared-decoder families require no independent
+workspace formula. The old `WorkspaceGeometry` input remains for serialized and
+manually constructed requests until the legacy API is retired; ordinary selected
+production requests use the new topology instead.
+
+Finite planning estimates remain estimates. Native scratch, aliasing and
+allocator alignment are not proved by logical shapes: explicit calibrated
+mechanism envelopes account for their planning allowance without rewriting the
+raw phase-4 storage contract as exact. Unsupported equation providers, missing
+rank-local topology and unsupported residency lifetimes retain named gaps.
+Embedded prediction clears target topology for complete speculative forecasts
+until its additional invocations and state are described in subsequent phases.
+Cold and loaded calls remain read-only and cannot materialize modules, populate
+parameter conversion caches or consume observation budgets.

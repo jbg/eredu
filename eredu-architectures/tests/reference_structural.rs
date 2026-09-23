@@ -5859,3 +5859,98 @@ fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling
         30,
     );
 }
+
+#[test]
+fn prepared_invocation_topology_matches_constructed_projection_geometry() {
+    use eredu_core::ModelConfigurationResolver;
+    use eredu_runtime::execution_topology::{FeedForwardTopology, TokenMixerTopology};
+    for kind in ["llama", "gemma2", "lfm2"] {
+        let mut config = serde_json::json!({
+            "rms_norm_eps":0.00001, "model_type":kind, "vocab_size":32, "hidden_size":16,
+            "intermediate_size":32, "num_hidden_layers":2,
+            "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4,
+            "max_position_embeddings":64, "sliding_window":16,
+            "query_pre_attn_scalar":4, "attn_logit_softcapping":50.0,
+            "final_logit_softcapping":30.0, "layer_types":["conv","full_attention"],
+            "conv_L_cache":3, "block_auto_adjust_ff_dim":false,
+            "tie_word_embeddings":true
+        });
+        if kind != "lfm2" {
+            config.as_object_mut().unwrap().remove("layer_types");
+        }
+        let resolved = configuration::MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap();
+        let topology = eredu_architectures::memory_estimation::generation_memory_geometry(
+            resolved.architecture_plan(),
+        )
+        .unwrap()
+        .execution_topology
+        .unwrap();
+        let shapes = match kind {
+            "llama" => llama::LayeredModel::<ReferenceBackend>::new(
+                llama::model_args_from_config_value(&config).unwrap(),
+                &(),
+            )
+            .unwrap()
+            .parameter_description(&())
+            .map(|description| description.groups().iter().flat_map(|group| group.group().members()).map(|member| (member.target().to_owned(), member.global_shape().to_vec())).collect::<BTreeMap<_, _>>())
+            .unwrap(),
+            "gemma2" => {
+                // Construction needs no softcap execution capability: inspect the
+                // actual modules directly with this shape-only backend.
+                struct Shapes(BTreeMap<String, Vec<usize>>);
+                impl<'a> ParameterVisitor<'a, ReferenceTensor> for Shapes {
+                    fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
+                        self.0.insert(metadata.id.to_string(), value.shape().iter().map(|&n| n as usize).collect());
+                    }
+                }
+                let args = eredu_architectures::gemma2::model_args_from_config_value(&config).unwrap();
+                let mut collector = Shapes(BTreeMap::new());
+                decoder::StaticModules::<ReferenceBackend>::new(&args, &()).unwrap().visit_parameters(&mut collector);
+                for layer in 0..topology.layers.len() {
+                    TransformerBlock::<ReferenceBackend>::new(&args, layer, &()).unwrap().visit_parameters(&mut collector);
+                }
+                collector.0
+            },
+            "lfm2" => lfm2::LayeredModel::<ReferenceBackend>::new(
+                lfm2::model_args_from_config_value(&config).unwrap(),
+                &(),
+            )
+            .unwrap()
+            .parameter_description(&())
+            .map(|description| description.groups().iter().flat_map(|group| group.group().members()).map(|member| (member.target().to_owned(), member.global_shape().to_vec())).collect::<BTreeMap<_, _>>())
+            .unwrap(),
+            _ => unreachable!(),
+        };
+        let projections =
+            std::iter::once(&topology.output).chain(topology.layers.iter().flat_map(|layer| {
+                let mixer = match &layer.mixer {
+                    TokenMixerTopology::Attention { projections, .. }
+                    | TokenMixerTopology::GatedConvolution { projections, .. } => projections,
+                };
+                let FeedForwardTopology::Gated { projections, .. } = &layer.feed_forward else {
+                    panic!("dense fixture");
+                };
+                mixer.iter().chain(projections.iter())
+            }));
+        for projection in projections {
+            let shape = shapes.get(&projection.parameter).unwrap_or_else(|| panic!("{kind}: missing {}", projection.parameter));
+            assert_eq!(
+                shape.as_slice(),
+                [projection.output as usize, projection.input as usize],
+                "{kind}: {}",
+                projection.parameter
+            );
+        }
+        assert_eq!(topology.output.parameter, "model.embed_tokens.weight");
+        let encoded = serde_json::to_string(&topology).unwrap();
+        assert_eq!(
+            serde_json::from_str::<eredu_runtime::execution_topology::TextExecutionTopology>(
+                &encoded
+            )
+            .unwrap(),
+            topology
+        );
+    }
+}

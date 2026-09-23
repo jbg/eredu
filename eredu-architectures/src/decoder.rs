@@ -11,6 +11,7 @@ pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
 pub(crate) mod attention_partition;
 /// Shared-weight repeated stacks with independent state for each invocation.
 pub(crate) mod repeated;
+pub(crate) mod topology;
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
@@ -1510,29 +1511,16 @@ impl<B: NeuralBackend> Attention<B> {
             config.parameter_root(),
             fields.attention
         );
-        let hidden = config.hidden_size();
         let head = config.head_dim();
         let query_heads = config.num_attention_heads();
         let key_value_heads = config.num_key_value_heads();
-        let linear = |field: &str, input, output, bias: bool| {
-            let weight_name = format!("{prefix}.{field}.weight");
-            let bias = bias
-                .then(|| parameter_spec(config, format!("{prefix}.{field}.bias")))
-                .transpose()
-                .map_err(Error::backend)?;
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter_spec(config, &weight_name).map_err(Error::backend)?,
-                    bias,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        config.linear_format(&weight_name),
-                    )?,
-                },
-                context,
-            )
+        let projection_specs = topology::attention_projections(config, layer)?;
+        let linear = |field: &str| {
+            let spec = projection_specs
+                .iter()
+                .find(|(name, _)| name == field)
+                .ok_or_else(|| Error::backend("attention construction projection is absent"))?;
+            B::linear(spec.1.clone(), context)
         };
         let policy = config.attention_schedule().get(layer).ok_or_else(|| {
             Error::backend(format!(
@@ -1548,39 +1536,14 @@ impl<B: NeuralBackend> Attention<B> {
         let input_projection = match config.attention_projection_layout() {
             AttentionProjectionLayout::Split if config.external_attention_value(layer) => {
                 AttentionInputProjection::ExternalValue {
-                    query: linear(
-                        fields.attention_query,
-                        hidden,
-                        query_width,
-                        config.attention_bias(AttentionProjection::Query),
-                    )?,
-                    key: linear(
-                        fields.attention_key,
-                        hidden,
-                        key_value_width,
-                        config.attention_bias(AttentionProjection::Key),
-                    )?,
+                    query: linear(fields.attention_query)?,
+                    key: linear(fields.attention_key)?,
                 }
             }
             AttentionProjectionLayout::Split => AttentionInputProjection::Split {
-                query: linear(
-                    fields.attention_query,
-                    hidden,
-                    query_width,
-                    config.attention_bias(AttentionProjection::Query),
-                )?,
-                key: linear(
-                    fields.attention_key,
-                    hidden,
-                    key_value_width,
-                    config.attention_bias(AttentionProjection::Key),
-                )?,
-                value: linear(
-                    fields.attention_value,
-                    hidden,
-                    key_value_width,
-                    config.attention_bias(AttentionProjection::Value),
-                )?,
+                query: linear(fields.attention_query)?,
+                key: linear(fields.attention_key)?,
+                value: linear(fields.attention_value)?,
             },
             AttentionProjectionLayout::Fused { field } => {
                 if field.trim().is_empty() {
@@ -1603,14 +1566,14 @@ impl<B: NeuralBackend> Attention<B> {
                     FusedProjectionSegment::new("key", key_value_width)?,
                     FusedProjectionSegment::new("value", key_value_width)?,
                 ])?;
-                let projection = linear(field, hidden, layout.output_width(), biases[0])?;
+                let projection = linear(field)?;
                 AttentionInputProjection::Fused(FusedAttentionProjection { projection, layout })
             }
         };
         Ok(Self {
             output_gate: config
                 .attention_output_gate()
-                .map(|(field, _)| linear(field, hidden, query_width, false))
+                .map(|(field, _)| linear(field))
                 .transpose()?,
             output_gate_activation: config
                 .attention_output_gate()
@@ -1623,12 +1586,7 @@ impl<B: NeuralBackend> Attention<B> {
             softcap: config.attention_softcap(),
             arithmetic: config.attention_arithmetic(),
             input_projection,
-            output: linear(
-                fields.attention_output,
-                query_width,
-                hidden,
-                config.attention_bias(AttentionProjection::Output),
-            )?,
+            output: linear(fields.attention_output)?,
             sinks: config
                 .learned_attention_sinks()
                 .then(|| {
@@ -2127,44 +2085,18 @@ impl<B: NeuralBackend> Mlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let fields = config.block_parameter_fields().validate()?;
-        let prefix = format!(
-            "{}.layers.{layer}.{}",
-            config.parameter_root(),
-            fields.feed_forward
-        );
-        let build = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
-            let bias = config
-                .mlp_bias()
-                .then(|| parameter_spec(config, format!("{prefix}.{field}.bias")))
-                .transpose()
-                .map_err(Error::backend)?;
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter_spec(config, &weight_name).map_err(Error::backend)?,
-                    bias,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        config.linear_format(&weight_name),
-                    )?,
-                },
-                context,
-            )
+        let projection_specs = topology::gated_projections(config, layer)?;
+        let build = |field: &str| {
+            let spec = projection_specs
+                .iter()
+                .find(|(name, _)| name == field)
+                .ok_or_else(|| Error::backend("gated construction projection is absent"))?;
+            B::linear(spec.1.clone(), context)
         };
         let input_projection = match config.gated_projection_layout() {
             GatedProjectionLayout::Split => GatedInputProjection::Split {
-                gate: build(
-                    fields.feed_forward_gate,
-                    config.hidden_size(),
-                    config.intermediate_size(),
-                )?,
-                up: build(
-                    fields.feed_forward_up,
-                    config.hidden_size(),
-                    config.intermediate_size(),
-                )?,
+                gate: build(fields.feed_forward_gate)?,
+                up: build(fields.feed_forward_up)?,
             },
             GatedProjectionLayout::Fused { field } => {
                 if field.trim().is_empty() {
@@ -2177,18 +2109,14 @@ impl<B: NeuralBackend> Mlp<B> {
                     FusedProjectionSegment::new("up", config.intermediate_size())?,
                 ])?;
                 GatedInputProjection::Fused(FusedGatedProjection {
-                    projection: build(field, config.hidden_size(), layout.output_width())?,
+                    projection: build(field)?,
                     layout,
                 })
             }
         };
         Ok(Self {
             input_projection,
-            down: build(
-                fields.feed_forward_output,
-                config.intermediate_size(),
-                config.hidden_size(),
-            )?,
+            down: build(fields.feed_forward_output)?,
             limit: config.gated_product_policy(),
         })
     }
@@ -3553,6 +3481,50 @@ pub struct StaticModuleSpec {
     pub tied_head: bool,
 }
 
+impl StaticModuleSpec {
+    /// Shared ordinary static-module specification before backend binding.
+    pub(crate) fn from_config<C: Config>(config: &C) -> Self {
+        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
+        Self {
+            normalization_groups: config.normalization_groups(),
+            embedding_weight: embedding_name.clone(),
+            normalization_weight: format!("{}.norm.weight", config.parameter_root()),
+            head_weight: "lm_head.weight".into(),
+            vocabulary: config.vocabulary_size(),
+            hidden_size: config.hidden_size(),
+            normalization_epsilon: config.rms_norm_epsilon(),
+            normalization_offset: config.normalization_offset(),
+            embedding_quantization: config.weight_quantization(&embedding_name),
+            head_format: config.linear_format("lm_head.weight"),
+            tied_head: config.tie_word_embeddings(),
+        }
+    }
+
+    /// Actual output projection, including the embedding owner and encoding when tied.
+    pub(crate) fn output_topology(
+        &self,
+    ) -> Result<eredu_runtime::execution_topology::ProjectionTopology, Error> {
+        if self.hidden_size <= 0 || self.vocabulary <= 0 {
+            return Err(Error::backend("static module dimensions must be positive"));
+        }
+        Ok(eredu_runtime::execution_topology::ProjectionTopology {
+            input: self.hidden_size as u64,
+            output: self.vocabulary as u64,
+            format: if self.tied_head {
+                self.embedding_quantization.into()
+            } else {
+                self.head_format
+            },
+            bias: false,
+            parameter: if self.tied_head {
+                self.embedding_weight.clone()
+            } else {
+                self.head_weight.clone()
+            },
+        })
+    }
+}
+
 impl<B: eredu_nn::DistributedNeuralBackend> StaticModules<B> {
     /// Projects an already normalized value through its actual tied or untied
     /// head, retaining the vocabulary collective and projection-input boundary.
@@ -3772,24 +3744,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         config: &C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-        let norm_name = format!("{}.norm.weight", config.parameter_root());
-        Self::from_spec(
-            StaticModuleSpec {
-                normalization_groups: config.normalization_groups(),
-                embedding_weight: embedding_name.clone(),
-                normalization_weight: norm_name,
-                head_weight: "lm_head.weight".into(),
-                vocabulary: config.vocabulary_size(),
-                hidden_size: config.hidden_size(),
-                normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: config.normalization_offset(),
-                embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.linear_format("lm_head.weight"),
-                tied_head: config.tie_word_embeddings(),
-            },
-            context,
-        )
+        Self::from_spec(StaticModuleSpec::from_config(config), context)
     }
 
     /// Builds rank-local pinned modules for a decoder family.
@@ -3801,22 +3756,8 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-        let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_parallel_spec(
-            StaticModuleSpec {
-                normalization_groups: config.normalization_groups(),
-                embedding_weight: embedding_name.clone(),
-                normalization_weight: norm_name,
-                head_weight: "lm_head.weight".into(),
-                vocabulary: config.vocabulary_size(),
-                hidden_size: config.hidden_size(),
-                normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: config.normalization_offset(),
-                embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.linear_format("lm_head.weight"),
-                tied_head: config.tie_word_embeddings(),
-            },
+            StaticModuleSpec::from_config(config),
             geometry.embedding_range().clone(),
             geometry.output_range().cloned(),
             context,

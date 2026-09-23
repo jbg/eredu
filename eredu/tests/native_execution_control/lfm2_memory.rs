@@ -123,23 +123,23 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             loaded.with_prefill_chunk(1).unwrap().estimate.domains[0].generation_peak,
             loaded.estimate.domains[0].generation_peak
         );
-        let mut expected_workspace = cold.request.domains[0].executions[0].workspace.clone();
-        if let Some(bytes) = expected_workspace
+        let mut expected_topology = cold.request.domains[0].executions[0].execution_topology.clone();
+        if let Some(bytes) = expected_topology
             .as_mut()
-            .and_then(|w| w.mixed_precision_parameter_bytes.as_mut())
+            .and_then(|w| w.selected_parameter_promotion_bytes.as_mut())
         {
             *bytes = bytes.saturating_sub(converted_before);
         }
         assert_eq!(
-            expected_workspace,
-            loaded.request.domains[0].executions[0].workspace
+            expected_topology,
+            loaded.request.domains[0].executions[0].execution_topology
         );
         assert!(loaded.request.domains[0].executions[0]
-            .workspace
+            .execution_topology
             .as_ref()
             .unwrap()
-            .gated_convolution
-            .is_some());
+            .layers.iter().any(|layer| matches!(layer.mixer,
+                eredu_runtime::execution_topology::TokenMixerTopology::GatedConvolution { .. })));
         assert_eq!(
             eredu_backend_mlx::allocator_memory()
                 .unwrap()

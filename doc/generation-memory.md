@@ -7,11 +7,12 @@ estimation being available.
 
 ## Neutral resource-description contract
 
-`eredu_core::resources` is the additive foundation for deriving future forecasts
-from ordinary execution contracts. It currently describes resources only; it does
-not change existing forecasts or add embedded prediction coverage. Resource
-producers now derive parameter/state facts from ordinary preparation; mechanism
-sizing and generic lifetime/peak composition remain separate implementation phases.
+`eredu_core::resources` describes resources from ordinary execution contracts.
+Target workspace forecasts now compose reusable mechanism descriptions with
+explicit evaluation lifetimes. Parameter/state producers and native mechanism
+inventories remain descriptive contracts; their unknown allocation capacities
+are not silently converted into exact bounds. Embedded prediction coverage is
+still a later phase.
 
 A `ResourceDescription` records the current context and requested horizon as named
 logical extents, with fixed or evaluated context-dependent resource sizes. For
@@ -39,7 +40,8 @@ the starting state; the producer remains responsible for its equations and scope
 Descriptions carry no allocation authority, resident credit, lifetime ordering or
 fit verdict, and summing their entries is not a peak calculation. Producing one
 must not advance or synchronize execution or consume admission budgets. Existing
-`GenerationMemoryEstimate` reports retain their current format and behavior.
+`GenerationMemoryEstimate` reports retain their format; target workspace values
+now reflect the generic composition described below.
 
 `eredu_runtime::execution_resources::PreparedResourceQuery` gives an execution
 instance namespace, batch extent, hypothetical persisted prefix, additional
@@ -74,8 +76,10 @@ alignment, replacement copies, mechanism scratch, cached conversions and retaine
 outputs remain unknown; descriptions name missing execution-unit and static-module
 contracts. They are always partial for the complete execution. No new fit verdict
 or embedded prediction support is enabled by these producers. They add no
-family-specific forecasting dependencies or calibration constants; legacy
-forecast projection paths remain until their migration.
+family-specific forecasting dependencies or calibration constants. Production
+workspace forecasting uses ordinary invocation topology; the legacy aggregate
+workspace input remains supported for existing manually constructed or serialized
+requests.
 
 
 Neutral tests derive descriptions from ordinary Llama, LFM2, routed Qwen and
@@ -182,7 +186,7 @@ a full pass after selection.
 `GenerationMemoryOptions::chunked_prefill_supported` is deprecated and ignored.
 To forecast an explicitly unchunked request, set `prefill_chunk_tokens` to the
 input's model-position count. Workspace coverage is independent: a chunk-capable
-routed decoder may still have an unknown workspace bound. Smaller chunks never
+decoder with an undescribed mechanism may still have an unknown workspace bound. Smaller chunks never
 claim savings for a selection that requires a full pass.
 
 ## JSON wire format
@@ -599,8 +603,8 @@ earlier initialization. Forecasts and policy getters never select a policy as a
 side effect; before runtime initialization, a pure cold forecast can therefore
 still report a large native allowance. Cold selection remains backend-neutral.
 
-Architecture projections reuse normalized state schedules and supply decoder
-workspace dimensions. Runtime planning combines those with selected residency,
+Architecture preparation retains normalized state schedules and ordinary module
+construction topology. Runtime planning combines those with selected residency,
 materialization, attention, cache update, scalar-width and physical-placement
 facts. Low-level `GenerationMemoryRequest` accepts multiple disjoint physical
 pools and simultaneous rank-local executions. Supply exact local geometry and
@@ -614,27 +618,49 @@ Each phase includes overlapping parameters, state, retained input, workspace,
 staging and overhead; the lifecycle peak is the maximum of phases. Loading
 includes source/destination/conversion overlap separately from generation.
 
-Dense workspace currently models residuals, Q/K/V, gated feed-forward arrays,
-logits/probabilities, selected attention scratch and cache-update overlap. Ordinary
-shared dense readout projects only the last hidden row in each chunk, including
-the full-prompt case; observed full-logit contracts retain all rows. The
-shared calibration conservatively assumes float32 score/probability matrices even when MLX
-selects a fused kernel, and a whole extra state payload during cache replacement.
-Attention contributes an interval from zero to that score-matrix envelope, so
-a budget crossed only by its upper end yields insufficient information. The
-shared calibration linear-workspace upper envelope permits one activation set per local state
-layer plus 25% scratch margin, calibrated against the small Metal matrix below.
-The lower end models one set. This accounts coarsely for lazy graph retention;
-it does not assert exact tensor lifetimes. The dense LFM2/LFM2.5 hybrid
-calibration below extends coverage; other models and hardware remain uncalibrated. The initial one-layer formula underpredicted long-prompt peaks
-by 22–35%; measured calibration is essential to these planning assumptions. Other recurrent, routed,
-media, embedded/feature-conditioned speculative and distributed paths retain calculated facts but report
-uncovered workspace rather than claim comprehensive coverage. The public runtime
-API supports explicit fused scratch estimates and local device geometries.
+Production target workspace forecasts use `TextExecutionTopology`, retained by
+ordinary preparation and derived from the same projection, convolution, grouped
+expert and output specifications used to construct execution. Selected parameter
+formats replace checkpoint defaults after materialization selection. Families
+supply ordinary equations and invocation facts; runtime owns memory calibration.
 
-### Dense LFM2/LFM2.5 hybrid workspace
+The shared runtime evaluator describes projection outputs, normalization and
+residual intermediates, attention, gated convolution, dense or packed routed
+feed-forward work, output softcapping, logits, sampling, cache replacement and
+pending parameter conversions. It composes these resources through explicit
+layer evaluation lifetimes. The default retains one set per layer plus 25%
+overlap, rounded upward; an explicit smaller overlap releases older layer sets.
+The lower end is a proven individual output allocation, rather than an assertion
+that all layer temporaries coexist. The upper end remains a labeled planning
+allowance, including scratch and promotion, not a native allocator guarantee.
 
-Dense LFM2 selections now project the normalized feed-forward width, attention
+Shared decoder construction covers Llama, dense Qwen, Nanbeige and Gemma2 without
+family memory equations. Packed routed Qwen and LFM2 use the same generic expert
+mechanism; LFM2 mixes the reusable attention and convolution descriptions. Missing
+module equations, native input-score tile facts, rank-local invocation topology,
+nondevice state and prediction/residency exclusions remain explicit unknowns.
+Embedded prediction is still excluded pending its resource-description phase.
+Ordinary cold, loaded, settled continuation and external-drafter forecasts consume
+the same target evaluator. Legacy `WorkspaceGeometry` requests remain readable;
+when ordinary topology is present it is authoritative.
+
+Ordinary shared dense readout projects the final row per chunk; capture contracts
+can require every row. Fused attention retains the configurable float32 score
+matrix fallback. Explicit input-score attention instead consumes its selected
+native tile/retention facts directly, without adding a second whole-score-matrix
+fallback. A whole extra state payload covers cache replacement by default.
+Unknown scratch or retention remains unbounded. New mechanism coverage is shared
+by all families using those ordinary construction contracts; measurements below
+are validation cases, not dispatch criteria.
+
+### Earlier LFM2/LFM2.5 hybrid calibration
+
+The following records the legacy calibration and its measurement history. The
+generic migration below replaces its aggregate family geometry with ordinary
+module outputs and lifetimes, retaining the native tile facts and conservative
+conversion allowance.
+
+Dense LFM2 selections projected the normalized feed-forward width, attention
 schedule, convolution channels and kernel width for SafeTensors and GGUF.
 Persistent convolution history remains in the state estimate. With batch `B`,
 query positions `Q`, channels `C`, kernel width `K` and floating element size `S`,
@@ -678,8 +704,9 @@ scratch declaration.
 
 This coverage applies to ordinary cold, loaded and settled continuation
 forecasts. LFM2 still requires full-pass prefill: reducing a requested chunk size
-does not reduce its estimate. Routed LFM2, distributed projections, nondevice
-state, and existing prediction/residency exclusions retain their explicit gaps.
+does not reduce its estimate. The generic migration adds packed routed LFM2
+coverage; distributed projections, nondevice state and existing
+prediction/residency exclusions retain their explicit gaps.
 Mixed-width selected parameters add a separate float32 cast allowance, including
 promoted state and replacement storage above the nominal state estimate. The
 architecture computes this from selected logical parameter shapes and dtypes;
@@ -1435,3 +1462,97 @@ payload, and independent resources' horizon maxima do not become a simultaneous
 lower bound. Composition reads descriptions only; it does not run inference,
 consume budgets or issue a fit verdict. Existing forecast APIs remain unchanged
 until their workspace projections are migrated in phase 6.
+
+
+### Generic target-workspace migration (2026-09-23)
+
+Phase 6 replaces production family workspace formulas with ordinary construction
+specifications and reusable mechanism/lifetime composition. The previous CLI
+baseline was revision `2bde9278`. Validation used the same pinned checkpoints,
+Metal device, greedy eight-token requests and disabled allocator cache before
+and after the migration. SmolLM-135M used HuggingFace revision
+`1d461723eec654e65efdc40cf49301c89c0c92f4`; LFM2.5-1.2B-Instruct used revision
+`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`. Load-time 4-bit runs used the CLI's
+affine transformation. Prompts were repetitions of `" hello"`; the table reports
+the resolved model-position count.
+
+The upper bounds below are total modeled generation memory in MiB; measured
+peaks are MLX active-allocation high-water marks. They exclude allocator cache
+here, and are not total process or unified-memory pressure. The 64 MiB graph
+allowance remains part of each forecast. Source checkpoint loading is excluded
+from this generation comparison.
+
+| Model / weights | Positions | Chunk | Previous upper MiB | Generic upper MiB | Measured peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SmolLM F32 | 32 | 0 | 616.9 | 628.6 | 577.1 |
+| SmolLM F32 | 32 | 512 | 616.9 | 628.6 | 577.9 |
+| SmolLM F32 | 2000 | 0 | 3310.2 | 4042.6 | 2633.8 |
+| SmolLM F32 | 2000 | 512 | 1350.8 | 1538.3 | 1283.2 |
+| SmolLM 4-bit | 32 | 0 | 275.2 | 286.9 | 250.0 |
+| SmolLM 4-bit | 32 | 512 | 275.2 | 286.9 | 246.2 |
+| SmolLM 4-bit | 2000 | 0 | 2968.5 | 3700.9 | 2296.6 |
+| SmolLM 4-bit | 2000 | 512 | 1009.0 | 1196.6 | 866.5 |
+| LFM2.5 BF16 | 129 | 0 | 3057.5 | 3088.5 | 2768.3 |
+| LFM2.5 BF16 | 2001 | 0 | 14923.5 | 14492.9 | 3750.3 |
+| LFM2.5 4-bit | 129 | 0 | 1637.3 | 1668.3 | 1353.7 |
+| LFM2.5 4-bit | 2001 | 0 | 13503.3 | 13072.7 | 2330.1 |
+
+SmolLM's upper bounds increase because the generic description explicitly includes
+normalization, rotary and output allocations instead of the earlier aggregate
+layer formula. LFM2's long-prompt bound falls by replacing the extra full score
+matrix fallback with the selected explicit-score tile envelope; its smaller
+cases can rise. This is a migration of resource accounting, not a tighter-bound
+guarantee. All twelve measured peaks remained within the new planning upper
+bounds, and generated output matched byte-for-byte across the migration.
+
+Reproduce the matrix after building each revision, retaining the old binary:
+
+```sh
+cargo build -p eredu-cli --no-default-features --features mlx,metal --locked
+python3 validation/memory_estimation_matrix.py \
+  --model /path/to/pinned/SmolLM-135M --binary /path/to/eredu \
+  --output /tmp/smollm-matrix --prompt-lengths 32 2000 --chunks 0 512 \
+  --quantizations original 4
+python3 validation/memory_estimation_matrix.py \
+  --model /path/to/pinned/LFM2.5-1.2B-Instruct --binary /path/to/eredu \
+  --output /tmp/lfm-matrix --prompt-lengths 128 2000 --chunks 0 \
+  --quantizations original 4
+```
+
+Native LFM2.5 checks at 128 and 2,000 positions validated cold, loaded and
+settled continuation forecasts, ordinary/controlled forecast agreement and
+unchanged allocator activity during forecast calls. The pinned BF16 GGUF above
+was also exercised at 128, 2,000 and 128 positions in one loaded model: retained
+F32 conversions were credited once, reused after reset, and every measured
+startup/continuation growth stayed inside the forecast upper. The warm 128-row
+run retained 4,680,843,264 conversion bytes and forecast 928,753,920 additional
+bytes against 503,571,756 measured bytes.
+
+Before/after logit files compare every vocabulary value as an F32 bit pattern at
+eight predictions (prefill plus seven cached steps), for 17 and 513 input positions
+in both BF16 and affine 4-bit. All logits and token IDs match exactly. Ordinary
+observed and explicitly stepped controlled runs also match each other. Use the
+parity command above with `EREDU_LFM2_MEMORY_LENGTHS=17,513`; set
+`EREDU_LFM2_MEMORY_QUANTIZED=1` for the 4-bit comparison. The reference is the
+pre-migration native harness, so this is regression parity, not an independent
+model-quality validation.
+
+`native_generic_workspace_covers_softcapped_and_routed_modules` exercises nonzero
+Gemma2 and Qwen3-MoE fixtures through startup and settled continuation. Measured
+startup growth was 668,709 and 233,113 bytes, respectively; continuation growth
+was 51,394 and 11,734 bytes. Both stay inside their planning allowances, and
+forecast calls preserve native allocation counters. These small fixtures include
+the default 64 MiB overhead allowance and do not independently calibrate it.
+
+Portable validation passed the runtime, architecture and facade library suites,
+97 backend-conformance tests, 27 portable-facade tests, construction/topology
+consistency and strict portable/native Clippy. Tests cover retained selected
+quantization, tied ownership, custom-selector unknowns, malformed geometry,
+checked arithmetic, explicit evaluation overlap, zero-query continuation starts,
+speculative sampling vocabulary and legacy JSON round trips.
+
+Native CUDA, distributed invocation topology, other checkpoint scales and arbitrary
+mechanism combinations were not measured on this Metal host. Packed expert
+coverage has synthetic native validation; it has no released large-MoE calibration
+claim. Opaque native capacity facts remain unknown in the raw mechanism contract;
+finite forecast allowances are explicitly estimated.

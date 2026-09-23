@@ -34,6 +34,8 @@ pub mod execution_control;
 pub mod execution_plan;
 /// Descriptions derived from retained ordinary execution and materialization contracts.
 pub mod execution_resources;
+/// Reusable module construction and invocation topology.
+pub mod execution_topology;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
@@ -404,3 +406,6 @@ pub use weight_residency::{
     ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions, ParameterBankResidency,
     StaticUnitBindings, WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };
+
+/// Generic calibrated target workspace composition from ordinary module topology.
+pub mod workspace_resources;

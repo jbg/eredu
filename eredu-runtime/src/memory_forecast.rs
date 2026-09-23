@@ -71,7 +71,10 @@ impl ForecastCalibration {
     pub fn apply(&self, request: &mut GenerationMemoryRequest) -> Result<(), CapabilityError> {
         for domain in &mut request.domains {
             for execution in &mut domain.executions {
-                let layers = execution.state_layout.layer_layout().len() as u64;
+                let layers = execution.execution_topology.as_ref().map_or_else(
+                    || execution.state_layout.layer_layout().len(),
+                    |topology| topology.layers.len(),
+                ) as u64;
                 let upper = layers
                     .checked_add(layers.div_ceil(4))
                     .ok_or(CapabilityError::ArithmeticOverflow {
@@ -82,7 +85,7 @@ impl ForecastCalibration {
                 execution.cache_update = self.cache_update;
                 execution.workspace_overlap = self.workspace_overlap.clone().unwrap_or(WorkspaceOverlap {
                     upper_live_copies: Some(upper),
-                    detail: "forecast calibration v1: one linear activation set per local state layer plus 25% scratch; calibrated on SmolLM-135M Metal original/4-bit and dense LFM2.5-1.2B Metal BF16, not a universal bound".into(),
+                    detail: "forecast calibration v1: one activation set per selected invocation layer plus 25% scratch; calibrated on SmolLM-135M Metal original/4-bit and dense LFM2.5-1.2B Metal BF16, not a universal bound".into(),
                 });
             }
         }
@@ -97,6 +100,10 @@ pub struct LoadedMemoryGeometry {
     pub state_layout: eredu_core::StateMemoryLayout,
     /// Architecture workspace geometry, absent for uncovered equations.
     pub workspace: Option<WorkspaceGeometry>,
+    /// Ordinary selected module topology used by generic workspace composition.
+    pub execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
+    /// Selected native input-score attention implementation, independent of family.
+    pub input_score_attention_mechanism: Option<InputScoreAttentionMechanism>,
     /// Actual selected floating-state element width.
     pub scalar_bytes: NonZeroU8,
     /// Whether parameters stay resident rather than materializing during generation.

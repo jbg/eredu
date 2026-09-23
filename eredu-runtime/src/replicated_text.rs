@@ -1170,6 +1170,7 @@ impl ReplicatedTextContractError {
 /// Exact architecture and artifact requirements for replicated text execution.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextRequirements {
+    execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
     chunked_prefill: bool,
     floating_state_source: Option<TensorDtype>,
     architecture_identity: String,
@@ -1197,6 +1198,20 @@ pub struct ReplicatedTextRequirements {
 }
 
 impl ReplicatedTextRequirements {
+    /// Retains the ordinary reusable module topology alongside selected parameters.
+    pub fn with_execution_topology(
+        mut self,
+        topology: Option<crate::execution_topology::TextExecutionTopology>,
+    ) -> Self {
+        self.execution_topology = topology;
+        self
+    }
+
+    /// Ordered reusable module topology, independent of allocation or forecast policy.
+    pub fn execution_topology(&self) -> Option<&crate::execution_topology::TextExecutionTopology> {
+        self.execution_topology.as_ref()
+    }
+
     /// Declares parity of consecutive causal prefix passes with full prefill.
     pub const fn with_chunked_prefill(mut self, supported: bool) -> Self {
         self.chunked_prefill = supported;
@@ -1296,6 +1311,7 @@ impl ReplicatedTextRequirements {
             ));
         }
         Ok(Self {
+            execution_topology: None,
             chunked_prefill: false,
             floating_state_source: None,
             architecture_identity,

@@ -4,7 +4,7 @@ use eredu_core::{component::*, parameters::*};
 #[path = "routed_components/interventions.rs"]
 mod interventions;
 
-fn routed_fixture() -> Fixture {
+pub(super) fn routed_fixture() -> Fixture {
     let root = fixture(false);
     let config = serde_json::json!({
         "model_type":"qwen3_moe", "hidden_size":16, "num_hidden_layers":2,

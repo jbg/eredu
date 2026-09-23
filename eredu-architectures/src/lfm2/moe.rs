@@ -29,6 +29,37 @@ pub struct DenseSwiGlu<B: NeuralBackend> {
     pub up: B::Linear,
 }
 
+pub(crate) fn dense_projection_specs(
+    args: &ModelArgs,
+    layer: usize,
+    intermediate: i32,
+) -> Result<Vec<(String, LinearSpec)>, Error> {
+    let prefix = format!("model.layers.{layer}.feed_forward");
+    [
+        ("w1", args.hidden_size, intermediate),
+        ("w3", args.hidden_size, intermediate),
+        ("w2", intermediate, args.hidden_size),
+    ]
+    .into_iter()
+    .map(|(field, input, output)| {
+        let name = format!("{prefix}.{field}.weight");
+        Ok((
+            field.into(),
+            LinearSpec {
+                input,
+                output,
+                weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                bias: None,
+                format: crate::linear_format::standard_linear_format(
+                    &name,
+                    args.weight_quantization_for(&name).into(),
+                )?,
+            },
+        ))
+    })
+    .collect()
+}
+
 impl<B: NeuralBackend> DenseSwiGlu<B> {
     pub(crate) fn new(
         args: &ModelArgs,
@@ -36,27 +67,18 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.layers.{layer}.feed_forward");
-        let linear = |field: &str, input, output| {
-            let name = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &name,
-                        args.weight_quantization_for(&name).into(),
-                    )?,
-                },
-                context,
-            )
+        let specs = dense_projection_specs(args, layer, intermediate)?;
+        let linear = |field: &str| {
+            let spec = specs
+                .iter()
+                .find(|(name, _)| name == field)
+                .ok_or_else(|| Error::backend("dense feed-forward projection absent"))?;
+            B::linear(spec.1.clone(), context)
         };
         Ok(Self {
-            gate: linear("w1", args.hidden_size, intermediate)?,
-            down: linear("w2", intermediate, args.hidden_size)?,
-            up: linear("w3", args.hidden_size, intermediate)?,
+            gate: linear("w1")?,
+            down: linear("w2")?,
+            up: linear("w3")?,
         })
     }
 
@@ -119,38 +141,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
         spec: GroupedGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.layers.{layer}.feed_forward");
-        let gate_name = format!("{prefix}.gate.weight");
-        let routing = TopKGroupSelectionSpec::new(
-            args.num_experts,
-            args.num_experts_per_tok,
-            GroupScoring::Sigmoid,
-            args.norm_topk_prob,
-        )?
-        .with_weight_policy(1e-6, args.routed_scaling_factor)?;
-        let mut selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &gate_name,
-                args.weight_quantization_for(&gate_name).into(),
-            )?,
-            routing,
-        )?
-        // The released equation rounds projection, sigmoid, normalization and
-        // mixture coefficients in the input dtype. The F32 correction bias
-        // affects expert choice only; it must not promote the expert mixture.
-        .with_arithmetic(eredu_nn::RoutingArithmetic::uniform(
-            eredu_nn::RoutingPrecision::Input,
-        ));
-        if let Some(correction_bias) = args
-            .use_expert_bias
-            .then(|| ParameterSpec::trainable(format!("{prefix}.expert_bias")))
-            .transpose()
-            .map_err(Error::backend)?
-        {
-            selector = selector.with_correction_bias(correction_bias)?;
-        }
+        let selector = selector_spec(args, layer)?;
         let router = B::top_k_group_selector(selector, context)?;
         let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
@@ -159,6 +150,45 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             experts,
         })
     }
+}
+
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let prefix = format!("model.layers.{layer}.feed_forward");
+    let gate_name = format!("{prefix}.gate.weight");
+    let routing = TopKGroupSelectionSpec::new(
+        args.num_experts,
+        args.num_experts_per_tok,
+        GroupScoring::Sigmoid,
+        args.norm_topk_prob,
+    )?
+    .with_weight_policy(1e-6, args.routed_scaling_factor)?;
+    let mut selector = TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &gate_name,
+            args.weight_quantization_for(&gate_name).into(),
+        )?,
+        routing,
+    )?
+    // The released equation rounds projection, sigmoid, normalization and
+    // mixture coefficients in the input dtype. The F32 correction bias
+    // affects expert choice only; it must not promote the expert mixture.
+    .with_arithmetic(eredu_nn::RoutingArithmetic::uniform(
+        eredu_nn::RoutingPrecision::Input,
+    ));
+    if let Some(correction_bias) = args
+        .use_expert_bias
+        .then(|| ParameterSpec::trainable(format!("{prefix}.expert_bias")))
+        .transpose()
+        .map_err(Error::backend)?
+    {
+        selector = selector.with_correction_bias(correction_bias)?;
+    }
+    Ok(selector)
 }
 
 /// Returns the architecture-owned routed expert specification for one layer.

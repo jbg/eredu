@@ -249,9 +249,11 @@ pub fn inspected_generation_memory_request(
     let resources = &inspection.report().resources;
     let partitioned = execution.parallel_topology().is_some();
     let mut workspace = geometry.workspace;
+    let mut execution_topology = geometry.execution_topology;
     let state_layout = geometry.state_layout;
     if selected.preparation().prediction_realization().is_some() {
         workspace = None;
+        execution_topology = None;
     }
     let total = if partitioned {
         resources
@@ -320,6 +322,7 @@ pub fn inspected_generation_memory_request(
             },
         );
         workspace = None;
+        execution_topology = None;
     }
     let fully_resident = matches!(text.residency(), LayerWeightResidency::FullyResident);
     let mut staging = if fully_resident {
@@ -371,6 +374,8 @@ pub fn inspected_generation_memory_request(
     let execution_plan = ExecutionMemoryPlan {
         state_layout,
         workspace,
+        execution_topology,
+        input_score_attention_mechanism: geometry.input_score_attention_mechanism,
         attention: options.attention.clone(),
         workspace_overlap: options.workspace_overlap.clone(),
         cache_update: options.cache_update,

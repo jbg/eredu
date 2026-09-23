@@ -75,21 +75,14 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
             OperatorPolicy::SelfAttention(attention) => {
                 let head_dim = args.hidden_size / args.num_attention_heads;
                 let prefix = format!("{root}.self_attn");
-                let linear = |field: &str, input, output| {
-                    let name = format!("{prefix}.{field}.weight");
-                    B::linear(
-                        LinearSpec {
-                            input,
-                            output,
-                            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                &name,
-                                args.weight_quantization_for(&name).into(),
-                            )?,
-                        },
-                        context,
-                    )
+                let specs =
+                    attention_projection_specs(args, &root, BlockGeometry::replicated(args))?;
+                let linear = |field: &str| {
+                    let spec = specs
+                        .iter()
+                        .find(|(name, _)| name == field)
+                        .ok_or_else(|| Error::backend("attention projection absent"))?;
+                    B::linear(spec.1.clone(), context)
                 };
                 let norm = |field: &str| {
                     B::normalization(
@@ -106,18 +99,10 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     args.num_attention_heads,
                     args.num_key_value_heads,
                     head_dim,
-                    linear("q_proj", args.hidden_size, args.hidden_size)?,
-                    linear(
-                        "k_proj",
-                        args.hidden_size,
-                        args.num_key_value_heads * head_dim,
-                    )?,
-                    linear(
-                        "v_proj",
-                        args.hidden_size,
-                        args.num_key_value_heads * head_dim,
-                    )?,
-                    linear("out_proj", args.hidden_size, args.hidden_size)?,
+                    linear("q_proj")?,
+                    linear("k_proj")?,
+                    linear("v_proj")?,
+                    linear("out_proj")?,
                     Some(norm("q_layernorm")?),
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
@@ -286,21 +271,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             OperatorPolicy::SelfAttention(attention) => {
                 let head_dim = args.hidden_size / args.num_attention_heads;
                 let prefix = format!("{root}.self_attn");
-                let linear = |field: &str, input, output| {
-                    let name = format!("{prefix}.{field}.weight");
-                    B::linear(
-                        LinearSpec {
-                            input,
-                            output,
-                            weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                &name,
-                                args.weight_quantization_for(&name).into(),
-                            )?,
-                        },
-                        context,
-                    )
+                let specs = attention_projection_specs(args, &root, geometry)?;
+                let linear = |field: &str| {
+                    let spec = specs
+                        .iter()
+                        .find(|(name, _)| name == field)
+                        .ok_or_else(|| Error::backend("attention projection absent"))?;
+                    B::linear(spec.1.clone(), context)
                 };
                 let norm = |field: &str| {
                     B::normalization(
@@ -317,22 +294,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     geometry.query_heads,
                     geometry.key_value_heads,
                     head_dim,
-                    linear("q_proj", args.hidden_size, geometry.query_heads * head_dim)?,
-                    linear(
-                        "k_proj",
-                        args.hidden_size,
-                        geometry.key_value_heads * head_dim,
-                    )?,
-                    linear(
-                        "v_proj",
-                        args.hidden_size,
-                        geometry.key_value_heads * head_dim,
-                    )?,
-                    linear(
-                        "out_proj",
-                        geometry.query_heads * head_dim,
-                        args.hidden_size,
-                    )?,
+                    linear("q_proj")?,
+                    linear("k_proj")?,
+                    linear("v_proj")?,
+                    linear("out_proj")?,
                     Some(norm("q_layernorm")?),
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
@@ -691,7 +656,7 @@ fn finish_feed_forward<B: NeuralBackend>(
     instrumentation.apply("feed_forward.residual", hidden.add(&feed_forward, context)?)
 }
 
-fn short_convolution_spec(
+pub(crate) fn short_convolution_spec(
     args: &ModelArgs,
     root: &str,
     channels: i32,
@@ -730,5 +695,141 @@ fn short_convolution_spec(
                 .transpose()?,
             activation: ConvolutionActivation::Identity,
         },
+    })
+}
+
+fn attention_projection_specs(
+    args: &ModelArgs,
+    root: &str,
+    geometry: BlockGeometry,
+) -> Result<Vec<(String, LinearSpec)>, Error> {
+    let head = args.hidden_size / args.num_attention_heads;
+    let query = geometry
+        .query_heads
+        .checked_mul(head)
+        .ok_or_else(|| Error::backend("query projection width overflow"))?;
+    let kv = geometry
+        .key_value_heads
+        .checked_mul(head)
+        .ok_or_else(|| Error::backend("key/value projection width overflow"))?;
+    let prefix = format!("{root}.self_attn");
+    [
+        ("q_proj", args.hidden_size, query),
+        ("k_proj", args.hidden_size, kv),
+        ("v_proj", args.hidden_size, kv),
+        ("out_proj", query, args.hidden_size),
+    ]
+    .into_iter()
+    .map(|(field, input, output)| {
+        Ok((
+            field.into(),
+            attention_projection_spec(args, &prefix, field, input, output)?,
+        ))
+    })
+    .collect()
+}
+
+fn attention_projection_spec(
+    args: &ModelArgs,
+    prefix: &str,
+    field: &str,
+    input: i32,
+    output: i32,
+) -> Result<LinearSpec, Error> {
+    let name = format!("{prefix}.{field}.weight");
+    Ok(LinearSpec {
+        input,
+        output,
+        weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+        bias: None,
+        format: crate::linear_format::standard_linear_format(
+            &name,
+            args.weight_quantization_for(&name).into(),
+        )?,
+    })
+}
+
+/// Ordinary block construction topology, independent of native memory policy.
+pub(crate) fn execution_topology(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::execution_topology::TextExecutionTopology, Error> {
+    use eredu_runtime::execution_topology::*;
+    let positive = |n: i32| {
+        u64::try_from(n)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::backend("text topology dimensions must be positive"))
+    };
+    let layers = args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .map(|(layer, policy)| {
+            let root = format!("model.layers.{layer}");
+            let mixer = match policy.operator {
+                OperatorPolicy::CausalConvolution => {
+                    let spec = short_convolution_spec(args, &root, args.hidden_size)?;
+                    TokenMixerTopology::GatedConvolution {
+                        channels: positive(spec.channels)?,
+                        kernel: positive(spec.convolution.kernel_size)?,
+                        projections: [&spec.input_projection, &spec.output_projection]
+                            .into_iter()
+                            .map(ProjectionTopology::from_spec)
+                            .collect::<Result<_, _>>()?,
+                    }
+                }
+                OperatorPolicy::SelfAttention(_) => {
+                    let head = args.hidden_size / args.num_attention_heads;
+                    let specs =
+                        attention_projection_specs(args, &root, BlockGeometry::replicated(args))?;
+                    TokenMixerTopology::Attention {
+                        query_heads: positive(args.num_attention_heads)?,
+                        kv_heads: positive(args.num_key_value_heads)?,
+                        key_width: positive(head)?,
+                        value_width: positive(head)?,
+                        input_scores: true,
+                        softcap: false,
+                        sinks: false,
+                        projections: specs
+                            .iter()
+                            .map(|(_, spec)| ProjectionTopology::from_spec(spec))
+                            .collect::<Result<_, _>>()?,
+                        query_key_normalization: true,
+                        rotary: true,
+                    }
+                }
+            };
+            let feed_forward = match policy.feed_forward {
+                super::FeedForwardPolicy::Dense => FeedForwardTopology::Gated {
+                    intermediate_size: positive(args.dense_intermediate_size)?,
+                    projections: super::moe::dense_projection_specs(
+                        args,
+                        layer,
+                        args.dense_intermediate_size,
+                    )?
+                    .iter()
+                    .map(|(_, s)| ProjectionTopology::from_spec(s))
+                    .collect::<Result<_, _>>()?,
+                },
+                super::FeedForwardPolicy::SparseMoe => FeedForwardTopology::from_grouped_specs(
+                    &super::moe::selector_spec(args, layer)?,
+                    &super::moe::expert_bank_spec(args, layer)?,
+                )?,
+            };
+            Ok(TextLayerTopology {
+                mixer,
+                feed_forward,
+                normalization_count: 2,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(TextExecutionTopology {
+        hidden_size: positive(args.hidden_size)?,
+        vocabulary_size: positive(args.vocab_size)?,
+        layers,
+        output: super::static_spec(args).output_topology()?,
+        output_softcap: false,
+        selected_parameter_promotion_bytes: None,
+        missing: Vec::new(),
     })
 }

@@ -127,8 +127,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let decoder =
-            HybridDecoder::new(Self::static_spec(&args), "model.layers", layers, context)?;
+        let decoder = HybridDecoder::new(static_spec(&args), "model.layers", layers, context)?;
         Ok(Self {
             args,
             decoder,
@@ -145,7 +144,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let spec = Self::static_spec(&args);
+        let spec = static_spec(&args);
         let mut decoder = HybridDecoder::new(spec.clone(), "model.layers", layers, context)?;
         *decoder.static_modules_mut() = StaticModules::from_parallel_spec(
             spec,
@@ -158,23 +157,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             decoder,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
         })
-    }
-
-    fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
-        let embedding_name = "model.embed_tokens.weight";
-        StaticModuleSpec {
-            normalization_groups: None,
-            embedding_weight: embedding_name.into(),
-            normalization_weight: "model.embedding_norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
-            vocabulary: args.vocab_size,
-            hidden_size: args.hidden_size,
-            normalization_epsilon: args.norm_eps,
-            normalization_offset: 0.0,
-            embedding_quantization: args.weight_quantization_for(embedding_name),
-            head_format: args.weight_quantization_for("lm_head.weight").into(),
-            tied_head: args.tie_word_embeddings,
-        }
     }
 
     /// Returns normalized architecture policy.
@@ -1261,4 +1243,23 @@ pub fn state_identity(
         topology,
     )
     .map_err(Error::backend)
+}
+
+pub(crate) use block::execution_topology;
+
+pub(crate) fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
+    let embedding_name = "model.embed_tokens.weight";
+    StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: embedding_name.into(),
+        normalization_weight: "model.embedding_norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.norm_eps,
+        normalization_offset: 0.0,
+        embedding_quantization: args.weight_quantization_for(embedding_name),
+        head_format: args.weight_quantization_for("lm_head.weight").into(),
+        tied_head: args.tie_word_embeddings,
+    }
 }

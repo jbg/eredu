@@ -25,6 +25,8 @@ fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
                 ..Default::default()
             },
             executions: vec![ExecutionMemoryPlan {
+                execution_topology: None,
+                input_score_attention_mechanism: None,
                 state_layout: StateMemoryLayout::new(
                     LayerSchedule::new(
                         1,
@@ -385,4 +387,75 @@ fn continuation_unattributed_sampling_and_capture_storage_covers_discrete_pools(
         assert!(pool.generation_peak.upper_bytes.is_none());
         assert_eq!(pool.fit, MemoryFit::InsufficientInformation);
     }
+}
+
+fn use_generic_topology(request: &mut GenerationMemoryRequest) {
+    use crate::execution_topology::*;
+    let projection = |name: &str, input, output| ProjectionTopology {
+        input,
+        output,
+        format: eredu_checkpoint::LinearFormat::Dense,
+        bias: false,
+        parameter: name.into(),
+    };
+    for domain in &mut request.domains {
+        for execution in &mut domain.executions {
+            execution.execution_topology = Some(TextExecutionTopology {
+                hidden_size: 32,
+                vocabulary_size: 128,
+                selected_parameter_promotion_bytes: None,
+                output_softcap: false,
+                output: projection("output", 32, 128),
+                missing: vec![],
+                layers: vec![TextLayerTopology {
+                    normalization_count: 2,
+                    mixer: TokenMixerTopology::Attention {
+                        query_heads: 4,
+                        kv_heads: 1,
+                        key_width: 8,
+                        value_width: 8,
+                        input_scores: false,
+                        softcap: false,
+                        sinks: false,
+                        query_key_normalization: false,
+                        rotary: true,
+                        projections: vec![
+                            projection("query", 32, 32),
+                            projection("key", 32, 8),
+                            projection("value", 32, 8),
+                            projection("attention-output", 32, 32),
+                        ],
+                    },
+                    feed_forward: FeedForwardTopology::Gated {
+                        intermediate_size: 64,
+                        projections: vec![
+                            projection("gate", 32, 64),
+                            projection("up", 32, 64),
+                            projection("down", 64, 32),
+                        ],
+                    },
+                }],
+            });
+            execution.workspace = None;
+        }
+    }
+}
+
+#[test]
+fn speculative_startup_and_settled_continuation_use_generic_vocabulary_and_workspace() {
+    let mut target = request(MemoryDomain::Unified);
+    let mut plan = plan();
+    use_generic_topology(&mut target);
+    use_generic_topology(plan.draft.as_mut().unwrap());
+    let startup = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(startup.fit, MemoryFit::LikelyFit);
+    assert!(startup.domains[0].generation_peak.upper_bytes.is_some());
+    let (mut target, mut plan, continuation) = continuation_fixture(7, false);
+    use_generic_topology(&mut target);
+    use_generic_topology(plan.draft.as_mut().unwrap());
+    let before = (target.clone(), plan.clone(), continuation.clone());
+    let settled = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(settled.fit, MemoryFit::LikelyFit);
+    assert!(settled.domains[0].generation_peak.upper_bytes.is_some());
+    assert_eq!((target, plan, continuation), before);
 }

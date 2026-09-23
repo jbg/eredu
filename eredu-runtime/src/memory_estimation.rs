@@ -282,6 +282,12 @@ pub struct ExecutionMemoryPlan {
     pub state_layout: StateMemoryLayout,
     /// Decoder transient geometry; absent for currently uncovered architectures.
     pub workspace: Option<WorkspaceGeometry>,
+    /// Ordinary selected module topology; preferred over legacy aggregate geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
+    /// Native explicit-score attention calibration, independent of module topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_score_attention_mechanism: Option<InputScoreAttentionMechanism>,
     /// Selected attention implementation.
     pub attention: AttentionWorkspace,
     /// Cache update overlap.
@@ -521,6 +527,9 @@ fn workspace(
             "workspace_overlap",
             "upper live copies must be positive",
         ));
+    }
+    if execution.execution_topology.is_some() {
+        return crate::workspace_resources::workspace(execution, request, positions, query, persistent);
     }
     let Some(g) = &execution.workspace else {
         return Ok(MemoryBytes::unknown(
@@ -1010,7 +1019,7 @@ pub fn estimate_generation_memory(
         domains, fit: overall_fit, uncertainties, assumptions: vec![
             "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.".into(),
             "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.".into(),
-            "One decoder-layer workspace includes four residual-width arrays, Q/K/V and three MLP intermediates. The selected backend overlap interval multiplies linear intermediates only; logits, attention scratch and cache-update costs remain separate.".into(),
+            "Selected ordinary module topology supplies projection, attention, convolution and feed-forward geometry; reusable mechanism calibrations and explicit evaluation lifetimes compose their workspace. Legacy requests retain the earlier aggregate layer envelope.".into(),
             "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.".into(),
             "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately.".into(),
         ] })
@@ -1036,7 +1045,15 @@ pub(crate) fn memory_uncertainties(
         }
         for (rank, execution) in plan.executions.iter().enumerate() {
             let prefix = format!("{:?} execution {rank}", plan.domain);
-            if let Some(g) = &execution.workspace {
+            if let Some(topology) = &execution.execution_topology {
+                uncertainties.push(format!("{prefix}: generic mechanism calibration v1 uses explicit lazy-evaluation envelopes; native scratch, alignment and arithmetic promotion are planning assumptions, not allocator guarantees"));
+                uncertainties.extend(topology.missing.iter().map(|reason| format!("{prefix}: {reason}")));
+                for layer in &topology.layers {
+                    if let crate::execution_topology::FeedForwardTopology::Unknown { reason } = &layer.feed_forward {
+                        uncertainties.push(format!("{prefix}: {reason}"));
+                    }
+                }
+            } else if let Some(g) = &execution.workspace {
                 if g.gated_convolution.is_some() {
                     uncertainties.push(format!("{prefix}: gated-convolution calibration v1 includes gated rows, padded input copies, kernel-width scratch and layer overlap; linear upper allows float32 promotion; persistent history is separate"));
                 }
@@ -1047,7 +1064,7 @@ pub(crate) fn memory_uncertainties(
                     uncertainties.push(format!("{prefix}: input-score attention includes native query tiling, repeated expanded K/V, score conversions and layer overlap; linear upper allows float32 promotion; missing native facts preserve an unknown upper end"));
                 }
             }
-            if execution.workspace.is_none() {
+            if execution.workspace.is_none() && execution.execution_topology.is_none() {
                 uncertainties.push(format!("{prefix}: decoder workspace geometry unavailable"));
             }
             if execution.workspace_overlap.upper_live_copies != Some(1) {
@@ -1061,15 +1078,16 @@ pub(crate) fn memory_uncertainties(
                     "{prefix}: interior peaks of remainder-shaped state unavailable"
                 ));
             }
+            let fused_attention = execution.execution_topology.as_ref().is_none_or(|topology| topology.layers.iter().any(|layer| matches!(layer.mixer, crate::execution_topology::TokenMixerTopology::Attention { input_scores: false, softcap: false, .. })));
             match &execution.attention {
-                AttentionWorkspace::Unknown => {
+                AttentionWorkspace::Unknown if fused_attention => {
                     uncertainties.push(format!("{prefix}: attention kernel workspace unavailable"))
                 }
-                AttentionWorkspace::ScoreMatrixUpperBound => uncertainties.push(format!(
+                AttentionWorkspace::ScoreMatrixUpperBound if fused_attention => uncertainties.push(format!(
                     "{prefix}: uncalibrated fused attention uses score-matrix upper estimate"
                 )),
                 AttentionWorkspace::Fused { scratch }
-                    if scratch.kind != ObservationKind::Exact || scratch.upper_bytes.is_none() =>
+                    if fused_attention && (scratch.kind != ObservationKind::Exact || scratch.upper_bytes.is_none()) =>
                 {
                     uncertainties.push(format!("{prefix} attention scratch: {}", scratch.detail))
                 }

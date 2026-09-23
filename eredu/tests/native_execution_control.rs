@@ -671,3 +671,6 @@ mod continuation;
 
 #[path = "native_execution_control/lfm2_memory.rs"]
 mod lfm2_memory;
+
+#[path = "native_execution_control/generic_memory.rs"]
+mod generic_memory;

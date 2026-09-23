@@ -887,6 +887,8 @@ fn continuation_payload_floors_cover_installed_state_without_capacity_or_optiona
 pub(super) fn fixture_profile() -> LoadedMemoryProfile {
     LoadedMemoryProfile {
         geometry: LoadedMemoryGeometry {
+            execution_topology: None,
+            input_score_attention_mechanism: None,
             state_layout: StateMemoryLayout::new(
                 eredu_core::LayerSchedule::new(
                     2,

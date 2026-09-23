@@ -2472,6 +2472,22 @@ enum EligibleConfig<'a> {
 }
 
 impl EligibleConfig<'_> {
+    fn execution_topology(
+        &self,
+    ) -> Result<Option<eredu_runtime::execution_topology::TextExecutionTopology>, eredu_nn::Error>
+    {
+        let topology = match self {
+            Self::Llama(args) => crate::decoder::topology::text(*args)?,
+            Self::Nanbeige(args) => crate::decoder::topology::text(*args)?,
+            Self::Gemma2(args) => crate::decoder::topology::text(*args)?,
+            Self::K2Horizon(args) => crate::decoder::topology::text(*args)?,
+            Self::Qwen(args) => crate::qwen::execution_topology(args)?,
+            Self::Lfm2(args) => crate::lfm2::execution_topology(args)?,
+            _ => return Ok(None),
+        };
+        Ok(Some(topology))
+    }
+
     fn supports_chunked_prefill(&self) -> bool {
         match self {
             Self::Llama(_)
@@ -4369,6 +4385,10 @@ fn replicated_text_requirements_for_structure(
             )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    requirements =
+        requirements.with_execution_topology(config.execution_topology().map_err(|error| {
+            ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+        })?);
     if let Some(extension) = plan.prediction_extension() {
         use crate::configuration::PredictionExtensionKind;
         let roles: &[&str] = match extension.kind() {
@@ -5169,6 +5189,20 @@ fn gguf_eligible_config(
         GgufModelConfig::GptOss(_) => Err(ReplicatedTextIneligibility::Routed),
         GgufModelConfig::DeepSeekV3(args) => Ok(EligibleConfig::DeepSeekV3(args)),
     }
+}
+
+pub(crate) fn execution_topology(
+    plan: &ArtifactArchitecturePlan,
+) -> Result<
+    Option<eredu_runtime::execution_topology::TextExecutionTopology>,
+    ReplicatedTextRequirementsError,
+> {
+    let Ok(config) = eligible_config(plan) else {
+        return Ok(None);
+    };
+    config
+        .execution_topology()
+        .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))
 }
 
 fn eligible_config(

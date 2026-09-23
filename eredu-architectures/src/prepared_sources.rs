@@ -600,6 +600,7 @@ impl PreparedModelSources {
             .map(|mut geometry| {
                 if self.prediction_extension().is_some() {
                     geometry.workspace = None;
+                    geometry.execution_topology = None;
                 }
                 geometry
             })

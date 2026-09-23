@@ -1,62 +1,56 @@
-//! Cold, architecture-owned projections for request memory planning.
+//! Cold projections reuse ordinary selected state and module-construction contracts.
 
 use crate::{
     configuration::{GgufModelConfig, SafetensorsModelConfig},
     processor_plan::ArtifactArchitecturePlan,
 };
 use eredu_core::{CapabilityError, StateMemoryLayout};
-use eredu_runtime::memory_estimation::{GatedConvolutionWorkspace, WorkspaceGeometry};
+use eredu_runtime::{execution_topology::*, memory_estimation::WorkspaceGeometry};
 
-/// Architecture payload geometry; missing workspace coverage never rejects execution.
+/// Architecture payload geometry; incomplete mechanisms never reject execution.
 #[derive(Debug, Clone)]
 pub struct GenerationMemoryGeometry {
-    /// Exact persistent-state schedule from the normalized family.
+    /// Exact persistent-state schedule from ordinary family capabilities.
     pub state_layout: StateMemoryLayout,
-    /// Dense workspace dimensions, when the equations are modeled.
+    /// Legacy workspace geometry, absent for topology-based production forecasts.
     pub workspace: Option<WorkspaceGeometry>,
-    /// Reasons workspace or additional graph coverage is incomplete.
+    /// Reusable module topology from ordinary cold construction.
+    pub execution_topology: Option<TextExecutionTopology>,
+    /// Concrete missing invocation facts.
     pub assumptions: Vec<String>,
 }
 
-fn dimension(value: i32) -> Result<u64, CapabilityError> {
-    u64::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| CapabilityError::InvalidConfiguration {
-            field: "workspace_dimension",
-            detail: format!("expected a positive dimension, got {value}"),
-        })
-}
-
-/// Projects the exact selected state geometry and retains explicit coverage gaps.
+/// Retains exact selected topology and physical parameter formats without allocation.
 pub fn selected_generation_memory_geometry(
     plan: &ArtifactArchitecturePlan,
     execution: &crate::SelectedExecution,
 ) -> Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, CapabilityError> {
     let mut geometry = generation_memory_geometry(plan)?;
-    if let Some(explicit) = geometry
-        .workspace
-        .as_mut()
-        .and_then(|g| g.input_score_attention.as_mut())
-    {
-        explicit.mechanism = execution.input_score_attention_workspace();
-    }
     let text = execution.text_realization();
+    geometry.execution_topology = text.requirements().execution_topology().cloned();
+    // Routed construction can supply a topology even when ordinary unselected
+    // admission cannot select that execution class. Retained selection is authoritative.
+    geometry.assumptions.clear();
+    if geometry.execution_topology.is_none() {
+        geometry.assumptions.push(
+            "ordinary module invocation topology is unavailable; persistent state remains described".into(),
+        );
+    }
     if execution.parallel_topology().is_some() {
-        geometry.state_layout = eredu_core::StateMemoryLayout::new(
+        geometry.state_layout = StateMemoryLayout::new(
             eredu_core::LayerSchedule::empty(),
             Vec::new(),
             geometry.state_layout.hidden_size,
             1,
             geometry.state_layout.completeness,
         )?;
-        geometry.workspace = None;
+        geometry.execution_topology = None;
         geometry
             .assumptions
-            .push("rank-local state and workspace projection unavailable".into());
+            .push("rank-local invocation topology is unavailable".into());
     } else {
         let state = text.state().layout();
-        geometry.state_layout = eredu_core::StateMemoryLayout::new(
+        geometry.state_layout = StateMemoryLayout::new(
             state.layers().clone(),
             state.layer_prefix_offsets(),
             geometry.state_layout.hidden_size,
@@ -69,14 +63,47 @@ pub fn selected_generation_memory_geometry(
         eredu_runtime::CacheResidencyPolicy::Device
     ) || !execution.bounded_residency_exclusions().is_empty()
     {
-        geometry.workspace = None;
+        geometry.execution_topology = None;
+        geometry.assumptions.push(
+            "selected state or weight residency does not provide an invocation lifetime contract"
+                .into(),
+        );
     }
-    if let Some(workspace) = geometry.workspace.as_mut() {
-        // Mixed-width parameters can promote activations and create implicit
-        // projection-weight casts. Reserve the full potential F32 payload as a
-        // conservative bound, without asserting every parameter is converted.
-        // This follows selected task geometry and encodings for every covered
-        // dense architecture, not the checkpoint format or a family name.
+    if let Some(topology) = geometry.execution_topology.as_mut() {
+        // Materialization selection, not source file/config defaults, determines
+        // actual projection encoding (including requested load-time quantization).
+        let formats = text
+            .parameters()
+            .iter()
+            .map(|p| (p.name(), p.executable()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let update = |projection: &mut ProjectionTopology| {
+            if let Some(format) = formats.get(projection.parameter.as_str()) {
+                projection.format = *format;
+            }
+        };
+        update(&mut topology.output);
+        for layer in &mut topology.layers {
+            let projections = match &mut layer.mixer {
+                TokenMixerTopology::Attention { projections, .. }
+                | TokenMixerTopology::GatedConvolution { projections, .. } => projections,
+            };
+            projections.iter_mut().for_each(&update);
+            match &mut layer.feed_forward {
+                FeedForwardTopology::Gated { projections, .. } => {
+                    projections.iter_mut().for_each(&update)
+                }
+                FeedForwardTopology::Routed {
+                    projections,
+                    router,
+                    ..
+                } => {
+                    projections.iter_mut().for_each(&update);
+                    update(router);
+                }
+                FeedForwardTopology::Unknown { .. } => {}
+            }
+        }
         let nominal = text.state().floating_dtype().map(|d| d.bytes().get());
         let wider = text.materialization_tasks().iter().any(|task| {
             let dtype = task
@@ -103,12 +130,14 @@ pub fn selected_generation_memory_geometry(
                             operation: "mixed-precision parameter promotion",
                         })
                 })?;
-            workspace.mixed_precision_parameter_bytes = Some(bytes);
+            topology.selected_parameter_promotion_bytes = Some(bytes);
         }
     }
     Ok(eredu_runtime::memory_forecast::LoadedMemoryGeometry {
         state_layout: geometry.state_layout,
-        workspace: geometry.workspace,
+        workspace: None,
+        execution_topology: geometry.execution_topology,
+        input_score_attention_mechanism: execution.input_score_attention_workspace(),
         scalar_bytes: text
             .state()
             .floating_dtype()
@@ -124,190 +153,64 @@ pub fn selected_generation_memory_geometry(
     })
 }
 
-fn dense(
-    hidden: i32,
-    intermediate: i32,
-    heads: i32,
-    kv_heads: i32,
-    head_dim: i32,
-    vocabulary: i32,
-) -> Result<WorkspaceGeometry, CapabilityError> {
-    let head_dim = dimension(head_dim)?;
-    let width = |heads| {
-        dimension(heads)?
-            .checked_mul(head_dim)
-            .ok_or(CapabilityError::ArithmeticOverflow {
-                operation: "attention projection width",
-            })
-    };
-    Ok(WorkspaceGeometry {
-        hidden_size: dimension(hidden)?,
-        intermediate_size: dimension(intermediate)?,
-        query_width: width(heads)?,
-        key_value_width: width(kv_heads)?,
-        query_heads: dimension(heads)?,
-        vocabulary_size: dimension(vocabulary)?,
-        gated_convolution: None,
-        input_score_attention: None,
-        mixed_precision_parameter_bytes: None,
-    })
-}
-
-fn lfm2_workspace(
-    args: &crate::lfm2::ModelArgs,
-) -> Result<Option<WorkspaceGeometry>, CapabilityError> {
-    use crate::lfm2::OperatorPolicy;
-    if args.has_sparse_moe_layers() {
-        return Ok(None);
-    }
-    let conv_layers = args
-        .layer_schedule
-        .iter()
-        .filter(|p| matches!(p.operator, OperatorPolicy::CausalConvolution))
-        .count() as u64;
-    let has_attention = args
-        .layer_schedule
-        .iter()
-        .any(|p| matches!(p.operator, OperatorPolicy::SelfAttention(_)));
-    let mut geometry = dense(
-        args.hidden_size,
-        args.dense_intermediate_size,
-        args.num_attention_heads,
-        args.num_key_value_heads,
-        args.hidden_size / args.num_attention_heads,
-        args.vocab_size,
-    )?;
-    if !has_attention {
-        geometry.query_width = 0;
-        geometry.key_value_width = 0;
-        geometry.query_heads = 0;
-    }
-    if has_attention {
-        geometry.input_score_attention = Some(
-            eredu_runtime::memory_estimation::InputScoreAttentionWorkspace {
-                layers: args.layer_schedule.len() as u64 - conv_layers,
-                mechanism: None,
-            },
-        );
-    }
-    if conv_layers > 0 {
-        geometry.gated_convolution = Some(GatedConvolutionWorkspace {
-            channels: dimension(args.hidden_size)?,
-            kernel_size: dimension(args.conv_l_cache)?,
-            layers: conv_layers,
-        });
-    }
-    Ok(Some(geometry))
-}
-
-/// Projects validated metadata without allocating a device, tensor, or source store.
+/// Projects ordinary capabilities and construction topology before backend selection.
 pub fn generation_memory_geometry(
     plan: &ArtifactArchitecturePlan,
 ) -> Result<GenerationMemoryGeometry, CapabilityError> {
-    let (capability, workspace) = match (
+    let capability = match (
         plan.safetensors_architecture().map(|p| p.model()),
         plan.gguf_plan().map(|p| p.model()),
     ) {
         (Some(SafetensorsModelConfig::Llama(args)), None)
-        | (None, Some(GgufModelConfig::Llama(args))) => (
-            crate::capability::llama(args)?,
-            Some(dense(
-                args.hidden_size,
-                args.intermediate_size,
-                args.num_attention_heads,
-                args.num_key_value_heads,
-                args.head_dim,
-                args.vocab_size,
-            )?),
-        ),
+        | (None, Some(GgufModelConfig::Llama(args))) => crate::capability::llama(args)?,
         (Some(SafetensorsModelConfig::Qwen(args)), None)
-        | (None, Some(GgufModelConfig::Qwen(args))) => (
-            crate::capability::qwen(args)?,
-            if args.is_moe() {
-                None
-            } else {
-                Some(dense(
-                    args.hidden_size,
-                    args.intermediate_size,
-                    args.num_attention_heads,
-                    args.num_key_value_heads,
-                    args.head_dim,
-                    args.vocab_size,
-                )?)
-            },
-        ),
+        | (None, Some(GgufModelConfig::Qwen(args))) => crate::capability::qwen(args)?,
         (Some(SafetensorsModelConfig::Nanbeige(args)), None)
-        | (None, Some(GgufModelConfig::Nanbeige(args))) => {
-            let dense_args = args.dense_config();
-            (
-                crate::capability::nanbeige(args)?,
-                Some(dense(
-                    dense_args.hidden_size,
-                    dense_args.intermediate_size,
-                    dense_args.num_attention_heads,
-                    dense_args.num_key_value_heads,
-                    dense_args.head_dim,
-                    dense_args.vocab_size,
-                )?),
-            )
-        }
+        | (None, Some(GgufModelConfig::Nanbeige(args))) => crate::capability::nanbeige(args)?,
         (Some(SafetensorsModelConfig::DeepSeekV3(args)), None)
-        | (None, Some(GgufModelConfig::DeepSeekV3(args))) => {
-            (crate::capability::deepseek_v3(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::DeepSeekV3(args))) => crate::capability::deepseek_v3(args)?,
         (Some(SafetensorsModelConfig::DeepSeekV4(args)), None)
-        | (None, Some(GgufModelConfig::DeepSeekV4(args))) => {
-            (crate::capability::deepseek_v4(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::DeepSeekV4(args))) => crate::capability::deepseek_v4(args)?,
         (Some(SafetensorsModelConfig::Gemma4(args)), None)
-        | (None, Some(GgufModelConfig::Gemma4(args))) => (crate::capability::gemma4(args)?, None),
+        | (None, Some(GgufModelConfig::Gemma4(args))) => crate::capability::gemma4(args)?,
         (Some(SafetensorsModelConfig::Gemma2(args)), None)
-        | (None, Some(GgufModelConfig::Gemma2(args))) => (crate::capability::gemma2(args)?, None),
+        | (None, Some(GgufModelConfig::Gemma2(args))) => crate::capability::gemma2(args)?,
         (Some(SafetensorsModelConfig::GptOss(args)), None)
-        | (None, Some(GgufModelConfig::GptOss(args))) => (crate::capability::gpt_oss(args)?, None),
+        | (None, Some(GgufModelConfig::GptOss(args))) => crate::capability::gpt_oss(args)?,
         (Some(SafetensorsModelConfig::Inkling(args)), None)
-        | (None, Some(GgufModelConfig::Inkling(args))) => (crate::capability::inkling(args)?, None),
+        | (None, Some(GgufModelConfig::Inkling(args))) => crate::capability::inkling(args)?,
         (Some(SafetensorsModelConfig::K2Horizon(args)), None)
-        | (None, Some(GgufModelConfig::K2Horizon(args))) => {
-            (crate::capability::k2_horizon(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::K2Horizon(args))) => crate::capability::k2_horizon(args)?,
         (Some(SafetensorsModelConfig::KimiLinear(args)), None)
-        | (None, Some(GgufModelConfig::KimiLinear(args))) => {
-            (crate::capability::kimi_linear(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::KimiLinear(args))) => crate::capability::kimi_linear(args)?,
         (Some(SafetensorsModelConfig::MuseGlimmer(args)), None)
         | (None, Some(GgufModelConfig::MuseGlimmer(args))) => {
-            (crate::capability::muse_glimmer(args)?, None)
+            crate::capability::muse_glimmer(args)?
         }
         (Some(SafetensorsModelConfig::Lfm2(args)), None)
-        | (None, Some(GgufModelConfig::Lfm2(args))) => {
-            (crate::capability::lfm2(args)?, lfm2_workspace(args)?)
-        }
+        | (None, Some(GgufModelConfig::Lfm2(args))) => crate::capability::lfm2(args)?,
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
-        | (None, Some(GgufModelConfig::NemotronH(args))) => {
-            (crate::capability::nemotron_h(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::NemotronH(args))) => crate::capability::nemotron_h(args)?,
         (Some(SafetensorsModelConfig::QwenHybrid(args)), None)
-        | (None, Some(GgufModelConfig::QwenHybrid(args))) => {
-            (crate::capability::qwen_hybrid(args)?, None)
-        }
-        (Some(SafetensorsModelConfig::QwenVl(args)), None) => {
-            (crate::capability::qwen_vl(args)?, None)
-        }
+        | (None, Some(GgufModelConfig::QwenHybrid(args))) => crate::capability::qwen_hybrid(args)?,
+        (Some(SafetensorsModelConfig::QwenVl(args)), None) => crate::capability::qwen_vl(args)?,
         _ => {
             return Err(CapabilityError::Observation(
-                "generation memory geometry is unavailable for this architecture".into(),
+                "generation state geometry is unavailable for this architecture".into(),
             ))
         }
     };
-    let assumptions = if workspace.is_none() {
-        vec!["persistent state uses executable family geometry; recurrent, routed, media, or specialized activation workspace is not yet modeled".into()]
+    let execution_topology = crate::replicated_text::execution_topology(plan)
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let assumptions = if execution_topology.is_none() {
+        vec!["ordinary module invocation topology is unavailable; persistent state remains described".into()]
     } else {
         Vec::new()
     };
     Ok(GenerationMemoryGeometry {
         state_layout: capability.into_parts().1,
-        workspace,
+        workspace: None,
+        execution_topology,
         assumptions,
     })
 }
@@ -331,7 +234,17 @@ mod tests {
         .unwrap();
         // Two layers, K and V, one KV head, four scalars per head, ten positions.
         assert_eq!(state.context_state_bytes, 2 * 2 * 4 * 10 * 4);
-        assert_eq!(geometry.workspace.unwrap().key_value_width, 4);
+        let topology = geometry.execution_topology.unwrap();
+        assert!(geometry.workspace.is_none());
+        let TokenMixerTopology::Attention {
+            kv_heads,
+            key_width,
+            ..
+        } = topology.layers[0].mixer
+        else {
+            panic!("attention topology");
+        };
+        assert_eq!(kv_heads * key_width, 4);
         let outcome = crate::inspect_selected_model(
             artifact,
             &eredu_runtime::NormalizedLoadRequest::default(),
@@ -422,14 +335,56 @@ mod tests {
             .execution();
         let geometry = selected_generation_memory_geometry(&plan, execution).unwrap();
         assert_eq!(geometry.scalar_bytes.get(), 2);
-        let workspace = geometry.workspace.unwrap();
-        assert!(workspace.gated_convolution.is_none());
-        assert!(workspace.input_score_attention.is_none());
+        let topology = geometry.execution_topology.unwrap();
+        assert!(geometry.workspace.is_none());
         let expected = values
             .iter()
             .map(|(_, shape, _, _)| shape.iter().product::<usize>() as u64 * 4)
             .sum::<u64>();
-        assert_eq!(workspace.mixed_precision_parameter_bytes, Some(expected));
+        assert_eq!(topology.selected_parameter_promotion_bytes, Some(expected));
+    }
+
+    #[test]
+    fn selected_topology_uses_load_time_quantization_without_loading() {
+        use crate::preparation_selection::tests::{inspected_config, BoundedIndependentAdapter};
+        let (_root, artifact) = inspected_config(serde_json::json!({
+            "model_type":"llama", "hidden_size":32, "intermediate_size":64, "vocab_size":32,
+            "num_hidden_layers":2, "num_attention_heads":4, "num_key_value_heads":2,
+            "rms_norm_eps":0.00001, "head_dim":8, "max_position_embeddings":64, "tie_word_embeddings":false
+        }));
+        let plan = artifact.architecture_plan().clone();
+        let request = eredu_runtime::NormalizedLoadRequest::with_quantization(
+            eredu_core::QuantizationRequest::Affine {
+                group_size: 16,
+                bits: 4,
+            },
+        );
+        let outcome = crate::inspect_selected_model(
+            artifact,
+            &request,
+            &BoundedIndependentAdapter::with_transforms(),
+            eredu_core::MediaFeatureAvailability {
+                image: false,
+                audio: false,
+            },
+        );
+        let selected = outcome
+            .selected()
+            .unwrap_or_else(|| panic!("quantized selection failed: {outcome:?}"));
+        let geometry =
+            selected_generation_memory_geometry(&plan, selected.preparation().execution()).unwrap();
+        let topology = geometry.execution_topology.unwrap();
+        let TokenMixerTopology::Attention { projections, .. } = &topology.layers[0].mixer else {
+            panic!("attention");
+        };
+        assert!(projections
+            .iter()
+            .all(|p| matches!(p.format, eredu_checkpoint::LinearFormat::Affine(_))));
+        let wire = serde_json::to_value(&topology).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TextExecutionTopology>(wire).unwrap(),
+            topology
+        );
     }
 
     #[test]
@@ -467,26 +422,47 @@ mod tests {
             .resolve_safetensors(&config)
             .unwrap();
         let geometry = generation_memory_geometry(resolved.architecture_plan()).unwrap();
-        let workspace = geometry.workspace.unwrap();
-        assert_eq!(workspace.hidden_size, 1024);
-        assert_eq!(workspace.intermediate_size, 4608); // normalized SwiGLU 2/3 and 256 rounding
-        assert_eq!(workspace.query_width, 1024);
-        assert_eq!(workspace.key_value_width, 512);
+        let topology = geometry.execution_topology.unwrap();
+        assert_eq!(topology.hidden_size, 1024);
+        assert_eq!(topology.layers.len(), 16);
         assert_eq!(
-            workspace.gated_convolution,
-            Some(GatedConvolutionWorkspace {
-                channels: 1024,
-                kernel_size: 3,
-                layers: 10
-            })
+            topology
+                .layers
+                .iter()
+                .filter(|l| matches!(
+                    l.mixer,
+                    TokenMixerTopology::GatedConvolution {
+                        channels: 1024,
+                        kernel: 3,
+                        ..
+                    }
+                ))
+                .count(),
+            10
         );
-        assert_eq!(workspace.input_score_attention.as_ref().unwrap().layers, 6);
-        assert!(workspace
-            .input_score_attention
-            .as_ref()
-            .unwrap()
-            .mechanism
-            .is_none());
+        assert_eq!(
+            topology
+                .layers
+                .iter()
+                .filter(|l| matches!(
+                    l.mixer,
+                    TokenMixerTopology::Attention {
+                        input_scores: true,
+                        ..
+                    }
+                ))
+                .count(),
+            6
+        );
+        for layer in &topology.layers {
+            let FeedForwardTopology::Gated {
+                intermediate_size, ..
+            } = layer.feed_forward
+            else {
+                panic!("dense block");
+            };
+            assert_eq!(intermediate_size, 4608);
+        }
         let mut args = crate::lfm2::model_args_from_config_value(&config).unwrap();
         let mut policies: Vec<_> = args.layer_schedule.iter().copied().collect();
         for policy in &mut policies {
@@ -494,24 +470,29 @@ mod tests {
         }
         args.layer_schedule =
             eredu_core::LayerSchedule::new(policies.len(), policies.clone()).unwrap();
-        let conv = lfm2_workspace(&args).unwrap().unwrap();
-        assert_eq!(
-            (conv.query_heads, conv.query_width, conv.key_value_width),
-            (0, 0, 0)
-        );
-        assert_eq!(conv.gated_convolution.unwrap().layers, 16);
-        assert!(conv.input_score_attention.is_none());
-        policies[0].feed_forward = crate::lfm2::FeedForwardPolicy::SparseMoe;
-        args.layer_schedule = eredu_core::LayerSchedule::new(policies.len(), policies).unwrap();
-        assert!(lfm2_workspace(&args).unwrap().is_none());
+        let conv = crate::lfm2::execution_topology(&args).unwrap();
+        assert!(conv
+            .layers
+            .iter()
+            .all(|l| matches!(l.mixer, TokenMixerTopology::GatedConvolution { .. })));
     }
 
     #[test]
-    fn dense_projection_preserves_grouped_query_widths() {
-        let geometry = dense(128, 352, 8, 2, 16, 32000).unwrap();
-        assert_eq!(geometry.query_width, 128);
-        assert_eq!(geometry.key_value_width, 32);
-        assert_eq!(geometry.intermediate_size, 352);
-        assert!(dense(128, 352, 0, 2, 16, 32000).is_err());
+    fn shared_decoder_topology_covers_previously_unmodeled_gemma2() {
+        use eredu_core::ModelConfigurationResolver;
+        let config = serde_json::json!({"model_type":"gemma2", "vocab_size":32, "hidden_size":16, "intermediate_size":32, "num_hidden_layers":2, "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4, "max_position_embeddings":64, "sliding_window":16, "query_pre_attn_scalar":4, "attn_logit_softcapping":50.0, "final_logit_softcapping":30.0});
+        let resolved = crate::configuration::MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap();
+        let topology = generation_memory_geometry(resolved.architecture_plan())
+            .unwrap()
+            .execution_topology
+            .unwrap();
+        assert_eq!(topology.layers.len(), 2);
+        assert!(topology
+            .layers
+            .iter()
+            .all(|l| matches!(l.mixer, TokenMixerTopology::Attention { softcap: true, .. })));
+        assert!(topology.layers.iter().all(|l| l.normalization_count == 4));
     }
 }

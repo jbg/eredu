@@ -454,7 +454,7 @@ fn estimate_speculative_inner(
                 for owner in [t, d.map(|(_, p)| p)].into_iter().flatten() {
                     for e in &owner.executions {
                         vocab = vocab
-                            .zip(e.workspace.as_ref().map(|w| w.vocabulary_size))
+                            .zip(e.execution_topology.as_ref().map(|topology| topology.vocabulary_size).or_else(|| e.workspace.as_ref().map(|w| w.vocabulary_size)))
                             .map(|(a, b)| a.max(b));
                     }
                 }

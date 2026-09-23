@@ -30,6 +30,8 @@ fn request() -> GenerationMemoryRequest {
             backend_overhead: MemoryBytes::estimated(0, 512, "test allowance"),
             loading_peak: MemoryBytes::exact(0),
             executions: vec![ExecutionMemoryPlan {
+                execution_topology: None,
+                input_score_attention_mechanism: None,
                 state_layout,
                 workspace: Some(WorkspaceGeometry {
                     hidden_size: 32,
@@ -963,4 +965,303 @@ fn mixed_precision_covers_parameter_casts_and_promoted_state_without_double_char
     );
     e.workspace_overlap = WorkspaceOverlap::unknown();
     assert!(workspace(&e, &r, 8, 3, 100).unwrap().upper_bytes.is_none());
+}
+
+fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
+    use crate::execution_topology::*;
+    let projection = |name: &str, input, output| ProjectionTopology {
+        input,
+        output,
+        format: eredu_checkpoint::LinearFormat::Dense,
+        bias: false,
+        parameter: name.into(),
+    };
+    let layer = TextLayerTopology {
+        mixer: TokenMixerTopology::Attention {
+            query_heads: 4,
+            kv_heads: 1,
+            key_width: 8,
+            value_width: 8,
+            input_scores: false,
+            softcap: false,
+            sinks: false,
+            projections: vec![
+                projection("query", 32, 32),
+                projection("key", 32, 8),
+                projection("value", 32, 8),
+                projection("attention-output", 32, 32),
+            ],
+            query_key_normalization: false,
+            rotary: true,
+        },
+        feed_forward: FeedForwardTopology::Gated {
+            intermediate_size: 64,
+            projections: vec![
+                projection("gate", 32, 64),
+                projection("up", 32, 64),
+                projection("down", 64, 32),
+            ],
+        },
+        normalization_count: 2,
+    };
+    TextExecutionTopology {
+        hidden_size: 32,
+        vocabulary_size: 128,
+        layers: vec![layer.clone(), layer],
+        output: projection("output", 32, 128),
+        selected_parameter_promotion_bytes: None,
+        output_softcap: false,
+        missing: vec![],
+    }
+}
+
+#[test]
+fn generic_default_overlap_counts_invocations_including_stateless_layers() {
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.layers.resize(12, topology.layers[0].clone());
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    crate::memory_forecast::ForecastCalibration::default()
+        .apply(&mut r)
+        .unwrap();
+    assert_eq!(
+        r.domains[0].executions[0]
+            .workspace_overlap
+            .upper_live_copies,
+        Some(15)
+    );
+}
+
+#[test]
+fn generic_target_workspace_does_not_consume_legacy_family_geometry() {
+    let mut r = request();
+    let execution = &mut r.domains[0].executions[0];
+    execution.execution_topology = Some(generic_topology());
+    execution.workspace = None;
+    let generic = estimate_generation_memory(&r).unwrap();
+    assert_eq!(generic.fit, MemoryFit::LikelyFit);
+    assert!(generic.domains[0].phases[0].workspace.lower_bytes > 0);
+    assert!(!generic
+        .uncertainties
+        .iter()
+        .any(|detail| detail.contains("decoder workspace geometry unavailable")));
+    // Contradictory deprecated aggregates cannot alter the selected module path.
+    r.domains[0].executions[0].workspace = request().domains[0].executions[0].workspace.clone();
+    r.domains[0].executions[0]
+        .workspace
+        .as_mut()
+        .unwrap()
+        .hidden_size = u64::MAX;
+    assert_eq!(
+        estimate_generation_memory(&r).unwrap().domains,
+        generic.domains
+    );
+}
+
+#[test]
+fn generic_target_workspace_retention_and_output_contract_are_independent() {
+    let mut r = request();
+    r.domains[0].executions[0].execution_topology = Some(generic_topology());
+    let one = estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+        .workspace
+        .clone();
+    r.domains[0].executions[0]
+        .workspace_overlap
+        .upper_live_copies = Some(2);
+    let two = estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+        .workspace
+        .clone();
+    assert!(two.upper_bytes > one.upper_bytes);
+    // No assertion that all native temporaries coexist: the minimum stays one
+    // real logical output rather than summing a layer's independent minima.
+    assert_eq!(two.lower_bytes, one.lower_bytes);
+    r.domains[0].executions[0].logits = LogitsWorkspace::EveryPosition;
+    let every = estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+        .workspace
+        .clone();
+    assert!(every.upper_bytes > two.upper_bytes);
+    r.domains[0].executions[0]
+        .execution_topology
+        .as_mut()
+        .unwrap()
+        .output_softcap = true;
+    let capped = estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+        .workspace
+        .clone();
+    assert!(capped.upper_bytes > every.upper_bytes);
+    r.domains[0].executions[0]
+        .workspace_overlap
+        .upper_live_copies = None;
+    assert_eq!(
+        estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+            .workspace
+            .upper_bytes,
+        None
+    );
+}
+
+#[test]
+fn generic_target_workspace_preserves_unknown_modules_and_checks_geometry() {
+    use crate::execution_topology::FeedForwardTopology;
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.layers[0].feed_forward = FeedForwardTopology::Unknown {
+        reason: "custom recurrent update has no mechanism contract".into(),
+    };
+    r.domains[0].executions[0].execution_topology = Some(topology.clone());
+    assert_eq!(
+        estimate_generation_memory(&r).unwrap().domains[0].phases[0]
+            .workspace
+            .upper_bytes,
+        None
+    );
+    topology.layers[0].normalization_count = u64::MAX;
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    assert!(matches!(
+        estimate_generation_memory(&r),
+        Err(CapabilityError::ArithmeticOverflow { .. })
+    ));
+}
+
+#[test]
+fn generic_explicit_attention_uses_native_tile_contract_without_score_matrix_fallback() {
+    use crate::execution_topology::TokenMixerTopology;
+    let mut r = request();
+    let mut topology = generic_topology();
+    for layer in &mut topology.layers {
+        if let TokenMixerTopology::Attention { input_scores, .. } = &mut layer.mixer {
+            *input_scores = true;
+        }
+    }
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    let unknown = estimate_generation_memory(&r).unwrap();
+    assert_eq!(unknown.domains[0].phases[0].workspace.upper_bytes, None);
+    r.domains[0].executions[0].input_score_attention_mechanism =
+        Some(InputScoreAttentionMechanism {
+            score_tile_elements: 16,
+            max_query_rows: 2,
+            key_value_copies: 4,
+            score_bytes: 20,
+            full_key_tiles: Some(FullKeyAttentionTiles {
+                max_key_positions: 128,
+                shared_key_value_copies: 4,
+                max_live_query_tiles: 2,
+                retained_output_copies: 2,
+            }),
+        });
+    let bounded = estimate_generation_memory(&r).unwrap();
+    assert!(bounded.domains[0].phases[0].workspace.upper_bytes.is_some());
+    // Fused scratch policy is irrelevant to an explicitly selected input-score kernel.
+    r.domains[0].executions[0].attention = AttentionWorkspace::Unknown;
+    assert_eq!(
+        estimate_generation_memory(&r).unwrap().domains,
+        bounded.domains
+    );
+    // Softcap selects an explicit full matrix even with Fused arithmetic. It
+    // must not inherit InputScores query-tile savings or change the arithmetic.
+    for layer in &mut r.domains[0].executions[0]
+        .execution_topology
+        .as_mut()
+        .unwrap()
+        .layers
+    {
+        if let TokenMixerTopology::Attention {
+            input_scores,
+            softcap,
+            ..
+        } = &mut layer.mixer
+        {
+            *input_scores = false;
+            *softcap = true;
+        }
+    }
+    let softcap = estimate_generation_memory(&r).unwrap();
+    assert!(
+        softcap.domains[0].phases[0].workspace.upper_bytes
+            > bounded.domains[0].phases[0].workspace.upper_bytes
+    );
+}
+
+#[test]
+fn legacy_serialized_workspace_requests_remain_compatible() {
+    let r = request();
+    let value = serde_json::to_value(&r).unwrap();
+    assert!(value["domains"][0]["executions"][0]
+        .get("execution_topology")
+        .is_none());
+    let restored: GenerationMemoryRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        estimate_generation_memory(&restored).unwrap(),
+        estimate_generation_memory(&r).unwrap()
+    );
+    let mut r = restored;
+    r.domains[0].executions[0].execution_topology = Some(generic_topology());
+    let restored: GenerationMemoryRequest =
+        serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+    assert_eq!(restored, r);
+}
+
+#[test]
+fn generic_target_rejects_zero_kernels_and_inconsistent_projection_contracts() {
+    use crate::execution_topology::*;
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.output.output += 1;
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    assert!(estimate_generation_memory(&r).is_err());
+    let mut topology = generic_topology();
+    topology.layers[0].mixer = TokenMixerTopology::GatedConvolution {
+        channels: 32,
+        kernel: 0,
+        projections: vec![],
+    };
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    assert!(estimate_generation_memory(&r).is_err());
+    let mut topology = generic_topology();
+    if let TokenMixerTopology::Attention { query_heads, .. } = &mut topology.layers[0].mixer {
+        *query_heads = 0;
+    }
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    assert!(estimate_generation_memory(&r).is_err());
+}
+
+#[test]
+fn generic_expert_mechanism_bounds_selected_routes_without_a_family_dispatch() {
+    use crate::execution_topology::*;
+    let projection = |name: &str, input, output| ProjectionTopology {
+        input,
+        output,
+        parameter: name.into(),
+        format: eredu_checkpoint::LinearFormat::Dense,
+        bias: false,
+    };
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.layers[0].feed_forward = FeedForwardTopology::Routed {
+        experts: 8,
+        selected: 2,
+        intermediate_size: 64,
+        router: projection("router", 32, 8),
+        projections: vec![
+            projection("experts-up", 32, 128),
+            projection("experts-down", 64, 32),
+        ],
+    };
+    r.domains[0].executions[0].execution_topology = Some(topology.clone());
+    let first = estimate_generation_memory(&r).unwrap();
+    assert!(first.domains[0].phases[0].workspace.upper_bytes.is_some());
+    if let FeedForwardTopology::Routed { selected, .. } = &mut topology.layers[0].feed_forward {
+        *selected = 4;
+    }
+    r.domains[0].executions[0].execution_topology = Some(topology.clone());
+    let more_routes = estimate_generation_memory(&r).unwrap();
+    assert!(
+        more_routes.domains[0].phases[0].workspace.upper_bytes
+            > first.domains[0].phases[0].workspace.upper_bytes
+    );
+    if let FeedForwardTopology::Routed { selected, .. } = &mut topology.layers[0].feed_forward {
+        *selected = 9;
+    }
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    assert!(estimate_generation_memory(&r).is_err());
 }

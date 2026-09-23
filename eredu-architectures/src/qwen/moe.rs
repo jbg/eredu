@@ -58,21 +58,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
         if !args.is_moe() {
             return Err(Error::backend("routed Qwen block requires Qwen3-MoE args"));
         }
-        let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-        let routing = args.routing_spec()?;
-        let router_name = format!("{prefix}.gate.weight");
-        let router = B::top_k_group_selector(
-            TopKGroupSelectorSpec::new(
-                args.hidden_size,
-                ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
-                crate::linear_format::standard_linear_format(
-                    &router_name,
-                    args.weight_quantization_for(&router_name).into(),
-                )?,
-                routing,
-            )?,
-            context,
-        )?;
+        let router = B::top_k_group_selector(selector_spec(args, layer)?, context)?;
         let experts = B::grouped_gated_product(expert_bank_spec(args, layer)?, context)?;
         Ok(Self {
             layer,
@@ -122,6 +108,36 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedGatedPr
             router,
             experts,
         })
+    }
+}
+
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
+    let router_name = format!("{prefix}.gate.weight");
+    TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &router_name,
+            args.weight_quantization_for(&router_name).into(),
+        )?,
+        args.routing_spec()?,
+    )
+}
+
+pub(crate) fn execution_topology(
+    args: &ModelArgs,
+) -> Result<eredu_runtime::execution_topology::TextExecutionTopology, Error> {
+    if args.is_moe() {
+        crate::decoder::topology::text_with_feed_forward(args, |layer| {
+            eredu_runtime::execution_topology::FeedForwardTopology::from_grouped_specs(
+                &selector_spec(args, layer)?, &expert_bank_spec(args, layer)?)
+        })
+    } else {
+        crate::decoder::topology::text(args)
     }
 }
 

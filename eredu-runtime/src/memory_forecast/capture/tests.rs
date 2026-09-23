@@ -48,6 +48,8 @@ fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
             loading_peak: MemoryBytes::exact(0),
             budget: MemoryBudget::default(),
             executions: vec![ExecutionMemoryPlan {
+                execution_topology: None,
+                input_score_attention_mechanism: None,
                 state_layout: StateMemoryLayout::new(
                     LayerSchedule::new(
                         1,

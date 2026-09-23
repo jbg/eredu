@@ -1320,17 +1320,22 @@ pub(crate) mod tests {
             Err("selected architecture does not implement chunked prefill")
         );
 
-        // Routed Qwen uses the shared causal decoder even though its memory
-        // workspace has no finite projection. Coverage is not a support fact.
+        // Routed Qwen retains the shared causal decoder and the ordinary
+        // packed expert invocation topology through cold selection.
         let (_root, routed) = inspected_config(routed_config());
         let selected = select_preparation(&routed, &request, &mechanisms).unwrap();
         assert_eq!(selected.prefill_chunking_support(), Ok(()));
-        assert!(
-            crate::memory_estimation::generation_memory_geometry(routed.architecture_plan())
-                .unwrap()
-                .workspace
-                .is_none()
-        );
+        assert!(selected
+            .execution()
+            .text_realization()
+            .requirements()
+            .execution_topology()
+            .is_some());
+        let geometry = crate::memory_estimation::selected_generation_memory_geometry(
+            routed.architecture_plan(), selected.execution(),
+        ).unwrap();
+        assert!(geometry.execution_topology.is_some());
+        assert!(geometry.assumptions.is_empty(), "{:#?}", geometry.assumptions);
         for (config, reason) in [
             (
                 composite_config(),

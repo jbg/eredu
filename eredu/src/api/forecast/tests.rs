@@ -11,6 +11,8 @@ use std::num::NonZeroU8;
 fn profile(cached: Observed<u64>, resident: u64) -> LoadedMemoryProfile {
     LoadedMemoryProfile {
         geometry: LoadedMemoryGeometry {
+            execution_topology: None,
+            input_score_attention_mechanism: None,
             state_layout: StateMemoryLayout::new(
                 LayerSchedule::new(
                     2,
@@ -156,4 +158,88 @@ fn unavailable_conversion_observation_keeps_scratch_and_invalid_subset_is_reject
     let host = forecast(host).unwrap();
     assert_eq!(host.request.domains[0].domain, MemoryDomain::Host);
     assert_eq!(host.request.domains[0].already_resident_bytes, 1280);
+}
+
+#[test]
+fn generic_topology_credits_resident_conversions_without_losing_promotion() {
+    use eredu_runtime::execution_topology::*;
+    let generic_profile = |retained| {
+        let mut profile = profile(
+            Observed::exact(retained, "owned conversion"),
+            1024 + retained,
+        );
+        let projection = |input, output| ProjectionTopology {
+            input,
+            output,
+            format: eredu_checkpoint::LinearFormat::Dense,
+            bias: false,
+            parameter: format!("projection-{input}-{output}"),
+        };
+        profile.geometry.workspace = None;
+        profile.geometry.execution_topology = Some(TextExecutionTopology {
+            hidden_size: 16,
+            vocabulary_size: 32,
+            output: projection(16, 32),
+            output_softcap: false,
+            selected_parameter_promotion_bytes: Some(1024),
+            missing: vec![],
+            layers: vec![
+                TextLayerTopology {
+                    mixer: TokenMixerTopology::Attention {
+                        query_heads: 4,
+                        kv_heads: 1,
+                        key_width: 4,
+                        value_width: 4,
+                        input_scores: false,
+                        softcap: false,
+                        sinks: false,
+                        projections: vec![
+                            projection(16, 16),
+                            projection(16, 4),
+                            projection(16, 4),
+                            projection(16, 16)
+                        ],
+                        query_key_normalization: false,
+                        rotary: true,
+                    },
+                    feed_forward: FeedForwardTopology::Gated {
+                        intermediate_size: 32,
+                        projections: vec![
+                            projection(16, 32),
+                            projection(16, 32),
+                            projection(32, 16)
+                        ],
+                    },
+                    normalization_count: 2,
+                };
+                2
+            ],
+        });
+        profile
+    };
+    let cold = forecast(generic_profile(0)).unwrap();
+    for retained in [256, 1024] {
+        let warm = forecast(generic_profile(retained)).unwrap();
+        let domain = &warm.request.domains[0];
+        assert_eq!(domain.already_resident_bytes, 1024 + retained);
+        assert_eq!(
+            domain.executions[0]
+                .execution_topology
+                .as_ref()
+                .unwrap()
+                .selected_parameter_promotion_bytes,
+            Some(1024 - retained)
+        );
+        assert_eq!(
+            cold.estimate.domains[0]
+                .additional_generation_peak
+                .upper_bytes
+                .unwrap()
+                - warm.estimate.domains[0]
+                    .additional_generation_peak
+                    .upper_bytes
+                    .unwrap(),
+            retained + retained / 2
+        );
+    }
 }

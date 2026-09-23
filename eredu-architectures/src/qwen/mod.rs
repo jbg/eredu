@@ -350,3 +350,5 @@ mod tests {
         // backend is needed to exercise this compile-time assertion.
     }
 }
+
+pub(crate) use moe::execution_topology;
