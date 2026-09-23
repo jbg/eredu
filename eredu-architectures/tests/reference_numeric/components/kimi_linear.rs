@@ -156,10 +156,10 @@ fn kimi_channel_components_reconstruct_writes_and_preserve_cached_replay() {
                         "Kimi signed channel reconstruction",
                     );
                     for keep in [false, true] {
-                        let selection = Some(("unit.attention.channels", sequence as usize - 1, 2));
+                        let selection = ("unit.attention.channels", sequence as usize - 1, 2);
                         let mut observer = Components {
-                            zero: (!keep).then_some(selection.unwrap()),
-                            keep: keep.then_some(selection.unwrap()),
+                            zero: (!keep).then_some(selection),
+                            keep: keep.then_some(selection),
                             ..Default::default()
                         };
                         let mut edited_state = before.clone();

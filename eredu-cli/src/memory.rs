@@ -155,7 +155,7 @@ fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
         let mut candidate = request.clone();
         candidate.max_output_tokens = Some(output / 2);
         add_candidate_advice(
-            &estimate,
+            estimate,
             &candidate,
             &format!("--max-tokens {}", output / 2),
             &mut recommendations,

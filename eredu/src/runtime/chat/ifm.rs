@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn ifm_publisher_generated_weather_call_parses_at_every_byte_boundary() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../eredu-text/tests/fixtures/k2_horizon/tool-generation.json"
+            "../../../tests/fixtures/k2_horizon/text/tool-generation.json"
         ))
         .unwrap();
         for reference in fixture["references"].as_array().unwrap() {

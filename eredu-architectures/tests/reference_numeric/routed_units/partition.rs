@@ -446,14 +446,14 @@ fn verify_partitions(
                 .with_topology(topology)
                 .with_residency(residency.clone());
             let reference_sources = partitioned_adapter::prepare_plan(
-                &inspection,
+                inspection,
                 &reference_plan,
                 0,
                 std::time::Duration::from_secs(10),
             )
             .unwrap();
-            let reference_layouts = placement::layouts(&reference_sources, &description);
-            placement::verify_rejections(&reference_sources, &description);
+            let reference_layouts = placement::layouts(&reference_sources, description);
+            placement::verify_rejections(&reference_sources, description);
             let capture_world = Arc::new(observer::World::default());
             let results = std::thread::scope(|scope| {
                 (0..topology.world_size()).map(|rank| {

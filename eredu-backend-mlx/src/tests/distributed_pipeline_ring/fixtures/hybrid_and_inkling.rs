@@ -91,7 +91,7 @@ fn write_qwen_hybrid_config_fixture(directory: &Path, config: serde_json::Value)
 
 #[test]
 fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
-    use eredu_core::{ObservationSelector, ObservationSupportStatus};
+    use eredu_core::{ObservationSelector, ObservationSupportStatus, ObservationValueType};
     let checkpoint = tempfile::tempdir().unwrap();
     let mut config = qwen_hybrid_moe_config("qwen3_next");
     config["mtp_num_hidden_layers"] = 0.into();
@@ -115,6 +115,12 @@ fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
         .filter(|p| {
             p.prefill == ObservationSupportStatus::Supported
                 && p.decode == ObservationSupportStatus::Supported
+                // Legacy inspection materializes complete tensors. Sparse routed
+                // units use bounded capture, exercised for every point below.
+                && matches!(
+                    catalog.get(&p.path).unwrap().value_type,
+                    ObservationValueType::Tensor
+                )
         })
         .map(|p| p.path.clone())
         .collect::<Vec<_>>();
@@ -201,7 +207,12 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
                 path: point.path.clone(),
                 schedule: CaptureSchedule::default(),
                 slices: Vec::new(),
-                transform: if point.dtype == eredu_core::ObservationDtype::Integer {
+                transform: if matches!(
+                    point.value_type,
+                    eredu_core::ObservationValueType::RoutedUnits { .. }
+                ) {
+                    CaptureTransform::RoutedUnits
+                } else if point.dtype == eredu_core::ObservationDtype::Integer {
                     CaptureTransform::Preview { max_elements: 4 }
                 } else {
                     CaptureTransform::Summary
@@ -238,6 +249,18 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
     while let Some(token) = generated.next() {
         tokens.push(token.unwrap().token_id());
         let step = generated.take_captured_step().unwrap().unwrap();
+        let captured_paths = step
+            .records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let advertised_paths = discovery
+            .catalog
+            .points
+            .iter()
+            .map(|point| point.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(captured_paths, advertised_paths);
         assert_eq!(
             step.phase,
             if tokens.len() == 1 {

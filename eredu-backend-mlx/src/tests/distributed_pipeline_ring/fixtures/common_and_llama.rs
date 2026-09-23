@@ -233,10 +233,7 @@ fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
 }
 
 fn write_k2_fixture(directory: &Path, mova: bool) {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/k2_horizon/reference.json")))
     .unwrap();
     let mut config = fixture[if mova { "mova" } else { "dense" }]["config"].clone();
     config["num_hidden_layers"] = 3.into();

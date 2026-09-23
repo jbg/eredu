@@ -198,6 +198,7 @@ fn producer_receipts_preserve_nonfinite_wire_values_and_reduced_results() {
 }
 
 #[test]
+#[allow(clippy::single_range_in_vec_init)] // Deliberate range-valued validation input.
 fn receipt_admission_rejects_ownership_gaps_and_overlap_before_capture() {
     let plan = plan_for(CaptureTransform::Slice, false);
     let slice = resolve_slice(&plan.points()[0], &plan.plan().selections[0], &[3, 20]).unwrap();
@@ -368,8 +369,8 @@ fn empty_selection_needs_explicit_receipts_and_preserves_dtype() {
             Err(PartitionCaptureMergeError::MissingProducer { producer_rank: 1 })
         ));
         let mut delivery = authority.into_delivery();
-        for rank in 0..2 {
-            delivery.receive(rank, &records[rank], &mut ledger).unwrap();
+        for (rank, record) in records.iter().enumerate() {
+            delivery.receive(rank, record, &mut ledger).unwrap();
         }
         let result = delivery.finish(&mut ledger).unwrap();
         assert_eq!(result.producers(), [0, 1]);
@@ -522,8 +523,8 @@ fn deferred_skipped_producer_retains_its_outcome_without_fabricating_source_prec
     }
     bytes[1] = serde_json::to_vec(&skipped).unwrap();
     let mut delivery = authority.into_delivery();
-    for rank in 0..2 {
-        delivery.receive(rank, &bytes[rank], &mut ledger).unwrap();
+    for (rank, record) in bytes.iter().enumerate() {
+        delivery.receive(rank, record, &mut ledger).unwrap();
     }
     match delivery.finish(&mut ledger) {
         Err(PartitionCaptureMergeError::FragmentOutcome {

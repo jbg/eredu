@@ -132,7 +132,7 @@ impl MlxModelSession {
             );
             observed_nonzero |= values.iter().any(|n| n.abs() > 1e-4);
             let replacement = values.iter().map(|value| value + 0.125).collect::<Vec<_>>();
-            let tensor = Array::from_slice(&replacement, &value.shape())
+            let tensor = Array::from_slice(&replacement, value.shape())
                 .as_dtype(value.as_array().dtype(), stream)
                 .unwrap();
             tensor.evaluated().unwrap();

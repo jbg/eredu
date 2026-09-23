@@ -82,8 +82,8 @@ pub(super) fn selected_addressable_banks(
     Error,
 > {
     let members = banks
-        .iter()
-        .flat_map(|(_, bank)| bank.addressable_members().iter().cloned())
+        .values()
+        .flat_map(|bank| bank.addressable_members().iter().cloned())
         .collect::<Vec<_>>();
     let pool = MlxSharedAddressableBank::new(selected_addressable_bank(
         &members,

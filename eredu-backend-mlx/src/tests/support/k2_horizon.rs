@@ -5,7 +5,7 @@ pub(crate) fn gguf(format: eredu_gguf::GgmlType) -> tempfile::TempDir {
     use std::collections::BTreeMap;
     let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
+        "/tests/fixtures/k2_horizon/reference.json"
     )))
     .unwrap();
     let mut config = fixture["mova"]["config"].clone();
@@ -154,7 +154,7 @@ pub(crate) fn fp8() -> (tempfile::TempDir, tempfile::TempDir) {
     };
     let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
+        "/tests/fixtures/k2_horizon/reference.json"
     )))
     .unwrap();
     let mut config = fixture["mova"]["config"].clone();
@@ -229,7 +229,7 @@ pub(crate) fn fp8() -> (tempfile::TempDir, tempfile::TempDir) {
             let value = if fp8 {
                 // E4M3 exponent 2, mantissa 0..7: +/- 2^-5 * (1 + m/8).
                 let mantissa = (index + hash(&tensor.key) as usize) % 8;
-                let negative = (index / 7 + hash(&tensor.key) as usize) % 2 == 0;
+                let negative = (index / 7 + hash(&tensor.key) as usize).is_multiple_of(2);
                 bytes.push(0x10 | mantissa as u8 | if negative { 0x80 } else { 0 });
                 let rows = tensor.shape[tensor.shape.len() - 2];
                 let columns = tensor.shape[tensor.shape.len() - 1];

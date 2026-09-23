@@ -6,8 +6,15 @@ use super::*;
 // floating cache values. Preserve every integer exactly in this test-only
 // representation; an unrepresentable value must not hide a state difference.
 #[cfg(test)]
-fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exception> {
-    let evaluated = array.evaluated()?;
+pub(crate) fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exception> {
+    // Host copies read physical storage; pooling tails can be strided views.
+    thread_local! {
+        static COPY_STREAM: Stream = Stream::new_with_device(&safemlx::Device::new(
+            safemlx::DeviceType::Cpu, 0,
+        ));
+    }
+    let contiguous = COPY_STREAM.with(|stream| array.contiguous(false, stream))?;
+    let evaluated = contiguous.evaluated()?;
     match array.dtype() {
         safemlx::Dtype::Float32 => evaluated
             .try_to_vec::<f32>()
@@ -21,7 +28,9 @@ fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exception> {
                 if f64::from(converted) == f64::from(value) {
                     Ok(converted)
                 } else {
-                    Err(Exception::custom("integer state is not exactly representable in the numeric fixture report"))
+                    Err(Exception::custom(
+                        "integer state is not exactly representable in the numeric fixture report",
+                    ))
                 }
             })
             .collect(),
@@ -918,9 +927,7 @@ impl MlxHybridState {
     pub(crate) fn retained_numeric_snapshot(&self) -> Result<Vec<(Vec<i32>, Vec<f32>)>, Exception> {
         self.retained_arrays()
             .into_iter()
-            .map(|array| {
-                Ok((array.shape().to_vec(), numeric_fixture_values(array)?))
-            })
+            .map(|array| Ok((array.shape().to_vec(), numeric_fixture_values(array)?)))
             .collect()
     }
 

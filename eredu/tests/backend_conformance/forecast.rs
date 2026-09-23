@@ -261,8 +261,10 @@ fn prepared_backend_contract_and_calibration_overrides_are_retained() {
         cancellation: Default::default(),
         on_event: |_: SemanticEvent| {},
     };
-    let mut options = GenerationForecastOptions::default();
-    options.backend_overhead = Some(MemoryBytes::exact(7));
+    let mut options = GenerationForecastOptions {
+        backend_overhead: Some(MemoryBytes::exact(7)),
+        ..Default::default()
+    };
     options.calibration.workspace_overlap = Some(eredu::api::WorkspaceOverlap::single_layer());
     let forecast = model
         .forecast_prepared_generation(&request, &options)

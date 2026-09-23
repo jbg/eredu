@@ -89,7 +89,9 @@ jobs:
           name: release-plan
           path: release-plan.json
       - name: Check validation tooling
-        run: python3 -m unittest discover -s validation -p 'test_release_*.py'
+        run: |
+          python3 -m unittest discover -s validation -p 'test_release_*.py'
+          python3 -m unittest discover -s validation -p 'test_native_unit_batches.py'
 
   native:
     needs: plan

@@ -204,7 +204,9 @@ fn qwen_prediction_fusion_hooks_preserve_cached_execution_and_effective_hidden()
                         residual.shape.clone(),
                         residual
                             .data
-                            .chunks_exact(8)
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
                             .flat_map(|row| {
                                 let rms = (row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
                                     / 8.

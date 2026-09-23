@@ -648,7 +648,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             RoutedExpertRequest {
                 unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
-                layer: layer,
+                layer,
                 input: hidden,
                 routes: &routed_routes,
                 pass,
@@ -720,7 +720,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             RoutedExpertRequest {
                 unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
-                layer: layer,
+                layer,
                 input: hidden,
                 routes: &routed_routes,
                 pass,
@@ -1249,7 +1249,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         let feed_forward = feed_forward(&mut self.feed_forward, &normalized, instrumentation)?;
         let feed_forward = instrumentation.apply("feed_forward.write", feed_forward)?;
         let mut temporary_history = None;
-        let history = match state.as_deref_mut() {
+        let history = match state {
             Some(state) => state.convolution_state(3)?,
             None => &mut temporary_history,
         };

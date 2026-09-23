@@ -171,7 +171,9 @@ fn v3_prediction_hooks_reconstruct_writes_and_change_consumed_values() {
                             effective_residual.shape.clone(),
                             effective_residual
                                 .data
-                                .chunks_exact(8)
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
                                 .flat_map(|row| {
                                     let scale =
                                         (row.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()

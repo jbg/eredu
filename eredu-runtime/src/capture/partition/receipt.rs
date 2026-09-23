@@ -475,7 +475,7 @@ impl PartitionCaptureReceiptPlan {
                 || fragment.axis != projection.axis()
                 || fragment.global_shape != self.global_shape
                 || &fragment.global_slice != projection.global_slice()
-                || &fragment.geometry != &projection.fragments()[index]
+                || fragment.geometry != projection.fragments()[index]
             {
                 return Err(invalid(
                     "partition producer fragment differs from retained receipt authority",
@@ -663,9 +663,7 @@ impl PartitionCaptureReceiptPlan {
                         }
                     }
                     (CaptureTransform::Summary, Some(CapturePayload::Summary(_)))
-                    | (CaptureTransform::Histogram { .. }, Some(CapturePayload::Histogram(_))) => {
-                        ()
-                    }
+                    | (CaptureTransform::Histogram { .. }, Some(CapturePayload::Histogram(_))) => {}
                     (
                         CaptureTransform::TokenScores { .. }
                         | CaptureTransform::TopCandidates { .. },
@@ -688,10 +686,7 @@ impl PartitionCaptureReceiptPlan {
             CaptureOutcome::Skipped { .. }
             | CaptureOutcome::Failed { .. }
             | CaptureOutcome::Missing
-                if record.payload.is_none() =>
-            {
-                ()
-            }
+                if record.payload.is_none() => {}
             _ => return Err(invalid("partition fragment outcome and payload disagree")),
         }
         Ok(())

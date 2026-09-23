@@ -173,10 +173,7 @@ fn capture_inner(
             (Some(_), Some(origins))
                 if origins.peer_count() as u64 == request.ownership.source_peers
                     && origins.row_count() == source_shape[0] as usize
-                    && origins.routes_per_token() as u64 == geometry.routes_per_token =>
-            {
-                ()
-            }
+                    && origins.routes_per_token() as u64 == geometry.routes_per_token => {}
             (None, None) if source_shape[0] as u64 == request.source_tokens => (),
             _ => return Err(invalid()),
         }

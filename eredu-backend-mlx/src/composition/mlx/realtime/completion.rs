@@ -116,6 +116,8 @@ impl MlxRealtimeCompletion {
         })
     }
 
+    // Failure must carry the retained completion authority back to its owner.
+    #[allow(clippy::result_large_err)]
     pub(super) fn submit_retained_with_resources(
         mut retained: Vec<Array>,
         token_validations: TokenValidationBatch,

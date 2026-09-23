@@ -215,7 +215,8 @@ impl PartitionCommunicationAuthority {
         route: Option<CommunicationRouteId>,
     ) -> PartitionExecutionError {
         let mut failure = self.submission_error(&error, operation, phase, route);
-        if let PartitionExecutionError::CommunicationSubmissionFailed { source, .. } = &mut failure {
+        if let PartitionExecutionError::CommunicationSubmissionFailed { source, .. } = &mut failure
+        {
             *source = Some(eredu_core::BackendFailure::from_error(error));
         }
         failure
@@ -230,7 +231,8 @@ impl PartitionCommunicationAuthority {
         route: Option<CommunicationRouteId>,
     ) -> PartitionExecutionError {
         let mut failure = self.completion_error(&error, operation, phase, route);
-        if let PartitionExecutionError::CommunicationCompletionFailed { source, .. } = &mut failure {
+        if let PartitionExecutionError::CommunicationCompletionFailed { source, .. } = &mut failure
+        {
             *source = Some(eredu_core::BackendFailure::from_error(error));
         }
         failure
@@ -3102,9 +3104,7 @@ where
                                 local_error.is_none(),
                                 runtime.communication_executor.borrow(),
                             )
-                            .map_err(|error| {
-                                ReplicatedTextSessionError::Partition(error)
-                            })?;
+                            .map_err(ReplicatedTextSessionError::Partition)?;
                         if let Some(error) = local_error {
                             runtime.communication.authority.fence_protocol_failure(
                                 CommunicationOperation::SendReceive,
@@ -3139,9 +3139,7 @@ where
                                 true,
                                 runtime.communication_executor.borrow(),
                             )
-                            .map_err(|error| {
-                                ReplicatedTextSessionError::Partition(error)
-                            })?;
+                            .map_err(ReplicatedTextSessionError::Partition)?;
                         if !ready {
                             return Err(ReplicatedTextSessionError::Contract(
                                 PartitionExecutionError::RemotePhaseFailure(

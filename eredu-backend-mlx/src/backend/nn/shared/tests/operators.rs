@@ -25,7 +25,7 @@ fn mxfp4_embedding_lookup_contract(device: DeviceType) {
         .map(|i| ((i * 5 + i / 32) % 16) as u32)
         .collect::<Vec<_>>();
     let packed = codes
-        .chunks_exact(8)
+        .as_chunks::<8>().0.iter()
         .map(|chunk| {
             chunk
                 .iter()

@@ -143,7 +143,7 @@ fn verify(device: LocalDevice) {
                 input: PreparedChatInput::token_ids(&chat, prefix.clone()),
                 drafting: eredu_core::SpeculativeDraft::Embedded,
                 settings,
-                options: generation.clone(),
+                options: generation,
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},

@@ -386,6 +386,7 @@ mod tests {
             |_| panic!("local caller failure must not be replaced"),
         );
         assert_eq!(result, Err(CallerError("tokenizer failed")));
+        await_retirement(&drops);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 

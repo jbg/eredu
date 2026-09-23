@@ -87,14 +87,14 @@ impl CaptureSlicePartition {
             ));
         }
         elements(global_shape)?;
-        for dimension in 0..rank {
+        for (dimension, &extent) in global_shape.iter().enumerate() {
             let (start, end, stride) = (
                 global_slice.starts[dimension],
                 global_slice.ends[dimension],
                 global_slice.strides[dimension],
             );
             if start > end
-                || end > global_shape[dimension]
+                || end > extent
                 || stride == 0
                 || (end - start).div_ceil(stride) != global_slice.shape[dimension]
             {

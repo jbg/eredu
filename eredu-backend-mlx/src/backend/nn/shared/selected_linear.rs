@@ -407,7 +407,7 @@ mod tests {
             weights_tensor.clone(),
             weights_tensor,
         );
-        let mut expected = vec![0.0f32; 8];
+        let mut expected = [0.0f32; 8];
         for token in 0..2 {
             for slot in 0..2 {
                 for out in 0..4 {

@@ -325,19 +325,19 @@ where
             (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
                 "projection_input",
                 head,
-                &hidden,
+                hidden,
                 parallel,
                 context,
             ),
             (None, Some(head)) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
+                instrumentation.project::<B>("projection_input", head, hidden, None, context)
             }
             (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
                 "projection_input",
                 self.static_modules.embeddings.as_mut().ok_or_else(|| {
                     Error::backend("tied Nemotron-H output partition has no embedding")
                 })?,
-                &hidden,
+                hidden,
                 parallel,
                 context,
             ),
@@ -346,7 +346,7 @@ where
                 self.static_modules.embeddings.as_mut().ok_or_else(|| {
                     Error::backend("tied Nemotron-H output partition has no embedding")
                 })?,
-                &hidden,
+                hidden,
                 context,
             ),
         }?;

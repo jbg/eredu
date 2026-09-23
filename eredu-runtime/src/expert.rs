@@ -1826,21 +1826,18 @@ impl<T: Tensor> RoutedUnitObserver<T> for RecordingUnitObserver<'_, T> {
         self.inner.invocation_active()
     }
     fn observe(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<(), eredu_nn::Error> {
-        self.inner.observe(batch).map_err(|error| {
+        self.inner.observe(batch).inspect_err(|error| {
             self.failure.get_or_insert_with(|| error.clone());
-            error
         })
     }
     fn intervene(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<Option<T>, eredu_nn::Error> {
-        self.inner.intervene(batch).map_err(|error| {
+        self.inner.intervene(batch).inspect_err(|error| {
             self.failure.get_or_insert_with(|| error.clone());
-            error
         })
     }
     fn observe_effective(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<(), eredu_nn::Error> {
-        self.inner.observe_effective(batch).map_err(|error| {
+        self.inner.observe_effective(batch).inspect_err(|error| {
             self.failure.get_or_insert_with(|| error.clone());
-            error
         })
     }
 }
@@ -1874,7 +1871,6 @@ where
             .as_mut()
             .map(|observer| observer as &mut dyn RoutedUnitObserver<T>),
     });
-    drop(recording);
     match failure {
         Some(error) => Err(ObservedExpertProviderError::Unit(error)),
         None => result.map_err(ObservedExpertProviderError::Provider),

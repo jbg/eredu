@@ -143,7 +143,7 @@ where
         let mut digest = [0; 8];
         for (word, bytes) in digest
             .iter_mut()
-            .zip(receipt.identity().as_bytes().chunks_exact(8))
+            .zip(receipt.identity().as_bytes().as_chunks::<8>().0.iter())
         {
             *word = u32::from_str_radix(
                 std::str::from_utf8(bytes).map_err(|_| CaptureError::Overflow)?,
@@ -250,7 +250,7 @@ where
         let gathered = self.gather(&header)?;
         let mut max_length = 0;
         let mut rejected = None;
-        for (rank, frame) in gathered.chunks_exact(HEADER_WORDS).enumerate() {
+        for (rank, frame) in gathered.as_chunks::<HEADER_WORDS>().0.iter().enumerate() {
             self.validate_header(frame, rank, 0)?;
             let length = frame[14] as u64 | ((frame[15] as u64) << 32);
             match frame[13] {
@@ -295,7 +295,7 @@ where
         let verdict = self.header(1, u32::from(result.is_ok()), 0);
         let verdicts = self.gather(&verdict)?;
         let mut rejected = None;
-        for (rank, frame) in verdicts.chunks_exact(HEADER_WORDS).enumerate() {
+        for (rank, frame) in verdicts.as_chunks::<HEADER_WORDS>().0.iter().enumerate() {
             self.validate_header(frame, rank, 1)?;
             if frame[14..] != [0, 0] || frame[13] > 1 {
                 return Err(PartitionCaptureExchangeError::Protocol("delivery verdict"));

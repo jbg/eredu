@@ -22,6 +22,12 @@ env:
 jobs:
   cpu-msvc:
     runs-on: windows-2022
+    env:
+      # Full debug data makes the monomorphized backend archive exceed MSVC's
+      # library size limit (LNK4003), hiding its Rust symbols from the linker.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain
@@ -45,6 +51,7 @@ jobs:
       - name: Test the portable facade and CPU CLI
         run: |
           cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p eredu-cli --no-default-features --features mlx
       - name: Build and final-link safemlx tests
         if: inputs.full

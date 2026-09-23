@@ -72,7 +72,7 @@ impl MeasuredReadout {
             || norm.gain.len() != width
             || norm.bias.is_some_and(|bias| bias.len() != width)
             || norm.groups == 0
-            || width % norm.groups != 0
+            || !width.is_multiple_of(norm.groups)
         {
             return Err(AttributionError::Geometry);
         }

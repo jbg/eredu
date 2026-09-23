@@ -841,7 +841,7 @@ fn edit_component_reference(root: &Path, edits: &[eredu_core::parameters::Parame
         let values = config["linear_num_value_heads"].as_u64().unwrap();
         let key_dim = config["linear_key_head_dim"].as_u64().unwrap();
         let value_dim = config["linear_value_head_dim"].as_u64().unwrap();
-        assert!(keys > 0 && values % keys == 0);
+        assert!(keys > 0 && values.is_multiple_of(keys));
         let repeats = values / keys;
         let value_group = repeats * value_dim;
         let fused = if matches!(field, "in_proj_a" | "in_proj_b") {

@@ -637,7 +637,7 @@ where
             &mut ComponentInstrumentation::disabled(),
             |decoder, fused, context, _| {
                 decoder.forward_with_provider(
-                    &fused,
+                    fused,
                     tokens,
                     None,
                     Some(cache),
@@ -710,7 +710,7 @@ where
             &mut ComponentInstrumentation::disabled(),
             |decoder, fused, context, _| {
                 decoder.forward_parallel_with_provider(
-                    &fused,
+                    fused,
                     tokens,
                     None,
                     Some(cache),

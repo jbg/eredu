@@ -1691,8 +1691,7 @@ fn pipeline_ring_worker() {
                     },
                 );
                 let error = result
-                    .err()
-                    .expect("one invalid rank must reject speculative setup on every rank");
+                    .expect_err("one invalid rank must reject speculative setup on every rank");
                 assert_eq!(publications, 0);
                 let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
                 let mut found = false;
@@ -1770,8 +1769,7 @@ fn pipeline_ring_worker() {
                     )
                 };
                 let error = result
-                    .err()
-                    .expect("one scheduler rejection must reach every rank");
+                    .expect_err("one scheduler rejection must reach every rank");
                 assert_eq!(publications, 0);
                 let original: &(dyn std::error::Error + 'static) = match &failure {
                     Some(error) => error,

@@ -131,9 +131,9 @@ impl TextPreparationCoordinator {
         ]);
         for (word, bytes) in frame[10..]
             .iter_mut()
-            .zip(self.identity.bytes().chunks_exact(4))
+            .zip(self.identity.bytes().as_chunks::<4>().0.iter())
         {
-            *word = u32::from_le_bytes(bytes.try_into().expect("four-byte identity word"));
+            *word = u32::from_le_bytes(*bytes);
         }
         let prepared = self.resolve_schedule_frame(transport, &frame, false);
         frame[1] |= 1 << 16;
@@ -175,7 +175,12 @@ impl TextPreparationCoordinator {
                 "scheduler local echo",
             ));
         }
-        for (rank, peer) in gathered.chunks_exact(TEXT_PREPARATION_WORDS).enumerate() {
+        for (rank, peer) in gathered
+            .as_chunks::<TEXT_PREPARATION_WORDS>()
+            .0
+            .iter()
+            .enumerate()
+        {
             if peer[..6] != frame[..6] || peer[6] != rank as u32 || peer[10..] != frame[10..] {
                 return Err(TextPreparationAgreementError::Protocol(
                     "scheduler setup, attempt or rank",
@@ -188,7 +193,7 @@ impl TextPreparationCoordinator {
             }
         }
         let mut resolved = [frame[8], frame[9]];
-        for peer in gathered.chunks_exact(TEXT_PREPARATION_WORDS) {
+        for peer in gathered.as_chunks::<TEXT_PREPARATION_WORDS>().0 {
             if peer[8] != frame[8] {
                 return Err(TextPreparationAgreementError::Protocol(
                     "scheduler count or request identity",

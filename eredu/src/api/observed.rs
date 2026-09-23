@@ -597,11 +597,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
             }),
         }
-        if result.is_err() {
-            // The shared driver already agreed this failure. Preserve its cause;
-            // a best-effort Failed record cannot replace it or start a new phase.
-            return result;
-        }
+        // The shared driver already agreed any failure. Preserve its cause;
+        // a best-effort Failed record cannot replace it or start a new phase.
         let output = result?;
         self.runtime.finish_text_preparation_cancellable(
             eredu_core::run_preparation::TextPreparationStage::Delivery,

@@ -193,7 +193,7 @@ fn speculative_control_artifacts(
                     input: PreparedChatInput::rendered_prompt(&chat),
                     drafting: drafting.as_speculative_draft().unwrap(),
                     settings,
-                    options: generation_options.clone(),
+                    options: generation_options,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},

@@ -1,9 +1,6 @@
 #[test]
 fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/k2_horizon/reference.json")))
     .unwrap();
     let root = tiny_heterogeneous_artifact(fixture["mova"]["config"].clone());
     let (stream, weights_stream) = execution_streams();
@@ -212,10 +209,7 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
             Ok(())
         }
     }
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/k2_horizon/reference.json")))
     .unwrap();
     let config = fixture["mova"]["config"].clone();
     let args = eredu_architectures::k2_horizon::model_args_from_config_value(&config).unwrap();

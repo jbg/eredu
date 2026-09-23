@@ -1069,6 +1069,14 @@ pub fn qwen_hybrid_text(
     ))
 }
 
+/// Derives Gemma 2 context and mixed full/sliding KV residency from its schedule.
+pub fn gemma2(args: &crate::gemma2::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        "gemma2".into(),
+        llama_spec(args.dense_config(), false)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,12 +1365,4 @@ mod tests {
                 .layers()
         );
     }
-}
-
-/// Derives Gemma 2 context and mixed full/sliding KV residency from its schedule.
-pub fn gemma2(args: &crate::gemma2::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
-    Ok(finish(
-        "gemma2".into(),
-        llama_spec(args.dense_config(), false)?,
-    ))
 }

@@ -1788,7 +1788,8 @@ pub(crate) mod tests {
                         );
                     }
                 }
-                for name in ["layers.0.ffn.gate.tid2eid"] {
+                {
+                    let name = "layers.0.ffn.gate.tid2eid";
                     assert_eq!(
                         parameters[name].source_encoding(),
                         Some(&eredu_checkpoint::SourceTensorEncoding::Safetensors(

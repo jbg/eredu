@@ -279,17 +279,16 @@ mod tests {
                     rank,
                 )
                 .unwrap();
-                for layer in 0..3 {
+                for (layer, &expected_heads) in expected_heads.iter().enumerate() {
                     let policy = AttentionPartition::new(&args, layer).unwrap();
                     let head_range = policy.head_range(2, rank.tensor_parallel_rank()).unwrap();
-                    assert_eq!(head_range.len(), expected_heads[layer] as usize);
+                    assert_eq!(head_range.len(), expected_heads as usize);
                     let local = crate::k2_horizon::local_block_args(&args, layer, &layout).unwrap();
-                    assert_eq!(local.num_key_value_heads(), expected_heads[layer]);
-                    assert_eq!(local.num_attention_heads(), 2 * expected_heads[layer]);
-                    for (field, heads) in [
-                        ("q_norm", 2 * expected_heads[layer]),
-                        ("k_norm", expected_heads[layer]),
-                    ] {
+                    assert_eq!(local.num_key_value_heads(), expected_heads);
+                    assert_eq!(local.num_attention_heads(), 2 * expected_heads);
+                    for (field, heads) in
+                        [("q_norm", 2 * expected_heads), ("k_norm", expected_heads)]
+                    {
                         let name = format!("model.layers.{layer}.self_attn.{field}.weight");
                         assert_eq!(
                             layout.tensor(&name).unwrap().local_shape(),

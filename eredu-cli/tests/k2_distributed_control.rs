@@ -13,9 +13,10 @@ use std::{
 };
 
 fn fixture(root: &Path, family: &str) {
-    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
-        "../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    ))
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/k2_horizon/reference.json"
+    )))
     .unwrap();
     let mut config = fixtures[family]["config"].clone();
     config["num_hidden_layers"] = 3.into();
@@ -48,7 +49,7 @@ fn fixture(root: &Path, family: &str) {
         header.insert(tensor.key.clone(),serde_json::json!({"dtype":"F32","shape":tensor.shape,"data_offsets":[start,data.len()]}));
     }
     let mut header = serde_json::to_vec(&header).unwrap();
-    while header.len() % 8 != 0 {
+    while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
     let mut file = std::fs::File::create(root.join("model.safetensors")).unwrap();

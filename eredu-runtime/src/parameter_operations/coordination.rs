@@ -555,15 +555,21 @@ where
         ]);
         for (word, bytes) in frame[12..20]
             .iter_mut()
-            .zip(self.owner.setup.bytes().chunks_exact(4))
+            .zip(self.owner.setup.bytes().as_chunks::<4>().0.iter())
         {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+            *word = u32::from_le_bytes(*bytes);
         }
-        for (word, bytes) in frame[20..28].iter_mut().zip(self.digest.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in frame[20..28]
+            .iter_mut()
+            .zip(self.digest.as_chunks::<4>().0.iter())
+        {
+            *word = u32::from_le_bytes(*bytes);
         }
-        for (word, bytes) in frame[28..36].iter_mut().zip(self.geometry.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in frame[28..36]
+            .iter_mut()
+            .zip(self.geometry.as_chunks::<4>().0.iter())
+        {
+            *word = u32::from_le_bytes(*bytes);
         }
         frame[36] = self.max_words as u32;
         frame[37] = ((self.max_words as u64) >> 32) as u32;
@@ -623,10 +629,17 @@ where
         } else {
             frame[5] != stage_word(Stage::Admission)
                 || words
-                    .chunks_exact(PARAMETER_CONTROL_WORDS)
+                    .as_chunks::<PARAMETER_CONTROL_WORDS>()
+                    .0
+                    .iter()
                     .all(|peer| peer[8] == 0)
         };
-        for (rank, peer) in words.chunks_exact(PARAMETER_CONTROL_WORDS).enumerate() {
+        for (rank, peer) in words
+            .as_chunks::<PARAMETER_CONTROL_WORDS>()
+            .0
+            .iter()
+            .enumerate()
+        {
             if peer[..7] != frame[..7]
                 || peer[7] != rank as u32
                 || peer[11..28] != frame[11..28]

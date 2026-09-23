@@ -497,9 +497,10 @@ fn use_family_weights(root: &Path, family: &str) {
     match family {
         "qwen2" => {}
         "k2_horizon_dense" | "k2_horizon_mova" => {
-            let fixture: serde_json::Value = serde_json::from_str(include_str!(
-                "../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-            ))
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/k2_horizon/reference.json"
+            )))
             .unwrap();
             let mut config = fixture[if family == "k2_horizon_dense" {
                 "dense"

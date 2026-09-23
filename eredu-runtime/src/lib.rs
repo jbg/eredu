@@ -4,6 +4,8 @@
 //! no dependency on an architecture implementation or execution backend.
 
 #![warn(missing_docs)]
+// Portable execution contracts carry the complete typed backend context.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 /// Portable automatic-plan resource sizing and telemetry projections.
 pub mod automatic_support;

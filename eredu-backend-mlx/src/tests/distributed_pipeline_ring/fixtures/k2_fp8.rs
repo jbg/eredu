@@ -10,7 +10,7 @@ fn k2_fp8_scale(name: &str, block: usize) -> f32 {
 
 fn k2_fp8_code(name: &str, index: usize) -> u8 {
     let phase = k2_fp8_phase(name);
-    (0x28 + (index * 13 + phase) % 32) as u8 | if (index + phase) % 3 == 0 { 128 } else { 0 }
+    (0x28 + (index * 13 + phase) % 32) as u8 | if (index + phase).is_multiple_of(3) { 128 } else { 0 }
 }
 
 fn k2_fp8_scalar(name: &str, shape: &[usize], index: usize) -> f32 {
@@ -63,9 +63,9 @@ fn write_k2_fp8_fixture_with_non_f32_scales(directory: &Path) {
                 let bfloat = name.starts_with("model.layers.1.");
                 let bytes = view
                     .data()
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .flat_map(|bytes| {
-                        let value = f32::from_le_bytes(bytes.try_into().unwrap());
+                        let value = f32::from_le_bytes(*bytes);
                         let bits = if bfloat {
                             let encoded = half::bf16::from_f32(value);
                             assert_eq!(encoded.to_f32(), value);
@@ -105,10 +105,7 @@ fn write_k2_fp8_fixture_geometry(
     fused_tail: bool,
     attention_tail: bool,
 ) {
-    let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    )))
+    let source: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/k2_horizon/reference.json")))
     .unwrap();
     let mut config = source["mova"]["config"].clone();
     config["hidden_size"] = if partial { 130 } else { 128 }.into();

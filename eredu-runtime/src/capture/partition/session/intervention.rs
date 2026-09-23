@@ -443,15 +443,18 @@ where
             self.index as u32,
             status,
         ]);
-        for (word, bytes) in frame[8..16].iter_mut().zip(self.descriptor.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().expect("digest word"));
+        for (word, bytes) in frame[8..16]
+            .iter_mut()
+            .zip(self.descriptor.as_chunks::<4>().0.iter())
+        {
+            *word = u32::from_le_bytes(*bytes);
         }
         let affected = self.routed.as_ref().map_or(0, |work| work.affected);
         frame[16] = affected as u32;
         frame[17] = (affected >> 32) as u32;
         let gathered =
             super::super::exchange::gather_capture_words(self.transport, self.wait, world, &frame)?;
-        for (rank, peer) in gathered.chunks_exact(RECEIPT_WORDS).enumerate() {
+        for (rank, peer) in gathered.as_chunks::<RECEIPT_WORDS>().0.iter().enumerate() {
             if peer[..7]
                 != [
                     RECEIPT_MAGIC,
@@ -474,7 +477,9 @@ where
             }
         }
         if let Some(rank) = gathered
-            .chunks_exact(RECEIPT_WORDS)
+            .as_chunks::<RECEIPT_WORDS>()
+            .0
+            .iter()
             .position(|peer| peer[7] == 0)
         {
             return Err(PartitionCaptureExchangeError::PeerRejected {
@@ -483,7 +488,9 @@ where
             });
         }
         gathered
-            .chunks_exact(RECEIPT_WORDS)
+            .as_chunks::<RECEIPT_WORDS>()
+            .0
+            .iter()
             .try_fold(0u64, |sum, peer| {
                 add(sum, u64::from(peer[16]) | (u64::from(peer[17]) << 32)).map_err(Into::into)
             })

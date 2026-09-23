@@ -109,8 +109,7 @@ fn check_speculative_control_delivery<'world>(
         assert!(runtime.synchronize().is_ok());
     } else {
         let error = result
-            .err()
-            .expect("one failing controller must stop all peers");
+            .expect_err("one failing controller must stop all peers");
         let original: &(dyn std::error::Error + 'static) = match &failure {
             Some(error) => error,
             None => &error,

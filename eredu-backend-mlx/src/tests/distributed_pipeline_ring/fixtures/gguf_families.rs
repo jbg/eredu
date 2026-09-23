@@ -170,8 +170,8 @@ fn write_deepseek_gguf_fixture_with_components(path: &Path, components: bool) {
         // the existing general-purpose checkpoint and persistence fixtures.
         for tensor in &mut tensors {
             if !tensor.name.contains("norm") {
-                for bytes in tensor.data.chunks_exact_mut(4) {
-                    let value = f32::from_le_bytes(bytes.try_into().unwrap()) * 8.0;
+                for bytes in tensor.data.as_chunks_mut::<4>().0.iter_mut() {
+                    let value = f32::from_le_bytes(*bytes) * 8.0;
                     bytes.copy_from_slice(&value.to_le_bytes());
                 }
             }
@@ -221,8 +221,8 @@ fn write_deepseek_dense_gguf_fixture(path: &Path) {
     // nonzero matrix fixture so component interventions cannot pass as noise.
     for tensor in &mut tensors {
         if !tensor.name.contains("norm") {
-            for bytes in tensor.data.chunks_exact_mut(4) {
-                let value = f32::from_le_bytes(bytes.try_into().unwrap()) * 8.0;
+            for bytes in tensor.data.as_chunks_mut::<4>().0.iter_mut() {
+                let value = f32::from_le_bytes(*bytes) * 8.0;
                 bytes.copy_from_slice(&value.to_le_bytes());
             }
         }

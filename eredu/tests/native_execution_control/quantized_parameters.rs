@@ -440,9 +440,11 @@ fn promote_reference_matrices(root: &Path, edits: &[ParameterEdit]) {
             let mut values = bytes[start..end].to_vec();
             if edits.iter().any(|edit| edit.parameter == name) && dtype == "BF16" {
                 values = values
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .flat_map(|word| {
-                        let bits = u16::from_le_bytes(word.try_into().unwrap()) as u32;
+                        let bits = u16::from_le_bytes(*word) as u32;
                         (bits << 16).to_le_bytes()
                     })
                     .collect();

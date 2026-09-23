@@ -8623,7 +8623,6 @@ pub(crate) trait TextRequirements {
 
 /// Parameter coordinates use the same group layout and pipeline ownership
 /// compiler as construction. Only the requested atomic parameter group is lowered.
-
 struct ResolvedParameterMember<'a> {
     task: &'a eredu_runtime::ReplicatedTextMaterializationTask,
     companion: Option<&'a eredu_runtime::ReplicatedTextOutputCompanion>,

@@ -457,6 +457,8 @@ pub enum ComponentNormalizationKind {
 /// Activation applied before the output projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Preserve the inline public descriptor; boxing would change its construction API.
+#[allow(clippy::large_enum_variant)]
 pub enum ComponentActivation {
     /// An ordinary affine read followed by one activation.
     Unary {

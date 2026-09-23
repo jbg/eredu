@@ -32,7 +32,7 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
             },
             ..Default::default()
         },
-        options: generation.clone(),
+        options: *generation,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
         on_event: |_| {},

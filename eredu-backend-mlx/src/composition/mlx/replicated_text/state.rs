@@ -640,12 +640,11 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         let mut snapshot = Vec::new();
         for (layer, cache) in self.as_ref().iter().enumerate() {
             for state in cache.prompt_cache_state_arrays(layer) {
-                let evaluated = state.array.evaluated()?;
                 snapshot.push((
                     layer,
                     state.role,
                     state.array.shape().to_vec(),
-                    evaluated.as_slice::<f32>().to_vec(),
+                    crate::backend::runtime::cache::state::numeric_fixture_values(state.array)?,
                 ));
             }
         }
@@ -657,8 +656,10 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
         self.retained_arrays()
             .into_iter()
             .map(|array| {
-                let evaluated = array.evaluated()?;
-                Ok((array.shape().to_vec(), evaluated.as_slice::<f32>().to_vec()))
+                Ok((
+                    array.shape().to_vec(),
+                    crate::backend::runtime::cache::state::numeric_fixture_values(array)?,
+                ))
             })
             .collect()
     }

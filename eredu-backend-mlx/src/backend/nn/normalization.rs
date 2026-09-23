@@ -82,7 +82,7 @@ pub(crate) fn f32_weightless_rms(
                 .expect("normalization kernel initialized")
                 .apply_device([input, &squared, &epsilon], &config, stream)
         })?;
-        return Ok(output.pop());
+        Ok(output.pop())
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
@@ -172,7 +172,7 @@ pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Arra
                 include_str!("rms_cascade.metal"),true,false)?); }
             cell.borrow().as_ref().expect("row sum kernel initialized").apply_device([input],&config,stream)
         })?;
-        return Ok(output.pop());
+        Ok(output.pop())
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {

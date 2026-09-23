@@ -43,14 +43,19 @@ jobs:
       - name: Test scoped native backend and CLI consumers
         if: ${{ !inputs.full }}
         run: |
-          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib --timings
+          python3 validation/run_native_unit_tests.py
           cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
       - name: Test the macOS workspace
         if: inputs.full
         run: |
-          cargo test --locked --workspace --timings --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
+          python3 validation/run_native_unit_tests.py
+          cargo test --locked --workspace --exclude eredu-backend-mlx --timings --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
+      - name: Test native integration and documentation targets
+        run: |
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --test '*' --examples --timings
+          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --doc --timings
       - name: Test MLX neutral semantic operator parity
         if: inputs.full
         run: |

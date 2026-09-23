@@ -375,14 +375,12 @@ fn shared_routed_observer_prepays_receives_and_votes_before_provider_returns() {
                         } else {
                             assert!(step.records.iter().all(|record| record.payload.is_none()));
                         }
-                        if rank == 8 {
-                            assert_eq!(source_calls, 0);
-                        } else if matches!(fault, Some("width" | "rows" | "origins" | "dtype" | "units")) {
+                        if rank == 8 || matches!(fault, Some("width" | "rows" | "origins" | "dtype" | "units")) {
                             assert_eq!(source_calls, 0);
                         } else {
                             assert_eq!(source_calls, 2);
                         }
-                        if empty || rank < 2 || rank >= 6 {
+                        if empty || !(2..6).contains(&rank) {
                             assert_eq!(collector_calls, 0);
                         }
                         prepaid

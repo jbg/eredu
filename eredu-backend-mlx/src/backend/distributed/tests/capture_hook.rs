@@ -43,8 +43,10 @@ fn worker() {
         let words = session
             .session_identity()
             .bytes()
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         let BoundedSubmissionOutcome::Completed(output) = session
             .submit_all_gather_words(&words)

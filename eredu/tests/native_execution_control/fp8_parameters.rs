@@ -27,9 +27,10 @@ fn fp8_fixture() -> (Fixture, serde_json::Value, Tensors, Tensors) {
 }
 fn fp8_fixture_dimensions(partial_blocks: bool) -> (Fixture, serde_json::Value, Tensors, Tensors) {
     let root = fixture(false);
-    let source: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    ))
+    let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/k2_horizon/reference.json"
+    )))
     .unwrap();
     let mut config = source["dense"]["config"].clone();
     for (key, value) in [
@@ -520,8 +521,10 @@ fn verify_fp8_inputs_and_overlay_transitions(device: LocalDevice, partial_blocks
             let expected = &dense[&p.id];
             let values: Vec<f32> = expected
                 .2
-                .chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
                 .collect();
             assert_eq!(
                 model
@@ -815,9 +818,11 @@ fn verify_fp8_bfloat16_overlay_precision(device: LocalDevice) {
         for (name, (dtype, _, bytes)) in &mut packed {
             if dtype == "F32" && !name.ends_with("weight_scale_inv") {
                 *bytes = bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|word| {
-                        let bits = u32::from_le_bytes(word.try_into().unwrap());
+                        let bits = u32::from_le_bytes(*word);
                         ((bits >> 16) as u16).to_le_bytes()
                     })
                     .collect();

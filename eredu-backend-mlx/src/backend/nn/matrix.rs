@@ -116,11 +116,11 @@ fn bf16_projection(
         })?;
         let mut shape = input.shape().to_vec();
         *shape.last_mut().expect("matrix input rank") = outputs;
-        return output
+        output
             .pop()
             .expect("row projection output")
             .reshape(&shape, stream)
-            .map(Some);
+            .map(Some)
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {

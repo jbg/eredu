@@ -1239,7 +1239,7 @@ where
         .map(|address| {
             architecture
                 .build_unit(address.group(), address.index(), context)
-                .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
+                .map_err(PartitionedRuntimeConstructionError::Architecture)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut source_units = source_architecture
@@ -1250,7 +1250,7 @@ where
                 .map(|address| {
                     source
                         .build_unit(address.group(), address.index(), context)
-                        .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
+                        .map_err(PartitionedRuntimeConstructionError::Architecture)
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -1288,10 +1288,10 @@ where
             addressable_parameters,
             context,
         )
-        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
+        .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
     let state = mechanisms
         .realize_state(&selected_state, context)
-        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
+        .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
     if state.optional_layout() != Some(selected_state.layout()) {
         return Err(PartitionedRuntimeConstructionError::Contract(
             "realized partition state differs from selected local geometry".into(),
@@ -1301,14 +1301,14 @@ where
         LayerWeightResidency::FullyResident => (
             mechanisms
                 .resident_policy(&mut architecture, units, selected, context)
-                .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?,
+                .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
             None,
         ),
         LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
             drop(units);
             let policy = mechanisms
                 .bounded_policy(&mut architecture, selected, context)
-                .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
+                .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
             (policy.clone(), Some(policy))
         }
     };
@@ -1746,7 +1746,9 @@ where
     A::Error: std::fmt::Display,
 {
     if selected.requirements().supports_chunked_prefill() && !A::supports_chunked_prefill() {
-        return Err("cold chunked-prefill declaration disagrees with constructed architecture".into());
+        return Err(
+            "cold chunked-prefill declaration disagrees with constructed architecture".into(),
+        );
     }
     prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
         architecture,

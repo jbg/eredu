@@ -50,7 +50,7 @@ fn prediction_rank_resources_count_tensor_shards_and_pipeline_expert_replicas() 
                 let request = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
                     &plan,
                     eredu_runtime::ResidencyDiagnostics::new(false, false),
-                    Some(parallel.clone()),
+                    Some(parallel),
                 )
                 .unwrap();
                 eredu_architectures::select_preparation(&inspection, &request, &Provider).unwrap()

@@ -1,3 +1,6 @@
+// Explicit consumption checks that ownership cannot refund reservations or identities.
+#![allow(clippy::drop_non_drop)]
+
 use super::*;
 use eredu_core::{
     consensus::ConsensusTransport, BoundedCompletionOutcome, CompletionCancellationMode, Submission,

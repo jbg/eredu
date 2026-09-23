@@ -398,7 +398,7 @@ fn live_sparse_chunks_share_quotas_delivery_and_commit_with_idle_and_inactive_ra
                     });
                     if fault.is_none() {
                         let calls = collected.transpose().unwrap().unwrap_or(0);
-                        if empty || rank < 2 || rank >= 6 {
+                        if empty || !(2..6).contains(&rank) {
                             assert_eq!(calls, 0);
                         }
                     }

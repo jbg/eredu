@@ -488,7 +488,7 @@ pub(super) fn verify_partitioned(
         logits(&references[2]),
         "nonzero feed-forward-unit deletion must change actual prediction scores"
     );
-    if shared.is_some() {
+    if let Some(shared) = shared {
         // Exercise global component coordinates and physical token positions
         // independently of the model's residual-stream geometry.
         for mode in 3..=8 {
@@ -515,7 +515,6 @@ pub(super) fn verify_partitioned(
             }
             references.push(expected.1);
         }
-        let shared = shared.unwrap();
         let kept = prediction_trial_tensor(&references[6], &shared.effective_activation);
         let recomputed = prediction_trial_tensor(&references[8], &shared.effective_activation);
         assert_ne!(

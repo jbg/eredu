@@ -150,7 +150,12 @@ def main():
         if name == "dense":
             c.update(query_key_norm=False,layernorm_num_groups=1,attention_gate_func=None)
         cases[name] = run(c)
-    Path(__file__).with_name("reference.json").write_text(json.dumps(cases, indent=2) + "\n")
+    reference = json.dumps(cases, indent=2) + "\n"
+    Path(__file__).with_name("reference.json").write_text(reference)
+    # Each published crate must compile its tests without sibling source trees.
+    workspace = Path(__file__).resolve().parents[4]
+    for crate in ("eredu-backend-mlx", "eredu", "eredu-cli"):
+        (workspace / crate / "tests/fixtures/k2_horizon/reference.json").write_text(reference)
 
 if __name__ == "__main__":
     main()

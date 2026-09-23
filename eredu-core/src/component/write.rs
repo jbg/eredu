@@ -112,7 +112,8 @@ impl ComponentGroup {
             None if *columns == convert(self.count)? => (id.index, 1, None),
             None => return Err(ComponentWriteError::Geometry),
             Some(stage) => {
-                if stage.groups == 0 || stage.rank == 0 || self.count % stage.groups != 0 {
+                if stage.groups == 0 || stage.rank == 0 || !self.count.is_multiple_of(stage.groups)
+                {
                     return Err(ComponentWriteError::Geometry);
                 }
                 let rows = stage

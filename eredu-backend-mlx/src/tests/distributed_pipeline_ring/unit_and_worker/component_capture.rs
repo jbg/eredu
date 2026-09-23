@@ -360,7 +360,7 @@ fn verify_loaded_component_capture(
             };
             let (before, after) = (values(input), values(output));
             assert!(before.iter().zip(after).any(|(a, b)| (a - b).abs() > 1e-4));
-            for (before, after) in before.chunks_exact(32).zip(after.chunks_exact(32)) {
+            for (before, after) in before.as_chunks::<32>().0.iter().zip(after.as_chunks::<32>().0.iter()) {
                 let rms = (before.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / 32.0 + 1e-6)
                     .sqrt();
                 for (index, (&input, &output)) in before.iter().zip(after).enumerate() {

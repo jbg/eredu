@@ -797,8 +797,7 @@ fn shared_hybrid_model_delivers_actual_routed_units_during_prefill_and_cached_de
             &context,
             &mut Failing,
         )
-        .err()
-        .expect("unit failure must stop the model");
+        .expect_err("unit failure must stop the model");
     assert_unit_source(&error);
 }
 
@@ -862,8 +861,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
         },
         context,
     )
-    .err()
-    .expect("unit failure must stop provider");
+    .expect_err("unit failure must stop provider");
     assert!(matches!(
         error,
         eredu_runtime::ObservedExpertProviderError::Unit(_)
@@ -898,8 +896,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
         )
         .map_err(|error| Error::backend(error.to_string()))
     })
-    .err()
-    .expect("neural adapter must preserve failed unit work");
+    .expect_err("neural adapter must preserve failed unit work");
     assert_unit_source(&error);
 
     let mut existing = Capture::default();

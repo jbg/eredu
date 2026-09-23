@@ -81,10 +81,10 @@ impl EffectiveLayout {
                     .is_some()
                     && ggml_type.block_and_bytes().is_ok_and(|(block, bytes)| {
                         let width = *self.shape.last().expect("matrix geometry");
-                        width % block as u64 == 0
+                        width.is_multiple_of(block)
                             && elements(&self.shape)
                                 .ok()
-                                .and_then(|count| (count / block as u64).checked_mul(bytes as u64))
+                                .and_then(|count| (count / block).checked_mul(bytes))
                                 .is_some_and(|expected| {
                                     elements(actual_shape).ok() == Some(expected)
                                 })
@@ -109,7 +109,7 @@ impl EffectiveLayout {
         }
         let axis = self.shape.len() - 1;
         self.shape[..axis] == actual[..axis]
-            && self.shape[axis] % group as u64 == 0
+            && self.shape[axis].is_multiple_of(group as u64)
             && self.shape[axis]
                 .checked_mul(bits as u64)
                 .is_some_and(|width| width % 32 == 0 && width / 32 == actual[axis])

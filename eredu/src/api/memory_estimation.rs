@@ -304,8 +304,8 @@ pub fn inspected_generation_memory_request(
         workspace,
         attention: options.attention.clone(),
         workspace_overlap: options.workspace_overlap.clone(),
-        cache_update: options.cache_update.clone(),
-        logits: options.logits.clone(),
+        cache_update: options.cache_update,
+        logits: options.logits,
     };
     let mut domain = DomainMemoryPlan {
         domain: MemoryDomain::Unified,

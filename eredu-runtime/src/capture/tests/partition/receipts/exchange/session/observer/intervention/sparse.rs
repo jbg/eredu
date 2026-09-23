@@ -291,7 +291,7 @@ fn invoke(
                     let origin = origins.resolve(start as usize + row).unwrap();
                     for (unit, actual) in values.iter().enumerate() {
                         let global = units.local_to_global(unit).unwrap();
-                        let original = data(&batch.units.values)[row * units.local_count() + unit];
+                        let original = data(batch.units.values)[row * units.local_count() + unit];
                         let expected = if all_keep || origin.token == 1 {
                             original
                         } else if [0, 5].contains(&global) {

@@ -14,24 +14,24 @@ mod partition_sum;
 
 #[path = "components/composite_banks.rs"]
 mod composite_banks;
-#[path = "components/gemma4_components.rs"]
-mod gemma4_components;
 #[path = "components/composite_routed.rs"]
 mod composite_routed;
+#[path = "components/gemma4_components.rs"]
+mod gemma4_components;
 #[path = "components/gemma4_placement.rs"]
 mod gemma4_placement;
 #[path = "components/muse.rs"]
 mod muse;
 #[path = "components/muse_placement.rs"]
 mod muse_placement;
-#[path = "components/qwen_vl.rs"]
-mod qwen_vl;
 #[path = "components/qwen_conditional.rs"]
 mod qwen_conditional;
 #[path = "components/qwen_prediction.rs"]
 mod qwen_prediction;
 #[path = "components/qwen_recurrent.rs"]
 mod qwen_recurrent;
+#[path = "components/qwen_vl.rs"]
+mod qwen_vl;
 
 #[path = "components/nemotron_prediction.rs"]
 mod nemotron_prediction;
@@ -841,7 +841,9 @@ fn lfm2_components_preserve_mixed_state_and_reconstruct_residual_writes() {
             let gain = &final_model.static_modules().norm.weight.data;
             let expected_normalized: Vec<f32> = residual
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|row| {
                     let denominator = (row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / 4.0
                         + readout.normalization.epsilon.value() as f64)
@@ -1604,7 +1606,9 @@ fn qwen_hybrid_components_preserve_mixed_state_and_interleaved_reads() {
                 let gain = &final_model.static_modules().norm.weight.data;
                 let expected_normalized: Vec<f32> = residual
                     .data
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .flat_map(|row| {
                         let denominator = (row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
                             / 8.0
@@ -2412,7 +2416,9 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
             let head = modules.lm_head.as_ref().unwrap();
             let normalized = residual
                 .data
-                .chunks_exact(32)
+                .as_chunks::<32>()
+                .0
+                .iter()
                 .flat_map(|row| {
                     let denominator = (row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / 32.0
                         + readout.normalization.epsilon.value() as f64)
@@ -2428,14 +2434,21 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
                 "declared final RMS equation",
             );
             let scores = normalized
-                .chunks_exact(32)
+                .as_chunks::<32>()
+                .0
+                .iter()
                 .flat_map(|row| {
-                    head.weight.data.chunks_exact(32).map(move |weights| {
-                        row.iter()
-                            .zip(weights)
-                            .map(|(v, w)| *v as f64 * *w as f64)
-                            .sum::<f64>() as f32
-                    })
+                    head.weight
+                        .data
+                        .as_chunks::<32>()
+                        .0
+                        .iter()
+                        .map(move |weights| {
+                            row.iter()
+                                .zip(weights)
+                                .map(|(v, w)| *v as f64 * *w as f64)
+                                .sum::<f64>() as f32
+                        })
                 })
                 .collect::<Vec<_>>();
             assert_tensor_close(
@@ -2443,7 +2456,12 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
                 &output,
                 "GPT-OSS reconstructed full scores",
             );
-            for (expected, actual) in scores.chunks_exact(17).zip(output.data.chunks_exact(17)) {
+            for (expected, actual) in scores
+                .as_chunks::<17>()
+                .0
+                .iter()
+                .zip(output.data.as_chunks::<17>().0.iter())
+            {
                 assert!(((expected[2] - expected[7]) - (actual[2] - actual[7])).abs() < 2e-5);
             }
         }
@@ -3133,7 +3151,7 @@ fn verify_prepared_component_execution_with_topologies(
                 .with_topology(topology)
                 .with_residency(residency.clone());
             let reference_sources = partitioned_adapter::prepare_plan(
-                &inspection,
+                inspection,
                 &reference_plan,
                 0,
                 std::time::Duration::from_secs(10),
@@ -3203,11 +3221,7 @@ fn verify_prepared_component_execution_with_topologies(
             let outputs = std::thread::scope(|scope| {
                 let handles = (0..topology.world_size()).map(|rank| {
                     let world = Arc::clone(&world);
-                    let inspection = inspection;
                     let parameters = &parameters;
-                    let inputs = inputs;
-                    let targets = targets;
-                    let expected = expected;
                     let residency = residency.clone();
                     scope.spawn(move || {
                         use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;

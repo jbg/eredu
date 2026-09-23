@@ -296,8 +296,10 @@ fn native_streamed_parameter_metadata_uses_prepared_bfloat16_dtype() {
         let start = 8 + header_len + tensor["data_offsets"][0].as_u64().unwrap() as usize;
         let end = 8 + header_len + tensor["data_offsets"][1].as_u64().unwrap() as usize;
         let bits: Vec<u16> = bytes[start..end]
-            .chunks_exact(4)
-            .map(|bytes| bf16_bits(f32::from_le_bytes(bytes.try_into().unwrap())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| bf16_bits(f32::from_le_bytes(*bytes)))
             .collect();
         widened.insert(
             id.clone(),

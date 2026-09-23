@@ -427,7 +427,7 @@ pub fn attention_with_softcap(
     }
     if let Some(mask) = mask {
         scores = if mask.dtype() == safemlx::Dtype::Bool {
-            safemlx::ops::r#where(mask, &scores, &Array::from_f32(f32::NEG_INFINITY), stream)?
+            safemlx::ops::r#where(mask, &scores, Array::from_f32(f32::NEG_INFINITY), stream)?
         } else {
             scores
                 .add(mask.as_dtype(score_dtype, stream)?, stream)?

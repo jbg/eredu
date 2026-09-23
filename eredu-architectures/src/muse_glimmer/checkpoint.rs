@@ -50,20 +50,18 @@ pub fn load_time_quantization(
         )?;
         let group = usize::try_from(quantization.group_size())
             .map_err(|_| "negative quantization group size")?;
-        target
-            .vision_config
-            .as_mut()
-            .unwrap()
-            .quantized_weight_configs = tensors
-            .into_iter()
-            .filter(|tensor| {
-                tensor.shape.len() == 2
-                    && tensor.shape[1] > 0
-                    && tensor.shape[1].is_multiple_of(group)
-                    && tensor.shape[1].is_multiple_of(32)
-            })
-            .map(|tensor| (tensor.key, quantization))
-            .collect();
+        if let Some(vision) = &mut target.vision_config {
+            vision.quantized_weight_configs = tensors
+                .into_iter()
+                .filter(|tensor| {
+                    tensor.shape.len() == 2
+                        && tensor.shape[1] > 0
+                        && tensor.shape[1].is_multiple_of(group)
+                        && tensor.shape[1].is_multiple_of(32)
+                })
+                .map(|tensor| (tensor.key, quantization))
+                .collect();
+        }
     }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)

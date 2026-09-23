@@ -3,19 +3,19 @@ use super::*;
 const TEMPLATES: [(&str, &str); 4] = [
     (
         "dense-safetensors",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/dense-safetensors.jinja"),
+        include_str!("../../../tests/fixtures/k2_horizon/text/dense-safetensors.jinja"),
     ),
     (
         "dense-gguf",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/dense-gguf.jinja"),
+        include_str!("../../../tests/fixtures/k2_horizon/text/dense-gguf.jinja"),
     ),
     (
         "mova-safetensors",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/mova-safetensors.jinja"),
+        include_str!("../../../tests/fixtures/k2_horizon/text/mova-safetensors.jinja"),
     ),
     (
         "mova-gguf",
-        include_str!("../../../../eredu-text/tests/fixtures/k2_horizon/mova-gguf.jinja"),
+        include_str!("../../../tests/fixtures/k2_horizon/text/mova-gguf.jinja"),
     ),
 ];
 
@@ -31,7 +31,7 @@ fn tokenizer() -> ChatTokenizer {
 #[test]
 fn ifm_released_templates_prepare_exact_prompts_and_recognize_all_formats() {
     let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../../eredu-text/tests/fixtures/k2_horizon/reference.json"
+        "../../../tests/fixtures/k2_horizon/text/reference.json"
     ))
     .unwrap();
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());

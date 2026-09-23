@@ -383,7 +383,9 @@ fn isolated_paged_snapshots_copy_strided_tails_and_sealed_blocks_across_branches
                 for head in 0..2 {
                     let rows = &rows[head * seq * 2..(head + 1) * seq * 2];
                     let weights = rows
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|v| {
                             (0.7 * (query_values[head * 2] * v[0]
                                 + query_values[head * 2 + 1] * v[1]))
@@ -393,7 +395,9 @@ fn isolated_paged_snapshots_copy_strided_tails_and_sealed_blocks_across_branches
                     let denominator: f32 = weights.iter().sum();
                     for column in 0..2 {
                         oracle.push(
-                            rows.chunks_exact(2)
+                            rows.as_chunks::<2>()
+                                .0
+                                .iter()
                                 .zip(&weights)
                                 .map(|(v, w)| v[column] * w / denominator)
                                 .sum::<f32>(),

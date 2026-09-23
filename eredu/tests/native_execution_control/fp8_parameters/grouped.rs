@@ -3,9 +3,10 @@ use super::*;
 
 fn fixture_banks(partial: bool) -> (Fixture, serde_json::Value, Tensors, Tensors) {
     let root = fixture(false);
-    let source: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../eredu-architectures/tests/fixtures/k2_horizon/reference.json"
-    ))
+    let source: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/k2_horizon/reference.json"
+    )))
     .unwrap();
     let mut config = source["moe"]["config"].clone();
     config["hidden_size"] = if partial { 130 } else { 128 }.into();
@@ -57,7 +58,12 @@ fn fixture_banks(partial: bool) -> (Fixture, serde_json::Value, Tensors, Tensors
         let phase = hash(name) as usize;
         let codes: Vec<_> = (0..count)
             .map(|i| {
-                (0x28 + (i * 13 + phase) % 32) as u8 | if (i + phase) % 3 == 0 { 128 } else { 0 }
+                (0x28 + (i * 13 + phase) % 32) as u8
+                    | if (i + phase).is_multiple_of(3) {
+                        128
+                    } else {
+                        0
+                    }
             })
             .collect();
         let values: Vec<_> = (0..count)
@@ -112,8 +118,10 @@ fn bank_values(id: &str, dense: &Tensors) -> Vec<f32> {
             projections.iter().flat_map(move |projection| {
                 dense[&format!("{prefix}{expert}.{projection}.weight")]
                     .2
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
             })
         })
         .collect()

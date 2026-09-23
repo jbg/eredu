@@ -1465,6 +1465,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)] // Deliberate range-valued validation input.
     fn logical_range_expansion_preserves_encoded_component_ownership() {
         let layout = |units, range| {
             LocalTensorLayout::new(
@@ -1581,6 +1582,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)] // Deliberate range-valued validation input.
     fn chunk_ranges_retain_short_tails_without_padding_or_overflow() {
         assert_eq!(partition_chunk_range(259, 128, 0..2).unwrap(), 0..256);
         assert_eq!(partition_chunk_range(259, 128, 2..3).unwrap(), 256..259);
@@ -1662,6 +1664,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // Deliberate range-valued validation input.
     fn chunk_groups_reject_mismatched_companions_and_segments() {
         for sharding in [
             MemberSharding::PartitionedChunks {

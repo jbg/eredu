@@ -344,7 +344,7 @@ impl Config for ModelArgs {
     }
     fn block_output_normalization(&self, layer: usize) -> Option<String> {
         (!self.skip_loop_final_norm
-            && (layer + 1) % self.physical_layer_count() == 0
+            && (layer + 1).is_multiple_of(self.physical_layer_count())
             && layer + 1 < self.state_layer_count())
         .then(|| format!("model.layers.{layer}.output_norm.weight"))
     }

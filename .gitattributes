@@ -1,1 +1,4 @@
 safemlx-sys/src/mlx-c/patches/*.patch -whitespace
+
+# Released templates must retain their exact rendered line endings on Windows.
+*.jinja text eol=lf

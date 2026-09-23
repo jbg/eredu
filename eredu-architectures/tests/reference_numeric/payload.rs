@@ -206,7 +206,11 @@ pub(super) fn recipe_value(
         }
         DerivedWeightRecipe::NegLog { input } => {
             let value = recipe_value(input, checkpoint, context)?;
-            if value.data.iter().any(|x| !(*x < 0.0)) {
+            if value
+                .data
+                .iter()
+                .any(|x| x.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less))
+            {
                 return Err(Error::backend(
                     "negative-log source must be strictly negative",
                 ));

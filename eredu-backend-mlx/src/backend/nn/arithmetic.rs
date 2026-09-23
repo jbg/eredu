@@ -40,7 +40,7 @@ pub(crate) fn f32_pointwise(
             }
             cell.borrow().as_ref().expect("pointwise kernel initialized").apply_device([input],&config,stream)
         })?;
-        return Ok(output.pop());
+        Ok(output.pop())
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
@@ -137,7 +137,7 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
                 include_str!("exp_f32.metal"),true,false)?); }
             cell.borrow().as_ref().expect("softmax kernel initialized").apply_device([input],&config,stream)
         })?;
-        return Ok(output.pop());
+        Ok(output.pop())
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {

@@ -154,9 +154,11 @@ fn verify(device: LocalDevice) {
             if trial != 0 {
                 for group in &graph.routed_components {
                     for prefill in [true, false] {
-                        let mut schedule = CaptureSchedule::default();
-                        schedule.prefill = prefill;
-                        schedule.decode = !prefill;
+                        let schedule = CaptureSchedule {
+                            prefill,
+                            decode: !prefill,
+                            ..Default::default()
+                        };
                         let slices = if prefill {
                             vec![CaptureSlice {
                                 axis: "token".into(),
@@ -283,7 +285,8 @@ fn verify(device: LocalDevice) {
                             let removed = selected_token
                                 && ((trial == 2 && selected_unit)
                                     || (trial == 3 && !selected_unit)
-                                    || (trial == 7 && (selected_row + component) % 3 == 0));
+                                    || (trial == 7
+                                        && (selected_row + component).is_multiple_of(3)));
                             let scaled = selected_token && (trial == 4 || trial == 8);
                             affected += u64::from(
                                 removed || scaled || (selected_token && (trial == 5 || trial == 6)),

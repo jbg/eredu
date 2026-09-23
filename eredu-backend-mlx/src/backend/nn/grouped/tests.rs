@@ -554,10 +554,10 @@ fn input_precision_sigmoid_routes_preserve_bf16_with_f32_choice_bias() {
         .as_dtype(Dtype::Bfloat16, stream)
         .unwrap();
         let expected = [
-            0.002471923828125f32,
-            0.006683349609375,
-            0.0179443359375,
-            0.04736328125,
+            0.002_471_923_8_f32,
+            0.006_683_349_6,
+            0.017_944_336,
+            0.047_363_28,
             0.119140625,
             0.26953125,
             0.5,
@@ -742,8 +742,8 @@ fn input_precision_routing_rounds_sum_once_after_float_accumulation() {
         };
         // Independent BF16 torch sigmoid scores sum exactly to 0.828125.
         // BF16 additions inside the reduction lose information before its output.
-        let scores = [0.306640625f32, 0.2177734375, 0.158203125, 0.1455078125];
-        let weights = [0.37109375f32, 0.263671875, 0.19140625, 0.17578125];
+        let scores = [0.306_640_63_f32, 0.217_773_44, 0.158_203_13, 0.145_507_81];
+        let weights = [0.37109375f32, 0.263_671_88, 0.19140625, 0.17578125];
         assert_eq!(
             read(&selected.scores),
             ids.iter()

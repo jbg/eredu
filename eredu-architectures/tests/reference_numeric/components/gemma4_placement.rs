@@ -420,7 +420,7 @@ fn run_placements(
                                     || path.ends_with(".residual.scaled.effective")
                                 {
                                     if let Some(expected) = reference[mode][step].1.get(path) {
-                                        assert_tensor_close(actual, expected, &path);
+                                        assert_tensor_close(actual, expected, path);
                                     }
                                 }
                             }

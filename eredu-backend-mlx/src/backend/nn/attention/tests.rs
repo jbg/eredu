@@ -45,7 +45,7 @@ fn bounded_input_score_attention_matches_pytorch_with_broadcast_noncausal_mask()
     )
     .unwrap();
     assert!(actual
-        .all_close(&tensor("output"), 0.0, 0.0, None, stream)
+        .all_close(tensor("output"), 0.0, 0.0, None, stream)
         .unwrap()
         .item::<bool>(stream));
 }

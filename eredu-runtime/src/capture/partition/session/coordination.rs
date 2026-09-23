@@ -240,8 +240,11 @@ where
             self.epoch.value() as u32,
             (self.epoch.value() >> 32) as u32,
         ]);
-        for (word, bytes) in frame[6..14].iter_mut().zip(self.digest.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().expect("digest word"));
+        for (word, bytes) in frame[6..14]
+            .iter_mut()
+            .zip(self.digest.as_chunks::<4>().0.iter())
+        {
+            *word = u32::from_le_bytes(*bytes);
         }
         let gathered = super::super::exchange::gather_capture_words(
             self.transport,
@@ -249,7 +252,7 @@ where
             self.participants,
             &frame,
         )?;
-        for (rank, peer) in gathered.chunks_exact(WORDS).enumerate() {
+        for (rank, peer) in gathered.as_chunks::<WORDS>().0.iter().enumerate() {
             if peer[..6]
                 != [
                     MAGIC,
@@ -269,7 +272,9 @@ where
         // Compare the same rank-major transcript on every rank. A mismatch is a
         // completed common rejection, not merely this rank's private opinion.
         if let Some(rank) = gathered
-            .chunks_exact(WORDS)
+            .as_chunks::<WORDS>()
+            .0
+            .iter()
             .position(|peer| peer[6..14] != gathered[6..14])
         {
             return Err(PartitionCaptureExchangeError::PeerRejected {

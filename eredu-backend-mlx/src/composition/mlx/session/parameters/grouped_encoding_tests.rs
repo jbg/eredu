@@ -246,7 +246,7 @@ fn verify_native_bank(
     // one. Other entries are signed exactly representable E4M3 values.
     let inputs: Vec<_> = (0..groups * 2 * width)
         .map(|i| {
-            if (i % width) % 128 == 0 {
+            if (i % width).is_multiple_of(128) {
                 448.0
             } else {
                 [0.5, -1.0, 2.0, -2.0][i % 4]
@@ -330,7 +330,7 @@ fn verify_native_bank(
             .iter()
             .enumerate()
             .map(|(i, value)| {
-                if (i % width) % 128 == 0 {
+                if (i % width).is_multiple_of(128) {
                     *value
                 } else {
                     *value + 0.037

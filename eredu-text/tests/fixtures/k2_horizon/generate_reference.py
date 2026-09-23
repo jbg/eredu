@@ -117,6 +117,11 @@ def main():
         "gguf":"MBZUAI-IFM/llama.cpp 35999d101cf2233fc54f09c3c8d599da7303ce02 llama-tokenize --stdin --ids --no-bos --no-escape"},
         llama_tokenize_sha256=hashlib.sha256(llama_tokenize.read_bytes()).hexdigest())
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    # Keep the facade's published test archive self-contained.
+    facade = Path(__file__).resolve().parents[4] / "eredu/tests/fixtures/k2_horizon/text"
+    facade.mkdir(parents=True, exist_ok=True)
+    for name in [*(f"{name}.jinja" for name in templates), "reference.json", "provenance.json"]:
+        (facade / name).write_bytes((output / name).read_bytes())
     print(json.dumps(provenance, indent=2))
 
 

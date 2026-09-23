@@ -8,14 +8,15 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use eredu_core::{
-    CollectiveGroupDescriptor, CollectiveGroupId, CompletionCancellationMode, ParallelAxis,
-    ParallelRankTopology, ParallelTopology, checkpoint::TensorDtype, consensus::ConsensusTransport,
+    checkpoint::TensorDtype, consensus::ConsensusTransport, CollectiveGroupDescriptor,
+    CollectiveGroupId, CompletionCancellationMode, ParallelAxis, ParallelRankTopology,
+    ParallelTopology,
 };
 use serde::{Deserialize, Serialize};
 
 mod session_identity;
 pub use session_identity::{
-    AgreedCommunicationSession, CommunicationSessionIdentity, establish_communication_session,
+    establish_communication_session, AgreedCommunicationSession, CommunicationSessionIdentity,
 };
 
 /// Exact rank-local send and receive element counts for a variable exchange.
@@ -1672,7 +1673,7 @@ fn gather_communication_payloads<T: ConsensusTransport>(
         .map(words_for_bytes)
         .max()
         .unwrap_or(0);
-    let local_words = encode_manifest_words(&encoded, payload_words);
+    let local_words = encode_manifest_words(encoded, payload_words);
     let gathered_payloads =
         gather_manifest_words(transport, &local_words, participants, "manifest payloads")?;
 
@@ -3305,14 +3306,12 @@ mod tests {
             CommunicationTopologyCapabilities::RingWithWorldWaves,
         )
         .unwrap();
-        assert!(
-            prepared
-                .manifest()
-                .routes()
-                .iter()
-                .enumerate()
-                .all(|(order, _)| prepared.route_world_wave(order) == Some(true))
-        );
+        assert!(prepared
+            .manifest()
+            .routes()
+            .iter()
+            .enumerate()
+            .all(|(order, _)| prepared.route_world_wave(order) == Some(true)));
 
         let calls = std::cell::Cell::new(0usize);
         let routes = prepared

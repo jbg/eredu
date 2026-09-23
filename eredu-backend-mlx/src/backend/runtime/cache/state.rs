@@ -65,4 +65,6 @@ pub use pooling::{
 };
 
 mod hybrid;
+#[cfg(test)]
+pub(crate) use hybrid::numeric_fixture_values;
 pub use hybrid::{MlxHybridLayerState, MlxHybridState};

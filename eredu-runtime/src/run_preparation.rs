@@ -222,9 +222,9 @@ impl TextPreparationCoordinator {
         ]);
         for (word, bytes) in frame[10..]
             .iter_mut()
-            .zip(self.identity.bytes().chunks_exact(4))
+            .zip(self.identity.bytes().as_chunks::<4>().0.iter())
         {
-            *word = u32::from_le_bytes(bytes.try_into().expect("four-byte identity word"));
+            *word = u32::from_le_bytes(*bytes);
         }
         let prepared = self.exchange_frame(transport, &frame, participants, false);
         // No rank advances merely because its own gather/decoding succeeded.
@@ -278,7 +278,12 @@ impl TextPreparationCoordinator {
         }
         let mut rejected = None;
         let mut cancelled = false;
-        for (rank, peer) in gathered.chunks_exact(TEXT_PREPARATION_WORDS).enumerate() {
+        for (rank, peer) in gathered
+            .as_chunks::<TEXT_PREPARATION_WORDS>()
+            .0
+            .iter()
+            .enumerate()
+        {
             if peer[..6] != frame[..6] || peer[6] != rank as u32 || peer[10..] != frame[10..] {
                 return Err(TextPreparationAgreementError::Protocol(
                     "setup, attempt, stage or rank",

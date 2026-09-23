@@ -530,8 +530,8 @@ pub(in crate::discovery) fn qwen_hybrid_ffn(
 ) -> (String, String) {
     let width = c.hidden_size as usize;
     let (ff, output) = g.sublayer(
-        &block,
-        &join,
+        block,
+        join,
         "feed_forward",
         &format!("{path}.post_attention_layernorm"),
         &format!("{path}.mlp"),

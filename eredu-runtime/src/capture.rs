@@ -473,7 +473,7 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
     slice: &ResolvedCaptureSlice,
     ledger: &mut dyn CaptureReservation,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
-    let usage = backend.estimate(tensor, selection, &slice)?;
+    let usage = backend.estimate(tensor, selection, slice)?;
     record.source_shape = Some(shape);
     record.selected_shape = Some(slice.shape.clone());
     if let Some(reason) = ledger.reserve(usage)? {
@@ -481,7 +481,7 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
         return Ok(());
     }
     record.charged = record.charged.checked_add(usage)?;
-    let transformed = backend.transform(tensor, selection, &slice);
+    let transformed = backend.transform(tensor, selection, slice);
     // A deferred source becomes known only after its reserved factory runs.
     // Preserve that fact even if the subsequent transformation fails.
     record.source_dtype = backend.source_dtype(tensor);

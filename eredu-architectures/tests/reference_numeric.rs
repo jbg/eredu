@@ -1,5 +1,12 @@
 //! Multi-family numerical reference tests using a deterministic scalar backend.
 
+// Scalar reference equations retain explicit indexed axes and full fixture contexts.
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
@@ -7758,9 +7765,9 @@ impl<U> LayerwisePolicy<NumericBackend, U> for RebuildingUnitPolicy {
             address.index(),
         ));
         if self.fail_acquire == Some(ordinal) {
-            return Err(LayerwiseAcquireError::Policy(
-                Error::backend("injected dense-stream acquisition failure"),
-            ));
+            return Err(LayerwiseAcquireError::Policy(Error::backend(
+                "injected dense-stream acquisition failure",
+            )));
         }
         build(context)
             .map(RebuiltUnitLease)
