@@ -549,11 +549,27 @@ fn workspace(
         g.vocabulary_size,
         add(u64::from(request.scalar_bytes.get()), 4)?,
     ])?;
+    // Mixed-width execution may project F32 logits even when persistent state
+    // has a narrower nominal dtype. Widen only that projection payload: the
+    // existing four-byte sampling/probability copy is still charged once.
+    let logits_upper = if g.mixed_precision_parameter_bytes.is_some() {
+        product(&[
+            request.batch_size,
+            logits_positions,
+            g.vocabulary_size,
+            add(u64::from(request.scalar_bytes.get()).max(4), 4)?,
+        ])?
+    } else {
+        logits
+    };
     let linear_upper = execution
         .workspace_overlap
         .upper_live_copies
         .map(|copies| {
-            let bytes = if g.input_score_attention.is_some() || g.gated_convolution.is_some() {
+            let bytes = if g.input_score_attention.is_some()
+                || g.gated_convolution.is_some()
+                || g.mixed_precision_parameter_bytes.is_some()
+            {
                 product(&[
                     request.batch_size,
                     query,
@@ -605,7 +621,9 @@ fn workspace(
     };
     let mut bytes = MemoryBytes {
         lower_bytes: add(linear, logits)?,
-        upper_bytes: linear_upper.map(|upper| add(upper, logits)).transpose()?,
+        upper_bytes: linear_upper
+            .map(|upper| add(upper, logits_upper))
+            .transpose()?,
         kind: ObservationKind::Estimated,
         detail: execution.workspace_overlap.detail.clone(),
     };

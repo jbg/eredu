@@ -354,6 +354,14 @@ extern "C" size_t mlx_array_nbytes(const mlx_array arr) {
     return 0;
   }
 }
+extern "C" size_t mlx_array_identity(const mlx_array arr) {
+  try {
+    return static_cast<size_t>(mlx_array_get_(arr).id());
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 0;
+  }
+}
 extern "C" size_t mlx_array_ndim(const mlx_array arr) {
   try {
     return mlx_array_get_(arr).ndim();

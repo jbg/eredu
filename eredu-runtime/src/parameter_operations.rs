@@ -138,10 +138,10 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
             return Ok(false);
         }
         struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
-        impl<T: Clone> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
+        impl<T: Tensor> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
             fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadata, value: &mut T) {
                 if let Some(replacement) = self.0.get(metadata.id.as_str()) {
-                    *value = replacement.clone();
+                    value.publish_parameter(replacement);
                 }
             }
         }

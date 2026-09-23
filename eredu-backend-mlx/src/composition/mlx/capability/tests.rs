@@ -862,3 +862,61 @@ fn capability_value_never_invents_default() {
     };
     assert!(unsupported.value().is_none());
 }
+
+#[test]
+fn parameter_conversions_are_resident_once_without_changing_logical_parameters() {
+    use eredu_core::residency::{
+        OffloadConfig, OffloadPlan, OffloadTelemetry, OffloadUnitId, OffloadUnitSpec,
+        ResidencyPolicy,
+    };
+    let plan = OffloadPlan::new(
+        OffloadConfig::new(None, None, 1).unwrap(),
+        [OffloadUnitSpec::new(
+            OffloadUnitId::new("weights").unwrap(),
+            8,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let mut telemetry = OffloadTelemetry::from_plan(&plan);
+    telemetry.set_resident_bytes(MemoryTier::Device, 8);
+    let diagnostics = eredu_checkpoint::store::WeightStoreDiagnostics {
+        backend: eredu_checkpoint::store::WeightStoreBackend::Memory,
+        cache_hits: 0,
+        cache_misses: 0,
+        evictions: 0,
+        currently_cached_shards: 0,
+        touched_shard_paths: vec![],
+        payload_shard_paths: vec![],
+        physical_reads: 0,
+        physical_read_bytes: 0,
+        coalesced_group_hits: 0,
+    };
+    let report = eredu_runtime::ResidencyReport::new(
+        true,
+        telemetry.snapshot(),
+        vec![],
+        vec![],
+        diagnostics,
+    )
+    .with_device_parameter_conversion_bytes(16);
+    let facade = static_memory_from_residency(Some(report.clone()), None).unwrap();
+    assert_eq!(facade.logical_parameter_bytes.value(), Some(&8));
+    assert_eq!(facade.current_device_resident_bytes.value(), Some(&24));
+    assert_eq!(
+        facade.current_device_parameter_conversion_bytes.value(),
+        Some(&16)
+    );
+    assert_eq!(facade.planned_disk_backed_bytes.value(), Some(&8));
+    let revoked =
+        static_memory_from_residency(Some(report.with_device_parameter_conversion_bytes(0)), None)
+            .unwrap();
+    assert_eq!(revoked.logical_parameter_bytes.value(), Some(&8));
+    assert_eq!(revoked.current_device_resident_bytes.value(), Some(&8));
+    assert_eq!(
+        revoked.current_device_parameter_conversion_bytes.value(),
+        Some(&0)
+    );
+}

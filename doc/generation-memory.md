@@ -930,6 +930,68 @@ invalidation, 96 backend-conformance tests and 27 portable-facade tests (one
 preexisting ignored case). Strict Clippy passed for the portable contracts,
 architectures, backend and native facade test harness.
 
+### Resident parameter conversion reuse (2026-09-23)
+
+Fully resident MLX dense projections now retain evaluated F32 conversions when
+F32 activations meet F16/BF16 parameters. This covers the mixed-width GGUF case
+without changing BF16 arithmetic or introducing casts for narrow activations.
+Tied aliases share a conversion. Reset preserves it; parameter publication
+revokes it, and dropping the resident owner releases it. Restoring a replaced
+parameter uses temporary casts until a new resident materialization enables reuse.
+Host-layerwise and disk-streamed policies keep temporary casts within their
+existing admission policy. An explicit device-residency ceiling also disables
+conversion retention, so derived storage cannot bypass that ceiling.
+
+`StaticMemoryReport.current_device_parameter_conversion_bytes` is the exact
+retained subset already included in `current_device_resident_bytes`. Do not add
+it again. Logical parameter sizes and bounded-residency ledger/telemetry remain
+the original parameter bytes. Resident session reports query their live owner,
+so later forecasts observe conversions created since loading. Loaded and
+continuation forecasts remove retained conversions from the pending cast allowance
+while preserving promoted activation/state sizing. Cold forecasts still reserve
+the full potential conversion payload; mixed-width detection now applies to all
+covered dense geometries. F32 activation and projection-logit upper allowances
+remain in force even when every cast is already resident; nominal lower bounds
+are unchanged. Neither inspection nor forecasting populates the cache.
+
+Using the same pinned BF16/mixed GGUF, Metal host, zero allocator cache and eight
+greedy output tokens as above, the first 128-position request retained exactly
+4,680,843,264 bytes (4,464.0 MiB). That count remained unchanged after reset and
+repeated 128/2,000-position requests. Measured incremental peaks and forecast
+upper bounds were (MiB):
+
+| Request | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
+|---|---:|---:|---:|---:|
+| 128, cache initially empty | 6450.9 | 4944.2 | 159.6 | 19.7 |
+| 128, conversions resident | 870.9 | 480.2 | 159.6 | 19.7 |
+| 2000, conversions resident | 13452.0 | 1332.1 | 1331.8 | 241.7 |
+
+The earlier 2,000-position continuation required 4,705.7 MiB of additional peak
+memory. Reuse trades those repeated casts for resident storage; smaller additional
+peaks do not imply lower total model memory. Cold lifecycle upper bounds are
+8,683.4/21,264.5 MiB for 128/2,000 positions. The conservative 2,000-position
+forecast still crosses a 16 GiB application budget. Warm eight-token timings
+were 131.2 ms at 128 positions and 1,079–1,116 ms at 2,000; these are local
+observations, not a cross-device throughput guarantee.
+
+Reproduce the memory checks with the preceding native forecast command, the
+pinned GGUF path, `EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000` and
+`EREDU_LFM2_MEMORY_EXPECT_PARAMETER_CONVERSIONS=1`. The latter asserts that the
+public report actually contains the retained conversions and that warm requests
+reuse them. Tests also check unchanged logical bytes, exact device residency
+growth, reset retention, ordinary/controlled forecasts and measured peaks.
+
+Against revision `a43a3171`, all 65,536 logits at each of eight predictions match
+bit-for-bit for both prompt lengths, including prefill, seven cached decode
+steps, raw tokens and ordinary/controlled execution. The same parity command
+above accepts this GGUF path and a reference exported from that revision.
+Focused native tests cover F16/BF16 promotions, alias reuse, narrow-input bypass,
+read-only parameter inspection, publication/restoration invalidation and owner
+release, and explicit device ceilings. The original BF16 SafeTensors checkpoint
+also passed the 128/2,000-position numerical, token, controlled-session and memory
+checks, retaining zero conversions and unchanged measured memory. Portable tests cover cold mixed-width Llama geometry, loaded forecast
+deductions and old JSON reports without the new observation.
+
 ## Focused verification
 
 - Cold chunking follow-up: portable preparation tests cover supported and absent

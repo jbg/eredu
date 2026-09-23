@@ -762,6 +762,7 @@ pub(crate) mod tests {
         counters: IndependentCounters,
         failure: IndependentFailure,
         fp8: bool,
+        half: bool,
         transforms: bool,
     }
 
@@ -772,6 +773,13 @@ pub(crate) mod tests {
                 ..Self::default()
             }
         }
+        pub(crate) fn with_half() -> Self {
+            Self {
+                half: true,
+                ..Self::default()
+            }
+        }
+
         pub(crate) fn with_fp8() -> Self {
             Self {
                 fp8: true,
@@ -828,6 +836,15 @@ pub(crate) mod tests {
 
         fn supports_direct(&self, descriptor: &eredu_runtime::WeightLoweringDescriptor) -> bool {
             use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
+            if self.half
+                && matches!(
+                    descriptor.source(),
+                    SourceTensorEncoding::Safetensors(StoredDtype::BF16 | StoredDtype::F16)
+                        | SourceTensorEncoding::RecipeOutput(StoredDtype::BF16 | StoredDtype::F16)
+                )
+            {
+                return descriptor.executable() == LinearFormat::Dense;
+            }
             if self.fp8
                 && matches!(
                     descriptor.source(),

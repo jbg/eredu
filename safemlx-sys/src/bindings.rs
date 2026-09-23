@@ -209,6 +209,7 @@ extern "C" {
 extern "C" {
     #[doc = " Number of elements in the array."]
     pub fn mlx_array_size(arr: mlx_array) -> usize;
+    pub fn mlx_array_identity(arr: mlx_array) -> usize;
 }
 extern "C" {
     #[doc = " The number of bytes in the array."]

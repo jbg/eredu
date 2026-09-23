@@ -71,14 +71,12 @@ pub fn selected_generation_memory_geometry(
     {
         geometry.workspace = None;
     }
-    if let Some(workspace) = geometry
-        .workspace
-        .as_mut()
-        .filter(|g| g.gated_convolution.is_some() || g.input_score_attention.is_some())
-    {
-        // Mixed-width parameters can promote a hybrid's activations and create
-        // implicit projection-weight casts. This conservative envelope follows
-        // selected task geometry and encodings, not the checkpoint format name.
+    if let Some(workspace) = geometry.workspace.as_mut() {
+        // Mixed-width parameters can promote activations and create implicit
+        // projection-weight casts. Reserve the full potential F32 payload as a
+        // conservative bound, without asserting every parameter is converted.
+        // This follows selected task geometry and encodings for every covered
+        // dense architecture, not the checkpoint format or a family name.
         let nominal = text.state().floating_dtype().map(|d| d.bytes().get());
         let wider = text.materialization_tasks().iter().any(|task| {
             let dtype = task
@@ -96,13 +94,13 @@ pub fn selected_generation_memory_geometry(
                         bytes
                             .checked_mul(dim as u64)
                             .ok_or(CapabilityError::ArithmeticOverflow {
-                                operation: "hybrid parameter promotion",
+                                operation: "mixed-precision parameter promotion",
                             })
                     })?;
                     total
                         .checked_add(cast)
                         .ok_or(CapabilityError::ArithmeticOverflow {
-                            operation: "hybrid parameter promotion",
+                            operation: "mixed-precision parameter promotion",
                         })
                 })?;
             workspace.mixed_precision_parameter_bytes = Some(bytes);
@@ -365,6 +363,73 @@ mod tests {
                 .ordinary_recipe_peak_bytes
                 > 0
         );
+    }
+
+    #[test]
+    fn cold_dense_mixed_width_parameters_bound_potential_promotions() {
+        use crate::preparation_selection::tests::{inspected_llama, BoundedIndependentAdapter};
+        use safetensors::{
+            tensor::{serialize_to_file, Dtype, TensorView},
+            SafeTensors,
+        };
+        let (root, artifact) = inspected_llama();
+        drop(artifact);
+        let path = root.path().join("model.safetensors");
+        let data = std::fs::read(&path).unwrap();
+        let tensors = SafeTensors::deserialize(&data).unwrap();
+        // Retain F32 normalization gains while using BF16 dense matrices. MLX
+        // RMS normalization's result type promotes this mixed input to F32.
+        let values = tensors
+            .tensors()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let dtype = if tensor.shape().len() == 2 {
+                    Dtype::BF16
+                } else {
+                    tensor.dtype()
+                };
+                let bytes =
+                    vec![0u8; tensor.shape().iter().product::<usize>() * dtype.bitsize() / 8];
+                (name, tensor.shape().to_vec(), dtype, bytes)
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            values.iter().map(|(name, shape, dtype, bytes)| {
+                (
+                    name.as_str(),
+                    TensorView::new(*dtype, shape.clone(), bytes).unwrap(),
+                )
+            }),
+            None,
+            &path,
+        )
+        .unwrap();
+        let artifact = crate::configuration::inspect_artifact(root.path()).unwrap();
+        let plan = artifact.architecture_plan().clone();
+        let outcome = crate::inspect_selected_model(
+            artifact,
+            &eredu_runtime::NormalizedLoadRequest::default(),
+            &BoundedIndependentAdapter::with_half(),
+            eredu_core::MediaFeatureAvailability {
+                image: false,
+                audio: false,
+            },
+        );
+        let execution = outcome
+            .selected()
+            .unwrap_or_else(|| panic!("mixed dense selection failed: {outcome:?}"))
+            .preparation()
+            .execution();
+        let geometry = selected_generation_memory_geometry(&plan, execution).unwrap();
+        assert_eq!(geometry.scalar_bytes.get(), 2);
+        let workspace = geometry.workspace.unwrap();
+        assert!(workspace.gated_convolution.is_none());
+        assert!(workspace.input_score_attention.is_none());
+        let expected = values
+            .iter()
+            .map(|(_, shape, _, _)| shape.iter().product::<usize>() as u64 * 4)
+            .sum::<u64>();
+        assert_eq!(workspace.mixed_precision_parameter_bytes, Some(expected));
     }
 
     #[test]

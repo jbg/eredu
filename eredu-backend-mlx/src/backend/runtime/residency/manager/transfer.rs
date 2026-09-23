@@ -95,6 +95,8 @@ pub(super) fn release_backend_copies(
 
 /// Named device arrays retained by one resident unit.
 pub struct ResidentArrays {
+    pub(super) parameter_conversions:
+        Mutex<crate::backend::nn::parameter_conversion::ResidentParameterConversions>,
     pub(super) arrays: BTreeMap<String, Array>,
 }
 
@@ -735,6 +737,7 @@ pub(super) fn ensure_many_resident(
             match tier {
                 MemoryTier::Device => {
                     unit.device = Some(Arc::new(ResidentArrays {
+                        parameter_conversions: Mutex::default(),
                         arrays: item.arrays,
                     }))
                 }

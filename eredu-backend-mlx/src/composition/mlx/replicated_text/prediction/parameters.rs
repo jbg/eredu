@@ -329,7 +329,7 @@ pub(in crate::composition::mlx::replicated_text) struct Publish<'a>(
 impl ParameterSlotVisitor<MlxTensor> for Publish<'_> {
     fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut MlxTensor) {
         if let Some(replacement) = self.0.get(metadata.id.as_str()) {
-            *value = replacement.clone();
+            eredu_nn::Tensor::publish_parameter(value, replacement);
         }
     }
 }

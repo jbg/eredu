@@ -3157,6 +3157,7 @@ mod tests {
                 ),
                 current_host_resident_bytes: unavailable(),
                 current_device_resident_bytes: unavailable(),
+                current_device_parameter_conversion_bytes: unavailable(),
                 planned_disk_backed_bytes: unavailable(),
                 backend_active_allocation_bytes: unavailable(),
                 backend_allocator_cache_bytes: unavailable(),

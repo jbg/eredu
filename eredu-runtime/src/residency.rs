@@ -75,6 +75,7 @@ pub struct ResidencyReport {
     weight_store: WeightStoreDiagnostics,
     unit_sources: BTreeMap<OffloadUnitId, WeightStoreDiagnostics>,
     materialization: Option<WeightMaterializationReport>,
+    device_parameter_conversion_bytes: u64,
 }
 
 impl ResidencyReport {
@@ -94,7 +95,21 @@ impl ResidencyReport {
             weight_store,
             unit_sources: BTreeMap::new(),
             materialization: None,
+            device_parameter_conversion_bytes: 0,
         }
+    }
+
+    /// Additional device payload retained as reusable parameter conversions.
+    /// This is separate from the offload ledger's original parameter bytes.
+    pub const fn device_parameter_conversion_bytes(&self) -> u64 {
+        self.device_parameter_conversion_bytes
+    }
+
+    /// Attaches current reusable conversion residency without changing logical
+    /// checkpoint sizes or the original parameter admission ledger.
+    pub fn with_device_parameter_conversion_bytes(mut self, bytes: u64) -> Self {
+        self.device_parameter_conversion_bytes = bytes;
+        self
     }
 
     /// Returns whether explicit initialization completed successfully.

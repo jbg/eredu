@@ -4918,6 +4918,16 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         self.shape()[axis]
     }
 
+    /// Publishes an already-completed parameter replacement.
+    ///
+    /// Parameter transaction drivers use this infallible publication hook after
+    /// validating and preparing all replacements. Backends may revoke derived
+    /// parameter storage before replacing the handle; ordinary tensor clones and
+    /// read-only parameter inspection do not invalidate that storage.
+    fn publish_parameter(&mut self, replacement: &Self) {
+        *self = replacement.clone();
+    }
+
     /// Allocates an unloaded floating-point parameter tensor.
     fn unloaded_f32(shape: &[i32], context: &Self::Context) -> Result<Self, Error>;
     /// Allocates an unloaded signed 32-bit integer parameter tensor.

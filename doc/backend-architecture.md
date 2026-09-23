@@ -6397,6 +6397,24 @@ Persistent convolution history remains in the state layout. Mixed-width selected
 parameter metadata adds a float32 cast allowance and promoted-state/replacement
 storage above nominal state bytes; it is derived from task shapes and dtypes,
 not checkpoint-format dispatch in a backend.
+Fully resident MLX parameter materializations own lazy F16/BF16-to-F32 conversion
+caches for dense projections, including tied output embeddings. A weak native
+identity registry shares aliases without extending residency; evaluated conversions
+are released with their owner. Bounded host/disk policies do not enable the cache.
+Explicit device-residency ceilings also disable retention rather than allowing
+derived storage to bypass original-parameter admission.
+`safemlx` exposes immutable graph identity through its existing native safety
+boundary; no pointer or native dependency enters portable crates.
+`Tensor::publish_parameter` is the neutral, infallible publication hook used by
+parameter transaction drivers. MLX revokes derived storage before replacing a
+parameter; read-only discovery preserves it. Restored values use ordinary casts
+until a new resident materialization enables reuse.
+Runtime reports conversion payload separately from its original-parameter ledger.
+The backend includes it once in `StaticMemoryReport` device residency and exposes
+the subset as `current_device_parameter_conversion_bytes`. The facade subtracts
+that subset from the remaining parameter-cast workspace allowance, preserving
+promoted activation/state sizing. Cold forecasts retain the full potential cast
+allowance; neither forecasts nor reports populate conversion caches.
 Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
 cache-copy overlap, layer workspace multiplier and graph allowance. Architecture
 preparation retains selected state/workspace geometry in `PreparedModelDiscovery`.

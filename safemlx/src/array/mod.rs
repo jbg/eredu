@@ -284,6 +284,17 @@ impl Array {
         self.c_array
     }
 
+    /// Returns the identity of this immutable graph value.
+    ///
+    /// Shallow clones share an identity; a newly produced value has a distinct
+    /// identity. It is valid only while a clone of the value remains alive and
+    /// must not be treated as a data pointer or a persistent identifier.
+    pub fn graph_identity(&self) -> usize {
+        // SAFETY: this owned handle is live and the native call only reads its
+        // immutable descriptor identity; it does not access tensor contents.
+        unsafe { safemlx_sys::mlx_array_identity(self.as_ptr()) }
+    }
+
     /// New array from a bool scalar.
     pub fn from_bool(val: bool) -> Array {
         let c_array = unsafe { safemlx_sys::mlx_array_new_bool(val) };

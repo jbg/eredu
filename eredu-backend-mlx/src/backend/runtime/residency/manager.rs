@@ -719,6 +719,35 @@ impl ResidencyManager {
         Ok(())
     }
 
+    /// Enables reusable promotions only after all permanent device leases exist.
+    pub(crate) fn enable_resident_parameter_conversions(&self) -> Result<(), ResidencyError> {
+        let state = self.lock()?;
+        // Conversion copies are not reservations in the original-parameter
+        // ledger. Never bypass an explicit device ceiling, including callers
+        // converting a bounded policy into a permanently resident one.
+        if state
+            .control
+            .ledger()
+            .plan()
+            .config()
+            .device_budget_bytes()
+            .is_some()
+        {
+            return Ok(());
+        }
+        for unit in state
+            .storage
+            .values()
+            .filter_map(|unit| unit.device.as_ref())
+        {
+            unit.parameter_conversions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .register(unit.arrays.values());
+        }
+        Ok(())
+    }
+
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
         let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
@@ -728,6 +757,21 @@ impl ResidencyManager {
             units,
             active_window,
             self.inner.sources.primary.source_diagnostics()?,
+        )
+        .with_device_parameter_conversion_bytes(
+            self.lock()?
+                .storage
+                .values()
+                .filter_map(|unit| unit.device.as_ref())
+                .flat_map(|unit| {
+                    unit.parameter_conversions
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .resident_bytes()
+                })
+                .collect::<BTreeMap<_, _>>()
+                .values()
+                .sum(),
         )
         .with_unit_sources(
             self.inner

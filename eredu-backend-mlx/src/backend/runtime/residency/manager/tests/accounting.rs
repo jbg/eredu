@@ -425,3 +425,105 @@ fn ordered_device_window_trims_stale_units_with_unlimited_budget() {
         .iter()
         .all(|unit| !unit.device_resident()));
 }
+
+#[test]
+fn parameter_conversion_residency_is_separate_and_released_on_eviction() {
+    use crate::backend::nn::parameter_conversion::promoted_weight;
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = [0x3f80u16, 0xc010, 0x3e80, 0x3fc0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [(
+            "weight",
+            TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap(),
+        )],
+        None,
+        &dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+    let constrained = manager(
+        Arc::clone(&store),
+        OffloadConfig::new(Some(8), None, 1).unwrap(),
+        [spec(
+            "limited",
+            8,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )],
+        [unit(
+            "limited",
+            [binding("weight", "weight", TensorSelection::Full, 8)],
+        )],
+    );
+    constrained.initialize().unwrap();
+    let limited = constrained
+        .acquire(&id("limited"), MemoryTier::Device)
+        .unwrap();
+    constrained.enable_resident_parameter_conversions().unwrap();
+    let probe = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+    assert!(promoted_weight(
+        &probe,
+        limited.device_value("weight").unwrap(),
+        &cpu_stream()
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        constrained
+            .report()
+            .unwrap()
+            .device_parameter_conversion_bytes(),
+        0
+    );
+    drop(limited);
+    drop(constrained);
+
+    let manager = manager(
+        store,
+        OffloadConfig::new(None, None, 1).unwrap(),
+        [spec(
+            "layer",
+            8,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )],
+        [unit(
+            "layer",
+            [binding("weight", "weight", TensorSelection::Full, 8)],
+        )],
+    );
+    manager.initialize().unwrap();
+    let stream = cpu_stream();
+    let lease = manager.acquire(&id("layer"), MemoryTier::Device).unwrap();
+    let weight = lease.device_value("weight").unwrap().clone();
+    let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+    // Ordinary bounded leases do not retain conversions or increase admission.
+    assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+    assert_eq!(
+        manager
+            .report()
+            .unwrap()
+            .device_parameter_conversion_bytes(),
+        0
+    );
+    manager.enable_resident_parameter_conversions().unwrap();
+    let converted = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+    let report = manager.report().unwrap();
+    assert_eq!(report.device_parameter_conversion_bytes(), 16);
+    assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
+    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Disk), 8);
+    drop(converted);
+    drop(lease);
+    assert!(manager.evict(&id("layer"), MemoryTier::Device).unwrap());
+    assert_eq!(
+        manager
+            .report()
+            .unwrap()
+            .device_parameter_conversion_bytes(),
+        0
+    );
+    assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+}

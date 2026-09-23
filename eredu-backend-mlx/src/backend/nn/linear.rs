@@ -303,7 +303,15 @@ impl PhysicalLinear {
             // original paths; companions are retained unchanged for restoration.
             match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
                 Some(output) => output,
-                None => matmul(input, self.weight.as_ref().transpose(stream)?, stream)?,
+                None => {
+                    let promoted = super::parameter_conversion::promoted_weight(
+                        input,
+                        self.weight.as_ref(),
+                        stream,
+                    )?;
+                    let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
+                    matmul(input, weight.transpose(stream)?, stream)?
+                }
             }
         } else if let Some(quantization) = self.gguf {
             let (ggml_type, endian) = quantization.gguf_iquant().expect("GGUF format");
@@ -337,7 +345,15 @@ impl PhysicalLinear {
         } else {
             match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
                 Some(output) => output,
-                None => matmul(input, self.weight.as_ref().transpose(stream)?, stream)?,
+                None => {
+                    let promoted = super::parameter_conversion::promoted_weight(
+                        input,
+                        self.weight.as_ref(),
+                        stream,
+                    )?;
+                    let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
+                    matmul(input, weight.transpose(stream)?, stream)?
+                }
             }
         };
         if let Some(bias) = self.bias.as_ref() {

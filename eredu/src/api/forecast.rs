@@ -378,7 +378,30 @@ pub(super) fn loaded_forecast(
     }
     let placements =
         eredu_runtime::memory_estimation::static_parameter_placement(&profile.parameters, None)?;
-    let geometry = profile.geometry;
+    let mut geometry = profile.geometry;
+    if let Some(cached) = observed(&profile.parameters.current_device_parameter_conversion_bytes) {
+        if observed(&profile.parameters.current_device_resident_bytes)
+            .is_some_and(|resident| cached > resident)
+        {
+            return Err(failure(
+                "parameter conversions exceed the declared device residency",
+            ));
+        }
+        if let Some(potential) = geometry
+            .workspace
+            .as_mut()
+            .and_then(|g| g.mixed_precision_parameter_bytes.as_mut())
+        {
+            // These retained conversions are already in the parameter baseline.
+            // Keep Some(0) when complete: mixed-width activation/state promotion
+            // still applies even when no further parameter conversion is needed.
+            let reused = (*potential).min(cached);
+            *potential -= reused;
+            if reused != 0 {
+                geometry.assumptions.push(format!("{reused} bytes of resident F32 parameter conversions are reused; only uncached conversions remain in workspace."));
+            }
+        }
+    }
     let overhead = options.backend_overhead.clone().unwrap_or_else(|| {
         match (
             observed(&profile.allocator_cache_limit),
@@ -482,6 +505,9 @@ pub(super) fn loaded_forecast(
         requested_chunk_tokens,
     })
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Forecasts retained cold selection with the library's shared calibration.
 pub fn forecast_inspected_generation(

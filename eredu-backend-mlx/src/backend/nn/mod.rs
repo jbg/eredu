@@ -18,6 +18,7 @@ pub(crate) mod module;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;
 pub(crate) mod normalization;
+pub(crate) mod parameter_conversion;
 pub(crate) mod primitives;
 pub(crate) mod relative_attention;
 pub(crate) mod rope;

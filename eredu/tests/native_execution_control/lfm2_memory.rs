@@ -72,6 +72,11 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
     for length in lengths {
         model.reset().unwrap();
         model.synchronize().unwrap();
+        let before = model.static_memory().unwrap();
+        let converted_before = *before
+            .current_device_parameter_conversion_bytes
+            .value()
+            .unwrap();
         let ids = vec![1; length];
         let baseline = eredu_backend_mlx::allocator_memory()
             .unwrap()
@@ -118,8 +123,15 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             loaded.with_prefill_chunk(1).unwrap().estimate.domains[0].generation_peak,
             loaded.estimate.domains[0].generation_peak
         );
+        let mut expected_workspace = cold.request.domains[0].executions[0].workspace.clone();
+        if let Some(bytes) = expected_workspace
+            .as_mut()
+            .and_then(|w| w.mixed_precision_parameter_bytes.as_mut())
+        {
+            *bytes = bytes.saturating_sub(converted_before);
+        }
         assert_eq!(
-            cold.request.domains[0].executions[0].workspace,
+            expected_workspace,
             loaded.request.domains[0].executions[0].workspace
         );
         assert!(loaded.request.domains[0].executions[0]
@@ -186,7 +198,41 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             "growth {measured_growth}, bound {upper}"
         );
         assert!(continued_growth <= continued_upper);
+        let after = model.static_memory().unwrap();
+        let converted_after = *after
+            .current_device_parameter_conversion_bytes
+            .value()
+            .unwrap();
+        if std::env::var_os("EREDU_LFM2_MEMORY_EXPECT_PARAMETER_CONVERSIONS").is_some() {
+            assert!(
+                converted_after > 0,
+                "mixed-width resident conversions must be reported"
+            );
+            if converted_before > 0 {
+                assert_eq!(
+                    converted_after, converted_before,
+                    "warm generation must reuse conversions"
+                );
+            }
+        }
+        assert_eq!(
+            before.logical_parameter_bytes,
+            after.logical_parameter_bytes
+        );
+        assert_eq!(
+            after.current_device_resident_bytes.value().unwrap()
+                - before.current_device_resident_bytes.value().unwrap(),
+            converted_after - converted_before,
+        );
         model.reset().unwrap();
+        assert_eq!(
+            model
+                .static_memory()
+                .unwrap()
+                .current_device_parameter_conversion_bytes,
+            after.current_device_parameter_conversion_bytes
+        );
+        let warm = model.forecast_token_ids(&ids, settings, &options).unwrap();
         let trace = TraceLimits {
             per_record_bytes: 16384,
             total_bytes: 1 << 20,
@@ -199,8 +245,8 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             .unwrap();
         // Available capacity is a fresh host observation on each forecast.
         ordinary.request.domains[0].budget.available_bytes =
-            loaded.request.domains[0].budget.available_bytes;
-        assert_eq!(ordinary.request, loaded.request);
+            warm.request.domains[0].budget.available_bytes;
+        assert_eq!(ordinary.request, warm.request);
         let mut run = model
             .start_controlled_text(prepared, &[], Default::default(), |_| {
                 ControlFlow::Continue(())
@@ -222,6 +268,7 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             run.run(|_| ControlFlow::Continue(())).unwrap();
         }
         assert_eq!(run.token_ids(), &generated[..run.token_ids().len()]);
+        eprintln!("LFM2 parameter conversions: positions={length}, resident_before={converted_before}, resident_after={converted_after}, warm_additional_upper={}", warm.estimate.domains[0].additional_generation_peak.upper_bytes.unwrap());
         eprintln!("LFM2 memory: model={}, quantized={quantized}, positions={length}, scalar_bytes={}, cold_upper={}, loaded_additional_upper={upper}, measured_growth={measured_growth}, continuation_upper={continued_upper}, continuation_growth={continued_growth}, controlled_forecast={checked_controlled}", path.display(), loaded.request.scalar_bytes, cold.estimate.domains[0].overall_peak.upper_bytes.unwrap());
         eprintln!("LFM2 timing: positions={length}, first_token_ms={:.3}, generation_ms={:.3}, generated_tokens={}", first_token_elapsed.as_secs_f64() * 1000.0, generation_elapsed.as_secs_f64() * 1000.0, generated.len());
         eprintln!(

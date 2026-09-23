@@ -241,6 +241,9 @@ pub(crate) fn static_memory_from_residency(
         crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
     >,
 ) -> Result<StaticMemoryReport, CapabilityError> {
+    let conversions = residency
+        .as_ref()
+        .map(|report| report.device_parameter_conversion_bytes());
     let (mut logical, mut host, mut device, mut disk, cached_shards) =
         if let Some(report) = residency {
             let planned = report.offload().planned_bytes();
@@ -313,10 +316,17 @@ pub(crate) fn static_memory_from_residency(
             add_parameter_observation(&mut disk, bank.owned_bytes())?;
         }
     }
+    if let Some(bytes) = conversions {
+        add_parameter_observation(&mut device, bytes)?;
+    }
     Ok(StaticMemoryReport {
         logical_parameter_bytes: logical,
         current_host_resident_bytes: host,
         current_device_resident_bytes: device,
+        current_device_parameter_conversion_bytes: conversions.map_or_else(
+            || Observed::unavailable("parameter conversion ownership unavailable"),
+            |bytes| Observed::exact(bytes, "resident parameter conversion owners"),
+        ),
         planned_disk_backed_bytes: disk,
         backend_active_allocation_bytes: runtime_counter(
             safemlx::memory::active_memory,
@@ -340,13 +350,9 @@ fn add_parameter_observation(
     extra: u64,
 ) -> Result<(), CapabilityError> {
     if let Observed::Available { value, source, .. } = observation {
-        *value = checked_add(
-            *value,
-            extra,
-            "ordinary and independent bank parameter bytes",
-        )?;
+        *value = checked_add(*value, extra, "resident parameter storage bytes")?;
         if extra != 0 {
-            *source = "ordinary residency plus independently owned bank entries".into();
+            *source = "ordinary residency plus independently owned native parameter storage".into();
         }
     }
     Ok(())

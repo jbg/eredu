@@ -220,6 +220,9 @@ size_t mlx_array_itemsize(const mlx_array arr);
  * Number of elements in the array.
  */
 size_t mlx_array_size(const mlx_array arr);
+
+/** Immutable graph-value identity, shared by shallow copies. */
+size_t mlx_array_identity(const mlx_array arr);
 /**
  * The number of bytes in the array.
  */

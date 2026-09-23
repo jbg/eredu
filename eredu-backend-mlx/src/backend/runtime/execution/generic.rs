@@ -198,7 +198,7 @@ pub(super) struct ParameterPublisher<'a>(
 impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_> {
     fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
         if let Some(replacement) = self.0.get(metadata.id.as_str()) {
-            *value = replacement.clone();
+            eredu_nn::Tensor::publish_parameter(value, replacement);
         }
     }
 }
@@ -443,6 +443,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
         }
+        self.residency.enable_resident_parameter_conversions()?;
         Ok(MlxResidentPolicy {
             units,
             residency: self.residency.clone(),
@@ -489,6 +490,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             self.populator.populate(&mut unit, lease)?;
             populated.push(Some(unit));
         }
+        self.residency.enable_resident_parameter_conversions()?;
         Ok(MlxResidentPolicy {
             units: populated,
             residency: self.residency.clone(),
@@ -544,8 +546,7 @@ where
                 .map_err(|error| Error::Other(Box::new(error)))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::Other(Box::new(error)))
+    ExecutionUnitLayout::new(&graph, counts).map_err(|error| Error::Other(Box::new(error)))
 }
 
 /// Cold preparation for bounded and resident policies.

@@ -484,6 +484,7 @@ fn static_report(semantics: PhysicalMemorySemantics) -> StaticMemoryReport {
         logical_parameter_bytes: Observed::exact(100, "test"),
         current_host_resident_bytes: Observed::exact(100, "test"),
         current_device_resident_bytes: Observed::exact(100, "test"),
+        current_device_parameter_conversion_bytes: Observed::exact(0, "no retained conversions"),
         planned_disk_backed_bytes: Observed::exact(0, "test"),
         backend_active_allocation_bytes: Observed::exact(1000, "global, not extra"),
         backend_allocator_cache_bytes: Observed::exact(1000, "global, not extra"),
@@ -843,8 +844,8 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
     }
 
     // Promotion changes shared K/V and retained outputs, while score scratch
-    // already includes conversion widths. Also include one parameter cast set
-    // plus the extra half-set from this fixture's layer overlap.
+    // already includes conversion widths. Also include promoted projected logits,
+    // one parameter cast set and the overlap fixture's extra half-set.
     r.scalar_bytes = NonZeroU8::new(2).unwrap();
     let base = workspace(&e, &r, 8, 13, 0).unwrap();
     e.workspace
@@ -855,7 +856,10 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
     let g = e.workspace.as_ref().unwrap();
     assert_eq!(
         projected.upper_bytes.unwrap() - base.upper_bytes.unwrap(),
-        (g.query_width * 8 * 2 * 4 + g.query_width * 13 * 2 * 2) * r.batch_size * 2 + 1024 + 512
+        (g.query_width * 8 * 2 * 4 + g.query_width * 13 * 2 * 2) * r.batch_size * 2
+            + g.vocabulary_size * r.batch_size * 2
+            + 1024
+            + 512
     );
 
     let wire = serde_json::to_value(facts).unwrap();
@@ -933,11 +937,29 @@ fn mixed_precision_covers_parameter_casts_and_promoted_state_without_double_char
         .mixed_precision_parameter_bytes = Some(1000);
     let promoted = workspace(&e, &r, 8, 3, 100).unwrap();
     assert_eq!(promoted.lower_bytes, plain.lower_bytes);
-    // One full cast set, half an excess set for a two-layer fixture, and
-    // promoted state/replacement above the nominal state payload.
+    // F32 activation payload (368 scalars per row, 3 rows, 3 live copies),
+    // F32 projected logits (128 scalars) with the existing F32 sampling copy
+    // unchanged, one cast set plus half an excess set, and promoted state.
+    let widened_activations_and_logits = 368 * 3 * 3 * 2 + 128 * 2;
     assert_eq!(
         promoted.upper_bytes.unwrap() - plain.upper_bytes.unwrap(),
-        1000 + 500 + 200
+        widened_activations_and_logits + 1000 + 500 + 200
+    );
+    // All parameter casts can already be resident without undoing activation,
+    // logit or state promotion; Some(0) retains that execution-width evidence.
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .mixed_precision_parameter_bytes = Some(0);
+    let warm = workspace(&e, &r, 8, 3, 100).unwrap();
+    assert_eq!(warm.lower_bytes, plain.lower_bytes);
+    assert_eq!(
+        warm.upper_bytes.unwrap() - plain.upper_bytes.unwrap(),
+        widened_activations_and_logits + 200
+    );
+    assert_eq!(
+        promoted.upper_bytes.unwrap() - warm.upper_bytes.unwrap(),
+        1500
     );
     e.workspace_overlap = WorkspaceOverlap::unknown();
     assert!(workspace(&e, &r, 8, 3, 100).unwrap().upper_bytes.is_none());

@@ -67,7 +67,7 @@ where
     prediction_residency: super::super::prediction::parameters::PredictionResidency,
     prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
     parameter_declarations: Vec<eredu_nn::ParameterMetadata>,
-    resident_report: Option<ResidencyReport>,
+    resident_residency: Option<crate::backend::runtime::residency::manager::ResidencyManager>,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     stream: Stream,
     weights_stream: Stream,
@@ -109,7 +109,7 @@ where
             prediction_residency: Default::default(),
             prepared_parameters: Vec::new(),
             parameter_declarations: Vec::new(),
-            resident_report: None,
+            resident_residency: None,
             materialization: None,
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
@@ -600,8 +600,9 @@ where
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
         let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let residency = policy.residency_manager().clone();
         let resident = policy.into_resident_units(units, context)?;
-        self.resident_report = Some(resident.residency_report()?);
+        self.resident_residency = Some(residency);
         MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
     }
 
@@ -711,9 +712,13 @@ where
                 dense: policy.dense_stream_report()?,
             }),
             None => Ok(MlxExecutionReport {
-                residency: self.resident_report.clone().ok_or_else(|| {
-                    Error::ArchitectureModel("resident report was not captured".into())
-                })?,
+                residency: self
+                    .resident_residency
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::ArchitectureModel("resident telemetry owner was not retained".into())
+                    })?
+                    .report()?,
                 dense: None,
             }),
         }

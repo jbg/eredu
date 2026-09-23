@@ -70,6 +70,10 @@ impl GenerationForecastBackend for MockBackend {
                 logical_parameter_bytes: Observed::exact(4096, "fixture"),
                 current_host_resident_bytes: Observed::exact(0, "fixture"),
                 current_device_resident_bytes: Observed::exact(4096, "fixture"),
+                current_device_parameter_conversion_bytes: Observed::exact(
+                    0,
+                    "no retained conversions",
+                ),
                 planned_disk_backed_bytes: Observed::exact(0, "fixture"),
                 backend_active_allocation_bytes: Observed::exact(
                     999999,

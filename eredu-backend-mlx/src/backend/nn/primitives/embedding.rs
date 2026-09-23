@@ -43,7 +43,13 @@ impl Embedding {
     /// Use this for example when input embedding and output projection
     /// weights are tied.
     pub fn as_linear(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
-        crate::ops::matmul(x, self.weight.value.transpose(stream)?, stream)
+        let promoted = crate::backend::nn::parameter_conversion::promoted_weight(
+            x,
+            self.weight.as_ref(),
+            stream,
+        )?;
+        let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
+        crate::ops::matmul(x, weight.transpose(stream)?, stream)
     }
 }
 

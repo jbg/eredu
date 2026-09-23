@@ -102,6 +102,11 @@ impl Tensor for MlxTensor {
         self.0.shape()
     }
 
+    fn publish_parameter(&mut self, replacement: &Self) {
+        crate::backend::nn::parameter_conversion::invalidate(&self.0);
+        *self = replacement.clone();
+    }
+
     fn unloaded_f32(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::zeros::<f32>(shape, context))
     }

@@ -277,6 +277,13 @@ pub struct StaticMemoryReport {
     /// already-resident bytes of a unified host/device pool; account for host
     /// parameters and any shared backing when constructing a pool baseline.
     pub current_device_resident_bytes: Observed<u64>,
+    /// Resident F32 parameter conversions retained by the execution backend.
+    /// This is a subset of `current_device_resident_bytes`, not extra bytes to
+    /// add again. It excludes original parameters and the allocator free cache.
+    /// Loaded forecasts may deduct these bytes from the remaining F32 parameter
+    /// conversion allowance while keeping them in the resident baseline.
+    #[serde(default = "unreported_parameter_conversions")]
+    pub current_device_parameter_conversion_bytes: Observed<u64>,
     /// Planned logical disk-backed bytes.
     pub planned_disk_backed_bytes: Observed<u64>,
     /// Process-global backend active allocation counter.
@@ -287,6 +294,10 @@ pub struct StaticMemoryReport {
     pub physical_semantics: PhysicalMemorySemantics,
     /// Currently retained checkpoint shard buffers or readers.
     pub currently_cached_shards: Observed<u64>,
+}
+
+fn unreported_parameter_conversions() -> Observed<u64> {
+    Observed::unavailable("resident parameter conversions were not reported")
 }
 
 /// System memory usable as an admission signal.
@@ -1090,6 +1101,10 @@ mod tests {
             logical_parameter_bytes: Observed::exact(1_024, "mock catalog"),
             current_host_resident_bytes: Observed::exact(512, "mock ledger"),
             current_device_resident_bytes: Observed::exact(512, "mock ledger"),
+            current_device_parameter_conversion_bytes: Observed::exact(
+                0,
+                "no retained conversions",
+            ),
             planned_disk_backed_bytes: Observed::exact(0, "mock plan"),
             backend_active_allocation_bytes: Observed::unavailable("no allocator probe"),
             backend_allocator_cache_bytes: Observed::unsupported("no allocator cache"),
@@ -1099,5 +1114,15 @@ mod tests {
         let encoded = serde_json::to_string(&report).unwrap();
         let decoded: StaticMemoryReport = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, report);
+        let mut older = serde_json::to_value(&report).unwrap();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("current_device_parameter_conversion_bytes");
+        let decoded: StaticMemoryReport = serde_json::from_value(older).unwrap();
+        assert!(matches!(
+            decoded.current_device_parameter_conversion_bytes,
+            Observed::Unavailable { .. }
+        ));
     }
 }

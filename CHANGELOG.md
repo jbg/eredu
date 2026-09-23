@@ -4,6 +4,21 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Reused resident parameter conversions
+
+MLX fully resident dense projections reuse F32 conversions of F16/BF16 weights,
+removing repeated GGUF mixed-precision casts. Retained conversions are included
+once in device residency; loaded and continuation forecasts deduct them from
+future cast workspace. Host-layerwise and disk-streamed policies keep temporary
+casts. Parameter publication revokes obsolete conversions; model reset preserves
+valid ones and dropping their residency owner releases them.
+
+`StaticMemoryReport` adds `current_device_parameter_conversion_bytes`. Older JSON
+defaults this observation to unavailable; Rust struct literals need the new field.
+The neutral `Tensor::publish_parameter` hook defaults to clone replacement and lets
+backends invalidate derived storage at actual publication. Measurements and parity
+validation are recorded in [generation memory](doc/generation-memory.md).
+
 ## 2026-09-23 — Recalibrated input-score memory forecasts
 
 Forecasts now account for shared K/V layouts, bounded live tile graphs and retained
