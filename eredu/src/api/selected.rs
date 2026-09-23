@@ -5,6 +5,16 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub use eredu_core::{AllocatorCachePolicyReport, AllocatorCachePolicySource};
+
+/// Observes the cache limit and native provenance atomically without configuring it.
+pub fn local_allocator_cache_policy(
+) -> Result<AllocatorCachePolicyReport, eredu_core::BackendFailure> {
+    eredu_backend_mlx::allocator_cache_policy().map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache policy query")
+    })
+}
+
 /// Discovers hardware available to the MLX backend.
 /// Available memory is a point-in-time estimate, not an allocation guarantee.
 pub fn discover_local_hardware() -> eredu_core::HardwareProfile {
@@ -23,7 +33,8 @@ pub fn local_allocator_cache_limit() -> Result<usize, eredu_core::BackendFailure
 /// for explicit restoration. Coordinate changes with other runtime users.
 pub fn set_local_allocator_cache_limit(bytes: usize) -> Result<usize, eredu_core::BackendFailure> {
     eredu_backend_mlx::set_allocator_cache_limit(bytes).map_err(|error| {
-        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache configuration")
+        eredu_core::BackendFailure::from_error(error)
+            .with_operation("allocator-cache configuration")
     })
 }
 
@@ -43,24 +54,30 @@ impl super::GenerationMemoryOptions {
         placement: super::GenerationMemoryPlacement,
     ) -> Self {
         let mut options = Self::new(input, placement);
-        options.backend_overhead = match local_allocator_cache_limit()
-            .and_then(|limit| allocator_telemetry().map(|memory| (limit, memory.cache_bytes)))
-        {
-            Ok((limit, cached)) => local_allocator_overhead(limit, cached),
-            Err(error) => super::MemoryBytes::unknown(format!(
-                "local allocator-cache observation failed: {error}"
-            )),
-        };
+        options.backend_overhead = observed_local_allocator_overhead();
         options
     }
 }
 
-fn local_allocator_overhead(limit: usize, cached: u64) -> super::MemoryBytes {
-    match u64::try_from(limit) {
-        Ok(limit) => eredu_runtime::memory_forecast::ForecastCalibration::default()
-            .allocator_overhead(limit, cached),
-        Err(_) => super::MemoryBytes::unknown("allocator-cache limit exceeds representable bytes"),
+fn observed_local_allocator_overhead() -> super::MemoryBytes {
+    match local_allocator_cache_policy()
+        .and_then(|policy| allocator_telemetry().map(|memory| (policy, memory.cache_bytes)))
+    {
+        Ok((policy, cached)) => {
+            let mut overhead = local_allocator_overhead(policy.limit_bytes, cached);
+            overhead
+                .detail
+                .push_str(&format!("; native policy provenance: {:?}", policy.source));
+            overhead
+        }
+        Err(error) => super::MemoryBytes::unknown(format!(
+            "local allocator-cache observation failed: {error}"
+        )),
     }
+}
+
+fn local_allocator_overhead(limit: u64, cached: u64) -> super::MemoryBytes {
+    super::ForecastCalibration::default().allocator_overhead(limit, cached)
 }
 
 use super::{DevicePlanError, ExpertCacheBenchmarkError};
@@ -236,12 +253,26 @@ pub const fn default_local_device() -> LocalDevice {
     }
 }
 
+/// Process-global allocator policy, selected before native model realization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalAllocatorCachePolicy {
+    /// Cap an untouched native default at 256 MiB, preserving smaller defaults.
+    /// Explicit settings and earlier initialization always take precedence.
+    #[default]
+    Automatic,
+    /// Preserve the untouched native default across subsequent automatic startup.
+    /// This must be selected before the first model is realized or policy initialized.
+    PreserveNative,
+    /// Explicitly set the process-global byte limit, overriding earlier policy.
+    Fixed(usize),
+}
+
 /// Process-global configuration for the selected local runtime.
 #[derive(Debug, Clone, Default)]
 pub struct LocalRuntimeConfiguration {
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     accelerator_library_path: Option<PathBuf>,
-    allocator_cache_limit: Option<usize>,
+    allocator_cache_policy: LocalAllocatorCachePolicy,
 }
 
 impl LocalRuntimeConfiguration {
@@ -257,7 +288,14 @@ impl LocalRuntimeConfiguration {
 
     /// Sets the selected runtime's process-global allocator-cache limit.
     pub const fn with_allocator_cache_limit(mut self, bytes: usize) -> Self {
-        self.allocator_cache_limit = Some(bytes);
+        self.allocator_cache_policy = LocalAllocatorCachePolicy::Fixed(bytes);
+        self
+    }
+
+    /// Selects automatic, preserved-native or explicit cache policy. Initialization
+    /// is process-global; coordinate it with other MLX users before loading models.
+    pub const fn with_allocator_cache_policy(mut self, policy: LocalAllocatorCachePolicy) -> Self {
+        self.allocator_cache_policy = policy;
         self
     }
 }
@@ -272,8 +310,18 @@ pub fn configure_local_runtime(
             BackendFailure::from_error(error).with_operation("runtime configuration")
         })?;
     }
-    if let Some(bytes) = configuration.allocator_cache_limit {
-        set_local_allocator_cache_limit(bytes)?;
+    match configuration.allocator_cache_policy {
+        LocalAllocatorCachePolicy::Fixed(bytes) => {
+            set_local_allocator_cache_limit(bytes)?;
+        }
+        policy => {
+            eredu_backend_mlx::initialize_allocator_cache_policy(
+                policy == LocalAllocatorCachePolicy::PreserveNative,
+            )
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("allocator-cache initialization")
+            })?;
+        }
     }
     Ok(())
 }
@@ -568,7 +616,10 @@ mod tests {
             super::local_allocator_overhead(8192, 4096).upper_bytes,
             Some(8192 + allowance)
         );
-        assert_eq!(super::local_allocator_overhead(0, u64::MAX).upper_bytes, None);
+        assert_eq!(
+            super::local_allocator_overhead(0, u64::MAX).upper_bytes,
+            None
+        );
     }
 
     #[test]

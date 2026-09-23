@@ -283,6 +283,8 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
         let realized = mlx_device(selected.execution_plan().device())?;
+        crate::initialize_allocator_cache_policy(false)
+            .map_err(|error| planning_backend_error("initialize_allocator_cache", error))?;
         let stream = Stream::try_new_with_device(&realized.device)
             .map_err(|error| planning_backend_error("create_execution_stream", error))?;
         let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))

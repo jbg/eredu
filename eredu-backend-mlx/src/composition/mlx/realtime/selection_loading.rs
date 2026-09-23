@@ -71,6 +71,7 @@ impl MlxRealtimeExecutionContext {
         &self,
         selected: MlxPreparedRealtimeExecution,
     ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
+        crate::initialize_allocator_cache_policy(false)?;
         materialize_realtime_model(
             selected,
             self.world_group.clone(),

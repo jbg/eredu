@@ -32,6 +32,8 @@ int mlx_clear_cache(void);
 int mlx_get_active_memory(size_t* res);
 int mlx_get_cache_memory(size_t* res);
 int mlx_get_cache_limit(size_t* res);
+int mlx_get_cache_policy(size_t* bytes, int* source);
+int mlx_configure_default_cache_policy(size_t* bytes, int* source, size_t ceiling, bool preserve);
 int mlx_get_memory_limit(size_t* res);
 int mlx_get_peak_memory(size_t* res);
 int mlx_reset_peak_memory(void);

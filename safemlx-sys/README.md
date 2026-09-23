@@ -25,6 +25,11 @@ retained. Patch-content identities select fresh extracted source trees, so
 changing a native patch cannot silently reuse an older successful patch stamp.
 The cache-limit query patch provides a locked, non-mutating policy getter for
 CPU, Metal and CUDA allocators, exposed as `mlx_get_cache_limit` in the C API.
+It also stores native cache-policy provenance. `mlx_get_cache_policy` returns
+the limit and origin atomically; `mlx_configure_default_cache_policy` changes
+only untouched defaults under the same allocator lock used by explicit setters.
+Direct MLX setters mark explicit ownership even when the value is unchanged.
+Conditional configuration does not raise smaller native limits or evict cache.
 
 ## Backends
 

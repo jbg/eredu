@@ -47,15 +47,23 @@ impl GenerationForecastBackend for MlxBackend<'_> {
                     .with_operation("forecast execution device")
             })?
             == safemlx::DeviceType::Cpu;
+        let allocator_cache_limit = match crate::allocator_cache_policy() {
+            Ok(policy) => {
+                let source = format!(
+                    "MLX allocator-cache policy {:?}: {} bytes",
+                    policy.source, policy.limit_bytes
+                );
+                geometry.assumptions.push(source.clone());
+                Observed::exact(policy.limit_bytes, source)
+            }
+            Err(error) => Observed::unavailable(error.to_string()),
+        };
         Ok(LoadedMemoryProfile {
             geometry,
             parameters: crate::composition::mlx::capability::static_model_memory(session)?,
             available: crate::composition::mlx::capability::available_memory()?,
             host_execution,
-            allocator_cache_limit: match safemlx::memory::cache_limit() {
-                Ok(limit) => Observed::exact(limit as u64, "current native allocator-cache limit"),
-                Err(error) => Observed::unavailable(error.to_string()),
-            },
+            allocator_cache_limit,
         })
     }
 

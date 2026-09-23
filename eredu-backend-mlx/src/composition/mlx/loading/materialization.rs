@@ -17,6 +17,7 @@ pub(crate) fn materialize_model_plan(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
+    crate::initialize_allocator_cache_policy(false)?;
     let capture_discovery = sources.prepare_discovery(
         eredu_core::ObservationMechanisms {
             activation_tensors: true,

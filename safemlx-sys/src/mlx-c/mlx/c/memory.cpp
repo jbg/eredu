@@ -53,6 +53,28 @@ extern "C" int mlx_get_cache_limit(size_t* res) {
   }
   return 0;
 }
+extern "C" int mlx_get_cache_policy(size_t* bytes, int* source) {
+  try {
+    auto policy = mlx::core::get_cache_policy();
+    *bytes = policy.bytes;
+    *source = static_cast<int>(policy.source);
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_configure_default_cache_policy(size_t* bytes, int* source, size_t ceiling, bool preserve) {
+  try {
+    auto policy = mlx::core::configure_default_cache_policy(ceiling, preserve);
+    *bytes = policy.bytes;
+    *source = static_cast<int>(policy.source);
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_get_peak_memory(size_t* res) {
   try {
     *res = mlx::core::get_peak_memory();

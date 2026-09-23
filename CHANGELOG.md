@@ -4,6 +4,21 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Managed MLX allocator-cache default
+
+Native model realization now caps an untouched MLX allocator-cache default at
+256 MiB, preserving smaller defaults. This process-global policy reduces the
+default forecast allowance and can trade some throughput for lower retention.
+Explicit settings, including direct native setter calls, remain authoritative.
+Applications that need the native policy should configure
+`LocalAllocatorCachePolicy::PreserveNative` before the first model is realized.
+`with_allocator_cache_limit(bytes)` continues to select an explicit limit.
+
+`local_allocator_cache_policy()` reports the native limit and its provenance.
+Forecasts and getters remain observational: a pure cold forecast before runtime
+initialization still reports the policy in force. See
+[generation-memory policy and calibration](doc/generation-memory.md) for details.
+
 ## 2026-09-22 — Experimental memory-accounting lineage archived
 
 `main` was reset and force-pushed to

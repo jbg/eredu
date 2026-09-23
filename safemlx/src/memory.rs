@@ -91,6 +91,63 @@ pub fn cache_limit() -> Result<usize> {
     Ok(bytes)
 }
 
+/// Native provenance of the process-global cache limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLimitSource {
+    /// No setter or runtime policy has configured this allocator.
+    NativeDefault,
+    /// A runtime supplied a ceiling for the untouched native default.
+    ManagedDefault,
+    /// An explicit setter was called, even if it supplied the existing value.
+    Explicit,
+    /// Runtime initialization explicitly preserved the native default.
+    Preserved,
+}
+
+/// Atomically observed native cache limit and its provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheLimitPolicy {
+    /// Current limit, in bytes; existing cached allocations may exceed it.
+    pub bytes: usize,
+    /// How the current policy was selected.
+    pub source: CacheLimitSource,
+}
+
+fn cache_policy_result(bytes: usize, source: i32) -> Result<CacheLimitPolicy> {
+    let source = match source {
+        0 => CacheLimitSource::NativeDefault,
+        1 => CacheLimitSource::ManagedDefault,
+        2 => CacheLimitSource::Explicit,
+        3 => CacheLimitSource::Preserved,
+        _ => return Err(error::Exception::from("unknown native cache policy source")),
+    };
+    Ok(CacheLimitPolicy { bytes, source })
+}
+
+/// Reads the native limit and provenance under one allocator lock. No mutation
+/// or eviction occurs. Direct native setters are reflected in this observation.
+pub fn cache_policy() -> Result<CacheLimitPolicy> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    let (mut bytes, mut source) = (0, 0);
+    check_status(unsafe { safemlx_sys::mlx_get_cache_policy(&mut bytes, &mut source) })?;
+    cache_policy_result(bytes, source)
+}
+
+/// Configures only an untouched native default, atomically with native setters.
+/// Uses the smaller of the existing limit and `ceiling`, or leaves it unchanged
+/// when `preserve` is true. First initialization wins; explicit setters always
+/// take precedence. Existing cache is not evicted. This is process-global.
+pub fn configure_default_cache_policy(ceiling: usize, preserve: bool) -> Result<CacheLimitPolicy> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    let (mut bytes, mut source) = (0, 0);
+    check_status(unsafe {
+        safemlx_sys::mlx_configure_default_cache_policy(&mut bytes, &mut source, ceiling, preserve)
+    })?;
+    cache_policy_result(bytes, source)
+}
+
 /// Sets the process-global MLX memory limit, in bytes.
 ///
 /// Returns the previous limit reported by MLX. This limit applies to

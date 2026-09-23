@@ -241,6 +241,29 @@ pub enum PhysicalMemorySemantics {
     Unknown,
 }
 
+/// Provenance of a process-global native allocator-cache policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocatorCachePolicySource {
+    /// No runtime initialization or explicit setter has configured the limit.
+    NativeDefault,
+    /// The runtime applied its default ceiling to the untouched native policy.
+    ManagedDefault,
+    /// An explicit setter supplied the current limit, even if its value was unchanged.
+    Explicit,
+    /// Runtime initialization deliberately preserved the native default.
+    Preserved,
+}
+
+/// Atomically observed cache limit and provenance; a snapshot, not a reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatorCachePolicyReport {
+    /// Current limit. Existing retention may exceed it until native reclamation.
+    pub limit_bytes: u64,
+    /// Origin tracked at the native allocator, including native setter calls.
+    pub source: AllocatorCachePolicySource,
+}
+
 /// Static checkpoint and current residency observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticMemoryReport {

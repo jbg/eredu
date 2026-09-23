@@ -6403,6 +6403,19 @@ it when no proposed cold cache limit is supplied. This explicit local diagnostic
 may initialize the native allocator. The generic options constructor, portable
 estimator and cold architecture-selection driver do not perform native queries.
 
+The native allocator also retains cache-policy provenance. Its locked getter
+returns the limit and origin together; direct native setters mark explicit
+ownership even for unchanged values. Conditional initialization under that same
+lock caps only untouched defaults at the adapter's 256 MiB ceiling, or records
+an explicit choice to preserve the native policy. The MLX adapter applies this
+native cache policy at target/model realization, including controlled and realtime
+paths. It never applies it during cold selection or forecasting. Selected facade
+configuration exposes automatic, preserved-native and fixed policies; portable
+`AllocatorCachePolicyReport` and `AllocatorCachePolicySource` describe observations.
+Explicit settings and earlier initialization win across sessions. Reclamation is
+still native; existing retention and graph allowances remain in the forecast.
+No new unsafe-code boundary is introduced.
+
 Cold prefix support is an explicit architecture declaration in
 `ReplicatedTextRequirements`, combined with the backend's settled-prefix mechanism
 fact and retained in the selected realization. `SelectedPreparation` applies

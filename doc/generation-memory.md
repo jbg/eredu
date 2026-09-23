@@ -48,9 +48,12 @@ query the allocator's actual current limit. The allowance uses the larger of
 that limit and already retained cache, because lowering the limit may defer
 eviction. An explicit cache limit during cold inspection describes the proposed
 policy; reports after loading observe the policy in force. Query failures and
-arithmetic overflow remain explicit unknowns. A large native default can produce
-a pessimistic forecast; `--mlx-cache-limit-bytes 0` disables retention when that
-is the desired runtime policy.
+arithmetic overflow remain explicit unknowns. Native model realization now applies
+Eredu's 256 MiB cache ceiling to an untouched native default, preserving smaller
+defaults. Explicit limits remain authoritative. Pure cold queries still observe
+the current policy; they do not apply runtime configuration. To forecast with the
+managed default before loading, call `configure_local_runtime(&Default::default())`
+first. `--mlx-cache-limit-bytes 0` disables retention when desired.
 
 On macOS, `discover_local_hardware()` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus
@@ -240,6 +243,33 @@ Both policy and observations are process-global snapshots. Coordinate mutations
 with other users, restore policy on error paths as well, and recreate options
 after policy changes. The native getter also observes changes made outside Rust;
 there is no shadow configuration or mutation-based getter.
+
+`local_allocator_cache_policy()` additionally returns `limit_bytes` and a
+snake_case provenance value: `native_default`, `managed_default`, `explicit`, or
+`preserved`. Native allocator locks protect both fields. Every native setter marks
+the policy explicit, even when its argument equals the existing default; callers
+outside Rust are included. Restoring a saved numeric limit also counts as explicit.
+
+The MLX adapter initializes an untouched policy at native target/model realization,
+including ordinary, controlled and realtime loading. The automatic ceiling is
+256 MiB; CPU's smaller native default stays smaller. Initialization is atomic with
+setters and idempotent across sessions. It never overrides explicit settings or
+an earlier initialization, and does not forcibly evict already retained cache.
+Forecasts continue using `max(limit, retained)` plus their graph/driver allowance.
+This is a process-wide performance/memory tradeoff, not a physical process cap.
+
+Applications can retain the native policy before any model is realized:
+
+```rust,ignore
+use eredu::api::{configure_local_runtime, LocalAllocatorCachePolicy, LocalRuntimeConfiguration};
+configure_local_runtime(&LocalRuntimeConfiguration::default()
+    .with_allocator_cache_policy(LocalAllocatorCachePolicy::PreserveNative))?;
+```
+
+`with_allocator_cache_limit(bytes)` selects an explicit limit and can override
+earlier initialization. Forecasts and policy getters never select a policy as a
+side effect; before runtime initialization, a pure cold forecast can therefore
+still report a large native allowance. Cold selection remains backend-neutral.
 
 Architecture projections reuse normalized state schedules and supply decoder
 workspace dimensions. Runtime planning combines those with selected residency,
@@ -446,6 +476,41 @@ fixture checks and portable domain tests do not establish those native results.
   `InsufficientInformation`; an explicit proposed zero-cache policy reported
   `LikelyFit`. Metal tests and the default-policy CLI observation ran outside
   the sandbox; a denied Metal query remained an explicit unknown.
+- Managed cache-default calibration (2026-09-23): pinned SmolLM-135M above,
+  original weights, Metal on this 256 GiB Mac, 256/2,000 repetitions of ` hello`,
+  512-token prefill chunks, 32 generated tokens, temperature zero. Each case ran
+  in two fresh processes using `target/debug/eredu --model
+  /tmp/eredu-memory-validation/SmolLM-135M --no-auto --raw --max-tokens 32
+  --temperature 0 --prefill-chunk-size 512 --telemetry-json <output>` with
+  `--mlx-cache-limit-bytes 33554432`, `268435456`, or the prior untouched native
+  default (261,134,011,596 bytes on this host; supply that explicit byte limit
+  to reproduce the native-policy comparison after this default-policy change).
+  Checkpoint provenance is unchanged. Median observations:
+
+  | Prompt positions | Cache policy | Decode tokens/s | Retained cache MiB |
+  | --- | --- | --- | --- |
+  | 256 | 32 MiB | 73.84 | 31.6 |
+  | 256 | 256 MiB | 74.47 | 254.8 |
+  | 256 | Native | 75.56 | 419.6 |
+  | 2,000 | 32 MiB | 70.89 | 32.1 |
+  | 2,000 | 256 MiB | 71.21 | 255.5 |
+  | 2,000 | Native | 74.31 | 1,950.4 |
+
+  The selected 256 MiB ceiling traded about 1.4–4.2% decode throughput for
+  lower retention here. This short, single-model calibration does not establish
+  an optimal ceiling for large, routed, distributed or realtime models; those
+  applications can preserve native policy or choose an explicit limit. The
+  native limit is a retention policy, not a strict total-allocation guarantee.
+
+  After rebuilding with managed initialization, the loaded CLI smoke command
+  above with no cache flag reported `likely_fit`, a 268,435,456-byte managed cache
+  limit and a 875,655,276-byte generation upper bound. Native provenance tests
+  run in fresh CPU/Metal processes and cover default configuration, preservation,
+  unchanged-value direct native setters, setter/initializer races, and smaller
+  native defaults. Facade tests also verify that forecasts leave policy untouched.
+  CUDA carries the same native implementation but was not compiled or executed
+  on this macOS validation host.
+
 - `cargo test -p eredu-runtime --lib memory_estimation`: 20 tests, covering
   overlap, placement, state growth, unknowns, overflow and recomputed candidates.
 - `cargo test -p eredu-architectures --lib memory_estimation::tests`: 3 tests.
