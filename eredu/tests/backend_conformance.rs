@@ -1347,7 +1347,7 @@ impl SpeculativeGenerationBackend for MockBackend {
     {
         assert!(matches!(
             request.take_drafting(),
-            SpeculativeDraft::Embedded
+            SpeculativeDraft::Embedded | SpeculativeDraft::External(_)
         ));
         let mut lanes = request.take_lanes();
         let result_cardinality = lanes

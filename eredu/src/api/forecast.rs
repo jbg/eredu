@@ -4,7 +4,7 @@ use eredu_core::{CapabilityError, InputTokenCount, Observed, PhysicalMemorySeman
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
     ForecastCalibration, ForecastExecutionContract, GenerationForecastBackend,
-    GenerationForecastError,
+    GenerationForecastError, SpeculativeForecastBackend, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,9 @@ pub struct GenerationForecastOptions {
 /// Estimate plus the exact descriptive request and execution contract used for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationForecast {
+    /// Selected speculative resource facts for reproducible phase recomputation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<SpeculativeMemoryPlan>,
     /// Computed interval and fit verdict.
     pub estimate: GenerationMemoryEstimate,
     /// Descriptive request for recomputation and inspection.
@@ -36,6 +39,24 @@ pub struct GenerationForecast {
 }
 
 impl GenerationForecast {
+    /// Recomputes an output allowance, retaining both speculative models and
+    /// their transaction/scheduler limits when present.
+    pub fn with_max_output_tokens(&self, tokens: u64) -> Result<Self, GenerationForecastError> {
+        let mut candidate = self.clone();
+        candidate.request.max_output_tokens = Some(tokens);
+        candidate.request.forecast_output_tokens = tokens;
+        if let Some(draft) = candidate
+            .speculative
+            .as_mut()
+            .and_then(|p| p.draft.as_mut())
+        {
+            draft.max_output_tokens = Some(tokens);
+            draft.forecast_output_tokens = tokens;
+        }
+        candidate.reestimate()?;
+        Ok(candidate)
+    }
+
     /// Recomputes a chunk alternative only when the actual request can be chunked.
     pub fn with_prefill_chunk(&self, tokens: u64) -> Result<Self, GenerationForecastError> {
         if tokens == 0 {
@@ -55,8 +76,12 @@ impl GenerationForecast {
     }
 
     fn reestimate(&mut self) -> Result<(), GenerationForecastError> {
-        let mut estimate =
-            eredu_runtime::memory_estimation::estimate_generation_memory(&self.request)?;
+        let mut estimate = match &self.speculative {
+            Some(plan) => {
+                eredu_runtime::memory_forecast::estimate_speculative_memory(&self.request, plan)?
+            }
+            None => eredu_runtime::memory_estimation::estimate_generation_memory(&self.request)?,
+        };
         for assumption in &self.estimate.assumptions {
             if !estimate.assumptions.contains(assumption) {
                 estimate.assumptions.push(assumption.clone());
@@ -93,19 +118,101 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         self.forecast_input(&request.input, request.settings, options, false)
     }
 
-    /// Forecasts a speculative prepared request. Draft/verification storage is
-    /// explicitly unbounded until its concurrent state has a resource projection.
+    /// Forecasts the selected target/drafter, rollback, verification and lookahead
+    /// phases without consuming preparation. Uncovered components remain unknown.
     pub fn forecast_prepared_speculative_generation<D, F>(
         &self,
         request: &PreparedChatSpeculativeGenerationRequest<'_, B, D, F>,
         options: &GenerationForecastOptions,
-    ) -> Result<GenerationForecast, GenerationForecastError> {
+    ) -> Result<GenerationForecast, GenerationForecastError>
+    where
+        B: SpeculativeForecastBackend<D>,
+    {
         let mut forecast = self.forecast_input(&request.input, request.settings, options, false)?;
-        mark_specialized(
-            &mut forecast,
-            "speculative draft and verification state overlap is not projected",
-        )?;
+        self.project_speculation(&mut forecast, &request.drafting, request.options, options)?;
         Ok(forecast)
+    }
+
+    /// Forecasts a raw-token speculative lane with its actual selected drafter.
+    /// Uses the same accounting as prepared ordinary and controlled requests.
+    pub fn forecast_speculative_token_ids<D>(
+        &self,
+        token_ids: &[u32],
+        settings: PreparedChatGenerationSettings,
+        drafting: &eredu_core::SpeculativeDraft<'_, D>,
+        speculative: PreparedChatSpeculativeGenerationOptions,
+        options: &GenerationForecastOptions,
+    ) -> Result<GenerationForecast, GenerationForecastError>
+    where
+        B: SpeculativeForecastBackend<D>,
+    {
+        let mut forecast = self.forecast_token_ids(token_ids, settings, options)?;
+        self.project_speculation(&mut forecast, drafting, speculative, options)?;
+        Ok(forecast)
+    }
+
+    fn project_speculation<D>(
+        &self,
+        forecast: &mut GenerationForecast,
+        drafting: &eredu_core::SpeculativeDraft<'_, D>,
+        speculative: PreparedChatSpeculativeGenerationOptions,
+        options: &GenerationForecastOptions,
+    ) -> Result<(), GenerationForecastError>
+    where
+        B: SpeculativeForecastBackend<D>,
+    {
+        speculative.scheduler.validate()?;
+        let Some(profile) = B::speculative_memory_profile(&self.runtime, drafting)? else {
+            return mark_speculative_forecast(forecast);
+        };
+        if speculative.max_draft_tokens.get() as u64 > profile.proposal_capacity {
+            return Err(failure(
+                "forecast proposal width exceeds the selected drafter capacity",
+            ));
+        }
+        forecast.execution = ForecastExecutionContract {
+            full_pass_reason: Some(
+                "selected speculative transaction uses full-pass prefill".into(),
+            ),
+            logits: LogitsWorkspace::EveryPosition,
+        };
+        forecast.request.prefill_chunk_tokens = forecast.request.input.model_positions.max(1);
+        for domain in &mut forecast.request.domains {
+            for execution in &mut domain.executions {
+                execution.logits = LogitsWorkspace::EveryPosition;
+            }
+        }
+        let draft = profile
+            .draft
+            .map(|profile| {
+                loaded_forecast(
+                    profile,
+                    forecast.request.input,
+                    forecast
+                        .request
+                        .max_output_tokens
+                        .unwrap_or(forecast.request.forecast_output_tokens),
+                    eredu_core::PrefillChunkPolicy::Unchunked,
+                    forecast.execution.clone(),
+                    options,
+                )
+            })
+            .transpose()?;
+        if let Some(draft) = &draft {
+            forecast
+                .estimate
+                .assumptions
+                .extend(draft.estimate.assumptions.clone());
+        }
+        forecast.speculative = Some(SpeculativeMemoryPlan {
+            draft: draft.map(|f| f.request),
+            auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
+            sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,
+            max_draft_tokens: speculative.max_draft_tokens.get() as u64,
+            scheduler: speculative.scheduler,
+            shared_allocator: profile.shared_allocator,
+        });
+        forecast.reestimate()
     }
 
     fn forecast_input(
@@ -223,10 +330,12 @@ fn mark_specialized(
     reason: &str,
 ) -> Result<(), GenerationForecastError> {
     forecast.execution.full_pass_reason = Some(reason.into());
+    forecast.speculative = None;
     forecast.execution.logits = LogitsWorkspace::EveryPosition;
     forecast.request.prefill_chunk_tokens = forecast.request.input.model_positions.max(1);
     for domain in &mut forecast.request.domains {
-        domain.staging = MemoryBytes::unknown(reason);
+        domain.staging.upper_bytes = None;
+        domain.staging.detail = format!("{}; {reason}", domain.staging.detail);
         for execution in &mut domain.executions {
             execution.logits = LogitsWorkspace::EveryPosition;
         }
@@ -243,6 +352,7 @@ fn loaded_forecast(
     contract: ForecastExecutionContract,
     options: &GenerationForecastOptions,
 ) -> Result<GenerationForecast, GenerationForecastError> {
+    let unified = profile.parameters.physical_semantics == PhysicalMemorySemantics::Unified;
     if profile.host_execution {
         profile.parameters.physical_semantics = PhysicalMemorySemantics::Unified;
     }
@@ -264,7 +374,7 @@ fn loaded_forecast(
     let separate = profile.parameters.physical_semantics == PhysicalMemorySemantics::SeparateTiers;
     for (mut domain, mut parameters) in placements {
         let executes = !separate || matches!(domain, MemoryDomain::Device(_));
-        if profile.host_execution {
+        if profile.host_execution && !unified {
             domain = MemoryDomain::Host;
         }
         let already_resident_bytes = parameters.lower_bytes;
@@ -344,6 +454,7 @@ fn loaded_forecast(
     estimate.assumptions.extend(geometry.assumptions);
     estimate.assumptions.push("Loaded request: loading is excluded; only declared resident parameter bytes are deducted, never process-global active allocation counters.".into());
     Ok(GenerationForecast {
+        speculative: None,
         request,
         estimate,
         execution: contract,
@@ -398,6 +509,7 @@ pub fn forecast_inspected_generation(
         .assumptions,
     );
     Ok(GenerationForecast {
+        speculative: None,
         request,
         estimate,
         execution,

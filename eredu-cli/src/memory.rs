@@ -2,11 +2,10 @@
 use super::*;
 use eredu::api::{
     forecast_inspected_generation, ForecastCalibration, GenerationForecast,
-    GenerationForecastBackend, GenerationForecastOptions, GenerationMemoryEstimate,
-    GenerationMemoryOptions, GenerationMemoryPlacement, MemoryBudget, MemoryBytes, MemoryDomain,
-    MemoryFit,
+    GenerationForecastOptions, GenerationMemoryEstimate, GenerationMemoryOptions,
+    GenerationMemoryPlacement, MemoryBudget, MemoryBytes, MemoryDomain, MemoryFit,
+    SpeculativeForecastBackend,
 };
-use eredu_runtime::memory_estimation::{estimate_generation_memory, GenerationMemoryRequest};
 
 #[derive(Serialize)]
 pub(super) struct Report {
@@ -82,17 +81,21 @@ pub(super) fn report(
         reserve_bytes: args.memory_reserve_bytes,
         ..MemoryBudget::default()
     };
-    let forecast =
+    let mut forecast =
         forecast_inspected_generation(&inspection, &options, &ForecastCalibration::default())?;
+    if !matches!(plan.drafting(), DraftingPlan::Disabled) {
+        eredu::api::mark_speculative_forecast(&mut forecast)?;
+    }
     finish_report(args, forecast)
 }
 
-pub(super) fn report_loaded<B: GenerationForecastBackend>(
+pub(super) fn report_loaded<B: SpeculativeForecastBackend<D>, D>(
     args: &Cli,
     model: &LoadedModel<B>,
     tokens: &[u32],
     settings: PreparedChatGenerationSettings,
-    speculative: bool,
+    drafting: Option<&eredu_core::SpeculativeDraft<'_, D>>,
+    speculative: PreparedChatSpeculativeGenerationOptions,
 ) -> Result<Report> {
     let options = GenerationForecastOptions {
         budget: MemoryBudget {
@@ -106,10 +109,16 @@ pub(super) fn report_loaded<B: GenerationForecastBackend>(
         },
         ..GenerationForecastOptions::default()
     };
-    let mut forecast = model.forecast_token_ids(tokens, settings, &options)?;
-    if speculative {
-        eredu::api::mark_speculative_forecast(&mut forecast)?;
-    }
+    let forecast = match drafting {
+        Some(drafting) => model.forecast_speculative_token_ids(
+            tokens,
+            settings,
+            drafting,
+            speculative,
+            &options,
+        )?,
+        None => model.forecast_token_ids(tokens, settings, &options)?,
+    };
     finish_report(args, forecast)
 }
 
@@ -140,7 +149,7 @@ fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
                 let candidate = forecast.with_prefill_chunk(chunk)?;
                 add_candidate_advice(
                     estimate,
-                    &candidate.request,
+                    &candidate.estimate,
                     &format!("--prefill-chunk-size {chunk}"),
                     &mut recommendations,
                 )?;
@@ -152,11 +161,10 @@ fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
         ));
     }
     if let Some(output) = request.max_output_tokens.filter(|n| *n > 1) {
-        let mut candidate = request.clone();
-        candidate.max_output_tokens = Some(output / 2);
+        let candidate = forecast.with_max_output_tokens(output / 2)?;
         add_candidate_advice(
             estimate,
-            &candidate,
+            &candidate.estimate,
             &format!("--max-tokens {}", output / 2),
             &mut recommendations,
         )?;
@@ -186,11 +194,10 @@ fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
 
 fn add_candidate_advice(
     original: &GenerationMemoryEstimate,
-    candidate: &GenerationMemoryRequest,
+    estimate: &GenerationMemoryEstimate,
     label: &str,
     advice: &mut Vec<String>,
 ) -> Result<()> {
-    let estimate = estimate_generation_memory(candidate)?;
     for (before, after) in original.domains.iter().zip(&estimate.domains) {
         if let (Some(before), Some(after_peak)) = (
             before.generation_peak.upper_bytes,

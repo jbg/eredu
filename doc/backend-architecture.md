@@ -6385,6 +6385,19 @@ plans and trace limits shared by ordinary and controlled preparation. Runtime
 places costs in physical pools, counts unified backing once, preserves existing
 costs and unknowns, and performs checked arithmetic without consuming admission.
 
+`SpeculativeForecastBackend<D>` supplies immutable selected-drafter resource
+facts. MLX derives independent autoregressive draft geometry from the retained
+architecture discovery and reports its own residency, placement and sampling
+calibration. The runtime owns single-lane speculative phase accounting: joint
+canonical state, rollback/seed copies, K+1 verification and replay, configured
+optimistic overlap, distributions, host histories and physical-pool comparisons.
+The facade composes target and draft facts for the same prepared request used by
+ordinary and controlled speculative drivers and retains a serializable plan for
+recomputation. The CLI consumes it, including shorter-output alternatives.
+Embedded/feature-conditioned mechanisms remain explicitly uncovered until their
+architecture-owned auxiliary state and feature geometry is supplied; native
+adapters must not infer those facts from family names or checkpoints.
+
 The existing `safemlx::system` native observation boundary reads macOS Mach host
 VM statistics and releases the host port after querying. Available physical memory
 is estimated from free (including speculative) plus inactive pages, using the host

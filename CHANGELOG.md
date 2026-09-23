@@ -4,6 +4,17 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Speculative generation memory forecasts
+
+Loaded independent autoregressive drafting now has a bounded planning envelope
+when both models have ordinary workspace coverage. Prepared-request and
+raw-token facade calls account for both models, rollback/replay, verification,
+sampling and configured lookahead. Forecasts retain a serializable speculative
+plan; output-limit alternatives recompute both models. The CLI uses this path.
+Embedded heads, feature-conditioned assistants and cold reports without a
+realized drafter retain explicit unknowns. See
+[speculative forecast coverage](doc/generation-memory.md#speculative-requests).
+
 ## 2026-09-23 — Managed MLX allocator-cache default
 
 Native model realization now caps an untouched MLX allocator-cache default at

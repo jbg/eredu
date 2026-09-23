@@ -9,6 +9,8 @@ use std::num::NonZeroU8;
 
 mod capture;
 pub use capture::apply_capture_memory_bound;
+mod speculative;
+pub use speculative::*;
 
 /// Portable forecast failures retain native sources and typed policy errors.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +99,7 @@ pub struct LoadedMemoryGeometry {
 }
 
 /// Native observations; portable policy performs the physical-pool accounting.
+#[derive(Clone)]
 pub struct LoadedMemoryProfile {
     /// Geometry retained by architecture-owned preparation.
     pub geometry: LoadedMemoryGeometry,

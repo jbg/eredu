@@ -2434,7 +2434,16 @@ fn main() -> Result<()> {
             &model,
             &prompt_token_ids,
             settings,
-            drafting.is_enabled(),
+            drafting.as_speculative_draft().as_ref(),
+            PreparedChatSpeculativeGenerationOptions {
+                max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
+                    .unwrap_or(NonZeroUsize::MIN),
+                scheduler: SpeculativeSchedulerOptions {
+                    adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
+                    ..SpeculativeSchedulerOptions::default()
+                }
+                .with_lookahead(!args.disable_speculative_lookahead),
+            },
         ) {
             Ok(report) => memory::advise(&args, &report)?,
             Err(error) => {

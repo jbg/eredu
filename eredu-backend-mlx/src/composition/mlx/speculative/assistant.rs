@@ -270,6 +270,36 @@ impl Drop for DrafterOperation<'_> {
 }
 
 impl MlxDrafter {
+    /// Immutable facts for independent drafting; observing this does not acquire
+    /// mutation authority, synchronize work or allocate an execution state.
+    pub(crate) fn autoregressive_memory_profile(
+        &self,
+        mut profile: eredu_runtime::memory_forecast::LoadedMemoryProfile,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::LoadedMemoryProfile>,
+        eredu_runtime::memory_forecast::GenerationForecastError,
+    > {
+        let DrafterExecution::Autoregressive { model, .. } = &self.payload.execution else {
+            return Ok(None);
+        };
+        profile.geometry = model.memory_geometry()?;
+        profile.parameters = crate::composition::mlx::capability::static_memory_from_residency(
+            model
+                .residency_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+            model
+                .parameter_bank_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+        )?;
+        profile.host_execution = self
+            .stream()
+            .get_device()
+            .and_then(|d| d.get_type())
+            .map_err(eredu_core::BackendFailure::from_error)?
+            == safemlx::DeviceType::Cpu;
+        Ok(Some(profile))
+    }
+
     fn begin_operation(&mut self) -> Result<DrafterOperation<'_>, Error> {
         crate::backend::submission_recovery::reap();
         ordinary_retirement::reclaim();

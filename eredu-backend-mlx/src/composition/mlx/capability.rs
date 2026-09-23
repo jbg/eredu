@@ -229,6 +229,18 @@ pub fn static_model_memory(
     let residency = session
         .residency_report()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    let banks = session
+        .parameter_bank_report()
+        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+    static_memory_from_residency(residency, banks)
+}
+
+pub(crate) fn static_memory_from_residency(
+    residency: Option<eredu_runtime::ResidencyReport>,
+    banks: Option<
+        crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
+    >,
+) -> Result<StaticMemoryReport, CapabilityError> {
     let (mut logical, mut host, mut device, mut disk, cached_shards) =
         if let Some(report) = residency {
             let planned = report.offload().planned_bytes();
@@ -292,10 +304,7 @@ pub fn static_model_memory(
     // Independently addressable parameters are excluded from ordinary block
     // residency. Count each bank's owned entries once, even when banks share
     // the same physical pool and its aggregate telemetry.
-    if let Some(banks) = session
-        .parameter_bank_report()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?
-    {
+    if let Some(banks) = banks {
         for bank in banks.banks().values() {
             add_parameter_observation(&mut logical, bank.owned_bytes())?;
             add_parameter_observation(&mut host, bank.host_resident_bytes())?;

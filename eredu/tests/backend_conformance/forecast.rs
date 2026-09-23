@@ -2,7 +2,7 @@ use super::*;
 use eredu::api::{
     ForecastExecutionContract, GenerationForecastOptions, LogitsWorkspace, MemoryBytes, MemoryFit,
 };
-use eredu_core::AvailableMemory;
+use eredu_core::{generation::SpeculativeSchedulerOptions, AvailableMemory};
 use eredu_runtime::memory_estimation::WorkspaceGeometry;
 use eredu_runtime::memory_forecast::GenerationForecastError;
 use eredu_runtime::memory_forecast::{
@@ -87,6 +87,195 @@ impl GenerationForecastBackend for MockBackend {
             } else {
                 LogitsWorkspace::FinalPosition
             },
+        }
+    }
+}
+
+impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for MockBackend {
+    fn speculative_memory_profile(
+        runtime: &ModelRuntime<Self>,
+        drafting: &eredu_core::SpeculativeDraft<'_, MockDrafter>,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
+        GenerationForecastError,
+    > {
+        if !matches!(drafting, eredu_core::SpeculativeDraft::External(_)) {
+            return Ok(None);
+        }
+        Ok(Some(
+            eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                draft: Some(Self::loaded_memory_profile(runtime)?),
+                auxiliary_bytes_per_position: MemoryBytes::exact(0),
+                sampling_bytes_per_vocabulary_entry: MemoryBytes::estimated(
+                    0,
+                    128,
+                    "fixture sampling",
+                ),
+                proposal_capacity: 4,
+                shared_allocator: true,
+            },
+        ))
+    }
+}
+
+#[test]
+fn speculative_forecast_borrows_the_prepared_request_and_preserves_facts_on_recompute() {
+    let (model, chat, settings) = setup();
+    let mut drafter = MockDrafter;
+    let request = PreparedChatSpeculativeGenerationRequest {
+        input: PreparedChatInput::token_ids(&chat, vec![1; 17]),
+        drafting: eredu_core::SpeculativeDraft::External(&mut drafter),
+        settings,
+        options: Default::default(),
+        caller_stop_sequences: &[],
+        cancellation: Default::default(),
+        on_event: |_: SemanticEvent| panic!("forecast must not invoke callbacks"),
+    };
+    let forecast = model
+        .forecast_prepared_speculative_generation(&request, &Default::default())
+        .unwrap();
+    assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(forecast.execution.logits, LogitsWorkspace::EveryPosition);
+    assert_eq!(forecast.request.prefill_chunk_tokens, 17);
+    assert_eq!(
+        forecast
+            .speculative
+            .as_ref()
+            .unwrap()
+            .draft
+            .as_ref()
+            .unwrap()
+            .domains[0]
+            .already_resident_bytes,
+        4096
+    );
+    let raw = model
+        .forecast_speculative_token_ids(
+            &[1; 17],
+            settings,
+            &request.drafting,
+            request.options,
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(forecast.estimate, raw.estimate);
+    assert_eq!(forecast.speculative, raw.speculative);
+    assert_eq!(
+        forecast.with_prefill_chunk(1).unwrap().estimate,
+        forecast.estimate
+    );
+    let shorter = forecast.with_max_output_tokens(2).unwrap();
+    assert_eq!(shorter.request.max_output_tokens, Some(2));
+    assert_eq!(
+        shorter
+            .speculative
+            .as_ref()
+            .unwrap()
+            .draft
+            .as_ref()
+            .unwrap()
+            .max_output_tokens,
+        Some(2)
+    );
+    assert!(
+        shorter.estimate.domains[0].generation_peak.upper_bytes
+            <= forecast.estimate.domains[0].generation_peak.upper_bytes
+    );
+    assert_eq!(
+        shorter.estimate.domains[0].phases[0].parameters.lower_bytes,
+        8192
+    );
+    let json = serde_json::to_value(&forecast).unwrap();
+    assert_eq!(
+        json["estimate"]["domains"][0]["phases"][2]["phase"],
+        "speculative_verification"
+    );
+    let decoded: eredu::api::GenerationForecast = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded.with_max_output_tokens(2).unwrap().estimate,
+        shorter.estimate
+    );
+}
+
+#[test]
+fn unsupported_speculative_mechanisms_stay_unknown_and_capacity_is_enforced() {
+    let (model, _, settings) = setup();
+    let embedded = eredu_core::SpeculativeDraft::<MockDrafter>::Embedded;
+    let forecast = model
+        .forecast_speculative_token_ids(
+            &[1; 17],
+            settings,
+            &embedded,
+            Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(forecast.estimate.fit, MemoryFit::InsufficientInformation);
+    assert!(forecast.speculative.is_none());
+    assert_eq!(
+        forecast.with_max_output_tokens(2).unwrap().estimate.fit,
+        MemoryFit::InsufficientInformation
+    );
+    let mut drafter = MockDrafter;
+    let external = eredu_core::SpeculativeDraft::External(&mut drafter);
+    let options = PreparedChatSpeculativeGenerationOptions {
+        max_draft_tokens: NonZeroUsize::new(5).unwrap(),
+        ..Default::default()
+    };
+    assert!(model
+        .forecast_speculative_token_ids(&[1; 17], settings, &external, options, &Default::default())
+        .is_err());
+}
+
+#[test]
+fn forecasting_preserves_controlled_and_uninterrupted_speculative_parity() {
+    for reject in [false, true] {
+        for lookahead in [false, true] {
+            let mut outcomes = Vec::new();
+            let mut forecasts = Vec::new();
+            for controlled in [false, true] {
+                let (mut model, chat, mut settings) = setup();
+                settings.overrides.max_new_tokens = Some(6);
+                let mut drafter = MockDrafter;
+                let request = PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::token_ids(
+                        &chat,
+                        if reject {
+                            vec![CONTROL_REJECTION_PROMPT_TOKEN]
+                        } else {
+                            vec![3, 4]
+                        },
+                    ),
+                    drafting: eredu_core::SpeculativeDraft::External(&mut drafter),
+                    settings,
+                    options: PreparedChatSpeculativeGenerationOptions {
+                        scheduler: SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
+                        ..Default::default()
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_: SemanticEvent| {},
+                };
+                let forecast = model
+                    .forecast_prepared_speculative_generation(&request, &Default::default())
+                    .unwrap();
+                assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+                forecasts.push(forecast.estimate);
+                // Execute the very request just borrowed by forecasting.
+                let output = if controlled {
+                    model
+                        .with_controlled_text_speculative(request, Default::default(), |session| {
+                            while session.step()?.is_some() {}
+                            Ok(())
+                        })
+                        .unwrap()
+                } else {
+                    model.generate_prepared_text_speculative(request).unwrap()
+                };
+                outcomes.push(output.token_ids().to_vec());
+            }
+            assert_eq!(outcomes[0], outcomes[1]);
+            assert_eq!(forecasts[0], forecasts[1]);
         }
     }
 }

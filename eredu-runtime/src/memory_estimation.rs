@@ -55,7 +55,7 @@ impl MemoryBytes {
         }
     }
 
-    fn validate(&self) -> Result<(), CapabilityError> {
+    pub(crate) fn validate(&self) -> Result<(), CapabilityError> {
         if self
             .upper_bytes
             .is_some_and(|upper| upper < self.lower_bytes)
@@ -83,7 +83,7 @@ impl MemoryBytes {
         })
     }
 
-    fn maximum(&self, other: &Self) -> Self {
+    pub(crate) fn maximum(&self, other: &Self) -> Self {
         Self {
             lower_bytes: self.lower_bytes.max(other.lower_bytes),
             upper_bytes: self
@@ -95,7 +95,7 @@ impl MemoryBytes {
         }
     }
 
-    fn additional(&self, already_resident: u64) -> Self {
+    pub(crate) fn additional(&self, already_resident: u64) -> Self {
         Self {
             lower_bytes: self.lower_bytes.saturating_sub(already_resident),
             upper_bytes: self.upper_bytes.map(|n| n.saturating_sub(already_resident)),
@@ -322,6 +322,12 @@ pub enum MemoryPhase {
     Prefill,
     /// Cached autoregressive execution at the output allowance or forecast horizon.
     Decode,
+    /// Tentative assistant advancement, including rollback and copy overlap.
+    SpeculativeDraft,
+    /// Target block verification, possibly overlapping optimistic drafting.
+    SpeculativeVerification,
+    /// Accepted-prefix replay and canonical draft advancement.
+    SpeculativeCommit,
 }
 
 /// Explainable simultaneous contributions at a phase peak.
@@ -516,7 +522,7 @@ fn workspace(
     })
 }
 
-fn phase(
+pub(crate) fn phase(
     plan: &DomainMemoryPlan,
     request: &GenerationMemoryRequest,
     phase: MemoryPhase,
@@ -593,7 +599,7 @@ fn phase(
     })
 }
 
-fn fit(
+pub(crate) fn fit(
     bytes: &MemoryBytes,
     already_resident: u64,
     budget: &MemoryBudget,

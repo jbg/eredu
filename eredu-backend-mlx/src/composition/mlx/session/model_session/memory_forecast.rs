@@ -6,6 +6,51 @@ use eredu_runtime::memory_forecast::{
     ForecastExecutionContract, GenerationForecastBackend, LoadedMemoryProfile,
 };
 
+impl
+    eredu_runtime::memory_forecast::SpeculativeForecastBackend<
+        crate::composition::mlx::speculative::MlxDrafter,
+    > for MlxBackend<'_>
+{
+    fn speculative_memory_profile(
+        runtime: &ModelRuntime<Self>,
+        drafting: &eredu_core::SpeculativeDraft<
+            '_,
+            crate::composition::mlx::speculative::MlxDrafter,
+        >,
+    ) -> Result<
+        Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
+        GenerationForecastError,
+    > {
+        let eredu_core::SpeculativeDraft::External(drafter) = drafting else {
+            // Embedded prediction retains architecture-specific feature and head
+            // state beyond the ordinary target geometry. Do not guess its bound.
+            return Ok(None);
+        };
+        let target = Self::loaded_memory_profile(runtime)?;
+        if drafter.topology() == eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit
+            && target.parameters.physical_semantics != eredu_core::PhysicalMemorySemantics::Unified
+        {
+            // Cross-device copies need exact separate-pool identities/placement.
+            return Ok(None);
+        }
+        let Some(draft) = drafter.autoregressive_memory_profile(target)? else {
+            // Feature-conditioned assistants require their own architecture
+            // projection, including the captured target features they retain.
+            return Ok(None);
+        };
+        Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+            draft: Some(draft),
+            auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(0),
+            sampling_bytes_per_vocabulary_entry: eredu_runtime::memory_estimation::MemoryBytes::estimated(
+                0, 128,
+                "MLX speculative sampling calibration v1: 32 float32/index rows per live distribution for logits processing, filtering, normalization and residual sampling; planning envelope, not a kernel allocation guarantee",
+            ),
+            proposal_capacity: drafter.selected().requirements().strategy().proposal_capacity().get() as u64,
+            shared_allocator: true,
+        }))
+    }
+}
+
 impl GenerationForecastBackend for MlxBackend<'_> {
     fn capture_transforms_complete_per_step(_: &ModelRuntime<Self>) -> bool {
         // Bounded capture evaluates and transfers synchronously; no lazy capture

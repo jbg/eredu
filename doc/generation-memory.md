@@ -187,8 +187,97 @@ Limits can be conservative, and a large envelope can still prevent a fit verdict
 The forecast adds instrumentation to existing input costs and preserves unrelated
 unknowns. It neither reserves nor consumes capture or trace budgets, and applies
 equally to ordinary and controlled startup. Trace-only requests retain their
-ordinary forecast. `forecast_prepared_speculative_generation` still leaves
-concurrent draft and verification storage explicitly unbounded.
+ordinary forecast.
+
+### Speculative requests
+
+`forecast_prepared_speculative_generation` borrows the same request accepted by
+uninterrupted generation and `with_controlled_text_speculative` /
+`with_controlled_chat_speculative`. `forecast_speculative_token_ids` exposes the
+same projection for consumers that already counted/tokenized the input. The MLX
+adapter currently supplies complete speculative resource facts for **independent
+autoregressive drafters** when both models have ordinary workspace coverage.
+Both must already be loaded. Forecasting reads retained geometry, residency and
+native policy; it does not allocate a cache, run either model or consume a request.
+
+The runtime projects full-pass prefill, drafting, verification and commitment
+phases. Each includes distinct target/draft parameters, canonical caches,
+rollback checkpoints, proposal seed/restore/replacement copies, accepted-prefix
+replay and retained sampling distributions. Verification and replay permit K+1
+rows for K draft tokens. Configured lookahead permits one additional block; the
+estimate does not assume acceptance, early termination or adaptive disabling.
+Global verification/branch ceilings do not multiply one lane's footprint. Token
+history copies belong to the host pool; separate physical pools are compared
+independently. A shared allocator is counted once, and both models' declared
+resident parameter contributions are deducted from additional demand.
+
+The v1 transaction envelope budgets up to three additional target and five
+additional draft state payloads beyond canonical state/cache-update workspace,
+plus two target and three draft payloads for lookahead. Prefill uses one/two
+additional payloads respectively. These are conservative simultaneous-copy
+allowances, not claims that every copy is allocated. Sampling uses an MLX-owned
+calibration of 32 float32/index rows per live distribution, with target, draft
+and optional optimistic proposal rows. Kernel scratch, graph and allocator
+allowances remain planning assumptions rather than physical guarantees.
+
+`GenerationForecast.speculative` retains the exact plan for JSON round trips
+and recomputation. `with_max_output_tokens` updates both models; chunk changes
+preserve speculative full-pass prefill. The CLI uses these facade operations for
+its report and shorter-output advice.
+
+Embedded prediction heads and feature-conditioned assistants still need their
+architecture-specific prediction-state, retained-feature and workspace
+projections. MLX reports these as unknown; it does not substitute an ordinary
+draft model or count embedded parameters twice. Cold forecasts without a
+realized drafter, cross-device MLX execution outside unified memory, uncovered
+ordinary family workspaces, media and transfer costs also remain incomplete.
+Other backends opt in through `SpeculativeForecastBackend<D>`; its default report
+is unavailable. The portable `SpeculativeMemoryPlan` can describe embedded
+ownership and independent physical pools when a backend has the required facts.
+
+This forecasts one fresh lane. Extra controlled snapshots/branches, retained
+traces, captures/interventions enabled after startup and concurrent lanes need
+their own accounting. Ordinary and controlled execution share the startup
+forecast; the API does not claim to bound subsequent user-controlled retention.
+
+Validation on 2026-09-23 used debug builds on macOS/aarch64 Metal with 256 GiB
+unified memory and the pinned `HuggingFaceTB/SmolLM-135M` checkpoint documented
+below (`1d461723eec654e65efdc40cf49301c89c0c92f4`). Two independently loaded copies
+used the original weights. In a separate fixture directory, only
+`tokenizer_config.json` was changed to add the literal template
+`{% for message in messages %}{{ message['content'] }}{% endfor %}`; the base
+checkpoint has no chat template. The original checkpoint remained unchanged.
+
+| Execution | Input/output positions | Forecast upper, bytes | MLX peak active, bytes |
+| --- | ---: | ---: | ---: |
+| One Metal stream, greedy, lookahead disabled | 9/32 | 1,515,947,000 | 1,101,895,909 |
+| Separate Metal streams, stochastic, lookahead enabled | 9/32 | 1,561,923,812 | 1,104,419,037 |
+| Separate Metal streams, longer prompt | 289/32 | 2,530,177,084 | 1,580,703,442 |
+| Metal target, CPU draft, unified pool | 9/16 | 1,549,377,956 | 1,099,604,507 |
+
+All four forecasts returned `likely_fit`. The short split-stream run created six
+optimistic blocks, reused two and discarded four; the longer run reused six.
+The two identical models accepted all verified draft tokens; rejection/replay
+and controlled/uninterrupted parity are covered by neutral conformance tests.
+These observations validate a small model's planning envelope, not a universal
+allocator or process-RSS bound. CUDA and separate physical device pools were not
+validated natively.
+
+To reproduce after building with `cargo build -p eredu-cli`, set `MODEL` to the
+fixture directory and run:
+
+```sh
+target/debug/eredu --no-auto --model "$MODEL" --draft-model "$MODEL" \
+  --speculative-draft-device gpu:0 --speculative-draft-tokens 4 \
+  --disable-speculative-adaptive-lookahead --max-tokens 32 \
+  --temperature 0.8 --seed 42 --memory-report /tmp/speculative.json --verbose \
+  'The quick brown fox jumped over the fence and'
+```
+
+For the serial row, omit `--speculative-draft-device`, use `--temperature 0`,
+and add `--disable-speculative-lookahead`. For the CPU row, select `cpu` and
+16 output tokens. For the long row, pipe 32 repetitions of
+`The quick brown fox jumped over the fence. ` as the prompt.
 
 `GenerationForecast` contains the estimate, descriptive request, full-pass reason
 and logits contract. `with_prefill_chunk` recomputes a candidate only when the
@@ -300,7 +389,7 @@ The lower end models one set. This accounts coarsely for lazy graph retention;
 it does not assert exact tensor lifetimes and is uncalibrated on other models
 and hardware. The initial one-layer formula underpredicted long-prompt peaks
 by 22–35%; measured calibration is essential to these planning assumptions. Recurrent, routed,
-media, speculative and distributed paths retain calculated facts but report
+media, embedded/feature-conditioned speculative and distributed paths retain calculated facts but report
 uncovered workspace rather than claim comprehensive coverage. The public runtime
 API supports explicit fused scratch estimates and local device geometries.
 

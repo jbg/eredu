@@ -71,6 +71,21 @@ impl MlxModel {
         self.capture_discovery.take()
     }
 
+    pub(crate) fn memory_geometry(
+        &self,
+    ) -> Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError>
+    {
+        self.capture_discovery
+            .as_ref()
+            .ok_or_else(|| {
+                eredu_core::CapabilityError::Observation(
+                    "loaded drafter has no retained architecture memory projection".into(),
+                )
+            })?
+            .generation_memory()
+            .cloned()
+    }
+
     pub(crate) const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {
         &self.state_residency
     }
