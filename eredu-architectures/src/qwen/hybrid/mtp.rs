@@ -113,22 +113,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionSha
         Ok(Self {
             hidden_norm: norm("mtp.pre_fc_norm_hidden.weight")?,
             embedding_norm: norm("mtp.pre_fc_norm_embedding.weight")?,
-            fusion: B::linear(
-                LinearSpec {
-                    input: config.hidden_size * 2,
-                    output: config.hidden_size,
-                    weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "mtp.fc.weight",
-                        eredu_checkpoint::LinearFormat::Dense,
-                    )?,
-                },
-                context,
-            )?,
+            fusion: B::linear(fusion_spec(config)?, context)?,
             final_norm: norm("mtp.norm.weight")?,
         })
     }
+}
+
+/// The exact shared fusion constructor consumed by ordinary prediction execution.
+pub(super) fn fusion_spec(config: &HybridConfig) -> Result<LinearSpec, Error> {
+    Ok(LinearSpec {
+        input: config
+            .hidden_size
+            .checked_mul(2)
+            .ok_or_else(|| Error::backend("prediction fusion width overflow"))?,
+        output: config.hidden_size,
+        weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
+        bias: None,
+        format: crate::linear_format::standard_linear_format(
+            "mtp.fc.weight",
+            eredu_checkpoint::LinearFormat::Dense,
+        )?,
+    })
 }
 
 /// One prediction depth with independently streamable decoder parameters.

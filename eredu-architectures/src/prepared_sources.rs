@@ -645,13 +645,6 @@ impl PreparedModelSources {
                 self.architecture(),
                 self.selected().execution(),
             )
-            .map(|mut geometry| {
-                if self.prediction_extension().is_some() {
-                    geometry.workspace = None;
-                    geometry.execution_topology = None;
-                }
-                geometry
-            })
             .map_err(|error| error.to_string()),
             identity: self.graph.source_identity().clone(),
             execution_identity: self.execution_identity().to_owned(),

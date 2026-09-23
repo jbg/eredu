@@ -1049,6 +1049,9 @@ pub(crate) fn memory_uncertainties(
                 uncertainties.push(format!("{prefix}: generic mechanism calibration v1 uses explicit lazy-evaluation envelopes; native scratch, alignment and arithmetic promotion are planning assumptions, not allocator guarantees"));
                 uncertainties.extend(topology.missing.iter().map(|reason| format!("{prefix}: {reason}")));
                 for layer in &topology.layers {
+                    if let crate::execution_topology::TokenMixerTopology::Unknown { reason } = &layer.mixer {
+                        uncertainties.push(format!("{prefix}: {reason}"));
+                    }
                     if let crate::execution_topology::FeedForwardTopology::Unknown { reason } = &layer.feed_forward {
                         uncertainties.push(format!("{prefix}: {reason}"));
                     }

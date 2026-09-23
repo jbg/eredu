@@ -124,6 +124,7 @@ where
             retained_snapshots: allowance(Some(self.snapshot_usage().retained_bytes), "live snapshot/branch reservations; conservative per-pool allowance, not resident credit"),
         };
         let speculative = SpeculativeMemoryPlan {
+            embedded: None,
             draft: Some(draft),
             auxiliary_bytes_per_position: mechanism.auxiliary_bytes_per_position.clone(),
             sampling_bytes_per_vocabulary_entry: mechanism

@@ -977,6 +977,7 @@ fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
         parameter: name.into(),
     };
     let layer = TextLayerTopology {
+        input_projections: Vec::new(),
         mixer: TokenMixerTopology::Attention {
             query_heads: 4,
             kv_heads: 1,
@@ -991,6 +992,7 @@ fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
                 projection("value", 32, 8),
                 projection("attention-output", 32, 32),
             ],
+            output_gate: false,
             query_key_normalization: false,
             rotary: true,
         },
@@ -1010,6 +1012,8 @@ fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
         layers: vec![layer.clone(), layer],
         output: projection("output", 32, 128),
         selected_parameter_promotion_bytes: None,
+        selected_parameter_promotion_payloads: Default::default(),
+        output_invocations: 1,
         output_softcap: false,
         missing: vec![],
     }

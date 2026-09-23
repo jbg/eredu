@@ -90,7 +90,7 @@ pub struct ResidentParameterConversion {
     pub bindings: Vec<ResidentParameterConversionBinding>,
 }
 
-fn conversion_payload_bytes(
+pub(crate) fn conversion_payload_bytes(
     conversions: &[ResidentParameterConversion],
 ) -> Result<u64, eredu_core::resources::ResourceDescriptionError> {
     use eredu_core::resources::{ResourceDescriptionError, ResourceSize};

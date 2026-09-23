@@ -1,9 +1,16 @@
 //! Phase accounting for one speculative lane. This never allocates model state.
 use super::*;
+mod embedded;
+pub use embedded::{apply_embedded_parameter_conversion_credit, EmbeddedPredictionMemoryPlan};
 use eredu_core::{generation::SpeculativeSchedulerOptions, ObservationKind, SpeculativeDraft};
 
 /// Native/architecture facts about the selected speculative mechanism.
 pub struct SpeculativeMemoryProfile {
+    /// Exact selected embedded invocation, state and retained-feature contracts.
+    pub embedded: Option<crate::prediction_resources::EmbeddedPredictionTopology>,
+    /// Exact existing conversion allocations and their authoritative retaining bindings.
+    /// Already included in target parameter residency; used only to credit future conversion work.
+    pub parameter_conversions: Option<Vec<crate::ResidentParameterConversion>>,
     /// Separately owned drafter geometry and resident parameters. Embedded heads
     /// are already included in target residency and must not be charged again.
     pub draft: Option<LoadedMemoryProfile>,
@@ -44,6 +51,9 @@ pub trait SpeculativeForecastBackend<D>: GenerationForecastBackend {
 /// never predictions of acceptance rate or adaptive lookahead behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeculativeMemoryPlan {
+    /// Embedded invocation costs; target residency already includes its parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<EmbeddedPredictionMemoryPlan>,
     /// Ordinary geometry for a separately resident draft; absent for embedded heads.
     pub draft: Option<GenerationMemoryRequest>,
     /// Extra selected prediction state/features per context position.
@@ -96,6 +106,9 @@ pub fn estimate_speculative_continuation_memory(
     plan: &SpeculativeMemoryPlan,
     continuation: &SpeculativeContinuationMemoryPlan,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
+    if plan.embedded.is_some() {
+        return Err(CapabilityError::InvalidConfiguration { field: "speculative continuation", detail: "embedded prediction state and retained features require a settled native observation".into() });
+    }
     let draft = plan
         .draft
         .as_ref()
@@ -212,6 +225,12 @@ fn estimate_speculative_inner(
         normalize(draft);
     }
     let plan = &normalized;
+    if plan.embedded.is_some() && plan.draft.is_some() {
+        return Err(CapabilityError::InvalidConfiguration {
+            field: "speculative forecast",
+            detail: "embedded and independently resident drafters are mutually exclusive".into(),
+        });
+    }
     plan.auxiliary_bytes_per_position.validate()?;
     plan.sampling_bytes_per_vocabulary_entry.validate()?;
     let ordinary = |request: &GenerationMemoryRequest| {
@@ -420,6 +439,34 @@ fn estimate_speculative_inner(
             let execution_pool = t.is_some_and(|p| !p.executions.is_empty())
                 || d.is_some_and(|(_, p)| !p.executions.is_empty());
             if execution_pool && !start {
+                if let Some(embedded) = &plan.embedded {
+                    let (state, workspace, features) =
+                        embedded.costs(target, positions, query, prefill)?;
+                    p.persistent_state = p.persistent_state.add(&state)?;
+                    p.workspace = p.workspace.add(&interval(
+                        &workspace,
+                        if prefill { 1 } else { add(1, lookahead)? },
+                        &format!(
+                            "embedded prediction invocation and optimistic graph overlap: {}",
+                            workspace.detail
+                        ),
+                    )?)?;
+                    p.retained_input = p.retained_input.add(&features)?;
+                    p.staging = p.staging.add(&interval(&state,
+                        if prefill { 2 } else { add(5, mul(3, lookahead)?)? },
+                        "embedded seed, proposal restore/replacement, rollback/replay and optimistic prediction state copies",
+                    )?)?;
+                    p.staging = p.staging.add(&interval(&features,
+                        if prefill { 2 } else { add(5, mul(3, lookahead)?)? },
+                        "retained target feature views/copies through prediction, verification, rollback and lookahead",
+                    )?)?;
+                    if workspace.upper_bytes.is_none() {
+                        result.uncertainties.push(workspace.detail);
+                    }
+                    if features.upper_bytes.is_none() {
+                        result.uncertainties.push(features.detail);
+                    }
+                }
                 // The ordinary workspace already includes cache-update overlap.
                 // These *additional* copies envelope durable checkpoints, seed,
                 // proposal restore/replacement, rollback and optimistic branches.
@@ -454,7 +501,12 @@ fn estimate_speculative_inner(
                 for owner in [t, d.map(|(_, p)| p)].into_iter().flatten() {
                     for e in &owner.executions {
                         vocab = vocab
-                            .zip(e.execution_topology.as_ref().map(|topology| topology.vocabulary_size).or_else(|| e.workspace.as_ref().map(|w| w.vocabulary_size)))
+                            .zip(
+                                e.execution_topology
+                                    .as_ref()
+                                    .map(|topology| topology.vocabulary_size)
+                                    .or_else(|| e.workspace.as_ref().map(|w| w.vocabulary_size)),
+                            )
                             .map(|(a, b)| a.max(b));
                     }
                 }
@@ -525,7 +577,16 @@ fn estimate_speculative_inner(
                 .find(|d| d.domain == pool.domain)
                 .map_or(0, |d| d.state_growth_bytes_per_position)
         };
-        let growth = growth_in(&target_domains)
+        let embedded_growth = if t.is_some_and(|p| !p.executions.is_empty()) {
+            plan.embedded
+                .as_ref()
+                .map(|p| p.state_growth(target))
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let growth = add(growth_in(&target_domains), embedded_growth)?
             .checked_add(draft_estimate.as_ref().map_or(0, |r| growth_in(&r.domains)))
             .ok_or(CapabilityError::ArithmeticOverflow {
                 operation: "speculative state growth",
@@ -558,6 +619,17 @@ fn estimate_speculative_inner(
         .uncertainties
         .push(plan.sampling_bytes_per_vocabulary_entry.detail.clone());
     result.assumptions.push("Speculative single-lane envelope: full-pass prefill; target and draft residency, rollback, proposal copies, verification and replay; configured lookahead is retained without assuming acceptance or adaptive disabling. User snapshots/branches are additional allocations.".into());
+    if let Some(embedded) = &plan.embedded {
+        result.assumptions.push(format!("Embedded {:?} startup: prediction parameters remain in target residency; ordinary prediction components, retained target features, invocation workspace, state-copy and lookahead envelopes are composed without charging shared target weights twice.", embedded.mode));
+        result.uncertainties.extend(
+            embedded
+                .missing
+                .iter()
+                .map(|reason| format!("embedded prediction: {reason}")),
+        );
+    }
+    result.uncertainties.sort();
+    result.uncertainties.dedup();
     if let Some(c) = continuation {
         result.requested_positions = add(c.target.current_positions, c.additional_tokens)?;
         result.is_forecast = true;

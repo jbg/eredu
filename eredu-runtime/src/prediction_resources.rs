@@ -1,7 +1,8 @@
 //! Embedded prediction is an additional invocation of ordinary modules.
 //!
 //! Logical sharing, physical allocation sharing and execution order are separate
-//! contracts. These descriptions do not enable startup or continuation estimates.
+//! contracts. Startup forecasts compose these descriptions with explicit mechanism
+//! calibration; settled embedded continuation observations remain a separate contract.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +13,8 @@ use eredu_nn::ParameterMetadata;
 use crate::{SpeculativeCaptureSchema, SpeculativeStrategyClass};
 
 /// Physical invocation model, independent of the number of decoder blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PredictionExecutionMode {
     /// Each proposal depth is an independent invocation; units execute in order.
     Sequential,
@@ -58,7 +60,7 @@ pub struct PreparedPredictionModule {
 /// Ordinary state geometry for one additional prediction execution.
 /// Cold topology uses global ordinals; prepared placement uses local lane ordinals
 /// and replaces global geometry before local allocation sizing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PredictionStateLayer {
     /// State ordinal in the containing cold or prepared description.
     pub layer: usize,
@@ -71,6 +73,10 @@ pub struct PredictionStateLayer {
 /// Additional logical invocations selected by the ordinary embedded driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedPredictionTopology {
+    /// Ordinary construction geometry for the selected prediction modules.
+    pub execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
+    /// Concrete mechanisms whose ordinary invocation geometry remains unavailable.
+    pub missing: Vec<String>,
     /// Sequential depths and fused rows have different context preparation.
     pub mode: PredictionExecutionMode,
     /// Admitted proposal rows, independent of the physical module count.

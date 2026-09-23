@@ -1,3 +1,5 @@
+#[path = "forecast/embedded.rs"]
+mod embedded;
 use super::*;
 use eredu::api::{
     ForecastExecutionContract, GenerationForecastOptions, LogitsWorkspace, MemoryBytes, MemoryFit,
@@ -67,6 +69,8 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
         }
         Ok(Some(
             eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                embedded: None,
+                parameter_conversions: None,
                 draft: Some(Self::loaded_memory_profile(runtime)?),
                 auxiliary_bytes_per_position: MemoryBytes::exact(0),
                 sampling_bytes_per_vocabulary_entry: MemoryBytes::estimated(

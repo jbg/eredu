@@ -192,6 +192,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
                 ));
             }
             Ok(TextLayerTopology {
+                input_projections: Vec::new(),
                 mixer: TokenMixerTopology::Attention {
                     query_heads: positive(config.num_attention_heads())?,
                     kv_heads: positive(config.num_key_value_heads())?,
@@ -205,6 +206,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
                         .iter()
                         .map(|(_, s)| ProjectionTopology::from_spec(s))
                         .collect::<Result<_, _>>()?,
+                    output_gate: false,
                     query_key_normalization: config.query_key_norm_epsilon().is_some(),
                     rotary: config.rotary_enabled(),
                 },
@@ -222,8 +224,10 @@ pub(crate) fn text_with_feed_forward<C: Config>(
         vocabulary_size: positive(config.vocabulary_size())?,
         layers,
         output,
+        output_invocations: 1,
         output_softcap: config.output_softcap().is_some(),
         selected_parameter_promotion_bytes: None,
+        selected_parameter_promotion_payloads: Default::default(),
         missing,
     })
 }

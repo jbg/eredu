@@ -397,23 +397,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
         let prediction_steps =
             usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
-        let embedding_name = "model.embed_tokens.weight";
         let decoder = HybridDecoder::new_with_prediction_groups(
-            StaticModuleSpec {
-                normalization_groups: None,
-                embedding_weight: embedding_name.into(),
-                normalization_weight: "model.norm.weight".into(),
-                head_weight: "lm_head.weight".into(),
-                vocabulary: config.vocab_size,
-                hidden_size: config.hidden_size,
-                normalization_epsilon: config.rms_norm_eps,
-                normalization_offset: 1.0,
-                embedding_quantization: config
-                    .linear_format("model.embed_tokens.weight")
-                    .weight_quantization(),
-                head_format: config.linear_format("lm_head.weight"),
-                tied_head: config.tie_word_embeddings,
-            },
+            static_module_spec(&config),
             "model.layers",
             target_layers,
             "mtp.layers",
@@ -1716,6 +1701,25 @@ pub fn state_identity(
         topology,
     )
     .map_err(Error::backend)
+}
+
+/// Shared static construction consumed by ordinary execution and cold topology.
+pub(super) fn static_module_spec(config: &HybridConfig) -> StaticModuleSpec {
+    StaticModuleSpec {
+        normalization_groups: None,
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: config.vocab_size,
+        hidden_size: config.hidden_size,
+        normalization_epsilon: config.rms_norm_eps,
+        normalization_offset: 1.0,
+        embedding_quantization: config
+            .linear_format("model.embed_tokens.weight")
+            .weight_quantization(),
+        head_format: config.linear_format("lm_head.weight"),
+        tied_head: config.tie_word_embeddings,
+    }
 }
 
 #[cfg(test)]

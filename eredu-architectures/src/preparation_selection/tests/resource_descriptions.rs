@@ -207,3 +207,66 @@ fn cold_embedded_topology_reuses_invocation_scopes_capture_and_state_without_nat
     );
     mechanisms.assert_cold_only();
 }
+
+#[test]
+fn selected_prediction_topology_keeps_shared_readout_and_actual_fusion_specs() {
+    use eredu_runtime::execution_topology::{FeedForwardTopology, TokenMixerTopology};
+    let (root, inspection) = inspected_config(serde_json::json!({
+        "model_type": "qwen3_5_text", "vocab_size": 16, "hidden_size": 8,
+        "num_hidden_layers": 2, "mtp_num_hidden_layers": 2,
+        "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 8,
+        "max_position_embeddings": 32, "intermediate_size": 16, "num_experts": 0,
+        "tie_word_embeddings": true, "layer_types": ["full_attention", "full_attention"]
+    }));
+    let mechanisms = BoundedIndependentAdapter::default();
+    let selected =
+        select_preparation(&inspection, &NormalizedLoadRequest::default(), &mechanisms).unwrap();
+    drop(root);
+    let target = selected
+        .text_realization()
+        .requirements()
+        .execution_topology()
+        .unwrap();
+    let prediction = selected.embedded_prediction_topology().unwrap().unwrap();
+    let topology = prediction.execution_topology.as_ref().unwrap();
+    assert!(prediction.missing.is_empty());
+    assert_eq!(topology.layers.len(), 2);
+    assert_eq!(topology.output_invocations, 2);
+    assert_eq!(target.output_invocations, 1);
+    assert_eq!(topology.output.parameter, target.output.parameter);
+    assert_eq!(topology.output.parameter, "model.embed_tokens.weight");
+    assert_eq!(prediction.state.len(), 2);
+    assert!(prediction
+        .state
+        .iter()
+        .all(|s| s.processed_token_offset == -1));
+    for (index, layer) in topology.layers.iter().enumerate() {
+        assert_eq!(layer.input_projections.len(), 1);
+        let fusion = &layer.input_projections[0];
+        assert_eq!((fusion.input, fusion.output), (16, 8));
+        assert_eq!(fusion.parameter, "mtp.fc.weight");
+        let TokenMixerTopology::Attention {
+            projections,
+            output_gate,
+            ..
+        } = &layer.mixer
+        else {
+            panic!("prediction uses full attention")
+        };
+        assert!(*output_gate);
+        assert_eq!(projections[0].output, 16);
+        assert_eq!(
+            projections[0].parameter,
+            format!("mtp.layers.{index}.self_attn.q_proj.weight")
+        );
+        assert!(matches!(
+            layer.feed_forward,
+            FeedForwardTopology::Gated { .. }
+        ));
+    }
+    assert_eq!(
+        selected.embedded_prediction_topology().unwrap().unwrap(),
+        prediction
+    );
+    mechanisms.assert_cold_only();
+}

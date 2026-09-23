@@ -239,6 +239,8 @@ fn prediction_topology() -> crate::prediction_resources::EmbeddedPredictionTopol
     use crate::{SpeculativeCaptureEntry, SpeculativeCaptureSchema, SpeculativeIdentity};
     let id = |name: &str| SpeculativeIdentity::new(name).unwrap();
     crate::prediction_resources::EmbeddedPredictionTopology {
+        execution_topology: None,
+        missing: Vec::new(),
         mode: crate::prediction_resources::PredictionExecutionMode::Sequential,
         proposal_capacity: 2,
         nodes: vec![],

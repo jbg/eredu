@@ -84,11 +84,14 @@ pub fn selected_generation_memory_geometry(
         };
         update(&mut topology.output);
         for layer in &mut topology.layers {
-            let projections = match &mut layer.mixer {
+            layer.input_projections.iter_mut().for_each(&update);
+            match &mut layer.mixer {
                 TokenMixerTopology::Attention { projections, .. }
-                | TokenMixerTopology::GatedConvolution { projections, .. } => projections,
-            };
-            projections.iter_mut().for_each(&update);
+                | TokenMixerTopology::GatedConvolution { projections, .. } => {
+                    projections.iter_mut().for_each(&update)
+                }
+                TokenMixerTopology::Unknown { .. } => {}
+            }
             match &mut layer.feed_forward {
                 FeedForwardTopology::Gated { projections, .. } => {
                     projections.iter_mut().for_each(&update)
@@ -124,6 +127,9 @@ pub fn selected_generation_memory_geometry(
                                 operation: "mixed-precision parameter promotion",
                             })
                     })?;
+                    topology
+                        .selected_parameter_promotion_payloads
+                        .insert(task.name().to_owned(), cast);
                     total
                         .checked_add(cast)
                         .ok_or(CapabilityError::ArithmeticOverflow {
@@ -342,6 +348,21 @@ mod tests {
             .map(|(_, shape, _, _)| shape.iter().product::<usize>() as u64 * 4)
             .sum::<u64>();
         assert_eq!(topology.selected_parameter_promotion_bytes, Some(expected));
+        assert_eq!(
+            topology
+                .selected_parameter_promotion_payloads
+                .values()
+                .sum::<u64>(),
+            expected
+        );
+        for task in execution.text_realization().materialization_tasks() {
+            assert_eq!(
+                topology
+                    .selected_parameter_promotion_payloads
+                    .get(task.name()),
+                Some(&(task.logical_shape().iter().product::<usize>() as u64 * 4))
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use eredu_runtime::prediction_resources::{EmbeddedPredictionTopology, Prediction
 
 impl crate::SelectedPreparation {
     /// Additional prediction invocations retained by cold selection. This reads
-    /// neither payloads nor native resources and does not enable a fit verdict.
+    /// neither payloads nor native resources. Missing mechanisms remain explicit.
     pub fn embedded_prediction_topology(
         &self,
     ) -> Result<Option<EmbeddedPredictionTopology>, eredu_core::resources::ResourceDescriptionError>
@@ -112,7 +112,27 @@ impl crate::SelectedPreparation {
                 })
             })
             .collect::<Result<Vec<_>, eredu_core::resources::ResourceDescriptionError>>()?;
+        let (mut execution_topology, mut missing) = match extension.complete_architecture().model() {
+            crate::configuration::SafetensorsModelConfig::QwenHybrid(args) => (
+                Some(crate::qwen::hybrid::topology::prediction(&args.text).map_err(|e| invalid(e.to_string()))?),
+                Vec::new(),
+            ),
+            crate::configuration::SafetensorsModelConfig::DeepSeekV3(_) => (None, vec!["prediction multi-head latent attention and routed/shared feed-forward invocation topology is unavailable".into()]),
+            crate::configuration::SafetensorsModelConfig::DeepSeekV4(_) => (None, vec!["prediction pooling attention, compressed state and hyper-connection invocation topology is unavailable".into()]),
+            crate::configuration::SafetensorsModelConfig::Inkling(_) => (None, vec!["prediction learned relative attention and auxiliary causal-convolution invocation topology is unavailable".into()]),
+            crate::configuration::SafetensorsModelConfig::NemotronH(_) => (None, vec!["prediction patterned attention/routed-expert and fusion invocation topology is unavailable".into()]),
+            _ => (None, vec!["selected prediction module invocation topology is unavailable".into()]),
+        };
+        if self.execution().parallel_topology().is_some() {
+            execution_topology = None;
+            missing.push("rank-local prediction invocation topology is unavailable".into());
+        }
+        if let Some(topology) = execution_topology.as_mut() {
+            apply_selected_formats(topology, self.text_realization())?;
+        }
         Ok(Some(EmbeddedPredictionTopology {
+            execution_topology,
+            missing,
             mode: PredictionExecutionMode::from_strategy(
                 selected.requirements().strategy().class(),
             )?,
@@ -128,4 +148,84 @@ impl crate::SelectedPreparation {
 }
 fn invalid(reason: impl Into<String>) -> eredu_core::resources::ResourceDescriptionError {
     eredu_core::resources::ResourceDescriptionError::Invalid(reason.into())
+}
+
+// Actual materialization tasks override source/config encodings, including load-time
+// quantization. Canonical names preserve the target's shared embedding/readout.
+fn apply_selected_formats(
+    topology: &mut eredu_runtime::execution_topology::TextExecutionTopology,
+    selected: &eredu_runtime::SelectedReplicatedTextRealization,
+) -> Result<(), eredu_core::resources::ResourceDescriptionError> {
+    use eredu_runtime::execution_topology::*;
+    let tasks = selected
+        .materialization_tasks()
+        .iter()
+        .chain(selected.auxiliary_materialization_tasks())
+        .collect::<Vec<_>>();
+    let formats = tasks
+        .iter()
+        .map(|task| (task.name(), task.executable()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let update = |projection: &mut ProjectionTopology| {
+        if let Some(format) = formats.get(projection.parameter.as_str()) {
+            projection.format = *format;
+        }
+    };
+    update(&mut topology.output);
+    for layer in &mut topology.layers {
+        layer.input_projections.iter_mut().for_each(&update);
+        match &mut layer.mixer {
+            TokenMixerTopology::Attention { projections, .. }
+            | TokenMixerTopology::GatedConvolution { projections, .. } => {
+                projections.iter_mut().for_each(&update)
+            }
+            TokenMixerTopology::Unknown { .. } => {}
+        }
+        match &mut layer.feed_forward {
+            FeedForwardTopology::Gated { projections, .. } => {
+                projections.iter_mut().for_each(&update)
+            }
+            FeedForwardTopology::Routed {
+                projections,
+                router,
+                ..
+            } => {
+                projections.iter_mut().for_each(&update);
+                update(router);
+            }
+            FeedForwardTopology::Unknown { .. } => {}
+        }
+    }
+    let wider = tasks.iter().any(|task| {
+        let dtype = task
+            .derived_output()
+            .map(|o| o.dtype().clone())
+            .or_else(|| task.source_encoding().scalar_dtype().map(Into::into));
+        matches!(dtype, Some(eredu_checkpoint::recipe::RecipeDtype::F32))
+    });
+    if selected
+        .state()
+        .floating_dtype()
+        .is_some_and(|dtype| dtype.bytes().get() < 4)
+        && wider
+    {
+        let bytes =
+            selected
+                .auxiliary_materialization_tasks()
+                .iter()
+                .try_fold(0u64, |sum, task| {
+                    let bytes = task.logical_shape().iter().try_fold(4u64, |bytes, &dim| {
+                        bytes
+                            .checked_mul(dim as u64)
+                            .ok_or_else(|| invalid("prediction parameter promotion overflow"))
+                    })?;
+                    topology
+                        .selected_parameter_promotion_payloads
+                        .insert(task.name().to_owned(), bytes);
+                    sum.checked_add(bytes)
+                        .ok_or_else(|| invalid("prediction parameter promotion overflow"))
+                })?;
+        topology.selected_parameter_promotion_bytes = Some(bytes);
+    }
+    Ok(())
 }

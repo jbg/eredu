@@ -5,6 +5,7 @@ mod checkpoint;
 mod conditional;
 mod config;
 mod linear_attention;
+pub(crate) mod topology;
 mod model;
 mod mtp;
 mod parallel;

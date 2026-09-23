@@ -2483,6 +2483,8 @@ impl EligibleConfig<'_> {
             Self::K2Horizon(args) => crate::decoder::topology::text(*args)?,
             Self::Qwen(args) => crate::qwen::execution_topology(args)?,
             Self::Lfm2(args) => crate::lfm2::execution_topology(args)?,
+            Self::QwenHybrid(args) => crate::qwen::hybrid::topology::target(args)?,
+            Self::QwenCompositeHybrid(args) => crate::qwen::hybrid::topology::target(&args.text)?,
             _ => return Ok(None),
         };
         Ok(Some(topology))

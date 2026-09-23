@@ -6762,9 +6762,9 @@ allocator alignment are not proved by logical shapes: explicit calibrated
 mechanism envelopes account for their planning allowance without rewriting the
 raw phase-4 storage contract as exact. Unsupported equation providers, missing
 rank-local topology and unsupported residency lifetimes retain named gaps.
-Embedded prediction clears target topology for complete speculative forecasts
-until its additional invocations and state are composed into speculative startup
-and continuation forecasts.
+An embedded selection keeps ordinary request-only forecasts explicitly unbounded;
+startup forecasts retain target topology only alongside the prediction and
+transaction plan. Advanced embedded continuations still need settled observations.
 Cold and loaded calls remain read-only and cannot materialize modules, populate
 parameter conversion caches or consume observation budgets.
 
@@ -6796,8 +6796,28 @@ resident owners. Reusing a target readout conversion from several prediction
 heads does not charge another copy. Reading these reports does not materialize
 weights, populate conversion caches, evaluate tensors or advance execution.
 
-These are resource descriptions, not speculative peak forecasts. Logical state
-payloads do not establish native capacity. Missing dtype, local geometry, target
-feature backing, mechanism scratch and evaluation retention remain explicit.
-Startup/continuation transaction composition and finite embedded verdicts remain
-subsequent work; the existing conservative forecast behavior is preserved.
+Logical resource descriptions do not establish native capacity. Missing dtype,
+local geometry, target-feature backing, mechanism scratch and evaluation retention
+remain explicit. Startup forecasts now compose covered ordinary target and
+prediction invocations with the speculative transaction envelopes; advanced
+embedded continuations remain a separate capability.
+
+Qwen hybrid attention, dense feed-forward, shared prediction fusion and static
+readout construction expose their actual `LinearSpec`/`StaticModuleSpec` inputs
+through ordinary helpers. Both allocation and cold topology consume these same
+specifications. The runtime describes fusion projections, sigmoid attention gates
+and repeated output invocations generically, without consulting a family name.
+Prediction layers retain their actual parameter identities: each depth invokes
+the shared fusion and target readout, while its decoder parameters remain distinct.
+Selected physical task encodings replace source defaults before projection; any
+mixed-precision prediction promotion allowance derives from selected auxiliary
+tasks. These facts contain no calibration constants.
+
+A dense Qwen target consisting entirely of full-attention layers and its embedded
+predictor therefore use covered mechanisms. A gated-delta target or shared/routed
+expert reduction still names the missing invocation mechanism. Other prediction
+families retain concrete missing mechanism descriptions (latent/pooling or learned
+relative attention, hyper-connections, patterned operators) rather than acquiring
+a finite bound from the presence of an embedded head alone. Rank-local prediction
+invocation geometry remains unknown until ordinary partition contracts describe
+it.

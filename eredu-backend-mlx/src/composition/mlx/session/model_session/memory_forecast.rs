@@ -30,9 +30,33 @@ impl
         GenerationForecastError,
     > {
         let eredu_core::SpeculativeDraft::External(drafter) = drafting else {
-            // Embedded prediction retains architecture-specific feature and head
-            // state beyond the ordinary target geometry. Do not guess its bound.
-            return Ok(None);
+            let Some(discovery) = runtime.session().capture_discovery.as_ref() else {
+                return Ok(None);
+            };
+            let Some(topology) = discovery
+                .embedded_prediction_topology()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(
+                eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                    embedded: Some(topology.clone()),
+                    parameter_conversions: runtime
+                        .session()
+                        .residency_report()
+                        .map_err(eredu_core::BackendFailure::from_error)?
+                        .and_then(|report| {
+                            report.device_parameter_conversions().map(<[_]>::to_vec)
+                        }),
+                    draft: None,
+                    auxiliary_bytes_per_position:
+                        eredu_runtime::memory_estimation::MemoryBytes::exact(0),
+                    sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
+                    proposal_capacity: topology.proposal_capacity as u64,
+                    shared_allocator: true,
+                },
+            ));
         };
         let target = Self::loaded_memory_profile(runtime)?;
         if drafter.topology() == eredu_core::SpeculativeExecutionTopology::CrossDeviceSplit
@@ -46,16 +70,24 @@ impl
             // projection, including the captured target features they retain.
             return Ok(None);
         };
-        Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
-            draft: Some(draft),
-            auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(0),
-            sampling_bytes_per_vocabulary_entry: eredu_runtime::memory_estimation::MemoryBytes::estimated(
-                0, 128,
-                "MLX speculative sampling calibration v1: 32 float32/index rows per live distribution for logits processing, filtering, normalization and residual sampling; planning envelope, not a kernel allocation guarantee",
-            ),
-            proposal_capacity: drafter.selected().requirements().strategy().proposal_capacity().get() as u64,
-            shared_allocator: true,
-        }))
+        Ok(Some(
+            eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                embedded: None,
+                parameter_conversions: None,
+                draft: Some(draft),
+                auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(
+                    0,
+                ),
+                sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
+                proposal_capacity: drafter
+                    .selected()
+                    .requirements()
+                    .strategy()
+                    .proposal_capacity()
+                    .get() as u64,
+                shared_allocator: true,
+            },
+        ))
     }
 }
 
@@ -155,6 +187,7 @@ fn memory_profile(
         .map_err(eredu_core::BackendFailure::from_error)?;
     if !continuation && offset != Some(0) {
         geometry.workspace = None;
+        geometry.execution_topology = None;
         geometry.assumptions.push("existing or unavailable session state is not projected; reset before forecasting a fresh request".into());
     }
     let host_execution = runtime
@@ -177,9 +210,23 @@ fn memory_profile(
         }
         Err(error) => Observed::unavailable(error.to_string()),
     };
+    let mut parameters = crate::composition::mlx::capability::static_model_memory(session)?;
+    if session.capture_discovery.as_ref().is_some_and(|discovery| {
+        discovery
+            .embedded_prediction_topology()
+            .is_ok_and(|topology| topology.is_some())
+    }) {
+        // This aggregate spans target and prediction owners. Crediting all of
+        // it against target-only promotion could erase still-uncached target
+        // conversions. Keep actual conversions in parameter residency; the
+        // speculative composer applies exact owner/binding credit to both topologies.
+        parameters.current_device_parameter_conversion_bytes = Observed::unavailable(
+            "aggregate cached conversions span target and embedded prediction owners; no target-only workspace credit applied",
+        );
+    }
     Ok(LoadedMemoryProfile {
         geometry,
-        parameters: crate::composition::mlx::capability::static_model_memory(session)?,
+        parameters,
         available: crate::composition::mlx::capability::available_memory()?,
         host_execution,
         allocator_cache_limit,
@@ -238,4 +285,9 @@ impl eredu_runtime::memory_forecast::ContinuationForecastBackend for MlxBackend<
             },
         }))
     }
+}
+
+fn speculative_sampling_memory() -> eredu_runtime::memory_estimation::MemoryBytes {
+    eredu_runtime::memory_estimation::MemoryBytes::estimated(0, 128,
+        "MLX speculative sampling calibration v1: 32 float32/index rows per live distribution for logits processing, filtering, normalization and residual sampling; planning envelope, not a kernel allocation guarantee")
 }

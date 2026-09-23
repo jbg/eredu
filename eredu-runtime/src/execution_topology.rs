@@ -51,6 +51,11 @@ impl ProjectionTopology {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TokenMixerTopology {
+    /// An ordinary mixer whose invocation geometry is not yet available.
+    Unknown {
+        /// Concrete missing mechanism, never interpreted as zero work.
+        reason: String,
+    },
     /// Ordinary grouped-query attention with its selected arithmetic contract.
     Attention {
         /// Query heads.
@@ -69,6 +74,9 @@ pub enum TokenMixerTopology {
         sinks: bool,
         /// Exact split/fused input and output projections in invocation order.
         projections: Vec<ProjectionTopology>,
+        /// A sigmoid gate multiplies the attended query features.
+        #[serde(default)]
+        output_gate: bool,
         /// Q/K normalization is applied before attention.
         query_key_normalization: bool,
         /// Rotary transforms are applied to query and key values.
@@ -185,6 +193,9 @@ impl FeedForwardTopology {
 /// One sequential residual block using the reusable mechanisms above.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextLayerTopology {
+    /// Ordered fusion projections applied before the residual block.
+    #[serde(default)]
+    pub input_projections: Vec<ProjectionTopology>,
     /// Stateful token mixing.
     pub mixer: TokenMixerTopology,
     /// Dense or routed feed-forward execution.
@@ -193,7 +204,7 @@ pub struct TextLayerTopology {
     pub normalization_count: u64,
 }
 
-/// Ordinary construction topology for one target text stack.
+/// Ordinary construction topology for one target or prediction execution stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextExecutionTopology {
     /// Residual stream width.
@@ -204,14 +215,25 @@ pub struct TextExecutionTopology {
     pub layers: Vec<TextLayerTopology>,
     /// Output projection, including the tied embedding owner when applicable.
     pub output: ProjectionTopology,
+    /// Number of output projection invocations in this execution stack.
+    #[serde(default = "one_output_invocation")]
+    pub output_invocations: u64,
     /// Final vocabulary logits require a tanh cap.
     #[serde(default)]
     pub output_softcap: bool,
     /// Potential F32 parameter conversion payload from selected physical tasks.
     #[serde(default)]
     pub selected_parameter_promotion_bytes: Option<u64>,
+    /// Canonical selected task identities for the promotion payload above.
+    /// Empty means attribution is unavailable, so observed conversions cannot credit it.
+    #[serde(default)]
+    pub selected_parameter_promotion_payloads: std::collections::BTreeMap<String, u64>,
     /// Additional unsupported module equations or invocation facts.
     pub missing: Vec<String>,
+}
+
+fn one_output_invocation() -> u64 {
+    1
 }
 
 // Checkpoint formats deliberately have no frontend serde dependency. Preserve the

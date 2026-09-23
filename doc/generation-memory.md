@@ -12,8 +12,8 @@ Target workspace forecasts now compose reusable mechanism descriptions with
 explicit evaluation lifetimes. Parameter/state producers and native mechanism
 inventories remain descriptive contracts; their unknown allocation capacities
 are not silently converted into exact bounds. Embedded prediction resource
-descriptions are available separately; finite startup and continuation verdicts
-remain later phases.
+descriptions feed speculative startup composition when both target and prediction
+mechanisms are covered. Embedded continuation verdicts remain a later phase.
 
 A `ResourceDescription` records the current context and requested horizon as named
 logical extents, with fixed or evaluated context-dependent resource sizes. For
@@ -345,12 +345,13 @@ and recomputation. `with_max_output_tokens` updates both models; chunk changes
 preserve speculative full-pass prefill. The CLI uses these facade operations for
 its report and shorter-output advice.
 
-Embedded prediction heads and feature-conditioned assistants still need their
-architecture-specific prediction-state, retained-feature and workspace
-projections. MLX reports these as unknown; it does not substitute an ordinary
-draft model or count embedded parameters twice. Cold forecasts without a
-realized drafter, cross-device MLX execution outside unified memory, uncovered
-ordinary family workspaces, media and transfer costs also remain incomplete.
+Embedded prediction startup uses ordinary module, state and capture contracts,
+with explicit unknowns for uncovered mechanisms. Its parameters are already in
+target residency and are counted once. Feature-conditioned external assistants,
+cross-device MLX execution outside unified memory, uncovered ordinary workspaces,
+media and transfer costs remain incomplete. Cold embedded planning can use
+`inspected_speculative_generation_memory_plan` with explicit sampling calibration;
+cold external-drafter planning still needs retained draft geometry.
 Other backends opt in through `SpeculativeForecastBackend<D>`; its default report
 is unavailable. The portable `SpeculativeMemoryPlan` can describe embedded
 ownership and independent physical pools when a backend has the required facts.
@@ -640,7 +641,8 @@ family memory equations. Packed routed Qwen and LFM2 use the same generic expert
 mechanism; LFM2 mixes the reusable attention and convolution descriptions. Missing
 module equations, native input-score tile facts, rank-local invocation topology,
 nondevice state and prediction/residency exclusions remain explicit unknowns.
-Embedded prediction is still excluded pending its resource-description phase.
+Embedded startup composes the same evaluator with prediction invocations and
+transaction retention; uncovered prediction mechanisms remain explicit unknowns.
 Ordinary cold, loaded, settled continuation and external-drafter forecasts consume
 the same target evaluator. Legacy `WorkspaceGeometry` requests remain readable;
 when ordinary topology is present it is authoritative.
@@ -1634,3 +1636,84 @@ cargo test -p eredu --no-default-features --features mlx,metal --test native_exe
 This phase makes no new measured peak-memory or released-checkpoint calibration
 claim. Native validation uses synthetic Metal fixtures; CUDA and native
 distributed prediction were not exercised.
+
+### Embedded startup forecasts (phase 8)
+
+`forecast_prepared_speculative_generation` and `forecast_speculative_token_ids`
+now retain an optional `SpeculativeMemoryPlan.embedded` record. It composes ordinary target
+and prediction invocations with prediction state, retained target features,
+verification, rollback, replay and configured lookahead. Sequential prediction
+prepares all but the last prompt row; fused prediction prepares the full prefix.
+Proposal width, physical module count and repeated shared readouts remain distinct.
+Full-pass prefill and every-row verification logits remain transaction contracts.
+
+Prediction parameters stay in the target's parameter residency. Shared embedding,
+fusion and readout uses do not add another parameter allocation. Existing cached
+conversions remain resident once; their authoritative native backing/binding
+observations credit only the corresponding selected future-conversion allowances.
+Only complete matching binding payloads receive credit; partial or missing
+attribution keeps the conservative allowance. Selected physical formats,
+possible F32 promotion, state frontier offsets and allocation-granularity allowances
+are retained for recomputation. The resource descriptions remain logical facts;
+finite scratch, graph retention and transaction-copy bounds are labeled calibration.
+
+A finite estimate requires coverage for both sides. Dense Qwen3.5 text configurations
+whose target layers all use full attention provide an end-to-end covered case.
+The ordinary constructors and resource topology share the attention, MLP, fusion
+and static-module specifications. This does **not** establish full coverage for
+released Qwen hybrid schedules: gated-delta recurrent layers and shared/routed
+expert reductions still report their missing mechanisms. Other embedded families
+retain explicit gaps for latent/pooling/relative attention, hyper-connections and
+other uncovered invocations. Rank-local prediction and unfamiliar capture layouts
+also remain unknown.
+
+Cold callers use `inspected_speculative_generation_memory_plan` to obtain a target
+request and speculative plan from the same retained selection, supplying proposal
+width, scheduler ceilings and backend sampling calibration. Pass both records to
+`estimate_speculative_memory`. The legacy ordinary request stays unbounded for
+embedded selection so it cannot silently omit prediction costs. The convenience
+cold estimate reports unknown sampling scratch until backend calibration is
+supplied. Loaded MLX forecasts reuse the adapter's sampling calibration.
+
+The optional embedded plan and new ordinary topology fields have serialization
+defaults for older records. JSON round trips and output-horizon recomputation
+retain prediction costs. These operations do not allocate model tensors, populate
+conversion caches, advance lanes or consume capture/snapshot budgets. Startup
+forecasts describe a fresh isolated speculative lane even if an unrelated ordinary
+cache has advanced. They are shared by continuous and controlled execution;
+advanced embedded continuation outlooks still require phase 9's settled observations.
+
+Native Metal startup tests use a nonzero, two-layer all-attention Qwen3.5 text
+fixture with two prediction modules, F32 or mixed BF16/F32 parameters, and lookahead
+off/on. With the graph-driver allowance set to zero and the allocator cache disabled,
+measured additional allocation peaks were 13,372 bytes for F32 and 21,221 bytes for
+mixed parameters. Forecast additional upper bounds were 102,592/139,032 bytes for
+F32 and 123,200/169,736 bytes for mixed parameters (lookahead off/on). Warm mixed
+parameter conversions receive owner-specific credit. Repeated forecast calls leave
+native active allocations unchanged. Serialized recomputation, horizon growth,
+budget shortfalls and fresh speculative forecasts after ordinary cache advancement
+are covered. Continuous and controlled tokens and full candidate captures match.
+V3 and DSpark fixtures preserve explicit unknown prediction mechanisms.
+
+The native startup checks are reproducible with:
+
+```sh
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_embedded_startup --locked -- --ignored --nocapture --test-threads=1
+```
+
+These are synthetic fixture measurements, not released-checkpoint calibration.
+CUDA and native distributed prediction were not exercised. Portable and reference
+regression commands are listed in the phase 7 validation section above. This phase
+passed 1,439 portable library tests, 125 facade/conformance tests, 278 numerical
+and 47 structural reference tests, and speculative production conformance. Native
+activation parity, pooling snapshot/restore and external-drafter continuation
+regressions also passed. Strict Clippy passed for the portable libraries/tests,
+MLX backend/tests and native execution-control harness.
+
+Additional validation commands:
+
+```sh
+cargo test -p eredu-architectures --test reference_structural --locked
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_speculative_continuation_forecasts_cover_settled_state_without_advancement --locked -- --ignored --nocapture --test-threads=1
+cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
+```

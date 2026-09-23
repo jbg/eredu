@@ -794,6 +794,7 @@ pub(crate) fn execution_topology(
                             .iter()
                             .map(|(_, spec)| ProjectionTopology::from_spec(spec))
                             .collect::<Result<_, _>>()?,
+                        output_gate: false,
                         query_key_normalization: true,
                         rotary: true,
                     }
@@ -817,6 +818,7 @@ pub(crate) fn execution_topology(
                 )?,
             };
             Ok(TextLayerTopology {
+                input_projections: Vec::new(),
                 mixer,
                 feed_forward,
                 normalization_count: 2,
@@ -828,8 +830,10 @@ pub(crate) fn execution_topology(
         vocabulary_size: positive(args.vocab_size)?,
         layers,
         output: super::static_spec(args).output_topology()?,
+        output_invocations: 1,
         output_softcap: false,
         selected_parameter_promotion_bytes: None,
+        selected_parameter_promotion_payloads: Default::default(),
         missing: Vec::new(),
     })
 }

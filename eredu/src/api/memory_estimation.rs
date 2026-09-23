@@ -209,8 +209,33 @@ pub fn estimate_inspected_generation_memory(
     inspection: &ModelInspectionOutcome,
     options: &GenerationMemoryOptions,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
-    let request = inspected_generation_memory_request(inspection, options)?;
-    let mut report = estimate_generation_memory(&request)?;
+    let selected_embedded = inspection
+        .selected()
+        .is_some_and(|s| s.preparation().prediction_realization().is_some());
+    let (request, mut report) = if selected_embedded {
+        let capacity = inspection
+            .selected()
+            .unwrap()
+            .preparation()
+            .prediction_realization()
+            .unwrap()
+            .requirements()
+            .strategy()
+            .proposal_capacity()
+            .get() as u64;
+        let (request, plan) = inspected_speculative_generation_memory_plan(
+            inspection, options, capacity,
+            eredu_core::generation::SpeculativeSchedulerOptions::default(),
+            MemoryBytes::unknown("cold speculative sampling scratch has no backend calibration; supply an explicit sampling bound through inspected_speculative_generation_memory_plan"),
+        )?;
+        let estimate =
+            eredu_runtime::memory_forecast::estimate_speculative_memory(&request, &plan)?;
+        (request, estimate)
+    } else {
+        let request = inspected_generation_memory_request(inspection, options)?;
+        let estimate = estimate_generation_memory(&request)?;
+        (request, estimate)
+    };
     if request.prefill_chunk_tokens != options.prefill_chunk_tokens {
         report.assumptions.push("selected execution does not have modeled chunked-prefill support; full-prompt workspace was used".into());
     }
@@ -238,6 +263,87 @@ pub fn inspected_generation_memory_request(
     inspection: &ModelInspectionOutcome,
     options: &GenerationMemoryOptions,
 ) -> Result<GenerationMemoryRequest, CapabilityError> {
+    inspected_generation_memory_request_inner(inspection, options, false)
+}
+
+/// Builds a recomputable embedded startup plan from an exact cold selection.
+/// Sampling scratch is a backend calibration, not a fact inferred from a family.
+/// The returned target request must be estimated together with the returned plan.
+pub fn inspected_speculative_generation_memory_plan(
+    inspection: &ModelInspectionOutcome,
+    options: &GenerationMemoryOptions,
+    max_draft_tokens: u64,
+    scheduler: eredu_core::generation::SpeculativeSchedulerOptions,
+    sampling_bytes_per_vocabulary_entry: MemoryBytes,
+) -> Result<
+    (
+        GenerationMemoryRequest,
+        eredu_runtime::memory_forecast::SpeculativeMemoryPlan,
+    ),
+    CapabilityError,
+> {
+    use eredu_runtime::memory_forecast::{
+        EmbeddedPredictionMemoryPlan, ForecastCalibration, SpeculativeMemoryPlan,
+    };
+    let selected = inspection.selected().ok_or_else(|| {
+        CapabilityError::Observation("embedded forecast requires a valid cold selection".into())
+    })?;
+    let topology = selected
+        .preparation()
+        .embedded_prediction_topology()
+        .map_err(|e| CapabilityError::Observation(e.to_string()))?
+        .ok_or_else(|| {
+            CapabilityError::Observation("selection has no embedded prediction topology".into())
+        })?;
+    if max_draft_tokens == 0 || max_draft_tokens > topology.proposal_capacity as u64 {
+        return Err(CapabilityError::InvalidConfiguration {
+            field: "max_draft_tokens",
+            detail: "must be positive and within the selected proposal capacity".into(),
+        });
+    }
+    scheduler
+        .validate()
+        .map_err(|e| CapabilityError::Observation(e.to_string()))?;
+    if sampling_bytes_per_vocabulary_entry
+        .upper_bytes
+        .is_some_and(|upper| upper < sampling_bytes_per_vocabulary_entry.lower_bytes)
+    {
+        return Err(CapabilityError::InvalidConfiguration {
+            field: "sampling_bytes_per_vocabulary_entry",
+            detail: "upper bound is below lower bound".into(),
+        });
+    }
+    let mut request = inspected_generation_memory_request_inner(inspection, options, true)?;
+    request.prefill_chunk_tokens = request.input.model_positions.max(1);
+    for execution in request.domains.iter_mut().flat_map(|d| &mut d.executions) {
+        execution.logits = LogitsWorkspace::EveryPosition;
+    }
+    let calibration = ForecastCalibration {
+        attention: options.attention.clone(),
+        cache_update: options.cache_update,
+        workspace_overlap: Some(options.workspace_overlap.clone()),
+        ..Default::default()
+    };
+    let embedded = EmbeddedPredictionMemoryPlan::from_topology(&topology, &request, &calibration)?;
+    Ok((
+        request,
+        SpeculativeMemoryPlan {
+            embedded: Some(embedded),
+            draft: None,
+            auxiliary_bytes_per_position: MemoryBytes::exact(0),
+            sampling_bytes_per_vocabulary_entry,
+            max_draft_tokens,
+            scheduler,
+            shared_allocator: true,
+        },
+    ))
+}
+
+fn inspected_generation_memory_request_inner(
+    inspection: &ModelInspectionOutcome,
+    options: &GenerationMemoryOptions,
+    embedded_target: bool,
+) -> Result<GenerationMemoryRequest, CapabilityError> {
     let selected = inspection.selected().ok_or_else(|| CapabilityError::Observation("memory estimation requires a valid cold execution selection; inspect model issues for the admission failure".into()))?;
     let execution = selected.preparation().execution();
     let text = execution.text_realization();
@@ -251,7 +357,7 @@ pub fn inspected_generation_memory_request(
     let mut workspace = geometry.workspace;
     let mut execution_topology = geometry.execution_topology;
     let state_layout = geometry.state_layout;
-    if selected.preparation().prediction_realization().is_some() {
+    if selected.preparation().prediction_realization().is_some() && !embedded_target {
         workspace = None;
         execution_topology = None;
     }

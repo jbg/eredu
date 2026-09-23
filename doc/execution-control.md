@@ -1034,10 +1034,13 @@ per-step native storage because transformations complete synchronously; other
 backends default to the cumulative retained limit. These are logical estimates
 with separate allocator/graph allowances, not physical process guarantees.
 Independent autoregressive speculative forecasts include target/draft transaction
-resources where both ordinary workspaces are covered. Embedded and feature-conditioned
-prediction retain unknown components. Forecasts do not consume preparation, state,
+resources where both ordinary workspaces are covered. Embedded startup composes
+ordinary prediction modules, state, retained target features and transaction copies;
+it is finite only when the selected mechanisms are covered. Feature-conditioned
+external assistants retain unknown components. Forecasts do not consume preparation, state,
 callbacks, capture budgets or submission authority. Fresh-request forecasts require
-fresh/reset state; active sessions use the continuation operation below.
+fresh/reset state; speculative startup describes a fresh isolated lane. Active
+sessions use the continuation operation below.
 See [generation memory](generation-memory.md).
 
 

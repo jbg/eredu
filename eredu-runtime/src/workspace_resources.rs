@@ -173,6 +173,7 @@ pub fn describe_text_workspace(
         .ok_or_else(|| invalid("module topology unavailable"))?;
     if topology.hidden_size == 0
         || topology.vocabulary_size == 0
+        || topology.output_invocations == 0
         || topology.layers.is_empty()
         || request.batch_size == 0
         || positions < query
@@ -268,9 +269,22 @@ pub fn describe_text_workspace(
             0,
             product(&[rows, topology.hidden_size, hidden_outputs, upper_scalar])?,
         )?;
+        for projection_spec in &layer.input_projections {
+            charge(
+                &mut schedule,
+                "input-fusion-projection",
+                output_bytes(&projection(projection_spec, rows, scalar))?,
+                product(&[
+                    rows,
+                    add(projection_spec.input, projection_spec.output)?,
+                    upper_scalar,
+                ])?,
+            )?;
+        }
         let projections = match &layer.mixer {
             TokenMixerTopology::Attention { projections, .. }
-            | TokenMixerTopology::GatedConvolution { projections, .. } => projections,
+            | TokenMixerTopology::GatedConvolution { projections, .. } => projections.as_slice(),
+            TokenMixerTopology::Unknown { .. } => &[],
         };
         for p in projections {
             let payload = output_bytes(&projection(p, rows, scalar))?;
@@ -282,6 +296,9 @@ pub fn describe_text_workspace(
             )?;
         }
         match &layer.mixer {
+            TokenMixerTopology::Unknown { reason } => {
+                schedule.allocation("token-mixer", MemoryBytes::unknown(reason), hold.clone())?;
+            }
             TokenMixerTopology::Attention {
                 query_heads,
                 kv_heads,
@@ -292,8 +309,17 @@ pub fn describe_text_workspace(
                 sinks,
                 query_key_normalization,
                 rotary,
+                output_gate,
                 ..
             } => {
+                if *output_gate {
+                    charge(
+                        &mut schedule,
+                        "attention-output-gate",
+                        0,
+                        product(&[rows, *query_heads, *value_width, upper_scalar, 2])?,
+                    )?;
+                }
                 let invocation = MechanismInvocation::Attention {
                     batch: request.batch_size,
                     query_heads: *query_heads,
@@ -502,7 +528,7 @@ pub fn describe_text_workspace(
     }
     schedule.allocation("attention-scratch", attention_scratch, global.clone())?;
     let logits_rows = mul(
-        request.batch_size,
+        mul(request.batch_size, topology.output_invocations)?,
         if execution.logits == LogitsWorkspace::EveryPosition {
             query
         } else {
@@ -584,6 +610,20 @@ pub(crate) fn workspace(
     if report.pools.is_empty() && report.missing.is_empty() {
         return Ok(MemoryBytes::exact(0));
     }
+    let mut missing = report.missing.clone();
+    for event in &plan.events {
+        if let ResourceLifetimeEvent::Acquire(description) = event {
+            for allocation in &description.resources.allocations {
+                if let ResourceSize::Fixed { extent } = &allocation.size {
+                    if extent.capacity.upper_bytes.is_none() {
+                        missing.push(extent.capacity.detail.clone());
+                    }
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
     let peak = report
         .pools
         .first()
@@ -592,10 +632,10 @@ pub(crate) fn workspace(
         lower_bytes: peak.peak.capacity.lower_bytes,
         upper_bytes: peak.peak.capacity.upper_bytes,
         kind: ObservationKind::Estimated,
-        detail: if report.missing.is_empty() {
+        detail: if missing.is_empty() {
             "generic mechanism calibration composed with explicit lazy-evaluation lifetimes".into()
         } else {
-            report.missing.join("; ")
+            missing.join("; ")
         },
     })
 }
@@ -698,7 +738,18 @@ fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityE
         Ok(())
     };
     for layer in &topology.layers {
+        for p in &layer.input_projections {
+            if p.input == 0 || p.output != topology.hidden_size || p.parameter.trim().is_empty() {
+                return Err(invalid(
+                    "input fusion projection disagrees with residual stream geometry",
+                ));
+            }
+        }
         match &layer.mixer {
+            TokenMixerTopology::Unknown { reason } if reason.trim().is_empty() => {
+                return Err(invalid("missing token mixer mechanism requires a reason"));
+            }
+            TokenMixerTopology::Unknown { .. } => {}
             TokenMixerTopology::Attention {
                 query_heads,
                 kv_heads,

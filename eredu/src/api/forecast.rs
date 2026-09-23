@@ -3,8 +3,9 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
-    CaptureMemoryPlan, ForecastCalibration, ForecastExecutionContract, GenerationForecastBackend,
-    GenerationForecastError, SpeculativeForecastBackend, SpeculativeMemoryPlan,
+    CaptureMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
+    ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
+    SpeculativeForecastBackend, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;
@@ -173,6 +174,24 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             ),
             logits: LogitsWorkspace::EveryPosition,
         };
+        // Speculative lanes have isolated target state, even if an unrelated
+        // ordinary session has advanced. Observe that exact lane selection.
+        let target = loaded_forecast(
+            B::speculative_target_memory_profile(&self.runtime)?,
+            forecast.request.input,
+            forecast
+                .request
+                .max_output_tokens
+                .unwrap_or(forecast.request.forecast_output_tokens),
+            eredu_core::PrefillChunkPolicy::Unchunked,
+            forecast.execution.clone(),
+            options,
+        )?;
+        forecast.request = target.request;
+        forecast
+            .estimate
+            .assumptions
+            .extend(target.estimate.assumptions);
         forecast.request.prefill_chunk_tokens = forecast.request.input.model_positions.max(1);
         for domain in &mut forecast.request.domains {
             for execution in &mut domain.executions {
@@ -201,7 +220,28 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
                 .assumptions
                 .extend(draft.estimate.assumptions.clone());
         }
+        let mut embedded = profile
+            .embedded
+            .as_ref()
+            .map(|topology| {
+                eredu_runtime::memory_forecast::EmbeddedPredictionMemoryPlan::from_topology(
+                    topology,
+                    &forecast.request,
+                    &options.calibration,
+                )
+            })
+            .transpose()?;
+        if let Some(embedded) = embedded.as_mut() {
+            forecast.estimate.assumptions.extend(
+                eredu_runtime::memory_forecast::apply_embedded_parameter_conversion_credit(
+                    &mut forecast.request,
+                    embedded,
+                    profile.parameter_conversions.as_deref(),
+                )?,
+            );
+        }
         forecast.speculative = Some(SpeculativeMemoryPlan {
+            embedded,
             draft: draft.map(|f| f.request),
             auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
             sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,

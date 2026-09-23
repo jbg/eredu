@@ -61,6 +61,7 @@ fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
 
 fn plan() -> SpeculativeMemoryPlan {
     SpeculativeMemoryPlan {
+        embedded: None,
         draft: Some(request(MemoryDomain::Unified)),
         auxiliary_bytes_per_position: MemoryBytes::exact(0),
         sampling_bytes_per_vocabulary_entry: MemoryBytes::estimated(
@@ -404,10 +405,13 @@ fn use_generic_topology(request: &mut GenerationMemoryRequest) {
                 hidden_size: 32,
                 vocabulary_size: 128,
                 selected_parameter_promotion_bytes: None,
+                selected_parameter_promotion_payloads: Default::default(),
+                output_invocations: 1,
                 output_softcap: false,
                 output: projection("output", 32, 128),
                 missing: vec![],
                 layers: vec![TextLayerTopology {
+                    input_projections: Vec::new(),
                     normalization_count: 2,
                     mixer: TokenMixerTopology::Attention {
                         query_heads: 4,
@@ -417,6 +421,7 @@ fn use_generic_topology(request: &mut GenerationMemoryRequest) {
                         input_scores: false,
                         softcap: false,
                         sinks: false,
+                        output_gate: false,
                         query_key_normalization: false,
                         rotary: true,
                         projections: vec![
@@ -458,4 +463,271 @@ fn speculative_startup_and_settled_continuation_use_generic_vocabulary_and_works
     assert_eq!(settled.fit, MemoryFit::LikelyFit);
     assert!(settled.domains[0].generation_peak.upper_bytes.is_some());
     assert_eq!((target, plan, continuation), before);
+}
+
+fn embedded_fixture() -> (GenerationMemoryRequest, SpeculativeMemoryPlan) {
+    use crate::prediction_resources::{PredictionExecutionMode, PredictionStateLayer};
+    let mut target = request(MemoryDomain::Unified);
+    use_generic_topology(&mut target);
+    let execution = target.domains[0].executions[0].clone();
+    let mut plan = plan();
+    plan.draft = None;
+    plan.embedded = Some(EmbeddedPredictionMemoryPlan {
+        mode: PredictionExecutionMode::Sequential,
+        state: vec![PredictionStateLayer {
+            layer: 0,
+            policy: LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 8).unwrap(),
+            processed_token_offset: -1,
+        }],
+        allocation_granularity: 8,
+        execution,
+        target_feature_bytes_per_position: MemoryBytes::exact(32 * 4),
+        missing: vec![],
+    });
+    (target, plan)
+}
+
+#[test]
+fn embedded_startup_is_bounded_with_one_parameter_owner_and_recomputable_horizons() {
+    let (target, plan) = embedded_fixture();
+    let before = (target.clone(), plan.clone());
+    let estimate = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(estimate.domains[0].state_growth_bytes_per_position, 64);
+    assert!(estimate.domains[0]
+        .phases
+        .iter()
+        .filter(|p| p.phase != MemoryPhase::Loading)
+        .all(|p| p.parameters == MemoryBytes::exact(4096)));
+    assert_eq!(
+        estimate.domains[0].additional_generation_peak.upper_bytes,
+        Some(upper(&estimate) - 4096)
+    );
+    let mut serial = plan.clone();
+    serial.scheduler = serial.scheduler.with_lookahead(false);
+    assert!(upper(&estimate) > upper(&estimate_speculative_memory(&target, &serial).unwrap()));
+    let mut longer = target.clone();
+    longer.max_output_tokens = Some(128);
+    assert!(upper(&estimate_speculative_memory(&longer, &plan).unwrap()) > upper(&estimate));
+    let decoded: SpeculativeMemoryPlan =
+        serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+    assert_eq!(
+        estimate,
+        estimate_speculative_memory(&target, &decoded).unwrap()
+    );
+    assert_eq!((target, plan), before);
+}
+
+#[test]
+fn embedded_modes_use_ordinary_prefill_rows_and_zero_output_keeps_only_prefill() {
+    use crate::prediction_resources::PredictionExecutionMode;
+    let (mut target, mut plan) = embedded_fixture();
+    target.input = InputTokenCount::text(1);
+    target.max_output_tokens = Some(0);
+    let embedded = plan.embedded.as_mut().unwrap();
+    let (_, sequential, _) = embedded.costs(&target, 1, 1, true).unwrap();
+    assert_eq!(sequential.upper_bytes, Some(0));
+    embedded.mode = PredictionExecutionMode::Fused;
+    let (_, fused, _) = embedded.costs(&target, 1, 1, true).unwrap();
+    assert!(fused.upper_bytes.unwrap() > 0);
+    let result = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(result.fit, MemoryFit::LikelyFit);
+    assert_eq!(result.domains[0].phases.len(), 2);
+    // Fused proposal row capacity is independent of the one declared state layer.
+    target.max_output_tokens = Some(8);
+    plan.max_draft_tokens = 1;
+    let narrow = upper(&estimate_speculative_memory(&target, &plan).unwrap());
+    plan.max_draft_tokens = 6;
+    assert!(upper(&estimate_speculative_memory(&target, &plan).unwrap()) > narrow);
+}
+
+#[test]
+fn embedded_missing_mechanisms_remain_named_and_known_residency_survives() {
+    let (target, mut plan) = embedded_fixture();
+    plan.embedded
+        .as_mut()
+        .unwrap()
+        .missing
+        .push("pooling attention native scratch".into());
+    let result = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(result.fit, MemoryFit::InsufficientInformation);
+    assert_eq!(result.domains[0].generation_peak.upper_bytes, None);
+    assert!(result.domains[0].generation_peak.lower_bytes >= 4096);
+    assert!(result
+        .uncertainties
+        .iter()
+        .any(|r| r.contains("pooling attention native scratch")));
+    plan.embedded.as_mut().unwrap().missing.clear();
+    plan.embedded.as_mut().unwrap().execution.execution_topology = None;
+    assert_eq!(
+        estimate_speculative_memory(&target, &plan).unwrap().fit,
+        MemoryFit::InsufficientInformation
+    );
+}
+
+#[test]
+fn embedded_discrete_pool_does_not_charge_prediction_storage_to_host() {
+    let (mut target, plan) = embedded_fixture();
+    target.domains[0].domain = MemoryDomain::Device("accelerator".into());
+    let mut host = target.domains[0].clone();
+    host.domain = MemoryDomain::Host;
+    host.executions.clear();
+    host.resident_parameters = MemoryBytes::exact(0);
+    host.already_resident_bytes = 0;
+    host.backend_overhead = MemoryBytes::exact(0);
+    target.domains.push(host);
+    let result = estimate_speculative_memory(&target, &plan).unwrap();
+    assert_eq!(result.fit, MemoryFit::LikelyFit);
+    assert!(
+        result.domains[0].phases[0]
+            .persistent_state
+            .upper_bytes
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        result.domains[1].phases[0].persistent_state.upper_bytes,
+        Some(0)
+    );
+    assert_eq!(result.domains[1].phases[0].workspace.upper_bytes, Some(0));
+}
+
+#[test]
+fn embedded_invalid_ownership_continuation_and_overflow_are_rejected() {
+    let (target, mut plan) = embedded_fixture();
+    plan.draft = Some(target.clone());
+    assert!(estimate_speculative_memory(&target, &plan).is_err());
+    let (_, _, continuation) = continuation_fixture(1, false);
+    assert!(estimate_speculative_continuation_memory(&target, &plan, &continuation).is_err());
+    plan.draft = None;
+    plan.embedded
+        .as_mut()
+        .unwrap()
+        .target_feature_bytes_per_position = MemoryBytes::exact(u64::MAX);
+    assert!(matches!(
+        estimate_speculative_memory(&target, &plan),
+        Err(CapabilityError::ArithmeticOverflow { .. })
+    ));
+}
+
+#[test]
+fn old_speculative_serialization_preserves_explicit_auxiliary_unknowns() {
+    let mut plan = plan();
+    plan.draft = None;
+    plan.auxiliary_bytes_per_position = MemoryBytes::unknown("legacy unprojected predictor");
+    let mut wire = serde_json::to_value(&plan).unwrap();
+    wire.as_object_mut().unwrap().remove("embedded");
+    let decoded: SpeculativeMemoryPlan = serde_json::from_value(wire).unwrap();
+    assert_eq!(decoded, plan);
+    assert_eq!(
+        estimate_speculative_memory(&request(MemoryDomain::Unified), &decoded)
+            .unwrap()
+            .fit,
+        MemoryFit::InsufficientInformation
+    );
+}
+
+#[test]
+fn embedded_conversion_credit_uses_authoritative_backing_bindings_without_new_residency() {
+    use crate::{ResidentParameterConversion, ResidentParameterConversionBinding};
+    use eredu_core::resources::*;
+    let (mut target, mut plan) = embedded_fixture();
+    let prediction = plan.embedded.as_mut().unwrap();
+    for topology in [
+        target.domains[0].executions[0]
+            .execution_topology
+            .as_mut()
+            .unwrap(),
+        prediction.execution.execution_topology.as_mut().unwrap(),
+    ] {
+        topology.selected_parameter_promotion_bytes = Some(300);
+        topology.selected_parameter_promotion_payloads =
+            [("shared".into(), 100), ("independent".into(), 200)].into();
+    }
+    let identity = |key: &str| ResourceIdentity {
+        scope: "native-test".into(),
+        key: key.into(),
+    };
+    let conversion = |key: &str, names: &[&str], bytes: u64| ResidentParameterConversion {
+        allocation: ResourceAllocation {
+            identity: identity(key),
+            uses: vec![ResourceUse {
+                owner: identity("owner"),
+                role: ResourceRole::Parameters,
+            }],
+            placement: eredu_core::Observed::unavailable("no pool observation"),
+            size: ResourceSize::Fixed {
+                extent: ResourceExtent {
+                    payload: ResourceByteBounds::exact(bytes),
+                    capacity: ResourceByteBounds::unknown(bytes, "native capacity unknown"),
+                },
+            },
+        },
+        bindings: names
+            .iter()
+            .map(|name| ResidentParameterConversionBinding {
+                owner: identity("owner"),
+                unit: eredu_core::residency::OffloadUnitId::new("unit").unwrap(),
+                name: (*name).into(),
+                logical_target: Some((*name).into()),
+            })
+            .collect(),
+    };
+    // One observed backing has two aliases. Only exact prepared destinations receive credit.
+    let observed = vec![
+        conversion("shared-allocation", &["shared", "alias"], 100),
+        conversion("other-model", &["unrelated"], 200),
+    ];
+    let parameters = target.domains[0].resident_parameters.clone();
+    let notes =
+        apply_embedded_parameter_conversion_credit(&mut target, prediction, Some(&observed))
+            .unwrap();
+    assert!(notes[0].contains("300 bytes of distinct resident conversion backing"));
+    assert_eq!(target.domains[0].resident_parameters, parameters);
+    assert_eq!(
+        target.domains[0].executions[0]
+            .execution_topology
+            .as_ref()
+            .unwrap()
+            .selected_parameter_promotion_bytes,
+        Some(200)
+    );
+    assert_eq!(
+        prediction
+            .execution
+            .execution_topology
+            .as_ref()
+            .unwrap()
+            .selected_parameter_promotion_bytes,
+        Some(200)
+    );
+    // Shared readout is absent from future work in both invocations; cached residency is unchanged.
+    let before = (target.clone(), prediction.clone());
+    apply_embedded_parameter_conversion_credit(&mut target, prediction, Some(&observed)).unwrap();
+    assert_eq!((target.clone(), prediction.clone()), before);
+    let duplicate = vec![observed[0].clone(), observed[0].clone()];
+    assert!(
+        apply_embedded_parameter_conversion_credit(&mut target, prediction, Some(&duplicate))
+            .is_err()
+    );
+    assert_eq!((target.clone(), prediction.clone()), before);
+    let independent = vec![
+        conversion("first", &["independent"], 100),
+        conversion("second", &["independent"], 100),
+    ];
+    apply_embedded_parameter_conversion_credit(&mut target, prediction, Some(&independent))
+        .unwrap();
+    assert_eq!((target.clone(), prediction.clone()), before);
+    let complete = vec![conversion("complete", &["independent"], 200)];
+    apply_embedded_parameter_conversion_credit(&mut target, prediction, Some(&complete)).unwrap();
+    assert_eq!(
+        prediction
+            .execution
+            .execution_topology
+            .as_ref()
+            .unwrap()
+            .selected_parameter_promotion_bytes,
+        Some(0)
+    );
+    assert_eq!(target.domains[0].resident_parameters, parameters);
 }

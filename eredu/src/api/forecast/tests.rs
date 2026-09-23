@@ -180,12 +180,16 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
             hidden_size: 16,
             vocabulary_size: 32,
             output: projection(16, 32),
+            output_invocations: 1,
             output_softcap: false,
             selected_parameter_promotion_bytes: Some(1024),
+            selected_parameter_promotion_payloads: Default::default(),
             missing: vec![],
             layers: vec![
                 TextLayerTopology {
+                    input_projections: vec![],
                     mixer: TokenMixerTopology::Attention {
+                        output_gate: false,
                         query_heads: 4,
                         kv_heads: 1,
                         key_width: 4,

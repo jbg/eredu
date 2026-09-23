@@ -1027,16 +1027,7 @@ fn new_attention<B: NeuralBackend>(
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Attention<B>, Error> {
     let prefix = format!("{root}.self_attn");
-    let linear = |field: &str, input, output| {
-        new_linear::<B>(
-            config,
-            &format!("{prefix}.{field}"),
-            input,
-            output,
-            config.attention_bias,
-            context,
-        )
-    };
+    let [query, key, value, output] = attention_projection_specs(config, root)?;
     let norm = |field: &str| {
         B::normalization(
             NormalizationConstructionSpec {
@@ -1056,26 +1047,10 @@ fn new_attention<B: NeuralBackend>(
         config.num_attention_heads,
         config.num_key_value_heads,
         config.head_dim,
-        linear(
-            "q_proj",
-            config.hidden_size,
-            2 * config.num_attention_heads * config.head_dim,
-        )?,
-        linear(
-            "k_proj",
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-        )?,
-        linear(
-            "v_proj",
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-        )?,
-        linear(
-            "o_proj",
-            config.num_attention_heads * config.head_dim,
-            config.hidden_size,
-        )?,
+        B::linear(query, context)?,
+        B::linear(key, context)?,
+        B::linear(value, context)?,
+        B::linear(output, context)?,
         Some(norm("q_norm")?),
         Some(norm("k_norm")?),
         Some(B::rotary(
@@ -1099,33 +1074,90 @@ fn new_mlp<B: NeuralBackend>(
     intermediate: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Mlp<B>, Error> {
+    let [gate, up, down] = mlp_projection_specs(config, prefix, intermediate)?;
     Ok(Mlp::from_parts(
-        new_linear::<B>(
+        B::linear(gate, context)?,
+        B::linear(up, context)?,
+        B::linear(down, context)?,
+        None,
+    ))
+}
+
+pub(super) fn attention_projection_specs(
+    config: &HybridConfig,
+    root: &str,
+) -> Result<[LinearSpec; 4], Error> {
+    let prefix = format!("{root}.self_attn");
+    let query = config
+        .num_attention_heads
+        .checked_mul(config.head_dim)
+        .ok_or_else(|| Error::backend("query width overflow"))?;
+    let kv = config
+        .num_key_value_heads
+        .checked_mul(config.head_dim)
+        .ok_or_else(|| Error::backend("key/value width overflow"))?;
+    Ok([
+        linear_spec(
+            config,
+            &format!("{prefix}.q_proj"),
+            config.hidden_size,
+            query
+                .checked_mul(2)
+                .ok_or_else(|| Error::backend("gated query width overflow"))?,
+            config.attention_bias,
+        )?,
+        linear_spec(
+            config,
+            &format!("{prefix}.k_proj"),
+            config.hidden_size,
+            kv,
+            config.attention_bias,
+        )?,
+        linear_spec(
+            config,
+            &format!("{prefix}.v_proj"),
+            config.hidden_size,
+            kv,
+            config.attention_bias,
+        )?,
+        linear_spec(
+            config,
+            &format!("{prefix}.o_proj"),
+            query,
+            config.hidden_size,
+            config.attention_bias,
+        )?,
+    ])
+}
+
+pub(super) fn mlp_projection_specs(
+    config: &HybridConfig,
+    prefix: &str,
+    intermediate: i32,
+) -> Result<[LinearSpec; 3], Error> {
+    Ok([
+        linear_spec(
             config,
             &format!("{prefix}.gate_proj"),
             config.hidden_size,
             intermediate,
             false,
-            context,
         )?,
-        new_linear::<B>(
+        linear_spec(
             config,
             &format!("{prefix}.up_proj"),
             config.hidden_size,
             intermediate,
             false,
-            context,
         )?,
-        new_linear::<B>(
+        linear_spec(
             config,
             &format!("{prefix}.down_proj"),
             intermediate,
             config.hidden_size,
             false,
-            context,
         )?,
-        None,
-    ))
+    ])
 }
 
 fn new_linear<B: NeuralBackend>(
@@ -1136,22 +1168,29 @@ fn new_linear<B: NeuralBackend>(
     bias: bool,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Linear, Error> {
+    B::linear(linear_spec(config, prefix, input, output, bias)?, context)
+}
+
+pub(super) fn linear_spec(
+    config: &HybridConfig,
+    prefix: &str,
+    input: i32,
+    output: i32,
+    bias: bool,
+) -> Result<LinearSpec, Error> {
     let weight = format!("{prefix}.weight");
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&weight)?,
-            bias: bias
-                .then(|| parameter(format!("{prefix}.bias")))
-                .transpose()?,
-            format: crate::linear_format::standard_linear_format(
-                &weight,
-                config.linear_format(&weight),
-            )?,
-        },
-        context,
-    )
+    Ok(LinearSpec {
+        input,
+        output,
+        weight: parameter(&weight)?,
+        bias: bias
+            .then(|| parameter(format!("{prefix}.bias")))
+            .transpose()?,
+        format: crate::linear_format::standard_linear_format(
+            &weight,
+            config.linear_format(&weight),
+        )?,
+    })
 }
 
 fn parameter(name: impl AsRef<str>) -> Result<ParameterSpec, Error> {
