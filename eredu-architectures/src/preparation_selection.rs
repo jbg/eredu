@@ -58,6 +58,14 @@ use crate::{
 /// execution branch, or inspect model-family identity. Architecture code supplies
 /// exact neutral requirements and retains every selection decision.
 pub trait PreparationMechanismProvider {
+    /// Native temporary geometry for explicit input-score attention. No family
+    /// identity, tensor, stream or device is consulted.
+    fn input_score_attention_workspace(
+        &self,
+    ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
+        None
+    }
+
     /// Conservative live buffers for one physical recipe, including native
     /// copies and index buffers. This must inspect metadata only.
     fn recipe_materialization_workspace(
@@ -450,7 +458,7 @@ where
         partitioned_base: parallel.is_some(),
         mechanisms,
     };
-    let execution = match parallel {
+    let mut execution = match parallel {
         Some(topology) => {
             let (maximum_batch_size, maximum_sequence_length) = request
                 .partitioned_invocation_limits()
@@ -502,6 +510,7 @@ where
             SelectedExecution::ordinary(selected)
         }
     };
+    execution.input_score_attention_workspace = mechanisms.input_score_attention_workspace();
     Ok(SelectedPreparation::new(
         inspection.admission_token(),
         execution,
@@ -747,6 +756,8 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub(crate) struct BoundedIndependentAdapter {
+        input_score_workspace:
+            Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>,
         chunked_prefill: bool,
         counters: IndependentCounters,
         failure: IndependentFailure,
@@ -879,6 +890,12 @@ pub(crate) mod tests {
     }
 
     impl PreparationMechanismProvider for BoundedIndependentAdapter {
+        fn input_score_attention_workspace(
+            &self,
+        ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
+            self.input_score_workspace
+        }
+
         fn recipe_materialization_workspace(
             &self,
             recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
@@ -1541,6 +1558,49 @@ pub(crate) mod tests {
                 "retained requirements must not form an ownership cycle"
             );
         }
+    }
+
+    #[test]
+    fn workspace_mechanism_changes_invalidate_retained_cold_selection() {
+        use eredu_runtime::memory_estimation::InputScoreAttentionMechanism;
+        use std::sync::atomic::Ordering;
+        let (_root, inspection) = inspected_llama();
+        let validation = inspection
+            .architecture_plan()
+            .validation(inspection.admission_token());
+        let request = NormalizedLoadRequest::default();
+        let mut mechanisms = BoundedIndependentAdapter::default();
+        let absent = select_preparation(&inspection, &request, &mechanisms).unwrap();
+        assert!(absent
+            .execution()
+            .input_score_attention_workspace()
+            .is_none());
+        mechanisms.input_score_workspace = Some(InputScoreAttentionMechanism {
+            score_tile_elements: 16,
+            max_query_rows: 4,
+            key_value_copies: 4,
+            score_bytes: 16,
+        });
+        for _ in 0..2 {
+            let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
+            assert_eq!(
+                selected.execution().input_score_attention_workspace(),
+                mechanisms.input_score_workspace
+            );
+        }
+        assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 2);
+        mechanisms
+            .input_score_workspace
+            .as_mut()
+            .unwrap()
+            .max_query_rows = 8;
+        let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
+        assert_eq!(
+            selected.execution().input_score_attention_workspace(),
+            mechanisms.input_score_workspace
+        );
+        assert_eq!(validation.selection_runs.load(Ordering::Relaxed), 3);
+        mechanisms.assert_cold_only();
     }
 
     #[test]

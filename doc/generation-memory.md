@@ -454,12 +454,58 @@ a budget crossed only by its upper end yields insufficient information. The
 shared calibration linear-workspace upper envelope permits one activation set per local state
 layer plus 25% scratch margin, calibrated against the small Metal matrix below.
 The lower end models one set. This accounts coarsely for lazy graph retention;
-it does not assert exact tensor lifetimes and is uncalibrated on other models
-and hardware. The initial one-layer formula underpredicted long-prompt peaks
-by 22–35%; measured calibration is essential to these planning assumptions. Recurrent, routed,
+it does not assert exact tensor lifetimes. The dense LFM2/LFM2.5 hybrid
+calibration below extends coverage; other models and hardware remain uncalibrated. The initial one-layer formula underpredicted long-prompt peaks
+by 22–35%; measured calibration is essential to these planning assumptions. Other recurrent, routed,
 media, embedded/feature-conditioned speculative and distributed paths retain calculated facts but report
 uncovered workspace rather than claim comprehensive coverage. The public runtime
 API supports explicit fused scratch estimates and local device geometries.
+
+### Dense LFM2/LFM2.5 hybrid workspace
+
+Dense LFM2 selections now project the normalized feed-forward width, attention
+schedule, convolution channels and kernel width for SafeTensors and GGUF.
+Persistent convolution history remains in the state estimate. With batch `B`,
+query positions `Q`, channels `C`, kernel width `K` and floating element size `S`,
+one additional convolution set allows:
+
+```text
+B * C * (6*Q + 2*(Q+K-1) + Q*K + K) * max(S, 4)
+```
+
+This covers the three-way projection, two gate products, convolution output,
+padded/history input copies, kernel-width unfolded scratch and a contiguous
+kernel. The shared linear upper also permits float32 promotion. For either
+operator, `min(copies, operator_layers + max(copies - total_layers, 0))` bounds
+live sets using the existing layer-overlap calibration. The convolution lower
+contribution stays zero; these are conservative planning allowances.
+
+LFM2's explicit input-score attention needs more than a score-matrix allowance.
+MLX's query tiles can retain separate expanded K/V and contiguous projection
+buffers. The backend supplies its actual tile thresholds (8,192 query-by-key
+elements, at most 32 query rows) with conservative allowances of four expanded
+K/V copies per tile and 16 working bytes per score element. These facts are
+retained during selection, including cold inspection, and participate in cached
+selection validation. Runtime adds their layer-overlap envelope to the ordinary
+attention fallback. Above the score budget, whole-context K/V copies also bound
+the smaller key-block realizations conservatively. Missing native facts leave
+an unknown upper end. Attention-free convolution schedules need no attention
+scratch declaration.
+
+This coverage applies to ordinary cold, loaded and settled continuation
+forecasts. LFM2 still requires full-pass prefill: reducing a requested chunk size
+does not reduce its estimate. Routed LFM2, distributed projections, nondevice
+state, and existing prediction/residency exclusions retain their explicit gaps.
+Mixed-width selected parameters add a separate float32 cast allowance, including
+promoted state and replacement storage above the nominal state estimate. The
+architecture computes this from selected logical parameter shapes and dtypes;
+no file-format name selects the allowance. It is especially relevant to the
+published BF16 GGUF, whose small convolution/norm tensors include float32.
+
+The new optional `WorkspaceGeometry` JSON fields `gated_convolution`,
+`input_score_attention` and `mixed_precision_parameter_bytes` are omitted for
+ordinary dense attention records; older records deserialize with them absent.
+Rust struct literals must initialize them.
 
 Unified memory describes shared capacity, not automatic identity of every host
 and device buffer. Separate devices are compared independently. The static-report
@@ -586,16 +632,82 @@ exited with status 1 before model loading. These are modest application budgets,
 not the host's 256 GiB capacity. Cold inspection plus candidate recomputation
 took 37–39 ms per fresh process on this checkpoint.
 
-A separate run of cached official `LiquidAI/LFM2.5-1.2B-Instruct` revision
+An earlier run of cached official `LiquidAI/LFM2.5-1.2B-Instruct` revision
 `0f604ada3f766f9f257460c4c9f0b5d6f69d431b`, with 128 input positions and eight
 decode tokens, completed successfully while reporting an unavailable workspace
 upper bound. Its recurrent workspace was not treated as zero and ordinary
 generation remained available. This is coverage of the uncertainty path, not
-calibration of hybrid-model peak estimates.
+calibration of hybrid-model peak estimates. The new hybrid calibration below
+supersedes that workspace gap.
 
 Native distributed placement, media workspace and other model/hardware
 calibrations remain open. CUDA validation was explicitly deferred. The native
 fixture checks and portable domain tests do not establish those native results.
+
+## Hybrid calibration (2026-09-23)
+
+Native tests used macOS/aarch64, Metal and the same 256 GiB unified-memory host.
+The cached official `LiquidAI/LFM2.5-1.2B-Instruct` revision was
+`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`. Its 2,340,697,936-byte
+`model.safetensors` SHA-256 was verified as
+`1ba63d9adb03ae43581db0e136e4416febe0441aff7296397bd455fb6017f73a`.
+The model has 16 layers (10 convolution, six attention), hidden width 2,048,
+normalized MLP width 8,192, 32 query heads, eight KV heads and kernel width three.
+Selected state storage is BF16. A nonzero float32 fixture additionally covers
+one-token, 17-position and 39-position prompts.
+
+Each run disables allocator caching, requests eight greedy tokens and a
+four-token prefill chunk (correctly normalized to the full prompt). After four
+committed predictions it forecasts four more tokens at a synchronized boundary.
+It compares cold/loaded geometry, ordinary/controlled forecasts and output tokens,
+and verifies that forecasts allocate no active native bytes. The table records
+additional active-memory growth above loaded parameters, not process RSS. The
+256 GiB application budget makes these calibration cases observable; a separate
+16 GiB-budget check rejects `LikelyFit` for the 2,000-position request.
+
+All values are MiB; upper ends are calibrated envelopes, not tight projections.
+
+| Source | Positions | Cold lifecycle upper | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
+|---|---:|---:|---:|---:|---:|---:|
+| SafeTensors BF16 | 128 | 5296.5 | 786.9 | 546.0 | 124.3 | 13.9 |
+| SafeTensors BF16 | 2000 | 187728.0 | 185495.7 | 67375.7 | 865.1 | 159.2 |
+| GGUF BF16/mixed | 128 | 8686.2 | 6453.7 | 4960.2 | 5738.6 | 4483.7 |
+| GGUF BF16/mixed | 2000 | 349607.0 | 347374.5 | 110485.0 | 6901.7 | 4705.7 |
+
+The GGUF run used official `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` revision
+`6767265158422fb8a19c62ceb45f16f05363615b`, file
+`LFM2.5-1.2B-Instruct-BF16.gguf` (2,343,326,528 bytes), with verified SHA-256
+`3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b`.
+Pass that file as `EREDU_LFM2_MEMORY_MODEL` to reproduce. Its 128-position
+fresh/continuation forecasts report `LikelyFit`. The 2,000-position fresh forecast
+has a finite upper but remains `InsufficientInformation` because its interval
+crosses the host/application capacity. That is interval uncertainty rather than
+missing workspace coverage. Parameter casts explain much of the GGUF continuation
+cost; the broader envelope intentionally covers both promoted storage and casts.
+
+The first convolution-only extension underpredicted the SafeTensors cases. The long case
+actually retains about 66 GiB of extra active allocations through explicit
+input-score attention. Query tiling does not imply bounded whole-graph retention.
+The final native-copy envelope covers that measured behavior conservatively;
+optimizing shared K/V expansion would be separate backend work.
+
+Reproduce with a cached immutable snapshot (no downloads or cache edits occur):
+
+```sh
+EREDU_LFM2_MEMORY_MODEL=/path/to/LFM2.5-1.2B-Instruct/snapshot \
+EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
+cargo test -p eredu --features mlx,metal --offline \
+  --test native_execution_control native_lfm2_workspace_forecasts \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Without environment variables the same test uses the small float32 fixture.
+The optional `EREDU_LFM2_MEMORY_QUANTIZED=1` requests affine 4-bit weights with
+64-value groups. On this pinned BF16 SafeTensors checkpoint, native loading
+currently fails before inference: `model.layers.0.conv.in_proj.weight` expects
+recipe dtype BF16 but receives native F32. That validation gap is recorded rather
+than counted as a successful quantized calibration. The workspace change does
+not alter quantization or generation equations.
 
 ## Focused verification
 
@@ -607,7 +719,8 @@ fixture checks and portable domain tests do not establish those native results.
   eight output positions, a requested 512-token chunk and zero allocator cache.
   SmolLM retained 512 and recomputed smaller-chunk savings; LFM2.5 used all 2,000
   positions, reported the architecture's full-pass reason and suggested no chunk
-  savings. The existing unknown workspace bound remained unknown.
+  savings. At that time the workspace upper was unknown; the hybrid calibration
+  now supplies the missing coverage.
 - Prepared-request facade forecasts are covered with a neutral mock backend:
   exact request settings, resident-byte deduction independent of allocator activity,
   calibration overrides, chunk recomputation, trace-only controlled parity,

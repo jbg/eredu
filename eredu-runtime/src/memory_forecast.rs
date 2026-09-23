@@ -80,7 +80,7 @@ impl ForecastCalibration {
                 execution.cache_update = self.cache_update;
                 execution.workspace_overlap = self.workspace_overlap.clone().unwrap_or(WorkspaceOverlap {
                     upper_live_copies: Some(upper),
-                    detail: "forecast calibration v1: one linear activation set per local state layer plus 25% scratch; calibrated on SmolLM-135M Metal original/4-bit, not a universal bound".into(),
+                    detail: "forecast calibration v1: one linear activation set per local state layer plus 25% scratch; calibrated on SmolLM-135M Metal original/4-bit and dense LFM2.5-1.2B Metal BF16, not a universal bound".into(),
                 });
             }
         }

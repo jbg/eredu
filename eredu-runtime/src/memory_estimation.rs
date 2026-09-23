@@ -133,6 +133,53 @@ pub struct WorkspaceGeometry {
     pub query_heads: u64,
     /// Local vocabulary projection width, including any gathered result.
     pub vocabulary_size: u64,
+    /// Additional gated causal depthwise-convolution workspace, when scheduled.
+    /// Absent in legacy dense-attention records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated_convolution: Option<GatedConvolutionWorkspace>,
+    /// Explicit input-score attention and its selected native workspace mechanism.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_score_attention: Option<InputScoreAttentionWorkspace>,
+    /// Full float32 parameter payload allowed for mixed-width promotion during
+    /// execution. Persistent parameters remain separately charged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_precision_parameter_bytes: Option<u64>,
+}
+
+/// Geometry for a three-way input projection, input/output gates, and causal
+/// depthwise convolution. Persistent history is accounted in the state layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatedConvolutionWorkspace {
+    /// Local convolution channel width.
+    pub channels: u64,
+    /// Positive causal kernel width.
+    pub kernel_size: u64,
+    /// Number of scheduled convolution layers sharing this geometry.
+    pub layers: u64,
+}
+
+/// Architecture-declared explicit input-score layers. Missing native facts keep
+/// their workspace unbounded rather than substituting a fused-attention model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputScoreAttentionWorkspace {
+    /// Number of scheduled layers using the explicit score arithmetic.
+    pub layers: u64,
+    /// Selected backend facts; absence preserves an unknown upper end.
+    pub mechanism: Option<InputScoreAttentionMechanism>,
+}
+
+/// Side-effect-free native facts for tiled explicit input-score attention.
+/// Copies and score bytes are conservative live-buffer allowances, not payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputScoreAttentionMechanism {
+    /// Query-by-key elements per head before query tiling.
+    pub score_tile_elements: u64,
+    /// Maximum query rows in one tile.
+    pub max_query_rows: u64,
+    /// Expanded K/V plus contiguous projection copies retained per query tile.
+    pub key_value_copies: u64,
+    /// Working bytes per score element, including precision conversions.
+    pub score_bytes: u64,
 }
 
 /// Selected attention implementation's workspace behavior.
@@ -485,34 +532,174 @@ fn workspace(
     let linear_upper = execution
         .workspace_overlap
         .upper_live_copies
-        .map(|copies| mul(linear, copies))
+        .map(|copies| {
+            let bytes = if g.input_score_attention.is_some() || g.gated_convolution.is_some() {
+                product(&[
+                    request.batch_size,
+                    query,
+                    width,
+                    u64::from(request.scalar_bytes.get()).max(4),
+                ])?
+            } else {
+                linear
+            };
+            mul(bytes, copies)
+        })
         .transpose()?;
+    let convolution = if let Some(conv) = &g.gated_convolution {
+        let layers = execution.state_layout.layer_layout().len() as u64;
+        if conv.channels == 0 || conv.kernel_size == 0 || conv.layers == 0 || conv.layers > layers {
+            return Err(invalid(
+                "gated_convolution",
+                "positive channels/kernel and a layer count within the selected layout are required",
+            ));
+        }
+        // Three-way projection, two gates and convolution output, two padded
+        // input copies, kernel-width unfolded scratch and a contiguous kernel.
+        let padded = add(query, conv.kernel_size - 1)?;
+        let rows = add(
+            add(mul(query, 6)?, mul(padded, 2)?)?,
+            add(mul(query, conv.kernel_size)?, conv.kernel_size)?,
+        )?;
+        let one = product(&[
+            request.batch_size,
+            conv.channels,
+            rows,
+            u64::from(request.scalar_bytes.get()).max(4),
+        ])?;
+        execution
+            .workspace_overlap
+            .upper_live_copies
+            .map(|copies| {
+                let live = copies.min(add(conv.layers, copies.saturating_sub(layers))?);
+                mul(one, live)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let linear_upper = match (&g.gated_convolution, linear_upper, convolution) {
+        (Some(_), Some(linear), Some(conv)) => Some(add(linear, conv)?),
+        (Some(_), _, _) => None,
+        (None, linear, _) => linear,
+    };
     let mut bytes = MemoryBytes {
         lower_bytes: add(linear, logits)?,
         upper_bytes: linear_upper.map(|upper| add(upper, logits)).transpose()?,
         kind: ObservationKind::Estimated,
         detail: execution.workspace_overlap.detail.clone(),
     };
-    let attention = match &execution.attention {
-        AttentionWorkspace::Materialized | AttentionWorkspace::ScoreMatrixUpperBound => {
-            let n = product(&[request.batch_size, g.query_heads, query, positions, 8])?;
-            let lower = if matches!(execution.attention, AttentionWorkspace::Materialized) {
-                n
-            } else {
-                0
-            };
-            MemoryBytes::estimated(
+    let attention = if g.query_heads == 0 {
+        MemoryBytes::exact(0)
+    } else {
+        match &execution.attention {
+            AttentionWorkspace::Materialized | AttentionWorkspace::ScoreMatrixUpperBound => {
+                let n = product(&[request.batch_size, g.query_heads, query, positions, 8])?;
+                let lower = if matches!(execution.attention, AttentionWorkspace::Materialized) {
+                    n
+                } else {
+                    0
+                };
+                MemoryBytes::estimated(
                 lower,
                 n,
                 "float32 attention scores and probabilities; fallback bounds have zero lower end",
             )
-        }
-        AttentionWorkspace::Fused { scratch } => scratch.clone(),
-        AttentionWorkspace::Unknown => {
-            MemoryBytes::unknown("attention kernel workspace unavailable")
+            }
+            AttentionWorkspace::Fused { scratch } => scratch.clone(),
+            AttentionWorkspace::Unknown => {
+                MemoryBytes::unknown("attention kernel workspace unavailable")
+            }
         }
     };
     bytes = bytes.add(&attention)?;
+    if let Some(explicit) = &g.input_score_attention {
+        let layers = execution.state_layout.layer_layout().len() as u64;
+        if explicit.layers == 0
+            || explicit.layers > layers
+            || g.query_heads == 0
+            || g.query_width % g.query_heads != 0
+        {
+            return Err(invalid(
+                "input_score_attention",
+                "invalid explicit attention layer/head geometry",
+            ));
+        }
+        let extra = match (
+            explicit.mechanism,
+            execution.workspace_overlap.upper_live_copies,
+        ) {
+            (Some(facts), Some(copies)) => {
+                if facts.score_tile_elements == 0
+                    || facts.max_query_rows == 0
+                    || facts.key_value_copies == 0
+                    || facts.score_bytes == 0
+                {
+                    return Err(invalid(
+                        "input_score_attention",
+                        "native tile and workspace allowances must be positive",
+                    ));
+                }
+                let tile = if mul(query, positions)? <= facts.score_tile_elements {
+                    query.max(1)
+                } else {
+                    (facts.score_tile_elements / positions.max(1)).clamp(1, facts.max_query_rows)
+                };
+                let tiles = query.div_ceil(tile);
+                let live = copies.min(add(explicit.layers, copies.saturating_sub(layers))?);
+                // Each tile may retain its own expanded K/V and contiguous
+                // projection inputs. Beyond the score budget, whole-context
+                // copies also cover smaller key-block realizations conservatively.
+                let expanded = product(&[
+                    request.batch_size,
+                    g.query_width,
+                    positions,
+                    if g.mixed_precision_parameter_bytes.is_some() {
+                        u64::from(request.scalar_bytes.get()).max(4)
+                    } else {
+                        u64::from(request.scalar_bytes.get())
+                    },
+                    facts.key_value_copies,
+                    tiles,
+                ])?;
+                let scores = product(&[
+                    request.batch_size,
+                    g.query_heads,
+                    query,
+                    positions,
+                    facts.score_bytes,
+                ])?;
+                MemoryBytes::estimated(0, mul(add(expanded, scores)?, live)?, "tiled input-score attention: retained expanded K/V, contiguous projection copies and score conversions")
+            }
+            _ => MemoryBytes::unknown(
+                "input-score attention native workspace facts or overlap unavailable",
+            ),
+        };
+        bytes = bytes.add(&extra)?;
+    }
+
+    if let Some(parameters) = g.mixed_precision_parameter_bytes {
+        let total_layers = (execution.state_layout.layer_layout().len() as u64).max(1);
+        let promotion = execution
+            .workspace_overlap
+            .upper_live_copies
+            .map(|copies| {
+                // One cast set across the selected parameters, plus the same excess
+                // scratch proportion as activation overlap. Allow promoted state and
+                // its replacement in addition to nominal storage already modeled.
+                let casts = add(
+                    parameters,
+                    mul(parameters, copies.saturating_sub(total_layers))?.div_ceil(total_layers),
+                )?;
+                add(casts, mul(persistent, 2)?)
+            })
+            .transpose()?;
+        bytes = bytes.add(&MemoryBytes {
+            lower_bytes: 0, upper_bytes: promotion, kind: ObservationKind::Estimated,
+            detail: "mixed floating widths: float32 parameter casts plus promoted state/replacement allowance".into(),
+        })?;
+    }
+
     bytes.add(&match execution.cache_update {
         CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
         CacheUpdateWorkspace::CopyState => MemoryBytes::estimated(
@@ -775,6 +962,17 @@ pub(crate) fn memory_uncertainties(
         }
         for (rank, execution) in plan.executions.iter().enumerate() {
             let prefix = format!("{:?} execution {rank}", plan.domain);
+            if let Some(g) = &execution.workspace {
+                if g.gated_convolution.is_some() {
+                    uncertainties.push(format!("{prefix}: gated-convolution calibration v1 includes gated rows, padded input copies, kernel-width scratch and layer overlap; linear upper allows float32 promotion; persistent history is separate"));
+                }
+                if g.mixed_precision_parameter_bytes.is_some() {
+                    uncertainties.push(format!("{prefix}: mixed floating widths allow float32 parameter casts and promoted state/replacement above nominal state storage"));
+                }
+                if g.input_score_attention.is_some() {
+                    uncertainties.push(format!("{prefix}: input-score attention includes native query tiling, repeated expanded K/V, score conversions and layer overlap; linear upper allows float32 promotion; missing native facts preserve an unknown upper end"));
+                }
+            }
             if execution.workspace.is_none() {
                 uncertainties.push(format!("{prefix}: decoder workspace geometry unavailable"));
             }

@@ -4,6 +4,18 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Dense LFM2/LFM2.5 memory forecasts
+
+Cold, loaded and continuation forecasts now bound dense LFM2 hybrid workspace,
+including gated convolution and MLX's repeated input-score attention buffers.
+Geometry comes from the normalized schedule; native tile and temporary-buffer
+facts are retained during selection. Full-pass prefill remains explicit. Missing
+backend facts, routed variants and previously excluded paths remain unbounded.
+`WorkspaceGeometry` adds optional `gated_convolution`, `input_score_attention`
+and `mixed_precision_parameter_bytes` fields: older JSON remains readable; Rust
+literals need the new fields.
+See [calibration and limits](doc/generation-memory.md#dense-lfm2lfm25-hybrid-workspace).
+
 ## 2026-09-23 — Installed continuation state lower bounds
 
 Continuation plans and phase reports now include the known required logical

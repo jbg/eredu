@@ -5,7 +5,7 @@ use crate::{
     processor_plan::ArtifactArchitecturePlan,
 };
 use eredu_core::{CapabilityError, StateMemoryLayout};
-use eredu_runtime::memory_estimation::WorkspaceGeometry;
+use eredu_runtime::memory_estimation::{GatedConvolutionWorkspace, WorkspaceGeometry};
 
 /// Architecture payload geometry; missing workspace coverage never rejects execution.
 #[derive(Debug, Clone)]
@@ -34,6 +34,13 @@ pub fn selected_generation_memory_geometry(
     execution: &crate::SelectedExecution,
 ) -> Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, CapabilityError> {
     let mut geometry = generation_memory_geometry(plan)?;
+    if let Some(explicit) = geometry
+        .workspace
+        .as_mut()
+        .and_then(|g| g.input_score_attention.as_mut())
+    {
+        explicit.mechanism = execution.input_score_attention_workspace();
+    }
     let text = execution.text_realization();
     if execution.parallel_topology().is_some() {
         geometry.state_layout = eredu_core::StateMemoryLayout::new(
@@ -63,6 +70,43 @@ pub fn selected_generation_memory_geometry(
     ) || !execution.bounded_residency_exclusions().is_empty()
     {
         geometry.workspace = None;
+    }
+    if let Some(workspace) = geometry
+        .workspace
+        .as_mut()
+        .filter(|g| g.gated_convolution.is_some() || g.input_score_attention.is_some())
+    {
+        // Mixed-width parameters can promote a hybrid's activations and create
+        // implicit projection-weight casts. This conservative envelope follows
+        // selected task geometry and encodings, not the checkpoint format name.
+        let nominal = text.state().floating_dtype().map(|d| d.bytes().get());
+        let wider = text.materialization_tasks().iter().any(|task| {
+            let dtype = task
+                .derived_output()
+                .map(|o| o.dtype().clone())
+                .or_else(|| task.source_encoding().scalar_dtype().map(Into::into));
+            matches!(dtype, Some(eredu_checkpoint::recipe::RecipeDtype::F32))
+        });
+        if nominal.is_some_and(|width| width < 4) && wider {
+            let bytes = text
+                .materialization_tasks()
+                .iter()
+                .try_fold(0u64, |total, task| {
+                    let cast = task.logical_shape().iter().try_fold(4u64, |bytes, &dim| {
+                        bytes
+                            .checked_mul(dim as u64)
+                            .ok_or(CapabilityError::ArithmeticOverflow {
+                                operation: "hybrid parameter promotion",
+                            })
+                    })?;
+                    total
+                        .checked_add(cast)
+                        .ok_or(CapabilityError::ArithmeticOverflow {
+                            operation: "hybrid parameter promotion",
+                        })
+                })?;
+            workspace.mixed_precision_parameter_bytes = Some(bytes);
+        }
     }
     Ok(eredu_runtime::memory_forecast::LoadedMemoryGeometry {
         state_layout: geometry.state_layout,
@@ -105,7 +149,57 @@ fn dense(
         key_value_width: width(kv_heads)?,
         query_heads: dimension(heads)?,
         vocabulary_size: dimension(vocabulary)?,
+        gated_convolution: None,
+        input_score_attention: None,
+        mixed_precision_parameter_bytes: None,
     })
+}
+
+fn lfm2_workspace(
+    args: &crate::lfm2::ModelArgs,
+) -> Result<Option<WorkspaceGeometry>, CapabilityError> {
+    use crate::lfm2::OperatorPolicy;
+    if args.has_sparse_moe_layers() {
+        return Ok(None);
+    }
+    let conv_layers = args
+        .layer_schedule
+        .iter()
+        .filter(|p| matches!(p.operator, OperatorPolicy::CausalConvolution))
+        .count() as u64;
+    let has_attention = args
+        .layer_schedule
+        .iter()
+        .any(|p| matches!(p.operator, OperatorPolicy::SelfAttention(_)));
+    let mut geometry = dense(
+        args.hidden_size,
+        args.dense_intermediate_size,
+        args.num_attention_heads,
+        args.num_key_value_heads,
+        args.hidden_size / args.num_attention_heads,
+        args.vocab_size,
+    )?;
+    if !has_attention {
+        geometry.query_width = 0;
+        geometry.key_value_width = 0;
+        geometry.query_heads = 0;
+    }
+    if has_attention {
+        geometry.input_score_attention = Some(
+            eredu_runtime::memory_estimation::InputScoreAttentionWorkspace {
+                layers: args.layer_schedule.len() as u64 - conv_layers,
+                mechanism: None,
+            },
+        );
+    }
+    if conv_layers > 0 {
+        geometry.gated_convolution = Some(GatedConvolutionWorkspace {
+            channels: dimension(args.hidden_size)?,
+            kernel_size: dimension(args.conv_l_cache)?,
+            layers: conv_layers,
+        });
+    }
+    Ok(Some(geometry))
 }
 
 /// Projects validated metadata without allocating a device, tensor, or source store.
@@ -188,7 +282,9 @@ pub fn generation_memory_geometry(
             (crate::capability::muse_glimmer(args)?, None)
         }
         (Some(SafetensorsModelConfig::Lfm2(args)), None)
-        | (None, Some(GgufModelConfig::Lfm2(args))) => (crate::capability::lfm2(args)?, None),
+        | (None, Some(GgufModelConfig::Lfm2(args))) => {
+            (crate::capability::lfm2(args)?, lfm2_workspace(args)?)
+        }
         (Some(SafetensorsModelConfig::NemotronH(args)), None)
         | (None, Some(GgufModelConfig::NemotronH(args))) => {
             (crate::capability::nemotron_h(args)?, None)
@@ -294,6 +390,55 @@ mod tests {
         .unwrap();
         assert!(state.fixed_state_bytes > 0);
         assert!(state.context_state_bytes > 0);
+    }
+
+    #[test]
+    fn lfm2_dense_workspace_uses_normalized_ffn_and_hybrid_schedule() {
+        use eredu_core::ModelConfigurationResolver;
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/lfm2/released-config.json"))
+                .unwrap();
+        let resolved = crate::configuration::MODEL_CONFIGURATIONS
+            .resolve_safetensors(&config)
+            .unwrap();
+        let geometry = generation_memory_geometry(resolved.architecture_plan()).unwrap();
+        let workspace = geometry.workspace.unwrap();
+        assert_eq!(workspace.hidden_size, 1024);
+        assert_eq!(workspace.intermediate_size, 4608); // normalized SwiGLU 2/3 and 256 rounding
+        assert_eq!(workspace.query_width, 1024);
+        assert_eq!(workspace.key_value_width, 512);
+        assert_eq!(
+            workspace.gated_convolution,
+            Some(GatedConvolutionWorkspace {
+                channels: 1024,
+                kernel_size: 3,
+                layers: 10
+            })
+        );
+        assert_eq!(workspace.input_score_attention.as_ref().unwrap().layers, 6);
+        assert!(workspace
+            .input_score_attention
+            .as_ref()
+            .unwrap()
+            .mechanism
+            .is_none());
+        let mut args = crate::lfm2::model_args_from_config_value(&config).unwrap();
+        let mut policies: Vec<_> = args.layer_schedule.iter().copied().collect();
+        for policy in &mut policies {
+            policy.operator = crate::lfm2::OperatorPolicy::CausalConvolution;
+        }
+        args.layer_schedule =
+            eredu_core::LayerSchedule::new(policies.len(), policies.clone()).unwrap();
+        let conv = lfm2_workspace(&args).unwrap().unwrap();
+        assert_eq!(
+            (conv.query_heads, conv.query_width, conv.key_value_width),
+            (0, 0, 0)
+        );
+        assert_eq!(conv.gated_convolution.unwrap().layers, 16);
+        assert!(conv.input_score_attention.is_none());
+        policies[0].feed_forward = crate::lfm2::FeedForwardPolicy::SparseMoe;
+        args.layer_schedule = eredu_core::LayerSchedule::new(policies.len(), policies).unwrap();
+        assert!(lfm2_workspace(&args).unwrap().is_none());
     }
 
     #[test]

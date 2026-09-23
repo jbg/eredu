@@ -110,6 +110,12 @@ impl<'a> MlxPreparationMechanisms<'a> {
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {
+    fn input_score_attention_workspace(
+        &self,
+    ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
+        Some(crate::backend::nn::attention::INPUT_SCORE_WORKSPACE)
+    }
+
     fn recipe_materialization_workspace(
         &self,
         recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,

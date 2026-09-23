@@ -6369,6 +6369,18 @@ application limits and reserves. The explicit-placement constructor remains avai
 Architecture-owned memory projections describe workspace geometry using the
 normalized family configuration and exact state schedule. Runtime owns checked
 phase-overlap estimates, physical-capacity comparisons and candidate recomputation.
+Dense LFM2 projections include gated-convolution geometry and the count of
+explicit input-score attention layers. `PreparationMechanismProvider` supplies
+neutral input-score workspace facts without family inspection. MLX reports its
+query tile thresholds and conservative temporary-copy allowances from the same
+constants used by its native attention mechanism; selection retains these facts
+and includes them in cached-selection validation. Runtime combines them with
+architecture geometry for repeated K/V projection buffers, score conversions,
+convolution scratch and overlap. Missing native facts preserve an unknown bound.
+Persistent convolution history remains in the state layout. Mixed-width selected
+parameter metadata adds a float32 cast allowance and promoted-state/replacement
+storage above nominal state bytes; it is derived from task shapes and dtypes,
+not checkpoint-format dispatch in a backend.
 Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
 cache-copy overlap, layer workspace multiplier and graph allowance. Architecture
 preparation retains selected state/workspace geometry in `PreparedModelDiscovery`.

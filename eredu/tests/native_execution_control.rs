@@ -668,3 +668,6 @@ mod capture_failures;
 
 #[path = "native_execution_control/continuation.rs"]
 mod continuation;
+
+#[path = "native_execution_control/lfm2_memory.rs"]
+mod lfm2_memory;

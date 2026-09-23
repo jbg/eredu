@@ -59,6 +59,7 @@ pub(crate) struct ValidatedSelection {
 /// on a backend name or object address as evidence that its support is unchanged.
 #[derive(Debug)]
 pub(crate) enum MechanismObservation {
+    InputScoreWorkspace(Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>),
     Observation(eredu_core::ObservationMechanisms),
     Capture(eredu_core::capture::CaptureCapabilities),
     Preparation(eredu_core::PreparationMechanismCapabilities),
@@ -76,6 +77,9 @@ pub(crate) enum MechanismObservation {
 impl MechanismObservation {
     pub fn matches(&self, provider: &impl crate::PreparationMechanismProvider) -> bool {
         match self {
+            Self::InputScoreWorkspace(facts) => {
+                *facts == provider.input_score_attention_workspace()
+            }
             Self::Observation(facts) => *facts == provider.observation_mechanisms(),
             Self::Capture(facts) => *facts == provider.capture_capabilities(),
             Self::Preparation(facts) => *facts == provider.preparation_capabilities(),
@@ -100,6 +104,16 @@ pub(crate) struct RecordingMechanisms<'a, P> {
 impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
     for RecordingMechanisms<'_, P>
 {
+    fn input_score_attention_workspace(
+        &self,
+    ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
+        let facts = self.provider.input_score_attention_workspace();
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::InputScoreWorkspace(facts));
+        facts
+    }
+
     fn observation_mechanisms(&self) -> eredu_core::ObservationMechanisms {
         let facts = self.provider.observation_mechanisms();
         self.observations

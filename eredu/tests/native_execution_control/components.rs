@@ -591,7 +591,7 @@ fn native_non_gated_parameter_edits_match_independent_reference_and_restore() {
     );
 }
 
-fn lfm2_fixture() -> Fixture {
+pub(super) fn lfm2_fixture() -> Fixture {
     lfm2_fixture_with_banks(false)
 }
 

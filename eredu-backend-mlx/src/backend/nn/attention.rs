@@ -335,6 +335,16 @@ pub fn sliding_window_prefill_attention_with_softcap(
 #[cfg(test)]
 mod tests;
 
+/// Conservative native live-buffer facts shared with cold memory selection.
+pub(crate) const INPUT_SCORE_WORKSPACE:
+    eredu_runtime::memory_estimation::InputScoreAttentionMechanism =
+    eredu_runtime::memory_estimation::InputScoreAttentionMechanism {
+        score_tile_elements: 8192,
+        max_query_rows: 32,
+        key_value_copies: 4,
+        score_bytes: 16,
+    };
+
 /// Scaled attention with an optional score transform, before masks and sink logits.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_with_softcap(
@@ -381,7 +391,8 @@ pub fn attention_with_softcap(
         ));
     }
     if arithmetic == eredu_nn::AttentionArithmetic::InputScores
-        && i64::from(queries.dim(2)) * i64::from(keys.dim(2)) > 8192
+        && i64::from(queries.dim(2)) * i64::from(keys.dim(2))
+            > INPUT_SCORE_WORKSPACE.score_tile_elements as i64
     {
         return bounded_input_score_attention(
             queries, keys, values, scale, mask, sinks, softcap, stream,
@@ -486,7 +497,8 @@ fn bounded_input_score_attention(
         })
         .transpose()?;
     let mut outputs = Vec::new();
-    let query_step = (8192 / keys.dim(2)).clamp(1, 32);
+    let query_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
+        .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
     for start in (0..queries.dim(2)).step_by(query_step as usize) {
         let end = (start + query_step).min(queries.dim(2));
         let query = queries.try_index_device((.., .., start..end, ..), stream)?;
@@ -494,7 +506,7 @@ fn bounded_input_score_attention(
             .as_ref()
             .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
             .transpose()?;
-        if keys.dim(2) <= 8192 {
+        if keys.dim(2) <= INPUT_SCORE_WORKSPACE.score_tile_elements as i32 {
             outputs.push(attention_with_softcap(
                 &query,
                 keys,

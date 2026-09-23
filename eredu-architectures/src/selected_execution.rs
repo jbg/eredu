@@ -101,9 +101,18 @@ pub trait SelectedExecutionDispatcher: Sized {
 #[derive(Debug, Clone)]
 pub struct SelectedExecution {
     kind: Box<SelectedExecutionKind>,
+    pub(crate) input_score_attention_workspace:
+        Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>,
 }
 
 impl SelectedExecution {
+    /// Retained native workspace facts; no device or tensor observation.
+    pub fn input_score_attention_workspace(
+        &self,
+    ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
+        self.input_score_attention_workspace
+    }
+
     /// Resolves effective parameter coordinates on one rank of this retained
     /// execution. This is bounded descriptive geometry, not loaded authority.
     pub fn parameter_partition_layout_for_rank(
@@ -322,36 +331,42 @@ impl SelectedExecution {
     pub(crate) fn replicated(selected: SelectedReplicatedTextRealization) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::Replicated(selected)),
+            input_score_attention_workspace: None,
         }
     }
 
     pub(crate) fn routed(selected: SelectedRoutedTextRealization) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::Routed(selected)),
+            input_score_attention_workspace: None,
         }
     }
 
     pub(crate) fn composite(selected: SelectedCompositeTextRealization) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::Composite(selected)),
+            input_score_attention_workspace: None,
         }
     }
 
     pub(crate) fn partitioned_dense(selected: SelectedDensePartitionedExecution) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedDense(selected)),
+            input_score_attention_workspace: None,
         }
     }
 
     pub(crate) fn partitioned_routed(selected: SelectedRoutedPartitionedExecution) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedRouted(selected)),
+            input_score_attention_workspace: None,
         }
     }
 
     pub(crate) fn partitioned_composite(selected: SelectedCompositePartitionedExecution) -> Self {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedComposite(selected)),
+            input_score_attention_workspace: None,
         }
     }
 

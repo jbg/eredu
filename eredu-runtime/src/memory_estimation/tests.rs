@@ -38,6 +38,9 @@ fn request() -> GenerationMemoryRequest {
                     key_value_width: 8,
                     query_heads: 4,
                     vocabulary_size: 128,
+                    gated_convolution: None,
+                    input_score_attention: None,
+                    mixed_precision_parameter_bytes: None,
                 }),
                 attention: AttentionWorkspace::Materialized,
                 cache_update: CacheUpdateWorkspace::InPlace,
@@ -628,4 +631,175 @@ fn request_and_estimate_json_share_the_forecast_wire_contract() {
         serde_json::from_value::<GenerationMemoryEstimate>(encoded_report).unwrap(),
         report
     );
+}
+
+#[test]
+fn gated_convolution_workspace_counts_padding_scratch_and_scheduled_overlap() {
+    let mut r = request();
+    let execution = &mut r.domains[0].executions[0];
+    execution.workspace_overlap.upper_live_copies = Some(3); // two layers plus scratch
+    execution.workspace.as_mut().unwrap().gated_convolution = Some(GatedConvolutionWorkspace {
+        channels: 16,
+        kernel_size: 3,
+        layers: 1,
+    });
+    let execution = execution.clone();
+    let with = workspace(&execution, &r, 17, 8, 0).unwrap();
+    let mut dense = execution.clone();
+    dense.workspace.as_mut().unwrap().gated_convolution = None;
+    let without = workspace(&dense, &r, 17, 8, 0).unwrap();
+    // One conv layer plus one excess scratch set. Half-precision activation
+    // storage still permits float32 convolution scratch/promotion.
+    let conv = 16 * (6 * 8 + 2 * (8 + 3 - 1) + 8 * 3 + 3) * 4;
+    assert_eq!(
+        with.upper_bytes.unwrap() - without.upper_bytes.unwrap(),
+        conv * 2 + (4 * 32 + 3 * 64 + 32 + 2 * 8) * 8 * 2 * 3
+    );
+    assert_eq!(with.lower_bytes, without.lower_bytes);
+    let mut decode = dense.clone();
+    decode.workspace.as_mut().unwrap().gated_convolution = Some(GatedConvolutionWorkspace {
+        channels: 16,
+        kernel_size: 1,
+        layers: 1,
+    });
+    let small = workspace(&decode, &r, 17, 1, 0).unwrap();
+    let plain = workspace(&dense, &r, 17, 1, 0).unwrap();
+    assert_eq!(
+        small.upper_bytes.unwrap() - plain.upper_bytes.unwrap(),
+        16 * (6 + 2 + 1 + 1) * 4 * 2 + (4 * 32 + 3 * 64 + 32 + 2 * 8) * 2 * 3
+    );
+    decode.workspace_overlap = WorkspaceOverlap::unknown();
+    assert!(workspace(&decode, &r, 17, 1, 0)
+        .unwrap()
+        .upper_bytes
+        .is_none());
+    decode.workspace_overlap = WorkspaceOverlap::single_layer();
+    for (channels, kernel_size, layers) in [
+        (0, 3, 1),
+        (16, 0, 1),
+        (16, 3, 0),
+        (16, 3, 3),
+        (u64::MAX, 3, 1),
+    ] {
+        decode.workspace.as_mut().unwrap().gated_convolution = Some(GatedConvolutionWorkspace {
+            channels,
+            kernel_size,
+            layers,
+        });
+        assert!(workspace(&decode, &r, 17, 8, 0).is_err());
+    }
+}
+
+#[test]
+fn convolution_only_does_not_require_attention_scratch_and_old_wire_records_remain_valid() {
+    let mut r = request();
+    let execution = &mut r.domains[0].executions[0];
+    let g = execution.workspace.as_mut().unwrap();
+    let old = serde_json::to_value(&g).unwrap();
+    assert!(old.get("gated_convolution").is_none());
+    assert!(old.get("input_score_attention").is_none());
+    let restored: WorkspaceGeometry = serde_json::from_value(old).unwrap();
+    assert_eq!(*g, restored);
+    g.query_width = 0;
+    g.key_value_width = 0;
+    g.query_heads = 0;
+    g.gated_convolution = Some(GatedConvolutionWorkspace {
+        channels: 32,
+        kernel_size: 3,
+        layers: 2,
+    });
+    execution.attention = AttentionWorkspace::Unknown;
+    let result = estimate_generation_memory(&r).unwrap();
+    assert!(result.domains[0].generation_peak.upper_bytes.is_some());
+    let wire = serde_json::to_string(&r).unwrap();
+    assert_eq!(
+        serde_json::from_str::<GenerationMemoryRequest>(&wire).unwrap(),
+        r
+    );
+}
+
+#[test]
+fn explicit_score_attention_retains_tiled_projection_copies_and_unknown_native_facts() {
+    let mut r = request();
+    r.scalar_bytes = NonZeroU8::new(4).unwrap();
+    let mut e = r.domains[0].executions[0].clone();
+    e.workspace_overlap.upper_live_copies = Some(3);
+    let plain = e.clone();
+    let facts = InputScoreAttentionMechanism {
+        score_tile_elements: 16,
+        max_query_rows: 4,
+        key_value_copies: 4,
+        score_bytes: 16,
+    };
+    e.workspace.as_mut().unwrap().input_score_attention = Some(InputScoreAttentionWorkspace {
+        layers: 1,
+        mechanism: Some(facts),
+    });
+    for (positions, query, tiles) in [(8, 1, 1), (8, 2, 1), (8, 3, 2), (8, 5, 3), (32, 5, 5)] {
+        let base = workspace(&plain, &r, positions, query, 0).unwrap();
+        let projected = workspace(&e, &r, positions, query, 0).unwrap();
+        let g = e.workspace.as_ref().unwrap();
+        let expanded = g.query_width * positions * 4 * 4 * tiles;
+        let scores = g.query_heads * query * positions * 16;
+        assert_eq!(
+            projected.upper_bytes.unwrap() - base.upper_bytes.unwrap(),
+            (expanded + scores) * 2
+        );
+        assert_eq!(projected.lower_bytes, base.lower_bytes);
+    }
+    let wire = serde_json::to_string(&e).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ExecutionMemoryPlan>(&wire).unwrap(),
+        e
+    );
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .input_score_attention
+        .as_mut()
+        .unwrap()
+        .mechanism = None;
+    assert!(workspace(&e, &r, 8, 3, 0).unwrap().upper_bytes.is_none());
+    let explicit = e
+        .workspace
+        .as_mut()
+        .unwrap()
+        .input_score_attention
+        .as_mut()
+        .unwrap();
+    explicit.mechanism = Some(InputScoreAttentionMechanism {
+        score_tile_elements: 0,
+        ..facts
+    });
+    assert!(workspace(&e, &r, 8, 3, 0).is_err());
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .input_score_attention
+        .as_mut()
+        .unwrap()
+        .mechanism = Some(facts);
+    assert!(workspace(&e, &r, u64::MAX, 3, 0).is_err());
+}
+
+#[test]
+fn mixed_precision_covers_parameter_casts_and_promoted_state_without_double_charging_weights() {
+    let r = request();
+    let mut e = r.domains[0].executions[0].clone();
+    e.workspace_overlap.upper_live_copies = Some(3);
+    let plain = workspace(&e, &r, 8, 3, 100).unwrap();
+    e.workspace
+        .as_mut()
+        .unwrap()
+        .mixed_precision_parameter_bytes = Some(1000);
+    let promoted = workspace(&e, &r, 8, 3, 100).unwrap();
+    assert_eq!(promoted.lower_bytes, plain.lower_bytes);
+    // One full cast set, half an excess set for a two-layer fixture, and
+    // promoted state/replacement above the nominal state payload.
+    assert_eq!(
+        promoted.upper_bytes.unwrap() - plain.upper_bytes.unwrap(),
+        1000 + 500 + 200
+    );
+    e.workspace_overlap = WorkspaceOverlap::unknown();
+    assert!(workspace(&e, &r, 8, 3, 100).unwrap().upper_bytes.is_none());
 }
