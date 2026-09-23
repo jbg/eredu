@@ -69,11 +69,6 @@ pub fn native_grouped_linear(
     native_grouped_linear_cpu(input, weight, group_ids, stream)
 }
 
-#[cfg(not(feature = "cuda"))]
-pub(super) fn is_gpu(stream: &Stream) -> Result<bool, Exception> {
-    Ok(stream.get_device()?.get_type()? == DeviceType::Gpu)
-}
-
 /// Selects a native execution backend without consulting model architecture.
 pub(super) fn native_execution_backend(
     stream: &Stream,
@@ -85,7 +80,7 @@ pub(super) fn native_execution_backend(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        Ok(if is_gpu(stream)? {
+        Ok(if uses_metal_device(stream.get_device()?.get_type()?) {
             NativeExecutionBackend::Metal
         } else {
             NativeExecutionBackend::GenericFallback

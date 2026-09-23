@@ -291,6 +291,114 @@ impl ConcatKeyValueCache {
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
+    fn memory_retained_positions(&self) -> Option<u64> {
+        u64::try_from(self.length).ok()
+    }
+
+    fn update_memory_contract(
+        &self,
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+        use eredu_nn::mechanism_memory::*;
+        let MechanismInvocation::CacheUpdate {
+            batch,
+            heads,
+            previous,
+            appended,
+            key_width,
+            value_width,
+            element,
+        } = *invocation
+        else {
+            return Err(ComputeError::backend(
+                "cache update memory requires a cache append invocation",
+            ));
+        };
+        if previous != u64::try_from(self.length).map_err(ComputeError::backend)? {
+            return Err(ComputeError::backend(
+                "cache memory append retained frontier differs from installed state",
+            ));
+        }
+        if self.key_only && key_width != value_width {
+            return Err(ComputeError::backend(
+                "key-only cache value geometry must match keys",
+            ));
+        }
+        for (array, width) in [
+            (self.keys.as_ref(), key_width),
+            (self.values.as_ref(), value_width),
+        ] {
+            if let Some(array) = array {
+                let shape = array.shape();
+                if shape.len() != 4
+                    || shape[0] as u64 != batch
+                    || shape[1] as u64 != heads
+                    || shape[3] as u64 != width
+                    || crate::backend::nn::memory::element_type(array.dtype()) != Some(element)
+                {
+                    return Err(ComputeError::backend(
+                        "cache memory append shape/dtype differs from installed arrays",
+                    ));
+                }
+            }
+        }
+        let mut result = crate::backend::nn::memory::describe(invocation)?;
+        result
+            .storage
+            .retain(|storage| storage.name == "native_workspace");
+        result
+            .missing
+            .retain(|reason| !reason.starts_with("cache append backing"));
+        let visible = previous
+            .checked_add(appended)
+            .ok_or_else(|| ComputeError::backend("cache append overflowed"))?;
+        let padded = self
+            .continuation_capacity_bound(appended)
+            .ok_or_else(|| ComputeError::backend("cache append capacity overflowed"))?;
+        // Sliding retention is a view into the complete concatenation. Its
+        // shorter logical history does not reduce this backing payload.
+        let backing_positions = if self.attention_window.is_some() {
+            visible
+        } else {
+            padded.max(visible)
+        };
+        for (name, width) in [("cache_keys", key_width), ("cache_values", value_width)] {
+            if self.key_only && name == "cache_values" {
+                continue;
+            }
+            let payload = crate::backend::nn::memory::bytes(
+                &[batch, heads, backing_positions, width],
+                element_bytes(element),
+            )?;
+            let mut storage = crate::backend::nn::memory::allocation(
+                name,
+                payload,
+                MechanismStorageRole::State,
+                StorageRetention::Returned,
+            );
+            if self.keys.is_none() && backing_positions == appended {
+                storage.backing = MechanismBacking::Unknown;
+                storage.detail =
+                    "empty cache borrows appended tensor backing; no independent cache allocation"
+                        .into();
+            } else if self.step > 1
+                && self.attention_window.is_none()
+                && visible <= self.capacity as u64
+            {
+                storage.backing = MechanismBacking::Owner(name.into());
+                storage.detail =
+                    "append fits actual reserved cache capacity; mutation reuses owner backing"
+                        .into();
+            } else {
+                storage.detail = "selected cache append allocates concatenated/padded backing; old storage remains a lazy graph dependency".into();
+            }
+            result.storage.push(storage);
+        }
+        result.missing.push("cache input layouts and native update copy-on-write/old-buffer retention require completion/lifetime composition".into());
+        result.validate()?;
+        Ok(result)
+    }
+
     fn offset(&self) -> i32 {
         self.offset
     }
@@ -486,5 +594,107 @@ impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for ConcatKeyValueCache 
         ]
         .into_iter()
         .flatten()
+    }
+}
+
+#[cfg(test)]
+mod mechanism_memory_tests {
+    use super::*;
+    use eredu_nn::{mechanism_memory::*, TensorElementType};
+    fn request(previous: u64, appended: u64) -> MechanismInvocation {
+        MechanismInvocation::CacheUpdate {
+            batch: 1,
+            heads: 2,
+            previous,
+            appended,
+            key_width: 3,
+            value_width: 3,
+            element: TensorElementType::F32,
+        }
+    }
+    fn input(tokens: i32) -> Array {
+        Array::from_slice(&vec![0.5f32; (2 * tokens * 3) as usize], &[1, 2, tokens, 3])
+    }
+    #[test]
+    fn mechanism_cache_descriptions_preserve_frontier_and_backing() {
+        let stream =
+            safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut cache = ConcatKeyValueCache::new_with_step(8);
+        let empty = KeyValueCache::update_memory_contract(&cache, &request(0, 3)).unwrap();
+        assert_eq!(cache.offset, 0);
+        assert_eq!(
+            empty
+                .storage
+                .iter()
+                .find(|entry| entry.name == "cache_keys")
+                .unwrap()
+                .payload,
+            MechanismBytes::exact(2 * 8 * 3 * 4)
+        );
+        cache.update_and_fetch(input(3), input(3), &stream).unwrap();
+        let before = (
+            cache.offset,
+            cache.length,
+            cache.capacity,
+            cache.keys.as_ref().unwrap().graph_identity(),
+        );
+        let contract = KeyValueCache::update_memory_contract(&cache, &request(3, 2)).unwrap();
+        assert_eq!(
+            contract,
+            KeyValueCache::update_memory_contract(&cache, &request(3, 2)).unwrap()
+        );
+        assert_eq!(
+            before,
+            (
+                cache.offset,
+                cache.length,
+                cache.capacity,
+                cache.keys.as_ref().unwrap().graph_identity()
+            )
+        );
+        let keys = contract
+            .storage
+            .iter()
+            .find(|entry| entry.name == "cache_keys")
+            .unwrap();
+        assert_eq!(keys.backing, MechanismBacking::Owner("cache_keys".into()));
+        assert_eq!(keys.payload, MechanismBytes::exact(2 * 8 * 3 * 4));
+        let growth = KeyValueCache::update_memory_contract(&cache, &request(3, 9)).unwrap();
+        let keys = growth
+            .storage
+            .iter()
+            .find(|entry| entry.name == "cache_keys")
+            .unwrap();
+        assert_eq!(keys.payload, MechanismBytes::exact(2 * 16 * 3 * 4));
+        assert_eq!(keys.backing, MechanismBacking::Invocation);
+        assert!(KeyValueCache::update_memory_contract(&cache, &request(2, 1)).is_err());
+        let mut mismatched = request(3, 1);
+        if let MechanismInvocation::CacheUpdate { heads, .. } = &mut mismatched {
+            *heads = 1;
+        }
+        assert!(KeyValueCache::update_memory_contract(&cache, &mismatched).is_err());
+    }
+    #[test]
+    fn mechanism_sliding_cache_prices_complete_concatenation_and_key_only_sharing() {
+        let stream =
+            safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut cache = ConcatKeyValueCache::new_key_only_for_sliding_attention(4);
+        cache.update_and_fetch(input(6), input(6), &stream).unwrap();
+        assert_eq!((cache.offset, cache.length), (6, 3));
+        let contract = KeyValueCache::update_memory_contract(&cache, &request(3, 8)).unwrap();
+        assert!(!contract
+            .storage
+            .iter()
+            .any(|entry| entry.name == "cache_values"));
+        assert_eq!(
+            contract
+                .storage
+                .iter()
+                .find(|entry| entry.name == "cache_keys")
+                .unwrap()
+                .payload,
+            MechanismBytes::exact(2 * 11 * 3 * 4)
+        );
+        assert_eq!((cache.offset, cache.length), (6, 3));
     }
 }

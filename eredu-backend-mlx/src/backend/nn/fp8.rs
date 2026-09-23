@@ -49,7 +49,7 @@ thread_local! {
 
 const OUT_TILE: i32 = 16;
 const REDUCTION_TILE: i32 = 16;
-const SCALE_BLOCK: i32 = 128;
+pub(crate) const SCALE_BLOCK: i32 = 128;
 #[cfg(not(feature = "cuda"))]
 const TILED_ROW_THRESHOLD: i32 = 8;
 

@@ -1381,3 +1381,32 @@ upper of 482,707,361 bytes. The measured incremental native active peak remained
 usage. The earlier calibration above used a 64 KiB trace budget and the older
 semantic-history multiplier; use the commands above to reproduce the current
 64 MiB regression case.
+
+
+## Reusable mechanism descriptions (phase 4)
+
+Low-level consumers can obtain `eredu_nn::mechanism_memory::MechanismInvocation`
+from ordinary projection/convolution/grouped-linear specs or actual attention and
+recurrent inputs. Runtime sampling producers derive it from the resolved config
+or existing sampler state. Backend `mechanism_memory` hooks then describe known
+storage, and `eredu_runtime::describe_mechanism_resources` binds owner identities
+and physical pools into the neutral resource format. Querying these records does
+not allocate tensors, evaluate lazy graphs, advance caches or consume budgets.
+
+Coverage includes dense/packed projection geometry; explicit/tiled attention;
+causal convolution output/history; FP32 recurrent state; selected expert routes;
+cache append/capacity/window facts; and standard/Mirostat sampling policy.
+MLX's optional selected-device query additionally distinguishes direct GGUF Metal
+kernels from host row-wise decoding, and FP8 activation/scales from CPU fallback
+dequantization. Cache-instance queries validate installed geometry, preserve the
+frontier, and describe actual reserved capacity and backing reuse. Parameter
+conversions with unknown residency ownership do not become fresh allocations.
+
+These descriptions are inputs for subsequent lifetime composition, not a new
+bounded forecast. Logical tensor bytes and physical allocation capacity are
+separate: views/no-op casts can alias, lazy intermediate records are not a live
+peak, and query/key tiles can overlap until evaluation. Opaque MLX kernel scratch,
+allocator capacity, unresolved owner identity and unsupported native selection
+facts remain named gaps. Existing generation/continuation forecasts and wire
+records are unchanged in this phase; no previously unsupported family receives a
+verdict solely because its reusable mechanisms now expose descriptions.

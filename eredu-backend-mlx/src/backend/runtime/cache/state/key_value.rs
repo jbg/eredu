@@ -51,6 +51,27 @@ impl MlxKeyValueLayerState {
 }
 
 impl KeyValueCache for MlxKeyValueLayerState {
+    fn memory_retained_positions(&self) -> Option<u64> {
+        match self {
+            Self::Stateless => None,
+            Self::Device(cache) => KeyValueCache::memory_retained_positions(cache),
+            Self::Paged(cache) => KeyValueCache::memory_retained_positions(cache),
+        }
+    }
+
+    fn update_memory_contract(
+        &self,
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_nn::Error> {
+        match self {
+            Self::Stateless => Err(eredu_nn::Error::backend(
+                "stateless layer has no cache update",
+            )),
+            Self::Device(cache) => KeyValueCache::update_memory_contract(cache, invocation),
+            Self::Paged(cache) => KeyValueCache::update_memory_contract(cache, invocation),
+        }
+    }
+
     fn paged_relative_attention(
         &mut self,
         input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,

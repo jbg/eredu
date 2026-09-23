@@ -377,6 +377,16 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
 macro_rules! impl_attention_cache {
     ($type:ty) => {
         impl AttentionCache<MlxTensor> for $type {
+            fn memory_retained_positions(&self) -> Option<u64> {
+                KeyValueCache::memory_retained_positions(self)
+            }
+            fn update_memory_contract(
+                &self,
+                invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+            ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+                KeyValueCache::update_memory_contract(self, invocation)
+            }
+
             fn uses_blockwise_attention(&self) -> bool {
                 KeyValueCache::is_paged(self)
             }

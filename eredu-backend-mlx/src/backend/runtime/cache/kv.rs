@@ -33,6 +33,20 @@ fn retained_tensor(array: &Array) -> &MlxTensor {
 
 /// A per-layer attention key/value cache.
 pub trait KeyValueCache {
+    /// Retained history extent for descriptive append geometry, when available.
+    fn memory_retained_positions(&self) -> Option<u64> {
+        None
+    }
+
+    /// Read-only storage facts for one append; specialized stores refine this
+    /// without allocating a tensor or advancing their position.
+    fn update_memory_contract(
+        &self,
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+        crate::backend::nn::memory::describe(invocation)
+    }
+
     /// Returns the current sequence offset represented by the cache.
     fn offset(&self) -> i32;
 

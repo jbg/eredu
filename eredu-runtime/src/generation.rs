@@ -7,6 +7,9 @@ use eredu_core::{
 };
 use eredu_nn::Tensor;
 
+mod memory;
+pub use memory::sampling_invocation;
+
 /// Monomorphized causal model used by generation sessions.
 pub trait CausalModel<S> {
     /// Backend-native tensor handle containing logits and decode token ids.
@@ -70,6 +73,14 @@ impl TokenDomain {
 /// Implementations operate directly on native logits and random state without
 /// copying values through a neutral tensor representation.
 pub trait SamplingBackend {
+    /// Describes sampling storage without tensors, random draws or state changes.
+    /// Backends without implementation facts preserve explicit incomplete coverage.
+    fn mechanism_memory(
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_nn::Error> {
+        eredu_nn::mechanism_memory::MechanismMemoryContract::unknown(invocation)
+    }
+
     /// Backend-native logits tensor.
     type Logits: Clone;
     /// Backend-native sampled-token tensor.

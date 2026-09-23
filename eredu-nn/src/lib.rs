@@ -19,6 +19,8 @@ mod grouped_units;
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
 pub use linear_rows::LinearRowLayout;
+/// Logical and implementation memory descriptions for reusable mechanisms.
+pub mod mechanism_memory;
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
@@ -3542,6 +3544,21 @@ impl<T: Tensor> AttentionRequest<'_, T> {
 
 /// Backend-native key/value cache operations required by attention.
 pub trait AttentionCache<T: Tensor> {
+    /// Installed retained history length, when the storage owner can observe it.
+    /// An absolute offset is not a retained length for sliding/paged caches.
+    fn memory_retained_positions(&self) -> Option<u64> {
+        None
+    }
+
+    /// Describes an append against this cache's actual storage policy without
+    /// changing its frontier or forcing lazy evaluation.
+    fn update_memory_contract(
+        &self,
+        invocation: &mechanism_memory::MechanismInvocation,
+    ) -> Result<mechanism_memory::MechanismMemoryContract, Error> {
+        mechanism_memory::MechanismMemoryContract::unknown(invocation)
+    }
+
     /// Whether attention must scan cache-owned history instead of the returned tensors.
     fn uses_blockwise_attention(&self) -> bool {
         false
@@ -4076,6 +4093,15 @@ mod neural_operator_capability_tests {
 /// Associated concrete types make calls statically dispatched. Implementations
 /// retain ownership of tensor storage, fusion, quantization, and collectives.
 pub trait NeuralBackend: Sized + 'static {
+    /// Describes one selected invocation without allocating execution resources.
+    /// Native scratch, alignment, conversions and retention remain explicit gaps
+    /// unless this backend overrides the default. This is not a peak forecast.
+    fn mechanism_memory(
+        invocation: &mechanism_memory::MechanismInvocation,
+    ) -> Result<mechanism_memory::MechanismMemoryContract, Error> {
+        mechanism_memory::MechanismMemoryContract::unknown(invocation)
+    }
+
     /// Optional forward operators explicitly supported by this backend.
     const OPERATOR_CAPABILITIES: NeuralOperatorCapabilities = NeuralOperatorCapabilities::NONE;
 

@@ -15,7 +15,6 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
 
 use eredu_gguf::{Endian as GgufEndian, GgmlType, IQuantCodebook};
-#[cfg(any(test, not(feature = "cuda")))]
 use safemlx::DeviceType;
 use safemlx::{
     error::Exception,
@@ -130,3 +129,8 @@ pub use storage::{NativeQuantizationFormat, NativeQuantizedTensor};
 
 #[cfg(test)]
 mod tests;
+
+/// Pure device selection shared by native execution and memory descriptions.
+pub(crate) fn uses_metal_device(device: DeviceType) -> bool {
+    !cfg!(feature = "cuda") && device == DeviceType::Gpu
+}

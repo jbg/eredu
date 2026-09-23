@@ -4,6 +4,22 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Reusable mechanism memory contracts
+
+`eredu_nn::mechanism_memory` describes dense/quantized projections, attention,
+causal convolution, recurrent scans, expert dispatch, cache appends and sampling.
+Ordinary operator specs/inputs and resolved sampler policy produce logical
+geometry; backend hooks add selected implementation storage and retention.
+Logical views never establish independent allocation identity. MLX reports known
+intermediates, cache capacity/reuse and device-dependent conversions while keeping
+native scratch, allocator capacity and unresolved sharing explicitly unknown.
+
+Runtime `describe_mechanism_resources` binds authoritative allocation owners and
+physical pools, retaining per-storage lifetime declarations for later composition.
+These additive hooks default to unknown for other backends. Existing generation
+forecasts and serialized records are unchanged; generic lifetime composition and
+forecast migration remain subsequent phases.
+
 ## 2026-09-23 — Resources derived from ordinary execution contracts
 
 Selected/prepared text contracts and retained runtime sessions now expose

@@ -46,6 +46,8 @@ pub mod intervention;
 pub mod layered;
 /// Normalized portable policy for cold model preparation.
 pub mod load_request;
+/// Physical storage descriptions and retention facts for reusable mechanisms.
+pub mod mechanism_resources;
 /// Exact mechanism capability synthesis from neutral requirements.
 pub mod mechanism_synthesis;
 /// Request-specific generation-memory estimates and fit advice.
@@ -219,6 +221,9 @@ pub use layered::{
 pub use load_request::{
     DraftingLoadRequest, NormalizedLoadRequest, NormalizedLoadRequestError, ParallelLoadRequest,
     ValidatedModelLoadRequest,
+};
+pub use mechanism_resources::{
+    describe_mechanism_resources, MechanismResourceDescription, MechanismResourceQuery,
 };
 pub use mechanism_synthesis::{
     synthesize_replicated_text_capabilities, BackendMechanismFacts, ReplicatedTextMechanismSupport,

@@ -163,6 +163,54 @@ fn apply_score_mask(
     Ok(())
 }
 
+/// Selected ordinary attention lowering; shared by execution and memory facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionMemoryPath {
+    Fused,
+    Explicit,
+    QueryTiles,
+    KeyTiles,
+}
+
+pub(crate) fn memory_path(
+    queries: u64,
+    keys: u64,
+    arithmetic: eredu_nn::AttentionArithmetic,
+    softcap: bool,
+) -> AttentionMemoryPath {
+    if !softcap && arithmetic == eredu_nn::AttentionArithmetic::Fused {
+        return AttentionMemoryPath::Fused;
+    }
+    if arithmetic == eredu_nn::AttentionArithmetic::InputScores
+        && queries.saturating_mul(keys) > INPUT_SCORE_WORKSPACE.score_tile_elements
+    {
+        if keys > INPUT_SCORE_WORKSPACE.score_tile_elements {
+            AttentionMemoryPath::KeyTiles
+        } else {
+            AttentionMemoryPath::QueryTiles
+        }
+    } else {
+        AttentionMemoryPath::Explicit
+    }
+}
+
+pub(crate) fn memory_tile_geometry(
+    queries: u64,
+    keys: u64,
+    path: AttentionMemoryPath,
+) -> (u64, u64) {
+    match path {
+        AttentionMemoryPath::QueryTiles => (
+            (INPUT_SCORE_WORKSPACE.score_tile_elements / keys)
+                .max(1)
+                .min(queries),
+            keys,
+        ),
+        AttentionMemoryPath::KeyTiles => (1, keys.min(INPUT_SCORE_KEY_TILE_POSITIONS as u64)),
+        _ => (queries, keys),
+    }
+}
+
 /// Applies caller-provided rotary cosine and sine tensors to one head view.
 pub fn apply_rotary_embeddings(
     value: &Array,
@@ -358,6 +406,7 @@ pub(crate) const INPUT_SCORE_WORKSPACE:
 // invocation-local K/V layouts survive each synchronous evaluation; score,
 // softmax and projection temporaries do not. Small invocations stay lazy.
 const INPUT_SCORE_LIVE_TILE_BATCH: usize = 32;
+const INPUT_SCORE_KEY_TILE_POSITIONS: usize = 256;
 
 /// Scaled attention with an optional score transform, before masks and sink logits.
 #[allow(clippy::too_many_arguments)]
@@ -372,7 +421,7 @@ pub fn attention_with_softcap(
     arithmetic: eredu_nn::AttentionArithmetic,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    if softcap.is_none() && arithmetic == eredu_nn::AttentionArithmetic::Fused {
+    if memory_path(0, 0, arithmetic, softcap.is_some()) == AttentionMemoryPath::Fused {
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -404,10 +453,15 @@ pub fn attention_with_softcap(
             "incompatible soft-capped attention geometry",
         ));
     }
-    if arithmetic == eredu_nn::AttentionArithmetic::InputScores
-        && i64::from(queries.dim(2)) * i64::from(keys.dim(2))
-            > INPUT_SCORE_WORKSPACE.score_tile_elements as i64
-    {
+    if matches!(
+        memory_path(
+            queries.dim(2) as u64,
+            keys.dim(2) as u64,
+            arithmetic,
+            softcap.is_some()
+        ),
+        AttentionMemoryPath::QueryTiles | AttentionMemoryPath::KeyTiles
+    ) {
         return bounded_input_score_attention(
             queries, keys, values, scale, mask, sinks, softcap, stream,
         );
@@ -662,8 +716,8 @@ fn input_score_attention_with_tile_batches(
             if pass == 1 {
                 accumulator.begin_value_pass()?;
             }
-            for key_start in (0..keys.dim(2)).step_by(256) {
-                let key_end = (key_start + 256).min(keys.dim(2));
+            for key_start in (0..keys.dim(2)).step_by(INPUT_SCORE_KEY_TILE_POSITIONS) {
+                let key_end = (key_start + INPUT_SCORE_KEY_TILE_POSITIONS as i32).min(keys.dim(2));
                 let block = KeyValueAttentionBlock::unleased(
                     i64::from(key_start),
                     i64::from(key_end),

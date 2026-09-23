@@ -14,6 +14,8 @@ pub(crate) mod hyper_connections;
 pub mod layers;
 pub(crate) mod linear;
 pub(crate) mod matrix;
+/// Allocation-free memory facts for reusable mechanisms.
+pub mod memory;
 pub(crate) mod module;
 pub(crate) mod native_quantization;
 pub(crate) mod nested;

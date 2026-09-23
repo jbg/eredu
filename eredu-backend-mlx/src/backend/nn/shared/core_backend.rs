@@ -102,6 +102,12 @@ impl ParameterBackend for MlxNeuralBackend {
 }
 
 impl NeuralBackend for MlxNeuralBackend {
+    fn mechanism_memory(
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+        crate::backend::nn::memory::describe(invocation)
+    }
+
     const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
         eredu_nn::NeuralOperatorCapabilities::ALL;
 

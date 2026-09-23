@@ -16,6 +16,20 @@ use eredu_core::TokenFilter;
 pub struct MlxSamplingBackend;
 
 impl SamplingBackend for MlxSamplingBackend {
+    fn mechanism_memory(
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_nn::Error> {
+        if !matches!(
+            invocation,
+            eredu_nn::mechanism_memory::MechanismInvocation::Sampling { .. }
+        ) {
+            return Err(eredu_nn::Error::backend(
+                "sampling memory requires a sampling invocation",
+            ));
+        }
+        crate::backend::nn::memory::describe(invocation)
+    }
+
     type Logits = MlxTensor;
     type Token = MlxTensor;
     type RandomState = RandomState;

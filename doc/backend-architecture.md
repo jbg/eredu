@@ -6620,8 +6620,58 @@ missing. Sliding visibility does not prove physical history truncation. Resource
 capacity is unknown until an implementation contract supplies allocation facts.
 
 Selected execution-unit/static identities name missing workspace and retention
-contracts. Mechanisms will supply sizing facts, and runtime will later own
-lifetime/overlap composition and fit policy. These producers do not migrate
+contracts. Reusable mechanisms supply per-invocation sizing facts through the
+contracts below; runtime will later own lifetime/overlap composition and fit policy. These producers do not migrate
 forecasting, derive embedded prediction invocations, or calibrate kernels.
 These producers add no family-specific forecasting dependencies or calibration
 constants. Existing forecast records and legacy estimation paths are unchanged.
+
+
+### Reusable mechanism memory contracts
+
+`eredu-nn::mechanism_memory` owns tensor-independent invocation geometry for dense
+and quantized projections, grouped-query attention, causal depthwise convolution,
+gated-delta/selective state-space scans, expert dispatch and logical cache appends.
+The ordinary `LinearSpec`, `AttentionRequest`, convolution/grouped-linear specs and
+scan inputs expose `memory_invocation`; no family imports forecast types or chooses
+calibration constants. Logical values describe shapes and nominal scalar types,
+not backing allocations. Packed parameter payload/sharing remains owned by the
+prepared-binding description rather than being charged as workspace.
+
+`NeuralBackend::mechanism_memory`, `AttentionCache::update_memory_contract`, and
+runtime `SamplingBackend::mechanism_memory` are additive read-only hooks whose
+default is explicit unknown implementation coverage. Backends own scratch,
+conversion buffers, allocation capacity and retention boundaries. MLX shares
+attention tile selection/limits and native quantization device selection with
+ordinary execution. Its `describe_for_device` accepts an already-selected device
+kind without constructing a device or stream. A cache-instance hook reads its
+retained frontier, actual shapes/dtypes and existing growth/window policy, rejects
+mismatched requests, and distinguishes capacity reuse, new concatenations,
+key-only sharing and sliding views. Paged/compressed append decomposition remains
+an explicit missing implementation fact.
+
+Native output dtype can differ from nominal portable geometry (mixed dense
+parameter/activation dtypes, GGUF host fallback, gated-delta FP32 results). MLX
+refines it when selected facts establish the representation; missing device,
+bias or bound parameter metadata leaves output storage uncertain. Named lazy
+intermediate tensors do not imply they all coexist. Views/no-op casts and
+optional retained parameter conversions keep backing unknown until their actual
+owner provides identity. MLX does not publish finite per-kernel scratch or
+allocator-capacity bounds, so the contract explicitly retains those gaps.
+
+Portable runtime sampling producers use actual `GenerationSampler` or
+`MirostatV2Sampler` state, or an admitted `TextGenerationConfig`: rows, vocabulary,
+provided history, active top-k/top-p/min-p/penalties and resolved strategy are
+mechanism facts. Mirostat's adaptive scalar belongs to host sampler state, not a
+fresh device allocation. Host penalty vectors are separate from execution-pool
+filtering tensors; arbitrary token filters/custom samplers remain outside this
+ordinary producer and require their own contracts.
+
+Runtime `describe_mechanism_resources` converts only backend storage records with
+resolved backing identities. It binds host/execution access to authoritative
+physical pools, validates compatible facts for shared owners, and retains the
+original contract and storage-name bindings. Unknown owner/alias identity,
+placement, capacity and retention remain explicit. This bridge never sums a live
+peak or treats logical input/output shapes as allocation proof. Family workspace
+migration, repeated invocation/lazy-graph scheduling and overall lifetime/peak
+composition are subsequent phases, not hidden defaults in these descriptions.
