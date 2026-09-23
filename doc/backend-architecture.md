@@ -4909,7 +4909,9 @@ receive the ordinary neutral linear-format declaration.
 
 Exact native transform materialization validates the admitted whole-source recipe
 before applying retained rank placements. It then checks the selected local shape
-and dtype against the actual source module. Global derived-output metadata and
+and floating slot category against the source module. Unloaded source slots
+use construction-default dtypes; the admitted recipe supplies F16/BF16/F32
+precision for transformation and affine companions. Global derived-output metadata and
 local executable geometry remain separate authorities; comparing the former to an
 already sharded recipe would reject valid TP/EP materialization.
 

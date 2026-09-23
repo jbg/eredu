@@ -671,6 +671,8 @@ All values are MiB; upper ends are calibrated envelopes, not tight projections.
 |---|---:|---:|---:|---:|---:|---:|
 | SafeTensors BF16 | 128 | 5296.5 | 786.9 | 546.0 | 124.3 | 13.9 |
 | SafeTensors BF16 | 2000 | 187728.0 | 185495.7 | 67375.7 | 865.1 | 159.2 |
+| SafeTensors affine 4-bit / BF16 | 128 | 3876.2 | 786.9 | 572.5 | 124.3 | 13.1 |
+| SafeTensors affine 4-bit / BF16 | 2000 | 186307.7 | 185495.7 | 67485.1 | 865.1 | 159.5 |
 | GGUF BF16/mixed | 128 | 8686.2 | 6453.7 | 4960.2 | 5738.6 | 4483.7 |
 | GGUF BF16/mixed | 2000 | 349607.0 | 347374.5 | 110485.0 | 6901.7 | 4705.7 |
 
@@ -703,11 +705,15 @@ cargo test -p eredu --features mlx,metal --offline \
 
 Without environment variables the same test uses the small float32 fixture.
 The optional `EREDU_LFM2_MEMORY_QUANTIZED=1` requests affine 4-bit weights with
-64-value groups. On this pinned BF16 SafeTensors checkpoint, native loading
-currently fails before inference: `model.layers.0.conv.in_proj.weight` expects
-recipe dtype BF16 but receives native F32. That validation gap is recorded rather
-than counted as a successful quantized calibration. The workspace change does
-not alter quantization or generation equations.
+64-value groups. The pinned BF16 SafeTensors checkpoint now passes the same
+128/2,000-position matrix, including continuation and controlled-session parity.
+The earlier failure compared an admitted BF16 recipe with an unloaded Float32
+source slot. Exact-task quantization now retains the recipe's precision and checks
+only the source slot's shape and floating category. Generated affine scales and
+biases remain BF16; quantization does not reduce activation or attention scratch
+precision. A nonzero native CPU regression covers F16, BF16 and F32 sources,
+compares packed weights/scales/biases with direct native quantization, and preserves
+rejections for incompatible source shapes and integer slots.
 
 ## Focused verification
 

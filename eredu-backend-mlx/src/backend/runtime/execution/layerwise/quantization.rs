@@ -369,23 +369,18 @@ where
                 source_shape
             )));
         }
-        let native_source_dtype = match source_dtype {
-            Dtype::Float16 => RecipeDtype::F16,
-            Dtype::Bfloat16 => RecipeDtype::BF16,
-            Dtype::Float32 => RecipeDtype::F32,
-            dtype => {
-                return Err(Error::Quantization(format!(
-                "selected materialization task {:?} source module has unsupported dtype {dtype:?}",
-                task.name()
-            )))
-            }
-        };
-        if metadata.dtype() != &native_source_dtype {
+        // Source modules describe unloaded parameter slots, whose floating
+        // dtype is a construction default. The admitted recipe owns the actual
+        // source precision, just as it owns affine companion precision below.
+        // Keep the slot category check without requiring its placeholder dtype
+        // to match the checkpoint's F16/BF16/F32 storage.
+        if !matches!(
+            source_dtype,
+            Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+        ) {
             return Err(Error::Quantization(format!(
-                "selected materialization task {:?} source recipe dtype {:?} differs from native source dtype {:?}",
-                task.name(),
-                metadata.dtype(),
-                native_source_dtype
+                "selected materialization task {:?} source module has unsupported dtype {source_dtype:?}",
+                task.name()
             )));
         }
         let mut companions = selected.get(name).cloned().ok_or_else(|| {

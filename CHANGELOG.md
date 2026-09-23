@@ -4,6 +4,14 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Reduced-precision load-time quantization
+
+Exact selected-task quantization now accepts F16/BF16 checkpoint recipes with
+unloaded Float32 source slots. Recipe precision controls the transform and affine
+companions; source shapes, floating slot categories and admitted output metadata
+remain validated. This fixes affine 4-bit loading of the official BF16 LFM2.5
+checkpoint. Native short/long generation and continuation validation now passes.
+
 ## 2026-09-23 — Dense LFM2/LFM2.5 memory forecasts
 
 Cold, loaded and continuation forecasts now bound dense LFM2 hybrid workspace,
