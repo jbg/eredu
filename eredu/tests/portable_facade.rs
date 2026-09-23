@@ -22,6 +22,9 @@ mod lifecycle;
 #[path = "portable_facade/nanbeige.rs"]
 mod nanbeige;
 
+#[path = "portable_facade/memory_hardware.rs"]
+mod memory_hardware;
+
 #[derive(Default)]
 struct BackendCalls {
     configs: Vec<TextGenerationConfig>,

@@ -31,6 +31,16 @@ pub struct MlxBackendFactory {
 }
 
 impl MlxBackendFactory {
+    /// Classifies a canonical plan device without realizing native resources.
+    /// Hardware discovery must separately confirm that the device is available.
+    pub fn device_uses_host_memory(
+        &self,
+        device: &DevicePlan,
+    ) -> Result<bool, AutomaticPlanningError> {
+        let (family, _) = parse_mlx_device(device)?;
+        Ok(family.is_none())
+    }
+
     /// Enables backend allocator and process-memory sampling for bounded residency.
     pub const fn with_residency_diagnostics(
         mut self,
@@ -406,7 +416,9 @@ struct RealizedMlxDevice {
     identity: MlxDeviceIdentity,
 }
 
-fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlanningError> {
+fn parse_mlx_device(
+    device: &DevicePlan,
+) -> Result<(Option<MlxAcceleratorFamily>, i32), AutomaticPlanningError> {
     if device.backend().as_str() != "mlx" {
         return Err(AutomaticPlanningError::Invalid(format!(
             "MLX cannot probe backend {}",
@@ -447,6 +459,13 @@ fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlannin
                 family.as_str()
             )));
         }
+    }
+    Ok((accelerator_family, index))
+}
+
+fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlanningError> {
+    let (accelerator_family, index) = parse_mlx_device(device)?;
+    if let Some(family) = accelerator_family {
         let available = family.is_available().map_err(|error| {
             planning_backend_error("discover_accelerator_family_availability", error)
         })?;

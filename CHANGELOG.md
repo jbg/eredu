@@ -4,6 +4,16 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Device-aware cold memory forecasts
+
+`GenerationMemoryOptions::for_local_device(input, plan.device())` now derives
+placement, host/device availability and allocator overhead from the selected
+local device. Application budgets and reserves remain explicit. The portable
+`for_hardware_device` constructor performs the capacity mapping from supplied
+observations and a backend host-execution fact. Invalid device selections are
+rejected; missing capacity stays unknown. The CLI uses the new constructor;
+`for_local_backend` remains available for explicit placement.
+
 ## 2026-09-23 — Speculative generation memory forecasts
 
 Loaded independent autoregressive drafting now has a bounded planning envelope

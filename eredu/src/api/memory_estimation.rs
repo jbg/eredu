@@ -1,7 +1,10 @@
 //! Cold request memory planning composed from retained architecture selection.
 
 use eredu_architectures::{ModelInspectionOutcome, PreparationMechanismProvider};
-use eredu_core::{CapabilityError, InputTokenCount, MediaFeatureAvailability, Observed};
+use eredu_core::{
+    CapabilityError, DevicePlan, HardwareMemorySemantics, HardwareProfile, InputTokenCount,
+    MediaFeatureAvailability, Observed,
+};
 pub use eredu_runtime::memory_estimation::*;
 use eredu_runtime::{LayerWeightResidency, NormalizedLoadRequest};
 use std::path::Path;
@@ -71,7 +74,73 @@ pub struct GenerationMemoryOptions {
 }
 
 impl GenerationMemoryOptions {
+    /// Derives physical placement and point-in-time availability from an exact
+    /// backend/device observation. This pure constructor performs no discovery.
+    ///
+    /// `host_execution` is a backend-supplied fact about the selected device;
+    /// opaque device identifiers and family names are not interpreted here.
+    /// Missing capacity stays unknown, including when installed capacity is
+    /// known. Application limits/reserves remain unset and overhead remains
+    /// unknown. An absent or unavailable backend/device is a typed error.
+    pub fn for_hardware_device(
+        input: InputTokenCount,
+        hardware: &HardwareProfile,
+        device: &DevicePlan,
+        host_execution: bool,
+    ) -> Result<Self, CapabilityError> {
+        let backend = hardware
+            .backends
+            .iter()
+            .find(|backend| &backend.backend == device.backend() && backend.available)
+            .ok_or_else(|| CapabilityError::InvalidConfiguration {
+                field: "hardware.backend",
+                detail: format!(
+                    "selected backend {} is absent or unavailable",
+                    device.backend()
+                ),
+            })?;
+        let selected = backend
+            .devices
+            .iter()
+            .find(|candidate| candidate.id == device.device())
+            .ok_or_else(|| CapabilityError::InvalidConfiguration {
+                field: "hardware.device",
+                detail: format!(
+                    "device {} was not discovered for backend {}",
+                    device.device(),
+                    device.backend()
+                ),
+            })?;
+        let placement = if host_execution {
+            GenerationMemoryPlacement::Host
+        } else {
+            match hardware.physical_memory_semantics {
+                HardwareMemorySemantics::Unified => GenerationMemoryPlacement::Unified,
+                HardwareMemorySemantics::SeparateTiers => GenerationMemoryPlacement::Separate {
+                    device: selected.id.clone(),
+                },
+                HardwareMemorySemantics::Unknown => GenerationMemoryPlacement::Unknown,
+            }
+        };
+        let available = match placement {
+            GenerationMemoryPlacement::Host | GenerationMemoryPlacement::Unified => {
+                hardware.available_memory_bytes.value().copied()
+            }
+            GenerationMemoryPlacement::Separate { .. } => {
+                selected.available_memory_bytes.value().copied()
+            }
+            GenerationMemoryPlacement::Unknown => None,
+        };
+        let mut options = Self::new(input, placement);
+        options.budget.available_bytes = available;
+        options.host_budget.available_bytes = hardware.available_memory_bytes.value().copied();
+        Ok(options)
+    }
+
     /// Creates an estimate with explicit unknown backend mechanisms and overhead.
+    /// `Self::for_hardware_device` derives placement and available capacities
+    /// from supplied observations. With `mlx`, `Self::for_local_device` also
+    /// performs local discovery and samples allocator overhead.
     /// With the `mlx` feature, `Self::for_local_backend` instead samples the
     /// current local allocator-cache policy for its overhead allowance.
     #[allow(deprecated)]

@@ -39,7 +39,33 @@ pub fn set_local_allocator_cache_limit(bytes: usize) -> Result<usize, eredu_core
 }
 
 impl super::GenerationMemoryOptions {
+    /// Creates cold-forecast options for the exact selected local device.
+    ///
+    /// Observes local hardware once, derives placement and available execution
+    /// and host capacity, and samples allocator overhead. Application limits and
+    /// reserves remain unset. Missing capacity/overhead stays unknown; an invalid
+    /// or undiscovered device is rejected. This does not load a model, allocate
+    /// tensors, or change allocator policy; diagnostic queries may initialize
+    /// the native runtime. Availability is a point-in-time observation.
+    pub fn for_local_device(
+        input: eredu_core::InputTokenCount,
+        device: &crate::DevicePlan,
+    ) -> Result<Self, super::GenerationForecastError> {
+        let host_execution = eredu_backend_mlx::MlxBackendFactory::default()
+            .device_uses_host_memory(device)
+            .map_err(|error| eredu_core::CapabilityError::InvalidConfiguration {
+                field: "device",
+                detail: error.to_string(),
+            })?;
+        let hardware = discover_local_hardware();
+        let mut options = Self::for_hardware_device(input, &hardware, device, host_execution)?;
+        options.backend_overhead = observed_local_allocator_overhead();
+        Ok(options)
+    }
+
     /// Creates local-backend options with an observed allocator-cache allowance.
+    /// Use [`Self::for_local_device`] to also derive placement and availability
+    /// from a selected device. This explicit-placement constructor is unchanged.
     ///
     /// Overhead uses the larger of the current cache limit and retained cache,
     /// plus a 64 MiB graph/driver planning allowance. This is an estimated bound,

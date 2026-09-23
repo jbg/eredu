@@ -6356,6 +6356,16 @@ native backend still establishes completion before releasing native resources.
 
 ### Request memory forecasts and prefill chunks
 
+Cold options can derive physical placement and available capacities through the
+portable facade's `GenerationMemoryOptions::for_hardware_device`. It matches
+backend/device identities exactly, takes a backend-supplied host-execution fact,
+and maps hardware observations into execution and host budgets without substituting
+installed capacity or application policy. `for_local_device` composes that helper
+with local hardware discovery and allocator observations. MLX classifies canonical
+device IDs using the same parser as realization, without creating a native device
+or stream. The CLI supplies its selected plan device and retains ownership of
+application limits and reserves. The explicit-placement constructor remains available.
+
 Architecture-owned memory projections describe workspace geometry using the
 normalized family configuration and exact state schedule. Runtime owns checked
 phase-overlap estimates, physical-capacity comparisons and candidate recomputation.

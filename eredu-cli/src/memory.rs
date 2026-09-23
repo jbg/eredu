@@ -2,9 +2,8 @@
 use super::*;
 use eredu::api::{
     forecast_inspected_generation, ForecastCalibration, GenerationForecast,
-    GenerationForecastOptions, GenerationMemoryEstimate, GenerationMemoryOptions,
-    GenerationMemoryPlacement, MemoryBudget, MemoryBytes, MemoryDomain, MemoryFit,
-    SpeculativeForecastBackend,
+    GenerationForecastOptions, GenerationMemoryEstimate, GenerationMemoryOptions, MemoryBudget,
+    MemoryBytes, MemoryDomain, MemoryFit, SpeculativeForecastBackend,
 };
 
 #[derive(Serialize)]
@@ -35,52 +34,23 @@ pub(super) fn report(
             MlxBackendFactory::default().load_request_for_plan(plan)?,
         ),
     )?;
-    let hardware = discover_local_hardware();
-    let placement = if args.device == CliDevice::Cpu {
-        GenerationMemoryPlacement::Host
-    } else {
-        match hardware.physical_memory_semantics {
-            HardwareMemorySemantics::Unified => GenerationMemoryPlacement::Unified,
-            HardwareMemorySemantics::SeparateTiers => GenerationMemoryPlacement::Separate {
-                device: args.device.to_string(),
-            },
-            _ => GenerationMemoryPlacement::Unknown,
-        }
-    };
     let input = eredu_core::InputTokenCount::text(input_tokens);
-    let mut options = if let Some(cache_limit) = args.mlx_cache_limit_bytes {
+    let mut options = GenerationMemoryOptions::for_local_device(input, plan.device())?;
+    if let Some(cache_limit) = args.mlx_cache_limit_bytes {
         // Cold explicit overrides describe the proposed policy without changing
         // process-global allocator state. Loaded reports sample the actual policy.
-        let mut options = GenerationMemoryOptions::new(input, placement);
         options.backend_overhead =
             ForecastCalibration::default().allocator_overhead(cache_limit, 0);
-        options
-    } else {
-        GenerationMemoryOptions::for_local_backend(input, placement)
-    };
+    }
     options.max_output_tokens = output_tokens;
     options.prefill_chunk_tokens = if args.prefill_chunk_size == 0 {
         input_tokens
     } else {
         args.prefill_chunk_size as u64
     };
-    let host_available = observed_u64(&hardware.available_memory_bytes);
-    options.budget = MemoryBudget {
-        application_limit_bytes: args.memory_budget_bytes,
-        available_bytes: if args.device == CliDevice::Cpu
-            || hardware.physical_memory_semantics == HardwareMemorySemantics::Unified
-        {
-            host_available
-        } else {
-            selected_device_available_memory(&hardware, plan.device())
-        },
-        reserve_bytes: args.memory_reserve_bytes,
-    };
-    options.host_budget = MemoryBudget {
-        available_bytes: host_available,
-        reserve_bytes: args.memory_reserve_bytes,
-        ..MemoryBudget::default()
-    };
+    options.budget.application_limit_bytes = args.memory_budget_bytes;
+    options.budget.reserve_bytes = args.memory_reserve_bytes;
+    options.host_budget.reserve_bytes = args.memory_reserve_bytes;
     let mut forecast =
         forecast_inspected_generation(&inspection, &options, &ForecastCalibration::default())?;
     if !matches!(plan.drafting(), DraftingPlan::Disabled) {

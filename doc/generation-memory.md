@@ -306,8 +306,44 @@ cold backend mechanism facts. Neither function creates a native device or tensor
 `inspected_generation_memory_request` exposes the descriptive request for
 recomputing supported alternatives.
 
-With the `mlx` feature, `GenerationMemoryOptions::for_local_backend(input,
-placement)` samples the current cache limit and retained bytes and defaults
+With the `mlx` feature, use the selected plan device to construct cold options:
+
+```rust,ignore
+let mut options = GenerationMemoryOptions::for_local_device(input, plan.device())?;
+options.max_output_tokens = Some(32);
+options.budget.application_limit_bytes = Some(2 * 1024 * 1024 * 1024);
+options.budget.reserve_bytes = 256 * 1024 * 1024;
+options.host_budget.reserve_bytes = 256 * 1024 * 1024;
+let forecast = forecast_inspected_generation(&inspection, &options, &Default::default())?;
+```
+
+`for_local_device` validates the selected backend/device, observes hardware once,
+and derives placement and availability. CPU execution uses host capacity; unified
+accelerator execution uses the shared host observation; separate accelerators use
+the matching device observation plus an independent host budget. Unknown physical
+relationships and missing availability remain unknown. Installed capacity, another
+device's free memory and automatic-planner budget fallbacks are never substituted.
+Invalid or undiscovered selections return `GenerationForecastError::Capability`
+with `CapabilityError::InvalidConfiguration`. Application limits and reserves
+default to `None` and zero; already-resident bytes default to zero for cold models.
+The CLI uses this constructor and then applies its application budget/reserve policy.
+
+The backend-neutral `GenerationMemoryOptions::for_hardware_device(input,
+hardware, device, host_execution)` performs the same mapping from supplied
+observations. `host_execution` is a backend fact; portable code does not interpret
+opaque device IDs or family strings. This pure constructor leaves native overhead
+unknown and can be used without the `mlx` feature.
+
+Validation covers exact device matching, CPU/unified/separate pools, missing and
+zero availability, unknown physical relationships and invalid selections in seven
+portable tests. Native policy tests verify the constructor does not change the
+allocator policy. Cold CLI smoke tests on the pinned SmolLM checkpoint below, with
+64 input positions, 32 output tokens and `--mlx-cache-limit-bytes 0`, returned
+`likely_fit` without an application budget on both CPU (host) and Metal (unified).
+
+`for_local_device` and the existing explicit-placement constructor
+`GenerationMemoryOptions::for_local_backend(input, placement)` both sample the
+current cache limit and retained bytes and default
 `backend_overhead` to their maximum plus the 64 MiB graph/driver planning allowance.
 This is an estimated allowance, not a measured upper bound on all graph or driver
 allocations. Callers can override `backend_overhead` with their own calibration;

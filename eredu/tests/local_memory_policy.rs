@@ -48,6 +48,23 @@ fn runtime_default_policy_and_forecast_observation() {
     let before = GenerationMemoryOptions::for_local_backend(input, GenerationMemoryPlacement::Host);
     assert_eq!(local_allocator_cache_policy().unwrap(), initial);
     assert!(before.backend_overhead.detail.contains("NativeDefault"));
+    let cpu = eredu::api::local_device_plan(eredu::api::LocalDevice::Cpu).unwrap();
+    let device_options = GenerationMemoryOptions::for_local_device(input, &cpu).unwrap();
+    assert!(matches!(
+        device_options.placement,
+        GenerationMemoryPlacement::Host
+    ));
+    assert_eq!(
+        device_options.budget.available_bytes,
+        device_options.host_budget.available_bytes
+    );
+    assert_eq!(device_options.budget.application_limit_bytes, None);
+    assert_eq!(device_options.budget.reserve_bytes, 0);
+    assert!(device_options
+        .backend_overhead
+        .detail
+        .contains("NativeDefault"));
+    assert_eq!(local_allocator_cache_policy().unwrap(), initial);
     let configuration = match scenario.as_str() {
         "automatic" => LocalRuntimeConfiguration::default(),
         "preserved" => LocalRuntimeConfiguration::default()
@@ -88,6 +105,28 @@ fn runtime_default_policy_and_forecast_observation() {
         Some(configured.limit_bytes + 64 * 1024 * 1024)
     );
     assert_eq!(local_allocator_cache_policy().unwrap(), configured);
+}
+
+#[test]
+fn local_forecast_rejects_invalid_or_undiscovered_devices() {
+    for (backend, device) in [
+        ("other", "cpu:0"),
+        ("mlx", "cpu:00"),
+        ("mlx", "gpu:0"),
+        ("mlx", "cpu:1234"),
+    ] {
+        let error = GenerationMemoryOptions::for_local_device(
+            InputTokenCount::text(16),
+            &eredu_core::DevicePlan::new(backend, device).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            eredu::api::GenerationForecastError::Capability(
+                eredu_core::CapabilityError::InvalidConfiguration { .. }
+            )
+        ));
+    }
 }
 
 #[test]
