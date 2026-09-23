@@ -29,69 +29,9 @@ impl GenerationForecastBackend for MockBackend {
     fn loaded_memory_profile(
         _: &ModelRuntime<Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        Ok(LoadedMemoryProfile {
-            geometry: LoadedMemoryGeometry {
-                state_layout: StateMemoryLayout::new(
-                    eredu_core::LayerSchedule::new(
-                        2,
-                        vec![
-                            eredu_core::cache::LayerCachePolicy::key_only(
-                                eredu_core::AttentionPolicy::Full,
-                                1,
-                                8
-                            )
-                            .unwrap();
-                            2
-                        ],
-                    )
-                    .unwrap(),
-                    vec![0; 2],
-                    32,
-                    8,
-                    EstimationCompleteness::Complete,
-                )
-                .unwrap(),
-                workspace: Some(WorkspaceGeometry {
-                    hidden_size: 32,
-                    intermediate_size: 64,
-                    query_width: 32,
-                    key_value_width: 8,
-                    query_heads: 4,
-                    vocabulary_size: 128,
-                    gated_convolution: None,
-                    input_score_attention: None,
-                    mixed_precision_parameter_bytes: None,
-                }),
-                scalar_bytes: NonZeroU8::new(2).unwrap(),
-                fully_resident: true,
-                assumptions: vec![],
-            },
-            parameters: StaticMemoryReport {
-                logical_parameter_bytes: Observed::exact(4096, "fixture"),
-                current_host_resident_bytes: Observed::exact(0, "fixture"),
-                current_device_resident_bytes: Observed::exact(4096, "fixture"),
-                current_device_parameter_conversion_bytes: Observed::exact(
-                    0,
-                    "no retained conversions",
-                ),
-                planned_disk_backed_bytes: Observed::exact(0, "fixture"),
-                backend_active_allocation_bytes: Observed::exact(
-                    999999,
-                    "unrelated process allocations",
-                ),
-                backend_allocator_cache_bytes: Observed::exact(0, "fixture"),
-                physical_semantics: PhysicalMemorySemantics::Unified,
-                currently_cached_shards: Observed::exact(0, "fixture"),
-            },
-            available: AvailableMemory {
-                physical_memory_bytes: Observed::exact(1 << 30, "fixture"),
-                available_memory_bytes: Observed::exact(1 << 29, "fixture"),
-                physical_semantics: PhysicalMemorySemantics::Unified,
-            },
-            allocator_cache_limit: Observed::exact(0, "fixture"),
-            host_execution: false,
-        })
+        Ok(fixture_profile())
     }
+
     fn forecast_execution_contract(
         _: &ModelRuntime<Self>,
         prompt: Option<&Self::Prompt>,
@@ -942,4 +882,185 @@ fn continuation_payload_floors_cover_installed_state_without_capacity_or_optiona
         backend_floor.with_logical_state_bounds(&request).unwrap(),
         backend_floor
     );
+}
+
+pub(super) fn fixture_profile() -> LoadedMemoryProfile {
+    LoadedMemoryProfile {
+        geometry: LoadedMemoryGeometry {
+            state_layout: StateMemoryLayout::new(
+                eredu_core::LayerSchedule::new(
+                    2,
+                    vec![
+                        eredu_core::cache::LayerCachePolicy::key_only(
+                            eredu_core::AttentionPolicy::Full,
+                            1,
+                            8
+                        )
+                        .unwrap();
+                        2
+                    ],
+                )
+                .unwrap(),
+                vec![0; 2],
+                32,
+                8,
+                EstimationCompleteness::Complete,
+            )
+            .unwrap(),
+            workspace: Some(WorkspaceGeometry {
+                hidden_size: 32,
+                intermediate_size: 64,
+                query_width: 32,
+                key_value_width: 8,
+                query_heads: 4,
+                vocabulary_size: 128,
+                gated_convolution: None,
+                input_score_attention: None,
+                mixed_precision_parameter_bytes: None,
+            }),
+            scalar_bytes: NonZeroU8::new(2).unwrap(),
+            fully_resident: true,
+            assumptions: vec![],
+        },
+        parameters: StaticMemoryReport {
+            logical_parameter_bytes: Observed::exact(4096, "fixture"),
+            current_host_resident_bytes: Observed::exact(0, "fixture"),
+            current_device_resident_bytes: Observed::exact(4096, "fixture"),
+            current_device_parameter_conversion_bytes: Observed::exact(
+                0,
+                "no retained conversions",
+            ),
+            planned_disk_backed_bytes: Observed::exact(0, "fixture"),
+            backend_active_allocation_bytes: Observed::exact(
+                999999,
+                "unrelated process allocations",
+            ),
+            backend_allocator_cache_bytes: Observed::exact(0, "fixture"),
+            physical_semantics: PhysicalMemorySemantics::Unified,
+            currently_cached_shards: Observed::exact(0, "fixture"),
+        },
+        available: AvailableMemory {
+            physical_memory_bytes: Observed::exact(1 << 30, "fixture"),
+            available_memory_bytes: Observed::exact(1 << 29, "fixture"),
+            physical_semantics: PhysicalMemorySemantics::Unified,
+        },
+        allocator_cache_limit: Observed::exact(0, "fixture"),
+        host_execution: false,
+    }
+}
+
+#[test]
+fn settled_speculative_outlooks_are_read_only_and_follow_restore_and_branch_retention() {
+    use eredu::api::ControlledSpeculativeOptions;
+    use eredu_core::{
+        execution_control::SnapshotLimits, generation::SpeculativeRequestStatus as Status,
+    };
+    for reject in [false, true] {
+        for lookahead in [false, true] {
+            let (mut model, chat, mut settings) = setup();
+            settings.overrides.max_new_tokens = Some(10);
+            let mut drafter = MockDrafter;
+            let input = if reject {
+                vec![CONTROL_REJECTION_PROMPT_TOKEN]
+            } else {
+                vec![3, 4]
+            };
+            let options = PreparedChatSpeculativeGenerationOptions {
+                scheduler: SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
+                ..Default::default()
+            };
+            let request = PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::token_ids(&chat, input.clone()),
+                drafting: SpeculativeDraft::External(&mut drafter),
+                settings,
+                options,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_: SemanticEvent| {},
+            };
+            let controlled = model
+                .with_controlled_text_speculative(
+                    request,
+                    ControlledSpeculativeOptions {
+                        snapshots: Some(SnapshotLimits {
+                            max_snapshots: 2,
+                            max_branches: 1,
+                            retained_bytes: 32 << 20,
+                            cumulative_copy_bytes: 128 << 20,
+                        }),
+                        ..Default::default()
+                    },
+                    |session| {
+                        let budget = GenerationForecastOptions::default();
+                        assert!(session.forecast_remaining_generation(4, &budget).is_err());
+                        session.step()?;
+                        let prefix = session.token_ids().to_vec();
+                        let usage = session.snapshot_usage();
+                        let timing = session.timing();
+                        let before = session.forecast_remaining_generation(4, &budget).unwrap();
+                        assert_eq!(before.estimate.fit, MemoryFit::LikelyFit);
+                        assert_eq!(
+                            before.continuation.target.current_positions,
+                            input.len() as u64
+                        );
+                        let repeated = session.forecast_remaining_generation(4, &budget).unwrap();
+                        assert_eq!(before.estimate, repeated.estimate);
+                        assert_eq!(session.token_ids(), prefix);
+                        assert_eq!(session.snapshot_usage(), usage);
+                        assert_eq!(session.timing(), timing);
+                        let saved = session.snapshot()?;
+                        let child = session.fork(&saved)?;
+                        let with_saved = session.forecast_remaining_generation(4, &budget).unwrap();
+                        assert!(
+                            with_saved
+                                .continuation
+                                .retained_snapshots
+                                .upper_bytes
+                                .unwrap()
+                                > 0
+                        );
+                        assert!(
+                            with_saved.estimate.domains[0].generation_peak.upper_bytes
+                                > before.estimate.domains[0].generation_peak.upper_bytes
+                        );
+                        session.step()?;
+                        assert!(session.forecast_remaining_generation(4, &budget).is_err());
+                        while session.status() != Status::ReadyToDraft
+                            && !matches!(session.status(), Status::Completed | Status::Cancelled)
+                        {
+                            session.step()?;
+                        }
+                        if session.status() == Status::ReadyToDraft {
+                            assert!(session.forecast_remaining_generation(2, &budget).is_ok());
+                            session.restore(&saved)?;
+                            assert_eq!(
+                                session
+                                    .forecast_remaining_generation(4, &budget)
+                                    .unwrap()
+                                    .continuation
+                                    .target,
+                                before.continuation.target
+                            );
+                        }
+                        session.release_branch(&child)?;
+                        session.release_snapshot(&saved)?;
+                        while session.step()?.is_some() {}
+                        assert!(session.forecast_remaining_generation(0, &budget).is_err());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let request = PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::token_ids(&chat, input),
+                drafting: SpeculativeDraft::External(&mut drafter),
+                settings,
+                options,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_: SemanticEvent| {},
+            };
+            let ordinary = model.generate_prepared_text_speculative(request).unwrap();
+            assert_eq!(controlled.token_ids(), ordinary.token_ids());
+        }
+    }
 }

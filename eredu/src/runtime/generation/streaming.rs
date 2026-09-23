@@ -615,6 +615,13 @@ pub(crate) trait ProtocolParser: Send {
         None
     }
 
+    /// Owned semantic events retained by speculative staging through a finite
+    /// decoded-input/token horizon. This is separate from parser live storage:
+    /// ordinary delivery drains events immediately, speculative forks do not.
+    fn continuation_event_storage_bytes(&self, _input_bytes: u64, _tokens: u64) -> Option<u64> {
+        None
+    }
+
     /// Copies exact incremental state without reparsing history or emitting
     /// events. Custom parsers must explicitly implement independent state copying.
     fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = Self::Error>>, String> {
@@ -661,6 +668,10 @@ where
 
     fn continuation_storage_bytes(&self, input_bytes: u64) -> Option<u64> {
         (**self).continuation_storage_bytes(input_bytes)
+    }
+
+    fn continuation_event_storage_bytes(&self, input_bytes: u64, tokens: u64) -> Option<u64> {
+        (**self).continuation_event_storage_bytes(input_bytes, tokens)
     }
 
     fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = Self::Error>>, String> {
@@ -799,6 +810,18 @@ impl ProtocolParser for TextParser {
 
     fn continuation_storage_bytes(&self, _: u64) -> Option<u64> {
         Some(0)
+    }
+
+    fn continuation_event_storage_bytes(&self, input_bytes: u64, tokens: u64) -> Option<u64> {
+        // A structural token can flush stop lookbehind and emit its spelling.
+        // Include final decoder/stop flushes and terminal delivery as well as
+        // geometric Vec/String capacity above logical payload.
+        tokens
+            .checked_mul(2)?
+            .checked_add(3)?
+            .checked_mul(std::mem::size_of::<SemanticEvent>() as u64)?
+            .checked_add(input_bytes)?
+            .checked_mul(2)
     }
 
     fn fork_box(&self) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
@@ -1350,6 +1373,47 @@ mod tests {
     const REASONING_END: &str = "</r>";
     const TOOL_START: &str = "<call:";
     const TOOL_END: &str = "</call>";
+
+    #[test]
+    fn speculative_text_event_bound_covers_staging_without_draining() {
+        let mut parser = ToolRuntimeParser::text(["STOP"]);
+        parser.push("left ST").unwrap();
+        parser.stream.structural(1, "<special>").unwrap();
+        parser.push("right 😀").unwrap();
+        parser.finish(FinishReason::MaxTokens).unwrap();
+        let bound = parser
+            .stream
+            .parser
+            .continuation_event_storage_bytes(64, 3)
+            .unwrap();
+        let repeated = parser
+            .stream
+            .parser
+            .continuation_event_storage_bytes(64, 3)
+            .unwrap();
+        assert_eq!(bound, repeated);
+        let events = parser.take_events();
+        assert!(events.len() >= 4);
+        let retained = (events.capacity() * std::mem::size_of::<SemanticEvent>()) as u64
+            + events
+                .iter()
+                .map(|event| match event {
+                    SemanticEvent::TextDelta(text) => text.capacity() as u64,
+                    _ => 0,
+                })
+                .sum::<u64>();
+        assert!(retained <= bound, "retained {retained}, bound {bound}");
+        assert!(parser
+            .stream
+            .parser
+            .continuation_event_storage_bytes(1, u64::MAX)
+            .is_none());
+        assert!(parser
+            .stream
+            .parser
+            .continuation_event_storage_bytes(u64::MAX, 1)
+            .is_none());
+    }
 
     #[derive(Debug, Clone)]
     enum SyntheticState {

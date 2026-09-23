@@ -1665,6 +1665,12 @@ pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
         None
     }
 
+    /// Total current and future storage for an additional token horizon.
+    /// This read-only query must not commit or fork grammar state.
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> {
+        None
+    }
+
     /// Returns the filter at `history` without committing its uncommitted suffix.
     ///
     /// `history` contains the controller's durable prefix followed by zero or

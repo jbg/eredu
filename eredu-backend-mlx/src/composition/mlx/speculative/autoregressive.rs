@@ -98,10 +98,60 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         Self::estimate_state(saved)
     }
+    fn checkpoint_retained_bytes(saved: &Self::Checkpoint) -> Option<u64> {
+        saved
+            .native
+            .control_estimate()?
+            .retained_bytes
+            .checked_add(saved.native.control_growth(0)?)
+    }
     fn estimate_state(
         state: &Self::State,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         state.native.control_estimate()
+    }
+    fn memory_observation(
+        model: &Self::Model,
+        state: &Self::State,
+        additional_positions: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let position = state
+            .native
+            .generation()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let retained = state.native.control_estimate().map(|e| e.retained_bytes);
+        let current = retained.and_then(|n| n.checked_add(state.native.control_growth(0)?));
+        let peak = retained
+            .and_then(|n| n.checked_add(state.native.control_growth(additional_positions)?));
+        let parameters = crate::composition::mlx::capability::static_memory_from_residency(
+            model
+                .residency_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+            model
+                .parameter_bank_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+        )
+        .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(Some(
+            eredu_core::speculative::SpeculativeModelMemoryObservation {
+                current_positions: position,
+                current_state_bytes: current,
+                peak_state_bytes: peak,
+                parameters,
+                available: crate::composition::mlx::capability::available_memory()
+                    .map_err(eredu_core::BackendFailure::from_error)?,
+                allocator_cache_limit: match crate::allocator_cache_policy() {
+                    Ok(policy) => eredu_core::Observed::exact(
+                        policy.limit_bytes,
+                        "current MLX allocator-cache policy",
+                    ),
+                    Err(error) => eredu_core::Observed::unavailable(error.to_string()),
+                },
+            },
+        ))
     }
     fn logits(
         output: &Self::Output,

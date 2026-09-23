@@ -11,6 +11,14 @@ impl
         crate::composition::mlx::speculative::MlxDrafter,
     > for MlxBackend<'_>
 {
+    fn speculative_target_memory_profile(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
+        // Independent speculative lanes realize isolated caches. Retain selected
+        // geometry even when an unrelated ordinary session has advanced.
+        memory_profile(runtime, true)
+    }
+
     fn speculative_memory_profile(
         runtime: &ModelRuntime<Self>,
         drafting: &eredu_core::SpeculativeDraft<

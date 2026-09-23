@@ -255,3 +255,134 @@ fn plan_roundtrip_and_zero_output_keep_phase_accounting_coherent() {
     assert_eq!(estimate.domains[0].phases[0].phase, MemoryPhase::Prefill);
     assert_eq!(estimate.domains[0].phases[1].phase, MemoryPhase::Loading);
 }
+
+fn continuation_fixture(
+    tokens: u64,
+    lookahead: bool,
+) -> (
+    GenerationMemoryRequest,
+    SpeculativeMemoryPlan,
+    SpeculativeContinuationMemoryPlan,
+) {
+    let mut target = request(MemoryDomain::Unified);
+    let mut plan = plan();
+    plan.scheduler = plan.scheduler.with_lookahead(lookahead);
+    let additional =
+        speculative_continuation_positions(tokens, plan.max_draft_tokens, plan.scheduler).unwrap();
+    target.max_output_tokens = Some(additional);
+    target.forecast_output_tokens = additional;
+    target.domains[0].loading_peak = MemoryBytes::exact(u64::MAX / 4);
+    let draft = plan.draft.as_mut().unwrap();
+    draft.input = InputTokenCount::text(19);
+    draft.max_output_tokens = Some(additional);
+    draft.forecast_output_tokens = additional;
+    draft.domains[0].loading_peak = MemoryBytes::unknown("completed draft loading");
+    let state = |position| ContinuationMemoryPlan {
+        current_positions: position,
+        additional_input_tokens: additional,
+        current_state: MemoryBytes::estimated(0, 100_000, "retained capacity"),
+        peak_state: MemoryBytes::estimated(0, 100_000 + additional * 100, "native capacity growth"),
+    };
+    (
+        target,
+        plan,
+        SpeculativeContinuationMemoryPlan {
+            additional_tokens: tokens,
+            target: state(17),
+            draft: state(19),
+            seed: MemoryBytes::estimated(0, 999, "seed"),
+            host_retention: MemoryBytes::estimated(0, 888, "sampling and semantic state"),
+            retained_snapshots: MemoryBytes::estimated(0, 777, "snapshots and branches"),
+        },
+    )
+}
+
+#[test]
+fn continuation_uses_both_installed_frontiers_and_capacity_without_completed_phases() {
+    let (target, plan, continuation) = continuation_fixture(7, false);
+    let result = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(result.fit, MemoryFit::LikelyFit);
+    assert_eq!(result.requested_positions, 24);
+    let pool = &result.domains[0];
+    assert_eq!(
+        pool.phases.iter().map(|p| p.phase).collect::<Vec<_>>(),
+        [
+            MemoryPhase::ContinuationStart,
+            MemoryPhase::SpeculativeDraft,
+            MemoryPhase::SpeculativeVerification,
+            MemoryPhase::SpeculativeCommit
+        ]
+    );
+    let start = &pool.phases[0];
+    assert_eq!(start.workspace.upper_bytes, Some(0));
+    assert_eq!(start.persistent_state.upper_bytes, Some(200_000));
+    assert!(start.persistent_state.lower_bytes > 0);
+    assert_eq!(start.staging.upper_bytes, Some(999 + 777));
+    assert_eq!(pool.phases[1].persistent_state.upper_bytes, Some(202_400));
+    assert_eq!(
+        pool.additional_generation_peak.upper_bytes,
+        Some(pool.generation_peak.upper_bytes.unwrap() - 8192)
+    );
+    let restored: SpeculativeContinuationMemoryPlan =
+        serde_json::from_str(&serde_json::to_string(&continuation).unwrap()).unwrap();
+    assert_eq!(continuation, restored);
+    assert_eq!(
+        result,
+        estimate_speculative_continuation_memory(&target, &plan, &restored).unwrap()
+    );
+}
+
+#[test]
+fn continuation_zero_horizon_retains_state_and_snapshots_but_no_transaction_workspace() {
+    let (target, plan, mut continuation) = continuation_fixture(0, true);
+    let before = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(before.domains[0].phases.len(), 1);
+    continuation.retained_snapshots = MemoryBytes::estimated(0, 1777, "extra child");
+    let after = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(upper(&after), upper(&before) + 1000);
+    continuation.host_retention = MemoryBytes::unknown("unsupported custom sampler");
+    let unknown = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    assert_eq!(unknown.fit, MemoryFit::InsufficientInformation);
+    assert!(unknown.domains[0].generation_peak.lower_bytes > 8192);
+}
+
+#[test]
+fn continuation_envelopes_grow_with_lookahead_and_reject_stale_horizons() {
+    let (target, plan, continuation) = continuation_fixture(7, false);
+    let base = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    let (look_target, look_plan, mut look) = continuation_fixture(7, true);
+    assert!(
+        upper(&estimate_speculative_continuation_memory(&look_target, &look_plan, &look).unwrap())
+            > upper(&base)
+    );
+    look.additional_tokens += 1;
+    assert!(estimate_speculative_continuation_memory(&look_target, &look_plan, &look).is_err());
+    let mut embedded = plan.clone();
+    embedded.draft = None;
+    assert!(estimate_speculative_continuation_memory(&target, &embedded, &continuation).is_err());
+    assert!(speculative_continuation_positions(u64::MAX, 4, plan.scheduler).is_err());
+}
+
+#[test]
+fn continuation_unattributed_sampling_and_capture_storage_covers_discrete_pools() {
+    let (mut target, mut plan, mut continuation) = continuation_fixture(0, false);
+    let device = MemoryDomain::Device("gpu:0".into());
+    target.domains[0].domain = device.clone();
+    plan.draft.as_mut().unwrap().domains[0].domain = device;
+    let mut host = target.domains[0].clone();
+    host.domain = MemoryDomain::Host;
+    host.executions.clear();
+    host.resident_parameters = MemoryBytes::exact(0);
+    host.already_resident_bytes = 0;
+    target.domains.push(host);
+    let known = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    for pool in &known.domains {
+        assert!(pool.phases[0].retained_input.upper_bytes.unwrap() >= 888);
+    }
+    continuation.host_retention = MemoryBytes::unknown("unprojected native instrumentation");
+    let unknown = estimate_speculative_continuation_memory(&target, &plan, &continuation).unwrap();
+    for pool in &unknown.domains {
+        assert!(pool.generation_peak.upper_bytes.is_none());
+        assert_eq!(pool.fit, MemoryFit::InsufficientInformation);
+    }
+}

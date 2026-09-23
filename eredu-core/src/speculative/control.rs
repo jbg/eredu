@@ -10,7 +10,7 @@ pub enum SpeculativeControlError {
     #[error("controlled speculation is unsupported: {0}")]
     Unsupported(&'static str),
     /// A verification or proposal transaction is still retained.
-    #[error("speculative snapshots require a canonical boundary without pending proposals")]
+    #[error("speculative control requires a canonical boundary without pending proposals")]
     NotQuiescent,
     /// An invalidated session cannot be advanced or restored.
     #[error("controlled speculative session has failed or been cancelled")]
@@ -63,6 +63,34 @@ pub struct SpeculativeProposalView {
     pub token_ids: Vec<u32>,
     /// Full assumed generated prefix for optimistic work, otherwise absent.
     pub assumed_prefix: Option<Vec<u32>>,
+}
+
+/// Read-only native storage facts for one independently executable model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeModelMemoryObservation {
+    /// Current canonical cache frontier, observed from the actual state owner.
+    pub current_positions: u64,
+    /// Current retained state and backing-capacity allowance.
+    pub current_state_bytes: Option<u64>,
+    /// State allowance across the requested horizon, including interior capacity peaks.
+    pub peak_state_bytes: Option<u64>,
+    /// Current parameter backing, including cached parameter conversions.
+    pub parameters: crate::StaticMemoryReport,
+    /// Point-in-time host capacity observation.
+    pub available: crate::AvailableMemory,
+    /// Current allocator cache policy for this physical allocator.
+    pub allocator_cache_limit: crate::Observed<u64>,
+}
+
+/// Native observations for a settled external autoregressive transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeContinuationObservation {
+    /// Installed target state and residency.
+    pub target: SpeculativeModelMemoryObservation,
+    /// Installed independent draft state and residency.
+    pub draft: SpeculativeModelMemoryObservation,
+    /// Durable assistant seed retained alongside the installed caches.
+    pub seed_bytes: Option<u64>,
 }
 
 /// Complete saved canonical execution and output state; callbacks are not copied.
@@ -240,6 +268,69 @@ where
             return Some("complete snapshot size overflowed");
         }
         None
+    }
+
+    /// Observes a settled external draft without copying, submitting or polling work.
+    pub fn continuation_memory_observation(
+        &self,
+        executor: &E,
+        additional_positions: u64,
+    ) -> Result<Option<SpeculativeContinuationObservation>, SpeculativeControlError> {
+        self.validate_control_edit()?;
+        executor
+            .continuation_memory_observation(
+                self.cache,
+                self.target_state
+                    .as_ref()
+                    .expect("checked canonical boundary"),
+                additional_positions,
+            )
+            .map_err(SpeculativeControlError::Backend)
+    }
+
+    /// Configured proposal ceiling, independent of adaptive lookahead decisions.
+    pub fn forecast_max_draft_tokens(&self) -> u64 {
+        self.config.max_draft_tokens as u64
+    }
+
+    /// Retained host/sampling/semantic state, including both random streams.
+    /// This is an allowance, never resident credit.
+    pub fn continuation_host_bytes(&self) -> Option<u64> {
+        self.runtime
+            .sampler()
+            .control_snapshot_bytes(
+                self.target_randomness.as_ref(),
+                self.draft_randomness.as_ref(),
+            )?
+            .checked_add(self.runtime.constraint().control_snapshot_bytes()?)?
+            .checked_add(self.sequence().snapshot_storage_bytes()?)?
+            .checked_add((self.config.eos_token_ids.capacity() as u64).checked_mul(4)?)?
+            .checked_add(
+                (self.stats.accept_lens().len() as u64)
+                    .checked_mul(std::mem::size_of::<usize>() as u64)?,
+            )?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
+    /// Total future host retention, preserving unknown custom sampling/semantic costs.
+    pub fn continuation_host_peak_bytes(&self, additional: u64) -> Option<u64> {
+        self.runtime
+            .sampler()
+            .continuation_storage_bytes(
+                self.target_randomness.as_ref(),
+                self.draft_randomness.as_ref(),
+                additional,
+            )?
+            .checked_add(
+                self.runtime
+                    .constraint()
+                    .continuation_storage_bytes(additional)?,
+            )?
+            .checked_add(self.sequence().snapshot_storage_bytes()?)?
+            .checked_add(additional.checked_mul(32)?)?
+            .checked_add((self.config.eos_token_ids.capacity() as u64).checked_mul(4)?)?
+            .checked_add((self.stats.accept_lens().len() as u64).checked_mul(16)?)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
     }
 
     /// Complete conservative copy bound; unknown components fail closed.

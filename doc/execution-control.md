@@ -1033,12 +1033,12 @@ The host envelope allows one record history and one compact JSON trace. MLX uses
 per-step native storage because transformations complete synchronously; other
 backends default to the cumulative retained limit. These are logical estimates
 with separate allocator/graph allowances, not physical process guarantees.
-Speculative forecasts still disclose the missing concurrent draft/verification
-resource projection. That is an accounting gap, not an execution rejection. Forecasts
-do not consume preparation, state, callbacks, capture budgets or submission
-authority. Forecast before startup from fresh/reset state; forecasting an already
-advanced continuation requires a current-state projection, which the MLX adapter
-currently reports as unbounded. See [generation memory](generation-memory.md).
+Independent autoregressive speculative forecasts include target/draft transaction
+resources where both ordinary workspaces are covered. Embedded and feature-conditioned
+prediction retain unknown components. Forecasts do not consume preparation, state,
+callbacks, capture budgets or submission authority. Fresh-request forecasts require
+fresh/reset state; active sessions use the continuation operation below.
+See [generation memory](generation-memory.md).
 
 
 ## Forecasting further tokens
@@ -1053,9 +1053,21 @@ conservative retained upper costs, not resident-memory credits. Unknown native o
 host state retains an unknown upper end. The requested horizon is hypothetical
 and never extends the run's configured token limit.
 
-This API applies to advanced ordinary sessions. It rejects initial, terminal and
-unsettled boundaries. Controlled speculative sessions can retain tentative draft,
-verification and optimistic transaction state between actions; they require a
-phase-aware continuation projection and do not expose this ordinary forecast.
+Ordinary sessions reject initial, terminal and unsettled boundaries. The object-safe
+`ControlledSpeculativeSession` exposes the same method name for **settled external
+autoregressive** lanes. It returns a `SpeculativeContinuationForecast` after prefill
+or canonical verification/commit with no retained proposals, optimistic branch or
+pending verification. It never polls or settles work to make a boundary eligible.
+Before prefill, after termination/cancellation, on failed sessions, and during an
+uncommitted transaction it returns `UnsupportedContinuation` without changing state.
+Embedded and feature-conditioned prediction are not yet covered. Instrumentation
+or custom sampler/semantic growth without a complete bound preserves known native
+facts but leaves retention unbounded.
+
+Speculative outlooks observe both real cache frontiers and native capacity, the
+retained assistant seed, sampling/RNG/semantic storage, and live user snapshot/branch
+reservations. Completed loading and prefill are excluded. Further drafting,
+verification and commit keep the configured proposal/lookahead ceilings. Request a
+new outlook after restore, branch exchange, advancement, or a horizon change.
 For complete accounting and raw iterator settlement, see
 [mid-session memory forecasts](generation-memory.md#mid-session-continuation-forecasts).

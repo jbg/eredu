@@ -93,6 +93,19 @@ where
         bytes.checked_add(std::mem::size_of::<Self>() as u64)
     }
 
+    fn continuation_storage_bytes(
+        &self,
+        target: Option<&RandomState>,
+        draft: Option<&Array>,
+        additional_tokens: u64,
+    ) -> Option<u64> {
+        // Current allowance includes RNG and intervention ownership; policy's
+        // total continuation bound supplies all future history/grammar growth.
+        self.control_snapshot_bytes(target, draft)?
+            .checked_add(self.inner.continuation_storage_bytes(additional_tokens)?)?
+            .checked_add(2 * (4096 + 32))
+    }
+
     fn enable_control_capture(
         &mut self,
         plan: eredu_core::capture::AdmittedCapturePlan,

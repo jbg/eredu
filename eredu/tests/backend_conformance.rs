@@ -953,6 +953,34 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     ) -> Option<eredu_core::speculative::SpeculativeControlError> {
         self.activations.as_mut().and_then(|o| o.error())
     }
+    fn continuation_memory_observation(
+        &self,
+        cache: &usize,
+        _: &(),
+        additional: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let profile = forecast::fixture_profile();
+        let state = eredu_core::speculative::SpeculativeModelMemoryObservation {
+            current_positions: *cache as u64,
+            current_state_bytes: Some(65536),
+            peak_state_bytes: additional
+                .checked_mul(1024)
+                .and_then(|n| n.checked_add(65536)),
+            parameters: profile.parameters,
+            available: profile.available,
+            allocator_cache_limit: profile.allocator_cache_limit,
+        };
+        Ok(Some(
+            eredu_core::speculative::SpeculativeContinuationObservation {
+                target: state.clone(),
+                draft: state,
+                seed_bytes: Some(32),
+            },
+        ))
+    }
     fn control_snapshot_estimate(
         &self,
         _: &usize,
@@ -1171,6 +1199,9 @@ impl SpeculativeSampling for MockSpeculativeSampling {
         self.forced.map(|p| p.0)
     }
     fn control_snapshot_bytes(&self, _: Option<&()>, _: Option<&()>) -> Option<u64> {
+        Some(0)
+    }
+    fn continuation_storage_bytes(&self, _: Option<&()>, _: Option<&()>, _: u64) -> Option<u64> {
         Some(0)
     }
 

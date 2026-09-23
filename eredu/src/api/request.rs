@@ -332,6 +332,13 @@ impl TokenFilterController for PreparedChatSpeculativeConstraint {
 }
 
 impl eredu_core::SpeculativeTokenFilterController for PreparedChatSpeculativeConstraint {
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        eredu_core::SpeculativeTokenFilterController::continuation_storage_bytes(
+            &self.controller,
+            additional_tokens,
+        )
+    }
+
     fn control_snapshot_bytes(&self) -> Option<u64> {
         eredu_runtime::execution_control::SnapshotTokenController::snapshot_storage_bytes(
             &self.controller,
@@ -422,6 +429,21 @@ impl PreparedChatSemanticState {
 }
 
 impl SpeculativeSemanticState for PreparedChatSemanticState {
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        let predictions = (self.token_ids.len() as u64).checked_add(additional_tokens)?;
+        self.control_snapshot_bytes()?
+            .checked_add(self.pipeline.continuation_storage_bytes(predictions)?)?
+            .checked_add(
+                self.pipeline
+                    .continuation_event_storage_bytes(predictions)?,
+            )?
+            .checked_add(
+                (self.token_ids.capacity() as u64)
+                    .checked_add(additional_tokens)?
+                    .checked_mul(8)?,
+            )
+    }
+
     fn control_snapshot_bytes(&self) -> Option<u64> {
         use crate::runtime::generation::storage::SnapshotStorage;
         self.pipeline

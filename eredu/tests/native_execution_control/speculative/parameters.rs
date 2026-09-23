@@ -4,7 +4,7 @@ use eredu_core::{
     component::ComponentResidualBase, intervention::InterventionDtype, parameters::*,
 };
 
-pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
+pub(super) fn captures<B>(
     model: &mut LoadedModel<B>,
     generation: &PreparedChatSpeculativeGenerationOptions,
     paths: &[String],
@@ -13,7 +13,11 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
 ) -> (
     Vec<u32>,
     Vec<(SpeculativeActivationPhase, Vec<CaptureRecord>)>,
-) {
+)
+where
+    B: eredu_core::SpeculativeGenerationBackend
+        + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>,
+{
     let chat = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"left right"})],

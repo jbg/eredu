@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
 mod branch;
+mod forecast;
 pub use branch::*;
 
 /// Explicit resource limits for controlled speculative inspection.
@@ -158,6 +159,24 @@ impl SpeculativeSnapshotHandle {
 /// require `can_snapshot`; committed blocks are never split into fake token steps.
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
+    /// Read-only outlook at an advanced canonical boundary without proposals or
+    /// pending verification. Does not poll, settle, copy, reserve or advance work.
+    /// The what-if horizon does not change the configured generation limit.
+    fn forecast_remaining_generation(
+        &self,
+        additional_tokens: u64,
+        options: &crate::memory_forecast::GenerationForecastOptions,
+    ) -> Result<
+        crate::memory_forecast::SpeculativeContinuationForecast,
+        crate::memory_forecast::GenerationForecastError,
+    > {
+        let _ = (additional_tokens, options);
+        Err(
+            crate::memory_forecast::GenerationForecastError::UnsupportedContinuation(
+                "controlled session has no speculative continuation projection".into(),
+            ),
+        )
+    }
     /// Replaces future internal edits using authority prepared for this loaded
     /// execution. Capture selections, geometry and allowances remain fixed.
     fn readmit_activation_interventions(
@@ -275,6 +294,11 @@ where
     vocabulary: usize,
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
     activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
+    forecast_profiles: Option<(
+        crate::memory_forecast::LoadedMemoryProfile,
+        crate::memory_forecast::SpeculativeMemoryProfile,
+    )>,
+    forecast_instrumented: bool,
 }
 
 impl<'a, E, S, C, P> Session<'a, E, S, C, P>
@@ -496,6 +520,16 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn forecast_remaining_generation(
+        &self,
+        additional_tokens: u64,
+        options: &crate::memory_forecast::GenerationForecastOptions,
+    ) -> Result<
+        crate::memory_forecast::SpeculativeContinuationForecast,
+        crate::memory_forecast::GenerationForecastError,
+    > {
+        self.forecast_inner(additional_tokens, options)
+    }
     fn readmit_activation_interventions(
         &mut self,
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
@@ -511,9 +545,12 @@ where
                 "loaded execution has no internal activation discovery",
             ),
         )?)?;
+        let instrumented = !plan.is_empty();
         self.scheduler
             .executor
-            .readmit_activation_interventions(plan)
+            .readmit_activation_interventions(plan)?;
+        self.forecast_instrumented |= instrumented;
+        Ok(())
     }
     fn status(&self) -> SpeculativeRequestStatus {
         self.request()
@@ -637,8 +674,11 @@ where
                 }
             }
         }
+        let instrumented = plans.iter().any(|p| !p.plan.plan().operations.is_empty());
         if let Some(lane) = self.lane.as_mut() {
-            return lane.runtime_mut().sampler_mut().control_intervene(plans);
+            lane.runtime_mut().sampler_mut().control_intervene(plans)?;
+            self.forecast_instrumented |= instrumented;
+            return Ok(());
         }
         let request = self
             .scheduler
@@ -646,7 +686,9 @@ where
             .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
             .expect("submitted request");
         request.validate_control_edit()?;
-        request.sampler_mut().control_intervene(plans)
+        request.sampler_mut().control_intervene(plans)?;
+        self.forecast_instrumented |= instrumented;
+        Ok(())
     }
     fn epoch(&self) -> u64 {
         self.epoch
@@ -829,6 +871,10 @@ pub struct DriveControlledSpeculation<'f, F> {
     vocabulary: usize,
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
     activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
+    forecast_profiles: Option<(
+        crate::memory_forecast::LoadedMemoryProfile,
+        crate::memory_forecast::SpeculativeMemoryProfile,
+    )>,
 }
 impl<'f, F> DriveControlledSpeculation<'f, F> {
     /// Starts active preparation timing before facade and backend preparation.
@@ -846,10 +892,23 @@ impl<'f, F> DriveControlledSpeculation<'f, F> {
             vocabulary: 0,
             intervention_discovery: None,
             activation_discovery: None,
+            forecast_profiles: None,
         }
     }
 }
 impl<F> DriveControlledSpeculation<'_, F> {
+    /// Supplies immutable selected geometry before execution resources are borrowed.
+    /// Native residency/capacity are refreshed from the active executor on observation.
+    pub fn with_forecast_profiles(
+        mut self,
+        profiles: Option<(
+            crate::memory_forecast::LoadedMemoryProfile,
+            crate::memory_forecast::SpeculativeMemoryProfile,
+        )>,
+    ) -> Self {
+        self.forecast_profiles = profiles;
+        self
+    }
     /// Retains authoritative loaded internal discovery for prospective edits.
     pub fn with_activation_discovery(
         mut self,
@@ -960,6 +1019,17 @@ where
                 vocabulary: self.vocabulary,
                 intervention_discovery: self.intervention_discovery,
                 activation_discovery: self.activation_discovery,
+                forecast_profiles: self.forecast_profiles,
+                forecast_instrumented: self
+                    .options
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| !c.plan().selections.is_empty())
+                    || self
+                        .options
+                        .activations
+                        .as_ref()
+                        .is_some_and(|a| !a.is_empty()),
             };
             let driven = (self.drive)(&mut session);
             if session.failed {

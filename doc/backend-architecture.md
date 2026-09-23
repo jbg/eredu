@@ -6537,3 +6537,30 @@ the shared quiescent continuation boundary. Neither path changes execution limit
 or refunds resource budgets. Native state/reservation estimates are upper
 allowances, never credits against observed available memory. See
 [generation memory](generation-memory.md#mid-session-continuation-forecasts).
+
+### Settled external speculative memory observations
+
+`eredu-core::SpeculativeExecutor::continuation_memory_observation` is an optional,
+read-only contract for actual target/draft cache frontiers, retained-capacity and
+horizon bounds, current parameter backing, available capacity and allocator policy.
+Core checks the canonical lifecycle before calling it. The neutral autoregressive
+executor composes two `AutoregressiveMechanisms::memory_observation` results and
+its retained assistant seed. MLX reads native state metadata/capacity and residency;
+it never creates checkpoints, settles completions or submits tensors for this call.
+Embedded and feature-conditioned executors retain the unsupported default.
+
+Runtime owns physical-pool request composition (`loaded_generation_request`),
+`GenerationForecastOptions`, calibrated continuation phase accounting and the
+object-safe controlled outlook. The facade reexports the options at the existing
+API path and supplies selection profiles before lending execution resources.
+Native observations refresh mutable residency/capacity on every outlook; geometry
+continues to belong to architecture preparation. No family dispatch was added.
+Sampler/controller/semantic continuation-storage contracts default to unknown;
+the facade supplies tokenizer/parser-specific host facts. Live snapshot/branch
+reservations are conservative allowances and never resident credits. Instrumented
+retention without coverage leaves an explicit unknown contribution. Forecasting
+has no admission, copy, randomness, observation-budget or execution authority.
+
+`SpeculativeForecastBackend::speculative_target_memory_profile` supplies selection
+geometry for the isolated lane. MLX retains that geometry even if an unrelated
+installed ordinary cache has advanced; forecasting never resets either cache.

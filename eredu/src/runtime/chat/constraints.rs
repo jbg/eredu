@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{num::NonZeroUsize, sync::Arc};
 
 use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
+use eredu_runtime::execution_control::SnapshotTokenController;
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use llguidance::{
     toktrie::{SimpleVob, TokEnv, TokenId},
@@ -291,6 +292,20 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
 }
 
 impl SpeculativeTokenFilterController for ConstraintController {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        self.snapshot_storage_bytes()
+    }
+
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        let predictions = (self.committed_tokens.len() as u64).checked_add(additional_tokens)?;
+        self.snapshot_storage_bytes()?
+            .checked_add(ConstraintController::continuation_storage_bytes(
+                self,
+                predictions,
+            )?)?
+            .checked_add(predictions.checked_mul(4)?)
+    }
+
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         ConstraintController::filter_at(self, history)
     }

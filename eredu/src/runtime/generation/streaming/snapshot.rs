@@ -120,6 +120,17 @@ impl CommittedGenerationCursor {
 }
 
 impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
+    pub(crate) fn continuation_event_storage_bytes(&self, max_predictions: u64) -> Option<u64> {
+        let (_, input) = self
+            .decoder
+            .backend
+            .continuation_storage_bounds(max_predictions)?;
+        self.parser
+            .stream
+            .parser
+            .continuation_event_storage_bytes(input, max_predictions)
+    }
+
     pub(crate) fn continuation_storage_bytes(&self, max_predictions: u64) -> Option<u64> {
         let (decoder, input) = self
             .decoder

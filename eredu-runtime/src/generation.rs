@@ -241,6 +241,11 @@ pub trait SpeculativeSampler<B: SamplingBackend> {
         None
     }
 
+    /// Total current and future retained storage for speculative continuation.
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> {
+        None
+    }
+
     /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {
         false
@@ -427,6 +432,16 @@ where
         self.policy
             .control_snapshot_bytes()?
             .checked_add(self.controller.control_snapshot_bytes()?)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        self.policy
+            .continuation_storage_bytes(additional_tokens)?
+            .checked_add(
+                self.controller
+                    .continuation_storage_bytes(additional_tokens)?,
+            )?
             .checked_add(std::mem::size_of::<Self>() as u64)
     }
 

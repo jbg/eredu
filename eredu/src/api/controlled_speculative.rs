@@ -12,6 +12,9 @@ pub use eredu_core::speculative::{
 use eredu_core::{
     generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
 };
+pub use eredu_runtime::memory_forecast::{
+    SpeculativeContinuationForecast, SpeculativeContinuationMemoryPlan,
+};
 pub use eredu_runtime::speculative::{
     ControlledSpeculativeActivation, ControlledSpeculativeOptions, ControlledSpeculativeSession,
     ControlledSpeculativeStep, SpeculativeBranchHandle, SpeculativeBranchInfo,
@@ -93,7 +96,13 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
         B::validate_speculative_interventions(&self.runtime, capture, &plan)?;
         Ok(SpeculativeInterventionPlan { role, plan })
     }
+}
 
+impl<B> LoadedModel<B>
+where
+    B: SpeculativeGenerationBackend
+        + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>,
+{
     /// Runs the shared controlled driver continuously, delivering each bounded
     /// speculative step immediately. Breaking the callback cancels and settles
     /// execution through the same scheduler. Use the scoped controlled API when
@@ -151,7 +160,7 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
     /// # use eredu::api::*;
     /// # use eredu::runtime::chat::PreparedChat;
     /// # use eredu_core::{SpeculativeGenerationBackend, SpeculativeDraft, SpeculativeGenerationOutput};
-    /// # fn inspect<B: SpeculativeGenerationBackend>(model: &mut LoadedModel<B>, chat: &PreparedChat,
+    /// # fn inspect<B: SpeculativeGenerationBackend + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>>(model: &mut LoadedModel<B>, chat: &PreparedChat,
     /// #     drafting: SpeculativeDraft<'_, B::Drafter>) -> Result<SpeculativeGenerationOutput, Box<dyn std::error::Error>> {
     /// let output = model.with_controlled_text_speculative(
     ///     PreparedChatSpeculativeGenerationRequest {
@@ -242,6 +251,16 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
             validation,
             |error| PreparedChatSpeculativeError::Backend(error).into(),
         )?;
+        // Retain selection geometry before the backend lends its mutable execution
+        // resources. Unsupported forecasts must not prevent ordinary execution.
+        let forecast_profiles = B::speculative_target_memory_profile(&self.runtime)
+            .ok()
+            .and_then(|target| {
+                B::speculative_memory_profile(&self.runtime, &request.drafting)
+                    .ok()
+                    .flatten()
+                    .map(|draft| (target, draft))
+            });
         let mut failure = None;
         let driver = eredu_runtime::speculative::DriveControlledSpeculation::new(
             request.options.scheduler,
@@ -249,6 +268,7 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
             drive,
             &mut failure,
         )
+        .with_forecast_profiles(forecast_profiles)
         .with_vocabulary(
             self.tokenizer
                 .get_vocab(true)

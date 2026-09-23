@@ -80,8 +80,24 @@ pub trait AutoregressiveMechanisms {
     ) -> Result<Self::State, Self::Error>;
     /// Reports a complete logical bound for a durable checkpoint copy.
     fn estimate(saved: &Self::Checkpoint) -> Option<SnapshotEstimate>;
+    /// Retained immutable seed including native backing capacity; no checkpoint
+    /// is created. Unknown capacity must remain unknown in continuation outlooks.
+    fn checkpoint_retained_bytes(_saved: &Self::Checkpoint) -> Option<u64> {
+        None
+    }
     /// Estimates installed state without allocating a checkpoint or issuing copies.
     fn estimate_state(state: &Self::State) -> Option<SnapshotEstimate>;
+    /// Observes actual cache geometry, capacity and parameter residency without work.
+    fn memory_observation(
+        _model: &Self::Model,
+        _state: &Self::State,
+        _additional_positions: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeModelMemoryObservation>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
     /// Selects one sequence position for the shared sampler.
     fn logits(
         output: &Self::Output,
@@ -340,6 +356,32 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         let seed = M::checkpoint(&draft)?;
         cache.draft = draft;
         Ok(SpeculativeCommit::new(seed, replayed))
+    }
+
+    fn continuation_memory_observation(
+        &self,
+        cache: &Self::Cache,
+        state: &Self::TargetState,
+        additional_positions: u64,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
+        eredu_core::BackendFailure,
+    > {
+        let Some(target) = M::memory_observation(self.target, &cache.target, additional_positions)?
+        else {
+            return Ok(None);
+        };
+        let Some(draft) = M::memory_observation(self.draft, &cache.draft, additional_positions)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            eredu_core::speculative::SpeculativeContinuationObservation {
+                target,
+                draft,
+                seed_bytes: M::checkpoint_retained_bytes(state),
+            },
+        ))
     }
 
     fn control_snapshot_estimate(

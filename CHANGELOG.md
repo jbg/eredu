@@ -4,6 +4,24 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Settled speculative continuation outlooks
+
+Controlled external autoregressive sessions now expose
+`forecast_remaining_generation` at canonical settled boundaries. Outlooks include
+actual target/draft cache frontiers and native capacity, the retained assistant
+seed, sampler/semantic growth and live snapshot/branch reservations. Completed
+loading/prefill are excluded; forecasts never advance or settle execution.
+Embedded/feature-conditioned and in-flight outlooks remain unsupported. Missing
+custom host-growth or instrumented retention bounds remain explicitly unknown.
+
+`GenerationForecastOptions` is now runtime-owned and reexported at its existing
+facade path. Controlled speculative entrypoints additionally require
+`SpeculativeForecastBackend<B::Drafter>` (and its `GenerationForecastBackend`
+supertrait). Backend implementors without coverage can return unavailable profile
+errors / the default `None`; generation remains supported. New optional executor,
+sampler and semantic storage hooks default to unsupported/unknown. Existing JSON
+forecast records are unchanged; speculative continuations use a separate record.
+
 ## 2026-09-23 — Reused resident parameter conversions
 
 MLX fully resident dense projections reuse F32 conversions of F16/BF16 weights,

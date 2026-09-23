@@ -1,10 +1,12 @@
 //! High-level contracts and orchestration for speculative execution backends.
 
+#[cfg(test)]
+use crate::backend::BoundedCompletionOutcome;
 use crate::{
     backend::{
-        BoundedCompletion, BoundedCompletionWait, Completion,
-        CompletionCancellationMode, ModelRuntime, SpeculativeTokenFilterController, Submission,
-        TextGenerationBackend, TextGenerationConfig,
+        BoundedCompletion, BoundedCompletionWait, Completion, CompletionCancellationMode,
+        ModelRuntime, SpeculativeTokenFilterController, Submission, TextGenerationBackend,
+        TextGenerationConfig,
     },
     generation::{
         FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
@@ -14,8 +16,6 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use crate::backend::BoundedCompletionOutcome;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -859,6 +859,18 @@ pub trait SpeculativeExecutor {
         }
     }
 
+    /// Pure observation of settled independent-model cache frontiers, capacity
+    /// and residency. No polling, synchronization, copying or budget consumption.
+    /// Embedded and feature-conditioned prediction remain unsupported by default.
+    fn continuation_memory_observation(
+        &self,
+        _cache: &Self::Cache,
+        _state: &Self::TargetState,
+        _additional_positions: u64,
+    ) -> Result<Option<SpeculativeContinuationObservation>, crate::BackendFailure> {
+        Ok(None)
+    }
+
     /// Complete bound for a durable canonical cache and assistant seed snapshot.
     /// Transaction rollback markers alone are insufficient for reusable snapshots.
     fn control_snapshot_estimate(
@@ -1244,6 +1256,17 @@ pub trait SpeculativeSampling: Clone {
         &self,
         _target: Option<&Self::RandomState>,
         _draft: Option<&Self::DraftRandomness>,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Total current and future sampler/RNG storage for a continuation horizon.
+    /// Unknown custom samplers must leave the upper allowance unavailable.
+    fn continuation_storage_bytes(
+        &self,
+        _target: Option<&Self::RandomState>,
+        _draft: Option<&Self::DraftRandomness>,
+        _additional_tokens: u64,
     ) -> Option<u64> {
         None
     }
@@ -1704,6 +1727,12 @@ pub trait SpeculativeConstraint: Sized {
         None
     }
 
+    /// Total retained storage through a further token horizon, including the
+    /// installed state. Observation must not fork, advance or drain that state.
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> {
+        None
+    }
+
     /// Forks state for tentative verification.
     fn fork(&self) -> Result<Self, SpeculativeOutputError>;
     /// Stages one token and reports a matched stop condition.
@@ -1744,6 +1773,12 @@ pub trait SpeculativeSemanticState {
         None
     }
 
+    /// Total current and future semantic storage, including events staged until
+    /// commitment. Unknown custom parser or decoder growth remains unavailable.
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> {
+        None
+    }
+
     /// Forks the exact committed prefix for tentative verification.
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError>;
     /// Stages one token and reports whether a stop sequence matched.
@@ -1774,6 +1809,13 @@ impl SpeculativeSemanticConstraint {
 }
 
 impl SpeculativeConstraint for SpeculativeSemanticConstraint {
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        match &self.state {
+            Some(state) => state.continuation_storage_bytes(additional_tokens),
+            None => Some(0),
+        }
+    }
+
     fn control_snapshot_bytes(&self) -> Option<u64> {
         match &self.state {
             Some(state) => state.control_snapshot_bytes(),
@@ -2363,7 +2405,9 @@ where
     let mut input_tokens = Vec::with_capacity(block.proposals.len() + 1);
     input_tokens.push(last_committed_token);
     input_tokens.extend(block.proposals.iter().map(|proposal| proposal.token));
-    let checkpoint = executor.checkpoint(cache).map_err(SpeculativeDriverError::Backend);
+    let checkpoint = executor
+        .checkpoint(cache)
+        .map_err(SpeculativeDriverError::Backend);
     let checkpoint = coordination::ready_result(executor, checkpoint, context)?;
     let submission = match executor.submit_verification(&input_tokens, cache, context) {
         Ok(submission) => submission,
@@ -2979,7 +3023,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
@@ -3014,7 +3059,8 @@ where
                 .expect("ready request has target state");
             let state = with_activation_origin(executor, origin, |executor| {
                 executor.begin_proposal(target_state, last, target_count, context)
-            }).map_err(SpeculativeDriverError::Backend);
+            })
+            .map_err(SpeculativeDriverError::Backend);
             SpeculativeDraftBlock {
                 state: coordination::ready_result(executor, state, context)?,
                 proposals: Vec::new(),
@@ -3088,7 +3134,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
@@ -3124,7 +3171,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;

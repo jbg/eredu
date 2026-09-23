@@ -7,6 +7,8 @@ use eredu_core::{
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
+mod loaded;
+pub use loaded::*;
 mod continuation;
 pub use continuation::*;
 mod capture;

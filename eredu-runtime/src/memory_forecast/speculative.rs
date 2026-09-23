@@ -22,6 +22,15 @@ pub struct SpeculativeMemoryProfile {
 /// Backend projection borrowed from the exact target and selected draft. A report
 /// must not load artifacts, allocate caches, submit work or consume the drafter.
 pub trait SpeculativeForecastBackend<D>: GenerationForecastBackend {
+    /// Target selection for an isolated speculative lane. Backends with separate
+    /// lane caches override this to avoid treating unrelated installed ordinary
+    /// state as this lane's state. This never resets or creates a cache.
+    fn speculative_target_memory_profile(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
+        Self::loaded_memory_profile(runtime)
+    }
+
     /// Retains unknown coverage for backends without speculative resource facts.
     fn speculative_memory_profile(
         _runtime: &ModelRuntime<Self>,
@@ -47,6 +56,87 @@ pub struct SpeculativeMemoryPlan {
     pub scheduler: SpeculativeSchedulerOptions,
     /// Whether a shared pool has one cache/driver allowance.
     pub shared_allocator: bool,
+}
+
+/// Settled, horizon-specific observations for an external autoregressive lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeculativeContinuationMemoryPlan {
+    /// Requested additional committed decisions; this does not change the run limit.
+    pub additional_tokens: u64,
+    /// Actual target state, including speculative overshoot in its peak horizon.
+    pub target: ContinuationMemoryPlan,
+    /// Actual draft state, which need not have the same installed frontier.
+    pub draft: ContinuationMemoryPlan,
+    /// Current retained assistant seed; future copies use the draft-state envelope.
+    pub seed: MemoryBytes,
+    /// Current and future sampler, random, history and semantic storage allowance.
+    /// Includes unattributed native RNG/capture storage, so charged to every pool.
+    pub host_retention: MemoryBytes,
+    /// Live user snapshot and inactive-branch reservations; not resident credit.
+    pub retained_snapshots: MemoryBytes,
+}
+
+/// Reproducible settled speculative outlook. Reobserve after advancing/restoring
+/// or changing the horizon; native capacity cannot be extrapolated from this record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeculativeContinuationForecast {
+    /// Total/additional peaks without completed loading or prefill.
+    pub estimate: GenerationMemoryEstimate,
+    /// Target physical pools and calibrated geometry.
+    pub request: GenerationMemoryRequest,
+    /// Separate draft request and selected transaction ceilings.
+    pub speculative: SpeculativeMemoryPlan,
+    /// Native state and controlled-retention observations for this horizon.
+    pub continuation: SpeculativeContinuationMemoryPlan,
+}
+
+/// Projects settled external autoregressive continuation from actual installed state.
+pub fn estimate_speculative_continuation_memory(
+    target: &GenerationMemoryRequest,
+    plan: &SpeculativeMemoryPlan,
+    continuation: &SpeculativeContinuationMemoryPlan,
+) -> Result<GenerationMemoryEstimate, CapabilityError> {
+    let draft = plan
+        .draft
+        .as_ref()
+        .ok_or(CapabilityError::InvalidConfiguration {
+            field: "speculative continuation",
+            detail: "requires an independent autoregressive draft".into(),
+        })?;
+    let mut continuation = continuation.clone();
+    continuation.target = continuation.target.with_logical_state_bounds(target)?;
+    continuation.draft = continuation.draft.with_logical_state_bounds(draft)?;
+    let extra = speculative_continuation_positions(
+        continuation.additional_tokens,
+        plan.max_draft_tokens,
+        plan.scheduler,
+    )?;
+    if continuation.target.additional_input_tokens != extra
+        || continuation.draft.additional_input_tokens != extra
+    {
+        return Err(CapabilityError::InvalidConfiguration { field: "speculative continuation horizon", detail: "native state observations must include the requested horizon and configured speculative overshoot".into() });
+    }
+    estimate_speculative_inner(target, plan, Some(&continuation))
+}
+
+/// Additional cache positions required by a what-if horizon and selected lookahead.
+pub fn speculative_continuation_positions(
+    tokens: u64,
+    width: u64,
+    scheduler: SpeculativeSchedulerOptions,
+) -> Result<u64, CapabilityError> {
+    if tokens == 0 {
+        return Ok(0);
+    }
+    add(
+        tokens,
+        mul(
+            add(width, 1)?,
+            1 + u64::from(
+                scheduler.lookahead_blocks != 0 && scheduler.max_optimistic_branches != 0,
+            ),
+        )?,
+    )
 }
 
 fn add(a: u64, b: u64) -> Result<u64, CapabilityError> {
@@ -96,6 +186,14 @@ pub fn estimate_speculative_memory(
     target: &GenerationMemoryRequest,
     plan: &SpeculativeMemoryPlan,
 ) -> Result<GenerationMemoryEstimate, CapabilityError> {
+    estimate_speculative_inner(target, plan, None)
+}
+
+fn estimate_speculative_inner(
+    target: &GenerationMemoryRequest,
+    plan: &SpeculativeMemoryPlan,
+    continuation: Option<&SpeculativeContinuationMemoryPlan>,
+) -> Result<GenerationMemoryEstimate, CapabilityError> {
     // These are transaction contracts, not caller-tunable savings: both
     // prefills run in full and verification/replay can project every row.
     let normalize = |r: &mut GenerationMemoryRequest| {
@@ -116,7 +214,19 @@ pub fn estimate_speculative_memory(
     let plan = &normalized;
     plan.auxiliary_bytes_per_position.validate()?;
     plan.sampling_bytes_per_vocabulary_entry.validate()?;
-    let mut result = estimate_generation_memory(target)?;
+    let ordinary = |request: &GenerationMemoryRequest| {
+        let mut validation = request.clone();
+        if continuation.is_some() {
+            validation.input = eredu_core::InputTokenCount::text(1);
+            validation.max_output_tokens = Some(0);
+            validation.prefill_chunk_tokens = 1;
+            for pool in &mut validation.domains {
+                pool.loading_peak = MemoryBytes::exact(0);
+            }
+        }
+        estimate_generation_memory(&validation)
+    };
+    let mut result = ordinary(target)?;
     if target.batch_size != 1 || plan.max_draft_tokens == 0 {
         return Err(CapabilityError::InvalidConfiguration {
             field: "speculative forecast",
@@ -126,14 +236,15 @@ pub fn estimate_speculative_memory(
     plan.scheduler
         .validate()
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let draft_estimate = plan
-        .draft
-        .as_ref()
-        .map(estimate_generation_memory)
-        .transpose()?;
-    let output = target
-        .max_output_tokens
-        .unwrap_or(target.forecast_output_tokens);
+    let draft_estimate = plan.draft.as_ref().map(ordinary).transpose()?;
+    let output = continuation.map_or_else(
+        || {
+            target
+                .max_output_tokens
+                .unwrap_or(target.forecast_output_tokens)
+        },
+        |c| c.additional_tokens,
+    );
     let canonical = add(target.input.model_positions, output)?;
     let width = add(plan.max_draft_tokens, 1)?;
     // A verified block and one optimistic block may extend beyond the canonical
@@ -144,7 +255,7 @@ pub fn estimate_speculative_memory(
     let frontier = add(canonical, mul(width, add(1, lookahead)?)?)?;
     let mut pools = target.domains.clone();
     if let Some(draft) = &plan.draft {
-        if draft.input != target.input
+        if (continuation.is_none() && draft.input != target.input)
             || draft.max_output_tokens != target.max_output_tokens
             || draft.forecast_output_tokens != target.forecast_output_tokens
             || draft.batch_size != 1
@@ -197,7 +308,17 @@ pub fn estimate_speculative_memory(
             _ => pool.budget.clone(),
         };
         let mut phases = Vec::new();
-        let stages = if output == 0 {
+        let stages = if continuation.is_some() {
+            let mut stages = vec![MemoryPhase::ContinuationStart];
+            if output != 0 {
+                stages.extend([
+                    MemoryPhase::SpeculativeDraft,
+                    MemoryPhase::SpeculativeVerification,
+                    MemoryPhase::SpeculativeCommit,
+                ]);
+            }
+            stages
+        } else if output == 0 {
             vec![MemoryPhase::Prefill]
         } else {
             vec![
@@ -209,17 +330,62 @@ pub fn estimate_speculative_memory(
         };
         for stage in stages {
             let prefill = stage == MemoryPhase::Prefill;
+            let start = stage == MemoryPhase::ContinuationStart;
             let positions = if prefill {
                 target.input.model_positions
             } else {
                 frontier
             };
             let query = if prefill { positions } else { width };
-            let get = |r: &GenerationMemoryRequest, p: &DomainMemoryPlan| {
-                phase(p, r, stage, positions, query)
+            let get = |r: &GenerationMemoryRequest,
+                       p: &DomainMemoryPlan,
+                       native: Option<&ContinuationMemoryPlan>|
+             -> Result<PhaseMemoryEstimate, CapabilityError> {
+                let mut positions = positions;
+                let mut pool = p.clone();
+                if let Some(native) = native {
+                    positions = if start {
+                        native.current_positions
+                    } else {
+                        add(native.current_positions, native.additional_input_tokens)?
+                    };
+                    for e in &mut pool.executions {
+                        e.cache_update = CacheUpdateWorkspace::InPlace;
+                    }
+                }
+                let mut result = phase(&pool, r, stage, positions, if start { 0 } else { query })?;
+                if let Some(native) = native {
+                    if !pool.executions.is_empty() {
+                        result.persistent_state = if start {
+                            native.current_state.clone()
+                        } else {
+                            native.peak_state.clone()
+                        };
+                        if !start {
+                            let copy = match p.executions[0].cache_update {
+                                CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
+                                CacheUpdateWorkspace::CopyState => {
+                                    interval(&native.peak_state, 1, "native cache-update overlap")?
+                                }
+                                CacheUpdateWorkspace::Unknown => {
+                                    MemoryBytes::unknown("native cache update overlap unavailable")
+                                }
+                            };
+                            result.workspace = result.workspace.add(&copy)?;
+                        }
+                    }
+                    if start {
+                        result.workspace = MemoryBytes::exact(0);
+                    }
+                }
+                Ok(result)
             };
-            let tp = t.map(|p| get(target, p)).transpose()?;
-            let dp = d.map(|(r, p)| get(r, p)).transpose()?;
+            let tp = t
+                .map(|p| get(target, p, continuation.map(|c| &c.target)))
+                .transpose()?;
+            let dp = d
+                .map(|(r, p)| get(r, p, continuation.map(|c| &c.draft)))
+                .transpose()?;
             let mut p = tp
                 .clone()
                 .or_else(|| dp.clone())
@@ -246,14 +412,14 @@ pub fn estimate_speculative_memory(
                     t.backend_overhead.add(&d.backend_overhead)?
                 };
             }
-            if matches!(pool.domain, MemoryDomain::Host | MemoryDomain::Unified) {
+            if !start && matches!(pool.domain, MemoryDomain::Host | MemoryDomain::Unified) {
                 p.staging = p.staging.add(&MemoryBytes::estimated(0,
                     mul(mul(positions, 4)?, add(6, mul(3,lookahead)?)?)?,
                     "single-lane token/history copies through rollback, replay and optimistic advancement"))?;
             }
             let execution_pool = t.is_some_and(|p| !p.executions.is_empty())
                 || d.is_some_and(|(_, p)| !p.executions.is_empty());
-            if execution_pool {
+            if execution_pool && !start {
                 // The ordinary workspace already includes cache-update overlap.
                 // These *additional* copies envelope durable checkpoints, seed,
                 // proposal restore/replacement, rollback and optimistic branches.
@@ -302,11 +468,20 @@ pub fn estimate_speculative_memory(
             }
             // The frontier includes uncommitted positions and worst-case replay.
             // Do not promote that upper envelope to an inevitable allocation.
-            if !prefill {
+            if !prefill && !start {
                 p.persistent_state.lower_bytes = 0;
                 p.persistent_state.kind = ObservationKind::Estimated;
                 p.workspace.lower_bytes = 0;
                 p.workspace.kind = ObservationKind::Estimated;
+            }
+            if let Some(c) = continuation {
+                if execution_pool {
+                    p.staging = p.staging.add(&c.seed)?;
+                }
+                p.staging = p.staging.add(&c.retained_snapshots)?;
+                // Sampler/RNG and instrumented retention may own native arrays;
+                // without exact placement, conservatively charge every pool.
+                p.retained_input = p.retained_input.add(&c.host_retention)?;
             }
             p.total = total(&p)?;
             phases.push(p);
@@ -314,33 +489,36 @@ pub fn estimate_speculative_memory(
         let peak = phases
             .iter()
             .fold(MemoryBytes::exact(0), |a, p| a.maximum(&p.total));
-        let loading = t
-            .map(|p| p.loading_peak.clone())
-            .unwrap_or(MemoryBytes::exact(0))
-            .add(
-                &d.map(|(_, p)| p.loading_peak.clone())
-                    .unwrap_or(MemoryBytes::exact(0)),
-            )?
-            .add(&phases[0].backend_overhead)?;
-        let overall = peak.maximum(&loading);
-        phases.push(PhaseMemoryEstimate {
-            phase: MemoryPhase::Loading,
-            positions: 0,
-            query_positions: 0,
-            parameters: MemoryBytes::exact(0),
-            persistent_state: MemoryBytes::exact(0),
-            retained_input: MemoryBytes::exact(0),
-            workspace: MemoryBytes::exact(0),
-            staging: t
+        let mut overall = peak.clone();
+        if continuation.is_none() {
+            let loading = t
                 .map(|p| p.loading_peak.clone())
                 .unwrap_or(MemoryBytes::exact(0))
                 .add(
                     &d.map(|(_, p)| p.loading_peak.clone())
                         .unwrap_or(MemoryBytes::exact(0)),
-                )?,
-            backend_overhead: phases[0].backend_overhead.clone(),
-            total: loading,
-        });
+                )?
+                .add(&phases[0].backend_overhead)?;
+            overall = peak.maximum(&loading);
+            phases.push(PhaseMemoryEstimate {
+                phase: MemoryPhase::Loading,
+                positions: 0,
+                query_positions: 0,
+                parameters: MemoryBytes::exact(0),
+                persistent_state: MemoryBytes::exact(0),
+                retained_input: MemoryBytes::exact(0),
+                workspace: MemoryBytes::exact(0),
+                staging: t
+                    .map(|p| p.loading_peak.clone())
+                    .unwrap_or(MemoryBytes::exact(0))
+                    .add(
+                        &d.map(|(_, p)| p.loading_peak.clone())
+                            .unwrap_or(MemoryBytes::exact(0)),
+                    )?,
+                backend_overhead: phases[0].backend_overhead.clone(),
+                total: loading,
+            });
+        }
         let growth_in = |domains: &[DomainMemoryEstimate]| {
             domains
                 .iter()
@@ -380,6 +558,21 @@ pub fn estimate_speculative_memory(
         .uncertainties
         .push(plan.sampling_bytes_per_vocabulary_entry.detail.clone());
     result.assumptions.push("Speculative single-lane envelope: full-pass prefill; target and draft residency, rollback, proposal copies, verification and replay; configured lookahead is retained without assuming acceptance or adaptive disabling. User snapshots/branches are additional allocations.".into());
+    if let Some(c) = continuation {
+        result.requested_positions = add(c.target.current_positions, c.additional_tokens)?;
+        result.is_forecast = true;
+        result
+            .assumptions
+            .retain(|s| !s.starts_with("Speculative single-lane envelope:"));
+        result.assumptions.push("Settled external autoregressive continuation: actual target/draft frontiers and native capacity; no completed loading/prefill; configured proposal and lookahead ceilings, with no assumption of acceptance. Snapshot/branch and state bounds are allowances, never resident credit. Horizon does not change generation limits.".into());
+        result.uncertainties.extend([
+            c.target.current_state.detail.clone(),
+            c.target.peak_state.detail.clone(),
+            c.draft.current_state.detail.clone(),
+            c.draft.peak_state.detail.clone(),
+            c.host_retention.detail.clone(),
+        ]);
+    }
     result.fit = if result
         .domains
         .iter()

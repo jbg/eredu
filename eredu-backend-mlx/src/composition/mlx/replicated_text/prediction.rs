@@ -127,6 +127,7 @@ impl MlxParameterBankTelemetry
 }
 
 pub(super) trait ErasedPredictionTargetState: std::any::Any {
+    fn control_growth(&self, additional: u64) -> Option<u64>;
     fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate>;
     fn control_copy(
         &self,
@@ -148,6 +149,9 @@ impl<S> ErasedPredictionTargetState for S
 where
     S: MlxStateMechanisms + 'static,
 {
+    fn control_growth(&self, additional: u64) -> Option<u64> {
+        self.isolated_snapshot_growth(additional)
+    }
     fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         self.isolated_snapshot_estimate()
     }
@@ -196,6 +200,9 @@ where
 pub(crate) struct MlxPredictionTargetState(Option<Box<dyn ErasedPredictionTargetState>>);
 
 impl MlxPredictionTargetState {
+    pub(crate) fn control_growth(&self, additional: u64) -> Option<u64> {
+        self.0.as_ref()?.control_growth(additional)
+    }
     pub(crate) fn control_estimate(
         &self,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {

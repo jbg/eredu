@@ -199,6 +199,11 @@ impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTok
             .control_snapshot_bytes()?
             .checked_add(std::mem::size_of::<Self>() as u64)
     }
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        self.inner
+            .continuation_storage_bytes(additional_tokens)?
+            .checked_add(std::mem::size_of::<Self>() as u64)
+    }
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         let filter = self
             .inner

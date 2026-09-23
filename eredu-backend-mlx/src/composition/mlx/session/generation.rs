@@ -76,6 +76,13 @@ impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
             .checked_add(std::mem::size_of::<Self>() as u64)
     }
 
+    fn continuation_storage_bytes(&self, additional_tokens: u64) -> Option<u64> {
+        // Retain a generous Vec growth/replacement allowance for history.
+        self.control_snapshot_bytes()?
+            .checked_mul(2)?
+            .checked_add(additional_tokens.checked_mul(8)?)
+    }
+
     fn supports_exact_optimistic_promotion(&self) -> bool {
         match self {
             Self::Standard(sampler) => {

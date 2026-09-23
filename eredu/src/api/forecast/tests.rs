@@ -3,6 +3,7 @@ use eredu_core::{
     AvailableMemory, EstimationCompleteness, LayerSchedule, ObservationKind, StateMemoryLayout,
     StaticMemoryReport,
 };
+use eredu_core::{Observed, PhysicalMemorySemantics};
 use eredu_runtime::memory_estimation::WorkspaceGeometry;
 use eredu_runtime::memory_forecast::LoadedMemoryGeometry;
 use std::num::NonZeroU8;

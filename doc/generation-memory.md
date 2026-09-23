@@ -272,6 +272,8 @@ traces, captures/interventions enabled after startup and concurrent lanes need
 their own accounting. Ordinary and controlled execution share the startup
 forecast; the API does not claim to bound subsequent user-controlled retention.
 
+### Speculative startup validation
+
 Validation on 2026-09-23 used debug builds on macOS/aarch64 Metal with 256 GiB
 unified memory and the pinned `HuggingFaceTB/SmolLM-135M` checkpoint documented
 below (`1d461723eec654e65efdc40cf49301c89c0c92f4`). Two independently loaded copies
@@ -310,6 +312,92 @@ For the serial row, omit `--speculative-draft-device`, use `--temperature 0`,
 and add `--disable-speculative-lookahead`. For the CPU row, select `cpu` and
 16 output tokens. For the long row, pipe 32 repetitions of
 `The quick brown fox jumped over the fence. ` as the prompt.
+
+### Settled speculative continuation
+
+Inside `with_controlled_text_speculative` or `with_controlled_chat_speculative`, use
+`session.forecast_remaining_generation(additional_tokens, &options)` after prefill
+or a canonical commit. The object-safe operation returns
+`SpeculativeContinuationForecast`: target `request`, the existing `speculative`
+plan (including draft request), horizon-specific `continuation` observations, and
+an `estimate`. It performs no native execution, completion polling, synchronization,
+cache copy or budget reservation. It does not change the configured output limit.
+
+The first implementation covers independent autoregressive drafters. It observes
+both installed cache frontiers separately, current backing-capacity allowances,
+state growth through the horizon and speculative overshoot, and the retained
+assistant seed. It refreshes both parameter residency reports (including cached
+conversions), available capacity and allocator-cache policy. Only parameters receive
+already-resident credit. State, seed and snapshot/branch reservations are conservative
+upper allowances, not measurements of distinct physical backing.
+
+The `continuation_start` phase has installed state and no new forward workspace.
+Positive horizons add drafting, verification and commit phases using the existing
+copy, distribution and lookahead envelopes with native capacity substituted for
+logical cache payload. Loading and prefill are excluded, including their validation
+arithmetic. A zero-token horizon still includes current state and retained user
+snapshots/branches. Native `additional_input_tokens` includes configured speculative
+overshoot; `continuation.additional_tokens` is the requested committed-token horizon.
+Reobserve for another horizon instead of editing that descriptive record.
+
+Canonical boundaries contain no pending proposal distribution or completion.
+Retained sampler/RNG/history and semantic state are observed, with conservative
+future fork/replay growth and one compact trace allowance. Custom samplers,
+controllers or semantic parsers without a continuation storage contract keep the
+upper end unknown. This combined allowance includes native RNG storage and is
+conservatively charged in every physical pool until exact attribution is available.
+Instrumented speculative retention also remains unknown
+in this phase; native state/residency facts remain available. Returned records or
+external application copies retained outside these declared allowances are excluded.
+
+Before prefill, terminal/cancelled/failed owners, retained proposals, optimistic
+transactions and in-flight verification are explicitly unsupported. The method
+does not make those states eligible by advancing execution. Embedded and
+feature-conditioned prediction remain unsupported. User snapshots and inactive
+branches are included from live non-rewindable reservations; restore and exchange
+change the state observed by the next call without refunding those reservations.
+
+Validation on 2026-09-23 used the same pinned SmolLM-135M revision below on
+macOS/aarch64 Metal with allocator caching disabled. Original checkpoint files were
+unchanged; a local `chat_template.jinja` supplied the literal content-only template
+shown in the startup validation. Two independent copies ran 32-token requests with
+proposal width four. Outlooks were taken after prefill committed the first token,
+with one live user snapshot, for 31 further tokens.
+
+| Prompt positions | Lookahead | Additional forecast upper, bytes | Subsequent MLX peak growth, bytes |
+| ---: | --- | ---: | ---: |
+| 10 | Disabled, greedy | 388,148,363 | 23,401,674 |
+| 10 | Enabled, stochastic | 530,300,871 | 26,023,130 |
+| 289 | Disabled, greedy | 1,468,286,819 | 99,036,825 |
+| 289 | Enabled, stochastic | 1,996,132,275 | 114,372,220 |
+
+All four returned `likely_fit`. Forecasts preserved tokens, RNG state, epochs and
+snapshot budgets, and did not increase active native allocation. Snapshot restore
+and branch exchange preserved subsequent token output; controlled and uninterrupted
+speculative output matched exactly. In-flight calls were rejected. The native
+nonzero Qwen2 fixture passed the same checks; portable conformance exercises
+acceptance, rejection/replay and lookahead. These conservative bounds include
+current state/capacity and snapshot allowances, so they deliberately exceed just
+new allocation growth. Native separate physical pools and embedded prediction
+were not validated by this phase.
+
+Reproduce with the pinned checkpoint files and literal `chat_template.jinja` in
+`MODEL` (omit the environment variables to use the nonzero native fixture):
+
+```sh
+EREDU_SPECULATIVE_CONTINUATION_MODEL="$MODEL" \
+EREDU_SPECULATIVE_CONTINUATION_REPEAT=1 \
+cargo test -p eredu --features mlx,metal --test native_execution_control \
+  native_speculative_continuation_forecasts -- --ignored --nocapture --test-threads=1
+```
+
+Use `EREDU_SPECULATIVE_CONTINUATION_REPEAT=32` for the longer prompt. Each run
+checks serial greedy and separate-stream stochastic lookahead, zero-token outlooks,
+read-only observation, snapshot/fork/exchange/restore and token parity. Structured
+semantic parsers currently retain an unknown staged-event bound; plain text has a
+finite bound derived from token and decoded-input geometry.
+
+### Shared request calibration
 
 `GenerationForecast` contains the estimate, descriptive request, full-pass reason
 and logits contract. `with_prefill_chunk` recomputes a candidate only when the
@@ -1155,8 +1243,9 @@ memory remain outside the modeled request; reserve capacity for them.
 Initial prefill, failed/cancelled/terminal controlled sessions and unsettled
 submissions are rejected. Selected executables without an installed-state
 projection return `GenerationForecastError::UnsupportedContinuation`. Mid-flight
-speculative transactions are not ordinary continuations and remain unsupported;
-the existing prepared speculative forecast still covers fresh speculative runs.
+speculative transactions are not ordinary continuations. Settled external
+autoregressive lanes use the separate speculative continuation plan above; the
+existing prepared speculative forecast still covers fresh speculative runs.
 
 
 Initial continuation validation (2026-09-23, before tightening the semantic-history
