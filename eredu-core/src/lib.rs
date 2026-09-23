@@ -53,6 +53,8 @@ pub mod observation;
 pub mod realtime;
 /// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
+/// Neutral resource identities, placement, payload and allocation-capacity bounds.
+pub mod resources;
 /// Portable text-run preparation status and cumulative reservation reports.
 pub mod run_preparation;
 /// Transactional fair work scheduler.

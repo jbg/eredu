@@ -4,6 +4,17 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Neutral execution resource descriptions
+
+`eredu_core::resources` adds a backend-neutral contract for parameter storage,
+mutable state, retained tensors and workspace. Scoped backing and owner identities
+distinguish shared storage from replicas and cached conversions; physical-pool
+identities preserve unified-memory sharing. Descriptions carry current payload,
+allocation capacity and whole-horizon bounds, with explicit missing coverage and
+placement. The new contract is additive: existing generation forecast APIs and
+serialized reports are unchanged. Execution-derived producers and lifetime/peak
+composition are subsequent work; this change does not enable embedded forecasts.
+
 ## 2026-09-23 — Settled speculative continuation outlooks
 
 Controlled external autoregressive sessions now expose

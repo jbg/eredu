@@ -6564,3 +6564,39 @@ has no admission, copy, randomness, observation-budget or execution authority.
 `SpeculativeForecastBackend::speculative_target_memory_profile` supplies selection
 geometry for the isolated lane. MLX retains that geometry even if an unrelated
 installed ordinary cache has advanced; forecasting never resets either cache.
+
+### Neutral execution resource descriptions
+
+`eredu-core::resources` owns a descriptive contract below portable families and
+mechanisms. It does not depend on runtime forecast types. A `ResourceDescription`
+names its execution/module scope, current logical dimensions and requested
+horizon. Entries describe parameter storage, mutable state, retained tensors or
+temporary workspace. Each backing allocation has one scoped identity and a list
+of logical uses: tied slots and views can share backing, while independently
+loaded instances, replicas, copied snapshots and cached dtype conversions retain
+distinct allocation identities. Equal checkpoint keys do not establish sharing.
+
+Physical pools have separately scoped, authoritative identities. Host and device
+access to unified backing uses one pool, while independent devices and different
+hosts remain separate. Unknown placement stays explicitly unavailable; guessed
+identities cannot establish either shared storage or a shared capacity pool.
+
+`ResourceSize` supports fixed extents and evaluated context-dependent extents.
+Actual stored payload (including encoding metadata) and allocation capacity are
+separate, non-additive facts. Whole-horizon maxima include the starting boundary
+and interior peaks, allowing nonlinear scratch geometry and rounded cache growth
+without an equation language or a bytes-per-token assumption. The producer's
+ordinary execution contract defines dimension names and units. Missing sizes,
+placement and resource-set coverage remain explicit; a missing coverage field
+defaults to unspecified, never complete. Public validation checks decoded records
+before use but cannot prove producer equations or claims of completeness.
+Dimensions are sizing provenance derived from typed invocation/state facts, not
+family-specific configuration that applications must supply.
+
+Producers must observe metadata without submitting, polling, synchronizing or
+advancing execution, allocating execution resources, or consuming budgets.
+Constructing the host description is allowed. This phase adds the contract only:
+ordinary execution topology will supply producers, mechanisms will supply sizing
+facts, and runtime will later own lifetime/overlap composition and fit policy.
+No family imports forecast types or owns calibration constants. Existing forecast
+records and estimation paths are unchanged.

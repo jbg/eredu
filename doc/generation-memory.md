@@ -5,6 +5,42 @@ current available capacity. They are planning estimates, not allocation limits o
 a guarantee about total process memory. Ordinary generation does not depend on
 estimation being available.
 
+## Neutral resource-description contract
+
+`eredu_core::resources` is the additive foundation for deriving future forecasts
+from ordinary execution contracts. It currently describes resources only; it does
+not change existing forecasts or add embedded prediction coverage. Resource
+producers, mechanism sizing and generic lifetime/peak composition remain separate
+implementation phases.
+
+A `ResourceDescription` records the current context and requested horizon as named
+logical extents, with fixed or evaluated context-dependent resource sizes. For
+example, a 39-position cache might hold 1,248 payload bytes in a 2,048-byte
+allocation; a 30-position continuation might reach 2,208 payload bytes and a
+4,096-byte capacity after allocation rounding. A score matrix can separately carry
+a query-by-key scratch bound. Horizon bounds cover the entire interval, including
+the starting state and temporary interior peaks, rather than only the endpoint.
+These are producer-supplied facts, not a built-in geometry calculator.
+
+Payload means bytes in the stored representation, including quantization metadata.
+Allocation capacity already includes payload and unused reservation space; the
+two are never added. Backing identities are distinct from logical owner identities
+and physical-pool identities. Tied parameters/views share backing, while replicas,
+copies and cached conversions get distinct allocation identities. Host/device
+aliases on unified memory share a pool identity; identical artifact names or pool
+names on different hosts do not imply shared storage or capacity.
+
+Incomplete resource-set coverage, unknown upper bounds and unknown placement
+remain explicit. An empty list cannot imply completeness, and exact payload alone
+cannot establish finite native capacity. Constructed or decoded descriptions must
+pass `ResourceDescription::validate()` before use. Validation rejects malformed
+intervals, repeated backing identities, guessed pools and horizons that exclude
+the starting state; the producer remains responsible for its equations and scope.
+Descriptions carry no allocation authority, resident credit, lifetime ordering or
+fit verdict, and summing their entries is not a peak calculation. Producing one
+must not advance or synchronize execution or consume admission budgets. Existing
+`GenerationMemoryEstimate` reports retain their current format and behavior.
+
 ## CLI
 
 Inspect a model before allocating weights, using the number of model input
