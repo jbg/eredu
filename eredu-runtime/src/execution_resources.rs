@@ -200,10 +200,7 @@ fn parameter_resources(
             PreparedParameterLocation::Unit { ordinal, address } => {
                 format!("unit/{ordinal}/{}/{}", address.group(), address.index())
             }
-            PreparedParameterLocation::Prediction { module } => {
-                missing.insert(format!("prediction module {module}: invocation and parameter resource contracts are not described"));
-                continue;
-            }
+            PreparedParameterLocation::Prediction { module } => format!("prediction/{module}"),
             PreparedParameterLocation::Bank { bank, unit } => {
                 missing.insert(format!("parameter bank {bank} unit {unit}: per-member backing allocations are not described"));
                 continue;

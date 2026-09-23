@@ -106,7 +106,7 @@ fn described_attention_paths_preserve_uniform_attention_results() {
             .logical_bytes()
             .unwrap();
         assert_eq!(output.as_slice::<f32>().len() as u64 * 4, expected_bytes);
-        for pair in output.as_slice::<f32>().chunks_exact(2) {
+        for pair in output.as_slice::<f32>().as_chunks::<2>().0 {
             assert!(
                 (pair[0] - 2.0).abs() < 2.0e-5 && (pair[1] - 4.0).abs() < 4.0e-5,
                 "queries={query_count}, keys={key_count}: {pair:?}"

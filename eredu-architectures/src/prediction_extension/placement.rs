@@ -11,6 +11,8 @@ pub struct PreparedPredictionPlacement {
     topology: ParallelRankTopology,
     parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     layout: Option<Arc<LocalModelLayout>>,
+    modules: Vec<eredu_runtime::prediction_resources::PreparedPredictionModule>,
+    state: Vec<eredu_runtime::prediction_resources::PredictionStateLayer>,
 }
 impl PreparedPredictionPlacement {
     pub(crate) fn from_prepared(
@@ -22,7 +24,18 @@ impl PreparedPredictionPlacement {
             topology,
             parameters,
             layout,
+            modules: Vec::new(),
+            state: Vec::new(),
         }
+    }
+
+    /// Actual local module declarations, in ordinary parameter traversal order.
+    pub fn modules(&self) -> &[eredu_runtime::prediction_resources::PreparedPredictionModule] {
+        &self.modules
+    }
+    /// Exact local state policies consumed by the prediction materializer.
+    pub fn state(&self) -> &[eredu_runtime::prediction_resources::PredictionStateLayer] {
+        &self.state
     }
 
     /// Global execution topology, including replicas outside the tensor axis.
@@ -85,8 +98,124 @@ where
                 parameters, layout, ..
             } => (Some(Arc::clone(parameters)), Some(Arc::clone(layout))),
         };
-        Arc::new(PreparedPredictionPlacement::from_prepared(
-            topology, parameters, layout,
-        ))
+        let mut placement =
+            PreparedPredictionPlacement::from_prepared(topology, parameters, layout);
+        let state = match self {
+            Self::DeepSeekV3 { units, state, .. } => {
+                placement.modules.extend(
+                    units
+                        .iter()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i)),
+                );
+                Some(state)
+            }
+            Self::DeepSeekV4 {
+                units,
+                state_layout,
+                ..
+            } => {
+                placement.modules.extend(
+                    units
+                        .iter()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i)),
+                );
+                Some(state_layout)
+            }
+            Self::DeepSeekV4Dspark {
+                extension,
+                units,
+                state_layout,
+                ..
+            } => {
+                placement
+                    .modules
+                    .push(extension.static_modules.resource_module(0));
+                placement.modules.extend(
+                    units
+                        .iter()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i + 1)),
+                );
+                Some(state_layout)
+            }
+            Self::Inkling {
+                units,
+                shared,
+                state,
+                ..
+            } => {
+                if let Some(shared) = shared {
+                    placement.modules.push(shared.resource_module(0));
+                }
+                placement.modules.extend(
+                    units
+                        .iter()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i + 1)),
+                );
+                Some(state)
+            }
+            Self::QwenHybrid {
+                units,
+                shared,
+                state,
+                ..
+            } => {
+                placement.modules.push(shared.resource_module(0));
+                placement.modules.extend(
+                    units
+                        .iter()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i + 1)),
+                );
+                Some(state)
+            }
+            Self::NemotronH { groups, state, .. } => {
+                placement.modules.extend(
+                    groups
+                        .iter()
+                        .flatten()
+                        .enumerate()
+                        .map(|(i, unit)| unit.resource_module(i)),
+                );
+                Some(state)
+            }
+        };
+        if let Some(state) = state {
+            placement.state = state
+                .layers()
+                .iter()
+                .zip(state.layer_prefix_offsets())
+                .enumerate()
+                .map(|(layer, (policy, processed_token_offset))| {
+                    eredu_runtime::prediction_resources::PredictionStateLayer {
+                        layer,
+                        policy: policy.clone(),
+                        processed_token_offset,
+                    }
+                })
+                .collect();
+        }
+        Arc::new(placement)
+    }
+}
+
+impl<M> PreparedPredictionUnit<M> {
+    fn resource_module(
+        &self,
+        ordinal: usize,
+    ) -> eredu_runtime::prediction_resources::PreparedPredictionModule {
+        eredu_runtime::prediction_resources::PreparedPredictionModule {
+            ordinal,
+            residency_owner: self
+                .tasks
+                .iter()
+                .find_map(|task| task.auxiliary_residency())
+                .cloned(),
+            shared: self.role == PredictionModuleRole::Shared,
+            parameters: self.local_parameters.clone(),
+        }
     }
 }

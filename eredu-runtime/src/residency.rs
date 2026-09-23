@@ -65,6 +65,97 @@ impl WeightMaterializationReport {
     }
 }
 
+/// One binding whose resident parameter owner retains a cached conversion.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidentParameterConversionBinding {
+    /// Native-materialization lifetime identity, independent of an artifact name.
+    pub owner: eredu_core::resources::ResourceIdentity,
+    /// Ordinary residency unit containing this binding.
+    pub unit: OffloadUnitId,
+    /// Exact executable binding name inside the unit.
+    pub name: String,
+    /// Architecture-logical destination, when supplied by ordinary preparation.
+    pub logical_target: Option<String>,
+}
+
+/// Existing reusable parameter conversion observed without populating a cache.
+///
+/// Shared aliases have one backing identity and all retaining owners/bindings.
+/// Capacity and physical placement remain unknown unless the backend knows them.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidentParameterConversion {
+    /// The actual retained allocation, separate from its source parameters.
+    pub allocation: eredu_core::resources::ResourceAllocation,
+    /// Ordinary bindings that retain this conversion; these are not extra bytes.
+    pub bindings: Vec<ResidentParameterConversionBinding>,
+}
+
+fn conversion_payload_bytes(
+    conversions: &[ResidentParameterConversion],
+) -> Result<u64, eredu_core::resources::ResourceDescriptionError> {
+    use eredu_core::resources::{ResourceDescriptionError, ResourceSize};
+    let invalid = |reason: &str| ResourceDescriptionError::Invalid(reason.into());
+    let mut identities = BTreeSet::new();
+    let mut bytes = 0u64;
+    for conversion in conversions {
+        conversion.allocation.validate()?;
+        if conversion.bindings.is_empty() {
+            return Err(invalid("cached conversion has no retaining bindings"));
+        }
+        for binding in &conversion.bindings {
+            if binding.name.trim().is_empty()
+                || binding
+                    .logical_target
+                    .as_ref()
+                    .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(invalid("cached conversion has an empty binding identity"));
+            }
+            if !conversion.allocation.uses.iter().any(|usage| {
+                usage.owner == binding.owner
+                    && usage.role == eredu_core::resources::ResourceRole::Parameters
+            }) {
+                return Err(invalid(
+                    "cached conversion binding has no matching parameter owner",
+                ));
+            }
+        }
+        if conversion.allocation.uses.iter().any(|usage| {
+            usage.role != eredu_core::resources::ResourceRole::Parameters
+                || !conversion
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.owner == usage.owner)
+        }) {
+            return Err(invalid(
+                "cached conversion owner has no retaining parameter binding",
+            ));
+        }
+        if !identities.insert(&conversion.allocation.identity) {
+            return Err(invalid("cached conversion repeats a backing identity"));
+        }
+        let ResourceSize::Fixed { extent } = &conversion.allocation.size else {
+            return Err(invalid(
+                "cached conversion requires a fixed current payload",
+            ));
+        };
+        if extent.payload.upper_bytes != Some(extent.payload.lower_bytes)
+            || !matches!(
+                extent.payload.kind,
+                eredu_core::ObservationKind::Exact | eredu_core::ObservationKind::Observational
+            )
+        {
+            return Err(invalid(
+                "cached conversion requires an observed exact payload",
+            ));
+        }
+        bytes = bytes
+            .checked_add(extent.payload.lower_bytes)
+            .ok_or_else(|| invalid("cached conversion payload total overflows"))?;
+    }
+    Ok(bytes)
+}
+
 /// Immutable residency-control and checkpoint-storage telemetry snapshot.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResidencyReport {
@@ -76,6 +167,7 @@ pub struct ResidencyReport {
     unit_sources: BTreeMap<OffloadUnitId, WeightStoreDiagnostics>,
     materialization: Option<WeightMaterializationReport>,
     device_parameter_conversion_bytes: u64,
+    device_parameter_conversions: Option<Vec<ResidentParameterConversion>>,
 }
 
 impl ResidencyReport {
@@ -96,6 +188,7 @@ impl ResidencyReport {
             unit_sources: BTreeMap::new(),
             materialization: None,
             device_parameter_conversion_bytes: 0,
+            device_parameter_conversions: None,
         }
     }
 
@@ -109,7 +202,26 @@ impl ResidencyReport {
     /// checkpoint sizes or the original parameter admission ledger.
     pub fn with_device_parameter_conversion_bytes(mut self, bytes: u64) -> Self {
         self.device_parameter_conversion_bytes = bytes;
+        self.device_parameter_conversions = None;
         self
+    }
+
+    /// Point-in-time conversion allocations, or `None` when the producer only
+    /// supplies aggregate bytes. An observed empty list means no cache is live.
+    pub fn device_parameter_conversions(&self) -> Option<&[ResidentParameterConversion]> {
+        self.device_parameter_conversions.as_deref()
+    }
+
+    /// Attaches observed allocations and derives their exact aggregate payload.
+    /// Rejects repeated backing identities, unknown or varying current payload,
+    /// and arithmetic overflow rather than turning lower bounds into totals.
+    pub fn with_device_parameter_conversions(
+        mut self,
+        conversions: Vec<ResidentParameterConversion>,
+    ) -> Result<Self, eredu_core::resources::ResourceDescriptionError> {
+        self.device_parameter_conversion_bytes = conversion_payload_bytes(&conversions)?;
+        self.device_parameter_conversions = Some(conversions);
+        Ok(self)
     }
 
     /// Returns whether explicit initialization completed successfully.
@@ -1798,6 +1910,213 @@ mod tests {
     use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
 
     use super::*;
+
+    #[test]
+    fn conversion_payload_rejects_inexact_duplicate_and_overflowing_observations() {
+        use eredu_core::resources::{
+            ResourceAllocation, ResourceByteBounds, ResourceExtent, ResourceIdentity, ResourceRole,
+            ResourceSize, ResourceUse,
+        };
+        let conversion = |key: &str, bytes| ResidentParameterConversion {
+            allocation: ResourceAllocation {
+                identity: ResourceIdentity {
+                    scope: "test".into(),
+                    key: key.into(),
+                },
+                uses: vec![ResourceUse {
+                    owner: ResourceIdentity {
+                        scope: "test".into(),
+                        key: "owner".into(),
+                    },
+                    role: ResourceRole::Parameters,
+                }],
+                placement: eredu_core::Observed::Unavailable {
+                    reason: "unknown pool".into(),
+                },
+                size: ResourceSize::Fixed {
+                    extent: ResourceExtent {
+                        payload: ResourceByteBounds::exact(bytes),
+                        capacity: ResourceByteBounds::unknown(bytes, "unknown capacity"),
+                    },
+                },
+            },
+            bindings: vec![ResidentParameterConversionBinding {
+                owner: ResourceIdentity {
+                    scope: "test".into(),
+                    key: "owner".into(),
+                },
+                unit: OffloadUnitId::new("unit").unwrap(),
+                name: "weight".into(),
+                logical_target: Some("module.weight".into()),
+            }],
+        };
+        let first = conversion("first", 16);
+        let second = conversion("second", 32);
+        assert_eq!(conversion_payload_bytes(&[]).unwrap(), 0);
+        assert_eq!(
+            conversion_payload_bytes(&[first.clone(), second]).unwrap(),
+            48
+        );
+        assert!(conversion_payload_bytes(&[first.clone(), first.clone()]).is_err());
+        assert!(conversion_payload_bytes(&[conversion("max", u64::MAX), first.clone()]).is_err());
+        let mut missing_bindings = first.clone();
+        missing_bindings.bindings.clear();
+        assert!(conversion_payload_bytes(&[missing_bindings]).is_err());
+        let mut unrelated_owner = first.clone();
+        unrelated_owner.bindings[0].owner.key = "unrelated".into();
+        assert!(conversion_payload_bytes(&[unrelated_owner]).is_err());
+        let mut empty_binding = first.clone();
+        empty_binding.bindings[0].logical_target = Some(" ".into());
+        assert!(conversion_payload_bytes(&[empty_binding]).is_err());
+        let mut uncertain = first;
+        let ResourceSize::Fixed { extent } = &mut uncertain.allocation.size else {
+            unreachable!()
+        };
+        extent.payload = ResourceByteBounds::unknown(16, "partial observation");
+        assert!(conversion_payload_bytes(&[uncertain]).is_err());
+    }
+
+    #[test]
+    fn conversion_resources_merge_backing_owners_and_reject_conflicts_atomically() {
+        use crate::prediction_resources::include_resident_parameter_conversions;
+        use eredu_core::resources::{
+            ResourceAllocation, ResourceByteBounds, ResourceContext, ResourceCoverage,
+            ResourceDescription, ResourceExtent, ResourceIdentity, ResourceRole, ResourceSize,
+            ResourceUse, RESOURCE_DESCRIPTION_SCHEMA_VERSION,
+        };
+
+        let identity = |key: &str| ResourceIdentity {
+            scope: "test".into(),
+            key: key.into(),
+        };
+        let allocation = |key: &str, owner: &str, bytes, pool: &str| ResourceAllocation {
+            identity: identity(key),
+            uses: vec![ResourceUse {
+                owner: identity(owner),
+                role: ResourceRole::Parameters,
+            }],
+            placement: eredu_core::Observed::exact(identity(pool), "test physical pool"),
+            size: ResourceSize::Fixed {
+                extent: ResourceExtent {
+                    payload: ResourceByteBounds::exact(bytes),
+                    capacity: ResourceByteBounds::unknown(bytes, "native capacity unavailable"),
+                },
+            },
+        };
+        let conversion = |allocation: ResourceAllocation| ResidentParameterConversion {
+            bindings: allocation
+                .uses
+                .iter()
+                .map(|usage| ResidentParameterConversionBinding {
+                    owner: usage.owner.clone(),
+                    unit: OffloadUnitId::new(usage.owner.key.clone()).unwrap(),
+                    name: "weight".into(),
+                    logical_target: Some(format!("{}.weight", usage.owner.key)),
+                })
+                .collect(),
+            allocation,
+        };
+        let report = ResidencyReport::new(
+            true,
+            eredu_core::residency::OffloadTelemetry::default().snapshot(),
+            Vec::new(),
+            Vec::new(),
+            WeightStoreDiagnostics {
+                backend: eredu_checkpoint::store::WeightStoreBackend::Memory,
+                cache_hits: 0,
+                cache_misses: 0,
+                evictions: 0,
+                currently_cached_shards: 0,
+                touched_shard_paths: Vec::new(),
+                payload_shard_paths: Vec::new(),
+                physical_reads: 0,
+                physical_read_bytes: 0,
+                coalesced_group_hits: 0,
+            },
+        );
+        let baseline = ResourceDescription {
+            schema_version: RESOURCE_DESCRIPTION_SCHEMA_VERSION,
+            scope: identity("execution"),
+            context: ResourceContext::default(),
+            horizon: ResourceContext::default(),
+            coverage: ResourceCoverage::Complete,
+            allocations: vec![allocation("shared", "target", 16, "pool")],
+        };
+        baseline.validate().unwrap();
+        let observed = report
+            .clone()
+            .with_device_parameter_conversions(vec![conversion(allocation(
+                "shared",
+                "prediction",
+                16,
+                "pool",
+            ))])
+            .unwrap();
+        let mut merged = baseline.clone();
+        include_resident_parameter_conversions(&mut merged, &observed).unwrap();
+        assert_eq!(merged.allocations.len(), 1);
+        assert_eq!(merged.allocations[0].size, baseline.allocations[0].size);
+        assert_eq!(merged.allocations[0].uses.len(), 2);
+        assert!(merged.allocations[0]
+            .uses
+            .iter()
+            .any(|usage| usage.owner == identity("target")));
+        assert!(merged.allocations[0]
+            .uses
+            .iter()
+            .any(|usage| usage.owner == identity("prediction")));
+        let once = merged.clone();
+        include_resident_parameter_conversions(&mut merged, &observed).unwrap();
+        assert_eq!(
+            merged, once,
+            "repeated observations must not add owners or bytes"
+        );
+
+        let empty = report
+            .clone()
+            .with_device_parameter_conversions(Vec::new())
+            .unwrap();
+        let mut observed_empty = baseline.clone();
+        include_resident_parameter_conversions(&mut observed_empty, &empty).unwrap();
+        assert_eq!(observed_empty, baseline, "observed empty is complete");
+        let mut missing = baseline.clone();
+        include_resident_parameter_conversions(&mut missing, &report).unwrap();
+        assert_eq!(missing.allocations, baseline.allocations);
+        let ResourceCoverage::Partial { reasons } = missing.coverage else {
+            panic!("missing conversion identities must preserve incomplete coverage")
+        };
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("conversion backing identities")));
+
+        for conflicting in [
+            allocation("shared", "prediction", 32, "pool"),
+            allocation("shared", "prediction", 16, "different_pool"),
+        ] {
+            // The first entry could be added before the conflicting backing is found.
+            // Failure must leave the entire input unchanged, including that addition.
+            let conflict = report
+                .clone()
+                .with_device_parameter_conversions(vec![
+                    conversion(allocation("new", "prediction", 8, "pool")),
+                    conversion(conflicting),
+                ])
+                .unwrap();
+            let mut unchanged = baseline.clone();
+            assert!(include_resident_parameter_conversions(&mut unchanged, &conflict).is_err());
+            assert_eq!(unchanged, baseline);
+        }
+        let mut duplicates = baseline.clone();
+        duplicates
+            .allocations
+            .push(duplicates.allocations[0].clone());
+        let invalid_input = duplicates.clone();
+        assert!(include_resident_parameter_conversions(&mut duplicates, &empty).is_err());
+        assert_eq!(
+            duplicates, invalid_input,
+            "duplicate input must not be silently coalesced"
+        );
+    }
 
     struct Catalog(BTreeMap<String, TensorMetadata>);
 

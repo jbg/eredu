@@ -108,6 +108,7 @@ pub struct PreparedModelSourceGraph {
 /// Retained discovery declarations; content hashing happens only on discovery demand.
 #[derive(Debug, Clone)]
 pub struct PreparedModelDiscovery {
+    resource_selection: eredu_runtime::SelectedReplicatedTextRealization,
     generation_memory: Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, String>,
     identity: DeferredArtifactIdentity,
     execution_identity: String,
@@ -124,6 +125,7 @@ pub struct PreparedModelDiscovery {
 
 #[derive(Debug, Clone)]
 struct PreparedPredictionDiscovery {
+    resources: Result<eredu_runtime::prediction_resources::EmbeddedPredictionTopology, String>,
     placement: crate::prediction_extension::PredictionPlacementSlot,
     descriptor: eredu_core::ArchitectureDescriptor,
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
@@ -203,6 +205,51 @@ impl PreparedModelDiscovery {
         &self,
     ) -> Option<&Arc<crate::prediction_extension::PreparedPredictionPlacement>> {
         self.prediction.as_ref()?.placement.get()
+    }
+
+    /// Retained cold prediction invocation, sharing, state and target-feature facts.
+    /// Querying loaded discovery performs no materialization or execution.
+    pub fn embedded_prediction_topology(
+        &self,
+    ) -> Result<
+        Option<&eredu_runtime::prediction_resources::EmbeddedPredictionTopology>,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        self.prediction
+            .as_ref()
+            .map(|prediction| {
+                prediction.resources.as_ref().map_err(|reason| {
+                    eredu_core::resources::ResourceDescriptionError::Invalid(reason.clone())
+                })
+            })
+            .transpose()
+    }
+
+    /// Composes ordinary prepared slots, actual prediction-local state and retained
+    /// target values. It neither acquires modules nor advances the session.
+    pub fn describe_embedded_prediction_resources(
+        &self,
+        slots: &[eredu_runtime::parameter_operations::PreparedParameterSlot],
+        residency: Option<&eredu_runtime::ResidencyReport>,
+        query: &eredu_runtime::prediction_resources::PredictionResourceQuery,
+    ) -> Result<
+        Option<eredu_core::resources::ResourceDescription>,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        let Some(topology) = self.embedded_prediction_topology()? else {
+            return Ok(None);
+        };
+        let placement = self.prediction_placement();
+        eredu_runtime::prediction_resources::describe_prediction_resources(
+            topology,
+            &self.resource_selection,
+            placement.map(|p| p.state()),
+            placement.map_or(&[], |p| p.modules()),
+            slots,
+            residency,
+            query,
+        )
+        .map(Some)
     }
 
     /// Exact architecture execution identity, independent of rank-local shapes.
@@ -593,6 +640,7 @@ impl PreparedModelSources {
         );
         support.capture = capture;
         PreparedModelDiscovery {
+            resource_selection: self.selected().text_realization().clone(),
             generation_memory: crate::memory_estimation::selected_generation_memory_geometry(
                 self.architecture(),
                 self.selected().execution(),
@@ -622,6 +670,14 @@ impl PreparedModelSources {
             prediction: self.prediction_extension().map(|_| {
                 let complete = self.inspection.architecture_plan();
                 PreparedPredictionDiscovery {
+                    resources: self
+                        .selected()
+                        .embedded_prediction_topology()
+                        .map_err(|error| error.to_string())
+                        .and_then(|topology| {
+                            topology
+                                .ok_or_else(|| "selected prediction topology is missing".to_owned())
+                        }),
                     placement: Arc::clone(&self.graph.prediction_placement),
                     descriptor: complete.architecture_descriptor(),
                     intervention_points: complete.intervention_points(),

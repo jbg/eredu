@@ -234,3 +234,304 @@ fn resources_preserve_segment_offsets_and_require_frame_horizons() {
         matches!(description.coverage, ResourceCoverage::Partial { reasons } if reasons.iter().any(|r| r.contains("frame-local") && r.contains("frame horizon")))
     );
 }
+
+fn prediction_topology() -> crate::prediction_resources::EmbeddedPredictionTopology {
+    use crate::{SpeculativeCaptureEntry, SpeculativeCaptureSchema, SpeculativeIdentity};
+    let id = |name: &str| SpeculativeIdentity::new(name).unwrap();
+    crate::prediction_resources::EmbeddedPredictionTopology {
+        mode: crate::prediction_resources::PredictionExecutionMode::Sequential,
+        proposal_capacity: 2,
+        nodes: vec![],
+        edges: vec![],
+        parameters: vec![],
+        invocations: vec![],
+        state: vec![],
+        target_features: SpeculativeCaptureSchema::new(
+            id("features"),
+            ["a", "b"].map(|name| {
+                SpeculativeCaptureEntry::new(
+                    id(name),
+                    vec![1, 8, 4],
+                    id("target"),
+                    id(&format!("observation/{name}")),
+                )
+                .unwrap()
+                .with_bounded_dimension(1)
+                .unwrap()
+            }),
+        )
+        .unwrap(),
+    }
+}
+
+#[test]
+fn prediction_resources_preserve_physical_parameter_owners_state_offsets_and_feature_views() {
+    use crate::prediction_resources::*;
+    let selected = selection();
+    let topology = prediction_topology();
+    let mut prediction = slot("prediction.weight", Some("weights"), "unused");
+    prediction.location = PreparedParameterLocation::Prediction { module: 0 };
+    let target = slot("target.weight", Some("weights"), "embedding");
+    // Same local backing key in separate materialization batches is not sharing.
+    let mut description = describe_prepared_resources(
+        &selected,
+        None,
+        &[target.clone(), prediction.clone()],
+        &[],
+        &query(),
+    )
+    .unwrap();
+    assert_eq!(description.allocations.len(), 2);
+    let mut target_output = description.allocations[0].clone();
+    target_output.identity.key = "actual-target-output".into();
+    let backings = std::collections::BTreeMap::from([
+        ("a".into(), target_output.clone()),
+        ("b".into(), target_output),
+    ]);
+    let resource_query = PredictionResourceQuery {
+        prepared: query(),
+        floating_state_bytes: Some(2),
+        feature_scalar_bytes: Some(2),
+        feature_shapes: vec![vec![1, 4, 4], vec![1, 4, 4]],
+        feature_backings: backings,
+    };
+    let state = PredictionStateLayer {
+        layer: 0,
+        policy: eredu_core::cache::LayerCachePolicy::key_value(
+            eredu_core::AttentionPolicy::Full,
+            1,
+            4,
+        )
+        .unwrap(),
+        processed_token_offset: -1,
+    };
+    let module = PreparedPredictionModule {
+        ordinal: 0,
+        residency_owner: None,
+        shared: false,
+        parameters: vec![prediction.parameter.clone()],
+    };
+    description = describe_prediction_resources(
+        &topology,
+        &selected,
+        Some(&[state]),
+        &[module],
+        &[target, prediction],
+        None,
+        &resource_query,
+    )
+    .unwrap();
+    let state = description
+        .allocations
+        .iter()
+        .filter(|a| a.uses[0].role == ResourceRole::MutableState)
+        .collect::<Vec<_>>();
+    assert_eq!(state.len(), 2);
+    for allocation in state {
+        let ResourceSize::ContextDependent {
+            current,
+            horizon_peak,
+        } = &allocation.size
+        else {
+            panic!("state")
+        };
+        assert_eq!(current.payload.lower_bytes, 32); // (5 - 1) positions * 4 * f16
+        assert_eq!(horizon_peak.payload.upper_bytes, Some(56));
+        assert_eq!(horizon_peak.capacity.upper_bytes, None);
+    }
+    let output = description
+        .allocations
+        .iter()
+        .filter(|a| a.identity.key == "actual-target-output")
+        .collect::<Vec<_>>();
+    assert_eq!(output.len(), 1);
+    assert_eq!(
+        output[0]
+            .uses
+            .iter()
+            .filter(|usage| usage.role == ResourceRole::RetainedTensor)
+            .count(),
+        2
+    );
+    assert!(matches!(
+        description.coverage,
+        ResourceCoverage::Partial { .. }
+    ));
+    assert_eq!(
+        PredictionExecutionMode::Sequential.prefill_sequence_len(0),
+        0
+    );
+    assert_eq!(
+        PredictionExecutionMode::Sequential.prefill_sequence_len(5),
+        4
+    );
+    assert_eq!(PredictionExecutionMode::Fused.prefill_sequence_len(5), 5);
+}
+
+#[test]
+fn feature_binding_rejects_bad_shapes_conflicts_and_duplicate_input_without_mutation() {
+    use crate::prediction_resources::*;
+    let selected = selection();
+    let topology = prediction_topology();
+    let mut description = describe_prepared_resources(
+        &selected,
+        None,
+        &[slot("target", Some("target"), "embedding")],
+        &[],
+        &query(),
+    )
+    .unwrap();
+    let original = description.clone();
+    assert!(include_target_features(
+        &mut description,
+        &topology,
+        vec![vec![1, 9, 4], vec![1, 4, 4]],
+        2,
+        &Default::default()
+    )
+    .is_err());
+    assert_eq!(description, original);
+    let mut conflicting = description.allocations[0].clone();
+    conflicting.placement = Observed::unavailable("another pool");
+    let backings = std::collections::BTreeMap::from([
+        ("a".into(), description.allocations[0].clone()),
+        ("b".into(), conflicting),
+    ]);
+    assert!(include_target_features(
+        &mut description,
+        &topology,
+        vec![vec![1, 4, 4]; 2],
+        2,
+        &backings
+    )
+    .is_err());
+    assert_eq!(description, original);
+    description
+        .allocations
+        .push(description.allocations[0].clone());
+    let invalid = description.clone();
+    assert!(include_target_features(
+        &mut description,
+        &topology,
+        vec![vec![1, 4, 4]; 2],
+        2,
+        &Default::default()
+    )
+    .is_err());
+    assert_eq!(description, invalid);
+}
+
+#[test]
+fn prediction_resource_slots_must_match_physical_module_declarations() {
+    use crate::prediction_resources::*;
+    let selected = selection();
+    let topology = prediction_topology();
+    let mut parameter = slot("shared-name", Some("backing"), "unused");
+    parameter.location = PreparedParameterLocation::Prediction { module: 0 };
+    let first = PreparedPredictionModule {
+        ordinal: 0,
+        residency_owner: None,
+        shared: false,
+        parameters: vec![parameter.parameter.clone()],
+    };
+    let mut second = first.clone();
+    second.ordinal = 1;
+    let query = PredictionResourceQuery {
+        prepared: query(),
+        floating_state_bytes: None,
+        feature_scalar_bytes: None,
+        feature_shapes: vec![],
+        feature_backings: Default::default(),
+    };
+    let describe = |modules: &[PreparedPredictionModule], slots: &[PreparedParameterSlot]| {
+        describe_prediction_resources(
+            &topology,
+            &selected,
+            Some(&[]),
+            modules,
+            slots,
+            None,
+            &query,
+        )
+    };
+    let description = describe(&[first.clone(), second.clone()], &[parameter.clone()]).unwrap();
+    let ResourceCoverage::Partial { reasons } = description.coverage else {
+        panic!("missing module")
+    };
+    assert!(reasons
+        .iter()
+        .any(|reason| reason.contains("prediction module 1 parameter \"shared-name\"")));
+    assert!(!reasons
+        .iter()
+        .any(|reason| reason.contains("prediction module 0 parameter \"shared-name\"")));
+    assert!(describe(&[first.clone(), first.clone()], &[]).is_err());
+    let mut wrong = parameter.clone();
+    wrong.location = PreparedParameterLocation::Prediction { module: 2 };
+    assert!(describe(&[first.clone(), second], &[wrong]).is_err());
+    let mut wrong = parameter.clone();
+    wrong.parameter.alias_of = Some(eredu_nn::ParameterId::new("another-owner").unwrap());
+    assert!(describe(std::slice::from_ref(&first), &[wrong]).is_err());
+    assert!(describe(&[first], &[parameter.clone(), parameter]).is_err());
+}
+
+#[test]
+fn prediction_sliding_state_keeps_window_minimum_and_full_prefix_upper_end() {
+    use crate::prediction_resources::*;
+    let selected = selection();
+    let state = PredictionStateLayer {
+        layer: 0,
+        policy: eredu_core::cache::LayerCachePolicy::key_value(
+            eredu_core::AttentionPolicy::Sliding {
+                window: std::num::NonZeroU32::new(2).unwrap(),
+            },
+            1,
+            4,
+        )
+        .unwrap(),
+        processed_token_offset: -1,
+    };
+    let query = PredictionResourceQuery {
+        prepared: query(),
+        floating_state_bytes: Some(2),
+        feature_scalar_bytes: None,
+        feature_shapes: vec![],
+        feature_backings: Default::default(),
+    };
+    let description = describe_prediction_resources(
+        &prediction_topology(),
+        &selected,
+        Some(&[state]),
+        &[],
+        &[],
+        None,
+        &query,
+    )
+    .unwrap();
+    assert_eq!(description.allocations.len(), 2);
+    for allocation in description.allocations {
+        let ResourceSize::ContextDependent {
+            current,
+            horizon_peak,
+        } = allocation.size
+        else {
+            panic!("state")
+        };
+        assert_eq!(
+            (current.payload.lower_bytes, current.payload.upper_bytes),
+            (16, Some(32))
+        );
+        assert_eq!(
+            (
+                horizon_peak.payload.lower_bytes,
+                horizon_peak.payload.upper_bytes
+            ),
+            (16, Some(56))
+        );
+        assert_eq!(current.payload.kind, eredu_core::ObservationKind::Estimated);
+        assert_eq!(
+            horizon_peak.payload.kind,
+            eredu_core::ObservationKind::Estimated
+        );
+        assert_eq!(current.capacity.lower_bytes, 16);
+    }
+}

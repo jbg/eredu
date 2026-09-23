@@ -36,6 +36,8 @@ pub mod execution_plan;
 pub mod execution_resources;
 /// Reusable module construction and invocation topology.
 pub mod execution_topology;
+/// Ordinary embedded prediction invocation and storage descriptions.
+pub mod prediction_resources;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
@@ -373,8 +375,8 @@ pub use residency::{
     ResidencyController, ResidencyControllerError, ResidencyDeclarationError, ResidencyLease,
     ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
     ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
-    ResidentLayerGroupReport, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,
-    WeightMaterializationReport,
+    ResidentLayerGroupReport, ResidentParameterConversion, ResidentParameterConversionBinding,
+    WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use speculative_selection::{

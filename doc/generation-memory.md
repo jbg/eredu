@@ -11,8 +11,9 @@ estimation being available.
 Target workspace forecasts now compose reusable mechanism descriptions with
 explicit evaluation lifetimes. Parameter/state producers and native mechanism
 inventories remain descriptive contracts; their unknown allocation capacities
-are not silently converted into exact bounds. Embedded prediction coverage is
-still a later phase.
+are not silently converted into exact bounds. Embedded prediction resource
+descriptions are available separately; finite startup and continuation verdicts
+remain later phases.
 
 A `ResourceDescription` records the current context and requested horizon as named
 logical extents, with fixed or evaluated context-dependent resource sizes. For
@@ -1556,3 +1557,80 @@ mechanism combinations were not measured on this Metal host. Packed expert
 coverage has synthetic native validation; it has no released large-MoE calibration
 claim. Opaque native capacity facts remain unknown in the raw mechanism contract;
 finite forecast allowances are explicitly estimated.
+
+### Embedded prediction resource descriptions (phase 7)
+
+Embedded prediction now has an additional execution description built from the
+ordinary selected strategy, architecture discovery, capture schema and actual
+prepared modules. `SelectedPreparation::embedded_prediction_topology()` exposes
+cold facts; retained `PreparedModelDiscovery` exposes the same description after
+loading without reopening the checkpoint or materializing modules.
+
+The description distinguishes sequential proposal depths from fused proposal
+rows, including their different context-preparation lengths. Invocation scopes
+keep a fused context builder separate from its proposal blocks and score heads.
+Prediction state remains independent of parameter sharing and proposal depth;
+its policies and processed-position offsets come from ordinary state contracts.
+The actual prepared module traversal retains local parameter declarations,
+physical module ordinals and auxiliary residency owners.
+
+Canonical shared parameter groups are logical uses, not extra allocations and
+not proof that native storage aliases. Physical resource descriptions use exact
+prepared backing identities. Retained target feature shapes are checked against
+the same capture schema that admits execution; several feature views can refer
+to one producer allocation. Missing producer backing, capacity or lifetime facts
+remain explicit gaps.
+
+`ResidencyReport::device_parameter_conversions()` optionally reports individual
+existing conversion allocations with the residency owners and bindings that
+retain them. MLX uses process-local lifetime identities rather than exposing
+native pointers. Shared aliases contribute one conversion payload; replacements
+get distinct identities, and invalidation or eviction removes released copies.
+The report observes existing caches without evaluating tensors or populating a
+conversion cache. Unknown native capacity and physical-pool identity stay unknown.
+An absent allocation list means the producer only supplies aggregate telemetry;
+an observed empty list means there are no retained conversions.
+
+The generic prediction resource helpers merge authoritative feature/conversion
+backings and preserve all logical uses. They reject conflicting physical facts,
+malformed ownership and arithmetic overflow. Target weights already represented
+by the target resource description are not added again simply because several
+prediction heads reference them.
+
+This phase supplies descriptions for subsequent composition. It does not enable
+finite embedded startup or continuation forecasts, settle pending work, consume
+observation budgets, or treat logical geometry as an exact native workspace
+bound. Those forecast paths retain their existing explicit unknowns until phases
+8 and 9 compose the additional resources with speculative transactions.
+
+Validation uses the neutral runtime and architecture unit suites, portable facade
+and backend conformance, and the reference numerical suite. Focused regressions
+cover cold descriptions for DeepSeek-V3, DeepSeek-V4, DSpark, Inkling, Qwen hybrid
+and Nemotron-H; loaded queries preserve payload/materialization/execution counters.
+They also cover sliding-state ranges, state offsets, exact module-slot ownership,
+shared feature views, arithmetic errors and atomic rejection of conflicting
+conversion observations. Native MLX tests cover conversion aliases, distinct
+owners, invalidation, replacement and final-owner eviction.
+
+The 278-case reference numerical suite and speculative production conformance
+passed, as did portable tests and strict Clippy. Metal activation parity passed
+for V3, V4 and DSpark; pooling prediction snapshot/restore passed across resident,
+host-layerwise and disk-streamed execution.
+
+Reproducible commands:
+
+```sh
+cargo test -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --locked
+cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
+cargo test -p eredu-architectures --test reference_numeric --locked
+cargo test -p eredu-architectures --test reference_conformance speculative_production --locked
+cargo clippy -p eredu-runtime -p eredu-architectures -p eredu --no-default-features --lib --tests --locked -- -D warnings
+cargo clippy -p eredu-backend-mlx --features metal --lib --tests --locked -- -D warnings
+cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --nocapture --test-threads=1
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control internal_activations_match_continuous_and_controlled_metal --locked -- --ignored --nocapture --test-threads=1
+cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control public_pooling_prediction_snapshots_metal --locked -- --ignored --nocapture --test-threads=1
+```
+
+This phase makes no new measured peak-memory or released-checkpoint calibration
+claim. Native validation uses synthetic Metal fixtures; CUDA and native
+distributed prediction were not exercised.

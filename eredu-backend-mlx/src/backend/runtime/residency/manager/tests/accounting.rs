@@ -427,6 +427,162 @@ fn ordered_device_window_trims_stale_units_with_unlimited_budget() {
 }
 
 #[test]
+fn parameter_conversion_residency_deduplicates_alias_owners_and_expires_with_manager() {
+    use crate::backend::nn::parameter_conversion::promoted_weight;
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = [0x3f80u16, 0xc010, 0x3e80, 0x3fc0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [(
+            "weight",
+            TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap(),
+        )],
+        None,
+        &dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+    let manager = manager(
+        store,
+        OffloadConfig::new(None, None, 1).unwrap(),
+        [
+            spec("layer", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+            spec(
+                "prediction",
+                8,
+                ResidencyPolicy::Cacheable,
+                MemoryTier::Disk,
+            ),
+        ],
+        [
+            unit(
+                "layer",
+                [binding("weight", "weight", TensorSelection::Full, 8)
+                    .with_logical_target("shared.weight")
+                    .unwrap()],
+            ),
+            unit(
+                "prediction",
+                [binding("weight", "weight", TensorSelection::Full, 8)
+                    .with_logical_target("prediction.weight")
+                    .unwrap()],
+            ),
+        ],
+    );
+    manager.initialize().unwrap();
+    let stream = cpu_stream();
+    let lease = manager.acquire(&id("layer"), MemoryTier::Device).unwrap();
+    let prediction = manager
+        .acquire(&id("prediction"), MemoryTier::Device)
+        .unwrap();
+    let weight = lease.device_value("weight").unwrap().clone();
+    drop(prediction);
+    // Install an actual native alias to isolate storage observation from
+    // checkpoint alias selection. Identical values alone never establish sharing.
+    {
+        let mut state = manager.lock().unwrap();
+        let arrays = Arc::get_mut(
+            state
+                .storage
+                .get_mut(&id("prediction"))
+                .unwrap()
+                .device
+                .as_mut()
+                .unwrap(),
+        )
+        .unwrap();
+        arrays.arrays.insert("weight".into(), weight.clone());
+    }
+    let prediction = manager
+        .acquire(&id("prediction"), MemoryTier::Device)
+        .unwrap();
+    assert_eq!(
+        prediction.device_value("weight").unwrap().graph_identity(),
+        weight.graph_identity()
+    );
+    let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+    // Ordinary bounded leases do not retain conversions or increase admission.
+    assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+    assert_eq!(
+        manager
+            .report()
+            .unwrap()
+            .device_parameter_conversion_bytes(),
+        0
+    );
+    manager.enable_resident_parameter_conversions().unwrap();
+    let before = manager.report().unwrap();
+    assert_eq!(before.device_parameter_conversions(), Some([].as_slice()));
+    let converted = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+    let report = manager.report().unwrap();
+    assert_eq!(report.device_parameter_conversion_bytes(), 16);
+    let observed = report.device_parameter_conversions().unwrap();
+    assert_eq!(observed.len(), 1);
+    observed[0].allocation.validate().unwrap();
+    assert_eq!(observed[0].bindings.len(), 2);
+    assert_eq!(observed[0].allocation.uses.len(), 2);
+    assert_eq!(
+        observed[0].bindings[0].logical_target.as_deref(),
+        Some("shared.weight")
+    );
+    assert_eq!(observed[0].bindings[0].unit, id("layer"));
+    assert_eq!(observed[0].bindings[0].name, "weight");
+    assert_eq!(
+        observed[0].allocation.uses[0].owner,
+        observed[0].bindings[0].owner
+    );
+    let eredu_core::resources::ResourceSize::Fixed { extent } = &observed[0].allocation.size else {
+        panic!("retained conversion is a fixed allocation")
+    };
+    assert_eq!(extent.payload.upper_bytes, Some(16));
+    assert_eq!(extent.capacity.lower_bytes, 16);
+    assert_eq!(extent.capacity.upper_bytes, None);
+    assert!(matches!(
+        observed[0].allocation.placement,
+        eredu_core::Observed::Unavailable { .. }
+    ));
+    assert_eq!(
+        manager.report().unwrap().device_parameter_conversions(),
+        Some(observed)
+    );
+    assert_eq!(
+        report.offload().resident_bytes().get(MemoryTier::Device),
+        16
+    );
+    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Disk), 16);
+    drop(converted);
+    drop(lease);
+    drop(prediction);
+    assert!(manager
+        .evict(&id("prediction"), MemoryTier::Device)
+        .unwrap());
+    let target_only = manager.report().unwrap();
+    assert_eq!(target_only.device_parameter_conversion_bytes(), 16);
+    assert_eq!(
+        target_only.device_parameter_conversions().unwrap()[0]
+            .allocation
+            .identity,
+        observed[0].allocation.identity
+    );
+    assert_eq!(
+        target_only.device_parameter_conversions().unwrap()[0]
+            .allocation
+            .uses
+            .len(),
+        1
+    );
+    assert!(manager.evict(&id("layer"), MemoryTier::Device).unwrap());
+    assert_eq!(
+        manager.report().unwrap().device_parameter_conversions(),
+        Some([].as_slice())
+    );
+    drop(manager);
+    assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+}
+
+#[test]
 fn parameter_conversion_residency_is_separate_and_released_on_eviction() {
     use crate::backend::nn::parameter_conversion::promoted_weight;
     let dir = tempfile::tempdir().unwrap();

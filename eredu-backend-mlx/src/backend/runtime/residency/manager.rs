@@ -117,6 +117,9 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// A backend resource observation violates its neutral accounting contract.
+    #[error(transparent)]
+    ResourceObservation(#[from] eredu_core::resources::ResourceDescriptionError),
     /// A complete owner binding set is unsupported by the MLX parameter backend.
     #[error("MLX residency binding preflight failed: {0}")]
     BindingPreflight(String),
@@ -758,21 +761,7 @@ impl ResidencyManager {
             active_window,
             self.inner.sources.primary.source_diagnostics()?,
         )
-        .with_device_parameter_conversion_bytes(
-            self.lock()?
-                .storage
-                .values()
-                .filter_map(|unit| unit.device.as_ref())
-                .flat_map(|unit| {
-                    unit.parameter_conversions
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .resident_bytes()
-                })
-                .collect::<BTreeMap<_, _>>()
-                .values()
-                .sum(),
-        )
+        .with_device_parameter_conversions(self.parameter_conversion_observations()?)?
         .with_unit_sources(
             self.inner
                 .sources
@@ -785,6 +774,81 @@ impl ResidencyManager {
                 })
                 .collect::<Result<_, _>>()?,
         ))
+    }
+
+    /// Observe existing cache entries without evaluating or creating conversions.
+    fn parameter_conversion_observations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::ResidentParameterConversion>, ResidencyError> {
+        use eredu_core::{
+            resources::{
+                ResourceAllocation, ResourceByteBounds, ResourceExtent, ResourceRole, ResourceSize,
+                ResourceUse,
+            },
+            Observed,
+        };
+        use eredu_runtime::{ResidentParameterConversion, ResidentParameterConversionBinding};
+
+        let state = self.lock()?;
+        let mut observations = BTreeMap::new();
+        for (unit_id, storage) in &state.storage {
+            let Some(unit) = storage.device.as_ref() else {
+                continue;
+            };
+            let cache = unit
+                .parameter_conversions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let owner = cache.owner_identity();
+            let conversions = cache.resident_conversions();
+            for (name, array) in &unit.arrays {
+                let Some(conversion) = conversions.get(&array.graph_identity()) else {
+                    continue;
+                };
+                let observation = observations.entry(conversion.allocation.clone())
+                    .or_insert_with(|| ResidentParameterConversion {
+                        allocation: ResourceAllocation {
+                            identity: conversion.allocation.clone(),
+                            uses: Vec::new(),
+                            placement: Observed::Unavailable {
+                                reason: "native conversion cache does not identify a physical capacity pool".into(),
+                            },
+                            size: ResourceSize::Fixed { extent: ResourceExtent {
+                                payload: ResourceByteBounds::exact(conversion.payload_bytes),
+                                capacity: ResourceByteBounds::unknown(conversion.payload_bytes,
+                                    "MLX does not expose cached conversion backing capacity"),
+                            } },
+                        },
+                        bindings: Vec::new(),
+                    });
+                let usage = ResourceUse {
+                    owner: owner.clone(),
+                    role: ResourceRole::Parameters,
+                };
+                if !observation.allocation.uses.contains(&usage) {
+                    observation.allocation.uses.push(usage);
+                }
+                let logical_target = state
+                    .control
+                    .unit(unit_id)
+                    .and_then(|unit| {
+                        unit.bindings()
+                            .iter()
+                            .find(|binding| binding.name() == name)
+                    })
+                    .and_then(WeightBinding::logical_target)
+                    .map(str::to_owned);
+                observation
+                    .bindings
+                    .push(ResidentParameterConversionBinding {
+                        owner: owner.clone(),
+                        unit: unit_id.clone(),
+                        name: name.clone(),
+                        logical_target,
+                    });
+            }
+        }
+        Ok(observations.into_values().collect())
     }
 
     /// Returns initialized state, aggregate telemetry, unit reports, and active window.

@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 pub(crate) mod invocation;
 mod placement;
 pub(crate) mod residency;
+mod resources;
 mod snapshot;
 use invocation::prediction_invocation;
 pub use invocation::PredictionInvocation;
@@ -593,6 +594,7 @@ pub struct PreparedPredictionUnit<M> {
     source_layout: Option<std::sync::Arc<LocalModelLayout>>,
     residency: eredu_runtime::LayerWeightResidency,
     role: PredictionModuleRole,
+    local_parameters: Vec<eredu_nn::ParameterMetadata>,
 }
 
 /// Architecture-constructed fused DSpark modules and immutable strategy.
@@ -705,6 +707,8 @@ impl<M> PreparedPredictionUnit<M> {
                 tasks.iter().map(ReplicatedTextMaterializationTask::name).collect::<Vec<_>>()
             )));
         }
+        let local_parameters = eredu_nn::validate_parameter_topology(&local)
+            .map_err(|error| invalid(error.to_string()))?;
         Ok(Self {
             source,
             local,
@@ -712,6 +716,7 @@ impl<M> PreparedPredictionUnit<M> {
             source_layout: None,
             residency: eredu_runtime::LayerWeightResidency::FullyResident,
             role,
+            local_parameters,
         })
     }
 
@@ -762,6 +767,8 @@ where
         parameters: std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>,
         /// Ordered checkpoint-global/rank-local unit pairs.
         units: Vec<PreparedPredictionUnit<crate::deepseek::v3::Unit<B>>>,
+        /// Exact prediction-only local state geometry retained before binding.
+        state: StateLayout,
     },
     /// DeepSeek-V4 sequential MTP units and their immutable cache policies.
     DeepSeekV4 {
@@ -773,6 +780,8 @@ where
         units: Vec<PreparedPredictionUnit<crate::deepseek::v4::Unit<B>>>,
         /// Ordered rank-local cache policy for every prediction unit.
         state: Vec<(usize, LayerCachePolicy)>,
+        /// Exact local layout preserving ordinary state frontier offsets.
+        state_layout: StateLayout,
     },
     /// DeepSeek-V4 fused DSpark blocks, pinned modules, and immutable cache policies.
     DeepSeekV4Dspark {
@@ -786,6 +795,8 @@ where
         units: Vec<PreparedPredictionUnit<crate::deepseek::v4::Unit<B>>>,
         /// Ordered rank-local cache policy for every DSpark block.
         state: Vec<(usize, LayerCachePolicy)>,
+        /// Exact local layout preserving ordinary state frontier offsets.
+        state_layout: StateLayout,
     },
     /// Inkling sequential MTP units and optional shared normalization.
     Inkling {
@@ -1118,7 +1129,8 @@ where
     /// prediction pairs each target hidden row with the following token; fused
     /// context builders may instead consume the complete accepted prefix.
     fn prefill_sequence_len(&self, target_sequence: usize) -> usize {
-        target_sequence.saturating_sub(1)
+        eredu_runtime::prediction_resources::PredictionExecutionMode::Sequential
+            .prefill_sequence_len(target_sequence)
     }
 
     /// Clones the architecture-materialized lane-state prototype.
@@ -2604,8 +2616,14 @@ where
 
     fn prefill_sequence_len(&self, target_sequence: usize) -> usize {
         match self {
-            Self::Dspark { .. } => target_sequence,
-            Self::Sequential { .. } => target_sequence.saturating_sub(1),
+            Self::Dspark { .. } => {
+                eredu_runtime::prediction_resources::PredictionExecutionMode::Fused
+                    .prefill_sequence_len(target_sequence)
+            }
+            Self::Sequential { .. } => {
+                eredu_runtime::prediction_resources::PredictionExecutionMode::Sequential
+                    .prefill_sequence_len(target_sequence)
+            }
         }
     }
 
@@ -4542,6 +4560,12 @@ where
                 None => crate::deepseek::v3::Model::<B>::new(args.clone(), source_context),
             }
             .map_err(|error| invalid(error.to_string()))?;
+            let target_layers = usize::try_from(args.num_hidden_layers)
+                .map_err(|error| invalid(error.to_string()))?;
+            let state = geometry
+                .state_layout()
+                .slice(target_layers..target_layers + extension.depth())
+                .map_err(|error| invalid(error.to_string()))?;
             let local = crate::deepseek::v3::Model::<B>::new_parallel(
                 target_args,
                 geometry,
@@ -4595,6 +4619,7 @@ where
                 layout: std::sync::Arc::new(layout),
                 parameters: std::sync::Arc::new(parameters),
                 units,
+                state,
             })
         }
         SafetensorsModelConfig::DeepSeekV4(args) => {
@@ -4723,6 +4748,9 @@ where
                 );
                 state.push((ordinal, policy));
             }
+            let state_layout = state_layout
+                .slice(target..target + extension.depth())
+                .map_err(|error| invalid(error.to_string()))?;
             if args.dspark.is_some() {
                 let strategy = DsparkPredictionStrategy::from_args(args)?;
                 let source_static =
@@ -4748,6 +4776,7 @@ where
                     },
                     units,
                     state,
+                    state_layout,
                 })
             } else {
                 Ok(PreparedPredictionExtension::DeepSeekV4 {
@@ -4755,6 +4784,7 @@ where
                     parameters: std::sync::Arc::new(parameters),
                     units,
                     state,
+                    state_layout,
                 })
             }
         }

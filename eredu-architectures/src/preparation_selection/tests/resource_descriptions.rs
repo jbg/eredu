@@ -165,3 +165,45 @@ fn selected_sliding_attention_does_not_claim_native_storage_truncation() {
     assert_eq!(totals, [192, 320, 192, 512]);
     mechanisms.assert_cold_only();
 }
+
+#[test]
+fn cold_embedded_topology_reuses_invocation_scopes_capture_and_state_without_native_work() {
+    use eredu_core::speculative::SpeculativeCaptureScope;
+    use eredu_runtime::prediction_resources::PredictionExecutionMode;
+    let (root, inspection) = inspected_config(prediction_config());
+    let mechanisms = BoundedIndependentAdapter::default();
+    let selected =
+        select_preparation(&inspection, &NormalizedLoadRequest::default(), &mechanisms).unwrap();
+    drop(root);
+    let topology = selected.embedded_prediction_topology().unwrap().unwrap();
+    assert_eq!(topology.mode, PredictionExecutionMode::Sequential);
+    assert_eq!(topology.proposal_capacity, 1);
+    assert_eq!(
+        topology.target_features,
+        *selected
+            .prediction_realization()
+            .unwrap()
+            .requirements()
+            .capture()
+    );
+    assert!(!topology
+        .nodes_for_scope(SpeculativeCaptureScope::Prediction { depth: 0 })
+        .collect::<Vec<_>>()
+        .is_empty());
+    assert!(topology
+        .nodes_for_scope(SpeculativeCaptureScope::Target)
+        .next()
+        .is_none());
+    assert_eq!(topology.state.len(), 1);
+    assert_eq!(topology.state[0].processed_token_offset, -1);
+    assert_eq!(topology.state[0].layer, 2);
+    assert!(topology
+        .parameters
+        .iter()
+        .any(|group| group.canonical_prefix == "model.embed_tokens"));
+    assert_eq!(
+        selected.embedded_prediction_topology().unwrap().unwrap(),
+        topology
+    );
+    mechanisms.assert_cold_only();
+}

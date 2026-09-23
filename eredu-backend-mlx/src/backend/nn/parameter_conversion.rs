@@ -5,12 +5,16 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 
 use safemlx::{error::Exception, Array, Dtype, Stream};
 
 struct Conversion {
+    allocation: u64,
     _source: Array,
     state: Mutex<ConversionState>,
 }
@@ -29,12 +33,64 @@ fn registry() -> &'static Mutex<Registry> {
 /// Cache ownership follows one permanently resident device materialization.
 /// Bounded-residency managers deliberately never enable this cache: their
 /// admission ledger reserves original parameter storage only.
-#[derive(Default)]
 pub(crate) struct ResidentParameterConversions {
+    owner: u64,
     entries: BTreeMap<usize, Arc<Conversion>>,
 }
 
+fn next_identity() -> u64 {
+    static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+    NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for ResidentParameterConversions {
+    fn default() -> Self {
+        Self {
+            owner: next_identity(),
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+/// Immutable native-cache observation keyed by source graph identity internally.
+/// Exposed identities are lifetime-scoped counters, never native pointers.
+pub(crate) struct ResidentConversionObservation {
+    pub(crate) allocation: eredu_core::resources::ResourceIdentity,
+    pub(crate) payload_bytes: u64,
+}
+
 impl ResidentParameterConversions {
+    pub(crate) fn owner_identity(&self) -> eredu_core::resources::ResourceIdentity {
+        eredu_core::resources::ResourceIdentity {
+            scope: "mlx.parameter_materialization".into(),
+            key: self.owner.to_string(),
+        }
+    }
+
+    pub(crate) fn resident_conversions(&self) -> BTreeMap<usize, ResidentConversionObservation> {
+        self.entries
+            .iter()
+            .filter_map(|(&identity, entry)| {
+                let state = entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                state.value.as_ref().map(|array| {
+                    (
+                        identity,
+                        ResidentConversionObservation {
+                            allocation: eredu_core::resources::ResourceIdentity {
+                                scope: "mlx.cached_parameter_conversion".into(),
+                                key: entry.allocation.to_string(),
+                            },
+                            payload_bytes: array.nbytes() as u64,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn register<'a>(&mut self, arrays: impl IntoIterator<Item = &'a Array>) {
         // Native descriptor access and shallow cloning happen before taking
         // the registry lock; that lock never encloses a native runtime call.
@@ -52,6 +108,7 @@ impl ResidentParameterConversions {
                     .and_then(Weak::upgrade)
                     .unwrap_or_else(|| {
                         Arc::new(Conversion {
+                            allocation: next_identity(),
                             _source: source.take().expect("registered source value"),
                             state: Mutex::new(ConversionState {
                                 active: true,
@@ -68,6 +125,7 @@ impl ResidentParameterConversions {
 
     /// Retained conversion payload, separate from logical source parameters.
     /// One entry per immutable identity counts tied aliases only once.
+    #[cfg(test)]
     pub(crate) fn resident_bytes(&self) -> BTreeMap<usize, u64> {
         self.entries
             .iter()
@@ -168,6 +226,59 @@ pub(crate) fn promoted_weight(
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType};
+
+    #[test]
+    fn conversion_observation_preserves_shared_backing_and_owner_lifetimes() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        let weight = Array::from_slice(&[1.0f32, -2.0, 0.25, 1.5], &[2, 2])
+            .as_dtype(Dtype::Bfloat16, &stream)
+            .unwrap();
+        let separate = Array::from_slice(&[1.0f32, -2.0, 0.25, 1.5], &[2, 2])
+            .as_dtype(Dtype::Bfloat16, &stream)
+            .unwrap();
+        let mut target = ResidentParameterConversions::default();
+        let mut prediction = ResidentParameterConversions::default();
+        target.register([&weight, &separate]);
+        prediction.register([&weight]);
+        assert_ne!(target.owner_identity(), prediction.owner_identity());
+        // Observation cannot fill an eligible but unused cache.
+        assert!(target.resident_conversions().is_empty());
+        assert!(prediction.resident_conversions().is_empty());
+        assert!(target.resident_conversions().is_empty());
+        promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        promoted_weight(&input, &separate, &stream)
+            .unwrap()
+            .unwrap();
+        let target_report = target.resident_conversions();
+        let prediction_report = prediction.resident_conversions();
+        assert_eq!(target_report.len(), 2);
+        assert_eq!(prediction_report.len(), 1);
+        let shared = &target_report[&weight.graph_identity()];
+        assert_eq!(shared.payload_bytes, 16);
+        assert_eq!(
+            shared.allocation,
+            prediction_report[&weight.graph_identity()].allocation
+        );
+        assert_ne!(
+            shared.allocation,
+            target_report[&separate.graph_identity()].allocation
+        );
+        drop(target);
+        assert_eq!(
+            prediction.resident_conversions()[&weight.graph_identity()].allocation,
+            shared.allocation
+        );
+        invalidate(&weight);
+        assert!(prediction.resident_conversions().is_empty());
+        let mut replacement = ResidentParameterConversions::default();
+        replacement.register([&weight]);
+        promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        assert_ne!(
+            replacement.resident_conversions()[&weight.graph_identity()].allocation,
+            shared.allocation
+        );
+    }
 
     #[test]
     fn parameter_conversion_reuses_aliases_preserves_values_and_expires_with_owner() {

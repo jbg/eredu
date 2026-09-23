@@ -19,6 +19,8 @@ mod qwen_components;
 mod residency;
 #[path = "prediction_adapter/v3_components.rs"]
 mod v3_components;
+#[path = "prediction_adapter/resources.rs"]
+mod resources;
 
 type State = DeviceState<NumericBackend, NumericHybridLayerState>;
 type Snapshots = Rc<RefCell<Vec<State>>>;
@@ -163,6 +165,7 @@ impl PreparationMechanismProvider for Provider {
             TensorOperations,
             NeuralOperations,
             GroupedNeuralOperations,
+            HyperNeuralOperations,
             PayloadMaterialization,
             LogitsProcessing,
             Sampling,
@@ -769,11 +772,18 @@ fn execute_config(
     .unwrap();
     let selected =
         eredu_architectures::select_preparation(&inspection, &request, &Provider).unwrap();
+    let cold_prediction = selected.embedded_prediction_topology().unwrap().unwrap();
     let admitted =
         eredu_core::ModelPreparationPlan::from_retained_admission(inspection, selected.admission())
             .unwrap();
     let sources =
         eredu_architectures::prepared_sources::prepare_model_sources(admitted, selected).unwrap();
+    let resource_discovery = sources.prepare_discovery(Default::default(), Default::default());
+    assert_eq!(
+        resource_discovery.embedded_prediction_topology().unwrap(),
+        Some(&cold_prediction)
+    );
+    assert!(resource_discovery.prediction_placement().is_none());
     let target_keys = sources
         .target()
         .source_keys()
@@ -860,6 +870,7 @@ fn execute_config(
         )
         .unwrap()
     };
+    resources::assert_prepared_prediction_resources(&resource_discovery);
     canonical_qwen_fixture(&config, &mut expected, &mut aliases);
     let evidence = last_reference_stage_evidence();
     let mut matched = BTreeSet::new();
@@ -899,6 +910,7 @@ fn execute_config(
         .all(|read| read.physically_bounded && read.encoded_bytes > 0));
     run
 }
+
 
 pub(super) fn assert_real_embedded_prediction() {
     let ordinary = execute(1.0, false);

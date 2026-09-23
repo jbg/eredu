@@ -6763,6 +6763,41 @@ mechanism envelopes account for their planning allowance without rewriting the
 raw phase-4 storage contract as exact. Unsupported equation providers, missing
 rank-local topology and unsupported residency lifetimes retain named gaps.
 Embedded prediction clears target topology for complete speculative forecasts
-until its additional invocations and state are described in subsequent phases.
+until its additional invocations and state are composed into speculative startup
+and continuation forecasts.
 Cold and loaded calls remain read-only and cannot materialize modules, populate
 parameter conversion caches or consume observation budgets.
+
+### Embedded prediction resource descriptions
+
+`SelectedPreparation::embedded_prediction_topology` projects additional invocations
+from the ordinary architecture descriptor and the admitted speculative strategy.
+It retains canonical parameter groups, explicit per-node prediction/context/fused
+scopes, target capture geometry and ordinary state policies. Data-flow edges do
+not establish native allocation lifetimes. Sequential context preparation consumes
+all but the last target row; fused context preparation consumes the full prefix.
+The materialized executor and the descriptive contract use the same
+`PredictionExecutionMode` operation for that rule.
+
+Actual prediction preparation retains local parameter declarations, physical
+module ordinals, auxiliary residency owners and local state policies alongside
+`PreparedPredictionPlacement`. These are the modules and state supplied to native
+materialization, not a second family forecasting implementation. Shared modules
+remain distinct from sequential units and from target parameters borrowed by an
+invocation. Cold logical sharing is never upgraded to physical aliasing.
+
+`PreparedModelDiscovery::describe_embedded_prediction_resources` composes these
+facts with the exact prepared parameter slots, explicitly bound target-feature
+allocations and current residency observations. Prediction slots use their own
+materialization batches; borrowed target weights keep the target batch identity.
+Two retained feature views of one target allocation add uses, not extra bytes.
+Native cached conversions are separate allocations identified by their actual
+resident owners. Reusing a target readout conversion from several prediction
+heads does not charge another copy. Reading these reports does not materialize
+weights, populate conversion caches, evaluate tensors or advance execution.
+
+These are resource descriptions, not speculative peak forecasts. Logical state
+payloads do not establish native capacity. Missing dtype, local geometry, target
+feature backing, mechanism scratch and evaluation retention remain explicit.
+Startup/continuation transaction composition and finite embedded verdicts remain
+subsequent work; the existing conservative forecast behavior is preserved.

@@ -167,9 +167,11 @@ mod tests {
 
     #[test]
     fn adaptive_ignores_standard_filters_and_preserves_state() {
-        let mut sampler = MirostatV2Sampler::default();
-        sampler.penalties = GenerationSampler {
-            repeat_penalty: 1.2,
+        let mut sampler = MirostatV2Sampler {
+            penalties: GenerationSampler {
+                repeat_penalty: 1.2,
+                ..Default::default()
+            },
             ..Default::default()
         };
         sampler.accept_token(4, 0.25).unwrap();
@@ -238,8 +240,10 @@ mod tests {
                 .unwrap()
         );
         let config = config.with_mirostat_v2(5.0, 0.1).unwrap();
-        let mut adaptive = MirostatV2Sampler::default();
-        adaptive.penalties = live;
+        let adaptive = MirostatV2Sampler {
+            penalties: live,
+            ..Default::default()
+        };
         assert_eq!(
             sampling_invocation(&config, 1, 128, TensorElementType::F32, 2).unwrap(),
             adaptive

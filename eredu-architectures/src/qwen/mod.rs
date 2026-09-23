@@ -329,6 +329,8 @@ pub fn state_identity(
     crate::decoder::state_identity(args, layout, global_layer_start, topology)
 }
 
+pub(crate) use moe::execution_topology;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +352,3 @@ mod tests {
         // backend is needed to exercise this compile-time assertion.
     }
 }
-
-pub(crate) use moe::execution_topology;
