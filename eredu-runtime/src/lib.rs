@@ -48,6 +48,8 @@ pub mod layered;
 pub mod load_request;
 /// Physical storage descriptions and retention facts for reusable mechanisms.
 pub mod mechanism_resources;
+/// Execution-order, retention and per-physical-pool resource peak composition.
+pub mod resource_lifetimes;
 /// Exact mechanism capability synthesis from neutral requirements.
 pub mod mechanism_synthesis;
 /// Request-specific generation-memory estimates and fit advice.

@@ -6621,7 +6621,7 @@ capacity is unknown until an implementation contract supplies allocation facts.
 
 Selected execution-unit/static identities name missing workspace and retention
 contracts. Reusable mechanisms supply per-invocation sizing facts through the
-contracts below; runtime will later own lifetime/overlap composition and fit policy. These producers do not migrate
+contracts below; runtime owns generic lifetime/overlap composition separately from fit policy. These producers do not migrate
 forecasting, derive embedded prediction invocations, or calibrate kernels.
 These producers add no family-specific forecasting dependencies or calibration
 constants. Existing forecast records and legacy estimation paths are unchanged.
@@ -6672,6 +6672,60 @@ resolved backing identities. It binds host/execution access to authoritative
 physical pools, validates compatible facts for shared owners, and retains the
 original contract and storage-name bindings. Unknown owner/alias identity,
 placement, capacity and retention remain explicit. This bridge never sums a live
-peak or treats logical input/output shapes as allocation proof. Family workspace
-migration, repeated invocation/lazy-graph scheduling and overall lifetime/peak
-composition are subsequent phases, not hidden defaults in these descriptions.
+peak or treats logical input/output shapes as allocation proof. The lifetime
+composer below consumes these descriptions; family workspace forecast migration
+remains a separate step.
+
+### Generic resource lifetime and peak composition
+
+`eredu-runtime::resource_lifetimes` composes prepared `ResourceDescription` and
+bound `MechanismResourceDescription` records without family or native dependencies.
+A `ResourceLifetimePlan` is an explicit acquisition/completion event schedule.
+Acquisitions before earlier work completes describe concurrency; completing work
+before the next acquisition describes sequential execution. Native completion,
+lazy evaluation and owner release are separate token namespaces. Evaluation
+retains graph dependencies until its declared completed boundary, including after
+native submission completes. Returned values, installed state and parameter
+conversions survive until their owning reference is released. Tokens cannot be
+retired twice or acquired again after retirement; owners may remain live at the
+end of the requested horizon.
+
+Each authoritative allocation identity is charged once while any reference is
+live. Distinct copies retain distinct identities. Multiple views can contribute
+different retention references to the same allocation, so releasing a parameter
+owner cannot release a surviving lazy graph alias. Repeated descriptions of a
+backing must agree on size and physical pool; context-dependent descriptions must
+also agree on starting context and horizon. An updated query requires a new plan,
+not replacing existing facts silently. Physical pools compose independently;
+host/device access to one unified pool uses the same identity. Pool peaks need
+not occur at the same event and are not presented as a simultaneous global sum.
+
+`describe_mechanism_lifetimes` binds mechanism retention to schedule-supplied
+completion/evaluation tokens and authoritative allocation owners. It checks the
+public wrapper's storage bindings, backing semantics and numeric bounds before
+composition. Named mechanism intermediates need not coexist: the bridge describes
+an internal overlap envelope and does not assert simultaneous current minima.
+An explicit schedule may set `live_at_acquire` when that coexistence is known.
+
+Upper bounds sum potentially overlapping per-allocation horizon maxima. Lower
+bounds take the larger of proven simultaneous current minima and individual
+resource horizon minima, never the sum of independent horizon maxima. Dynamic
+current bytes describe the acquisition boundary, not a minimum maintained over
+a potentially shrinking lifetime. Fixed bytes with declared retention can
+establish later simultaneous minima; unknown retention cannot. Payload and
+capacity are independent bounds and are never added to each other. Capacity's
+minimum includes its payload minimum. Equal numerical bounds do not upgrade
+estimated or observed source bytes to exact metadata; source quality is preserved
+across all descriptions of a shared backing.
+
+A plan must explicitly declare resource-set completeness. Missing coverage,
+placement, or retention leaves all observed pool upper bounds unknown, with
+unplaced allocation identities and reasons retained. Unknown capacity in a known
+pool does not erase known payload or bounds in other pools. Unknown lifetime
+references remain conservatively live but never manufacture a minimum overlap.
+Overflow, conflicting shared facts, malformed descriptions and invalid release
+order are errors. Small synthetic schedules validate sequential/concurrent work,
+shared backing, independent pools, explicit evaluation batches, dynamic growth
+and shrinkage, and unknown facts. This is a read-only composer, not a native
+scheduler or budget verdict; existing generation forecast APIs and serialized
+reports remain unchanged until their separate migration.

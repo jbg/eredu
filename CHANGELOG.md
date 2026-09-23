@@ -4,6 +4,17 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Generic resource lifetime and peak composition
+
+`eredu_runtime::resource_lifetimes` composes prepared and mechanism resources
+through explicit acquisition, native-completion, lazy-evaluation and owner-release
+events. It accounts shared backing once, distinguishes sequential work from
+concurrency, retains graph dependencies to their evaluation boundary, and reports
+payload/capacity peak bounds independently for each physical pool. Missing facts
+remain explicit; dynamic resource maxima do not manufacture simultaneous lower
+bounds. Existing generation forecasts and wire records are unchanged; migrating
+their workspace projections remains the next phase.
+
 ## 2026-09-23 — Reusable mechanism memory contracts
 
 `eredu_nn::mechanism_memory` describes dense/quantized projections, attention,

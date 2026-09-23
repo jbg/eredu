@@ -51,16 +51,9 @@ pub fn describe_mechanism_resources(
     let mut bindings = BTreeMap::new();
     for storage in &contract.storage {
         let identity = match &storage.backing {
-            MechanismBacking::Invocation => ResourceIdentity {
-                scope: query.invocation.scope.clone(),
-                // Length framing separates invocation keys from local names.
-                key: format!(
-                    "mechanism:{}:{}{}",
-                    query.invocation.key.len(),
-                    query.invocation.key,
-                    storage.name
-                ),
-            },
+            MechanismBacking::Invocation => {
+                invocation_storage_identity(&query.invocation, &storage.name)
+            }
             MechanismBacking::Owner(key) => {
                 let Some(identity) = query.owner_backings.get(key) else {
                     missing.push(format!(
@@ -164,6 +157,22 @@ pub fn describe_mechanism_resources(
         contract,
         storage_bindings: bindings,
     })
+}
+
+pub(crate) fn invocation_storage_identity(
+    invocation: &ResourceIdentity,
+    name: &str,
+) -> ResourceIdentity {
+    ResourceIdentity {
+        scope: invocation.scope.clone(),
+        // Length framing separates invocation keys from local names.
+        key: format!(
+            "mechanism:{}:{}{}",
+            invocation.key.len(),
+            invocation.key,
+            name
+        ),
+    }
 }
 
 fn bounds(bytes: MechanismBytes, detail: &str) -> ResourceByteBounds {

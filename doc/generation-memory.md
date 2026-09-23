@@ -1402,7 +1402,7 @@ dequantization. Cache-instance queries validate installed geometry, preserve the
 frontier, and describe actual reserved capacity and backing reuse. Parameter
 conversions with unknown residency ownership do not become fresh allocations.
 
-These descriptions are inputs for subsequent lifetime composition, not a new
+These descriptions are inputs for generic lifetime composition, not a new
 bounded forecast. Logical tensor bytes and physical allocation capacity are
 separate: views/no-op casts can alias, lazy intermediate records are not a live
 peak, and query/key tiles can overlap until evaluation. Opaque MLX kernel scratch,
@@ -1410,3 +1410,28 @@ allocator capacity, unresolved owner identity and unsupported native selection
 facts remain named gaps. Existing generation/continuation forecasts and wire
 records are unchanged in this phase; no previously unsupported family receives a
 verdict solely because its reusable mechanisms now expose descriptions.
+
+## Generic lifetime composition (phase 5)
+
+`eredu_runtime::resource_lifetimes::compose_resource_peaks` accepts a
+`ResourceLifetimePlan` containing acquisitions and explicit native-completion,
+evaluation and owner-release events. For example, two independent allocations
+of 10 and 20 MiB peak at 20 MiB when the first is released before the second is
+acquired, or 30 MiB when their lifetimes overlap. Two aliases of one allocation
+count once, and that backing survives until every declared reference ends.
+Separate physical pools receive separate peak reports; their maxima need not
+occur simultaneously.
+
+`describe_mechanism_lifetimes` binds an existing mechanism description to those
+release boundaries. Native completion does not release a lazy graph's retained
+buffers; its evaluation boundary must complete. Returned tensors and parameter
+conversions use explicit owner lifetimes. The bridge does not assume that all
+intermediates within a mechanism coexist. An explicit schedule can assert known
+coexistence through `live_at_acquire`.
+
+Plans must declare their coverage. Unknown coverage, placement or retention
+prevents a finite complete peak. Unknown capacity remains separate from known
+payload, and independent resources' horizon maxima do not become a simultaneous
+lower bound. Composition reads descriptions only; it does not run inference,
+consume budgets or issue a fit verdict. Existing forecast APIs remain unchanged
+until their workspace projections are migrated in phase 6.
