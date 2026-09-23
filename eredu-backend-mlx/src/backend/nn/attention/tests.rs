@@ -7,47 +7,54 @@ use crate::backend::{nn::tensor::create_causal_mask, ExecutionContext};
 #[ignore = "requires MLX runtime execution"]
 fn bounded_input_score_attention_matches_pytorch_with_broadcast_noncausal_mask() {
     use safemlx::Dtype;
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../validation/attention_input_scores.json"
-    ))
-    .unwrap();
-    let tensor = |name: &str| {
-        let value = &fixture["bounded"][name];
-        let shape = value["shape"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_i64().unwrap() as i32)
-            .collect::<Vec<_>>();
-        let data = value["values"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_f64().unwrap() as f32)
-            .collect::<Vec<_>>();
-        Array::from_slice(&data, &shape)
-            .as_dtype(Dtype::Bfloat16, stream)
-            .unwrap()
+    let devices = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+        vec![DeviceType::Cpu, DeviceType::Gpu]
+    } else {
+        vec![DeviceType::Cpu]
     };
-    let mask = Array::from_slice(&(0..257).map(|x| x % 7 != 0).collect::<Vec<_>>(), &[257]);
-    let actual = super::attention_with_softcap(
-        &tensor("queries"),
-        &tensor("keys"),
-        &tensor("values"),
-        fixture["scale"].as_f64().unwrap() as f32,
-        Some(&mask),
-        None,
-        None,
-        eredu_nn::AttentionArithmetic::InputScores,
-        stream,
-    )
-    .unwrap();
-    assert!(actual
-        .all_close(tensor("output"), 0.0, 0.0, None, stream)
-        .unwrap()
-        .item::<bool>(stream));
+    for device in devices {
+        let context = ExecutionContext::new(Device::new(device, 0));
+        let stream = context.stream();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../validation/attention_input_scores.json"
+        ))
+        .unwrap();
+        let tensor = |name: &str| {
+            let value = &fixture["bounded"][name];
+            let shape = value["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect::<Vec<_>>();
+            let data = value["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>();
+            Array::from_slice(&data, &shape)
+                .as_dtype(Dtype::Bfloat16, stream)
+                .unwrap()
+        };
+        let mask = Array::from_slice(&(0..257).map(|x| x % 7 != 0).collect::<Vec<_>>(), &[257]);
+        let actual = super::attention_with_softcap(
+            &tensor("queries"),
+            &tensor("keys"),
+            &tensor("values"),
+            fixture["scale"].as_f64().unwrap() as f32,
+            Some(&mask),
+            None,
+            None,
+            eredu_nn::AttentionArithmetic::InputScores,
+            stream,
+        )
+        .unwrap();
+        assert!(actual
+            .all_close(tensor("output"), 0.0, 0.0, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
 }
 
 #[test]
@@ -405,6 +412,240 @@ fn native_bf16_attention_query_tiles_match_independent_reference() {
             "width {width}: {} mismatches; first {:?}",
             mismatches.len(),
             &mismatches[..mismatches.len().min(12)]
+        );
+    }
+}
+
+// Rebuilding the full-key RHS for each small query tile is the pre-reuse
+// execution strategy. Keep it as a behavioral reference for tile boundaries,
+// numerical rounding and the allocation regression, without forcing evaluation.
+fn independently_prepared_query_tiles(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &safemlx::Stream,
+) -> Array {
+    use safemlx::ops::indexing::TryIndexOp;
+    let step = (super::INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
+        .clamp(1, super::INPUT_SCORE_WORKSPACE.max_query_rows as i32);
+    let mask = mask.map(|mask| {
+        safemlx::ops::broadcast_to(
+            mask,
+            &[queries.dim(0), queries.dim(1), queries.dim(2), keys.dim(2)],
+            stream,
+        )
+        .unwrap()
+    });
+    let outputs = (0..queries.dim(2))
+        .step_by(step as usize)
+        .map(|start| {
+            let end = (start + step).min(queries.dim(2));
+            let query = queries
+                .try_index_device((.., .., start..end, ..), stream)
+                .unwrap();
+            let mask = mask.as_ref().map(|mask| {
+                mask.try_index_device((.., .., start..end, ..), stream)
+                    .unwrap()
+            });
+            super::attention_with_softcap(
+                &query,
+                keys,
+                values,
+                0.125,
+                mask.as_ref(),
+                sinks,
+                softcap,
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    safemlx::ops::concatenate_axis(&outputs, 2, stream).unwrap()
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution; run with --test-threads=1"]
+fn prepared_input_score_tiles_preserve_gqa_masks_sinks_and_rounding() {
+    use safemlx::Dtype;
+    let device = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+        DeviceType::Gpu
+    } else {
+        DeviceType::Cpu
+    };
+    let context = ExecutionContext::new(Device::new(device, 0));
+    let stream = context.stream();
+    // Multiple batches, grouped heads, unequal key/value widths and a partial
+    // final query tile catch layout reuse across different row counts.
+    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+        let tensor = |shape: &[i32], phase: f32| {
+            let size = shape.iter().product::<i32>();
+            Array::from_slice(
+                &(0..size)
+                    .map(|i| ((i as f32 * 0.07) + phase).sin())
+                    .collect::<Vec<_>>(),
+                shape,
+            )
+            .as_dtype(dtype, stream)
+            .unwrap()
+        };
+        let q = tensor(&[2, 4, 67, 32], 0.1);
+        let k = tensor(&[2, 2, 257, 32], 0.3);
+        let v = tensor(&[2, 2, 257, 9], 0.7);
+        let boolean = Array::from_slice(&(0..257).map(|i| i % 7 != 0).collect::<Vec<_>>(), &[257]);
+        let additive = Array::from_slice(
+            &(0..67 * 257)
+                .map(|i| {
+                    if i % 257 > i / 257 + 190 {
+                        -10000.0f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+            &[67, 257],
+        );
+        let sinks = tensor(&[4], 0.4);
+        for (mask, sinks, cap) in [
+            (None, None, None),
+            (Some(&boolean), Some(&sinks), Some(2.0)),
+            (Some(&additive), None, None),
+        ] {
+            let reference =
+                independently_prepared_query_tiles(&q, &k, &v, mask, sinks, cap, stream);
+            let actual = super::attention_with_softcap(
+                &q,
+                &k,
+                &v,
+                0.125,
+                mask,
+                sinks,
+                cap,
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )
+            .unwrap();
+            assert!(
+                actual
+                    .all_close(&reference, 0.0, 0.0, None, stream)
+                    .unwrap()
+                    .item::<bool>(stream),
+                "dtype {dtype:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[test]
+#[ignore = "requires isolated Metal allocator telemetry; run with --test-threads=1"]
+fn prepared_input_score_tiles_share_native_key_value_layout_allocations() {
+    use safemlx::{memory, Dtype};
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = context.stream();
+    struct RestoreCache(usize);
+    impl Drop for RestoreCache {
+        fn drop(&mut self) {
+            memory::set_cache_limit(self.0).unwrap();
+        }
+    }
+    let _cache = RestoreCache(memory::set_cache_limit(0).unwrap());
+    let tensor = |shape: &[i32], phase: f32| {
+        let size = shape.iter().product::<i32>();
+        Array::from_slice(
+            &(0..size)
+                .map(|i| (i as f32 * 0.03 + phase).sin())
+                .collect::<Vec<_>>(),
+            shape,
+        )
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .as_array()
+        .clone()
+    };
+    let q = tensor(&[1, 8, 128, 64], 0.1);
+    let k = tensor(&[1, 2, 1024, 64], 0.3);
+    let v = tensor(&[1, 2, 1024, 64], 0.7);
+    let measure = |shared: bool| {
+        stream.synchronize().unwrap();
+        let baseline = memory::active_memory().unwrap();
+        memory::reset_peak_memory().unwrap();
+        let output = if shared {
+            super::attention_with_softcap(
+                &q,
+                &k,
+                &v,
+                0.125,
+                None,
+                None,
+                None,
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )
+            .unwrap()
+        } else {
+            independently_prepared_query_tiles(&q, &k, &v, None, None, None, stream)
+        }
+        .as_dtype(Dtype::Float32, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap();
+        stream.synchronize().unwrap();
+        (
+            memory::peak_memory().unwrap().saturating_sub(baseline),
+            output.as_slice::<f32>().to_vec(),
+        )
+    };
+    let (repeated_peak, reference) = measure(false);
+    let (shared_peak, actual) = measure(true);
+    assert_eq!(actual, reference);
+    assert!(
+        shared_peak < repeated_peak * 3 / 4,
+        "shared {shared_peak}, repeated {repeated_peak}"
+    );
+    eprintln!("prepared attention K/V: shared_peak={shared_peak}, repeated_peak={repeated_peak}");
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn input_score_preparation_preserves_full_key_and_blockwise_threshold() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    // Uniform scores with one masked position and one zero-valued sink give
+    // an independent closed-form output on both sides of the key-row limit.
+    for tokens in [8192, 8193] {
+        let q = Array::from_slice(&[0.0f32; 4], &[1, 2, 2, 1]);
+        let k = Array::from_slice(&vec![0.0f32; tokens as usize], &[1, 1, tokens, 1]);
+        let v = Array::from_slice(&vec![2.0f32; tokens as usize], &[1, 1, tokens, 1]);
+        let mask = Array::from_slice(&(0..tokens).map(|i| i != 0).collect::<Vec<_>>(), &[tokens]);
+        let sinks = Array::from_slice(&[0.0f32; 2], &[2]);
+        let actual = super::attention_with_softcap(
+            &q,
+            &k,
+            &v,
+            1.0,
+            Some(&mask),
+            Some(&sinks),
+            Some(2.0),
+            eredu_nn::AttentionArithmetic::InputScores,
+            stream,
+        )
+        .unwrap();
+        let expected = Array::from_slice(
+            &[2.0 * (tokens - 1) as f32 / tokens as f32; 4],
+            &[1, 2, 2, 1],
+        );
+        assert!(
+            actual
+                .all_close(&expected, 2e-6, 2e-6, None, stream)
+                .unwrap()
+                .item::<bool>(stream),
+            "key tokens {tokens}"
         );
     }
 }

@@ -6376,7 +6376,14 @@ explicit input-score attention layers. `PreparationMechanismProvider` supplies
 neutral input-score workspace facts without family inspection. MLX reports its
 query tile thresholds and conservative temporary-copy allowances from the same
 constants used by its native attention mechanism; selection retains these facts
-and includes them in cached-selection validation. Runtime combines them with
+and includes them in cached-selection validation. Within a full-key input-score
+attention invocation (at most 8,192 key positions), MLX prepares expanded K/V and
+contiguous BF16 RHS projection layouts once for all query tiles, preserving lazy
+execution and reduction order. This reuse is mechanism-owned and has no family
+condition. Longer rows retain the separate two-pass blockwise realization and
+its evaluated per-block state, without retaining every expanded block. Forecast
+copy allowances remain conservative until independently recalibrated. Runtime
+combines them with
 architecture geometry for repeated K/V projection buffers, score conversions,
 convolution scratch and overlap. Missing native facts preserve an unknown bound.
 Persistent convolution history remains in the state layout. Mixed-width selected

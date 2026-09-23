@@ -4,6 +4,14 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Shared input-score attention layouts
+
+MLX explicit input-score attention now reuses expanded K/V and contiguous BF16
+projection layouts across query tiles for complete key rows up to 8,192 positions.
+The optimization applies to the shared mechanism, preserves arithmetic and lazy
+execution, and leaves longer-row blockwise execution unchanged. Forecast copy
+allowances remain conservative pending recalibration.
+
 ## 2026-09-23 — Reduced-precision load-time quantization
 
 Exact selected-task quantization now accepts F16/BF16 checkpoint recipes with

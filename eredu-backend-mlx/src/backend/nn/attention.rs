@@ -398,31 +398,88 @@ pub fn attention_with_softcap(
             queries, keys, values, scale, mask, sinks, softcap, stream,
         );
     }
+    let prepared = PreparedAttentionKeyValues::new(queries, keys, values, arithmetic, stream)?;
+    attention_with_prepared_key_values(queries, &prepared, scale, mask, sinks, softcap, stream)
+}
+
+/// Invocation-local layouts shared by every full-key query tile. In particular,
+/// the BF16 value projection needs a contiguous transposed layout, not merely a
+/// shared transpose expression which each custom-kernel call would copy again.
+struct PreparedAttentionKeyValues {
+    keys: Array,
+    values: Array,
+    key_product: Option<super::matrix::PreparedBf16BatchedProduct>,
+    value_product: Option<super::matrix::PreparedBf16BatchedProduct>,
+    score_dtype: Dtype,
+}
+
+impl PreparedAttentionKeyValues {
+    fn new(
+        queries: &Array,
+        keys: &Array,
+        values: &Array,
+        arithmetic: eredu_nn::AttentionArithmetic,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let batch = queries.dim(0);
+        let heads = queries.dim(1);
+        let kv_heads = keys.dim(1);
+        let tokens = keys.dim(2);
+        let repeat = heads / kv_heads;
+        let expand = |x: &Array| -> Result<Array, Exception> {
+            broadcast_to(
+                &x.reshape(&[batch, kv_heads, 1, tokens, x.dim(3)], stream)?,
+                &[batch, kv_heads, repeat, tokens, x.dim(3)],
+                stream,
+            )?
+            .reshape(&[batch, heads, tokens, x.dim(3)], stream)
+        };
+        let score_dtype = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
+            queries.dtype()
+        } else {
+            Dtype::Float32
+        };
+        let keys = expand(keys)?
+            .as_dtype(score_dtype, stream)?
+            .contiguous(false, stream)?
+            .swap_axes(-1, -2, stream)?;
+        let values = expand(values)?.contiguous(false, stream)?;
+        let key_product = super::matrix::PreparedBf16BatchedProduct::new(&keys, false, stream)?;
+        let value_product = super::matrix::PreparedBf16BatchedProduct::new(&values, true, stream)?;
+        Ok(Self {
+            keys,
+            values,
+            key_product,
+            value_product,
+            score_dtype,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_with_prepared_key_values(
+    queries: &Array,
+    prepared: &PreparedAttentionKeyValues,
+    scale: f32,
+    mask: Option<&Array>,
+    sinks: Option<&Array>,
+    softcap: Option<f32>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     let batch = queries.dim(0);
     let heads = queries.dim(1);
-    let kv_heads = keys.dim(1);
-    let tokens = keys.dim(2);
-    let repeat = heads / kv_heads;
-    let expand = |x: &Array| -> Result<Array, Exception> {
-        safemlx::ops::broadcast_to(
-            &x.reshape(&[batch, kv_heads, 1, tokens, x.dim(3)], stream)?,
-            &[batch, kv_heads, repeat, tokens, x.dim(3)],
-            stream,
-        )?
-        .reshape(&[batch, heads, tokens, x.dim(3)], stream)
-    };
-    let score_dtype = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
-        queries.dtype()
-    } else {
-        Dtype::Float32
-    };
-    let keys = expand(keys)?.as_dtype(score_dtype, stream)?;
-    let values = expand(values)?;
+    let tokens = prepared.values.dim(2);
+    let score_dtype = prepared.score_dtype;
     let query = queries.as_dtype(score_dtype, stream)?;
-    let key = keys.swap_axes(-1, -2, stream)?;
-    let mut scores = match super::matrix::bf16_batched_product(&query, &key, false, stream)? {
+    let mut scores = match prepared
+        .key_product
+        .as_ref()
+        .map(|product| product.apply(&query, stream))
+        .transpose()?
+        .flatten()
+    {
         Some(scores) => scores,
-        None => safemlx::ops::matmul(&query, &key, stream)?,
+        None => safemlx::ops::matmul(&query, &prepared.keys, stream)?,
     };
     scores = scores
         .as_dtype(Dtype::Float32, stream)?
@@ -463,9 +520,15 @@ pub fn attention_with_softcap(
     let probabilities = probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
         .as_dtype(queries.dtype(), stream)?;
-    match super::matrix::bf16_batched_product(&probabilities, &values, true, stream)? {
+    match prepared
+        .value_product
+        .as_ref()
+        .map(|product| product.apply(&probabilities, stream))
+        .transpose()?
+        .flatten()
+    {
         Some(output) => Ok(output),
-        None => safemlx::ops::matmul(&probabilities, &values, stream),
+        None => safemlx::ops::matmul(&probabilities, &prepared.values, stream),
     }
 }
 
@@ -496,6 +559,17 @@ fn bounded_input_score_attention(
             )
         })
         .transpose()?;
+    let prepared = (keys.dim(2) <= INPUT_SCORE_WORKSPACE.score_tile_elements as i32)
+        .then(|| {
+            PreparedAttentionKeyValues::new(
+                queries,
+                keys,
+                values,
+                eredu_nn::AttentionArithmetic::InputScores,
+                stream,
+            )
+        })
+        .transpose()?;
     let mut outputs = Vec::new();
     let query_step = (INPUT_SCORE_WORKSPACE.score_tile_elements as i32 / keys.dim(2))
         .clamp(1, INPUT_SCORE_WORKSPACE.max_query_rows as i32);
@@ -506,16 +580,14 @@ fn bounded_input_score_attention(
             .as_ref()
             .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
             .transpose()?;
-        if keys.dim(2) <= INPUT_SCORE_WORKSPACE.score_tile_elements as i32 {
-            outputs.push(attention_with_softcap(
+        if let Some(prepared) = &prepared {
+            outputs.push(attention_with_prepared_key_values(
                 &query,
-                keys,
-                values,
+                prepared,
                 scale,
                 mask.as_ref(),
                 sinks,
                 softcap,
-                eredu_nn::AttentionArithmetic::InputScores,
                 stream,
             )?);
             continue;

@@ -129,44 +129,74 @@ fn bf16_projection(
     }
 }
 
-/// Complete FP32 batched BF16 products with row-dot or strided-column sums.
-pub(crate) fn bf16_batched_product(
-    lhs: &Array,
-    rhs: &Array,
+/// Reusable RHS layout for complete FP32 batched BF16 products.
+/// The contiguous node belongs to the complete invocation, so the native kernel
+/// does not insert a separate layout copy for every query tile. Preparation is
+/// lazy and preserves the row-dot / strided-column reduction order.
+pub(crate) struct PreparedBf16BatchedProduct {
+    weights: Array,
+    batch: i32,
+    heads: i32,
+    width: i32,
+    outputs: i32,
     columns: bool,
-    stream: &Stream,
-) -> Result<Option<Array>, Exception> {
-    if !cfg!(all(feature = "metal", not(feature = "cuda")))
-        || lhs.size() == 0
-        || rhs.size() == 0
-        || lhs.dtype() != safemlx::Dtype::Bfloat16
-        || rhs.dtype() != safemlx::Dtype::Bfloat16
-        || lhs.ndim() != 4
-        || rhs.ndim() != 4
-        || lhs.shape()[..2] != rhs.shape()[..2]
-        || lhs.dim(3) != rhs.dim(2)
-        || stream.get_device()?.get_type()? != safemlx::DeviceType::Gpu
-    {
-        return Ok(None);
+}
+
+impl PreparedBf16BatchedProduct {
+    pub(crate) fn new(
+        rhs: &Array,
+        columns: bool,
+        stream: &Stream,
+    ) -> Result<Option<Self>, Exception> {
+        if !cfg!(all(feature = "metal", not(feature = "cuda")))
+            || rhs.size() == 0
+            || rhs.dtype() != safemlx::Dtype::Bfloat16
+            || rhs.ndim() != 4
+            || (!columns && rhs.dim(2) % 32 != 0)
+            || stream.get_device()?.get_type()? != safemlx::DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        let batches = rhs
+            .dim(0)
+            .checked_mul(rhs.dim(1))
+            .ok_or_else(|| Exception::custom("matrix batch count overflow"))?;
+        let width = rhs.dim(2);
+        let outputs = rhs.dim(3);
+        let weights = rhs
+            .swap_axes(-1, -2, stream)?
+            .reshape(&[batches, outputs, width], stream)?
+            .contiguous(false, stream)?;
+        Ok(Some(Self {
+            weights,
+            batch: rhs.dim(0),
+            heads: rhs.dim(1),
+            width,
+            outputs,
+            columns,
+        }))
     }
-    let batches = lhs
-        .dim(0)
-        .checked_mul(lhs.dim(1))
-        .ok_or_else(|| Exception::custom("matrix batch count overflow"))?;
-    let rows = lhs.dim(2);
-    let width = lhs.dim(3);
-    let outputs = rhs.dim(3);
-    let input = lhs.reshape(&[-1, width], stream)?;
-    let weights = rhs
-        .swap_axes(-1, -2, stream)?
-        .reshape(&[batches, outputs, width], stream)?;
-    let ids = (0..batches)
-        .flat_map(|batch| std::iter::repeat_n(batch, rows as usize))
-        .collect::<Vec<_>>();
-    let groups = Array::from_slice(&ids, &[ids.len() as i32]);
-    bf16_projection(&input, &weights, Some(&groups), columns, stream)?
-        .map(|output| output.reshape(&[lhs.dim(0), lhs.dim(1), rows, outputs], stream))
-        .transpose()
+
+    pub(crate) fn apply(&self, lhs: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
+        if lhs.size() == 0
+            || lhs.dtype() != safemlx::Dtype::Bfloat16
+            || lhs.ndim() != 4
+            || lhs.dim(0) != self.batch
+            || lhs.dim(1) != self.heads
+            || lhs.dim(3) != self.width
+        {
+            return Ok(None);
+        }
+        let rows = lhs.dim(2);
+        let input = lhs.reshape(&[-1, self.width], stream)?;
+        let ids = (0..self.batch * self.heads)
+            .flat_map(|batch| std::iter::repeat_n(batch, rows as usize))
+            .collect::<Vec<_>>();
+        let groups = Array::from_slice(&ids, &[ids.len() as i32]);
+        bf16_projection(&input, &self.weights, Some(&groups), self.columns, stream)?
+            .map(|output| output.reshape(&[self.batch, self.heads, rows, self.outputs], stream))
+            .transpose()
+    }
 }
 
 #[cfg(all(test, feature = "metal", not(feature = "cuda")))]

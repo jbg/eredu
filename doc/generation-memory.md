@@ -480,15 +480,22 @@ operator, `min(copies, operator_layers + max(copies - total_layers, 0))` bounds
 live sets using the existing layer-overlap calibration. The convolution lower
 contribution stays zero; these are conservative planning allowances.
 
-LFM2's explicit input-score attention needs more than a score-matrix allowance.
-MLX's query tiles can retain separate expanded K/V and contiguous projection
-buffers. The backend supplies its actual tile thresholds (8,192 query-by-key
-elements, at most 32 query rows) with conservative allowances of four expanded
-K/V copies per tile and 16 working bytes per score element. These facts are
+Explicit input-score attention needs more than a score-matrix allowance.
+For complete key rows of at most 8,192 positions, MLX now shares expanded K/V
+and contiguous BF16 projection layouts across query tiles in an invocation.
+Preparation stays lazy; this change adds no tile evaluation boundaries and does
+not bound the number of live score/softmax graphs. The backend supplies its actual
+tile thresholds (8,192 query-by-key elements, at most 32 query rows). The forecast
+retains its conservative allowance of four expanded K/V copies per tile and
+16 working bytes per score element pending separate recalibration. These facts are
 retained during selection, including cold inspection, and participate in cached
 selection validation. Runtime adds their layer-overlap envelope to the ordinary
-attention fallback. Above the score budget, whole-context K/V copies also bound
-the smaller key-block realizations conservatively. Missing native facts leave
+attention fallback. Above 8,192 key positions, attention still uses the existing
+two-pass blockwise accumulator, which evaluates each block's running state and
+releases temporary layouts. Retaining all prepared blocks would undermine that
+bounded residency strategy; its FP32 accumulation also differs from full-key
+BF16 projection. The conservative whole-context K/V allowance also bounds those
+smaller key-block realizations. Missing native facts leave
 an unknown upper end. Attention-free convolution schedules need no attention
 scratch declaration.
 
@@ -665,7 +672,9 @@ additional active-memory growth above loaded parameters, not process RSS. The
 256 GiB application budget makes these calibration cases observable; a separate
 16 GiB-budget check rejects `LikelyFit` for the 2,000-position request.
 
-All values are MiB; upper ends are calibrated envelopes, not tight projections.
+The following measurements precede shared K/V preparation; updated measurements
+appear below. All values are MiB; upper ends are calibrated envelopes, not tight
+projections.
 
 | Source | Positions | Cold lifecycle upper | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
 |---|---:|---:|---:|---:|---:|---:|
@@ -687,11 +696,10 @@ crosses the host/application capacity. That is interval uncertainty rather than
 missing workspace coverage. Parameter casts explain much of the GGUF continuation
 cost; the broader envelope intentionally covers both promoted storage and casts.
 
-The first convolution-only extension underpredicted the SafeTensors cases. The long case
-actually retains about 66 GiB of extra active allocations through explicit
+The first convolution-only extension underpredicted the SafeTensors cases. Before
+shared K/V preparation, the long case retained about 66 GiB of extra active allocations through explicit
 input-score attention. Query tiling does not imply bounded whole-graph retention.
-The final native-copy envelope covers that measured behavior conservatively;
-optimizing shared K/V expansion would be separate backend work.
+The native-copy envelope covers that measured behavior conservatively.
 
 Reproduce with a cached immutable snapshot (no downloads or cache edits occur):
 
@@ -714,6 +722,34 @@ biases remain BF16; quantization does not reduce activation or attention scratch
 precision. A nonzero native CPU regression covers F16, BF16 and F32 sources,
 compares packed weights/scales/biases with direct native quantization, and preserves
 rejections for incompatible source shapes and integer slots.
+
+### Shared K/V preparation validation (2026-09-23)
+
+Repeating the same pinned models, commands and 128/2,000-position matrix after
+sharing prepared K/V across query tiles produced these active-memory measurements
+(MiB). Forecast upper ends remain unchanged from the preceding table.
+
+| Source | Positions | Measured growth | Continuation growth |
+|---|---:|---:|---:|
+| SafeTensors BF16 | 128 | 525.0 | 15.5 |
+| SafeTensors BF16 | 2000 | 20641.3 | 175.1 |
+| SafeTensors affine 4-bit / BF16 | 128 | 552.5 | 15.5 |
+| SafeTensors affine 4-bit / BF16 | 2000 | 20641.3 | 175.1 |
+| GGUF BF16/mixed | 128 | 4924.2 | 4483.7 |
+| GGUF BF16/mixed | 2000 | 16922.5 | 4705.7 |
+
+Long-prompt SafeTensors growth fell from 65.8 GiB to 20.2 GiB (about 69%).
+Continuation measurements did not improve: SafeTensors growth increased modestly,
+while GGUF remained unchanged. All runs passed cold/loaded forecast checks,
+continuation bounds and controlled-session output parity. These observations do
+not establish a throughput improvement or bounded whole-graph retention.
+
+An isolated Metal allocation regression compares shared preparation with separate
+preparation for every query tile: 22,683,712 versus 69,869,632 peak bytes, with
+bit-identical output. Numerical coverage also includes an independent PyTorch
+fixture on CPU and Metal, F32/F16/BF16, grouped heads, multiple batches, unequal
+K/V widths, boolean/additive masks, sinks, softcaps, partial query tiles and both
+sides of the 8,192-key threshold. No tile evaluation barriers were added.
 
 ## Focused verification
 
