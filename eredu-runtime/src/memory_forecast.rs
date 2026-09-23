@@ -7,6 +7,9 @@ use eredu_core::{
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
+mod capture;
+pub use capture::apply_capture_memory_bound;
+
 /// Portable forecast failures retain native sources and typed policy errors.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerationForecastError {
@@ -118,6 +121,13 @@ pub struct ForecastExecutionContract {
 
 /// Backend facts needed to forecast an already loaded request. No inference is submitted.
 pub trait GenerationForecastBackend: ModelCapabilityBackend {
+    /// Whether capture/intervention native temporaries are completed and released
+    /// before the next prediction. This excludes allocator cache, accounted for
+    /// separately. The conservative default uses the cumulative retained limit.
+    fn capture_transforms_complete_per_step(_runtime: &ModelRuntime<Self>) -> bool {
+        false
+    }
+
     /// Observes retained geometry and current native memory facts. Existing
     /// mutable state must be projected or leave the workspace upper end unknown;
     /// a continuation must never silently be treated as a fresh request.

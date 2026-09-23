@@ -241,14 +241,100 @@ fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row()
             .prefill_chunk_tokens,
         capture_forecast.request.prefill_chunk_tokens
     );
+    assert_eq!(capture_forecast.estimate.fit, MemoryFit::LikelyFit);
     assert_eq!(
-        capture_forecast.estimate.fit,
-        MemoryFit::InsufficientInformation
+        capture_forecast.request.domains[0]
+            .retained_input
+            .lower_bytes,
+        ordinary.request.domains[0].retained_input.lower_bytes
     );
     let (other, _, _) = setup();
     assert!(other
         .forecast_observed_generation(&prepared, &Default::default())
         .is_err());
+}
+
+#[test]
+fn top_k_and_intervention_forecasts_use_admitted_limits_without_consuming_them() {
+    use eredu::api::TraceLimits;
+    use eredu_core::capture::CaptureTransform;
+    let (model, chat, settings) = setup();
+    let limits = TraceLimits {
+        per_record_bytes: 65536,
+        total_bytes: 1024 * 1024,
+    };
+    let mut plan = observed_mock::plan();
+    plan.selections[0].transform = CaptureTransform::TopCandidates { count: 1 };
+    plan.limits.per_step.retained_bytes = 500_000;
+    let captured = model
+        .prepare_observed_chat(&chat, settings, plan.clone(), limits)
+        .unwrap();
+    let forecast = model
+        .forecast_observed_generation(&captured, &Default::default())
+        .unwrap();
+    assert_eq!(forecast.estimate.fit, MemoryFit::LikelyFit);
+    assert_eq!(forecast.execution.logits, LogitsWorkspace::EveryPosition);
+    let peak = forecast.estimate.domains[0]
+        .generation_peak
+        .upper_bytes
+        .unwrap();
+    // The default backend fact permits cross-step native overlap, hence uses
+    // cumulative retained bytes even when the per-step allowance is smaller.
+    plan.limits.cumulative.retained_bytes += 1234;
+    plan.limits.cumulative.host_bytes += 5678;
+    let larger = model
+        .prepare_observed_chat(&chat, settings, plan.clone(), limits)
+        .unwrap();
+    let larger = model
+        .forecast_observed_generation(&larger, &Default::default())
+        .unwrap();
+    assert_eq!(
+        larger.estimate.domains[0]
+            .generation_peak
+            .upper_bytes
+            .unwrap(),
+        peak + 1234 + 5678
+    );
+    let intervened = model
+        .prepare_intervened_chat(
+            &chat,
+            settings,
+            plan,
+            observed_mock::intervention_plan(1.0),
+            limits,
+        )
+        .unwrap();
+    let intervened = model
+        .forecast_observed_generation(&intervened, &Default::default())
+        .unwrap();
+    assert_eq!(intervened.estimate.fit, MemoryFit::LikelyFit);
+    assert!(
+        intervened.estimate.domains[0]
+            .generation_peak
+            .upper_bytes
+            .unwrap()
+            > larger.estimate.domains[0]
+                .generation_peak
+                .upper_bytes
+                .unwrap()
+    );
+    let repeated = model
+        .forecast_observed_generation(&captured, &Default::default())
+        .unwrap();
+    assert_eq!(repeated.request, forecast.request);
+    assert_eq!(repeated.estimate, forecast.estimate);
+    let options = GenerationForecastOptions {
+        backend_overhead: Some(MemoryBytes::unknown("unprojected backend")),
+        ..Default::default()
+    };
+    let unknown = model
+        .forecast_observed_generation(&captured, &options)
+        .unwrap();
+    assert_eq!(unknown.estimate.fit, MemoryFit::InsufficientInformation);
+    assert!(unknown.estimate.domains[0]
+        .generation_peak
+        .upper_bytes
+        .is_none());
 }
 
 #[test]

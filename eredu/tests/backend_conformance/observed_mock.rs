@@ -18,7 +18,10 @@ pub(super) struct Sampling {
 pub(super) fn discovery() -> CaptureDiscovery {
     let path = eredu_core::MODEL_LOGITS_OBSERVATION_PATH.to_owned();
     let capabilities = CaptureCapabilities {
-        transformations: vec![CaptureTransformKind::Summary],
+        transformations: vec![
+            CaptureTransformKind::Summary,
+            CaptureTransformKind::TopCandidates,
+        ],
         max_histogram_bins: 0,
         physical_native_limit: false,
         conditions: vec![],
@@ -182,6 +185,18 @@ impl CaptureBackend for Mechanism {
     ) -> Result<CapturePayload, Self::Error> {
         if selection.id == "injected-native-failure" {
             return Err(MockError::Capture("injected capture fault".into()));
+        }
+        if matches!(selection.transform, CaptureTransform::TopCandidates { .. }) {
+            return Ok(CapturePayload::Candidates(CaptureCandidates {
+                stage: CandidateScoreStage::RawLogitsBeforeSampling,
+                source: CandidateLogitsSource::default(),
+                candidates: vec![CaptureCandidate {
+                    token_id: 0,
+                    score: tensor.scale,
+                    allowed: true,
+                }],
+                domain: None,
+            }));
         }
         let count = elements(&tensor.shape).unwrap();
         Ok(CapturePayload::Summary(CaptureSummary {

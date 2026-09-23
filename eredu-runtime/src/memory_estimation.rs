@@ -65,7 +65,7 @@ impl MemoryBytes {
         Ok(())
     }
 
-    fn add(&self, other: &Self) -> Result<Self, CapabilityError> {
+    pub(crate) fn add(&self, other: &Self) -> Result<Self, CapabilityError> {
         self.validate()?;
         other.validate()?;
         Ok(Self {
@@ -275,7 +275,9 @@ pub struct DomainMemoryPlan {
     /// Do not substitute process RSS, global allocator activity, planned disk
     /// bytes, or other allocations absent from this plan. Use zero before loading.
     pub already_resident_bytes: u64,
-    /// Additional retained host/media inputs, excluding embeddings modeled by state.
+    /// Additional retained inputs and instrumentation in this physical pool,
+    /// excluding embeddings modeled by state. Capture forecasts include bounded
+    /// native transforms, host records and immutable plans here.
     pub retained_input: MemoryBytes,
     /// Concurrent materialization or transfer staging during generation.
     pub staging: MemoryBytes,

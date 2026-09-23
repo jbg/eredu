@@ -321,6 +321,7 @@ pub fn admitted_intervention_storage_bytes(
     storage::heap_bytes(plan.plan())?
         .checked_add(storage::heap_bytes(plan.points())?)?
         .checked_add(plan.identity().len() as u64)?
+        .checked_add(plan.intent_identity().len() as u64)?
         .checked_add(plan.artifact_identity().len() as u64)?
         .checked_add(plan.session_id().len() as u64)?
         .checked_add(std::mem::size_of_val(plan) as u64)

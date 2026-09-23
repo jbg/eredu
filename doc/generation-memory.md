@@ -161,8 +161,30 @@ println!("{:?}", forecast.estimate.fit);
 settings. `forecast_observed_generation` consumes the preparation shared by
 observed ordinary and controlled execution: trace-only requests preserve ordinary
 chunking, while capture/intervention requests report their full-pass reason and
-all-row logits contract. Capture transformations and retained records leave the
-upper bound unknown. `forecast_prepared_speculative_generation` similarly leaves
+all-row logits contract. Their admitted capture limits now supply a logical
+instrumentation envelope, so a bounded top-k capture can receive `likely_fit`
+without the application projecting capture storage itself:
+
+- Native transforms and intervention execution/evidence use the same capture
+  ledger. MLX completes them synchronously, so native storage is bounded by the
+  smaller of the per-step and cumulative retained limits. Backends that do not
+  declare completion before the next prediction use the cumulative retained limit.
+- Host storage uses the cumulative host limit, plus the larger of the cumulative
+  encoded limit and the entire trace byte limit. This allows retaining one run's
+  records and one compact JSON trace; trace encoding already includes captures.
+  It also covers a captured record that exists before trace delivery rejects it.
+- The logical storage of admitted plans, including intervention payloads, is added
+  on the host. Native storage belongs to execution pools; host storage belongs to
+  the host pool. Unified memory counts both contributions once, as does CPU execution.
+
+These intervals are planning estimates, not measured process peaks or physical
+allocator guarantees. They exclude extra application copies, framing, snapshots,
+branches, and private native workspace; allocator/graph allowances remain separate.
+Limits can be conservative, and a large envelope can still prevent a fit verdict.
+The forecast adds instrumentation to existing input costs and preserves unrelated
+unknowns. It neither reserves nor consumes capture or trace budgets, and applies
+equally to ordinary and controlled startup. Trace-only requests retain their
+ordinary forecast. `forecast_prepared_speculative_generation` still leaves
 concurrent draft and verification storage explicitly unbounded.
 
 `GenerationForecast` contains the estimate, descriptive request, full-pass reason

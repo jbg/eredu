@@ -1026,10 +1026,15 @@ used by ordinary or controlled startup. `forecast_observed_generation` accepts
 `PreparedObservedGeneration`, verifies its session identity and uses its resolved
 settings and capture/intervention contract. Trace-only preparations retain ordinary
 chunking and final-row projection when the executor supports them. Instrumented
-prefill uses a full pass and all-row logits; unprojected native capture transforms
-and retained host records leave its upper bound unknown. Speculative forecasts
-likewise disclose the missing concurrent draft/verification resource projection.
-These are memory-accounting gaps, not execution capability rejections. Forecasts
+prefill uses a full pass and all-row logits. Admitted per-step/cumulative capture
+limits bound logical transform storage, intervention execution/evidence, and
+retained host records; immutable intervention payloads are included separately.
+The host envelope allows one record history and one compact JSON trace. MLX uses
+per-step native storage because transformations complete synchronously; other
+backends default to the cumulative retained limit. These are logical estimates
+with separate allocator/graph allowances, not physical process guarantees.
+Speculative forecasts still disclose the missing concurrent draft/verification
+resource projection. That is an accounting gap, not an execution rejection. Forecasts
 do not consume preparation, state, callbacks, capture budgets or submission
 authority. Forecast before startup from fresh/reset state; forecasting an already
 advanced continuation requires a current-state projection, which the MLX adapter

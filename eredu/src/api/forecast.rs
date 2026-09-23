@@ -150,6 +150,10 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
 
     /// Forecasts a prepared observed request before uninterrupted execution or
     /// `start_controlled_*`. Trace-only requests preserve ordinary chunking.
+    /// Instrumented requests use admitted logical storage limits, allowing one
+    /// retained record history and one compact JSON trace. Extra application
+    /// copies, snapshots and branches need separate allowances; unrelated unknown
+    /// costs remain unknown. Forecasting does not consume capture/trace budgets.
     pub fn forecast_observed_generation(
         &self,
         prepared: &PreparedObservedGeneration,
@@ -169,13 +173,13 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             instrumented,
         )?;
         if instrumented {
-            // Logits and full-pass contracts are known; capture transforms and
-            // retained host records still need a native peak-memory projection.
-            for domain in &mut result.request.domains {
-                domain.retained_input = MemoryBytes::unknown(
-                    "capture/intervention transform and retained-record peak is not projected",
-                );
-            }
+            eredu_runtime::memory_forecast::apply_capture_memory_bound(
+                &mut result.request,
+                &prepared.plan,
+                prepared.intervention.as_ref(),
+                prepared.trace_limits,
+                B::capture_transforms_complete_per_step(&self.runtime),
+            )?;
             result.reestimate()?;
         }
         Ok(result)

@@ -6374,6 +6374,17 @@ forecast path. The CLI consumes the facade and owns warning/refusal policy. Unkn
 overhead affects advice, never execution authorization. No allocation ledger or
 new funding protocol is involved. See [generation memory](generation-memory.md).
 
+Runtime projects admitted capture limits into logical native and host envelopes,
+including intervention execution/evidence under the shared ledger and immutable
+plan payloads on the host. `GenerationForecastBackend` supplies a default-false
+fact for whether native capture/intervention temporaries complete before the next
+prediction. MLX declares this synchronous lifetime, allowing the per-step retained
+bound; otherwise runtime uses the cumulative bound. Host records use cumulative
+limits, with an allowance for one compact trace. The facade supplies the admitted
+plans and trace limits shared by ordinary and controlled preparation. Runtime
+places costs in physical pools, counts unified backing once, preserves existing
+costs and unknowns, and performs checked arithmetic without consuming admission.
+
 The existing `safemlx::system` native observation boundary reads macOS Mach host
 VM statistics and releases the host port after querying. Available physical memory
 is estimated from free (including speculative) plus inactive pages, using the host

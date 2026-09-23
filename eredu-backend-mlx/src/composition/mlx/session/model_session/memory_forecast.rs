@@ -7,6 +7,12 @@ use eredu_runtime::memory_forecast::{
 };
 
 impl GenerationForecastBackend for MlxBackend<'_> {
+    fn capture_transforms_complete_per_step(_: &ModelRuntime<Self>) -> bool {
+        // Bounded capture evaluates and transfers synchronously; no lazy capture
+        // graphs or native views survive delivery of a completed prediction.
+        true
+    }
+
     fn loaded_memory_profile(
         runtime: &ModelRuntime<Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
