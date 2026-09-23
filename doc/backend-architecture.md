@@ -6384,16 +6384,26 @@ forecast path. The CLI consumes the facade and owns warning/refusal policy. Unkn
 overhead affects advice, never execution authorization. No allocation ledger or
 new funding protocol is involved. See [generation memory](generation-memory.md).
 
-Runtime projects admitted capture limits into logical native and host envelopes,
-including intervention execution/evidence under the shared ledger and immutable
-plan payloads on the host. `GenerationForecastBackend` supplies a default-false
-fact for whether native capture/intervention temporaries complete before the next
-prediction. MLX declares this synchronous lifetime, allowing the per-step retained
-bound; otherwise runtime uses the cumulative bound. Host records use cumulative
-limits, with an allowance for one compact trace. The facade supplies the admitted
-plans and trace limits shared by ordinary and controlled preparation. Runtime
-places costs in physical pools, counts unified backing once, preserves existing
-costs and unknowns, and performs checked arithmetic without consuming admission.
+Runtime owns ordinary capture sizing shared by preflight and forecasts: shape/slice
+resolution, absolute schedules, per-step diagnostic metadata and checked cumulative
+usage. `GenerationForecastBackend::capture_memory_projection` supplies complete
+native source/transform cost observations without submission or reservation. MLX
+reuses its admission estimator for ordinary logits; deferred sources, partition
+transport and intervention evidence without full projection coverage retain an
+explicit admitted-limit fallback. Backend cost observations never migrate into
+the portable runtime or facade.
+
+Runtime's serializable `CaptureMemoryPlan` caps complete geometry projections by
+admitted limits, adds immutable plan storage, and places host/native costs in
+physical pools. A default-false backend fact declares whether native transforms
+complete before the next prediction; MLX declares this synchronous lifetime, so
+runtime uses a per-step peak rather than cumulative native retention. Host records
+accumulate across selected occurrences with one compact trace allowance. The facade
+composes plans and trace limits from shared ordinary/controlled preparation. Horizon
+alternatives recount scheduled usage without accumulating prior forecasts;
+continuations retain actual charged history and use the sampler's absolute index,
+independent of cache position. Restoration does not refund capture history. Unknown
+costs remain explicit and forecasts consume no admission authority.
 
 `SpeculativeForecastBackend<D>` supplies immutable selected-drafter resource
 facts. MLX derives independent autoregressive draft geometry from the retained

@@ -5,6 +5,7 @@ use std::{cell::Cell, convert::Infallible};
 mod checkpoints;
 mod generated;
 mod partition;
+mod projection;
 mod routed;
 
 fn generated_source(creation_bytes: u64) -> GeneratedCaptureSource {

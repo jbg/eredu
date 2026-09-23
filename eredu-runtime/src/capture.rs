@@ -2,6 +2,10 @@
 
 use eredu_core::capture::*;
 
+mod projection;
+pub use projection::{
+    project_capture_usage, CaptureUsageOutlook, CaptureUsageProjection, ScheduledCaptureUsage,
+};
 mod checkpoint;
 mod empty;
 mod generated;
@@ -649,7 +653,7 @@ pub(crate) fn preflight_with_extra(
 pub(crate) fn preflight_continuation(
     plan: &AdmittedCapturePlan,
     extra: &[(CaptureSelection, eredu_core::ObservationPoint)],
-    mut base: CaptureUsage,
+    base: CaptureUsage,
     scheduled_costs: &[(CaptureSchedule, [CaptureUsage; 2])],
     next_prediction: u64,
     inherited: CaptureUsage,
@@ -669,67 +673,23 @@ pub(crate) fn preflight_continuation(
             estimate,
         );
     }
-    let remaining = plan
-        .request()
-        .max_predictions
-        .checked_sub(next_prediction)
-        .ok_or_else(|| {
-            CaptureError::Invalid("continuation exceeds admitted prediction range".into())
-        })?;
-    let entries: Vec<_> = plan
-        .plan()
-        .selections
-        .iter()
-        .zip(plan.points())
-        .chain(extra.iter().map(|(selection, point)| (selection, point)))
-        .collect();
-    for &(selection, point) in &entries {
-        base = base.checked_add(metadata_reservation(selection, point)?)?;
-    }
-    if let Some(budget) = base.exceeded(plan.plan().limits.per_step) {
-        return Err(CaptureError::Limit {
-            budget,
-            cumulative: false,
-        });
-    }
-    let mut total = inherited.checked_add(base.checked_mul(remaining)?)?;
-    for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
-        if remaining == 0 || (phase == CapturePhase::Prefill && next_prediction > 0) {
-            continue;
-        }
-        if phase == CapturePhase::Decode && plan.request().max_predictions <= 1 {
-            continue;
-        }
-        let mut step = base;
-        for (schedule, costs) in scheduled_costs {
-            if let Some((count, _)) = schedule.count_and_last_from(
-                phase,
-                next_prediction,
-                plan.request().max_predictions,
-            )? {
-                let cost = costs[if phase == CapturePhase::Prefill { 0 } else { 1 }];
-                step = step.checked_add(cost)?;
-                total = total.checked_add(cost.checked_mul(count)?)?;
-            }
-        }
-        for &(selection, point) in &entries {
-            let Some((count, last)) = selection.schedule.count_and_last_from(
-                phase,
-                next_prediction,
-                plan.request().max_predictions,
-            )?
-            else {
-                continue;
-            };
-            if let Some(shape) = plan.request().resolve(point, phase, last)? {
-                let slice = resolve_slice(point, selection, &shape)?;
-                let cost = estimate(&shape, selection, &slice)?;
-                if plan.plan().limits.on_limit == CaptureLimitPolicy::Fail {
-                    step = step.checked_add(cost)?;
-                    total = total.checked_add(cost.checked_mul(count)?)?;
-                }
-            }
-        }
+    let projection = projection::build_projection(
+        plan,
+        extra,
+        base,
+        scheduled_costs,
+        next_prediction,
+        Some(plan.plan().limits.per_step),
+        |shape, selection, slice| estimate(shape, selection, slice).map(Some),
+    )?;
+    let outlook = projection
+        .known_outlook(
+            next_prediction,
+            plan.request().max_predictions,
+            plan.plan().limits.on_limit == CaptureLimitPolicy::Fail,
+        )?
+        .expect("preflight projects its own admitted range");
+    for step in outlook.phases {
         if let Some(budget) = step.exceeded(plan.plan().limits.per_step) {
             return Err(CaptureError::Limit {
                 budget,
@@ -737,6 +697,8 @@ pub(crate) fn preflight_continuation(
             });
         }
     }
+    let total = inherited.checked_add(outlook.total)?;
+
     if let Some(budget) = total.exceeded(plan.plan().limits.cumulative) {
         return Err(CaptureError::Limit {
             budget,

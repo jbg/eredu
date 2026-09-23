@@ -164,30 +164,62 @@ println!("{:?}", forecast.estimate.fit);
 settings. `forecast_observed_generation` consumes the preparation shared by
 observed ordinary and controlled execution: trace-only requests preserve ordinary
 chunking, while capture/intervention requests report their full-pass reason and
-all-row logits contract. Their admitted capture limits now supply a logical
-instrumentation envelope, so a bounded top-k capture can receive `likely_fit`
-without the application projecting capture storage itself:
+all-row logits contract. Capture forecasts use selection geometry when the backend
+can bound the complete source and transform cost. MLX currently covers ordinary
+`model.logits` transforms, including top-k candidates and selected-token scores.
+The projection reuses admission's native transform estimator, resolves slices,
+counts absolute prefill/decode schedules, and includes per-step diagnostic metadata
+even when no value is selected. Top-k storage depends on vocabulary width and k;
+retained host records depend on selected occurrences and the prediction horizon.
+Increasing an already sufficient admission quota does not increase this projection.
 
-- Native transforms and intervention execution/evidence use the same capture
-  ledger. MLX completes them synchronously, so native storage is bounded by the
-  smaller of the per-step and cumulative retained limits. Backends that do not
-  declare completion before the next prediction use the cumulative retained limit.
-- Host storage uses the cumulative host limit, plus the larger of the cumulative
-  encoded limit and the entire trace byte limit. This allows retaining one run's
-  records and one compact JSON trace; trace encoding already includes captures.
-  It also covers a captured record that exists before trace delivery rejects it.
-- The logical storage of admitted plans, including intervention payloads, is added
-  on the host. Native storage belongs to execution pools; host storage belongs to
-  the host pool. Unified memory counts both contributions once, as does CPU execution.
+- Native transforms and intervention execution/evidence share the capture ledger.
+  MLX completes transforms synchronously, so the native bound is the largest
+  projected step, capped by per-step and remaining cumulative retained limits.
+  Backends allowing cross-step overlap use cumulative projected native storage.
+- Host storage covers projected records plus the larger of projected encoded
+  records and the entire trace byte allowance. Projections are capped by admitted
+  cumulative limits. This permits one retained record history and one compact JSON
+  trace, including a capture produced before trace delivery rejects it.
+- Immutable admitted plans, including intervention payloads, are added on the
+  host. Native costs belong to execution pools; host costs belong to the host pool.
+  Unified memory counts both contributions once, as does CPU execution.
+- Unknown geometry, deferred source creation without a complete cost, distributed
+  capture, and intervention execution/evidence currently retain an explicitly
+  labeled admitted-limit fallback. A missing native cost is never treated as zero.
+
+`GenerationForecast.capture` retains serializable projection facts.
+`with_max_output_tokens` recounts scheduled occurrences without accumulating the
+previous forecast's costs. Shape costs conservatively cover the original admitted
+range; extending beyond that coverage uses the admitted-limit fallback. Continuation
+forecasts use the sampler's absolute prediction index and actual cumulative capture
+reservations. Restoring a snapshot does not refund delivered record history, while
+completed step-scoped native transforms do not remain live.
 
 These intervals are planning estimates, not measured process peaks or physical
 allocator guarantees. They exclude extra application copies, framing, snapshots,
 branches, and private native workspace; allocator/graph allowances remain separate.
-Limits can be conservative, and a large envelope can still prevent a fit verdict.
-The forecast adds instrumentation to existing input costs and preserves unrelated
-unknowns. It neither reserves nor consumes capture or trace budgets, and applies
-equally to ordinary and controlled startup. Trace-only requests retain their
-ordinary forecast.
+The independent trace allowance remains even for small captures. The forecast adds
+instrumentation to existing input costs and preserves unrelated unknowns. It neither
+reserves nor consumes capture or trace budgets and applies equally to ordinary and
+controlled startup. Trace-only requests retain their ordinary forecast.
+
+Native calibration (2026-09-23): SmolLM2-135M-Instruct at revision
+`1d461723eec654e65efdc40cf49301c89c0c92f4`, Metal, top-k 8 for 32 predictions,
+1 GiB retained/host/encoded capture ceilings, and a 64 MiB trace allowance produced
+68,337,271 bytes of retained upper allowance (about 65.2 MiB). The projected
+capture host total was 37,088 bytes and the native step peak was 1,184,768 bytes.
+Increasing sufficient quotas did not change the result; increasing k raised it
+and capturing every other prediction lowered it. Four executed predictions stayed
+within the projected ledger usage; continuation forecasts preserved that history
+and neither forecasts nor quota comparisons changed native active allocations.
+Run against the pinned local checkpoint with:
+
+```sh
+EREDU_CONTINUATION_MODEL=/path/to/SmolLM2-135M-Instruct \
+  cargo test -p eredu --features mlx,metal --offline --test native_execution_control \
+  native_capture_forecasts -- --ignored --nocapture --test-threads=1
+```
 
 ### Speculative requests
 
@@ -686,7 +718,7 @@ mechanism. That mechanism covers capacity rounding, sliding-cache retention and
 interior peaks of remainder-shaped state. These are conservative logical storage
 allowances, not measured distinct backing. The same bound covers possible old and
 replacement cache overlap. Sampler/history/pending-input retention, admitted
-capture/intervention limits and the controlled facade's decoder, constraints,
+capture geometry (or explicit capture/intervention limit fallbacks) and the controlled facade's decoder, constraints,
 semantic records and trace are included. Live snapshots and branches contribute
 their reserved retention upper allowance, including reserved future growth.
 Unattributed host/native allowances are conservatively included in each separate
@@ -753,7 +785,6 @@ EREDU_CONTINUATION_MODEL=/tmp/eredu-spec-validation/model \
 The same fixture test can run without Metal using `--no-default-features
 --features mlx` and omitting `--ignored`; this change was validated natively on
 Metal, not CUDA or a CPU-only MLX build.
-
 
 
 Semantic-history regression validation uses a 64 MiB trace budget, checks the

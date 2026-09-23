@@ -3,7 +3,7 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount, Observed, PhysicalMemorySemantics};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
-    ForecastCalibration, ForecastExecutionContract, GenerationForecastBackend,
+    CaptureMemoryPlan, ForecastCalibration, ForecastExecutionContract, GenerationForecastBackend,
     GenerationForecastError, SpeculativeForecastBackend, SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,9 @@ pub struct GenerationForecastOptions {
 /// Estimate plus the exact descriptive request and execution contract used for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationForecast {
+    /// Selection geometry and admitted ceilings for capture horizon recomputation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureMemoryPlan>,
     /// Selected speculative resource facts for reproducible phase recomputation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speculative: Option<SpeculativeMemoryPlan>,
@@ -78,6 +81,13 @@ impl GenerationForecast {
     }
 
     fn reestimate(&mut self) -> Result<(), GenerationForecastError> {
+        if let Some(plan) = &self.capture {
+            let tokens = self
+                .request
+                .max_output_tokens
+                .unwrap_or(self.request.forecast_output_tokens);
+            plan.apply(&mut self.request, tokens)?;
+        }
         let mut estimate = match &self.speculative {
             Some(plan) => {
                 eredu_runtime::memory_forecast::estimate_speculative_memory(&self.request, plan)?
@@ -259,7 +269,8 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
 
     /// Forecasts a prepared observed request before uninterrupted execution or
     /// `start_controlled_*`. Trace-only requests preserve ordinary chunking.
-    /// Instrumented requests use admitted logical storage limits, allowing one
+    /// Instrumented requests project admitted selections where native costs are known,
+    /// falling back to admitted logical storage limits otherwise. Both allow one
     /// retained record history and one compact JSON trace. Extra application
     /// copies, snapshots and branches need separate allowances; unrelated unknown
     /// costs remain unknown. Forecasting does not consume capture/trace budgets.
@@ -282,13 +293,20 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             instrumented,
         )?;
         if instrumented {
-            eredu_runtime::memory_forecast::apply_capture_memory_bound(
-                &mut result.request,
+            let projection = B::capture_memory_projection(
+                &self.runtime,
+                &prepared.plan,
+                prepared.intervention.as_ref(),
+                0,
+            )?;
+            result.capture = Some(CaptureMemoryPlan::new(
+                &result.request,
                 &prepared.plan,
                 prepared.intervention.as_ref(),
                 prepared.trace_limits,
                 B::capture_transforms_complete_per_step(&self.runtime),
-            )?;
+                projection,
+            ));
             result.reestimate()?;
         }
         Ok(result)
@@ -456,6 +474,7 @@ pub(super) fn loaded_forecast(
     estimate.assumptions.extend(geometry.assumptions);
     estimate.assumptions.push("Loaded request: loading is excluded; only declared resident parameter bytes are deducted, never process-global active allocation counters.".into());
     Ok(GenerationForecast {
+        capture: None,
         speculative: None,
         request,
         estimate,
@@ -511,6 +530,7 @@ pub fn forecast_inspected_generation(
         .assumptions,
     );
     Ok(GenerationForecast {
+        capture: None,
         speculative: None,
         request,
         estimate,

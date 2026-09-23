@@ -4,6 +4,16 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Capture forecasts from selection geometry
+
+Loaded ordinary MLX logits captures now forecast admitted transform sizes and
+scheduled occurrences, capped by capture limits. Large top-k capture quotas no
+longer inflate a small selection to the whole quota. Output-horizon alternatives
+recompute retained records; continuations include actual charged history without
+refunding it after restore. Unknown sources, partitioned captures, and interventions
+retain a labeled limit fallback. Independent trace and allocator allowances remain.
+Forecasting performs no native submissions or budget reservations.
+
 ## 2026-09-23 — Tighter continuation host allowances
 
 Continuation forecasts now bound future semantic history by unspent trace bytes,

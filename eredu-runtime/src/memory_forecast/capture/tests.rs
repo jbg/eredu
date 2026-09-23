@@ -219,3 +219,129 @@ fn admitted_intervention_payloads_are_included_in_host_storage() {
     let (_, with) = bounds(&limits(), Some(storage), trace(), true).unwrap();
     assert!(with.upper_bytes.unwrap() >= without.upper_bytes.unwrap() + 4096 * 4);
 }
+
+fn projected_plan(request: &GenerationMemoryRequest, scoped: bool) -> CaptureMemoryPlan {
+    use crate::capture::{CaptureUsageProjection, ScheduledCaptureUsage};
+    let cost = CaptureUsage {
+        captures: 1,
+        retained_bytes: 20,
+        host_bytes: 30,
+        encoded_bytes: 40,
+    };
+    CaptureMemoryPlan {
+        projection: Some(CaptureUsageProjection {
+            first_prediction: 0,
+            max_predictions: 10,
+            per_step_metadata: CaptureUsage {
+                host_bytes: 2,
+                encoded_bytes: 3,
+                ..Default::default()
+            },
+            selections: vec![ScheduledCaptureUsage {
+                schedule: CaptureSchedule::default(),
+                costs: [Some(cost); 2],
+                required: false,
+            }],
+        }),
+        first_prediction: 0,
+        inherited_usage: CaptureUsage::default(),
+        limits: limits(),
+        trace: TraceLimits {
+            per_record_bytes: 0,
+            total_bytes: 0,
+        },
+        native_step_scoped: scoped,
+        plan_storage: Some(10),
+        baseline: request
+            .domains
+            .iter()
+            .map(|d| (d.domain.clone(), d.retained_input.clone()))
+            .collect(),
+    }
+}
+
+#[test]
+fn geometry_bounds_scale_with_horizon_not_quota_and_recompute_without_accumulating() {
+    let mut request = request(MemoryDomain::Unified);
+    let mut plan = projected_plan(&request, true);
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(
+        request.domains[0].retained_input.upper_bytes,
+        Some(8 + 10 + 20 + 2 * (32 + 43))
+    );
+    let once = request.clone();
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(request, once);
+    plan.limits.cumulative.host_bytes *= 10;
+    plan.limits.cumulative.retained_bytes *= 10;
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(request, once);
+    plan.apply(&mut request, 4).unwrap();
+    assert_eq!(
+        request.domains[0].retained_input.upper_bytes,
+        Some(8 + 10 + 20 + 4 * 75)
+    );
+    plan.apply(&mut request, 0).unwrap();
+    assert_eq!(request.domains[0].retained_input.upper_bytes, Some(18));
+    plan.apply(&mut request, 11).unwrap();
+    assert!(request.domains[0]
+        .retained_input
+        .detail
+        .contains("admitted-limit fallback"));
+    assert_eq!(
+        request.domains[0].retained_input.upper_bytes,
+        Some(18 + 100 + 20_000 + 3000)
+    );
+}
+
+#[test]
+fn continuation_keeps_charged_history_caps_remaining_costs_and_separates_pools() {
+    let mut request = request(MemoryDomain::Device("test".into()));
+    let mut host = request.domains[0].clone();
+    host.domain = MemoryDomain::Host;
+    host.executions.clear();
+    request.domains.push(host);
+    let mut plan = projected_plan(&request, true);
+    plan.first_prediction = 3;
+    plan.inherited_usage = CaptureUsage {
+        captures: 3,
+        retained_bytes: 990,
+        host_bytes: 1990,
+        encoded_bytes: 2990,
+    };
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(request.domains[0].retained_input.upper_bytes, Some(8 + 10)); // only 10 native bytes remain
+    assert_eq!(
+        request.domains[1].retained_input.upper_bytes,
+        Some(8 + 10 + 2000 + 3000)
+    );
+    plan.apply(&mut request, 0).unwrap();
+    assert_eq!(request.domains[0].retained_input.upper_bytes, Some(8));
+    assert_eq!(
+        request.domains[1].retained_input.upper_bytes,
+        Some(8 + 10 + 1990 + 2990)
+    );
+    plan.native_step_scoped = false;
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(request.domains[0].retained_input.upper_bytes, Some(1008));
+    let before = request.clone();
+    plan.first_prediction = u64::MAX;
+    assert!(plan.apply(&mut request, 2).is_err());
+    assert_eq!(request, before);
+}
+
+#[test]
+fn unknown_transform_and_missing_projection_retain_the_quota_bound() {
+    let mut request = request(MemoryDomain::Unified);
+    let mut plan = projected_plan(&request, true);
+    plan.projection.as_mut().unwrap().selections[0].costs[1] = None;
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(
+        request.domains[0].retained_input.upper_bytes,
+        Some(18 + 100 + 2000 + 3000)
+    );
+    let bound = request.clone();
+    plan.projection = None;
+    plan.apply(&mut request, 2).unwrap();
+    assert_eq!(request, bound);
+}

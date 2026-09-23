@@ -52,6 +52,34 @@ impl
 }
 
 impl GenerationForecastBackend for MlxBackend<'_> {
+    fn capture_memory_projection(
+        runtime: &ModelRuntime<Self>,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
+        first_prediction: u64,
+    ) -> Result<Option<eredu_runtime::capture::CaptureUsageProjection>, GenerationForecastError>
+    {
+        // Partition transport and intervention evidence need their own complete
+        // accounting. Deferred activation sources may allocate during creation;
+        // ordinary logits are already materialized by generation's workspace.
+        if runtime.session().payload.distributed.is_some()
+            || intervention.is_some_and(|p| !p.plan().operations.is_empty())
+        {
+            return Ok(None);
+        }
+        eredu_runtime::capture::project_capture_usage(
+            capture,
+            first_prediction,
+            |shape, selection, slice| {
+                if selection.path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
+                    return Ok(None);
+                }
+                super::super::bounded_capture::estimate_shape(shape, selection, slice).map(Some)
+            },
+        )
+        .map_err(|e| CapabilityError::Observation(e.to_string()).into())
+    }
+
     fn capture_transforms_complete_per_step(_: &ModelRuntime<Self>) -> bool {
         // Bounded capture evaluates and transfers synchronously; no lazy capture
         // graphs or native views survive delivery of a completed prediction.

@@ -10,7 +10,7 @@ use std::num::NonZeroU8;
 mod continuation;
 pub use continuation::*;
 mod capture;
-pub use capture::apply_capture_memory_bound;
+pub use capture::{apply_capture_memory_bound, CaptureMemoryPlan};
 mod speculative;
 pub use speculative::*;
 
@@ -129,6 +129,17 @@ pub struct ForecastExecutionContract {
 
 /// Backend facts needed to forecast an already loaded request. No inference is submitted.
 pub trait GenerationForecastBackend: ModelCapabilityBackend {
+    /// Complete ordinary capture sizing, including source creation where needed.
+    /// None retains the admitted ceilings. No submission or reservation is allowed.
+    fn capture_memory_projection(
+        _runtime: &ModelRuntime<Self>,
+        _capture: &eredu_core::capture::AdmittedCapturePlan,
+        _intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
+        _first_prediction: u64,
+    ) -> Result<Option<crate::capture::CaptureUsageProjection>, GenerationForecastError> {
+        Ok(None)
+    }
+
     /// Whether capture/intervention native temporaries are completed and released
     /// before the next prediction. This excludes allocator cache, accounted for
     /// separately. The conservative default uses the cumulative retained limit.

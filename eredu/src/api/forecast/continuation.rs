@@ -10,6 +10,9 @@ pub use eredu_runtime::memory_forecast::{
 /// cannot be extrapolated by changing `request.max_output_tokens` alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuationForecast {
+    /// Horizon-specific capture geometry and charged history, when instrumented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureMemoryPlan>,
     /// Total and additional continuation peaks, with no loading/prefill phases.
     pub estimate: GenerationMemoryEstimate,
     /// Physical pools, budgets and calibrated decode geometry used by the estimate.
@@ -105,9 +108,17 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     // Without finer attribution, cover the allowance in each separate pool.
     add_retention(&mut forecast.request, bound,
         "current sampler/pending input plus future sampling storage; conservative per-pool allowance", false)?;
+    let mut capture_plan = None;
     if let Some(capture) = B::capture_run(state) {
-        eredu_runtime::memory_forecast::apply_capture_memory_bound(
-            &mut forecast.request,
+        let first = B::sampling_prediction(sampling);
+        let projection = B::capture_memory_projection(
+            runtime,
+            capture.plan(),
+            capture.intervention_plan(),
+            first,
+        )?;
+        let mut plan = CaptureMemoryPlan::new(
+            &forecast.request,
             capture.plan(),
             capture.intervention_plan(),
             trace.unwrap_or(TraceLimits {
@@ -115,7 +126,12 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
                 total_bytes: 0,
             }),
             B::capture_transforms_complete_per_step(runtime),
-        )?;
+            projection,
+        );
+        plan.first_prediction = first;
+        plan.inherited_usage = capture.cumulative_usage();
+        plan.apply(&mut forecast.request, additional_tokens)?;
+        capture_plan = Some(plan);
     } else if let Some(trace) = trace {
         add_retention(
             &mut forecast.request,
@@ -125,6 +141,7 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
         )?;
     }
     let mut result = ContinuationForecast {
+        capture: capture_plan,
         estimate: estimate_continuation_memory(&forecast.request, &profile.plan)?,
         request: forecast.request,
         continuation: profile.plan,

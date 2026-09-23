@@ -10,6 +10,22 @@ use eredu_runtime::memory_forecast::{
 };
 
 impl GenerationForecastBackend for MockBackend {
+    fn capture_memory_projection(
+        _: &ModelRuntime<Self>,
+        capture: &eredu_core::capture::AdmittedCapturePlan,
+        intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
+        first_prediction: u64,
+    ) -> Result<Option<eredu_runtime::capture::CaptureUsageProjection>, GenerationForecastError>
+    {
+        if intervention.is_some_and(|p| !p.plan().operations.is_empty()) {
+            return Ok(None);
+        }
+        eredu_runtime::capture::project_capture_usage(capture, first_prediction, |shape, _, _| {
+            observed_mock::cost(shape).map(Some)
+        })
+        .map_err(|e| CapabilityError::Observation(e.to_string()).into())
+    }
+
     fn loaded_memory_profile(
         _: &ModelRuntime<Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
@@ -444,7 +460,7 @@ fn controlled_preparation_forecast_matches_ordinary_and_capture_uses_every_row()
 }
 
 #[test]
-fn top_k_and_intervention_forecasts_use_admitted_limits_without_consuming_them() {
+fn captures_use_geometry_and_interventions_keep_limits_without_consuming_them() {
     use eredu::api::TraceLimits;
     use eredu_core::capture::CaptureTransform;
     let (model, chat, settings) = setup();
@@ -467,8 +483,7 @@ fn top_k_and_intervention_forecasts_use_admitted_limits_without_consuming_them()
         .generation_peak
         .upper_bytes
         .unwrap();
-    // The default backend fact permits cross-step native overlap, hence uses
-    // cumulative retained bytes even when the per-step allowance is smaller.
+    // Raising already sufficient quotas cannot inflate a geometry projection.
     plan.limits.cumulative.retained_bytes += 1234;
     plan.limits.cumulative.host_bytes += 5678;
     let larger = model
@@ -482,8 +497,31 @@ fn top_k_and_intervention_forecasts_use_admitted_limits_without_consuming_them()
             .generation_peak
             .upper_bytes
             .unwrap(),
-        peak + 1234 + 5678
+        peak
     );
+    let short = forecast.with_max_output_tokens(1).unwrap();
+    assert!(
+        short.request.domains[0].retained_input.upper_bytes
+            < forecast.request.domains[0].retained_input.upper_bytes
+    );
+    let restored = short
+        .with_max_output_tokens(forecast.request.max_output_tokens.unwrap())
+        .unwrap();
+    assert_eq!(restored.request, forecast.request);
+    let wire = serde_json::to_string(&forecast).unwrap();
+    let decoded: eredu::api::GenerationForecast = serde_json::from_str(&wire).unwrap();
+    assert_eq!(
+        decoded.with_max_output_tokens(1).unwrap().request,
+        short.request
+    );
+    assert!(forecast
+        .with_max_output_tokens(100)
+        .unwrap()
+        .request
+        .domains[0]
+        .retained_input
+        .detail
+        .contains("admitted-limit fallback"));
     let intervened = model
         .prepare_intervened_chat(
             &chat,

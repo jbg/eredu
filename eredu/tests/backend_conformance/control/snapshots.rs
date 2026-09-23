@@ -822,6 +822,19 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
         .forecast_remaining_generation(3, &Default::default())
         .unwrap();
     assert_eq!(restored.continuation, forecast.continuation);
+    let original_capture = forecast.capture.as_ref().unwrap();
+    let restored_capture = restored.capture.as_ref().unwrap();
+    assert_eq!(original_capture.first_prediction, 1);
+    assert_eq!(
+        restored_capture.first_prediction,
+        original_capture.first_prediction
+    );
+    // Replaying after restore can leave the already delivered records with the
+    // caller. Those charged host/native reservations are never refunded; encoded
+    // records still fit inside the independently retained trace allowance.
+    let original_usage = original_capture.inherited_usage;
+    let restored_usage = restored_capture.inherited_usage;
+    assert!(restored_usage.captures > original_usage.captures);
     assert_eq!(
         restored.request.domains[0]
             .retained_input
@@ -833,6 +846,10 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
             .upper_bytes
             .unwrap()
             + transport
+            + restored_usage.host_bytes
+            - original_usage.host_bytes
+            + restored_usage.retained_bytes
+            - original_usage.retained_bytes
     );
 
     let mut branch = run
