@@ -29,10 +29,11 @@ pub(in crate::composition::mlx::replicated_text) fn collect_module<M: Parameteri
             // A partition or independent parameter bank owns this slot.
             continue;
         };
-        let materialized = binding_metadata(binding, bindings, store)?;
+        let (materialized, backing) = binding_metadata(binding, bindings, store)?;
         output.push(PreparedParameterSlot {
             parameter,
             materialized,
+            backing: Some(backing),
             location: location.clone(),
         });
     }
@@ -43,7 +44,7 @@ fn binding_metadata<'a>(
     mut binding: &'a WeightBinding,
     bindings: &'a [WeightBinding],
     store: &dyn CheckpointSource,
-) -> Result<RecipeMetadata, Error> {
+) -> Result<(RecipeMetadata, String), Error> {
     let mut remaining = bindings.len();
     while let Some(owner) = binding.alias_of() {
         if remaining == 0 {
@@ -64,9 +65,10 @@ fn binding_metadata<'a>(
     let recipe = binding.recipe().cloned().unwrap_or_else(|| {
         DerivedWeightRecipe::source(binding.checkpoint_key(), binding.selection().clone())
     });
-    recipe
+    let metadata = recipe
         .infer(store)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    Ok((metadata, binding.name().to_owned()))
 }
 
 pub(super) fn collect<A, S>(

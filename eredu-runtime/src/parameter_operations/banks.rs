@@ -97,6 +97,7 @@ pub fn prepare_bank_parameter_slots(
             slot: PreparedParameterSlot {
                 parameter: (*parameter).clone(),
                 materialized,
+                backing: None,
                 location: PreparedParameterLocation::Bank { bank, unit },
             },
             members,

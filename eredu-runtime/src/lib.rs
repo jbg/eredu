@@ -32,6 +32,8 @@ pub mod execution;
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
 pub mod execution_control;
 pub mod execution_plan;
+/// Descriptions derived from retained ordinary execution and materialization contracts.
+pub mod execution_resources;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;

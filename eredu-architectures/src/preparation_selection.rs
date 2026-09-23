@@ -733,6 +733,8 @@ pub(crate) mod tests {
 
     use super::*;
 
+    mod resource_descriptions;
+
     #[derive(Default)]
     struct IndependentCounters {
         preparation_queries: Cell<usize>,

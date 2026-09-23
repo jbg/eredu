@@ -4,6 +4,23 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-23 — Resources derived from ordinary execution contracts
+
+Selected/prepared text contracts and retained runtime sessions now expose
+`describe_prepared_resources`. Parameter outputs use retained recipe geometry and
+actual binding sharing; state uses the selected local layout, dtype, conditional
+presence and nonlinear prefix geometry. Missing native capacities, mechanism
+scratch, paged/frame-local state decomposition and other unimplemented resources
+remain explicit. The typed query is hypothetical prepared sizing, not a live
+session observation. Existing forecast APIs and wire records are unchanged.
+
+Backend implementors constructing `PreparedParameterSlot` must supply its new
+`backing` field: the canonical output binding name within the materialization
+batch, or `None` when unavailable/aggregate. Checkpoint keys or logical aliases
+are not physical backing proof. MLX records its actual binding-plan identity;
+aggregate bank slots keep `None`. Kernel memory contracts, lifetime composition
+and embedded prediction forecasting remain subsequent phases.
+
 ## 2026-09-23 — Neutral execution resource descriptions
 
 `eredu_core::resources` adds a backend-neutral contract for parameter storage,

@@ -227,6 +227,12 @@ pub struct PreparedParameterSlot {
     pub parameter: eredu_nn::ParameterMetadata,
     /// Exact physical output metadata of the retained binding recipe.
     pub materialized: eredu_checkpoint::recipe::RecipeMetadata,
+    /// Canonical binding output within this materialization batch, after resolving
+    /// actual binding aliases. This is not a checkpoint key or logical parameter
+    /// alias. All static roles share one batch; units and prediction modules have
+    /// independent batches. `None` means sharing/backing decomposition is unknown
+    /// (including bank catalogs that aggregate independently acquired members).
+    pub backing: Option<String>,
     /// Owner through which this slot is materialized.
     pub location: PreparedParameterLocation,
 }

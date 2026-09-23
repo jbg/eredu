@@ -3840,6 +3840,9 @@ pub(crate) fn placement_is_compatible(
 
 #[cfg(test)]
 mod tests {
+    mod resource_producers {
+        include!("execution_resources/tests.rs");
+    }
     use super::*;
     use crate::{
         ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,

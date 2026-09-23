@@ -4218,6 +4218,22 @@ impl IndependentAdmissionAdapter {
     }
 }
 
+fn prepared_resource_query() -> eredu_runtime::execution_resources::PreparedResourceQuery {
+    use eredu_core::{resources::ResourceIdentity, Observed};
+    eredu_runtime::execution_resources::PreparedResourceQuery {
+        scope: ResourceIdentity {
+            scope: "neutral-session-fixture".into(),
+            key: "target".into(),
+        },
+        batch_size: 1,
+        prefix_positions: 5,
+        additional_positions: 3,
+        device_pool: Observed::Unavailable {
+            reason: "neutral fixture has no native physical pool".into(),
+        },
+    }
+}
+
 #[test]
 fn production_replicated_text_constructor_executes_reference_mechanisms() {
     for residency in [
@@ -4267,6 +4283,22 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
             &(),
         )
         .unwrap();
+
+        let before_description = counters.snapshot();
+        let described = session
+            .describe_prepared_resources(&prepared_resource_query())
+            .unwrap();
+        assert!(described.allocations.iter().any(|allocation| allocation
+            .uses
+            .iter()
+            .any(|usage| usage.role == eredu_core::resources::ResourceRole::MutableState)));
+        assert_eq!(
+            described,
+            session
+                .describe_prepared_resources(&prepared_resource_query())
+                .unwrap()
+        );
+        assert_eq!(counters.snapshot(), before_description);
 
         let expected_policy_counts = if residency.is_fully_resident() {
             (1, 0)
@@ -5029,6 +5061,12 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         Strategy,
     >(binding, mechanisms, Strategy::new())
     .unwrap();
+    // Retained rank-local state ownership, not the global selected layout,
+    // determines whether state appears in a prepared resource description.
+    let described = stateless_session
+        .describe_prepared_resources(&prepared_resource_query())
+        .unwrap();
+    assert!(described.allocations.is_empty());
     assert!(
         stateless_session
             .report()

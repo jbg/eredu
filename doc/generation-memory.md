@@ -10,8 +10,8 @@ estimation being available.
 `eredu_core::resources` is the additive foundation for deriving future forecasts
 from ordinary execution contracts. It currently describes resources only; it does
 not change existing forecasts or add embedded prediction coverage. Resource
-producers, mechanism sizing and generic lifetime/peak composition remain separate
-implementation phases.
+producers now derive parameter/state facts from ordinary preparation; mechanism
+sizing and generic lifetime/peak composition remain separate implementation phases.
 
 A `ResourceDescription` records the current context and requested horizon as named
 logical extents, with fixed or evaluated context-dependent resource sizes. For
@@ -40,6 +40,53 @@ Descriptions carry no allocation authority, resident credit, lifetime ordering o
 fit verdict, and summing their entries is not a peak calculation. Producing one
 must not advance or synchronize execution or consume admission budgets. Existing
 `GenerationMemoryEstimate` reports retain their current format and behavior.
+
+`eredu_runtime::execution_resources::PreparedResourceQuery` gives an execution
+instance namespace, batch extent, hypothetical persisted prefix, additional
+positions, and an optional authoritative device-pool observation. Call
+`describe_prepared_resources` on the selected realization, prepared construction
+contract, or retained `ReplicatedTextSession`. These queries describe prepared
+geometry at the supplied prefix; they do not observe an installed session or
+replace the live continuation outlook API.
+
+The retained-session path reads ordinary `PreparedParameterSlot` metadata: exact
+recipe output bytes, materialization location and canonical binding backing.
+Actual binding aliases share one entry with several logical uses. Independent
+materialization batches, copies and quantization companions stay separate.
+Checkpoint aliases and shared source keys do not prove sharing. Cold selection
+without exact prepared output facts reports named missing parameters. Aggregate
+bank-member catalogs and prediction modules remain explicit gaps, as do missing
+slot metadata and ambiguous physical backing. Bounded weight residency does not
+infer that all copies occupy one pool.
+
+State comes from `SelectedStateRealization`, including local component shape,
+selected storage dtype, conditional presence and persistent segment offsets.
+The shared `StateComponentPolicy` element evaluator covers full prefix ranges,
+including quotient/remainder pooling shapes whose interior maximum exceeds both
+endpoints. For mixed nonlinear axes the upper end can conservatively combine
+dimension maxima that occur at different positions. Sliding attention preserves
+the interval from visible-window payload to full-prefix retention until its
+storage mechanism supplies a tighter fact. Frame-local state needs a frame
+horizon, and paged state needs block/tier decomposition; both remain named gaps.
+
+Exact logical payload does not establish native allocation capacity. Capacity,
+alignment, replacement copies, mechanism scratch, cached conversions and retained
+outputs remain unknown; descriptions name missing execution-unit and static-module
+contracts. They are always partial for the complete execution. No new fit verdict
+or embedded prediction support is enabled by these producers. They add no
+family-specific forecasting dependencies or calibration constants; legacy
+forecast projection paths remain until their migration.
+
+
+Neutral tests derive descriptions from ordinary Llama, LFM2, routed Qwen and
+sliding-window Mistral selections, including queries after checkpoint files are
+removed. Session conformance checks preserve materialization, state-allocation and
+execution counters and distinguish local stateless partitions. Reproduce with:
+
+```sh
+cargo test -p eredu-core -p eredu-runtime
+cargo test -p eredu-architectures --lib resource_descriptions
+```
 
 ## CLI
 

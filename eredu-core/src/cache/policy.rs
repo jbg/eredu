@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::AttentionPolicy;
 
+mod geometry;
+pub use geometry::StateElementBounds;
+
 /// Representation stored atomically in one cache block.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

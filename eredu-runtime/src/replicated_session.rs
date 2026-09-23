@@ -2281,6 +2281,26 @@ where
         self.mechanisms.prepared_parameter_slots()
     }
 
+    /// Describes hypothetical prepared geometry from this session's retained
+    /// local binding metadata and selected local state. This is not a live-state
+    /// observation: the query supplies the prefix and horizon. No unit is
+    /// acquired, native value inspected, or execution advanced.
+    pub fn describe_prepared_resources(
+        &self,
+        query: &crate::execution_resources::PreparedResourceQuery,
+    ) -> Result<
+        eredu_core::resources::ResourceDescription,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        crate::execution_resources::describe_prepared_resources(
+            &self.selected,
+            self.selected_state.state(),
+            self.prepared_parameter_slots(),
+            self.parameter_declarations(),
+            query,
+        )
+    }
+
     /// Borrows the statically paired unit-execution strategy for generic telemetry.
     pub const fn execution_strategy(&self) -> &D {
         &self.driver

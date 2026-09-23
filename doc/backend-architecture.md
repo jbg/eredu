@@ -6595,8 +6595,33 @@ family-specific configuration that applications must supply.
 
 Producers must observe metadata without submitting, polling, synchronizing or
 advancing execution, allocating execution resources, or consuming budgets.
-Constructing the host description is allowed. This phase adds the contract only:
-ordinary execution topology will supply producers, mechanisms will supply sizing
-facts, and runtime will later own lifetime/overlap composition and fit policy.
-No family imports forecast types or owns calibration constants. Existing forecast
-records and estimation paths are unchanged.
+Constructing the host description is allowed. Runtime `execution_resources`
+producers read the retained ordinary selection, prepared parameter outputs and
+local selected state. `describe_prepared_resources` is available on selected and
+prepared text contracts and the generic retained text session. Its typed query
+describes hypothetical prepared geometry, not an observation of current live
+state. The existing continuation outlook is still the live-state operation.
+
+`PreparedParameterSlot::backing` retains the canonical output of the actual
+materialization binding plan after resolving binding aliases. Static roles share
+the static batch, while execution units and prediction modules have separate
+materialization owners. MLX retains this fact while inferring its ordinary binding
+recipe metadata; describing resources never reruns inference or reads a payload.
+Logical parameter aliases and checkpoint names cannot establish physical sharing.
+An aggregate bank slot has no single backing identity and remains incomplete.
+This ordinary materialization metadata is also suitable for neutral backends.
+
+Core `StateComponentPolicy` owns checked element geometry at a prefix and across
+an inclusive prefix interval. Runtime applies the selected native scalar width,
+local state layout and segment offsets without redispatching on a family.
+Conditional presence and nonlinear quotient/remainder dimensions retain interval
+bounds; frame-local horizons and paged backing decomposition stay explicitly
+missing. Sliding visibility does not prove physical history truncation. Resource
+capacity is unknown until an implementation contract supplies allocation facts.
+
+Selected execution-unit/static identities name missing workspace and retention
+contracts. Mechanisms will supply sizing facts, and runtime will later own
+lifetime/overlap composition and fit policy. These producers do not migrate
+forecasting, derive embedded prediction invocations, or calibrate kernels.
+These producers add no family-specific forecasting dependencies or calibration
+constants. Existing forecast records and legacy estimation paths are unchanged.
