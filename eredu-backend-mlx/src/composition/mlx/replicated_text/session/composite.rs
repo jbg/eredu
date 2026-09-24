@@ -1001,6 +1001,16 @@ where
         ))
     }
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.session.trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<
@@ -1311,6 +1321,16 @@ where
         + 'static,
     P: 'static,
 {
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.session.trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<

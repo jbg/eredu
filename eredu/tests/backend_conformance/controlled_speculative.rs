@@ -738,3 +738,95 @@ fn conversion_retention_queries_preserve_speculative_proposals_and_budgets() {
         assert_eq!(committed, output.token_ids());
     }
 }
+
+#[test]
+fn controlled_speculative_trim_preserves_canonical_state_and_rejects_transactions() {
+    use eredu_core::residency::ParameterConversionTrimError;
+    for external in [false, true] {
+        let (_, chat, settings) = setup();
+        let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+        conversion_retention::retain_fixture(&runtime);
+        let mut model = unicode_model_with_runtime(None, 64, QWEN_TEMPLATE, runtime);
+        let mut drafter = MockDrafter {
+            retention: Some(conversion_retention::budget(&Default::default())),
+        };
+        let make_request = |drafting| PreparedChatSpeculativeGenerationRequest {
+            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+            drafting,
+            settings,
+            options: Default::default(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        };
+        let mut baseline_drafter = MockDrafter::default();
+        let baseline = model
+            .generate_prepared_chat_speculative(make_request(if external {
+                SpeculativeDraft::External(&mut baseline_drafter)
+            } else {
+                SpeculativeDraft::Embedded
+            }))
+            .unwrap();
+        let mut rejected = false;
+        let mut trimmed = false;
+        let output = model
+            .with_controlled_chat_speculative(
+                make_request(if external {
+                    SpeculativeDraft::External(&mut drafter)
+                } else {
+                    SpeculativeDraft::Embedded
+                }),
+                options(),
+                |session| {
+                    assert!(matches!(
+                        session.trim_parameter_conversions(),
+                        Err(ParameterConversionTrimError::NotQuiescent)
+                    ));
+                    let mut sequence = 0;
+                    while let Some(step) = session.step()? {
+                        assert_eq!(step.sequence, sequence);
+                        sequence += 1;
+                        assert_eq!(step.epoch, 0);
+                        let tokens = session.token_ids().to_vec();
+                        let snapshots = session.snapshot_usage();
+                        let timing = session.timing();
+                        if session.can_snapshot() {
+                            let snapshot = session.snapshot()?;
+                            let saved_usage = session.snapshot_usage();
+                            let first = session.trim_parameter_conversions().unwrap();
+                            let second = session.trim_parameter_conversions().unwrap();
+                            assert_eq!(
+                                first.target[0].released_payload_bytes,
+                                if trimmed { 0 } else { 16 }
+                            );
+                            assert_eq!(second.target[0].released_payload_bytes, 0);
+                            assert_eq!(first.target[0].remaining.retained_payload_bytes, 0);
+                            assert_eq!(second.target[0].remaining, first.target[0].remaining);
+                            assert_eq!(first.external_drafter.is_some(), external);
+                            assert_eq!(session.snapshot_usage(), saved_usage);
+                            assert_eq!(session.token_ids(), tokens);
+                            assert_eq!(session.timing(), timing);
+                            session.release_snapshot(&snapshot)?;
+                            trimmed = true;
+                        } else if matches!(
+                            step.status,
+                            Status::ReadyToSubmitVerification | Status::TargetVerificationInFlight
+                        ) {
+                            assert!(matches!(
+                                session.trim_parameter_conversions(),
+                                Err(ParameterConversionTrimError::NotQuiescent)
+                            ));
+                            assert_eq!(session.snapshot_usage(), snapshots);
+                            assert_eq!(session.token_ids(), tokens);
+                            rejected = true;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(output.token_ids(), baseline.token_ids());
+        assert!(trimmed);
+        assert!(rejected);
+    }
+}

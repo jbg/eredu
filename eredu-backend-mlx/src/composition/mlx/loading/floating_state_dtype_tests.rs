@@ -678,7 +678,7 @@ fn loaded_conversion_retention_policy_reaches_native_residency() {
         Policy::Bounded { max_bytes: 17 },
         Policy::Unlimited,
     ] {
-        let runtime = load(Some(policy));
+        let mut runtime = load(Some(policy));
         let observation = MlxBackend::parameter_conversion_retention(&runtime).unwrap();
         let group = &observation.value().unwrap()[0];
         assert_eq!(group.policy.value().unwrap().requested, policy);
@@ -693,6 +693,16 @@ fn loaded_conversion_retention_policy_reaches_native_residency() {
                 .parameter_conversion_retention,
             observation
         );
+        for _ in 0..2 {
+            let trimmed = runtime.trim_parameter_conversions().unwrap();
+            assert_eq!(trimmed[0].group, group.group);
+            assert_eq!(trimmed[0].released_claims, 0);
+            assert_eq!(trimmed[0].remaining.retained_payload_bytes, 0);
+            assert_eq!(
+                MlxBackend::parameter_conversion_retention(&runtime).unwrap(),
+                observation
+            );
+        }
         assert_eq!(
             MlxBackend::parameter_conversion_retention(&first).unwrap(),
             baseline

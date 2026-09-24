@@ -74,6 +74,17 @@ where
     /// Mechanism failure.
     type Error;
 
+    /// Releases optional conversions at an already settled session boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+        _bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads retention policy and usage without touching state or native work.
     fn parameter_conversion_retention(
         &self,
@@ -3653,6 +3664,18 @@ where
     /// Returns the prepared-input identity associated with the currently committed prompt state.
     pub const fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
         self.committed_prompt_input_identity.as_ref()
+    }
+
+    /// Releases shared target/prediction conversion claims without changing lanes.
+    /// The lending session or speculative driver establishes the settled boundary.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.mechanisms
+            .trim_parameter_conversions(D::bounded_policy(&self.execution))
     }
 
     /// Observes the installed retention budget without touching lane state.

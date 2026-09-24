@@ -134,6 +134,16 @@ impl MlxModel {
         self.executable.effective_model_type()
     }
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    pub(crate) fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.executable.erased_mut().trim_parameter_conversions()
+    }
+
     /// Reads load-selected retention budgets without touching execution state.
     pub(crate) fn parameter_conversion_retention(
         &self,

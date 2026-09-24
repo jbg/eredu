@@ -554,6 +554,16 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     /// Optional component telemetry.
     type Telemetry: SpeculativeTelemetry;
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads the target budget shared with embedded prediction owners without
     /// polling, settling, or touching request state.
     fn parameter_conversion_retention(
@@ -1087,6 +1097,21 @@ where
     type TargetCache = EmbeddedPredictionCache<S, P::LaneState>;
     type PredictionCache = EmbeddedPredictionDraftCache<P::LaneState>;
     type Telemetry = N::Telemetry;
+
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.session.trim_parameter_conversions().map(|target| {
+            eredu_core::residency::ExecutionConversionRetentionTrimReport {
+                target,
+                external_drafter: None,
+            }
+        })
+    }
 
     fn parameter_conversion_retention(
         &self,
@@ -1771,6 +1796,14 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
         &mut self,
         plan: AdmittedSpeculativeActivations,
     ) -> Result<(), SpeculativeControlError>;
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    >;
+
     /// Reads shared retention budgets without touching a lane or native work.
     fn parameter_conversion_retention(
         &self,
@@ -1942,6 +1975,16 @@ where
     ) -> Result<(), SpeculativeControlError> {
         SpeculativeExecutor::readmit_activation_interventions(self, plan)
     }
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        SpeculativeExecutor::trim_parameter_conversions(self)
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<
@@ -2283,6 +2326,16 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
         self.inner.readmit_activation_interventions(plan)
     }
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.inner.trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<
@@ -2582,6 +2635,16 @@ where
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
+
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.strategy.trim_parameter_conversions()
+    }
 
     fn parameter_conversion_retention(
         &self,

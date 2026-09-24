@@ -1092,8 +1092,7 @@ optional conversions. Multi-rank native TP/PP/EP/DP construction reports typed
 unsupported retention eligibility and effective disabled policy, since the local
 controller cannot coordinate reservations across processes. This rejects retention
 only; ordinary and controlled inference remain available through temporary casts.
-Explicit settled-boundary trimming and its controlled-session operation contract
-remain later retention-plan work.
+Explicit trimming uses the settled-boundary contract below.
 
 
 ### Conversion retention observations
@@ -1112,4 +1111,29 @@ external-drafter scopes; embedded prediction remains in the target group. Querie
 never settle pending submissions, allocate execution resources, populate caches,
 change tokens or RNG, or consume capture, snapshot, transport or copy budgets.
 Missing backend observations remain unsupported or unavailable rather than zero.
-There is no live limit setter or trimming operation in this phase.
+There is no live limit setter.
+
+### Trimming retained parameter conversions
+
+`LoadedModel::trim_parameter_conversions()` first uses ordinary synchronization to
+establish healthy completion, then releases optional conversion claims without
+resetting the request. Controlled ordinary and speculative sessions expose the
+same operation through their shared execution drivers. They require a canonical
+completed, drained boundary; pending native work or speculative transactions
+produce typed `ParameterConversionTrimError::NotQuiescent` rather than being
+settled, committed or rolled back implicitly. Unsupported backends return a typed
+`Unsupported` error; native failures retain their source through `BackendFailure`.
+
+Trimming preserves committed tokens, pending input, cache frontiers, sampling/RNG,
+epochs and capture, transport, snapshot, fork and copy accounting. Existing
+snapshots and branches remain valid. Embedded prediction participates in its
+target's group; separately loaded external drafters retain separate result scopes.
+The same backend claim-release operation serves ordinary and controlled runs.
+
+Repeated trimming is idempotent and empty retention stays empty. Eligible source
+bindings remain registered, so later inference may repopulate within the original
+load-selected cap. Parameter replacement still retires obsolete bindings and is
+not a trim. Reports describe released claims and remaining admission usage, not
+bytes returned to the OS. Other owners or native graphs can retain backing;
+allocator-cache flushing is a separate operation. Ordinary reset continues to
+preserve retained conversions.

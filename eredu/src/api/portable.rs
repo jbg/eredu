@@ -329,7 +329,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     /// Settles prior work and clears request state for a fresh request.
     ///
-    /// Retains loaded weights, tokenizer, model identity and execution placement.
+    /// Retains loaded weights, admitted parameter conversions, tokenizer, model identity
+    /// and execution placement.
     /// Success guarantees fresh-session behavior for the next generation with
     /// the same prompt and configuration. An error does not establish safe reuse.
     /// Failures use the same [`eredu_core::BackendFailure`] for every backend.
@@ -492,5 +493,20 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Returns true when `id` is a configured EOS token id.
     pub fn is_eos_token(&self, id: u32) -> bool {
         self.eos_token_ids.contains(&id)
+    }
+}
+
+impl<B: eredu_core::ModelCapabilityBackend> LoadedModel<B> {
+    /// Settles submitted work and releases optional parameter conversions while
+    /// preserving loaded weights and request state. Future inference can retain
+    /// conversions again within the selected policy. Reset preserves conversions;
+    /// this operation neither flushes allocator caches nor promises RSS reduction.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.runtime.trim_parameter_conversions()
     }
 }

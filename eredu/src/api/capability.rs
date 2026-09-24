@@ -117,3 +117,32 @@ impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRet
         })
     }
 }
+
+impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionTrimmer>
+    super::PlannedModel<B, D>
+{
+    /// Releases optional conversions for the target and separately loaded drafter.
+    /// Each participant establishes its ordinary settled boundary; no request
+    /// state, sampling state or allocator-cache policy is changed.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        let (model, drafting) = self.parts_mut();
+        let target = model.trim_parameter_conversions()?;
+        let external_drafter = match drafting {
+            eredu_core::RealizedDrafting::External(draft) => {
+                Some(draft.trim_parameter_conversions()?)
+            }
+            _ => None,
+        };
+        Ok(
+            eredu_core::residency::ExecutionConversionRetentionTrimReport {
+                target,
+                external_drafter,
+            },
+        )
+    }
+}

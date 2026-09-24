@@ -87,6 +87,16 @@ pub trait AutoregressiveMechanisms {
     }
     /// Estimates installed state without allocating a checkpoint or issuing copies.
     fn estimate_state(state: &Self::State) -> Option<SnapshotEstimate>;
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        _model: &mut Self::Model,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Observes one model-scoped budget without touching state or native work.
     fn parameter_conversion_retention(
         _model: &Self::Model,
@@ -366,6 +376,21 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         let seed = M::checkpoint(&draft)?;
         cache.draft = draft;
         Ok(SpeculativeCommit::new(seed, replayed))
+    }
+
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Ok(
+            eredu_core::residency::ExecutionConversionRetentionTrimReport {
+                target: M::trim_parameter_conversions(self.target)?,
+                external_drafter: Some(M::trim_parameter_conversions(self.draft)?),
+            },
+        )
     }
 
     fn parameter_conversion_retention(

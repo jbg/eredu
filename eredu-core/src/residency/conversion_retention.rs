@@ -174,7 +174,7 @@ pub struct ParameterConversionRetentionReport {
 
 /// Result of releasing optional conversion-retention claims at a settled boundary.
 ///
-/// This describes a future trim operation; it does not authorize settlement.
+/// This describes an explicit trim operation; it does not authorize settlement.
 /// Pending controlled transactions require the operation's typed rejection unless
 /// its submission/completion contract explicitly permits settlement. Ordinary
 /// reset retains admitted conversions. Trim preserves source parameters, request
@@ -245,3 +245,37 @@ pub fn unreported_parameter_conversion_retention(
 
 #[cfg(test)]
 mod tests;
+
+/// Failure to release optional conversions at a healthy settled boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ParameterConversionTrimError {
+    /// This implementation has no conversion trimming mechanism.
+    #[error("parameter conversion trimming is unsupported")]
+    Unsupported,
+    /// Native work or a speculative transaction remains pending.
+    #[error("parameter conversion trimming requires a canonical settled boundary")]
+    NotQuiescent,
+    /// Native failure, retaining its original source.
+    #[error(transparent)]
+    Backend(#[from] crate::BackendFailure),
+}
+
+/// Release results for the independent participants of one composed execution.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionConversionRetentionTrimReport {
+    /// Target, including shared embedded prediction owners.
+    pub target: Vec<ParameterConversionRetentionTrimReport>,
+    /// Separately loaded drafter, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_drafter: Option<Vec<ParameterConversionRetentionTrimReport>>,
+}
+
+/// Settled-boundary release for a separately loaded drafting execution.
+/// Implementations preserve request state and retain unresolved native resources
+/// on failure; they must never infer completion from a polling error.
+pub trait ParameterConversionRetentionTrimmer {
+    /// Settles ordinary submitted work when supported, then releases caller claims.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<Vec<ParameterConversionRetentionTrimReport>, ParameterConversionTrimError>;
+}

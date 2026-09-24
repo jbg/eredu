@@ -55,6 +55,22 @@ where
     type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
 
+    fn trim_parameter_conversions(
+        target: &mut Self::Target,
+        _assistant: &mut Self::Assistant,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        // Auxiliary assistants have no registered retained-conversion owners.
+        Ok(
+            eredu_core::residency::ExecutionConversionRetentionTrimReport {
+                target: target.trim_parameter_conversions()?,
+                external_drafter: Some(Vec::new()),
+            },
+        )
+    }
+
     fn parameter_conversion_retention(
         target: &Self::Target,
         _assistant: &Self::Assistant,

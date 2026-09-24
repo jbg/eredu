@@ -1357,6 +1357,21 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
     }
 }
 
+impl<B: ModelCapabilityBackend> ModelRuntime<B> {
+    /// Settles ordinary work and releases optional parameter-conversion claims.
+    /// Preserves source weights and request state; allocator caches are separate.
+    /// Controlled drivers use their canonical boundary instead of settling here.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<crate::residency::ParameterConversionRetentionTrimReport>,
+        crate::residency::ParameterConversionTrimError,
+    > {
+        self.synchronize()?;
+        B::trim_parameter_conversions(self)
+    }
+}
+
 impl<B: ModelLoadingBackend> ModelRuntime<B> {
     /// Loads an artifact and creates its sole session on `backend`.
     pub fn load(
@@ -1993,6 +2008,21 @@ pub trait MultimodalPreparationBackend: TextGenerationBackend {
 /// backend's existing opaque prompt type; tensor, stream, allocator, and
 /// executable types remain inside the adapter.
 pub trait ModelCapabilityBackend: TextGenerationBackend {
+    /// Releases this execution's optional conversion-retention claims at an
+    /// already settled boundary. Require healthy, idle submission authority;
+    /// never settle pending controlled transactions or invalidate parameters.
+    /// Preserve request/sampling state, snapshots, epochs and all run budgets.
+    /// Keep eligible bindings available for future bounded admission. Other
+    /// owners and native graphs may keep physical storage alive.
+    fn trim_parameter_conversions(
+        _runtime: &mut ModelRuntime<Self>,
+    ) -> Result<
+        Vec<crate::residency::ParameterConversionRetentionTrimReport>,
+        crate::residency::ParameterConversionTrimError,
+    > {
+        Err(crate::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads load-selected conversion-retention policy and live usage. This must
     /// not allocate execution resources, evaluate, synchronize or mutate state.
     fn parameter_conversion_retention(

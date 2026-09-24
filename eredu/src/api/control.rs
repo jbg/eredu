@@ -1055,6 +1055,28 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 }
 
 impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
+    /// Releases optional conversions at a completed, drained boundary without
+    /// settling pending work. Preserves tokens, sampling state, epochs, snapshots
+    /// and observation budgets. Subsequent inference can repopulate retention.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        use eredu_core::residency::ParameterConversionTrimError;
+        if matches!(
+            self.status(),
+            GenerationStatus::Running | GenerationStatus::Failed
+        ) {
+            return Err(ParameterConversionTrimError::NotQuiescent);
+        }
+        self.state
+            .boundary(&mut self.driver)
+            .map_err(|_| ParameterConversionTrimError::NotQuiescent)?
+            .trim_parameter_conversions()
+    }
+
     /// Read-only model-scoped retention telemetry, shared with ordinary generation.
     /// This query does not settle pending work or change the controlled boundary.
     pub fn parameter_conversion_retention(

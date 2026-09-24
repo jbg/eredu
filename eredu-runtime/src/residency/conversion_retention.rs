@@ -266,6 +266,60 @@ impl ConversionRetentionBudget {
         &self.0.group
     }
 
+    /// Drops the supplied owner's claims atomically with the returned ledger snapshot.
+    /// Aliases outside this batch and other groups remain live. Rejection leaves
+    /// the batch untouched. Native owners must detach paired storage only after
+    /// establishing completion, and prevent concurrent publication during release.
+    pub fn release_claims(
+        &self,
+        claims: &mut Vec<ConversionRetentionClaim>,
+    ) -> Result<
+        eredu_core::residency::ParameterConversionRetentionTrimReport,
+        ConversionRetentionError,
+    > {
+        if claims
+            .iter()
+            .any(|claim| !Arc::ptr_eq(&claim.0.budget, &self.0))
+        {
+            return Err(ConversionRetentionError::ConflictingIdentity);
+        }
+        let mut ledger = lock(&self.0.state);
+        if ledger.reserved != 0 {
+            return Err(ConversionRetentionError::Busy);
+        }
+        let before_claims = ledger.allocations.len() as u64;
+        let before_bytes = ledger.retained;
+        let mut aliases = BTreeMap::<usize, usize>::new();
+        for claim in claims.iter() {
+            *aliases.entry(Arc::as_ptr(&claim.0) as usize).or_default() += 1;
+        }
+        for claim in claims.iter() {
+            if aliases[&(Arc::as_ptr(&claim.0) as usize)] == Arc::strong_count(&claim.0) {
+                claim.0.release_locked(&mut ledger);
+            }
+        }
+        let remaining = ParameterConversionRetentionUsage {
+            retained_claims: ledger.allocations.len() as u64,
+            retained_payload_bytes: ledger.retained,
+            reserved_payload_bytes: ledger.reserved,
+            retained_backing_capacity_bytes: Observed::unavailable(
+                "native backing capacity is not observed",
+            ),
+        };
+        let report = eredu_core::residency::ParameterConversionRetentionTrimReport {
+            group: self.group().clone(),
+            released_claims: before_claims - remaining.retained_claims,
+            released_payload_bytes: before_bytes - remaining.retained_payload_bytes,
+            remaining,
+            reclaimed_backing_bytes: Observed::unavailable(
+                "other owners and native graphs may retain backing",
+            ),
+        };
+        drop(ledger);
+        claims.clear();
+        Ok(report)
+    }
+
     /// Coherent read-only accounting; never populates, settles or trims storage.
     pub fn report(&self) -> ParameterConversionRetentionReport {
         let state = lock(&self.0.state);
@@ -506,6 +560,9 @@ struct ClaimInner {
 impl ClaimInner {
     fn release(&self) {
         let mut ledger = lock(&self.budget.state);
+        self.release_locked(&mut ledger);
+    }
+    fn release_locked(&self, ledger: &mut BudgetState) {
         if !self.active.swap(false, Ordering::AcqRel) {
             return;
         }

@@ -38,6 +38,17 @@ where
     type Telemetry = M::Telemetry;
     type Error = M::Error;
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        target: &mut Self::Target,
+        assistant: &mut Self::Assistant,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        M::trim_parameter_conversions(target, assistant)
+    }
+
     fn parameter_conversion_retention(
         target: &Self::Target,
         assistant: &Self::Assistant,
@@ -552,6 +563,17 @@ pub trait ExternalMechanisms: 'static {
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        _target: &mut Self::Target,
+        _assistant: &mut Self::Assistant,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads participant budgets without touching caches or submitted work.
     fn parameter_conversion_retention(
         _target: &Self::Target,
@@ -837,6 +859,16 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        M::trim_parameter_conversions(self.target, self.assistant)
+    }
 
     fn parameter_conversion_retention(
         &self,

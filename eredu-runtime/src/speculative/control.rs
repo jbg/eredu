@@ -159,6 +159,17 @@ impl SpeculativeSnapshotHandle {
 /// require `can_snapshot`; committed blocks are never split into fake token steps.
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
+    /// Releases optional conversions only at a canonical boundary. Pending work
+    /// is rejected without polling, settling, advancing or consuming budgets.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads role-labelled retention budgets, including while native work is pending.
     /// Does not poll, settle, reserve, evaluate, or advance the controlled run.
     fn parameter_conversion_retention(
@@ -531,6 +542,22 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        if self.failed
+            || !self
+                .request()
+                .is_some_and(|request| request.is_control_boundary())
+        {
+            return Err(eredu_core::residency::ParameterConversionTrimError::NotQuiescent);
+        }
+        self.scheduler.executor.trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<eredu_core::residency::ExecutionConversionRetentionReport, SpeculativeControlError>

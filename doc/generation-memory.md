@@ -1923,8 +1923,8 @@ same temporary promotion path, preserving F16/BF16 rounding and logits. There is
 no automatic eviction. Reset preserves admitted copies and parameter publication
 revokes them. The allocator-cache limit remains independent, including at zero.
 The earlier 4,680,843,264-byte experiment describes the preceding unlimited
-behavior, not the new default. Full-checkpoint throughput calibration and
-settled trimming remain later phases of the retention plan.
+behavior, not the new default. Full-checkpoint throughput calibration remains later retention-plan work;
+settled trimming is described below.
 
 Host-layerwise, disk-streamed and explicit device ceilings disable retention.
 Multi-rank native execution also reports typed unsupported eligibility and effective
@@ -1995,7 +1995,8 @@ allocator cache has its own independent allowance. Neither setting bounds total
 memory, transient casts, graph storage, allocator padding or process RSS. Queries
 leave native execution resources, generation state, completion authority and
 observation budgets unchanged. Reset preserves the policy and admitted copies.
-Explicit trimming and forecast capacity arithmetic remain subsequent phases.
+Explicit trimming is described below; forecast capacity arithmetic remains
+subsequent retention-plan work.
 
 
 The residency telemetry document preserves `current_device_bytes` and
@@ -2025,3 +2026,52 @@ cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retenti
 
 These checks validate configuration and telemetry. Full-checkpoint throughput and
 retention-aware forecast calibration remain separate validation phases.
+
+
+### Settled-boundary conversion trimming (2026-09-24)
+
+`LoadedModel::trim_parameter_conversions()` settles submitted work and releases
+optional retained parameter conversions without unloading source weights or
+resetting generation state. Ordinary reset still preserves admitted conversions.
+Controlled ordinary and speculative sessions expose the same operation at their
+canonical completed, drained boundary, with typed rejection of pending work and
+no implicit advancement. Planned executions report target and external-drafter
+results separately; embedded prediction uses the target group.
+
+The result reports released group claims and payload plus remaining claims and
+reservations. Repeated trimming releases zero once the caller has no claims.
+Other owners, snapshots, branches and outstanding native graphs can retain
+physical storage; unobserved backing reclamation remains unknown. Group release
+is not a promise of lower RSS or bytes returned to the OS. Allocator-cache
+flushing remains independent and released backing may enter that cache.
+
+Trimming preserves token history, cache frontiers, pending input, RNG, epochs and
+observation/snapshot/fork accounting. Eligible source bindings remain registered,
+so later inference may retain conversions again within the same load-selected
+cap. Parameter editing invalidates obsolete bindings separately. Live telemetry
+reflects released claims; read-only queries never perform a trim.
+
+Phase 5 regression coverage checks atomic alias release, independent groups,
+idempotence, re-admission, pending reservations, retired bindings and delayed
+publication. Facade conformance compares trimmed continuations with ordinary
+output and retains snapshots and branches while checking sampling, sequence,
+epoch and budget preservation. Native fixtures check live graph references across
+trim, shared backing, re-admission and the loaded-session hook. Reproduce with:
+
+```sh
+cargo test -p eredu-core -p eredu-runtime -p eredu --no-default-features --lib --test portable_facade --test backend_conformance --locked
+cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
+cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
+```
+
+The portable suites passed, including all 111 backend-conformance tests after
+adding controlled speculative trimming. All seven selected native conversion
+tests and the loaded-session integration test passed on this macOS host with
+native device access. The sandbox could not initialize Metal. To fit available
+disk space, native test compilation used `CARGO_INCREMENTAL=0` and
+`--config 'profile.test.package.eredu-backend-mlx.debug=0'`; test behavior was
+unchanged. The MLX build without default features also passed.
+
+Full-checkpoint throughput calibration and native distributed validation remain
+in the later validation phase; these fixtures do not establish total-memory or
+RSS reclamation bounds.

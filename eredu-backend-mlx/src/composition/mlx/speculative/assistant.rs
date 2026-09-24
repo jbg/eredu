@@ -514,3 +514,24 @@ impl eredu_core::residency::ParameterConversionRetentionObserver for MlxDrafter 
 #[cfg(test)]
 #[path = "assistant_recovery_tests.rs"]
 mod recovery_tests;
+
+impl eredu_core::residency::ParameterConversionRetentionTrimmer for MlxDrafter {
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        let mut operation = self
+            .begin_operation()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let result = match &mut operation.payload().execution {
+            DrafterExecution::Autoregressive { model, .. } => model.trim_parameter_conversions(),
+            // These modules never register optional retained conversions.
+            DrafterExecution::Assistant(_) => Ok(Vec::new()),
+        };
+        operation
+            .finish(Ok(result))
+            .map_err(eredu_core::BackendFailure::from_error)?
+    }
+}

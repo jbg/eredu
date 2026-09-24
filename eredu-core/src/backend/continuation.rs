@@ -491,3 +491,17 @@ impl<B: crate::execution_control::NativeTextStateBackend, C: TokenFilterControll
         Ok(())
     }
 }
+
+impl<B: ModelCapabilityBackend, C: TokenFilterController> TextContinuationBoundary<'_, '_, B, C> {
+    /// Releases optional conversions without advancing or settling this already
+    /// completed and drained continuation. Native authority is checked by the
+    /// same backend hook used after ordinary synchronization.
+    pub fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<crate::residency::ParameterConversionRetentionTrimReport>,
+        crate::residency::ParameterConversionTrimError,
+    > {
+        B::trim_parameter_conversions(self.runtime)
+    }
+}

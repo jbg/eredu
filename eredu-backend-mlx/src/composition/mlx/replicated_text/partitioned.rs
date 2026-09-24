@@ -223,6 +223,27 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
         })
     }
 
+    pub(super) fn trim_parameter_conversions(
+        &self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        let policy = self.inner.lock().map_err(|_| {
+            eredu_core::BackendFailure::from_error(Error::ArchitectureModel(
+                "selected layerwise policy lock was poisoned".into(),
+            ))
+        })?;
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.trim_parameter_conversions()
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.residency_manager().trim_parameter_conversions()
+            }
+        }
+    }
+
     pub(super) fn residency_report(&self) -> Result<ResidencyReport, Error> {
         let policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())

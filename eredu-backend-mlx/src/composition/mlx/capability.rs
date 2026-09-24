@@ -364,6 +364,15 @@ fn add_parameter_observation(
 }
 
 impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
+    fn trim_parameter_conversions(
+        runtime: &mut eredu_core::ModelRuntime<Self>,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        runtime.session_mut().trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         runtime: &ModelRuntime<Self>,
     ) -> Result<

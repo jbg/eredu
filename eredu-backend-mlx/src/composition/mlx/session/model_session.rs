@@ -919,6 +919,23 @@ impl MlxModelSession {
             .take_speculative_activation_error())
     }
 
+    /// Uses ordinary submission authority without resetting request state.
+    pub(crate) fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.ensure_healthy()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        self.authority
+            .borrow()
+            .require_idle()
+            .map_err(|_| eredu_core::residency::ParameterConversionTrimError::NotQuiescent)?;
+        self.with_model_operation(|model| Ok(model.erased_mut().trim_parameter_conversions()))
+            .map_err(eredu_core::BackendFailure::from_error)?
+    }
+
     /// Reads the immutable load policy and live admission ledger without touching state.
     pub(crate) fn parameter_conversion_retention(
         &self,

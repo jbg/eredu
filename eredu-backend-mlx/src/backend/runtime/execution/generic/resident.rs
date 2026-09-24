@@ -44,6 +44,15 @@ impl<U> MlxResidentPolicy<U> {
         Arc::clone(&self.store)
     }
 
+    pub(crate) fn trim_parameter_conversions(
+        &self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        self.residency.trim_parameter_conversions()
+    }
+
     /// Returns current weight-residency accounting.
     pub fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
         self.residency.report().map_err(Into::into)

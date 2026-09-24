@@ -42,6 +42,7 @@ struct NativeConversion {
 }
 struct OwnerBinding {
     budget: ConversionRetentionBudget,
+    epoch: AtomicU64,
     retained: Mutex<Option<(ConversionRetentionClaim, Arc<NativeConversion>)>>,
 }
 struct RegisteredConversion {
@@ -163,6 +164,7 @@ impl ResidentParameterConversions {
             };
             let binding = Arc::new(OwnerBinding {
                 budget: budget.clone(),
+                epoch: AtomicU64::new(0),
                 retained: Mutex::new(None),
             });
             {
@@ -221,6 +223,61 @@ impl Drop for ResidentParameterConversions {
     }
 }
 
+/// Releases this execution group's owners while keeping registrations eligible.
+/// The session authority must be settled before entering this operation.
+pub(crate) fn trim_budget(
+    budget: &ConversionRetentionBudget,
+) -> Result<eredu_core::residency::ParameterConversionRetentionTrimReport, ConversionRetentionError>
+{
+    let registry = registry().lock().unwrap_or_else(|error| error.into_inner());
+    let entries: Vec<_> = registry.values().filter_map(Weak::upgrade).collect();
+    let states: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        })
+        .collect();
+    // Holding every native entry prevents publication or new reservations until
+    // detachment and the atomic ledger update have both completed.
+    if budget
+        .report()
+        .usage
+        .value()
+        .expect("exact usage")
+        .reserved_payload_bytes
+        != 0
+    {
+        return Err(ConversionRetentionError::Busy);
+    }
+    let mut claims = Vec::new();
+    let mut arrays = Vec::new();
+    for state in &states {
+        for owner in state.owners.iter().filter_map(Weak::upgrade) {
+            if owner.budget.group() == budget.group() {
+                owner.epoch.fetch_add(1, Ordering::Relaxed);
+                if let Some((claim, value)) = owner
+                    .retained
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    claims.push(claim);
+                    arrays.push(value);
+                }
+            }
+        }
+    }
+    let result = budget.release_claims(&mut claims);
+    drop(states);
+    drop(registry);
+    // Native destruction happens outside admission and registry locks.
+    drop(arrays);
+    result
+}
+
 /// Publication revokes old handles; restoring a source requires fresh registration.
 pub(crate) fn invalidate(weight: &Array) {
     let entry = registry()
@@ -277,7 +334,7 @@ fn promote_with(
     let Some(entry) = entry else {
         return Ok(None);
     };
-    let (publisher, reservation) = {
+    let (publisher, reservation, owners) = {
         let state = entry
             .state
             .lock()
@@ -286,6 +343,19 @@ fn promote_with(
             return Ok(None);
         }
         if let Some(value) = state.value.upgrade() {
+            // Trim preserves eligibility; joining existing shared storage still
+            // requires fresh admission for each previously released owner.
+            for owner in state.owners.iter().filter_map(Weak::upgrade) {
+                if let Ok(ConversionRetentionAdmission::Retained(claim)) =
+                    entry.parameter.reserve(&owner.budget)
+                {
+                    *owner
+                        .retained
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        Some((claim, Arc::clone(&value)));
+                }
+            }
             return Ok(Some(value.array.clone()));
         }
         let Some(admission) = state
@@ -301,7 +371,16 @@ fn promote_with(
         else {
             return Ok(None);
         };
-        admission
+        let owners = state
+            .owners
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|owner| {
+                let epoch = owner.epoch.load(Ordering::Relaxed);
+                (owner, epoch)
+            })
+            .collect::<Vec<_>>();
+        (admission.0, admission.1, owners)
     };
     // The move-only reservation restores capacity on errors or invalidation.
     let value = Arc::new(NativeConversion { array: convert()? });
@@ -327,7 +406,12 @@ fn promote_with(
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some((claim, Arc::clone(&value)));
     state.value = Arc::downgrade(&value);
-    for owner in state.owners.iter().filter_map(Weak::upgrade) {
+    for (owner, epoch) in owners {
+        // Work started by another group before trim must not restore this
+        // owner's released claim when its delayed evaluation publishes.
+        if owner.epoch.load(Ordering::Relaxed) != epoch {
+            continue;
+        }
         if let Ok(ConversionRetentionAdmission::Retained(claim)) =
             entry.parameter.reserve(&owner.budget)
         {
@@ -355,6 +439,100 @@ mod tests {
         budget: &ConversionRetentionBudget,
     ) -> eredu_core::residency::ParameterConversionRetentionUsage {
         budget.report().usage.value().unwrap().clone()
+    }
+
+    #[test]
+    fn trim_is_idempotent_preserves_shared_owners_and_future_admission() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        let weight = fixture(Dtype::Bfloat16, &stream);
+        let make_budget = || {
+            execution_budget(
+                Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }),
+                ParameterConversionRetentionEligibility::Eligible,
+            )
+            .unwrap()
+        };
+        let target = make_budget();
+        let other = make_budget();
+        let mut owner = ResidentParameterConversions::default();
+        let mut shared = ResidentParameterConversions::default();
+        owner.register([&weight], &target).unwrap();
+        shared.register([&weight], &other).unwrap();
+        assert_eq!(trim_budget(&target).unwrap().released_claims, 0);
+        let retained_graph = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        let expected = retained_graph
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let report = trim_budget(&target).unwrap();
+        assert_eq!(
+            (report.released_claims, report.released_payload_bytes),
+            (1, 16)
+        );
+        assert!(report.reclaimed_backing_bytes.value().is_none());
+        assert!(owner.resident_conversions().is_empty());
+        assert_eq!(usage(&other).retained_payload_bytes, 16);
+        assert_eq!(trim_budget(&target).unwrap().released_claims, 0);
+        assert_eq!(
+            retained_graph.evaluated().unwrap().as_slice::<f32>(),
+            expected
+        );
+        let reused = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        assert_eq!(reused.graph_identity(), retained_graph.graph_identity());
+        assert_eq!(usage(&target).retained_payload_bytes, 16);
+        trim_budget(&target).unwrap();
+        trim_budget(&other).unwrap();
+        let fresh = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        assert_eq!(fresh.evaluated().unwrap().as_slice::<f32>(), expected);
+        assert_eq!(usage(&target).retained_payload_bytes, 16);
+        invalidate(&weight);
+        trim_budget(&target).unwrap();
+        assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn trimming_during_other_groups_evaluation_cannot_be_undone_by_late_publication() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        let weight = fixture(Dtype::Float16, &stream);
+        let make_budget = || {
+            execution_budget(
+                Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }),
+                ParameterConversionRetentionEligibility::Eligible,
+            )
+            .unwrap()
+        };
+        let publisher = make_budget();
+        let other = make_budget();
+        let mut first = ResidentParameterConversions::default();
+        let mut second = ResidentParameterConversions::default();
+        first.register([&weight], &publisher).unwrap();
+        second.register([&weight], &other).unwrap();
+        promote_with(&input, &weight, || {
+            assert!(matches!(
+                trim_budget(&publisher),
+                Err(ConversionRetentionError::Busy)
+            ));
+            assert_eq!(
+                trim_budget(&other)
+                    .unwrap()
+                    .remaining
+                    .retained_payload_bytes,
+                0
+            );
+            let converted = weight.as_dtype(Dtype::Float32, &stream)?;
+            safemlx::transforms::eval([&converted])?;
+            Ok(converted)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(usage(&publisher).retained_payload_bytes, 16);
+        assert_eq!(usage(&other).retained_payload_bytes, 0);
+        assert!(second.resident_conversions().is_empty());
+        promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        assert_eq!(usage(&other).retained_payload_bytes, 16);
     }
 
     #[test]

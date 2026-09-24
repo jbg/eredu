@@ -709,6 +709,23 @@ where
         })
     }
 
+    fn trim_parameter_conversions(
+        &mut self,
+        bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        match bounded {
+            Some(policy) => policy.trim_parameter_conversions(),
+            None => self
+                .resident_residency
+                .as_ref()
+                .ok_or(eredu_core::residency::ParameterConversionTrimError::Unsupported)?
+                .trim_parameter_conversions(),
+        }
+    }
+
     fn parameter_conversion_retention(
         &self,
         residency: eredu_runtime::LayerWeightResidency,

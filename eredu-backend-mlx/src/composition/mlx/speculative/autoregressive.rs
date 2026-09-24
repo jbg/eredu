@@ -110,6 +110,16 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         state.native.control_estimate()
     }
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        model: &mut Self::Model,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        model.trim_parameter_conversions()
+    }
+
     fn parameter_conversion_retention(
         model: &Self::Model,
     ) -> Result<

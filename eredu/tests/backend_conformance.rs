@@ -112,6 +112,11 @@ impl Drop for TestDirectory {
 struct MockBackend;
 struct MockSession {
     retention_failure: bool,
+    retention_claims: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<eredu_runtime::residency::conversion_retention::ConversionRetentionClaim>,
+        >,
+    >,
     retention: eredu_runtime::residency::conversion_retention::ConversionRetentionBudget,
     cache_positions: u64,
     authority: eredu_core::SessionAuthority,
@@ -224,6 +229,7 @@ impl BackendProvider for MockBackend {
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
             retention_failure: false,
+            retention_claims: Default::default(),
             retention: model.into_parts().0,
             cache_positions: 0,
             authority: eredu_core::SessionAuthority::new(),
@@ -622,6 +628,30 @@ impl MultimodalPreparationBackend for MockBackend {
 }
 
 impl ModelCapabilityBackend for MockBackend {
+    fn trim_parameter_conversions(
+        runtime: &mut ModelRuntime<Self>,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        use eredu_core::residency::ParameterConversionTrimError;
+        runtime
+            .session()
+            .authority
+            .require_idle()
+            .map_err(|_| ParameterConversionTrimError::NotQuiescent)?;
+        if runtime.session().retention_failure {
+            return Err(eredu_core::BackendFailure::from_error(MockError::Token(999)).into());
+        }
+        let mut claims = runtime.session().retention_claims.lock().unwrap();
+        runtime
+            .session()
+            .retention
+            .release_claims(&mut claims)
+            .map(|report| vec![report])
+            .map_err(|error| eredu_core::BackendFailure::from_error(error).into())
+    }
+
     fn parameter_conversion_retention(
         runtime: &ModelRuntime<Self>,
     ) -> Result<
@@ -946,6 +976,12 @@ struct MockDrafter {
 }
 
 struct MockSpeculativeExecutor {
+    target_retention: eredu_runtime::residency::conversion_retention::ConversionRetentionBudget,
+    target_claims: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<eredu_runtime::residency::conversion_retention::ConversionRetentionClaim>,
+        >,
+    >,
     retention: eredu_core::residency::ExecutionConversionRetentionReport,
     embedded: bool,
     reject_second: bool,
@@ -954,6 +990,50 @@ struct MockSpeculativeExecutor {
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        use eredu_core::residency::*;
+        let trim = |reports: &Observed<Vec<ParameterConversionRetentionReport>>| {
+            reports
+                .value()
+                .into_iter()
+                .flatten()
+                .map(|report| {
+                    let mut remaining = report.usage.value().unwrap().clone();
+                    let released_claims = remaining.retained_claims;
+                    let released_payload_bytes = remaining.retained_payload_bytes;
+                    remaining.retained_claims = 0;
+                    remaining.retained_payload_bytes = 0;
+                    ParameterConversionRetentionTrimReport {
+                        group: report.group.clone(),
+                        released_claims,
+                        released_payload_bytes,
+                        remaining,
+                        reclaimed_backing_bytes: Observed::unavailable(
+                            "mock has no native backing observation",
+                        ),
+                    }
+                })
+                .collect()
+        };
+        let target = self
+            .target_retention
+            .release_claims(&mut self.target_claims.lock().unwrap())
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        self.retention.target = Observed::exact(
+            vec![self.target_retention.report()],
+            "mock execution ledger",
+        );
+        Ok(ExecutionConversionRetentionTrimReport {
+            target: vec![target],
+            external_drafter: self.retention.external_drafter.as_ref().map(trim),
+        })
+    }
+
     fn parameter_conversion_retention(
         &self,
     ) -> Result<
@@ -1503,6 +1583,8 @@ impl SpeculativeGenerationBackend for MockBackend {
         let mut output = visitor
             .run(
                 &mut MockSpeculativeExecutor {
+                    target_retention: runtime.session().retention.clone(),
+                    target_claims: std::sync::Arc::clone(&runtime.session().retention_claims),
                     retention,
                     embedded,
                     reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
@@ -2647,6 +2729,20 @@ fn unicode_model_with_template(
     vocabulary_size: u32,
     template: &str,
 ) -> LoadedModel<MockBackend> {
+    unicode_model_with_runtime(
+        first,
+        vocabulary_size,
+        template,
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+    )
+}
+
+fn unicode_model_with_runtime(
+    first: Option<u32>,
+    vocabulary_size: u32,
+    template: &str,
+    runtime: ModelRuntime<MockBackend>,
+) -> LoadedModel<MockBackend> {
     let mut vocabulary: std::collections::HashMap<String, u32> =
         std::iter::once(("[UNK]".into(), 0))
             .chain((0..vocabulary_size).map(|i| (format!("ordinary_{i}"), i + 1)))
@@ -2670,7 +2766,7 @@ fn unicode_model_with_template(
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
+        runtime,
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

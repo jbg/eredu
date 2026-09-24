@@ -802,6 +802,30 @@ impl ResidencyManager {
         Ok(())
     }
 
+    /// Trims optional conversion claims after the session establishes completion.
+    pub(crate) fn trim_parameter_conversions(
+        &self,
+    ) -> Result<
+        Vec<eredu_core::residency::ParameterConversionRetentionTrimReport>,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        let state = self
+            .lock()
+            .map_err(eredu_core::BackendFailure::from_error)?;
+        let budget = state
+            .control
+            .conversion_retention()
+            .expect("manager selection");
+        crate::backend::nn::parameter_conversion::trim_budget(budget)
+            .map(|report| vec![report])
+            .map_err(|error| match error {
+                eredu_runtime::residency::conversion_retention::ConversionRetentionError::Busy => {
+                    eredu_core::residency::ParameterConversionTrimError::NotQuiescent
+                }
+                error => eredu_core::BackendFailure::from_error(error).into(),
+            })
+    }
+
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
         let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;

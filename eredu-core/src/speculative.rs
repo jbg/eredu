@@ -859,6 +859,16 @@ pub trait SpeculativeExecutor {
         }
     }
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        &mut self,
+    ) -> Result<
+        crate::residency::ExecutionConversionRetentionTrimReport,
+        crate::residency::ParameterConversionTrimError,
+    > {
+        Err(crate::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads load-selected retention budgets without polling, settling, or touching
     /// request state. This is valid even while verification is pending.
     fn parameter_conversion_retention(

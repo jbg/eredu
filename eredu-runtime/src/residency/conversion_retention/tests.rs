@@ -506,3 +506,89 @@ fn publication_racing_invalidation_never_leaves_an_obsolete_live_claim() {
         assert_eq!(usage(&group), (0, 0, 0));
     }
 }
+
+#[test]
+fn trimming_releases_only_supplied_owners_and_readmits_without_invalidating() {
+    let registry = ConversionRetentionRegistry::default();
+    let group = budget(&registry, "target", 16);
+    let other = budget(&registry, "external", 16);
+    let source = registry.parameter(id("source"), 16).unwrap();
+    let claim = reserve(&source, &group)
+        .publish(allocation(&registry, "backing", 16))
+        .unwrap();
+    let shared = claim.clone();
+    let external = reused(&source, &other);
+    let partial = group.release_claims(&mut vec![claim]).unwrap();
+    assert_eq!(partial.released_payload_bytes, 0);
+    assert_eq!(partial.remaining.retained_payload_bytes, 16);
+    let released = group.release_claims(&mut vec![shared]).unwrap();
+    assert_eq!(
+        (released.released_claims, released.released_payload_bytes),
+        (1, 16)
+    );
+    assert_eq!(released.remaining.retained_payload_bytes, 0);
+    assert!(released.reclaimed_backing_bytes.value().is_none());
+    assert_eq!(usage(&other), (1, 16, 0));
+    assert!(external.is_active());
+    assert_eq!(
+        group
+            .release_claims(&mut vec![])
+            .unwrap()
+            .released_payload_bytes,
+        0
+    );
+    let admitted = reused(&source, &group);
+    assert_eq!(usage(&group), (1, 16, 0));
+    assert_eq!(
+        group
+            .release_claims(&mut vec![admitted.clone(), admitted])
+            .unwrap()
+            .released_claims,
+        1
+    );
+    drop(external);
+    let next = reserve(&source, &group)
+        .publish(allocation(&registry, "replacement", 16))
+        .unwrap();
+    source.invalidate();
+    assert_eq!(
+        group
+            .release_claims(&mut vec![next])
+            .unwrap()
+            .released_claims,
+        0
+    );
+    assert!(matches!(
+        source.reserve(&group),
+        Err(ConversionRetentionError::Invalidated)
+    ));
+}
+
+#[test]
+fn trim_rejection_preserves_batch_and_pending_reservation() {
+    let registry = ConversionRetentionRegistry::default();
+    let group = budget(&registry, "target", 32);
+    let source = registry.parameter(id("source"), 16).unwrap();
+    let claim = reserve(&source, &group)
+        .publish(allocation(&registry, "backing", 16))
+        .unwrap();
+    let second = registry.parameter(id("pending"), 16).unwrap();
+    let pending = reserve(&second, &group);
+    let mut batch = vec![claim];
+    assert_eq!(
+        group.release_claims(&mut batch),
+        Err(ConversionRetentionError::Busy)
+    );
+    assert_eq!(batch.len(), 1);
+    assert!(batch[0].is_active());
+    assert_eq!(usage(&group), (1, 16, 16));
+    drop(pending);
+    assert_eq!(
+        group
+            .release_claims(&mut batch)
+            .unwrap()
+            .released_payload_bytes,
+        16
+    );
+    assert!(batch.is_empty());
+}

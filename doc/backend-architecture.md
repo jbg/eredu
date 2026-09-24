@@ -6471,8 +6471,8 @@ Ordinary and controlled reporting uses the same native owner observations and
 preserves backend errors as `BackendFailure` sources. These queries do not
 allocate native execution resources, evaluate or settle work, populate conversions,
 or consume state/observation budgets. This initial API has no live limit setter;
-a request is immutable once loaded. Explicit settled trimming and retention-aware
-forecast arithmetic are separate changes.
+a request is immutable once loaded. Explicit settled trimming is described below;
+retention-aware forecast arithmetic remains a separate change.
 
 `eredu-runtime::residency::conversion_retention` implements the shared portable
 budget and weak registry. Composition may attach one `ConversionRetentionBudget`
@@ -6509,7 +6509,7 @@ creates a distinct entry, and stale ticket publication or destruction cannot
 revive the retired entry or alter the replacement's reservations. Backends must
 detach revoked native values at a completion-safe boundary; logical release does
 not establish physical reclamation. This mechanism provides admission and
-ownership accounting; settled-boundary trim remains separate work.
+ownership accounting and settled-boundary claim release.
 
 MLX retention owners pair each native conversion reference with their own admitted
 portable claim. The global native registry holds weak entries and each entry holds
@@ -6542,13 +6542,28 @@ payload, remaining claims/reservations, and independently observed backing
 reclamation. Releasing one group's claims neither releases another's nor proves
 physical reclamation: snapshots, other owners or native graphs may retain storage,
 and allocator caches may retain backing even after its final live reference drops.
-No reported claim release means bytes returned to the OS. The future trim operation
-must use existing submission/completion authority at a settled boundary and preserve
+No reported claim release means bytes returned to the OS. The trim operation
+uses existing submission/completion authority at a settled boundary and preserves
 source weights, request state, budgets and eligibility for future admission.
 Controlled transactions need typed pending-work rejection unless their operation
 contract explicitly permits settlement. Ordinary reset preserves conversions;
 trim, parameter invalidation and allocator-cache flushing have separate semantics.
 Reports remain read-only and cannot evaluate, settle, trim or populate conversions.
+
+`ModelCapabilityBackend::trim_parameter_conversions` is the neutral settled-only
+backend hook. `ModelRuntime` and the ordinary facade synchronize before calling
+it; controlled ordinary continuations call it through `TextContinuationBoundary`
+after canonical completion and record draining. Controlled speculative execution
+uses its existing transaction boundary and shared driver, rejecting pending work
+with `ParameterConversionTrimError::NotQuiescent`. Neither path changes request
+state or run budgets. Backend errors cross the facade as `BackendFailure` with
+the original source. Backends without the operation return typed `Unsupported`.
+MLX owns native reference detachment and healthy idle-authority validation;
+portable residency policy owns coherent claim accounting. Embedded prediction
+uses its target group, while composed external drafting keeps separate scopes.
+Bindings remain eligible for admission after trimming; invalidation alone retires
+them. Idempotent claim release and unknown physical reclamation are independent
+of allocator-cache flushing.
 
 `safemlx` exposes immutable graph identity through its existing native safety
 boundary; no pointer or native dependency enters portable crates.

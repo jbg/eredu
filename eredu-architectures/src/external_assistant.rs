@@ -552,6 +552,17 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Releases optional conversions; caller must establish a settled boundary.
+    fn trim_parameter_conversions(
+        _target: &mut Self::Target,
+        _assistant: &mut Self::Assistant,
+    ) -> Result<
+        eredu_core::residency::ExecutionConversionRetentionTrimReport,
+        eredu_core::residency::ParameterConversionTrimError,
+    > {
+        Err(eredu_core::residency::ParameterConversionTrimError::Unsupported)
+    }
+
     /// Reads participant budgets without touching caches or submitted work.
     fn parameter_conversion_retention(
         _target: &Self::Target,

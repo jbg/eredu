@@ -977,3 +977,75 @@ fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_he
         "retained delta: {delta}"
     );
 }
+
+#[test]
+fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
+    let (_, chat, settings, first) = snapshot_setup();
+    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
+    super::super::conversion_retention::retain_fixture(&runtime);
+    let mut model = unicode_model_with_runtime(Some(first), 512, QWEN_TEMPLATE, runtime);
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, observed_mock::plan(), limits())
+        .unwrap();
+    let mut run = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    run.enable_snapshots(SnapshotLimits {
+        max_branches: 1,
+        ..snapshot_limits()
+    })
+    .unwrap();
+    run.step(|_| ControlFlow::Continue(())).unwrap();
+    let saved = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
+    let branch = run
+        .fork(
+            &saved,
+            eredu::api::GenerationBranchOptions {
+                trace_limits: limits(),
+                capture_limits: Some(observed_mock::plan().limits),
+                sampling: None,
+                intervention: None,
+            },
+            |_| ControlFlow::Continue(()),
+        )
+        .unwrap();
+    let checkpoint = run.output_checkpoint();
+    let tokens = run.token_ids().to_vec();
+    let budgets = run.snapshot_usage();
+    let bytes = run.emitted_bytes();
+    let sampler = run.sampling_state().unwrap();
+    assert_eq!(
+        run.trim_parameter_conversions().unwrap()[0].released_payload_bytes,
+        16
+    );
+    assert_eq!(
+        run.trim_parameter_conversions().unwrap()[0].released_payload_bytes,
+        0
+    );
+    assert_eq!(run.output_checkpoint(), checkpoint);
+    assert_eq!(run.token_ids(), tokens);
+    assert_eq!(run.snapshot_usage(), budgets);
+    assert_eq!(run.emitted_bytes(), bytes);
+    assert_eq!(run.sampling_state().unwrap(), sampler);
+    assert_eq!(branch.token_ids(), saved.token_ids());
+    run.run(|_| ControlFlow::Continue(())).unwrap();
+    let expected = run.token_ids().to_vec();
+    run.restore(&saved, |_| ControlFlow::Continue(())).unwrap();
+    run.run(|_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(run.token_ids(), expected);
+    drop(branch);
+    drop(run);
+    model.reset().unwrap();
+    let ordinary = model
+        .generate_prepared_chat(PreparedChatGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(&chat),
+            settings,
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        })
+        .unwrap();
+    assert_eq!(ordinary.token_ids, expected);
+}
