@@ -1,0 +1,339 @@
+{
+  "report": {
+    "assumptions": [
+      "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.",
+      "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.",
+      "Selected ordinary module topology supplies projection, attention, convolution and feed-forward geometry; reusable mechanism calibrations and explicit evaluation lifetimes compose their workspace. Legacy requests retain the earlier aggregate layer envelope.",
+      "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.",
+      "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately."
+    ],
+    "domains": [
+      {
+        "additional_generation_peak": {
+          "detail": "additional to declared already-resident bytes",
+          "kind": "estimated",
+          "lower_bytes": 11648,
+          "upper_bytes": 12160
+        },
+        "domain": {
+          "kind": "unified"
+        },
+        "fit": "likely_fit",
+        "generation_fit": "likely_fit",
+        "generation_peak": {
+          "detail": "maximum of phase peaks, not their sum",
+          "kind": "estimated",
+          "lower_bytes": 15744,
+          "upper_bytes": 16256
+        },
+        "overall_peak": {
+          "detail": "maximum of phase peaks, not their sum",
+          "kind": "estimated",
+          "lower_bytes": 15744,
+          "upper_bytes": 16256
+        },
+        "phases": [
+          {
+            "backend_overhead": {
+              "detail": "test allowance",
+              "kind": "estimated",
+              "lower_bytes": 0,
+              "upper_bytes": 512
+            },
+            "parameters": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 4096,
+              "upper_bytes": 4096
+            },
+            "persistent_state": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "exact",
+              "lower_bytes": 512,
+              "upper_bytes": 512
+            },
+            "phase": "prefill",
+            "positions": 16,
+            "query_positions": 8,
+            "retained_input": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "exact",
+              "lower_bytes": 128,
+              "upper_bytes": 128
+            },
+            "staging": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 256,
+              "upper_bytes": 256
+            },
+            "total": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 15744,
+              "upper_bytes": 16256
+            },
+            "workspace": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 10752,
+              "upper_bytes": 10752
+            }
+          },
+          {
+            "backend_overhead": {
+              "detail": "test allowance",
+              "kind": "estimated",
+              "lower_bytes": 0,
+              "upper_bytes": 512
+            },
+            "parameters": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 4096,
+              "upper_bytes": 4096
+            },
+            "persistent_state": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "exact",
+              "lower_bytes": 768,
+              "upper_bytes": 768
+            },
+            "phase": "prefill",
+            "positions": 17,
+            "query_positions": 1,
+            "retained_input": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "exact",
+              "lower_bytes": 128,
+              "upper_bytes": 128
+            },
+            "staging": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 256,
+              "upper_bytes": 256
+            },
+            "total": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 7296,
+              "upper_bytes": 7808
+            },
+            "workspace": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 2048,
+              "upper_bytes": 2048
+            }
+          },
+          {
+            "backend_overhead": {
+              "detail": "test allowance",
+              "kind": "estimated",
+              "lower_bytes": 0,
+              "upper_bytes": 512
+            },
+            "parameters": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 4096,
+              "upper_bytes": 4096
+            },
+            "persistent_state": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "exact",
+              "lower_bytes": 768,
+              "upper_bytes": 768
+            },
+            "phase": "decode",
+            "positions": 21,
+            "query_positions": 1,
+            "retained_input": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 128,
+              "upper_bytes": 128
+            },
+            "staging": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 256,
+              "upper_bytes": 256
+            },
+            "total": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 7424,
+              "upper_bytes": 7936
+            },
+            "workspace": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 2176,
+              "upper_bytes": 2176
+            }
+          },
+          {
+            "backend_overhead": {
+              "detail": "test allowance",
+              "kind": "estimated",
+              "lower_bytes": 0,
+              "upper_bytes": 512
+            },
+            "parameters": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 0,
+              "upper_bytes": 0
+            },
+            "persistent_state": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 0,
+              "upper_bytes": 0
+            },
+            "phase": "loading",
+            "positions": 0,
+            "query_positions": 0,
+            "retained_input": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 0,
+              "upper_bytes": 0
+            },
+            "staging": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 0,
+              "upper_bytes": 0
+            },
+            "total": {
+              "detail": "sum of overlapping contributions; see phase breakdown",
+              "kind": "estimated",
+              "lower_bytes": 0,
+              "upper_bytes": 512
+            },
+            "workspace": {
+              "detail": "calculated payload",
+              "kind": "exact",
+              "lower_bytes": 0,
+              "upper_bytes": 0
+            }
+          }
+        ],
+        "state_growth_bytes_per_position": 32
+      }
+    ],
+    "fit": "likely_fit",
+    "is_forecast": false,
+    "requested_positions": 21,
+    "uncertainties": [
+      "Unified backend overhead: test allowance"
+    ]
+  },
+  "request": {
+    "batch_size": 1,
+    "domains": [
+      {
+        "already_resident_bytes": 4096,
+        "backend_overhead": {
+          "detail": "test allowance",
+          "kind": "estimated",
+          "lower_bytes": 0,
+          "upper_bytes": 512
+        },
+        "budget": {
+          "application_limit_bytes": 1000000,
+          "available_bytes": null,
+          "reserve_bytes": 1024
+        },
+        "domain": {
+          "kind": "unified"
+        },
+        "executions": [
+          {
+            "attention": {
+              "kind": "materialized"
+            },
+            "cache_update": "in_place",
+            "logits": "final_position",
+            "state_layout": {
+              "allocation_granularity": 8,
+              "completeness": "complete",
+              "hidden_size": 32,
+              "layer_layout": [
+                {
+                  "key_only": {
+                    "attention": "full",
+                    "head_dim": 8,
+                    "num_key_heads": 1
+                  }
+                },
+                {
+                  "key_only": {
+                    "attention": "full",
+                    "head_dim": 8,
+                    "num_key_heads": 1
+                  }
+                }
+              ],
+              "layer_prefix_offsets": [
+                0,
+                0
+              ]
+            },
+            "workspace": {
+              "hidden_size": 32,
+              "intermediate_size": 64,
+              "key_value_width": 8,
+              "query_heads": 4,
+              "query_width": 32,
+              "vocabulary_size": 128
+            },
+            "workspace_overlap": {
+              "detail": "one live layer workspace",
+              "upper_live_copies": 1
+            }
+          }
+        ],
+        "loading_peak": {
+          "detail": "calculated payload",
+          "kind": "exact",
+          "lower_bytes": 0,
+          "upper_bytes": 0
+        },
+        "resident_parameters": {
+          "detail": "calculated payload",
+          "kind": "exact",
+          "lower_bytes": 4096,
+          "upper_bytes": 4096
+        },
+        "retained_input": {
+          "detail": "calculated payload",
+          "kind": "exact",
+          "lower_bytes": 128,
+          "upper_bytes": 128
+        },
+        "staging": {
+          "detail": "calculated payload",
+          "kind": "exact",
+          "lower_bytes": 256,
+          "upper_bytes": 256
+        }
+      }
+    ],
+    "forecast_output_tokens": 128,
+    "input": {
+      "kind": "exact",
+      "media_execution_workspace_bytes": 0,
+      "media_execution_workspace_kind": "exact",
+      "media_positions": 0,
+      "model_positions": 17,
+      "text_tokens": 17
+    },
+    "max_output_tokens": 4,
+    "prefill_chunk_tokens": 8,
+    "scalar_bytes": 2
+  }
+}

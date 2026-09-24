@@ -646,8 +646,9 @@ nondevice state and prediction/residency exclusions remain explicit unknowns.
 Embedded startup composes the same evaluator with prediction invocations and
 transaction retention; uncovered prediction mechanisms remain explicit unknowns.
 Ordinary cold, loaded, settled continuation and external-drafter forecasts consume
-the same target evaluator. Legacy `WorkspaceGeometry` requests remain readable;
-when ordinary topology is present it is authoritative.
+the same target evaluator. Legacy `WorkspaceGeometry` requests remain readable
+through the phase-10 compatibility lowerer and common lifetime evaluator; when
+ordinary topology is present it is authoritative.
 
 Ordinary shared dense readout projects the final row per chunk; capture contracts
 can require every row. Fused attention retains the configurable float32 score
@@ -1809,3 +1810,106 @@ cargo test -p eredu --no-default-features --features mlx,metal --test native_exe
 
 These are synthetic fixture measurements, not released-checkpoint calibration.
 CUDA and native distributed embedded continuations were not exercised.
+
+
+### Unified evaluation and compatibility validation (phase 10)
+
+Generation-memory estimation no longer contains a separate aggregate workspace
+evaluator. All ordinary, speculative, startup and continuation paths use the
+resource-lifetime peak composer. The legacy wire adapter and ordinary topology
+share attention scratch, tiled attention retention, convolution intermediates,
+parameter-conversion and cache-replacement calibration.
+
+Existing `WorkspaceGeometry` records remain accepted. They retain their historical
+aggregate linear/logit/coexistence envelope as one compatibility allocation: the
+record cannot supply exact projection formats, parameter aliases or invocation
+order, so it is not converted into an invented module topology. Production
+selection supplies ordinary topology, which takes precedence if both fields are
+present. There is no duplicate family-dispatched workspace formula. The small
+aggregate compatibility contract remains necessary to recompute older reports
+without silently changing their bounds.
+
+Frozen requests and reports from revision `86a6215e` cover exact lower/upper
+bounds, fit verdicts, old JSON round trips, overlap, cache copies, convolution,
+input-score tiling/full-key reuse and mixed parameter promotion. Unknown facts
+remain unknown and overflow remains a typed error. Descriptive assumption text
+may change to name the common evaluator; the report wire structure is preserved.
+
+Validation on 2026-09-24 used macOS/aarch64 Metal with allocator caching disabled.
+The nonzero Gemma2 softcap and Qwen3-MoE routed-expert fixtures now also set the
+graph-driver allowance to zero, so the default 64 MiB allowance cannot hide an
+underestimate in their mechanism envelope:
+
+| Fixture | Startup growth | Startup additional upper | Continuation growth | Continuation additional upper |
+| --- | ---: | ---: | ---: | ---: |
+| Gemma2 | 668,709 | 1,642,460 | 51,393 | 555,402 |
+| Qwen3-MoE | 233,113 | 350,220 | 11,734 | 164,298 |
+
+All values are bytes of additional modeled memory or measured MLX active-allocation
+growth, not process RSS. Repeated forecasts, serialized recomputation and forecasts
+after reset preserve the bounds and native active allocations. Reset replay and
+controlled execution produce the same token IDs as uninterrupted cached generation.
+
+The cached official `LiquidAI/LFM2.5-1.2B-Instruct` checkpoint is pinned to
+`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`; `model.safetensors` SHA-256 is
+`1ba63d9adb03ae43581db0e136e4416febe0441aff7296397bd455fb6017f73a`.
+Against the pre-change harness at `86a6215e`, BF16 and affine 4-bit (group size 64)
+runs match every F32 logit bit and token ID at eight predictions (prefill plus
+seven cached decode steps), for 17 and 513 input positions. Ordinary and controlled
+runs match as well. This is regression parity against the earlier implementation,
+not a new independent-reference model validation.
+
+Cold, loaded and settled-continuation checks also pass at 128 and 2,000 positions.
+These released-checkpoint measurements retain the ordinary 64 MiB graph allowance:
+
+| Weights | Positions | Loaded additional upper | Measured growth | Continuation additional upper | Continuation growth |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16 | 128 | 890,192,384 | 550,495,720 | 131,132,826 | 16,292,558 |
+| BF16 | 2,000 | 12,849,864,512 | 1,590,378,036 | 917,073,306 | 183,647,386 |
+| Affine 4-bit | 128 | 890,192,384 | 579,380,608 | 131,132,826 | 16,292,158 |
+| Affine 4-bit | 2,000 | 12,849,864,512 | 1,590,378,020 | 917,073,306 | 183,647,478 |
+
+Values are bytes; loaded parameters are already resident. These are planning
+bounds, not tight peak predictions. Cold/loaded topology agrees, controlled
+forecasts agree with ordinary forecasts, and insufficient budgets still produce
+a shortfall verdict.
+
+Embedded startup/continuation checks cover F32 and mixed BF16/F32, lookahead on/off,
+zero and positive horizons, settled-frontier observations and explicit unknown
+mechanisms. External-drafter continuation, V3/V4/DSpark activation parity and
+pooling snapshots across resident, host-layerwise and disk-streamed execution
+also pass. Portable conformance exercises acceptance/rejection, rollback,
+restore/fork/exchange and read-only forecasts without consuming observation or
+snapshot budgets. Native repeated-query checks preserve allocator activity,
+tokens, sampling state, epochs and snapshot usage. Forecasting does not allocate
+execution resources to discover a bound.
+
+The runtime, architecture and portable facade library suites, 98 backend-conformance
+tests, 27 portable-facade tests and production speculative reference conformance
+pass. Strict portable, MLX backend and native-harness Clippy checks pass. Reproduce
+with the phase 9 commands above, plus:
+
+```sh
+cargo test -p eredu-runtime --lib --locked
+cargo test -p eredu --no-default-features --features mlx,metal \
+  --test native_execution_control native_generic_workspace --locked \
+  -- --ignored --nocapture --test-threads=1
+EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct \
+EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
+cargo test -p eredu --no-default-features --features mlx,metal \
+  --test native_execution_control native_lfm2_workspace_forecasts --locked \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Repeat the last command with `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit.
+For numerical parity, use `native_lfm2_forecast_recalibration` and lengths `17,513`:
+export each weight mode's reference with `EREDU_LFM2_PARITY_WRITE` using the
+`86a6215e` harness, then compare with `EREDU_LFM2_PARITY_REFERENCE` using the current
+harness. The activation and pooling filters are
+`internal_activations_match_continuous_and_controlled_metal` and
+`public_pooling_prediction_snapshots_metal`, with the same native test flags.
+
+This completes retirement of the independent aggregate evaluator, not coverage of
+every mechanism. Missing native contracts remain unknown; arbitrary in-flight
+outlooks remain unsupported. CUDA and native distributed execution were not
+validated in this phase.

@@ -1269,3 +1269,150 @@ fn generic_expert_mechanism_bounds_selected_routes_without_a_family_dispatch() {
     r.domains[0].executions[0].execution_topology = Some(topology);
     assert!(estimate_generation_memory(&r).is_err());
 }
+
+/// Frozen before retiring the aggregate estimator, from revision 86a6215e.
+/// Old reports remain readable; re-estimation preserves all numerical fields and
+/// fit decisions even though the explanatory assumptions describe the new path.
+#[test]
+fn archived_aggregate_request_and_report_preserve_wire_and_recomputed_bounds() {
+    let wire: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/legacy-generation-memory.json"
+    ))
+    .unwrap();
+    let request: GenerationMemoryRequest = serde_json::from_value(wire["request"].clone()).unwrap();
+    let report: GenerationMemoryEstimate = serde_json::from_value(wire["report"].clone()).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), wire["request"]);
+    assert_eq!(serde_json::to_value(&report).unwrap(), wire["report"]);
+    let mut recomputed = estimate_generation_memory(&request).unwrap();
+    recomputed.assumptions = report.assumptions.clone();
+    assert_eq!(recomputed, report);
+}
+
+#[test]
+fn archived_aggregate_mechanism_bounds_remain_exact_after_lifetime_lowering() {
+    let wire: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/legacy-generation-memory.json"
+    ))
+    .unwrap();
+    let mut r: GenerationMemoryRequest = serde_json::from_value(wire["request"].clone()).unwrap();
+    // Values captured from the old evaluator at revision 86a6215e. These exercise
+    // prefill, partial-final-chunk and decode, including the old replacement
+    // lower bound and simultaneous fused-fallback plus explicit-score allowance.
+    let expected = [
+        [(10752, Some(10752)), (2048, Some(2048)), (2176, Some(2176))],
+        [(11264, Some(11264)), (2816, Some(2816)), (2944, Some(2944))],
+        [(11264, Some(52864)), (2816, Some(8800)), (2944, Some(8928))],
+        [
+            (11264, Some(102016)),
+            (2816, Some(19680)),
+            (2944, Some(22368)),
+        ],
+        [
+            (11264, Some(76160)),
+            (2816, Some(20064)),
+            (2944, Some(22752)),
+        ],
+        [
+            (11264, Some(89216)),
+            (2816, Some(32352)),
+            (2944, Some(37088)),
+        ],
+        [(11264, None), (2816, None), (2944, None)],
+    ];
+    for (mode, expected) in expected.into_iter().enumerate() {
+        let e = &mut r.domains[0].executions[0];
+        match mode {
+            1 => e.cache_update = CacheUpdateWorkspace::CopyState,
+            2 => {
+                e.workspace_overlap.upper_live_copies = Some(3);
+                e.workspace.as_mut().unwrap().gated_convolution = Some(GatedConvolutionWorkspace {
+                    channels: 16,
+                    kernel_size: 3,
+                    layers: 1,
+                });
+            }
+            3 => {
+                e.workspace.as_mut().unwrap().input_score_attention =
+                    Some(InputScoreAttentionWorkspace {
+                        layers: 1,
+                        mechanism: Some(InputScoreAttentionMechanism {
+                            score_tile_elements: 32,
+                            max_query_rows: 4,
+                            key_value_copies: 4,
+                            score_bytes: 16,
+                            full_key_tiles: None,
+                        }),
+                    })
+            }
+            4 => {
+                e.workspace
+                    .as_mut()
+                    .unwrap()
+                    .input_score_attention
+                    .as_mut()
+                    .unwrap()
+                    .mechanism
+                    .as_mut()
+                    .unwrap()
+                    .full_key_tiles = Some(FullKeyAttentionTiles {
+                    max_key_positions: 32,
+                    shared_key_value_copies: 4,
+                    max_live_query_tiles: 3,
+                    retained_output_copies: 2,
+                })
+            }
+            5 => {
+                e.workspace
+                    .as_mut()
+                    .unwrap()
+                    .mixed_precision_parameter_bytes = Some(1024)
+            }
+            6 => e.workspace_overlap = WorkspaceOverlap::unknown(),
+            _ => (),
+        }
+        let report = estimate_generation_memory(&r).unwrap();
+        let phases = &report.domains[0].phases;
+        assert_eq!(phases.len(), 4);
+        for (phase, expected) in phases.iter().zip(expected) {
+            assert_eq!(
+                (phase.workspace.lower_bytes, phase.workspace.upper_bytes),
+                expected,
+                "legacy mode {mode}: {:?}",
+                phase.phase
+            );
+        }
+        assert_eq!(phases[3].workspace, MemoryBytes::exact(0));
+        assert_eq!(report.fit == MemoryFit::InsufficientInformation, mode == 6);
+    }
+}
+
+#[test]
+fn zero_query_workspace_has_no_invocation_for_current_or_archived_records() {
+    let r = request();
+    // An absent invocation cannot project logits, replace installed cache, or
+    // require missing module facts, even for old aggregate-only records.
+    for topology in [None, Some(generic_topology())] {
+        for aggregate in [None, r.domains[0].executions[0].workspace.clone()] {
+            let mut execution = r.domains[0].executions[0].clone();
+            execution.execution_topology = topology.clone();
+            execution.workspace = aggregate;
+            execution.cache_update = CacheUpdateWorkspace::CopyState;
+            let description =
+                crate::workspace_resources::describe_text_workspace(&execution, &r, 17, 0, 4096)
+                    .unwrap();
+            let report = crate::resource_lifetimes::compose_resource_peaks(&description).unwrap();
+            assert!(report.pools.is_empty());
+            assert!(report.missing.is_empty());
+            // Estimation still rejects an invalid calibration before attempting
+            // to plan an invocation, as it did before retirement of the fallback.
+            execution.workspace_overlap.upper_live_copies = Some(0);
+            assert!(matches!(
+                workspace(&execution, &r, 17, 0, 4096),
+                Err(CapabilityError::InvalidConfiguration {
+                    field: "workspace_overlap",
+                    ..
+                })
+            ));
+        }
+    }
+}

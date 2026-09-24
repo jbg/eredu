@@ -6753,9 +6753,11 @@ Runtime composes target workspace by reusable mechanism kind and explicit lazy
 retention boundaries. Llama, dense Qwen, Nanbeige and dense LFM2 migrate through
 these contracts. Shared Gemma2 and packed Qwen/LFM routed experts inherit the
 same mechanism composition. New shared-decoder families require no independent
-workspace formula. The old `WorkspaceGeometry` input remains for serialized and
-manually constructed requests until the legacy API is retired; ordinary selected
-production requests use the new topology instead.
+workspace formula. The old `WorkspaceGeometry` wire contract remains a
+compatibility input for serialized and manually constructed requests. It lowers its historical aggregate
+envelope into the same resource-lifetime plan and peak evaluator, reusing the
+ordinary mechanism calibrations. It does not reconstruct missing module identities
+or invocation order. Ordinary selected production requests use topology directly.
 
 Finite planning estimates remain estimates. Native scratch, aliasing and
 allocator alignment are not proved by logical shapes: explicit calibrated
@@ -6847,3 +6849,23 @@ survive a zero-token outlook. Loading and prefill do not reappear in continuatio
 phases. Missing native bounds or ordinary invocation mechanisms remain explicit.
 Only canonical settled boundaries are eligible; observation cannot poll, submit,
 settle, snapshot, advance execution or consume capture/transport/copy budgets.
+
+
+### Unified workspace evaluation and legacy compatibility
+
+All workspace estimates now flow through `describe_text_workspace` and
+`compose_resource_peaks`. Ordinary topology remains authoritative when both old
+and new fields are present. Attention score scratch, explicit input-score tile
+retention, convolution intermediates, parameter conversion and cache replacement
+share the same runtime calibration helpers. The old aggregate workspace evaluator
+is removed from generation-memory estimation. No backend or architecture family
+selects a compatibility equation.
+
+Old `WorkspaceGeometry` records lack exact projection encodings, parameter
+identities and invocation lifetimes. A compatibility lowerer preserves their
+historical aggregate linear/logit and overlap contract as one conservative
+allocation. This remaining arithmetic is a wire-compatibility obligation, not a
+second ordinary topology or family forecast. Serialized report schemas remain
+readable, and old finite bounds, unknowns and checked arithmetic are retained.
+Frozen pre-migration requests and numeric bounds test this behavior; explanatory
+assumption strings may describe the unified evaluator.

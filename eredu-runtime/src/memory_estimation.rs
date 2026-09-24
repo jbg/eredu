@@ -118,7 +118,12 @@ pub enum MemoryDomain {
     Device(String),
 }
 
-/// Local decoder geometry supplied by the architecture, not inferred from names.
+/// Compatibility input for serialized aggregate decoder forecasts.
+///
+/// Current preparation supplies [`crate::execution_topology::TextExecutionTopology`]
+/// from ordinary module construction. Existing aggregate-only records preserve
+/// their historical envelope through the same resource lifetime evaluator; they
+/// do not supply enough facts to reconstruct a module topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceGeometry {
     /// Local residual width.
@@ -280,9 +285,11 @@ impl WorkspaceOverlap {
 pub struct ExecutionMemoryPlan {
     /// Exact architecture state layout, reused by the core state estimator.
     pub state_layout: StateMemoryLayout,
-    /// Decoder transient geometry; absent for currently uncovered architectures.
+    /// Legacy aggregate geometry for archived or manually constructed requests.
+    /// Current preparation supplies `execution_topology` instead.
     pub workspace: Option<WorkspaceGeometry>,
-    /// Ordinary selected module topology; preferred over legacy aggregate geometry.
+    /// Ordinary selected module topology; authoritative over legacy aggregate
+    /// geometry even when its mechanism coverage is incomplete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
     /// Native explicit-score attention calibration, independent of module topology.
@@ -497,10 +504,6 @@ fn mul(a: u64, b: u64) -> Result<u64, CapabilityError> {
         operation: "generation memory product",
     })
 }
-fn product(values: &[u64]) -> Result<u64, CapabilityError> {
-    values.iter().try_fold(1, |a, b| mul(a, *b))
-}
-
 fn has_nonmonotonic_state(layout: &StateMemoryLayout) -> bool {
     layout.layer_layout().iter().any(|layer| {
         layer.fixed_state().iter().any(|tensor| {
@@ -528,270 +531,7 @@ fn workspace(
             "upper live copies must be positive",
         ));
     }
-    if execution.execution_topology.is_some() {
-        return crate::workspace_resources::workspace(execution, request, positions, query, persistent);
-    }
-    let Some(g) = &execution.workspace else {
-        return Ok(MemoryBytes::unknown(
-            "decoder workspace geometry unavailable",
-        ));
-    };
-    let width = add(
-        add(mul(4, g.hidden_size)?, mul(3, g.intermediate_size)?)?,
-        add(g.query_width, mul(2, g.key_value_width)?)?,
-    )?;
-    let linear = product(&[
-        request.batch_size,
-        query,
-        width,
-        request.scalar_bytes.get().into(),
-    ])?;
-    let logits_positions = match execution.logits {
-        LogitsWorkspace::EveryPosition => query,
-        LogitsWorkspace::FinalPosition => 1,
-    };
-    // Sampling commonly promotes logits to float32; retain both projection output
-    // and float32 probabilities. The explicit model is conservative, not exhaustive.
-    let logits = product(&[
-        request.batch_size,
-        logits_positions,
-        g.vocabulary_size,
-        add(u64::from(request.scalar_bytes.get()), 4)?,
-    ])?;
-    // Mixed-width execution may project F32 logits even when persistent state
-    // has a narrower nominal dtype. Widen only that projection payload: the
-    // existing four-byte sampling/probability copy is still charged once.
-    let logits_upper = if g.mixed_precision_parameter_bytes.is_some() {
-        product(&[
-            request.batch_size,
-            logits_positions,
-            g.vocabulary_size,
-            add(u64::from(request.scalar_bytes.get()).max(4), 4)?,
-        ])?
-    } else {
-        logits
-    };
-    let linear_upper = execution
-        .workspace_overlap
-        .upper_live_copies
-        .map(|copies| {
-            let bytes = if g.input_score_attention.is_some()
-                || g.gated_convolution.is_some()
-                || g.mixed_precision_parameter_bytes.is_some()
-            {
-                product(&[
-                    request.batch_size,
-                    query,
-                    width,
-                    u64::from(request.scalar_bytes.get()).max(4),
-                ])?
-            } else {
-                linear
-            };
-            mul(bytes, copies)
-        })
-        .transpose()?;
-    let convolution = if let Some(conv) = &g.gated_convolution {
-        let layers = execution.state_layout.layer_layout().len() as u64;
-        if conv.channels == 0 || conv.kernel_size == 0 || conv.layers == 0 || conv.layers > layers {
-            return Err(invalid(
-                "gated_convolution",
-                "positive channels/kernel and a layer count within the selected layout are required",
-            ));
-        }
-        // Three-way projection, two gates and convolution output, two padded
-        // input copies, kernel-width unfolded scratch and a contiguous kernel.
-        let padded = add(query, conv.kernel_size - 1)?;
-        let rows = add(
-            add(mul(query, 6)?, mul(padded, 2)?)?,
-            add(mul(query, conv.kernel_size)?, conv.kernel_size)?,
-        )?;
-        let one = product(&[
-            request.batch_size,
-            conv.channels,
-            rows,
-            u64::from(request.scalar_bytes.get()).max(4),
-        ])?;
-        execution
-            .workspace_overlap
-            .upper_live_copies
-            .map(|copies| {
-                let live = copies.min(add(conv.layers, copies.saturating_sub(layers))?);
-                mul(one, live)
-            })
-            .transpose()?
-    } else {
-        None
-    };
-    let linear_upper = match (&g.gated_convolution, linear_upper, convolution) {
-        (Some(_), Some(linear), Some(conv)) => Some(add(linear, conv)?),
-        (Some(_), _, _) => None,
-        (None, linear, _) => linear,
-    };
-    let mut bytes = MemoryBytes {
-        lower_bytes: add(linear, logits)?,
-        upper_bytes: linear_upper
-            .map(|upper| add(upper, logits_upper))
-            .transpose()?,
-        kind: ObservationKind::Estimated,
-        detail: execution.workspace_overlap.detail.clone(),
-    };
-    let attention = if g.query_heads == 0 {
-        MemoryBytes::exact(0)
-    } else {
-        match &execution.attention {
-            AttentionWorkspace::Materialized | AttentionWorkspace::ScoreMatrixUpperBound => {
-                let n = product(&[request.batch_size, g.query_heads, query, positions, 8])?;
-                let lower = if matches!(execution.attention, AttentionWorkspace::Materialized) {
-                    n
-                } else {
-                    0
-                };
-                MemoryBytes::estimated(
-                lower,
-                n,
-                "float32 attention scores and probabilities; fallback bounds have zero lower end",
-            )
-            }
-            AttentionWorkspace::Fused { scratch } => scratch.clone(),
-            AttentionWorkspace::Unknown => {
-                MemoryBytes::unknown("attention kernel workspace unavailable")
-            }
-        }
-    };
-    bytes = bytes.add(&attention)?;
-    if let Some(explicit) = &g.input_score_attention {
-        let layers = execution.state_layout.layer_layout().len() as u64;
-        if explicit.layers == 0
-            || explicit.layers > layers
-            || g.query_heads == 0
-            || g.query_width % g.query_heads != 0
-        {
-            return Err(invalid(
-                "input_score_attention",
-                "invalid explicit attention layer/head geometry",
-            ));
-        }
-        let extra = match (
-            explicit.mechanism,
-            execution.workspace_overlap.upper_live_copies,
-        ) {
-            (Some(facts), Some(copies)) => {
-                if facts.score_tile_elements == 0
-                    || facts.max_query_rows == 0
-                    || facts.key_value_copies == 0
-                    || facts.score_bytes == 0
-                {
-                    return Err(invalid(
-                        "input_score_attention",
-                        "native tile and workspace allowances must be positive",
-                    ));
-                }
-                if facts.full_key_tiles.is_some_and(|full| {
-                    full.max_key_positions == 0
-                        || full.shared_key_value_copies == 0
-                        || full.max_live_query_tiles == 0
-                        || full.retained_output_copies == 0
-                }) {
-                    return Err(invalid(
-                        "input_score_attention",
-                        "full-key retention limits and allowances must be positive",
-                    ));
-                }
-                let tile = if mul(query, positions)? <= facts.score_tile_elements {
-                    query.max(1)
-                } else {
-                    (facts.score_tile_elements / positions.max(1)).clamp(1, facts.max_query_rows)
-                };
-                let tiles = query.div_ceil(tile);
-                let live = copies.min(add(explicit.layers, copies.saturating_sub(layers))?);
-                let scalar_bytes = if g.mixed_precision_parameter_bytes.is_some() {
-                    u64::from(request.scalar_bytes.get()).max(4)
-                } else {
-                    u64::from(request.scalar_bytes.get())
-                };
-                let (key_value_copies, live_rows, output_copies, score_positions) = match facts
-                    .full_key_tiles
-                    .filter(|full| positions <= full.max_key_positions)
-                {
-                    Some(full) => (
-                        full.shared_key_value_copies,
-                        // Compare tile counts first: a huge but valid batch
-                        // limit must not overflow for a small invocation.
-                        if tiles <= full.max_live_query_tiles {
-                            query
-                        } else {
-                            mul(tile, full.max_live_query_tiles)?
-                        },
-                        full.retained_output_copies,
-                        // A sink adds one score column per query/head.
-                        add(positions, 1)?,
-                    ),
-                    None => (mul(facts.key_value_copies, tiles)?, query, 0, positions),
-                };
-                // Unknown reuse facts and out-of-range key rows retain the old
-                // per-tile whole-context envelope, including blockwise paths.
-                let expanded = product(&[
-                    request.batch_size,
-                    g.query_width,
-                    positions,
-                    scalar_bytes,
-                    key_value_copies,
-                ])?;
-                let scores = product(&[
-                    request.batch_size,
-                    g.query_heads,
-                    live_rows,
-                    score_positions,
-                    facts.score_bytes,
-                ])?;
-                let outputs = product(&[
-                    request.batch_size,
-                    g.query_width,
-                    query,
-                    scalar_bytes,
-                    output_copies,
-                ])?;
-                MemoryBytes::estimated(0, mul(add(add(expanded, scores)?, outputs)?, live)?, "tiled input-score attention: selected K/V layout retention, live score conversions and completed outputs")
-            }
-            _ => MemoryBytes::unknown(
-                "input-score attention native workspace facts or overlap unavailable",
-            ),
-        };
-        bytes = bytes.add(&extra)?;
-    }
-
-    if let Some(parameters) = g.mixed_precision_parameter_bytes {
-        let total_layers = (execution.state_layout.layer_layout().len() as u64).max(1);
-        let promotion = execution
-            .workspace_overlap
-            .upper_live_copies
-            .map(|copies| {
-                // One cast set across the selected parameters, plus the same excess
-                // scratch proportion as activation overlap. Allow promoted state and
-                // its replacement in addition to nominal storage already modeled.
-                let casts = add(
-                    parameters,
-                    mul(parameters, copies.saturating_sub(total_layers))?.div_ceil(total_layers),
-                )?;
-                add(casts, mul(persistent, 2)?)
-            })
-            .transpose()?;
-        bytes = bytes.add(&MemoryBytes {
-            lower_bytes: 0, upper_bytes: promotion, kind: ObservationKind::Estimated,
-            detail: "mixed floating widths: float32 parameter casts plus promoted state/replacement allowance".into(),
-        })?;
-    }
-
-    bytes.add(&match execution.cache_update {
-        CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
-        CacheUpdateWorkspace::CopyState => MemoryBytes::estimated(
-            persistent,
-            persistent,
-            "old and replacement cache may overlap; one extra persistent-state payload",
-        ),
-        CacheUpdateWorkspace::Unknown => MemoryBytes::unknown("cache update overlap unavailable"),
-    })
+    crate::workspace_resources::workspace(execution, request, positions, query, persistent)
 }
 
 pub(crate) fn phase(
@@ -1019,7 +759,7 @@ pub fn estimate_generation_memory(
         domains, fit: overall_fit, uncertainties, assumptions: vec![
             "Planning estimates do not bound every allocation or total process memory; reserve capacity for other work.".into(),
             "Parameters, growing state, retained inputs, workspace, staging and overhead overlap within each phase; separate phase peaks are maximized.".into(),
-            "Selected ordinary module topology supplies projection, attention, convolution and feed-forward geometry; reusable mechanism calibrations and explicit evaluation lifetimes compose their workspace. Legacy requests retain the earlier aggregate layer envelope.".into(),
+            "Selected ordinary module topology supplies projection, attention, convolution and feed-forward geometry; reusable mechanism calibrations and explicit evaluation lifetimes compose their workspace. Legacy aggregate requests are compatibility inputs to the same resource lifetime evaluator; their earlier bounds remain preserved.".into(),
             "Sliding attention workspace uses the full evaluated context conservatively; state follows the architecture's exact cache policy and allocation granularity.".into(),
             "Rank-local executions supplied in one physical pool are treated as concurrent; shared parameter backing must be declared once and replicas separately.".into(),
         ] })

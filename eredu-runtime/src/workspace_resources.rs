@@ -5,6 +5,8 @@
 //! calibration supplies scratch and lazy-retention envelopes. Opaque native facts
 //! are never silently reclassified as exact observations.
 
+mod legacy;
+
 use std::collections::BTreeMap;
 
 use eredu_core::{resources::*, CapabilityError, ObservationKind, Observed};
@@ -145,6 +147,10 @@ impl Schedule {
 
 /// Describe a selected text invocation's calibrated workspace lifetimes.
 ///
+/// Ordinary topology is authoritative. Older aggregate-only reports are lowered
+/// through a compatibility envelope preserving their historical bounds without
+/// inferring missing module identities, formats or invocation order.
+///
 /// Parameters and installed state are owned by separate resource producers. Cache
 /// replacement and uncached conversions are additional allocations here. No native
 /// tensor, stream, state transition or observation budget is touched.
@@ -166,6 +172,9 @@ pub fn describe_text_workspace(
             coverage: ResourceCoverage::Complete,
             events: vec![],
         });
+    }
+    if execution.execution_topology.is_none() {
+        return legacy::describe(execution, request, positions, query, persistent);
     }
     let topology = execution
         .execution_topology
@@ -364,7 +373,18 @@ pub fn describe_text_workspace(
                 if *input_scores || *softcap {
                     let bytes = explicit_attention(
                         execution.input_score_attention_mechanism,
-                        &invocation,
+                        ExplicitAttentionGeometry {
+                            batch: request.batch_size,
+                            heads: *query_heads,
+                            expanded_width: mul(*query_heads, (*key_width).max(*value_width))?,
+                            queries: query,
+                            keys: positions,
+                            arithmetic: if *input_scores {
+                                AttentionArithmetic::InputScores
+                            } else {
+                                AttentionArithmetic::Fused
+                            },
+                        },
                         if topology.selected_parameter_promotion_bytes.is_some() || !*input_scores {
                             upper_scalar
                         } else {
@@ -373,18 +393,13 @@ pub fn describe_text_workspace(
                     )?;
                     schedule.allocation("explicit-attention", bytes, hold.clone())?;
                 } else {
-                    let scratch = match &execution.attention {
-                        AttentionWorkspace::Materialized
-                        | AttentionWorkspace::ScoreMatrixUpperBound => {
-                            let upper =
-                                product(&[request.batch_size, *query_heads, query, positions, 8])?;
-                            MemoryBytes::estimated(if matches!(execution.attention, AttentionWorkspace::Materialized) { upper } else { 0 }, upper, "calibrated float32 score/probability upper envelope for selected attention")
-                        }
-                        AttentionWorkspace::Fused { scratch } => scratch.clone(),
-                        AttentionWorkspace::Unknown => {
-                            MemoryBytes::unknown("attention kernel workspace unavailable")
-                        }
-                    };
+                    let scratch = attention_scratch_bytes(
+                        &execution.attention,
+                        request.batch_size,
+                        *query_heads,
+                        query,
+                        positions,
+                    )?;
                     attention_scratch = attention_scratch.maximum(&scratch);
                 }
             }
@@ -405,18 +420,17 @@ pub fn describe_text_workspace(
                     payload,
                     product(&[rows, *channels, upper_scalar])?,
                 )?;
-                let padded = add(query, kernel - 1)?;
-                // Two gates, padded input and contiguous copy, unfolded native
-                // convolution and contiguous kernel. Persistent history is separate.
-                let working_rows = add(
-                    add(mul(query, 2)?, mul(padded, 2)?)?,
-                    add(mul(query, *kernel)?, *kernel)?,
-                )?;
                 charge(
                     &mut schedule,
                     "convolution-intermediates",
                     0,
-                    product(&[request.batch_size, *channels, working_rows, upper_scalar])?,
+                    convolution_intermediates(
+                        request.batch_size,
+                        query,
+                        *channels,
+                        *kernel,
+                        upper_scalar,
+                    )?,
                 )?;
             }
         }
@@ -567,32 +581,15 @@ pub fn describe_text_workspace(
     }
     schedule.allocation("sampling", MemoryBytes::estimated(0, product(&[logits_rows, topology.vocabulary_size, 4])?, "legacy portable float32 probability allowance; native sampling scratch is covered by backend overhead calibration"), global.clone())?;
     if let Some(parameters) = topology.selected_parameter_promotion_bytes {
-        let upper = copies
-            .map(|copies| {
-                add(
-                    add(
-                        parameters,
-                        mul(parameters, copies.saturating_sub(layers))?.div_ceil(layers),
-                    )?,
-                    mul(persistent, 2)?,
-                )
-            })
-            .transpose()?;
-        schedule.allocation("uncached-parameter-conversions", MemoryBytes { lower_bytes: 0, upper_bytes: upper, kind: ObservationKind::Estimated, detail: "selected-task F32 conversion payload plus promoted state/replacement calibration".into() }, global.clone())?;
+        schedule.allocation(
+            "uncached-parameter-conversions",
+            parameter_conversions(parameters, layers, copies, persistent)?,
+            global.clone(),
+        )?;
     }
     schedule.allocation(
         "cache-update",
-        match execution.cache_update {
-            CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
-            CacheUpdateWorkspace::CopyState => MemoryBytes::estimated(
-                0,
-                persistent,
-                "one additional state allocation may overlap the installed cache",
-            ),
-            CacheUpdateWorkspace::Unknown => {
-                MemoryBytes::unknown("cache update overlap unavailable")
-            }
-        },
+        cache_replacement(&execution.cache_update, persistent),
         global,
     )?;
     Ok(schedule.plan)
@@ -640,27 +637,118 @@ pub(crate) fn workspace(
     })
 }
 
+/// Shared calibration for materialized or fused score arithmetic. Selection
+/// determines whether the score matrix is a real payload or only an upper bound.
+fn attention_scratch_bytes(
+    selected: &AttentionWorkspace,
+    batch: u64,
+    heads: u64,
+    queries: u64,
+    keys: u64,
+) -> Result<MemoryBytes, CapabilityError> {
+    Ok(match selected {
+        AttentionWorkspace::Materialized | AttentionWorkspace::ScoreMatrixUpperBound => {
+            let upper = product(&[batch, heads, queries, keys, 8])?;
+            MemoryBytes::estimated(
+                if matches!(selected, AttentionWorkspace::Materialized) {
+                    upper
+                } else {
+                    0
+                },
+                upper,
+                "calibrated float32 score/probability upper envelope for selected attention",
+            )
+        }
+        AttentionWorkspace::Fused { scratch } => scratch.clone(),
+        AttentionWorkspace::Unknown => {
+            MemoryBytes::unknown("attention kernel workspace unavailable")
+        }
+    })
+}
+
+/// Gates, padded input and its contiguous copy, unfolded native convolution and
+/// contiguous kernel. Input projection and convolution output are separate.
+fn convolution_intermediates(
+    batch: u64,
+    queries: u64,
+    channels: u64,
+    kernel: u64,
+    scalar: u64,
+) -> Result<u64, CapabilityError> {
+    if kernel == 0 {
+        return Err(invalid("convolution kernel must be positive"));
+    }
+    let padded = add(queries, kernel - 1)?;
+    let rows = add(
+        add(mul(queries, 2)?, mul(padded, 2)?)?,
+        add(mul(queries, kernel)?, kernel)?,
+    )?;
+    product(&[batch, channels, rows, scalar])
+}
+
+fn parameter_conversions(
+    parameters: u64,
+    layers: u64,
+    copies: Option<u64>,
+    persistent: u64,
+) -> Result<MemoryBytes, CapabilityError> {
+    let layers = layers.max(1);
+    let upper = copies
+        .map(|copies| {
+            add(
+                add(
+                    parameters,
+                    mul(parameters, copies.saturating_sub(layers))?.div_ceil(layers),
+                )?,
+                mul(persistent, 2)?,
+            )
+        })
+        .transpose()?;
+    Ok(MemoryBytes {
+        lower_bytes: 0,
+        upper_bytes: upper,
+        kind: ObservationKind::Estimated,
+        detail: "selected-task F32 conversion payload plus promoted state/replacement calibration"
+            .into(),
+    })
+}
+
+fn cache_replacement(selected: &CacheUpdateWorkspace, persistent: u64) -> MemoryBytes {
+    match selected {
+        CacheUpdateWorkspace::InPlace => MemoryBytes::exact(0),
+        CacheUpdateWorkspace::CopyState => MemoryBytes::estimated(
+            0,
+            persistent,
+            "one additional state allocation may overlap the installed cache",
+        ),
+        CacheUpdateWorkspace::Unknown => MemoryBytes::unknown("cache update overlap unavailable"),
+    }
+}
+
+/// Only dimensions consumed by the native calibration; aggregate legacy records
+/// need not invent KV heads, parameter encodings or other module identities.
+struct ExplicitAttentionGeometry {
+    batch: u64,
+    heads: u64,
+    expanded_width: u64,
+    queries: u64,
+    keys: u64,
+    arithmetic: AttentionArithmetic,
+}
+
 fn explicit_attention(
     facts: Option<InputScoreAttentionMechanism>,
-    invocation: &MechanismInvocation,
+    geometry: ExplicitAttentionGeometry,
     scalar: u64,
 ) -> Result<MemoryBytes, CapabilityError> {
-    let MechanismInvocation::Attention {
+    let ExplicitAttentionGeometry {
         batch,
-        query_heads: heads,
-        key_width,
-        value_width,
+        heads,
+        expanded_width,
         queries: query,
         keys: positions,
         arithmetic,
-        ..
-    } = *invocation
-    else {
-        return Err(invalid(
-            "explicit attention requires attention invocation geometry",
-        ));
-    };
-    let width = key_width.max(value_width);
+    } = geometry;
     let Some(facts) = facts else {
         return Ok(MemoryBytes::unknown(
             "input-score attention native tile/retention calibration unavailable",
@@ -692,7 +780,7 @@ fn explicit_attention(
     let tile = if arithmetic != AttentionArithmetic::InputScores
         || mul(query, positions)? <= facts.score_tile_elements
     {
-        query
+        query.max(1)
     } else {
         (facts.score_tile_elements / positions.max(1)).clamp(1, facts.max_query_rows)
     };
@@ -713,9 +801,9 @@ fn explicit_attention(
         ),
         None => (mul(facts.key_value_copies, tiles)?, query, 0, positions),
     };
-    let expanded = product(&[batch, heads, width, positions, scalar, copies])?;
+    let expanded = product(&[batch, expanded_width, positions, scalar, copies])?;
     let scores = product(&[batch, heads, live_rows, score_positions, facts.score_bytes])?;
-    let outputs = product(&[batch, heads, width, query, scalar, output_copies])?;
+    let outputs = product(&[batch, expanded_width, query, scalar, output_copies])?;
     Ok(MemoryBytes::estimated(0, add(add(expanded, scores)?, outputs)?, "input-score mechanism calibration: shared K/V layouts, bounded live tile graphs, completed outputs"))
 }
 
