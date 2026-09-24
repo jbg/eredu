@@ -1,0 +1,3623 @@
+{
+  "date": "2026-09-24",
+  "stage": "before mixed-dtype kernels",
+  "provenance": {
+    "checkpoint_revision": "6767265158422fb8a19c62ceb45f16f05363615b",
+    "checkpoint_sha256": "3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b",
+    "checkpoint_bytes": 2343326528,
+    "reference_sha256": "f4625d733ac518405c7dfc95de9753f8c5b5c1c3deba299bc5caa619709ba6df",
+    "binary_sha256": "4c725b0214200511a57f98291953c22067a513aee979afa9efdd13387bbba41e",
+    "git_revision": "6451728020f704c12617a9144fe8dd28e4b940f9",
+    "tracked_diff_sha256": "270a9993d4452f715808220299ea156689b969d558bef96826857c23b4376e57",
+    "runner_sha256": "49b4469d561368dc65ef83af1cb20f6982e75d36fdb57d2b68b5ffa20ca6eac7",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "build_command": "CARGO_INCREMENTAL=0 cargo test -p eredu --release --features mlx,metal --test native_execution_control --no-run --locked --offline",
+    "repetitions": 3,
+    "timing_note": "Each repetition runs in a fresh process, cycling all policies before the next repetition. Each process measures cold/warm requests at both lengths. Decode samples contain four synchronized tokens. Parity runs once per policy/cache. Cached allocator peak is sampled at token boundaries, not native high-water telemetry.",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "hardware": "Apple M3 Ultra",
+    "memory_bytes": 274877906944
+  },
+  "cases": [
+    {
+      "name": "retention-disabled-allocator-0-repeat-1",
+      "policy": "disabled",
+      "allocator_cache_bytes": 0,
+      "repetition": 1,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "disabled",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-disabled-allocator-0-repeat-1.json"
+        },
+        "seconds": 13.850803416687995,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "parity": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "disabled",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,2000",
+          "EREDU_LFM2_PARITY_REFERENCE": "/private/tmp/eredu-cast-reuse-gguf-reference.json"
+        },
+        "seconds": 8.000235458370298,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2344611584,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 1467.780125,
+          "generation_ms": 2384.46425,
+          "cached_decode_tokens_per_second": 10.110897588614117,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 97.811042,
+          "generation_ms": 701.320959,
+          "cached_decode_tokens_per_second": 11.59662023924964,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.043834,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 719.428375,
+          "generation_ms": 1441.208625,
+          "cached_decode_tokens_per_second": 9.716827358699112,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 709.332792,
+          "generation_ms": 1343.158042,
+          "cached_decode_tokens_per_second": 11.095661942919754,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.048417,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 97.118666,
+          "generation_ms": 704.756458,
+          "cached_decode_tokens_per_second": 11.526721461818815,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-268435456-allocator-0-repeat-1",
+      "policy": "268435456",
+      "allocator_cache_bytes": 0,
+      "repetition": 1,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "268435456",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-268435456-allocator-0-repeat-1.json"
+        },
+        "seconds": 10.39160683285445,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "parity": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "268435456",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,2000",
+          "EREDU_LFM2_PARITY_REFERENCE": "/private/tmp/eredu-cast-reuse-gguf-reference.json"
+        },
+        "seconds": 7.905748333316296,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2613047040,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 128.119583,
+          "generation_ms": 705.313042,
+          "cached_decode_tokens_per_second": 12.167008927162582,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 92.50574999999999,
+          "generation_ms": 667.844208,
+          "cached_decode_tokens_per_second": 12.184871910661666,
+          "baseline_active": 2609377024,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9053639936,
+          "loaded_additional_upper": 6444263680,
+          "measured_growth": 4895008044,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.058,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 730.946583,
+          "generation_ms": 1336.4612920000002,
+          "cached_decode_tokens_per_second": 11.572653711653684,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 711.061458,
+          "generation_ms": 1316.221708,
+          "cached_decode_tokens_per_second": 11.609231806247726,
+          "baseline_active": 2609377024,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21517414976,
+          "loaded_additional_upper": 18908038720,
+          "measured_growth": 4878365346,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.059459,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 99.284125,
+          "generation_ms": 674.886042,
+          "cached_decode_tokens_per_second": 12.208563467934017,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-1073741824-allocator-0-repeat-1",
+      "policy": "1073741824",
+      "allocator_cache_bytes": 0,
+      "repetition": 1,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "1073741824",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-1073741824-allocator-0-repeat-1.json"
+        },
+        "seconds": 9.436972958035767,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "parity": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "1073741824",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,2000",
+          "EREDU_LFM2_PARITY_REFERENCE": "/private/tmp/eredu-cast-reuse-gguf-reference.json"
+        },
+        "seconds": 7.648164208047092,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 3418353408,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 134.399667,
+          "generation_ms": 618.129001,
+          "cached_decode_tokens_per_second": 14.550833909382659,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 78.338666,
+          "generation_ms": 560.024124,
+          "cached_decode_tokens_per_second": 14.57847702244141,
+          "baseline_active": 3414683392,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 8852313344,
+          "loaded_additional_upper": 5437630720,
+          "measured_growth": 4089701676,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.795458,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 746.9617920000001,
+          "generation_ms": 1262.934208,
+          "cached_decode_tokens_per_second": 13.525736941323663,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 719.7705,
+          "generation_ms": 1231.4622909999998,
+          "cached_decode_tokens_per_second": 13.725782037154834,
+          "baseline_active": 3414683392,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21316088384,
+          "loaded_additional_upper": 17901405760,
+          "measured_growth": 4073058978,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.722458,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 105.49541699999999,
+          "generation_ms": 586.738667,
+          "cached_decode_tokens_per_second": 14.518094536387334,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-5368709120-allocator-0-repeat-1",
+      "policy": "5368709120",
+      "allocator_cache_bytes": 0,
+      "repetition": 1,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "5368709120",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-5368709120-allocator-0-repeat-1.json"
+        },
+        "seconds": 5.170450417324901,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "parity": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "5368709120",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,2000",
+          "EREDU_LFM2_PARITY_REFERENCE": "/private/tmp/eredu-cast-reuse-gguf-reference.json"
+        },
+        "seconds": 6.39990224968642,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 161.42433400000002,
+          "generation_ms": 228.238792,
+          "cached_decode_tokens_per_second": 106.72073850751048,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.636792,
+          "generation_ms": 89.496583,
+          "cached_decode_tokens_per_second": 106.89613704084768,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.418458,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 786.652916,
+          "generation_ms": 899.062667,
+          "cached_decode_tokens_per_second": 66.33384544167579,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 692.200167,
+          "generation_ms": 801.181708,
+          "cached_decode_tokens_per_second": 68.18099497378228,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 6.454292000000001,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 133.743125,
+          "generation_ms": 199.501125,
+          "cached_decode_tokens_per_second": 107.35169068714423,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-unlimited-allocator-0-repeat-1",
+      "policy": "unlimited",
+      "allocator_cache_bytes": 0,
+      "repetition": 1,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "unlimited",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-unlimited-allocator-0-repeat-1.json"
+        },
+        "seconds": 5.180675792042166,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "parity": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "unlimited",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,2000",
+          "EREDU_LFM2_PARITY_REFERENCE": "/private/tmp/eredu-cast-reuse-gguf-reference.json"
+        },
+        "seconds": 6.3437151671387255,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 166.347709,
+          "generation_ms": 233.37800000000001,
+          "cached_decode_tokens_per_second": 106.40373311113397,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.727125,
+          "generation_ms": 89.317042,
+          "cached_decode_tokens_per_second": 107.20268006700168,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.702625,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 789.2714159999999,
+          "generation_ms": 900.837042,
+          "cached_decode_tokens_per_second": 67.0309609473097,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 696.272333,
+          "generation_ms": 805.006874,
+          "cached_decode_tokens_per_second": 68.30771278949727,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 6.653833,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 136.103333,
+          "generation_ms": 201.642999,
+          "cached_decode_tokens_per_second": 107.29781818470546,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-disabled-allocator-0-repeat-2",
+      "policy": "disabled",
+      "allocator_cache_bytes": 0,
+      "repetition": 2,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "disabled",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-disabled-allocator-0-repeat-2.json"
+        },
+        "seconds": 10.65012912498787,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2344611584,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 123.96304099999999,
+          "generation_ms": 727.13275,
+          "cached_decode_tokens_per_second": 11.613682443956854,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 97.148208,
+          "generation_ms": 700.210249,
+          "cached_decode_tokens_per_second": 11.611774845967194,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.043792,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 709.167667,
+          "generation_ms": 1346.034417,
+          "cached_decode_tokens_per_second": 11.006181690735238,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 705.301833,
+          "generation_ms": 1341.702083,
+          "cached_decode_tokens_per_second": 10.998424371223791,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.046291,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 96.58533399999999,
+          "generation_ms": 702.221792,
+          "cached_decode_tokens_per_second": 11.608052651224813,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-268435456-allocator-0-repeat-2",
+      "policy": "268435456",
+      "allocator_cache_bytes": 0,
+      "repetition": 2,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "268435456",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-268435456-allocator-0-repeat-2.json"
+        },
+        "seconds": 10.327881084289402,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2613047040,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 127.50066600000001,
+          "generation_ms": 698.865042,
+          "cached_decode_tokens_per_second": 12.277756605980182,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 91.802125,
+          "generation_ms": 666.2464580000001,
+          "cached_decode_tokens_per_second": 12.271914955629358,
+          "baseline_active": 2609377024,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9053639936,
+          "loaded_additional_upper": 6444263680,
+          "measured_growth": 4895008044,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.060208,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 718.2195,
+          "generation_ms": 1320.975624,
+          "cached_decode_tokens_per_second": 11.638548873371303,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 704.5029579999999,
+          "generation_ms": 1309.456375,
+          "cached_decode_tokens_per_second": 11.579886064458822,
+          "baseline_active": 2609377024,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21517414976,
+          "loaded_additional_upper": 18908038720,
+          "measured_growth": 4878365346,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.06125,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 98.312333,
+          "generation_ms": 670.095416,
+          "cached_decode_tokens_per_second": 12.254933273941024,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-1073741824-allocator-0-repeat-2",
+      "policy": "1073741824",
+      "allocator_cache_bytes": 0,
+      "repetition": 2,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "1073741824",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-1073741824-allocator-0-repeat-2.json"
+        },
+        "seconds": 9.345803791191429,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 3418353408,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 131.98808300000002,
+          "generation_ms": 611.262874,
+          "cached_decode_tokens_per_second": 14.65011410827378,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 80.636708,
+          "generation_ms": 557.032916,
+          "cached_decode_tokens_per_second": 14.716669617665522,
+          "baseline_active": 3414683392,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 8852313344,
+          "loaded_additional_upper": 5437630720,
+          "measured_growth": 4089701676,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.716458,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 736.9368750000001,
+          "generation_ms": 1245.916,
+          "cached_decode_tokens_per_second": 13.79118732924183,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 703.125458,
+          "generation_ms": 1210.1501660000001,
+          "cached_decode_tokens_per_second": 13.857222969213149,
+          "baseline_active": 3414683392,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21316088384,
+          "loaded_additional_upper": 17901405760,
+          "measured_growth": 4073058978,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.722334,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 103.94687499999999,
+          "generation_ms": 580.956625,
+          "cached_decode_tokens_per_second": 14.69441584645805,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-5368709120-allocator-0-repeat-2",
+      "policy": "5368709120",
+      "allocator_cache_bytes": 0,
+      "repetition": 2,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "5368709120",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-5368709120-allocator-0-repeat-2.json"
+        },
+        "seconds": 5.148478250019252,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 163.499416,
+          "generation_ms": 230.33904099999998,
+          "cached_decode_tokens_per_second": 106.13281858916316,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.588250000000002,
+          "generation_ms": 89.112167,
+          "cached_decode_tokens_per_second": 107.22087852123752,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.609958,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 779.144917,
+          "generation_ms": 890.333916,
+          "cached_decode_tokens_per_second": 67.3209896596138,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 686.285417,
+          "generation_ms": 795.442958,
+          "cached_decode_tokens_per_second": 68.09399279391917,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 6.618417,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 134.222417,
+          "generation_ms": 200.155917,
+          "cached_decode_tokens_per_second": 106.54366697518161,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-unlimited-allocator-0-repeat-2",
+      "policy": "unlimited",
+      "allocator_cache_bytes": 0,
+      "repetition": 2,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "unlimited",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-unlimited-allocator-0-repeat-2.json"
+        },
+        "seconds": 5.192006291821599,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 162.814042,
+          "generation_ms": 229.59045799999998,
+          "cached_decode_tokens_per_second": 106.98405268964595,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.626292,
+          "generation_ms": 89.49116599999999,
+          "cached_decode_tokens_per_second": 106.46745611930487,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.76575,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 791.0036249999999,
+          "generation_ms": 902.60125,
+          "cached_decode_tokens_per_second": 66.19009796134499,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 691.714709,
+          "generation_ms": 801.962293,
+          "cached_decode_tokens_per_second": 66.98503088863983,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 6.907,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 134.398333,
+          "generation_ms": 200.203541,
+          "cached_decode_tokens_per_second": 106.76679113984038,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-disabled-allocator-0-repeat-3",
+      "policy": "disabled",
+      "allocator_cache_bytes": 0,
+      "repetition": 3,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "disabled",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-disabled-allocator-0-repeat-3.json"
+        },
+        "seconds": 10.7269435422495,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2344611584,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 125.38316699999999,
+          "generation_ms": 731.1548329999999,
+          "cached_decode_tokens_per_second": 11.573916406254513,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 97.986917,
+          "generation_ms": 703.3239169999999,
+          "cached_decode_tokens_per_second": 11.55357143249139,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.040958,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 724.7645,
+          "generation_ms": 1363.8885830000002,
+          "cached_decode_tokens_per_second": 10.954739807812784,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 707.9457500000001,
+          "generation_ms": 1345.8431260000002,
+          "cached_decode_tokens_per_second": 11.008482484349853,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 7246959770,
+          "continuation_growth": 4934234782,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.040292,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 0,
+              "released_payload_bytes": 0,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 97.311875,
+          "generation_ms": 704.320792,
+          "cached_decode_tokens_per_second": 11.55087456363864,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 6018258074,
+          "continuation_growth": 4701450910,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 0,
+          "retained_claims": 0,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-268435456-allocator-0-repeat-3",
+      "policy": "268435456",
+      "allocator_cache_bytes": 0,
+      "repetition": 3,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "268435456",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-268435456-allocator-0-repeat-3.json"
+        },
+        "seconds": 10.427125500049442,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 2613047040,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 128.843042,
+          "generation_ms": 707.195416,
+          "cached_decode_tokens_per_second": 12.126065634100652,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 93.088042,
+          "generation_ms": 669.069417,
+          "cached_decode_tokens_per_second": 12.166382877675124,
+          "baseline_active": 2609377024,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9053639936,
+          "loaded_additional_upper": 6444263680,
+          "measured_growth": 4895008044,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.059500000000000004,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 733.493125,
+          "generation_ms": 1341.615083,
+          "cached_decode_tokens_per_second": 11.539863820548124,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 711.756083,
+          "generation_ms": 1318.935416,
+          "cached_decode_tokens_per_second": 11.539956739587172,
+          "baseline_active": 2609377024,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21517414976,
+          "loaded_additional_upper": 18908038720,
+          "measured_growth": 4878365346,
+          "continuation_upper": 6911415450,
+          "continuation_growth": 4665799326,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.061166000000000005,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 5,
+              "released_payload_bytes": 268435456,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 99.350583,
+          "generation_ms": 675.742291,
+          "cached_decode_tokens_per_second": 12.188318676986773,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 5682713754,
+          "continuation_growth": 4433015454,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 268435456,
+          "retained_claims": 5,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-1073741824-allocator-0-repeat-3",
+      "policy": "1073741824",
+      "allocator_cache_bytes": 0,
+      "repetition": 3,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "1073741824",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-1073741824-allocator-0-repeat-3.json"
+        },
+        "seconds": 9.433960541151464,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 3418353408,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 132.292208,
+          "generation_ms": 614.4565829999999,
+          "cached_decode_tokens_per_second": 14.571749930556505,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 78.140583,
+          "generation_ms": 561.53675,
+          "cached_decode_tokens_per_second": 14.556793387629009,
+          "baseline_active": 3414683392,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 8852313344,
+          "loaded_additional_upper": 5437630720,
+          "measured_growth": 4089701676,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 0.843959,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 742.5330409999999,
+          "generation_ms": 1256.199208,
+          "cached_decode_tokens_per_second": 13.595655848065148,
+          "baseline_active": 2340941568,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 5146800802,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 713.795167,
+          "generation_ms": 1224.449042,
+          "cached_decode_tokens_per_second": 13.796923340592894,
+          "baseline_active": 3414683392,
+          "active_peak": 7487742370,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21316088384,
+          "loaded_additional_upper": 17901405760,
+          "measured_growth": 4073058978,
+          "continuation_upper": 5904782490,
+          "continuation_growth": 3860492958,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 0.851291,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 25,
+              "released_payload_bytes": 1073741824,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 104.90229099999999,
+          "generation_ms": 586.1614579999999,
+          "cached_decode_tokens_per_second": 14.545996714422992,
+          "baseline_active": 2340941568,
+          "active_peak": 7504385068,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5163443500,
+          "continuation_upper": 4676080794,
+          "continuation_growth": 3627709086,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 1073741824,
+          "retained_claims": 25,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-5368709120-allocator-0-repeat-3",
+      "policy": "5368709120",
+      "allocator_cache_bytes": 0,
+      "repetition": 3,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "5368709120",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-5368709120-allocator-0-repeat-3.json"
+        },
+        "seconds": 5.2020650412887335,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 165.742125,
+          "generation_ms": 232.511459,
+          "cached_decode_tokens_per_second": 106.47193942683599,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.628667,
+          "generation_ms": 89.36395900000001,
+          "cached_decode_tokens_per_second": 106.99227983830792,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.590000000000001,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 793.446833,
+          "generation_ms": 904.064,
+          "cached_decode_tokens_per_second": 67.318062040225,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 690.6957500000001,
+          "generation_ms": 799.813041,
+          "cached_decode_tokens_per_second": 68.05870423951791,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 6.62875,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 135.17625,
+          "generation_ms": 200.992,
+          "cached_decode_tokens_per_second": 106.69903203971872,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "retention-unlimited-allocator-0-repeat-3",
+      "policy": "unlimited",
+      "allocator_cache_bytes": 0,
+      "repetition": 3,
+      "memory": {
+        "exit_code": 0,
+        "selected_one_test": true,
+        "environment": {
+          "EREDU_LFM2_MEMORY_MODEL": "/Users/jbg/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Instruct-GGUF/snapshots/6767265158422fb8a19c62ceb45f16f05363615b/LFM2.5-1.2B-Instruct-BF16.gguf",
+          "EREDU_LFM2_RETENTION": "unlimited",
+          "EREDU_LFM2_ALLOCATOR_CACHE_BYTES": "0",
+          "EREDU_LFM2_MEMORY_TRIM": "1",
+          "EREDU_LFM2_MEMORY_LENGTHS": "128,128,2000,2000,128",
+          "EREDU_LFM2_MEMORY_WRITE": "/private/tmp/eredu-mixed-dtype-before/retention-unlimited-allocator-0-repeat-3.json"
+        },
+        "seconds": 5.200123250018805,
+        "command": [
+          "/Users/jbg/dev/eredu/target/release/deps/native_execution_control-5fcd86c654364882",
+          "lfm2_memory::native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution",
+          "--exact",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ]
+      },
+      "before_load_active": 0,
+      "immediate_drop_active": 7025454848,
+      "after_drop_active": 0,
+      "after_drop_cached": 0,
+      "measurements": [
+        {
+          "positions": 128,
+          "iteration": 0,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 161.785083,
+          "generation_ms": 228.76274999999998,
+          "cached_decode_tokens_per_second": 106.71278935706398,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 1,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 23.717583,
+          "generation_ms": 89.507875,
+          "cached_decode_tokens_per_second": 106.72014626636366,
+          "baseline_active": 7021784832,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 7950537984,
+          "loaded_additional_upper": 928753920,
+          "measured_growth": 503571756,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "trim_ms": 6.819333,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 6779808000,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 2,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 796.969416,
+          "generation_ms": 908.7537500000001,
+          "cached_decode_tokens_per_second": 67.09819191340979,
+          "baseline_active": 2340941568,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 21584523840,
+          "loaded_additional_upper": 19243583040,
+          "measured_growth": 6077681200,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 2000,
+          "iteration": 3,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 692.2121249999999,
+          "generation_ms": 802.1304580000001,
+          "cached_decode_tokens_per_second": 68.14677718642844,
+          "baseline_active": 7021784832,
+          "active_peak": 8418622768,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 21584523840,
+          "loaded_generation_upper": 20414313024,
+          "loaded_additional_upper": 13392528960,
+          "measured_growth": 1396837936,
+          "continuation_upper": 1395905690,
+          "continuation_growth": 253391518,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            19528,
+            810,
+            17750,
+            938,
+            2166
+          ],
+          "trim_ms": 7.007791999999999,
+          "trim": [
+            {
+              "group": {
+                "scope": "mlx.parameter_conversion_group",
+                "key": "19"
+              },
+              "released_claims": 93,
+              "released_payload_bytes": 4680843264,
+              "remaining": {
+                "retained_claims": 0,
+                "retained_payload_bytes": 0,
+                "reserved_payload_bytes": 0,
+                "retained_backing_capacity_bytes": {
+                  "status": "unavailable",
+                  "reason": "native backing capacity is not observed"
+                }
+              },
+              "reclaimed_backing_bytes": {
+                "status": "unavailable",
+                "reason": "other owners and native graphs may retain backing"
+              }
+            }
+          ],
+          "post_trim_additional_upper": 19243583040,
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        },
+        {
+          "positions": 128,
+          "iteration": 4,
+          "allocator_cache_limit": 0,
+          "first_token_ms": 134.779292,
+          "generation_ms": 200.575875,
+          "cached_decode_tokens_per_second": 106.95354173444848,
+          "baseline_active": 2340941568,
+          "active_peak": 7525356588,
+          "sampled_cached_peak": 0,
+          "cold_overall_upper": 9120748800,
+          "loaded_generation_upper": 9120748800,
+          "loaded_additional_upper": 6779808000,
+          "measured_growth": 5184415020,
+          "continuation_upper": 167203994,
+          "continuation_growth": 20607646,
+          "tokens": [
+            4231,
+            2545,
+            1093,
+            5376,
+            535,
+            997,
+            1098,
+            6667
+          ],
+          "retained_payload_bytes": 4680843264,
+          "retained_claims": 93,
+          "reserved_payload_bytes": 0
+        }
+      ]
+    }
+  ]
+}

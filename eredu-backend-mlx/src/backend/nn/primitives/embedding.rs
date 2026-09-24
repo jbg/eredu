@@ -43,6 +43,11 @@ impl Embedding {
     /// Use this for example when input embedding and output projection
     /// weights are tied.
     pub fn as_linear(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
+        if let Some(output) =
+            crate::backend::nn::mixed_projection::project(x, self.weight.as_ref(), stream)?
+        {
+            return Ok(output);
+        }
         let promoted = crate::backend::nn::parameter_conversion::promoted_weight(
             x,
             self.weight.as_ref(),

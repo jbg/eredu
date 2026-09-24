@@ -15,6 +15,22 @@ use crate::{
     nn,
 };
 
+/// Shared dense dispatch for ordinary and restored packed parameters.
+fn dense_projection(input: &Array, weight: &Array, stream: &Stream) -> Result<Array, Exception> {
+    if let Some(output) = super::mixed_projection::project(input, weight, stream)? {
+        return Ok(output);
+    }
+    if let Some(output) = super::matrix::bf16_row_projection(input, weight, None, stream)? {
+        return Ok(output);
+    }
+    let promoted = super::parameter_conversion::promoted_weight(input, weight, stream)?;
+    matmul(
+        input,
+        promoted.as_ref().unwrap_or(weight).transpose(stream)?,
+        stream,
+    )
+}
+
 fn ceil_div(value: i32, divisor: i32) -> i32 {
     (value + divisor - 1) / divisor
 }
@@ -301,18 +317,7 @@ impl PhysicalLinear {
             // Admitted packed edits publish only the affected parameter as F32.
             // Ordinary dense parameters and restored packed parameters take their
             // original paths; companions are retained unchanged for restoration.
-            match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
-                Some(output) => output,
-                None => {
-                    let promoted = super::parameter_conversion::promoted_weight(
-                        input,
-                        self.weight.as_ref(),
-                        stream,
-                    )?;
-                    let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
-                    matmul(input, weight.transpose(stream)?, stream)?
-                }
-            }
+            dense_projection(input, self.weight.as_ref(), stream)?
         } else if let Some(quantization) = self.gguf {
             let (ggml_type, endian) = quantization.gguf_iquant().expect("GGUF format");
             NativeQuantizedTensor::from_iq_array(
@@ -343,18 +348,7 @@ impl PhysicalLinear {
                 observer,
             )?
         } else {
-            match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
-                Some(output) => output,
-                None => {
-                    let promoted = super::parameter_conversion::promoted_weight(
-                        input,
-                        self.weight.as_ref(),
-                        stream,
-                    )?;
-                    let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
-                    matmul(input, weight.transpose(stream)?, stream)?
-                }
-            }
+            dense_projection(input, self.weight.as_ref(), stream)?
         };
         if let Some(bias) = self.bias.as_ref() {
             output = output.add(bias, stream)?;

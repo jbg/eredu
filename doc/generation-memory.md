@@ -12,10 +12,15 @@ under a **256 MiB managed default**. Use
 `ExecutionPlan::with_parameter_conversion_retention` at load time to select
 `Bounded { max_bytes }`, `Disabled`, or explicitly `Unlimited`; `None` selects
 the managed default and a zero-byte bound normalizes to disabled. Admission is
-first-admitted, with no automatic eviction. A weight that does not fit still uses
-the ordinary temporary cast path without changing precision. The cap can reduce
-throughput substantially when repeated casts are expensive; the
-[measured policy matrix](conversion-retention-validation.md) records this tradeoff.
+first-admitted, with no automatic eviction. Eligible single-row Metal projections
+read materialized row-major F16/BF16 weights directly with F32 activations,
+accumulation and output, avoiding full-weight casts and conversion admission.
+This covers dense linear and tied-embedding output projections. Multi-row
+prefill and speculative verification, unsettled or column-major weights, CPU
+and CUDA retain their ordinary native paths. Those paths use an admitted F32
+conversion or a temporary cast when a weight does not fit, without changing
+precision. The [measured policy matrix](conversion-retention-validation.md)
+records the retention tradeoff and validation scope.
 
 The bound covers retained conversion **payload plus outstanding reservations**
 for one loaded execution, shared by permanent units and embedded prediction.

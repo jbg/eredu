@@ -4928,3 +4928,7 @@ extern "C" {
 extern "C" {
     pub fn mlx_version(str_: *mut mlx_string) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn _mlx_array_is_available(res: *mut bool, arr: mlx_array) -> ::std::os::raw::c_int;
+}

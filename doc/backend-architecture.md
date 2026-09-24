@@ -17,6 +17,15 @@ and a fixed softmax reduction with a pinned exponential polynomial. These are
 generic native numerical operations, independent of checkpoint and family policy.
 Metal realizes complete BF16 row and batched products, cascade normalization
 and FP32 softmax/sigmoid with the same accumulation and rounding boundaries.
+Single-row F32 activations with materialized row-major F16/BF16 dense weights
+use a mixed-dtype Metal GEMV for linear and tied-embedding output projections.
+It converts weights in registers and preserves the pinned MLX F32 GEMV's lane,
+coefficient and reduction order; it neither rounds activations down nor creates
+a full F32 weight copy. A safe nonblocking availability query prevents using
+provisional strides from lazy parameter graphs. Unsettled or column-major
+weights, multi-row prefill/speculative verification, CPU and CUDA keep their
+ordinary native paths. Conversion retention therefore remains applicable to
+fallback invocations, and memory bounds still conservatively allow their casts.
 These operators select by device, dtype and geometry. Router cutoff ties use
 value-only CPU partitioning of the small score/index tensors; expert parameters
 remain on their selected device. Independent PyTorch fixtures verify the native

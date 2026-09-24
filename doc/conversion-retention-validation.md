@@ -3,6 +3,9 @@
 Phase 7 of the bounded parameter-conversion retention plan validates policy,
 precision, request-state preservation and the throughput/memory tradeoff. The
 consumer contract and earlier calibration are in [generation-memory.md](generation-memory.md).
+The historical retention cost below is addressed for eligible Metal single-row
+decode by mixed-dtype kernels; see the before/after release measurements below.
+Multi-row prefill keeps its existing native matrix path.
 
 ## Reproduction and provenance
 
@@ -165,6 +168,146 @@ Readmission also matters: the next 128-position prefill took 106.6 ms rather tha
 98.5 ms at 256 MiB, and 154.7 ms rather than 29.8 ms with unlimited retention.
 These are individual local measurements; repeated statistical throughput runs,
 other model shapes and other accelerators remain outside this calibration.
+
+## Repeated release baseline before mixed-dtype kernels (2026-09-24)
+
+A sequential release-build rerun confirms that the retention bottleneck persists
+without debug-build overhead. There were no other agent builds or benchmarks
+running during measurement. The host, pinned checkpoint, exact historical logit
+reference, request sequence and allocator telemetry semantics are unchanged.
+The baseline code revision is `6451728020f704c12617a9144fe8dd28e4b940f9`;
+the only working-tree change before measurement extended the runner with repeated
+processes and explicit build-command provenance. The release executable SHA-256
+is `4c725b0214200511a57f98291953c22067a513aee979afa9efdd13387bbba41e`.
+
+The [release baseline evidence](../validation/results/mixed-dtype-matrix-before-2026-09-24.json)
+contains all 75 request measurements, 15 fresh-process invocations, five exact
+parity checks and provenance. Full logs and estimates are in
+`/tmp/eredu-mixed-dtype-before`. Policies cycle before the next repetition; each
+process performs the existing cold/warm/trim sequence. Parity runs once per
+policy; all five passed the 1,048,576 historical logit-bit comparisons plus
+ordinary/controlled token and settled-trim checks. All memory bounds, retention
+caps and post-drop reclamation assertions passed in all three repetitions.
+
+```sh
+CARGO_INCREMENTAL=0 cargo test -p eredu --release --features mlx,metal \
+  --test native_execution_control --no-run --locked --offline
+python3 validation/conversion_retention_matrix.py \
+  --binary target/release/deps/native_execution_control-<hash> \
+  --model /path/to/pinned/LFM2.5-1.2B-Instruct-BF16.gguf \
+  --reference /tmp/eredu-cast-reuse-gguf-reference.json \
+  --output /tmp/eredu-mixed-dtype-before \
+  --policies disabled 268435456 1073741824 5368709120 unlimited \
+  --allocator-caches 0 --repetitions 3 \
+  --build-command 'CARGO_INCREMENTAL=0 cargo test -p eredu --release --features mlx,metal --test native_execution_control --no-run --locked --offline'
+```
+
+The table reports medians across three fresh processes. Parenthesized decode
+values are the observed minimum–maximum, not confidence intervals. Each warm
+request still times four synchronized cached tokens, so this remains a short,
+single-checkpoint calibration rather than sustained serving throughput.
+
+| Retention | Warm 128 decode tokens/s | Warm 2,000 decode tokens/s | Warm prefill ms, 128 / 2,000 | Active peak MiB, 128 / 2,000 |
+|---|---:|---:|---:|---:|
+| Disabled | 11.60 (11.55–11.61) | 11.01 (11.00–11.10) | 97.81 / 707.95 | 7156.7 / 7140.9 |
+| 256 MiB | 12.18 (12.17–12.27) | 11.58 (11.54–11.61) | 92.51 / 711.06 | 7156.7 / 7140.9 |
+| 1 GiB | 14.58 (14.56–14.72) | 13.80 (13.73–13.86) | 78.34 / 713.80 | 7156.7 / 7140.9 |
+| 5 GiB | 106.99 (106.90–107.22) | 68.09 (68.06–68.18) | 23.63 / 690.70 | 7176.7 / 8028.6 |
+| Unlimited | 106.72 (106.47–107.20) | 68.15 (66.99–68.31) | 23.72 / 692.21 | 7176.7 / 8028.6 |
+
+The 5 GiB allowance admits the same 4,464 MiB payload as unlimited and has
+comparable throughput. The 256 MiB policy is 88.6% slower than 5 GiB at 128
+positions (about 8.8 times as long per token). The 1 GiB allowance improves this
+rate by only 19.7%. None of the smaller policies materially reduces the observed
+short-context active peak. These findings support removing full-weight
+promotion from the decode computation rather than merely changing admission
+order. They do not isolate cast time from allocation, graph construction and
+matrix execution: projection-level profiling is still required to attribute
+costs precisely. Before optimization, mixed F32-activation/narrow-weight dispatch fell
+through the BF16-only row kernel to retained promotion or native mixed-dtype
+matmul; the reusable mixed-dtype projection below targets that path while
+preserving its F32 output and numerical contract.
+
+## Mixed-dtype decode kernel results (2026-09-24)
+
+The same release matrix was repeated after introducing the reusable Metal
+F32-activation/F16-or-BF16-weight GEMV kernel. It widens weights during the dot
+product and preserves the native F32 reduction partition/order; it does not
+materialize a full F32 weight copy. Eligible single-row dense and tied-embedding
+projections use it regardless of retention policy. Multi-row prefill and
+speculative verification, unevaluated weights, column-major weights, CPU and CUDA
+keep the existing native fallback. No precision policy or managed retention
+allowance changed. The implementation and these fallback boundaries are
+recorded in [backend-architecture.md](backend-architecture.md).
+
+The [after evidence](../validation/results/mixed-dtype-matrix-after-2026-09-24.json)
+contains the same 75 requests and five parity cases, plus hashes for the new
+source files. The executable SHA-256 is
+`ff8151be35a2f4f60c3cc380633d8edd42c4d6928022c6fd670e8c29a10000b5`.
+Reproduce with the preceding release build/run commands, changing the output
+directory to `/tmp/eredu-mixed-dtype-after`. Measurements ran sequentially with
+all other agents and builds idle. All 15 cases passed retention caps, memory
+bounds, settled reservations and reclamation. Every policy still matched the
+unchanged historical reference **bit for bit**, including ordinary versus
+controlled generation with trimming at every prediction boundary.
+
+Warm cached-decode medians across three fresh processes:
+
+| Retention | 128 tokens/s, before → after | Speedup | 2,000 tokens/s, before → after | Speedup |
+|---|---:|---:|---:|---:|
+| Disabled | 11.60 → 139.07 | 11.99× | 11.01 → 80.57 | 7.32× |
+| 256 MiB | 12.18 → 139.35 | 11.44× | 11.58 → 80.22 | 6.93× |
+| 1 GiB | 14.58 → 133.93 | 9.19× | 13.80 → 79.75 | 5.78× |
+| 5 GiB | 106.99 → 147.23 | 1.38× | 68.09 → 80.60 | 1.18× |
+| Unlimited | 106.72 → 145.85 | 1.37× | 68.15 → 80.32 | 1.18× |
+
+For the default allowance, the three after samples ranged from 138.30–140.18
+at 128 positions and 80.11–80.99 at 2,000 positions. These are four-token timing
+windows, not sustained-load confidence intervals. The remaining small
+policy-to-policy differences should not be treated as a reliable ranking.
+
+Default warm-request memory, in MiB:
+
+| Observation | 128 before → after | 2,000 before → after |
+|---|---:|---:|
+| Full generation active peak | 7156.7 → 7156.7 | 7140.9 → 4794.6 |
+| Additional peak after settled decode boundary | 4227.7 → 19.7 | 4449.7 → 241.7 |
+| Retained conversion payload | 256 → 256 | 256 → 256 |
+
+The default no longer pays repeated full-weight promotion during eligible
+decode. Its long-context full-generation peak falls 32.9%; its short-context
+peak remains dominated by prefill. Default warm prefill was 94.99 / 713.81 ms
+afterward versus 92.51 / 711.06 ms before, so this change does not establish a
+prefill speedup. F32 conversions are still admitted during prefill, and forecasts
+remain conservative because the native multi-row fallback still needs that
+workspace. Afterward, disabled retention had full-generation peaks of
+7156.7 / 4538.6 MiB; 5 GiB and unlimited remained at 7176.7 / 8028.6 MiB.
+
+Four additional native release fixtures passed after the timing window:
+embedded mixed-width continuation with lookahead, target/drafter continuation,
+controlled snapshot replay, and independent target/drafter fork edits. The
+embedded cases preserved the previous 15 rejected proposals with lookahead off,
+and six accepted/seven rejected with lookahead on. Together with the matrix's
+controlled settled-trim parity, these cover reuse of the new native projection
+through controlled and speculative drivers. Projection-level cast/allocation
+profiling was not added: these end-to-end results demonstrate the gain, but do
+not attribute every millisecond to an individual native operation.
+
+Focused regression checks also passed: four mixed-projection Metal tests,
+11 existing conversion/residency tests, and the nonblocking availability test.
+The projection fixtures compare output bits for F16/BF16 weights, reduction
+boundaries, tails, strided vectors, padded weights, bias and tied embeddings;
+they also check native fallback and retention before/after trim. Reproduce with
+native device access:
+
+```sh
+cargo test -p eredu-backend-mlx --features metal --lib mixed_projection --locked -- --test-threads=1
+cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
+cargo test -p safemlx --features metal --lib availability_query_does_not_evaluate_lazy_layout --locked -- --test-threads=1
+```
+
+Strict Clippy passed for the backend and safemlx libraries/tests, along with the
+backend's no-default-features check and workspace formatting.
 
 ## Native behavioral coverage
 

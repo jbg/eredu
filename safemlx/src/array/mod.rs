@@ -682,6 +682,20 @@ impl Array {
         Dtype::try_from(dtype).unwrap()
     }
 
+    /// Whether evaluation has completed, without evaluating or waiting.
+    ///
+    /// Layout metadata such as strides is provisional until this returns true.
+    /// This is a snapshot, not a host-read guard; use [`Self::evaluated`] to read
+    /// tensor contents safely.
+    pub fn is_available(&self) -> crate::error::Result<bool> {
+        let _guard = runtime_lock::enter();
+        // SAFETY: the owned native array remains alive; Guarded supplies a valid
+        // output pointer and translates failures from this nonblocking query.
+        bool::try_from_op(|ready| unsafe {
+            safemlx_sys::_mlx_array_is_available(ready, self.as_ptr())
+        })
+    }
+
     /// Evaluate the array and return a borrowed host-readable value.
     pub fn evaluated(&self) -> crate::error::Result<EvaluatedArray<'_>> {
         let _guard = runtime_lock::enter();
@@ -1741,5 +1755,18 @@ mod tests {
         );
         assert_eq!(array.clone().item::<u8>(&stream), 1);
         assert_eq!(array.evaluated().unwrap().as_slice::<f32>(), &[1.0]);
+    }
+
+    #[test]
+    fn availability_query_does_not_evaluate_lazy_layout() {
+        let stream = crate::test_stream();
+        let source = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        let transposed = source.transpose(stream).unwrap();
+        assert!(!transposed.is_available().unwrap());
+        assert!(!transposed.is_available().unwrap());
+        let evaluated = transposed.evaluated().unwrap();
+        assert!(transposed.is_available().unwrap());
+        assert_eq!(transposed.strides(), &[1, 3]);
+        assert_eq!(evaluated.as_array().shape(), &[3, 2]);
     }
 }

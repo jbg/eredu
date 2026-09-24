@@ -602,6 +602,7 @@ fn generate_bindings(out_path: PathBuf) {
         .header("src/mlx-c/mlx/c/transforms_impl.h")
         .clang_arg("-Isrc/mlx-c")
         .allowlist_function("^mlx_.*")
+        .allowlist_function("^_mlx_array_is_available$")
         .blocklist_function("^mlx_export_to_dot$")
         .blocklist_function("^mlx_print_graph$")
         .allowlist_type("^mlx_.*")
