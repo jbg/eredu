@@ -552,6 +552,17 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Reads participant budgets without touching caches or submitted work.
+    fn parameter_conversion_retention(
+        _target: &Self::Target,
+        _assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
     /// Known bound for an isolated reusable target-cache checkpoint.
     fn control_cache_estimate(
         _cache: &Self::NativeCache,

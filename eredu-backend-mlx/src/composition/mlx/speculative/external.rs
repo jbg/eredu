@@ -55,6 +55,23 @@ where
     type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
 
+    fn parameter_conversion_retention(
+        target: &Self::Target,
+        _assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(Some(
+            eredu_core::residency::ExecutionConversionRetentionReport {
+                target: target.parameter_conversion_retention()?,
+                external_drafter: Some(eredu_core::Observed::unsupported(
+                    "auxiliary assistant does not expose parameter conversion retention",
+                )),
+            },
+        ))
+    }
+
     fn config(assistant: &Self::Assistant) -> &A::Config {
         &assistant.config
     }

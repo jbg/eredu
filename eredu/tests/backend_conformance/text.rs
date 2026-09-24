@@ -120,7 +120,7 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
     let model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

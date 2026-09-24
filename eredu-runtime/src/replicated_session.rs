@@ -74,6 +74,18 @@ where
     /// Mechanism failure.
     type Error;
 
+    /// Reads retention policy and usage without touching state or native work.
+    fn parameter_conversion_retention(
+        &self,
+        _residency: LayerWeightResidency,
+        _bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        Self::Error,
+    > {
+        Ok(eredu_core::residency::unreported_parameter_conversion_retention())
+    }
+
     /// Projects existing native residency into portable memory observations.
     /// Must not submit, settle, allocate execution resources, or consume budgets.
     fn parameter_memory_observation(
@@ -3641,6 +3653,21 @@ where
     /// Returns the prepared-input identity associated with the currently committed prompt state.
     pub const fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
         self.committed_prompt_input_identity.as_ref()
+    }
+
+    /// Observes the installed retention budget without touching lane state.
+    pub fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        self.mechanisms
+            .parameter_conversion_retention(
+                self.selected.residency(),
+                D::bounded_policy(&self.execution),
+            )
+            .map_err(ReplicatedTextSessionError::Mechanism)
     }
 
     /// Observes the installed shared parameter owner without touching lane state.

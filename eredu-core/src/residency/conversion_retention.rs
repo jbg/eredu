@@ -32,7 +32,7 @@ pub enum ParameterConversionRetentionPolicy {
 impl ParameterConversionRetentionPolicy {
     /// Initial finite managed policy for eligible executions: 256 MiB.
     ///
-    /// Defining this value does not install it in existing execution paths.
+    /// Eligible loaded executions use this when the caller omits an override.
     /// Missing historical policy observations must remain unknown.
     pub const MANAGED_DEFAULT: Self = Self::Bounded {
         max_bytes: 256 * 1024 * 1024,
@@ -213,6 +213,34 @@ fn unreported_backing_capacity() -> Observed<u64> {
 
 fn unreported_reclamation() -> Observed<u64> {
     Observed::unavailable("parameter conversion backing reclamation was not reported")
+}
+
+/// Role-labelled retention scopes for a composed execution. These are admission
+/// claims, not additive physical-residency counters. Embedded prediction owners
+/// are included in `target`; only a separately loaded drafter has a second entry.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionConversionRetentionReport {
+    /// Target execution, including any embedded prediction owners.
+    pub target: Observed<Vec<ParameterConversionRetentionReport>>,
+    /// Independent external drafter. `None` means no such participant; an
+    /// unsupported observation means the participant exists but cannot report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_drafter: Option<Observed<Vec<ParameterConversionRetentionReport>>>,
+}
+
+/// Read-only observation of a separately owned drafting execution. Implementations
+/// must not allocate native resources, settle, evaluate, or modify execution state.
+pub trait ParameterConversionRetentionObserver {
+    /// Reports load-selected policy and live admission usage without mutation.
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<Observed<Vec<ParameterConversionRetentionReport>>, crate::BackendFailure>;
+}
+
+/// Compatibility default for documents recorded before retention was observable.
+pub fn unreported_parameter_conversion_retention(
+) -> Observed<Vec<ParameterConversionRetentionReport>> {
+    Observed::unavailable("parameter conversion retention was not reported")
 }
 
 #[cfg(test)]

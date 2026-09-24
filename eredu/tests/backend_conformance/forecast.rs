@@ -92,7 +92,7 @@ impl eredu_runtime::memory_forecast::SpeculativeForecastBackend<MockDrafter> for
 #[test]
 fn speculative_forecast_borrows_the_prepared_request_and_preserves_facts_on_recompute() {
     let (model, chat, settings) = setup();
-    let mut drafter = MockDrafter;
+    let mut drafter = MockDrafter::default();
     let request = PreparedChatSpeculativeGenerationRequest {
         input: PreparedChatInput::token_ids(&chat, vec![1; 17]),
         drafting: eredu_core::SpeculativeDraft::External(&mut drafter),
@@ -193,7 +193,7 @@ fn unsupported_speculative_mechanisms_stay_unknown_and_capacity_is_enforced() {
         forecast.with_max_output_tokens(2).unwrap().estimate.fit,
         MemoryFit::InsufficientInformation
     );
-    let mut drafter = MockDrafter;
+    let mut drafter = MockDrafter::default();
     let external = eredu_core::SpeculativeDraft::External(&mut drafter);
     let options = PreparedChatSpeculativeGenerationOptions {
         max_draft_tokens: NonZeroUsize::new(5).unwrap(),
@@ -213,7 +213,7 @@ fn forecasting_preserves_controlled_and_uninterrupted_speculative_parity() {
             for controlled in [false, true] {
                 let (mut model, chat, mut settings) = setup();
                 settings.overrides.max_new_tokens = Some(6);
-                let mut drafter = MockDrafter;
+                let mut drafter = MockDrafter::default();
                 let request = PreparedChatSpeculativeGenerationRequest {
                     input: PreparedChatInput::token_ids(
                         &chat,
@@ -939,6 +939,8 @@ pub(super) fn fixture_profile() -> LoadedMemoryProfile {
             assumptions: vec![],
         },
         parameters: StaticMemoryReport {
+            parameter_conversion_retention:
+                eredu_core::residency::unreported_parameter_conversion_retention(),
             logical_parameter_bytes: Observed::exact(4096, "fixture"),
             current_host_resident_bytes: Observed::exact(0, "fixture"),
             current_device_resident_bytes: Observed::exact(4096, "fixture"),
@@ -976,7 +978,7 @@ fn settled_speculative_outlooks_are_read_only_and_follow_restore_and_branch_rete
             for lookahead in [false, true] {
                 let (mut model, chat, mut settings) = setup();
                 settings.overrides.max_new_tokens = Some(10);
-                let mut drafter = MockDrafter;
+                let mut drafter = MockDrafter::default();
                 let input = if reject {
                     vec![CONTROL_REJECTION_PROMPT_TOKEN]
                 } else {

@@ -257,3 +257,50 @@ fn invalid_plans_are_distinct_from_unavailable_backend_mechanisms() {
             .is_ok()
     );
 }
+
+#[test]
+fn conversion_retention_plan_is_optional_serializable_and_model_scoped() {
+    use eredu_core::residency::ParameterConversionRetentionPolicy as Policy;
+    let original = plan();
+    assert_eq!(
+        normalize(&original)
+            .unwrap()
+            .parameter_conversion_retention(),
+        None
+    );
+    for policy in [
+        Policy::Disabled,
+        Policy::Bounded { max_bytes: 0 },
+        Policy::Bounded { max_bytes: 19 },
+        Policy::Unlimited,
+    ] {
+        let configured = original
+            .clone()
+            .with_parameter_conversion_retention(Some(policy));
+        let serialized = serde_json::to_value(&configured).unwrap();
+        let decoded: ExecutionPlan = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded, configured);
+        assert_eq!(
+            normalize(&decoded)
+                .unwrap()
+                .parameter_conversion_retention(),
+            Some(policy)
+        );
+        assert_eq!(
+            normalize(&original)
+                .unwrap()
+                .parameter_conversion_retention(),
+            None
+        );
+    }
+    let mut old = serde_json::to_value(original).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("parameter_conversion_retention");
+    assert_eq!(
+        serde_json::from_value::<ExecutionPlan>(old)
+            .unwrap()
+            .parameter_conversion_retention(),
+        None
+    );
+}

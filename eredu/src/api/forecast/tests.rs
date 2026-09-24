@@ -49,6 +49,8 @@ fn profile(cached: Observed<u64>, resident: u64) -> LoadedMemoryProfile {
             assumptions: vec![],
         },
         parameters: StaticMemoryReport {
+            parameter_conversion_retention:
+                eredu_core::residency::unreported_parameter_conversion_retention(),
             logical_parameter_bytes: Observed::exact(1024, "original parameters"),
             current_host_resident_bytes: Observed::exact(0, "device only"),
             current_device_resident_bytes: Observed::exact(

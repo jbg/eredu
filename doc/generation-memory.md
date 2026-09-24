@@ -1923,8 +1923,8 @@ same temporary promotion path, preserving F16/BF16 rounding and logits. There is
 no automatic eviction. Reset preserves admitted copies and parameter publication
 revokes them. The allocator-cache limit remains independent, including at zero.
 The earlier 4,680,843,264-byte experiment describes the preceding unlimited
-behavior, not the new default. Full-checkpoint throughput calibration, public
-configuration and settled trimming remain later phases of the retention plan.
+behavior, not the new default. Full-checkpoint throughput calibration and
+settled trimming remain later phases of the retention plan.
 
 Host-layerwise, disk-streamed and explicit device ceilings disable retention.
 Multi-rank native execution also reports typed unsupported eligibility and effective
@@ -1948,3 +1948,80 @@ fixture streams), with exact F32 logits and greedy-token equality. The sandbox
 could not initialize the Metal device; the same test binary passed with native
 device access. Multi-process retention is explicitly disabled and was not
 hardware-validated. No full-checkpoint throughput claim is made by these fixtures.
+
+
+### Load-scoped conversion configuration and telemetry (2026-09-24)
+
+Conversion retention can now be selected without MLX-specific configuration:
+
+```rust
+use eredu_core::{DevicePlan, ExecutionPlan};
+use eredu_core::residency::ParameterConversionRetentionPolicy;
+
+let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "gpu:0")?)
+    .with_parameter_conversion_retention(Some(
+        ParameterConversionRetentionPolicy::Bounded { max_bytes: 32 * 1024 * 1024 },
+    ));
+```
+
+Pass this plan to `LoadedModel::load_execution_plan`. The low-level portable
+`NormalizedLoadRequest` has the same builder. Omitting the setting (`None`) uses
+256 MiB for each eligible loaded execution; `Disabled` opts out and `Unlimited`
+opts into the former unbounded reuse deliberately. A zero bound is explicitly
+requested but effectively disabled. The default changed from unlimited retention
+to finite first-admitted retention; throughput calibration is still pending.
+There is no process-global retention setting or live limit mutation.
+
+`LoadedModel::parameter_conversion_retention()` reads policy and current retained
+and reserved payload. The same observation is available in `static_memory()` and
+the residency telemetry document. `PlannedModel::parameter_conversion_retention()`
+labels the target and optional external drafter separately. Each independently
+loaded drafter has its own budget, while embedded prediction owners share the
+target budget. A 32 MiB target plus a 32 MiB external drafter can therefore retain
+64 MiB of claims. Aliases within one group charge once; independent groups can
+claim shared physical storage, so group usage is not an additive physical counter.
+
+Requested policy and effective exclusions are both reported. Host-layerwise,
+disk-streamed, explicit device ceilings and unsupported multi-rank admission
+remain effectively disabled, even for an explicit unlimited request. Unsupported
+observation is distinct from zero usage, and historical serialized reports with
+no retention facts remain unknown. Auxiliary MLX assistants currently expose an
+unsupported observation rather than inventing an empty ledger.
+
+Conversion payload is already included in current resident parameter memory. Do
+not add reported retained bytes again. Reservations describe pending admission,
+not guaranteed materialized storage; backing capacity can exceed payload. The
+allocator cache has its own independent allowance. Neither setting bounds total
+memory, transient casts, graph storage, allocator padding or process RSS. Queries
+leave native execution resources, generation state, completion authority and
+observation budgets unchanged. Reset preserves the policy and admitted copies.
+Explicit trimming and forecast capacity arithmetic remain subsequent phases.
+
+
+The residency telemetry document preserves `current_device_bytes` and
+`peak_device_bytes` as original-parameter admission-ledger counters.
+`total_current_device_parameter_bytes` reports the checked sum of current original
+parameters and deduplicated retained conversion payload;
+`current_device_parameter_conversion_bytes` is a named subset of that total.
+Use the total for current parameter accounting, without adding the subset again.
+The historical peak ledger is not a historical peak of optional conversions.
+An overflowing total is unavailable rather than saturated. This total covers the
+ordinary residency ledger; independently managed routed banks retain their
+separate telemetry. Use `StaticMemoryReport` for whole-model parameter composition,
+including those banks.
+
+Phase 4 validation passed the portable facade suite (27 tests, one existing
+ignored test), neutral backend conformance (106 tests), core contracts (272 tests),
+runtime contracts (640 tests), and focused architecture selection propagation.
+The native load-policy fixture verifies the managed default, explicit disabled,
+17-byte bounded and unlimited policies, independent model identities, and matching
+live/static observations. It passed on this macOS host with native device access;
+the sandbox could not initialize Metal even though the fixture uses CPU streams.
+Reproduce the native check with:
+
+```sh
+cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
+```
+
+These checks validate configuration and telemetry. Full-checkpoint throughput and
+retention-aware forecast calibration remain separate validation phases.

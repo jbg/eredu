@@ -569,11 +569,28 @@ pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
         })
         .collect();
     ResidencyTelemetry {
+        parameter_conversion_retention: offload.parameter_conversion_retention().clone(),
         planned_disk_bytes: planned.get(MemoryTier::Disk),
         planned_host_bytes: planned.get(MemoryTier::Host),
         planned_device_bytes: planned.get(MemoryTier::Device),
         current_host_bytes: current.get(MemoryTier::Host),
         current_device_bytes: current.get(MemoryTier::Device),
+        current_device_parameter_conversion_bytes: eredu_core::Observed::exact(
+            report.device_parameter_conversion_bytes(),
+            "residency conversion allocation payload",
+        ),
+        total_current_device_parameter_bytes: current
+            .get(MemoryTier::Device)
+            .checked_add(report.device_parameter_conversion_bytes())
+            .map_or_else(
+                || eredu_core::Observed::unavailable("device parameter payload total overflowed"),
+                |bytes| {
+                    eredu_core::Observed::exact(
+                        bytes,
+                        "original parameter ledger plus conversion allocation payload",
+                    )
+                },
+            ),
         peak_host_bytes: peak.get(MemoryTier::Host),
         peak_device_bytes: peak.get(MemoryTier::Device),
         transfers,
@@ -848,11 +865,22 @@ mod tests {
         assert_eq!(
             residency_telemetry(&report),
             ResidencyTelemetry {
+                parameter_conversion_retention: eredu_core::Observed::unavailable(
+                    "parameter conversion retention groups were not reported",
+                ),
                 planned_disk_bytes: 101,
                 planned_host_bytes: 202,
                 planned_device_bytes: 303,
                 current_host_bytes: 70,
                 current_device_bytes: 40,
+                current_device_parameter_conversion_bytes: eredu_core::Observed::exact(
+                    0,
+                    "residency conversion allocation payload"
+                ),
+                total_current_device_parameter_bytes: eredu_core::Observed::exact(
+                    40,
+                    "original parameter ledger plus conversion allocation payload"
+                ),
                 peak_host_bytes: 90,
                 peak_device_bytes: 60,
                 transfers: [
@@ -874,5 +902,38 @@ mod tests {
                 .collect(),
             }
         );
+        let partial =
+            residency_telemetry(&report.clone().with_device_parameter_conversion_bytes(17));
+        assert_eq!(partial.current_device_bytes, 40);
+        assert_eq!(
+            partial.current_device_parameter_conversion_bytes.value(),
+            Some(&17)
+        );
+        assert_eq!(
+            partial.total_current_device_parameter_bytes.value(),
+            Some(&57)
+        );
+        let encoded = serde_json::to_value(&partial).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ResidencyTelemetry>(encoded.clone()).unwrap(),
+            partial
+        );
+        let mut old = encoded;
+        for field in [
+            "parameter_conversion_retention",
+            "current_device_parameter_conversion_bytes",
+            "total_current_device_parameter_bytes",
+        ] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let old: ResidencyTelemetry = serde_json::from_value(old).unwrap();
+        assert!(old.parameter_conversion_retention.value().is_none());
+        assert!(old.total_current_device_parameter_bytes.value().is_none());
+        let overflow =
+            residency_telemetry(&report.with_device_parameter_conversion_bytes(u64::MAX));
+        assert!(overflow
+            .total_current_device_parameter_bytes
+            .value()
+            .is_none());
     }
 }

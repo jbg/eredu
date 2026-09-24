@@ -110,6 +110,15 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         state.native.control_estimate()
     }
+    fn parameter_conversion_retention(
+        model: &Self::Model,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        model.parameter_conversion_retention()
+    }
+
     fn memory_observation(
         model: &Self::Model,
         state: &Self::State,

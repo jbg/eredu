@@ -919,6 +919,16 @@ impl MlxModelSession {
             .take_speculative_activation_error())
     }
 
+    /// Reads the immutable load policy and live admission ledger without touching state.
+    pub(crate) fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        self.payload.model.erased().parameter_conversion_retention()
+    }
+
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         self.payload.model.residency_report()

@@ -241,6 +241,10 @@ pub(crate) fn static_memory_from_residency(
         crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
     >,
 ) -> Result<StaticMemoryReport, CapabilityError> {
+    let retention = residency.as_ref().map_or_else(
+        eredu_core::residency::unreported_parameter_conversion_retention,
+        |report| report.offload().parameter_conversion_retention().clone(),
+    );
     let conversions = residency
         .as_ref()
         .map(|report| report.device_parameter_conversion_bytes());
@@ -320,6 +324,7 @@ pub(crate) fn static_memory_from_residency(
         add_parameter_observation(&mut device, bytes)?;
     }
     Ok(StaticMemoryReport {
+        parameter_conversion_retention: retention,
         logical_parameter_bytes: logical,
         current_host_resident_bytes: host,
         current_device_resident_bytes: device,
@@ -359,6 +364,15 @@ fn add_parameter_observation(
 }
 
 impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
+    fn parameter_conversion_retention(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        runtime.session().parameter_conversion_retention()
+    }
+
     fn model_capabilities(
         runtime: &ModelRuntime<Self>,
     ) -> Result<ModelCapabilities, CapabilityError> {

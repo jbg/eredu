@@ -859,6 +859,15 @@ pub trait SpeculativeExecutor {
         }
     }
 
+    /// Reads load-selected retention budgets without polling, settling, or touching
+    /// request state. This is valid even while verification is pending.
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<Option<crate::residency::ExecutionConversionRetentionReport>, crate::BackendFailure>
+    {
+        Ok(None)
+    }
+
     /// Pure observation of settled model and prediction cache frontiers, capacity
     /// and residency. No polling, synchronization, copying or budget consumption.
     /// Executors without complete settled observations remain unsupported by default.

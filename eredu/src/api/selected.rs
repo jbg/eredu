@@ -157,6 +157,24 @@ pub struct LocalLoadOptions {
 }
 
 impl LocalLoadOptions {
+    /// Selects model-scoped retained conversion payload at load time. `None`
+    /// uses the finite 256 MiB managed default for eligible resident executions.
+    /// This is independent of allocator caching and does not limit temporary casts.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.normalized = self.normalized.with_parameter_conversion_retention(policy);
+        self
+    }
+
+    /// Explicit retention request, or `None` for the managed default.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
+        self.normalized.parameter_conversion_retention()
+    }
+
     /// Creates load options that quantize eligible dense weights on load.
     pub fn with_quantization(quantization: crate::QuantizationRequest) -> Self {
         Self {

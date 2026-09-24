@@ -17,10 +17,12 @@ mod conversion_retention;
 mod prefetch;
 
 pub use conversion_retention::{
+    unreported_parameter_conversion_retention, ExecutionConversionRetentionReport,
     ParameterConversionRetentionEligibility, ParameterConversionRetentionGroup,
-    ParameterConversionRetentionPolicy, ParameterConversionRetentionPolicyReport,
-    ParameterConversionRetentionPolicySource, ParameterConversionRetentionReport,
-    ParameterConversionRetentionTrimReport, ParameterConversionRetentionUsage,
+    ParameterConversionRetentionObserver, ParameterConversionRetentionPolicy,
+    ParameterConversionRetentionPolicyReport, ParameterConversionRetentionPolicySource,
+    ParameterConversionRetentionReport, ParameterConversionRetentionTrimReport,
+    ParameterConversionRetentionUsage,
 };
 
 pub use prefetch::{

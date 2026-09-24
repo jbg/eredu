@@ -82,3 +82,38 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
         apply_admission_policy(&capabilities, request, state, available)
     }
 }
+
+impl<B: ModelCapabilityBackend> LoadedModel<B> {
+    /// Reads this execution's conversion-retention budgets without evaluating,
+    /// settling, or changing request state. Embedded owners share these budgets.
+    pub fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        B::parameter_conversion_retention(&self.runtime)
+    }
+}
+
+impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionObserver>
+    super::PlannedModel<B, D>
+{
+    /// Reports every loaded participant's retention budget. External drafting
+    /// has an independent allowance; embedded owners are included in the target.
+    /// Queries never settle, evaluate, reserve, or advance execution.
+    pub fn parameter_conversion_retention(
+        &self,
+    ) -> Result<eredu_core::residency::ExecutionConversionRetentionReport, eredu_core::BackendFailure>
+    {
+        Ok(eredu_core::residency::ExecutionConversionRetentionReport {
+            target: self.model().parameter_conversion_retention()?,
+            external_drafter: match self.drafting() {
+                eredu_core::RealizedDrafting::External(draft) => {
+                    Some(draft.parameter_conversion_retention()?)
+                }
+                _ => None,
+            },
+        })
+    }
+}

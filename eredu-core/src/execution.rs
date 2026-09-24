@@ -313,6 +313,10 @@ pub struct ExecutionPlan {
     pub(crate) topology: ParallelTopology,
     /// Ordinary static-weight placement.
     pub(crate) residency: ResidencyPlan,
+    /// Optional model-scoped conversion retention override; absent selects the managed default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parameter_conversion_retention:
+        Option<crate::residency::ParameterConversionRetentionPolicy>,
     /// Optional transformation applied while checkpoint weights are loaded.
     pub(crate) weight_transformation: WeightTransformationPlan,
     /// Maximum number of checkpoint shards or readers retained simultaneously.
@@ -343,6 +347,7 @@ impl ExecutionPlan {
             device,
             topology: ParallelTopology::new(1, 1, 1, 1).expect("the singleton topology is valid"),
             residency: ResidencyPlan::FullyResident,
+            parameter_conversion_retention: None,
             weight_transformation: WeightTransformationPlan::PreserveCheckpoint,
             max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             expert_cache: None,
@@ -369,6 +374,25 @@ impl ExecutionPlan {
     pub const fn residency(&self) -> &ResidencyPlan {
         &self.residency
     }
+    /// Requested conversion-retention policy. `None` selects the finite managed default.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<crate::residency::ParameterConversionRetentionPolicy> {
+        self.parameter_conversion_retention
+    }
+
+    /// Selects optional retained F32 payload at load time for each loaded execution.
+    /// Target and embedded owners share a budget; a separate external drafter has its own.
+    /// `None` uses 256 MiB for eligible executions. This does not limit temporary casts,
+    /// allocator caching, or total memory. Bounded residency disables retention.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<crate::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.parameter_conversion_retention = policy;
+        self
+    }
+
     /// Load-time weight transformation.
     pub const fn weight_transformation(&self) -> WeightTransformationPlan {
         self.weight_transformation

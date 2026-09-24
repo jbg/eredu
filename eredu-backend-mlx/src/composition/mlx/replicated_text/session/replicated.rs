@@ -745,6 +745,17 @@ where
         ))
     }
 
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        self.session
+            .parameter_conversion_retention()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
         self.session
             .report()

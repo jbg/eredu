@@ -1993,6 +1993,19 @@ pub trait MultimodalPreparationBackend: TextGenerationBackend {
 /// backend's existing opaque prompt type; tensor, stream, allocator, and
 /// executable types remain inside the adapter.
 pub trait ModelCapabilityBackend: TextGenerationBackend {
+    /// Reads load-selected conversion-retention policy and live usage. This must
+    /// not allocate execution resources, evaluate, synchronize or mutate state.
+    fn parameter_conversion_retention(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<
+        crate::Observed<Vec<crate::residency::ParameterConversionRetentionReport>>,
+        crate::BackendFailure,
+    > {
+        Self::static_memory(runtime)
+            .map(|report| report.parameter_conversion_retention)
+            .map_err(crate::BackendFailure::from_error)
+    }
+
     /// Reports validated model capabilities for the selected session.
     fn model_capabilities(
         runtime: &ModelRuntime<Self>,
@@ -3157,6 +3170,8 @@ mod tests {
         ) -> Result<StaticMemoryReport, CapabilityError> {
             let unavailable = || crate::Observed::unavailable("mock does not expose this counter");
             Ok(StaticMemoryReport {
+                parameter_conversion_retention:
+                    crate::residency::unreported_parameter_conversion_retention(),
                 logical_parameter_bytes: crate::Observed::exact(
                     u64::from(runtime.session().model),
                     "mock model",

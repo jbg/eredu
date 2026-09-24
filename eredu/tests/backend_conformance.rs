@@ -69,6 +69,8 @@ const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
 mod controlled_speculative;
+#[path = "backend_conformance/conversion_retention.rs"]
+mod conversion_retention;
 #[path = "backend_conformance/forecast.rs"]
 mod forecast;
 #[path = "backend_conformance/observed_mock.rs"]
@@ -109,6 +111,8 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 struct MockSession {
+    retention_failure: bool,
+    retention: eredu_runtime::residency::conversion_retention::ConversionRetentionBudget,
     cache_positions: u64,
     authority: eredu_core::SessionAuthority,
     intervention_identity: String,
@@ -181,8 +185,8 @@ impl BoundedCompletion for Done {
 }
 
 impl BackendProvider for MockBackend {
-    type ModelConfig = ();
-    type Model = ();
+    type ModelConfig = eredu_runtime::NormalizedLoadRequest;
+    type Model = eredu_runtime::residency::conversion_retention::ConversionRetentionBudget;
     type Session = MockSession;
     type Error = MockError;
 
@@ -204,10 +208,10 @@ impl BackendProvider for MockBackend {
 
     fn prepare_model(
         &self,
-        _: Self::ModelConfig,
+        options: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
         Ok(PreparedModel::new(
-            (),
+            conversion_retention::budget(&options),
             SessionCapabilities::new(true, true, false),
         ))
     }
@@ -219,6 +223,8 @@ impl BackendProvider for MockBackend {
         eredu_core::SessionAdmission::new(model.capabilities())
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
+            retention_failure: false,
+            retention: model.into_parts().0,
             cache_positions: 0,
             authority: eredu_core::SessionAuthority::new(),
             intervention_identity: eredu_core::intervention::new_intervention_session_identity(),
@@ -576,7 +582,7 @@ impl TextGenerationBackend for MockBackend {
 
 #[test]
 fn lifecycle_rejects_unsettled_authority_without_resetting_it() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
     let pending = runtime.prefill(vec![1, 2]).unwrap();
     assert_eq!(
         runtime.synchronize().unwrap_err().kind(),
@@ -616,6 +622,23 @@ impl MultimodalPreparationBackend for MockBackend {
 }
 
 impl ModelCapabilityBackend for MockBackend {
+    fn parameter_conversion_retention(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<
+        Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        if runtime.session().retention_failure {
+            return Err(eredu_core::BackendFailure::from_error(MockError::Token(
+                999,
+            )));
+        }
+        Ok(Observed::exact(
+            vec![runtime.session().retention.report()],
+            "mock execution ledger",
+        ))
+    }
+
     fn model_capabilities(_: &ModelRuntime<Self>) -> Result<ModelCapabilities, CapabilityError> {
         Ok(ModelCapabilities {
             effective_model_type: "mistral".into(),
@@ -668,9 +691,13 @@ impl ModelCapabilityBackend for MockBackend {
         )
     }
 
-    fn static_memory(_: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
+    fn static_memory(runtime: &ModelRuntime<Self>) -> Result<StaticMemoryReport, CapabilityError> {
         let unavailable = || Observed::unavailable("mock counter is unavailable");
         Ok(StaticMemoryReport {
+            parameter_conversion_retention: Observed::exact(
+                vec![runtime.session().retention.report()],
+                "mock execution ledger",
+            ),
             logical_parameter_bytes: Observed::exact(128, "mock model"),
             current_host_resident_bytes: unavailable(),
             current_device_resident_bytes: unavailable(),
@@ -686,7 +713,10 @@ impl ModelCapabilityBackend for MockBackend {
 
 impl ModelLoadingBackend for MockBackend {
     type LoadOptions = ();
-    type SelectedPreparation = eredu_core::PreparationAdmission;
+    type SelectedPreparation = (
+        eredu_core::PreparationAdmission,
+        eredu_runtime::NormalizedLoadRequest,
+    );
     type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
 
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
@@ -713,30 +743,33 @@ impl ModelLoadingBackend for MockBackend {
                 eredu_core::InputModalities::TEXT,
             ),
         );
-        Ok(eredu_core::admit_preparation(
-            request,
-            eredu_core::PreparationMechanismCapabilities::new(true, true)
-                .with_residency(eredu_core::ResidencyRequest::FullyResident, true)
-                .with_input_modalities(eredu_core::InputModalities::TEXT)
-                .with_session(SessionCapabilities::new(true, true, false)),
-        )
-        .expect("mock preparation facts are coherent"))
+        Ok((
+            eredu_core::admit_preparation(
+                request,
+                eredu_core::PreparationMechanismCapabilities::new(true, true)
+                    .with_residency(eredu_core::ResidencyRequest::FullyResident, true)
+                    .with_input_modalities(eredu_core::InputModalities::TEXT)
+                    .with_session(SessionCapabilities::new(true, true, false)),
+            )
+            .expect("mock preparation facts are coherent"),
+            Default::default(),
+        ))
     }
 
     fn selected_preparation_admission(
         &self,
         selected: &Self::SelectedPreparation,
     ) -> eredu_core::PreparationAdmission {
-        *selected
+        selected.0
     }
 
     fn model_config(
         &self,
         selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        let (plan, _admission) = selected.into_parts();
+        let (plan, (_admission, request)) = selected.into_parts();
         assert_eq!(plan.inspection().configuration().family(), "llama");
-        Ok(())
+        Ok(request)
     }
 }
 
@@ -835,12 +868,18 @@ impl ExecutionPlanBackendFactory for MockBackend {
         inspection: &eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
-        _: &ExecutionPlan,
+        plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
+        let mut selection = self.select_preparation(inspection, &()).unwrap();
+        selection.1 = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+            plan,
+            eredu_runtime::ResidencyDiagnostics::default(),
+            None,
+        )
+        .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
         Ok(ExecutionPlanTargetSelection::new(
             eredu_core::PreparationPolicy::default(),
-            self.select_preparation(inspection, &())
-                .expect("mock target selection is coherent"),
+            selection,
             SessionCapabilities::new(true, true, false),
         ))
     }
@@ -883,7 +922,14 @@ impl ExecutionPlanBackendFactory for MockBackend {
             DraftingPlan::External { .. } => {
                 let artifact = external_artifact.expect("external drafting carries identities");
                 let _shared_tokenizer_fingerprint = artifact.tokenizer_compatibility.fingerprint();
-                RealizedDrafting::External(MockDrafter)
+                RealizedDrafting::External(MockDrafter {
+                    retention: Some(conversion_retention::budget(
+                        &eredu_runtime::NormalizedLoadRequest::default()
+                            .with_parameter_conversion_retention(
+                                plan.parameter_conversion_retention(),
+                            ),
+                    )),
+                })
             }
             _ => {
                 return Err(AutomaticPlanningError::Invalid(
@@ -894,9 +940,13 @@ impl ExecutionPlanBackendFactory for MockBackend {
     }
 }
 
-struct MockDrafter;
+#[derive(Default)]
+struct MockDrafter {
+    retention: Option<eredu_runtime::residency::conversion_retention::ConversionRetentionBudget>,
+}
 
 struct MockSpeculativeExecutor {
+    retention: eredu_core::residency::ExecutionConversionRetentionReport,
     embedded: bool,
     reject_second: bool,
     activations: Option<observed_mock::InternalCapture>,
@@ -904,6 +954,15 @@ struct MockSpeculativeExecutor {
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(Some(self.retention.clone()))
+    }
+
     fn coordinate_speculative_step<'a>(
         &mut self,
         states: Vec<eredu_core::SpeculativeScheduleState>,
@@ -1393,7 +1452,7 @@ impl SpeculativeGenerationBackend for MockBackend {
     }
 
     fn with_speculative_execution<C, V>(
-        _: &mut ModelRuntime<Self>,
+        runtime: &mut ModelRuntime<Self>,
         mut request: SpeculativeGenerationBatchRequest<'_, Self, Self::Drafter, C>,
         visitor: V,
     ) -> Result<SpeculativeGenerationBatchOutput, MockError>
@@ -1401,7 +1460,15 @@ impl SpeculativeGenerationBackend for MockBackend {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
-        let embedded = matches!(request.take_drafting(), SpeculativeDraft::Embedded);
+        let drafting = request.take_drafting();
+        let embedded = matches!(drafting, SpeculativeDraft::Embedded);
+        let retention = eredu_core::residency::ExecutionConversionRetentionReport {
+            target: Observed::exact(vec![runtime.session().retention.report()], "mock execution ledger"),
+            external_drafter: match drafting {
+                SpeculativeDraft::External(draft) => Some(eredu_core::residency::ParameterConversionRetentionObserver::parameter_conversion_retention(draft).unwrap()),
+                _ => None,
+            },
+        };
         let mut lanes = request.take_lanes();
         let result_cardinality = lanes
             .first()
@@ -1436,6 +1503,7 @@ impl SpeculativeGenerationBackend for MockBackend {
         let mut output = visitor
             .run(
                 &mut MockSpeculativeExecutor {
+                    retention,
                     embedded,
                     reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
                     activations: None,
@@ -2118,7 +2186,7 @@ fn assert_automatic_planning_conformance() {
             .unwrap()
             .into_runtime()
             .unwrap();
-        let mut foreign = ModelRuntime::prepare(MockBackend, ()).unwrap();
+        let mut foreign = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
         if through_parts {
             std::mem::swap(runtime.parts_mut().1, foreign.parts_mut().1);
         } else {
@@ -2273,7 +2341,7 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
 }
 
 fn assert_distributed_conformance() {
-    let runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
     let distributed = distributed_client_code(&runtime, &MockDistributedValue(vec![2, 3]));
     assert_eq!(distributed.reduced, MockDistributedValue(vec![4, 6]));
     assert_eq!(distributed.gathered, MockDistributedValue(vec![2, 3, 2, 3]));
@@ -2284,7 +2352,7 @@ fn assert_distributed_conformance() {
 }
 
 fn assert_session_observation_conformance() {
-    let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let mut runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
     let output = runtime.prefill(vec![1, 2, 3]).unwrap().wait().unwrap();
     let observations = runtime.observe_output(&output).unwrap();
     assert_eq!(
@@ -2315,7 +2383,7 @@ fn assert_prepared_generation_and_speculative_conformance() {
         serde_json::json!("<|begin_of_text|>"),
     )]));
 
-    let runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+    let runtime = ModelRuntime::prepare(MockBackend, Default::default()).unwrap();
     let mut model = LoadedModel::from_runtime(
         runtime,
         tokenizer,
@@ -2602,7 +2670,7 @@ fn unicode_model_with_template(
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

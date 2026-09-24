@@ -491,6 +491,10 @@ pub struct AllocatorTelemetry {
 /// Logical bytes and transfers reported by bounded parameter residency.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResidencyTelemetry {
+    /// Load-selected conversion-retention scopes and live admission usage.
+    #[serde(default = "crate::residency::unreported_parameter_conversion_retention")]
+    pub parameter_conversion_retention:
+        Observed<Vec<crate::residency::ParameterConversionRetentionReport>>,
     /// Planned logical disk bytes.
     pub planned_disk_bytes: u64,
     /// Planned logical host bytes.
@@ -499,14 +503,31 @@ pub struct ResidencyTelemetry {
     pub planned_device_bytes: u64,
     /// Current logical host-resident bytes.
     pub current_host_bytes: u64,
-    /// Current logical device-resident bytes.
+    /// Current original-parameter bytes in the residency admission ledger.
+    /// Excludes optional conversions; use `total_current_device_parameter_bytes`
+    /// for the current parameter total including those copies.
     pub current_device_bytes: u64,
+    /// Current retained conversion payload, already included in the total below.
+    /// Uses deduplicated allocations rather than summing independent budget claims.
+    #[serde(default = "unreported_conversion_payload")]
+    pub current_device_parameter_conversion_bytes: Observed<u64>,
+    /// Ordinary residency ledger parameters plus retained conversion payload.
+    /// Independently managed routed banks are reported separately; use
+    /// `StaticMemoryReport` for whole-model parameter composition. Unknown on
+    /// overflow. This excludes request state, temporary workspace and allocator cache.
+    #[serde(default = "unreported_conversion_payload")]
+    pub total_current_device_parameter_bytes: Observed<u64>,
     /// Peak logical host-resident bytes.
     pub peak_host_bytes: u64,
-    /// Peak logical device-resident bytes.
+    /// Peak original-parameter bytes in the residency admission ledger.
+    /// This is not a historical peak including optional conversions.
     pub peak_device_bytes: u64,
     /// Transfers in stable source-to-destination order.
     pub transfers: Vec<TransferTelemetry>,
+}
+
+fn unreported_conversion_payload() -> Observed<u64> {
+    Observed::unavailable("parameter conversion payload was not reported")
 }
 
 /// One logical residency transfer counter.

@@ -638,3 +638,64 @@ fn invalid_activation_dtype_does_not_silently_default() {
         Err(TensorDtype::U8)
     );
 }
+
+#[test]
+fn loaded_conversion_retention_policy_reaches_native_residency() {
+    use eredu_core::residency::{
+        ParameterConversionRetentionPolicy as Policy,
+        ParameterConversionRetentionPolicySource as Source,
+    };
+    use eredu_core::{ModelCapabilityBackend, ModelRuntime};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("model.gguf");
+    write_minimal_llama_gguf(&path, GgmlType::F16);
+    let stream = safemlx::Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let load = |policy| {
+        let backend = crate::native::backend(&stream, &stream);
+        let request = crate::MlxLoadRequest::from_normalized(
+            eredu_runtime::NormalizedLoadRequest::default()
+                .with_parameter_conversion_retention(policy),
+        );
+        let model = eredu_core::load_model(&backend, &path, request).unwrap();
+        ModelRuntime::from_prepared(backend, model).unwrap()
+    };
+    let first = load(None);
+    let baseline = MlxBackend::parameter_conversion_retention(&first).unwrap();
+    assert_eq!(
+        baseline.value().unwrap()[0].policy.value().unwrap().source,
+        Source::ManagedDefault
+    );
+    assert_eq!(
+        baseline.value().unwrap()[0]
+            .policy
+            .value()
+            .unwrap()
+            .effective,
+        Policy::MANAGED_DEFAULT
+    );
+    for policy in [
+        Policy::Disabled,
+        Policy::Bounded { max_bytes: 17 },
+        Policy::Unlimited,
+    ] {
+        let runtime = load(Some(policy));
+        let observation = MlxBackend::parameter_conversion_retention(&runtime).unwrap();
+        let group = &observation.value().unwrap()[0];
+        assert_eq!(group.policy.value().unwrap().requested, policy);
+        assert_eq!(group.policy.value().unwrap().effective, policy);
+        assert_eq!(group.policy.value().unwrap().source, Source::Explicit);
+        assert_eq!(group.usage.value().unwrap().retained_payload_bytes, 0);
+        assert_eq!(group.usage.value().unwrap().reserved_payload_bytes, 0);
+        assert_ne!(group.group, baseline.value().unwrap()[0].group);
+        assert_eq!(
+            MlxBackend::static_memory(&runtime)
+                .unwrap()
+                .parameter_conversion_retention,
+            observation
+        );
+        assert_eq!(
+            MlxBackend::parameter_conversion_retention(&first).unwrap(),
+            baseline
+        );
+    }
+}

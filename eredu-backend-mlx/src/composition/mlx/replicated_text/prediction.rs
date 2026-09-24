@@ -786,6 +786,12 @@ where
 }
 
 pub(crate) trait ErasedExternalPredictionExecutable: 'static {
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    >;
     fn prepare_external_prediction_target_cache(
         &mut self,
     ) -> Result<MlxPredictionTargetState, Error>;
@@ -984,6 +990,12 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         tokens: &Array,
         stream: &Stream,
     ) -> Result<CheckpointRestoreProbe, Error>;
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    >;
     fn residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport>;

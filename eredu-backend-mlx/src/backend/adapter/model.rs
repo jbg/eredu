@@ -134,6 +134,16 @@ impl MlxModel {
         self.executable.effective_model_type()
     }
 
+    /// Reads load-selected retention budgets without touching execution state.
+    pub(crate) fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        self.executable.erased().parameter_conversion_retention()
+    }
+
     /// Returns bounded parameter-residency telemetry when available.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         self.executable.residency_report()

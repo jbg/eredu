@@ -38,6 +38,16 @@ where
     type Telemetry = M::Telemetry;
     type Error = M::Error;
 
+    fn parameter_conversion_retention(
+        target: &Self::Target,
+        assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        M::parameter_conversion_retention(target, assistant)
+    }
+
     fn max_proposals(assistant: &Self::Assistant) -> usize {
         M::config(assistant).block_size.saturating_sub(1)
     }
@@ -449,6 +459,17 @@ pub trait ExternalMechanisms: 'static {
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Reads participant budgets without touching caches or submitted work.
+    fn parameter_conversion_retention(
+        _target: &Self::Target,
+        _assistant: &Self::Assistant,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
     /// Known bound for an isolated reusable target-cache checkpoint.
     fn control_cache_estimate(
         _cache: &Self::Cache,
@@ -728,6 +749,15 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        M::parameter_conversion_retention(self.target, self.assistant)
+    }
 
     fn control_snapshot_estimate(
         &self,

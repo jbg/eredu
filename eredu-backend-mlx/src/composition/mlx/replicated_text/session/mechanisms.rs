@@ -406,6 +406,14 @@ where
             prepared.unit_bindings,
             std::mem::take(&mut self.prediction_residency.units),
         )?;
+        policy
+            .residency_manager()
+            .configure_parameter_conversion_retention(
+                selected.parameter_conversion_retention(),
+                super::retention::partition_retention_exclusion(selected.topology()).unwrap_or(
+                    eredu_core::residency::ParameterConversionRetentionEligibility::Eligible,
+                ),
+            )?;
         self.prediction_residency
             .install(policy.residency_manager())?;
         Ok((policy, layout, prepared.addresses))
@@ -601,11 +609,6 @@ where
     ) -> Result<Self::ResidentPolicy, Self::Error> {
         let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
         let residency = policy.residency_manager().clone();
-        if let Some(exclusion) =
-            super::retention::partition_retention_exclusion(selected.topology())
-        {
-            residency.configure_parameter_conversion_retention(None, exclusion)?;
-        }
         let resident = policy.into_resident_units(units, context)?;
         self.resident_residency = Some(residency);
         MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
@@ -704,6 +707,22 @@ where
             #[cfg(test)]
             retained_numeric: S::retained_numeric_snapshot(state)?,
         })
+    }
+
+    fn parameter_conversion_retention(
+        &self,
+        residency: eredu_runtime::LayerWeightResidency,
+        bounded: Option<&Self::BoundedPolicy>,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        Error,
+    > {
+        Ok(self
+            .execution_report(residency, bounded)?
+            .residency
+            .offload()
+            .parameter_conversion_retention()
+            .clone())
     }
 
     fn parameter_memory_observation(

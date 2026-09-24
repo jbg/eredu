@@ -483,6 +483,8 @@ fn malformed_intervals_duplicate_domains_and_arithmetic_overflow_are_errors() {
 
 fn static_report(semantics: PhysicalMemorySemantics) -> StaticMemoryReport {
     StaticMemoryReport {
+        parameter_conversion_retention:
+            eredu_core::residency::unreported_parameter_conversion_retention(),
         logical_parameter_bytes: Observed::exact(100, "test"),
         current_host_resident_bytes: Observed::exact(100, "test"),
         current_device_resident_bytes: Observed::exact(100, "test"),

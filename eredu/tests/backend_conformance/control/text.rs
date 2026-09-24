@@ -443,7 +443,7 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
     vocab.insert("<|im_end|>".into(), serde_json::json!(65));
     let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&value).unwrap()).unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -503,7 +503,7 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
         .unwrap();
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,

@@ -1053,3 +1053,16 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         })
     }
 }
+
+impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
+    /// Read-only model-scoped retention telemetry, shared with ordinary generation.
+    /// This query does not settle pending work or change the controlled boundary.
+    pub fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        B::parameter_conversion_retention(self.driver.runtime())
+    }
+}

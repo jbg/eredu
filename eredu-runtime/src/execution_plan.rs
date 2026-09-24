@@ -148,6 +148,7 @@ impl NormalizedLoadRequest {
         let mut request = execution_plan_quantization(plan.weight_transformation())?
             .map_or_else(Self::default, Self::with_quantization)
             .with_weight_residency(residency)
+            .with_parameter_conversion_retention(plan.parameter_conversion_retention())
             .with_max_cached_shards(
                 std::num::NonZeroUsize::new(plan.max_cached_shards())
                     .expect("plan structure validates a positive reader limit"),

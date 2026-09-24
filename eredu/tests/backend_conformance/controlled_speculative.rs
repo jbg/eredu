@@ -674,3 +674,67 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
             .unwrap();
     }
 }
+
+#[test]
+fn conversion_retention_queries_preserve_speculative_proposals_and_budgets() {
+    for embedded in [true, false] {
+        let (mut model, chat, settings) = setup();
+        let target = model.parameter_conversion_retention().unwrap();
+        let mut draft = MockDrafter {
+            retention: Some(conversion_retention::budget(&Default::default())),
+        };
+        let expected = eredu_core::residency::ExecutionConversionRetentionReport {
+            target,
+            external_drafter: (!embedded).then(|| eredu_core::residency::ParameterConversionRetentionObserver::parameter_conversion_retention(&draft).unwrap()),
+        };
+        let mut observed_pending = false;
+        let mut committed = Vec::new();
+        let output = model
+            .with_controlled_chat_speculative(
+                PreparedChatSpeculativeGenerationRequest {
+                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+                    drafting: if embedded {
+                        SpeculativeDraft::Embedded
+                    } else {
+                        SpeculativeDraft::External(&mut draft)
+                    },
+                    settings,
+                    options: Default::default(),
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+                options(),
+                |session| {
+                    loop {
+                        let status = session.status();
+                        let tokens = session.token_ids().to_vec();
+                        let epoch = session.epoch();
+                        let usage = session.snapshot_usage();
+                        for _ in 0..3 {
+                            assert_eq!(session.parameter_conversion_retention()?, expected);
+                            assert_eq!(session.status(), status);
+                            assert_eq!(session.token_ids(), tokens);
+                            assert_eq!(session.epoch(), epoch);
+                            assert_eq!(session.snapshot_usage(), usage);
+                        }
+                        if status == Status::ReadyToSubmitVerification {
+                            observed_pending = true;
+                            assert!(matches!(
+                                session.snapshot(),
+                                Err(SpeculativeControlError::NotQuiescent)
+                            ));
+                        }
+                        let Some(step) = session.step()? else {
+                            break;
+                        };
+                        committed.extend(step.committed_token_ids);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(observed_pending);
+        assert_eq!(committed, output.token_ids());
+    }
+}

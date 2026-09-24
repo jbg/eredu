@@ -159,6 +159,17 @@ impl SpeculativeSnapshotHandle {
 /// require `can_snapshot`; committed blocks are never split into fake token steps.
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
+    /// Reads role-labelled retention budgets, including while native work is pending.
+    /// Does not poll, settle, reserve, evaluate, or advance the controlled run.
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<eredu_core::residency::ExecutionConversionRetentionReport, SpeculativeControlError>
+    {
+        Err(SpeculativeControlError::Unsupported(
+            "conversion retention observation",
+        ))
+    }
+
     /// Read-only outlook at an advanced canonical boundary without proposals or
     /// pending verification. Does not poll, settle, copy, reserve or advance work.
     /// The what-if horizon does not change the configured generation limit.
@@ -520,6 +531,19 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<eredu_core::residency::ExecutionConversionRetentionReport, SpeculativeControlError>
+    {
+        self.scheduler
+            .executor
+            .parameter_conversion_retention()
+            .map_err(SpeculativeControlError::Backend)?
+            .ok_or(SpeculativeControlError::Unsupported(
+                "conversion retention observation",
+            ))
+    }
+
     fn forecast_remaining_generation(
         &self,
         additional_tokens: u64,

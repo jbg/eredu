@@ -1094,3 +1094,22 @@ controller cannot coordinate reservations across processes. This rejects retenti
 only; ordinary and controlled inference remain available through temporary casts.
 Explicit settled-boundary trimming and its controlled-session operation contract
 remain later retention-plan work.
+
+
+### Conversion retention observations
+
+Parameter-conversion retention is selected at load time through the neutral
+execution plan or normalized load request. Eligible executions use a managed
+256 MiB payload ceiling when no override is supplied; disabled, bounded and
+explicit unlimited requests are supported. It is independent of allocator caching
+and covers retained payload plus reservations, not total memory or temporary casts.
+Controlled and uninterrupted inference use the same immutable budget and owners;
+ordinary reset preserves admitted conversions.
+
+`ControlledGenerationSession::parameter_conversion_retention` observes the same
+budget as the loaded model. Controlled speculative reporting labels target and
+external-drafter scopes; embedded prediction remains in the target group. Queries
+never settle pending submissions, allocate execution resources, populate caches,
+change tokens or RNG, or consume capture, snapshot, transport or copy budgets.
+Missing backend observations remain unsupported or unavailable rather than zero.
+There is no live limit setter or trimming operation in this phase.

@@ -6413,8 +6413,13 @@ Pure normalization preserves the requested value and managed-default/explicit
 provenance, canonicalizes a zero-byte bound to disabled, and reports effective
 disabled policy for host-layerwise, disk-streamed, explicit device-ceiling or
 unsupported mechanisms. The initial managed policy is 256 MiB and is enforced by
-eligible MLX resident materializations. Public load configuration remains a
-separate integration phase.
+eligible MLX resident materializations. `ExecutionPlan::with_parameter_conversion_retention`
+and `NormalizedLoadRequest::with_parameter_conversion_retention` select a
+model-scoped optional override before preparation. `None` retains managed-default
+provenance; explicit disabled, bounded (including zero), and unlimited requests
+survive normalization and architecture selection. The retained neutral selection
+supplies the policy to native residency construction before target or embedded
+owners register. Loading another model cannot change a published budget.
 Runtime owns shared admission and reservation policy; the backend owns native
 conversion storage, evaluation, completion safety and observations. Allocator
 caching remains an independent policy. A retained-payload ceiling covers retained
@@ -6433,8 +6438,41 @@ be summed as physical residency; allocation observations still deduplicate share
 backing. Core `OffloadReport` can carry the separate group reports without adding
 their payload to its original-parameter ledger. Unsupported or unavailable
 observations differ from an observed empty cache or group list. Legacy records
-and current unwired telemetry default to unavailable, never today's managed policy.
+and unsupported telemetry default to unavailable, never today's managed policy.
 Native backing capacity is separately observable and is not added to payload.
+
+`StaticMemoryReport::parameter_conversion_retention` and
+`ResidencyTelemetry::parameter_conversion_retention` preserve the load-selected
+policy, eligibility, budget identity, retained claims and reservations. Retained
+conversion payload remains a named subset of the memory report's current device
+parameters; group admission charges must not be added to physical residency.
+`LoadedModel::parameter_conversion_retention` reads these facts through the neutral
+`ModelCapabilityBackend` hook. `PlannedModel` composes role-labelled `target` and
+`external_drafter` observations through `ParameterConversionRetentionObserver`;
+embedded prediction has only the shared target entry. A missing external entry
+means no separate participant, while an unsupported entry means a participant
+whose ledger cannot be observed. The auxiliary MLX assistants currently report
+unsupported, while independently loaded autoregressive drafters expose their own
+budget. Execution-plan policy applies separately to both loaded models.
+
+The residency telemetry document preserves `current_device_bytes` and
+`peak_device_bytes` as original-parameter admission-ledger counters.
+`total_current_device_parameter_bytes` reports the checked sum of current original
+parameters and deduplicated retained conversion payload;
+`current_device_parameter_conversion_bytes` is a named subset of that total.
+Use the total for current parameter accounting, without adding the subset again.
+The historical peak ledger is not a historical peak of optional conversions.
+An overflowing total is unavailable rather than saturated. This total covers the
+ordinary residency ledger; independently managed routed banks retain their
+separate telemetry. Use `StaticMemoryReport` for whole-model parameter composition,
+including those banks.
+
+Ordinary and controlled reporting uses the same native owner observations and
+preserves backend errors as `BackendFailure` sources. These queries do not
+allocate native execution resources, evaluate or settle work, populate conversions,
+or consume state/observation budgets. This initial API has no live limit setter;
+a request is immutable once loaded. Explicit settled trimming and retention-aware
+forecast arithmetic are separate changes.
 
 `eredu-runtime::residency::conversion_retention` implements the shared portable
 budget and weak registry. Composition may attach one `ConversionRetentionBudget`

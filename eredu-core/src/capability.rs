@@ -267,6 +267,11 @@ pub struct AllocatorCachePolicyReport {
 /// Static checkpoint and current residency observations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticMemoryReport {
+    /// Load-selected budgets and current retention claims. Retained conversion
+    /// payload is already included in resident parameters; do not add it again.
+    #[serde(default = "crate::residency::unreported_parameter_conversion_retention")]
+    pub parameter_conversion_retention:
+        Observed<Vec<crate::residency::ParameterConversionRetentionReport>>,
     /// Logical bytes in parameters or the complete residency plan.
     pub logical_parameter_bytes: Observed<u64>,
     /// Current logical host-resident parameter bytes. On unified memory these
@@ -1098,6 +1103,8 @@ mod tests {
     #[test]
     fn capability_and_memory_schemas_round_trip_without_a_backend() {
         let report = StaticMemoryReport {
+            parameter_conversion_retention:
+                crate::residency::unreported_parameter_conversion_retention(),
             logical_parameter_bytes: Observed::exact(1_024, "mock catalog"),
             current_host_resident_bytes: Observed::exact(512, "mock ledger"),
             current_device_resident_bytes: Observed::exact(512, "mock ledger"),

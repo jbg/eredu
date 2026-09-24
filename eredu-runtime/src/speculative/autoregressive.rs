@@ -87,6 +87,16 @@ pub trait AutoregressiveMechanisms {
     }
     /// Estimates installed state without allocating a checkpoint or issuing copies.
     fn estimate_state(state: &Self::State) -> Option<SnapshotEstimate>;
+    /// Observes one model-scoped budget without touching state or native work.
+    fn parameter_conversion_retention(
+        _model: &Self::Model,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(eredu_core::residency::unreported_parameter_conversion_retention())
+    }
+
     /// Observes actual cache geometry, capacity and parameter residency without work.
     fn memory_observation(
         _model: &Self::Model,
@@ -356,6 +366,20 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         let seed = M::checkpoint(&draft)?;
         cache.draft = draft;
         Ok(SpeculativeCommit::new(seed, replayed))
+    }
+
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(Some(
+            eredu_core::residency::ExecutionConversionRetentionReport {
+                target: M::parameter_conversion_retention(self.target)?,
+                external_drafter: Some(M::parameter_conversion_retention(self.draft)?),
+            },
+        ))
     }
 
     fn continuation_memory_observation(

@@ -554,6 +554,17 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
     /// Optional component telemetry.
     type Telemetry: SpeculativeTelemetry;
 
+    /// Reads the target budget shared with embedded prediction owners without
+    /// polling, settling, or touching request state.
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        Ok(None)
+    }
+
     /// Reads installed target/prediction state and shared parameter ownership.
     fn continuation_memory_observation(
         &self,
@@ -1076,6 +1087,23 @@ where
     type TargetCache = EmbeddedPredictionCache<S, P::LaneState>;
     type PredictionCache = EmbeddedPredictionDraftCache<P::LaneState>;
     type Telemetry = N::Telemetry;
+
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        self.session
+            .parameter_conversion_retention()
+            .map(|target| {
+                Some(eredu_core::residency::ExecutionConversionRetentionReport {
+                    target,
+                    external_drafter: None,
+                })
+            })
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
 
     fn continuation_memory_observation(
         &self,
@@ -1743,6 +1771,14 @@ pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
         &mut self,
         plan: AdmittedSpeculativeActivations,
     ) -> Result<(), SpeculativeControlError>;
+    /// Reads shared retention budgets without touching a lane or native work.
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    >;
+
     /// Reads one settled lane without polling, copying, or evaluating native work.
     fn continuation_memory_observation(
         &self,
@@ -1906,6 +1942,15 @@ where
     ) -> Result<(), SpeculativeControlError> {
         SpeculativeExecutor::readmit_activation_interventions(self, plan)
     }
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        SpeculativeExecutor::parameter_conversion_retention(self)
+    }
+
     fn continuation_memory_observation(
         &self,
         cache: &DynEmbeddedCache,
@@ -2238,6 +2283,15 @@ impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T
         self.inner.readmit_activation_interventions(plan)
     }
 
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        self.inner.parameter_conversion_retention()
+    }
+
     fn continuation_memory_observation(
         &self,
         cache: &Self::Cache,
@@ -2528,6 +2582,15 @@ where
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
+
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
+        eredu_core::BackendFailure,
+    > {
+        self.strategy.parameter_conversion_retention()
+    }
 
     fn continuation_memory_observation(
         &self,

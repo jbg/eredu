@@ -162,6 +162,8 @@ pub struct NormalizedLoadRequest {
     parallel: Option<ParallelLoadRequest>,
     communication_completion: Option<CommunicationCompletionPolicy>,
     weight_residency: WeightResidency,
+    parameter_conversion_retention:
+        Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
     state_residency: CacheResidencyPolicy,
     required_session_capabilities: SessionCapabilities,
     prompt_cache_persistence: bool,
@@ -256,6 +258,25 @@ impl NormalizedLoadRequest {
     /// Selects fully resident or bounded checkpoint-weight execution.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
+        self
+    }
+
+    /// Requested conversion-retention policy. `None` selects the finite managed default.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
+        self.parameter_conversion_retention
+    }
+
+    /// Selects optional retained F32 payload at load time for each loaded execution.
+    /// Target and embedded owners share a budget; a separate external drafter has its own.
+    /// `None` uses 256 MiB for eligible executions. This does not limit temporary casts,
+    /// allocator caching, or total memory. Bounded residency disables retention.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.parameter_conversion_retention = policy;
         self
     }
 

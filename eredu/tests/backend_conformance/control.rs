@@ -541,7 +541,7 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
     assert!(tokenizer.get_vocab_size(true) < 65);
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     let mut model = LoadedModel::from_runtime(
-        ModelRuntime::prepare(MockBackend, ()).unwrap(),
+        ModelRuntime::prepare(MockBackend, Default::default()).unwrap(),
         ChatTokenizer::from_tokenizer(tokenizer),
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
@@ -679,4 +679,46 @@ fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_bef
             ..
         }
     )));
+}
+
+#[test]
+fn conversion_retention_observation_preserves_controlled_state_and_output() {
+    let (mut model, chat, settings, _) = setup();
+    let before = model.parameter_conversion_retention().unwrap();
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
+        .unwrap();
+    let mut session = model
+        .start_controlled_chat(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    let status = session.status();
+    assert_eq!(session.parameter_conversion_retention().unwrap(), before);
+    assert_eq!(session.status(), status);
+    assert_eq!(session.next_prediction(), 0);
+    session.step(|_| ControlFlow::Continue(())).unwrap();
+    let position = session.next_prediction();
+    let tokens = session.token_ids().to_vec();
+    let usage = session.snapshot_usage();
+    for _ in 0..3 {
+        assert_eq!(session.parameter_conversion_retention().unwrap(), before);
+        assert_eq!(session.next_prediction(), position);
+        assert_eq!(session.token_ids(), tokens);
+        assert_eq!(session.snapshot_usage(), usage);
+    }
+    session.run(|_| ControlFlow::Continue(())).unwrap();
+    let expected = session.token_ids().to_vec();
+    drop(session);
+    model.reset().unwrap();
+    let ordinary = model
+        .generate_prepared_chat(PreparedChatGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(&chat),
+            settings,
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        })
+        .unwrap();
+    assert_eq!(ordinary.token_ids, expected);
 }

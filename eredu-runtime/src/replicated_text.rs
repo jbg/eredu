@@ -1872,6 +1872,8 @@ impl BackendMechanismCapabilities {
 /// Caller choices resolved while selecting one replicated text realization.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplicatedTextSelectionRequest {
+    parameter_conversion_retention:
+        Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
     max_cached_shards: usize,
     /// Requested execution topology.
     topology: Option<ParallelTopology>,
@@ -1890,9 +1892,29 @@ pub struct ReplicatedTextSelectionRequest {
 }
 
 impl ReplicatedTextSelectionRequest {
+    /// Requested conversion-retention policy. `None` selects the finite managed default.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
+        self.parameter_conversion_retention
+    }
+
+    /// Selects optional retained F32 payload at load time for each loaded execution.
+    /// Target and embedded owners share a budget; a separate external drafter has its own.
+    /// `None` uses 256 MiB for eligible executions. This does not limit temporary casts,
+    /// allocator caching, or total memory. Bounded residency disables retention.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+    ) -> Self {
+        self.parameter_conversion_retention = policy;
+        self
+    }
+
     /// Creates a replicated request with fail-closed optional facilities.
     pub fn new(residency: LayerWeightResidency, state: CacheResidencyPolicy) -> Self {
         Self {
+            parameter_conversion_retention: None,
             max_cached_shards: residency.max_cached_shards(),
             topology: None,
             residency,
@@ -3439,6 +3461,8 @@ impl SelectedStateRealization {
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
+    parameter_conversion_retention:
+        Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
     backend_chunked_prefill: bool,
     max_cached_shards: usize,
     requirements: ReplicatedTextRequirements,
@@ -3468,6 +3492,12 @@ pub struct SelectedReplicatedTextRealization {
 }
 
 impl SelectedReplicatedTextRealization {
+    /// Model-scoped policy retained from the authoritative load request.
+    pub const fn parameter_conversion_retention(
+        &self,
+    ) -> Option<eredu_core::residency::ParameterConversionRetentionPolicy> {
+        self.parameter_conversion_retention
+    }
     /// Ordinary prefix support from retained architecture and backend facts.
     /// Outer preparation must still apply prediction, composite and partition restrictions.
     pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
@@ -3789,6 +3819,7 @@ pub fn select_replicated_text_realization(
         return Err(ReplicatedTextSelectionError { issues });
     }
     let mut selected = SelectedReplicatedTextRealization {
+        parameter_conversion_retention: request.parameter_conversion_retention,
         backend_chunked_prefill: capabilities.chunked_prefill,
         max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),

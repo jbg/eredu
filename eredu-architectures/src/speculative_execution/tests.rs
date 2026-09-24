@@ -246,6 +246,8 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         use eredu_core::speculative::*;
         use eredu_core::{Observed, PhysicalMemorySemantics};
         let parameters = eredu_core::StaticMemoryReport {
+            parameter_conversion_retention:
+                eredu_core::residency::unreported_parameter_conversion_retention(),
             logical_parameter_bytes: Observed::exact(32, "fixture"),
             current_host_resident_bytes: Observed::exact(0, "fixture"),
             current_device_resident_bytes: Observed::exact(32, "fixture"),

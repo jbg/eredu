@@ -493,6 +493,24 @@ impl eredu_architectures::MaterializedExternalAssistantVisitor<MlxAssistantPrepa
     }
 }
 
+impl eredu_core::residency::ParameterConversionRetentionObserver for MlxDrafter {
+    fn parameter_conversion_retention(
+        &self,
+    ) -> Result<
+        eredu_core::Observed<Vec<eredu_core::residency::ParameterConversionRetentionReport>>,
+        eredu_core::BackendFailure,
+    > {
+        match &self.payload.execution {
+            DrafterExecution::Autoregressive { model, .. } => {
+                model.parameter_conversion_retention()
+            }
+            DrafterExecution::Assistant(_) => Ok(eredu_core::Observed::unsupported(
+                "auxiliary assistant does not expose parameter conversion retention",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "assistant_recovery_tests.rs"]
 mod recovery_tests;
