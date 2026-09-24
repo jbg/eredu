@@ -1,8 +1,24 @@
-//! Reusable promotions owned by fully resident parameter materializations.
+//! Reusable promotions owned by permanently resident parameter materializations.
 //!
-//! The lookup table is weak: it never extends a model's residency. Original
-//! immutable native identities keep edits, restoration and aliases distinct.
+//! Registry entries and backing lookups are weak. Each owner retains native
+//! storage only alongside its own execution group's admitted claim. Lock order
+//! is native registry, native entry, owner binding, then portable controller.
+//! Native conversion/evaluation runs outside all these locks; publication is
+//! serialized with invalidation by the native entry lock.
 
+use eredu_core::{
+    residency::{
+        ParameterConversionRetentionEligibility, ParameterConversionRetentionGroup,
+        ParameterConversionRetentionPolicy, ParameterConversionRetentionPolicyReport,
+    },
+    resources::ResourceIdentity,
+};
+use eredu_runtime::residency::conversion_retention::{
+    conversion_retention_payload_bytes, ConversionRetentionAdmission, ConversionRetentionBudget,
+    ConversionRetentionClaim, ConversionRetentionError, ConversionRetentionParameter,
+    ConversionRetentionRegistry,
+};
+use safemlx::{error::Exception, Array, Dtype, Stream};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -11,17 +27,26 @@ use std::{
     },
 };
 
-use safemlx::{error::Exception, Array, Dtype, Stream};
-
 struct Conversion {
-    allocation: u64,
     _source: Array,
+    parameter: ConversionRetentionParameter,
     state: Mutex<ConversionState>,
 }
-
 struct ConversionState {
     active: bool,
-    value: Option<Array>,
+    value: Weak<NativeConversion>,
+    owners: Vec<Weak<OwnerBinding>>,
+}
+struct NativeConversion {
+    array: Array,
+}
+struct OwnerBinding {
+    budget: ConversionRetentionBudget,
+    retained: Mutex<Option<(ConversionRetentionClaim, Arc<NativeConversion>)>>,
+}
+struct RegisteredConversion {
+    entry: Arc<Conversion>,
+    binding: Arc<OwnerBinding>,
 }
 
 type Registry = BTreeMap<usize, Weak<Conversion>>;
@@ -29,20 +54,37 @@ fn registry() -> &'static Mutex<Registry> {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     REGISTRY.get_or_init(Mutex::default)
 }
-
-/// Cache ownership follows one permanently resident device materialization.
-/// Bounded-residency managers deliberately never enable this cache: their
-/// admission ledger reserves original parameter storage only.
-pub(crate) struct ResidentParameterConversions {
-    owner: u64,
-    entries: BTreeMap<usize, Arc<Conversion>>,
+fn controller() -> &'static ConversionRetentionRegistry {
+    static CONTROLLER: OnceLock<ConversionRetentionRegistry> = OnceLock::new();
+    CONTROLLER.get_or_init(ConversionRetentionRegistry::default)
 }
-
 fn next_identity() -> u64 {
     static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
     NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
+fn identity(scope: &str) -> ResourceIdentity {
+    ResourceIdentity {
+        scope: scope.into(),
+        key: next_identity().to_string(),
+    }
+}
 
+/// Creates a fixed execution-scoped budget without allocating native storage.
+pub(crate) fn execution_budget(
+    requested: Option<ParameterConversionRetentionPolicy>,
+    eligibility: ParameterConversionRetentionEligibility,
+) -> Result<ConversionRetentionBudget, ConversionRetentionError> {
+    controller().budget(
+        ParameterConversionRetentionGroup(identity("mlx.parameter_conversion_group")),
+        ParameterConversionRetentionPolicyReport::resolve(requested, eligibility),
+    )
+}
+
+/// Cache ownership follows one permanently resident device materialization.
+pub(crate) struct ResidentParameterConversions {
+    owner: u64,
+    entries: BTreeMap<usize, RegisteredConversion>,
+}
 impl Default for ResidentParameterConversions {
     fn default() -> Self {
         Self {
@@ -51,109 +93,127 @@ impl Default for ResidentParameterConversions {
         }
     }
 }
-
-/// Immutable native-cache observation keyed by source graph identity internally.
-/// Exposed identities are lifetime-scoped counters, never native pointers.
 pub(crate) struct ResidentConversionObservation {
-    pub(crate) allocation: eredu_core::resources::ResourceIdentity,
+    pub(crate) allocation: ResourceIdentity,
     pub(crate) payload_bytes: u64,
 }
-
 impl ResidentParameterConversions {
-    pub(crate) fn owner_identity(&self) -> eredu_core::resources::ResourceIdentity {
-        eredu_core::resources::ResourceIdentity {
+    pub(crate) fn owner_identity(&self) -> ResourceIdentity {
+        ResourceIdentity {
             scope: "mlx.parameter_materialization".into(),
             key: self.owner.to_string(),
         }
     }
-
     pub(crate) fn resident_conversions(&self) -> BTreeMap<usize, ResidentConversionObservation> {
         self.entries
             .iter()
-            .filter_map(|(&identity, entry)| {
-                let state = entry
-                    .state
+            .filter_map(|(&identity, registered)| {
+                let retained = registered
+                    .binding
+                    .retained
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                state.value.as_ref().map(|array| {
-                    (
-                        identity,
-                        ResidentConversionObservation {
-                            allocation: eredu_core::resources::ResourceIdentity {
-                                scope: "mlx.cached_parameter_conversion".into(),
-                                key: entry.allocation.to_string(),
+                retained
+                    .as_ref()
+                    .filter(|(claim, _)| claim.is_active())
+                    .map(|(claim, _)| {
+                        (
+                            identity,
+                            ResidentConversionObservation {
+                                allocation: claim.allocation().clone(),
+                                payload_bytes: claim.payload_bytes(),
                             },
-                            payload_bytes: array.nbytes() as u64,
-                        },
-                    )
-                })
+                        )
+                    })
             })
             .collect()
     }
-
-    pub(crate) fn register<'a>(&mut self, arrays: impl IntoIterator<Item = &'a Array>) {
-        // Native descriptor access and shallow cloning happen before taking
-        // the registry lock; that lock never encloses a native runtime call.
-        let mut candidates = arrays
+    pub(crate) fn register<'a>(
+        &mut self,
+        arrays: impl IntoIterator<Item = &'a Array>,
+        budget: &ConversionRetentionBudget,
+    ) -> Result<(), ConversionRetentionError> {
+        // Native descriptor access and shallow clones precede registry locking.
+        let candidates = arrays
             .into_iter()
             .filter(|array| matches!(array.dtype(), Dtype::Bfloat16 | Dtype::Float16))
-            .map(|array| (array.graph_identity(), Some(array.clone())))
-            .collect::<Vec<_>>();
+            .map(|array| {
+                let bytes = conversion_retention_payload_bytes(array.size() as u64, 4)?;
+                Ok((array.graph_identity(), array.clone(), bytes))
+            })
+            .collect::<Result<Vec<_>, ConversionRetentionError>>()?;
         let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
         registry.retain(|_, entry| entry.strong_count() > 0);
-        for (identity, source) in &mut candidates {
-            self.entries.entry(*identity).or_insert_with(|| {
-                let entry = registry
-                    .get(identity)
-                    .and_then(Weak::upgrade)
-                    .unwrap_or_else(|| {
-                        Arc::new(Conversion {
-                            allocation: next_identity(),
-                            _source: source.take().expect("registered source value"),
-                            state: Mutex::new(ConversionState {
-                                active: true,
-                                value: None,
-                            }),
-                        })
-                    });
-                registry.insert(*identity, Arc::downgrade(&entry));
-                entry
+        for (key, source, bytes) in candidates {
+            if self.entries.contains_key(&key) {
+                continue;
+            }
+            let entry = match registry.get(&key).and_then(Weak::upgrade) {
+                Some(entry) => entry,
+                None => Arc::new(Conversion {
+                    _source: source,
+                    parameter: controller()
+                        .parameter(identity("mlx.immutable_parameter"), bytes)?,
+                    state: Mutex::new(ConversionState {
+                        active: true,
+                        value: Weak::new(),
+                        owners: Vec::new(),
+                    }),
+                }),
+            };
+            let binding = Arc::new(OwnerBinding {
+                budget: budget.clone(),
+                retained: Mutex::new(None),
             });
-        }
-        drop(registry);
-    }
-
-    /// Retained conversion payload, separate from logical source parameters.
-    /// One entry per immutable identity counts tied aliases only once.
-    #[cfg(test)]
-    pub(crate) fn resident_bytes(&self) -> BTreeMap<usize, u64> {
-        self.entries
-            .iter()
-            .map(|(&identity, entry)| {
-                let state = entry
+            {
+                let mut state = entry
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                // Joining an existing backing still requires this group's claim.
+                if let Some(value) = state.value.upgrade() {
+                    if let Ok(ConversionRetentionAdmission::Retained(claim)) =
+                        entry.parameter.reserve(budget)
+                    {
+                        *binding
+                            .retained
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = Some((claim, value));
+                    }
+                }
+                state.owners.retain(|owner| owner.strong_count() > 0);
+                state.owners.push(Arc::downgrade(&binding));
+            }
+            registry.insert(key, Arc::downgrade(&entry));
+            self.entries
+                .insert(key, RegisteredConversion { entry, binding });
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn resident_bytes(&self) -> BTreeMap<usize, u64> {
+        let observations = self.resident_conversions();
+        self.entries
+            .keys()
+            .map(|identity| {
                 (
-                    identity,
-                    state
-                        .value
-                        .as_ref()
-                        .map_or(0, |array| array.nbytes() as u64),
+                    *identity,
+                    observations
+                        .get(identity)
+                        .map_or(0, |value| value.payload_bytes),
                 )
             })
             .collect()
     }
 }
-
 impl Drop for ResidentParameterConversions {
     fn drop(&mut self) {
         let mut registry = registry().lock().unwrap_or_else(|error| error.into_inner());
-        for (identity, entry) in &self.entries {
-            if Arc::strong_count(entry) == 1
+        for (identity, registered) in &self.entries {
+            if Arc::strong_count(&registered.entry) == 1
                 && registry
                     .get(identity)
-                    .is_some_and(|registered| registered.ptr_eq(&Arc::downgrade(entry)))
+                    .is_some_and(|entry| entry.ptr_eq(&Arc::downgrade(&registered.entry)))
             {
                 registry.remove(identity);
             }
@@ -161,17 +221,12 @@ impl Drop for ResidentParameterConversions {
     }
 }
 
-/// Revokes eligibility before publishing a replacement parameter value.
-/// Clearing and unregistering prevents an old alias from repopulating a cache
-/// after publication replaced the value represented by this residency owner.
-/// Restoring the original value remains numerically exact and uses the ordinary
-/// uncached path until it is materialized under a new resident owner.
+/// Publication revokes old handles; restoring a source requires fresh registration.
 pub(crate) fn invalidate(weight: &Array) {
-    let identity = weight.graph_identity();
     let entry = registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .remove(&identity)
+        .remove(&weight.graph_identity())
         .and_then(|entry| entry.upgrade());
     if let Some(entry) = entry {
         let mut state = entry
@@ -179,31 +234,83 @@ pub(crate) fn invalidate(weight: &Array) {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.active = false;
-        state.value = None;
+        entry.parameter.invalidate();
+        state.value = Weak::new();
+        for owner in state.owners.iter().filter_map(Weak::upgrade) {
+            owner
+                .retained
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        }
     }
 }
 
-/// Match MLX's F32 promotion exactly, while reusing the result when its source
-/// belongs to an enabled permanently resident owner. No cast is introduced for
-/// BF16/F16 inputs, and unregistered/replacement parameters use ordinary matmul.
+/// Match ordinary F32 promotion; denied admissions use the unchanged matmul path.
 pub(crate) fn promoted_weight(
     input: &Array,
     weight: &Array,
     stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    promote_with(input, weight, || {
+        let converted = weight.as_dtype(Dtype::Float32, stream)?;
+        safemlx::transforms::eval([&converted])?;
+        Ok(converted)
+    })
+}
+
+fn promote_with(
+    input: &Array,
+    weight: &Array,
+    convert: impl FnOnce() -> Result<Array, Exception>,
 ) -> Result<Option<Array>, Exception> {
     if input.dtype() != Dtype::Float32
         || !matches!(weight.dtype(), Dtype::Bfloat16 | Dtype::Float16)
     {
         return Ok(None);
     }
-    let identity = weight.graph_identity();
     let entry = registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(&identity)
+        .get(&weight.graph_identity())
         .and_then(Weak::upgrade);
     let Some(entry) = entry else {
         return Ok(None);
+    };
+    let (publisher, reservation) = {
+        let state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !state.active {
+            return Ok(None);
+        }
+        if let Some(value) = state.value.upgrade() {
+            return Ok(Some(value.array.clone()));
+        }
+        let Some(admission) = state
+            .owners
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|owner| match entry.parameter.reserve(&owner.budget) {
+                Ok(ConversionRetentionAdmission::Reserved(reservation)) => {
+                    Some((owner, reservation))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        admission
+    };
+    // The move-only reservation restores capacity on errors or invalidation.
+    let value = Arc::new(NativeConversion { array: convert()? });
+    let allocation = match controller().allocation(
+        identity("mlx.cached_parameter_conversion"),
+        value.array.nbytes() as u64,
+    ) {
+        Ok(allocation) => allocation,
+        Err(_) => return Ok(None),
     };
     let mut state = entry
         .state
@@ -212,20 +319,212 @@ pub(crate) fn promoted_weight(
     if !state.active {
         return Ok(None);
     }
-    if state.value.is_none() {
-        let converted = weight.as_dtype(Dtype::Float32, stream)?;
-        // Materialize once before publishing across streams. This also detaches
-        // the conversion graph from the source parameter after evaluation.
-        safemlx::transforms::eval([&converted])?;
-        state.value = Some(converted);
+    let Ok(claim) = reservation.publish(allocation) else {
+        return Ok(None);
+    };
+    *publisher
+        .retained
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((claim, Arc::clone(&value)));
+    state.value = Arc::downgrade(&value);
+    for owner in state.owners.iter().filter_map(Weak::upgrade) {
+        if let Ok(ConversionRetentionAdmission::Retained(claim)) =
+            entry.parameter.reserve(&owner.budget)
+        {
+            *owner
+                .retained
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some((claim, Arc::clone(&value)));
+        }
     }
-    Ok(state.value.clone())
+    Ok(Some(value.array.clone()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType};
+
+    fn fixture(dtype: Dtype, stream: &Stream) -> Array {
+        Array::from_slice(&[0.1234f32, -2.375, 0.53125, 1.0625], &[2, 2])
+            .as_dtype(dtype, stream)
+            .unwrap()
+    }
+
+    fn usage(
+        budget: &ConversionRetentionBudget,
+    ) -> eredu_core::residency::ParameterConversionRetentionUsage {
+        budget.report().usage.value().unwrap().clone()
+    }
+
+    #[test]
+    fn conversion_policy_matrix_bounds_mixed_promotions_with_allocator_cache_disabled() {
+        struct RestoreCache(usize);
+        impl Drop for RestoreCache {
+            fn drop(&mut self) {
+                safemlx::memory::set_cache_limit(self.0).unwrap();
+            }
+        }
+        let _cache = RestoreCache(safemlx::memory::set_cache_limit(0).unwrap());
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.375f32, -0.625, 1.125, 0.25], &[2, 2]);
+        use ParameterConversionRetentionPolicy::{Bounded, Disabled, Unlimited};
+        for (policy, expected_bytes) in [
+            (Disabled, 0),
+            (Bounded { max_bytes: 1 }, 0),
+            (Bounded { max_bytes: 16 }, 16),
+            (Bounded { max_bytes: 24 }, 16),
+            (Bounded { max_bytes: 32 }, 32),
+            (Unlimited, 32),
+        ] {
+            let budget = execution_budget(
+                Some(policy),
+                ParameterConversionRetentionEligibility::Eligible,
+            )
+            .unwrap();
+            let weights = [
+                fixture(Dtype::Float16, &stream),
+                fixture(Dtype::Bfloat16, &stream),
+            ];
+            // Distinct permanent units share exactly one allowance.
+            let mut owners = [
+                ResidentParameterConversions::default(),
+                ResidentParameterConversions::default(),
+            ];
+            for (owner, weight) in owners.iter_mut().zip(&weights) {
+                owner.register([weight, &weight.clone()], &budget).unwrap();
+            }
+            assert_eq!(usage(&budget).retained_payload_bytes, 0);
+            for weight in &weights {
+                let narrow = input.as_dtype(weight.dtype(), &stream).unwrap();
+                assert!(promoted_weight(&narrow, weight, &stream).unwrap().is_none());
+                let promoted = promoted_weight(&input, weight, &stream).unwrap();
+                let expected = input
+                    .matmul(weight.transpose(&stream).unwrap(), &stream)
+                    .unwrap();
+                let actual = input
+                    .matmul(
+                        promoted
+                            .as_ref()
+                            .unwrap_or(weight)
+                            .transpose(&stream)
+                            .unwrap(),
+                        &stream,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    expected.evaluated().unwrap().as_slice::<f32>(),
+                    actual.evaluated().unwrap().as_slice::<f32>()
+                );
+                let expected_token =
+                    safemlx::ops::indexing::argmax_axis(&expected, -1, false, &stream).unwrap();
+                let actual_token =
+                    safemlx::ops::indexing::argmax_axis(&actual, -1, false, &stream).unwrap();
+                assert_eq!(
+                    expected_token.evaluated().unwrap().as_slice::<u32>(),
+                    actual_token.evaluated().unwrap().as_slice::<u32>()
+                );
+            }
+            assert_eq!(usage(&budget).retained_payload_bytes, expected_bytes);
+            assert_eq!(usage(&budget).reserved_payload_bytes, 0);
+            let retained = promoted_weight(&input, &weights[0], &stream).unwrap();
+            if let Some(retained) = retained {
+                assert_eq!(
+                    promoted_weight(&input, &weights[0], &stream)
+                        .unwrap()
+                        .unwrap()
+                        .graph_identity(),
+                    retained.graph_identity()
+                );
+            }
+            drop(owners);
+            assert_eq!(usage(&budget).retained_payload_bytes, 0);
+            assert!(promoted_weight(&input, &weights[0], &stream)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn conversion_groups_require_independent_claims_and_denied_owners_do_not_retain() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        let weight = fixture(Dtype::Bfloat16, &stream);
+        let full = execution_budget(
+            Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }),
+            ParameterConversionRetentionEligibility::Eligible,
+        )
+        .unwrap();
+        let denied = execution_budget(
+            Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 15 }),
+            ParameterConversionRetentionEligibility::Eligible,
+        )
+        .unwrap();
+        let independent = execution_budget(
+            Some(ParameterConversionRetentionPolicy::Unlimited),
+            ParameterConversionRetentionEligibility::Eligible,
+        )
+        .unwrap();
+        let mut target = ResidentParameterConversions::default();
+        let mut blocked = ResidentParameterConversions::default();
+        let mut other = ResidentParameterConversions::default();
+        target.register([&weight], &full).unwrap();
+        blocked.register([&weight], &denied).unwrap();
+        promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        other.register([&weight], &independent).unwrap();
+        assert_eq!(usage(&full).retained_payload_bytes, 16);
+        assert_eq!(usage(&independent).retained_payload_bytes, 16);
+        assert_eq!(usage(&denied).retained_payload_bytes, 0);
+        assert!(blocked.resident_conversions().is_empty());
+        assert_eq!(
+            target.resident_conversions()[&weight.graph_identity()].allocation,
+            other.resident_conversions()[&weight.graph_identity()].allocation
+        );
+        drop(target);
+        assert_eq!(usage(&full).retained_payload_bytes, 0);
+        assert_eq!(usage(&independent).retained_payload_bytes, 16);
+        drop(other);
+        assert_eq!(usage(&independent).retained_payload_bytes, 0);
+        assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+    }
+
+    #[test]
+    fn conversion_failure_and_invalidation_during_evaluation_cancel_reservations() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        let weight = fixture(Dtype::Float16, &stream);
+        let budget = execution_budget(
+            Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }),
+            ParameterConversionRetentionEligibility::Eligible,
+        )
+        .unwrap();
+        let mut owner = ResidentParameterConversions::default();
+        owner.register([&weight], &budget).unwrap();
+        assert!(promote_with(&input, &weight, || {
+            assert_eq!(usage(&budget).reserved_payload_bytes, 16);
+            // A real MLX shape failure while the native publisher owns its ticket.
+            weight.reshape(&[3], &stream)
+        })
+        .is_err());
+        assert_eq!(usage(&budget).reserved_payload_bytes, 0);
+        assert_eq!(usage(&budget).retained_payload_bytes, 0);
+        assert!(promote_with(&input, &weight, || {
+            assert_eq!(usage(&budget).reserved_payload_bytes, 16);
+            invalidate(&weight);
+            let converted = weight.as_dtype(Dtype::Float32, &stream)?;
+            safemlx::transforms::eval([&converted])?;
+            Ok(converted)
+        })
+        .unwrap()
+        .is_none());
+        assert_eq!(usage(&budget).reserved_payload_bytes, 0);
+        assert_eq!(usage(&budget).retained_payload_bytes, 0);
+        assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+        let mut restored = ResidentParameterConversions::default();
+        restored.register([&weight], &budget).unwrap();
+        promoted_weight(&input, &weight, &stream).unwrap().unwrap();
+        assert_eq!(usage(&budget).retained_payload_bytes, 16);
+    }
 
     #[test]
     fn conversion_observation_preserves_shared_backing_and_owner_lifetimes() {
@@ -239,8 +538,18 @@ mod tests {
             .unwrap();
         let mut target = ResidentParameterConversions::default();
         let mut prediction = ResidentParameterConversions::default();
-        target.register([&weight, &separate]);
-        prediction.register([&weight]);
+        target
+            .register(
+                [&weight, &separate],
+                &execution_budget(None, ParameterConversionRetentionEligibility::Eligible).unwrap(),
+            )
+            .unwrap();
+        prediction
+            .register(
+                [&weight],
+                &execution_budget(None, ParameterConversionRetentionEligibility::Eligible).unwrap(),
+            )
+            .unwrap();
         assert_ne!(target.owner_identity(), prediction.owner_identity());
         // Observation cannot fill an eligible but unused cache.
         assert!(target.resident_conversions().is_empty());
@@ -272,7 +581,12 @@ mod tests {
         invalidate(&weight);
         assert!(prediction.resident_conversions().is_empty());
         let mut replacement = ResidentParameterConversions::default();
-        replacement.register([&weight]);
+        replacement
+            .register(
+                [&weight],
+                &execution_budget(None, ParameterConversionRetentionEligibility::Eligible).unwrap(),
+            )
+            .unwrap();
         promoted_weight(&input, &weight, &stream).unwrap().unwrap();
         assert_ne!(
             replacement.resident_conversions()[&weight.graph_identity()].allocation,
@@ -292,7 +606,13 @@ mod tests {
             assert_eq!(weight.graph_identity(), alias.graph_identity());
             assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
             let mut owner = ResidentParameterConversions::default();
-            owner.register([&weight, &alias]);
+            owner
+                .register(
+                    [&weight, &alias],
+                    &execution_budget(None, ParameterConversionRetentionEligibility::Eligible)
+                        .unwrap(),
+                )
+                .unwrap();
             assert_eq!(owner.resident_bytes().values().sum::<u64>(), 0);
             let promoted = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
             let reused = promoted_weight(&input, &alias, &stream).unwrap().unwrap();
@@ -355,7 +675,13 @@ mod tests {
                 .unwrap()
                 .is_none());
             let mut replacement_owner = ResidentParameterConversions::default();
-            replacement_owner.register([&weight]);
+            replacement_owner
+                .register(
+                    [&weight],
+                    &execution_budget(None, ParameterConversionRetentionEligibility::Eligible)
+                        .unwrap(),
+                )
+                .unwrap();
             let newly_cached = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
             assert_eq!(owner.resident_bytes().values().sum::<u64>(), 0);
             assert_eq!(replacement_owner.resident_bytes().values().sum::<u64>(), 16);

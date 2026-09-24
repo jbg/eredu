@@ -6412,8 +6412,9 @@ contract: disabled, bounded payload bytes, and explicitly unlimited policy.
 Pure normalization preserves the requested value and managed-default/explicit
 provenance, canonicalizes a zero-byte bound to disabled, and reports effective
 disabled policy for host-layerwise, disk-streamed, explicit device-ceiling or
-unsupported mechanisms. The initial managed policy is 256 MiB. These are contract
-definitions only: they do not yet install a limit or change native execution.
+unsupported mechanisms. The initial managed policy is 256 MiB and is enforced by
+eligible MLX resident materializations. Public load configuration remains a
+separate integration phase.
 Runtime owns shared admission and reservation policy; the backend owns native
 conversion storage, evaluation, completion safety and observations. Allocator
 caching remains an independent policy. A retained-payload ceiling covers retained
@@ -6437,12 +6438,13 @@ Native backing capacity is separately observable and is not added to payload.
 
 `eredu-runtime::residency::conversion_retention` implements the shared portable
 budget and weak registry. Composition may attach one `ConversionRetentionBudget`
-to each execution `ResidencyController`; target units, embedded owners and native
-partitions receive clones of the same selected budget. Named layer windows do not
-create allowances. Existing constructors remain unwired, so this mechanism does
-not yet change MLX behavior or install the managed default. Registry lookup joins
-live group identities only when policy facts agree, and immutable source identities
-only when payload agrees. Allocation descriptors preserve the actual backing
+to each execution `ResidencyController`; target units, embedded owners and
+in-process partitions can receive clones of the same selected budget. MLX
+multi-process partitions reject retention as described below. Named layer windows
+do not create allowances. MLX residency constructors now install the managed budget
+without creating conversions. Registry lookup joins live group identities only
+when policy facts agree, and immutable source identities only when payload agrees.
+Allocation descriptors preserve the actual backing
 identity and reject conflicting live payload observations across groups.
 
 Admission atomically counts retained plus reserved payload with checked arithmetic.
@@ -6469,8 +6471,33 @@ creates a distinct entry, and stale ticket publication or destruction cannot
 revive the retired entry or alter the replacement's reservations. Backends must
 detach revoked native values at a completion-safe boundary; logical release does
 not establish physical reclamation. This mechanism provides admission and
-ownership accounting only; settled-boundary trim and MLX integration remain
-separate work.
+ownership accounting; settled-boundary trim remains separate work.
+
+MLX retention owners pair each native conversion reference with their own admitted
+portable claim. The global native registry holds weak entries and each entry holds
+weak owner and backing references, so a denied group's source registration cannot
+keep another group's conversion alive. Admission reserves checked F32 payload
+before casting; native creation and evaluation occur outside native entry, registry
+and portable controller locks. Publication takes the native entry lock, checks
+retirement, and attaches the evaluated backing only to independently admitted
+owners. Native failures and retirement during evaluation drop or cancel the ticket.
+Source publication revokes all obsolete claims; restoration needs a new resident
+registration. Native graphs may still retain storage after logical claim release.
+
+One MLX residency manager shares its budget across permanent units and supplementary
+embedded prediction owners. Independently loaded models and external drafters have
+separate budgets. Multi-rank selected TP, PP, EP and DP topologies currently reject
+retention with typed `Unsupported` eligibility and effective `Disabled`: the local
+controller cannot coordinate reservations across native processes. Inference remains
+available with temporary casts. This is a mechanism wiring gap, not an architectural
+model limitation; no rank silently receives its own full managed allowance. Native
+cross-process retention remains unvalidated and requires coordinated admission.
+
+Host-layerwise, disk-streamed and explicit device-ceiling selections report their
+typed exclusion even for explicit unlimited requests. Selection becomes immutable
+before the first native owner registers. `OffloadReport` carries the effective policy
+and live group ledger; physical conversion observations include only admitted owner
+bindings and deduplicate shared allocations independently from group accounting.
 
 `ParameterConversionRetentionTrimReport` specifies released group claims and
 payload, remaining claims/reservations, and independently observed backing

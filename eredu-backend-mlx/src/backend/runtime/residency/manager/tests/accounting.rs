@@ -448,12 +448,12 @@ fn parameter_conversion_residency_deduplicates_alias_owners_and_expires_with_man
         store,
         OffloadConfig::new(None, None, 1).unwrap(),
         [
-            spec("layer", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+            spec("layer", 8, ResidencyPolicy::Cacheable, MemoryTier::Device),
             spec(
                 "prediction",
                 8,
                 ResidencyPolicy::Cacheable,
-                MemoryTier::Disk,
+                MemoryTier::Device,
             ),
         ],
         [
@@ -471,6 +471,16 @@ fn parameter_conversion_residency_deduplicates_alias_owners_and_expires_with_man
             ),
         ],
     );
+    manager
+        .configure_parameter_conversion_retention(
+            Some(
+                eredu_core::residency::ParameterConversionRetentionPolicy::Bounded {
+                    max_bytes: 16,
+                },
+            ),
+            eredu_core::residency::ParameterConversionRetentionEligibility::Eligible,
+        )
+        .unwrap();
     manager.initialize().unwrap();
     let stream = cpu_stream();
     let lease = manager.acquire(&id("layer"), MemoryTier::Device).unwrap();
@@ -518,6 +528,19 @@ fn parameter_conversion_residency_deduplicates_alias_owners_and_expires_with_man
     let converted = promoted_weight(&input, &weight, &stream).unwrap().unwrap();
     let report = manager.report().unwrap();
     assert_eq!(report.device_parameter_conversion_bytes(), 16);
+    let groups = report
+        .offload()
+        .parameter_conversion_retention()
+        .value()
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].usage.value().unwrap().retained_payload_bytes, 16);
+    assert_eq!(groups[0].usage.value().unwrap().retained_claims, 1);
+    assert_eq!(groups[0].usage.value().unwrap().reserved_payload_bytes, 0);
+    assert_eq!(
+        groups[0].policy.value().unwrap().effective,
+        eredu_core::residency::ParameterConversionRetentionPolicy::Bounded { max_bytes: 16 }
+    );
     let observed = report.device_parameter_conversions().unwrap();
     assert_eq!(observed.len(), 1);
     observed[0].allocation.validate().unwrap();
@@ -551,7 +574,7 @@ fn parameter_conversion_residency_deduplicates_alias_owners_and_expires_with_man
         report.offload().resident_bytes().get(MemoryTier::Device),
         16
     );
-    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Disk), 16);
+    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Device), 16);
     drop(converted);
     drop(lease);
     drop(prediction);
@@ -644,7 +667,7 @@ fn parameter_conversion_residency_is_separate_and_released_on_eviction() {
             "layer",
             8,
             ResidencyPolicy::Cacheable,
-            MemoryTier::Disk,
+            MemoryTier::Device,
         )],
         [unit(
             "layer",
@@ -670,7 +693,7 @@ fn parameter_conversion_residency_is_separate_and_released_on_eviction() {
     let report = manager.report().unwrap();
     assert_eq!(report.device_parameter_conversion_bytes(), 16);
     assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
-    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Disk), 8);
+    assert_eq!(report.offload().planned_bytes().get(MemoryTier::Device), 8);
     drop(converted);
     drop(lease);
     assert!(manager.evict(&id("layer"), MemoryTier::Device).unwrap());
@@ -682,4 +705,100 @@ fn parameter_conversion_residency_is_separate_and_released_on_eviction() {
         0
     );
     assert!(promoted_weight(&input, &weight, &stream).unwrap().is_none());
+}
+
+#[test]
+fn parameter_conversion_explicit_requests_report_effective_residency_exclusions() {
+    use crate::backend::nn::parameter_conversion::promoted_weight;
+    use eredu_core::residency::{
+        ParameterConversionRetentionEligibility as Eligibility,
+        ParameterConversionRetentionPolicy as Policy,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = [0x3f80u16, 0xc010, 0x3e80, 0x3fc0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [(
+            "weight",
+            TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap(),
+        )],
+        None,
+        &dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+    for (tier, ceiling, requested_eligibility, effective) in [
+        (
+            MemoryTier::Disk,
+            None,
+            Eligibility::Eligible,
+            Eligibility::DiskStreamed,
+        ),
+        (
+            MemoryTier::Host,
+            None,
+            Eligibility::Eligible,
+            Eligibility::HostLayerwise,
+        ),
+        (
+            MemoryTier::Device,
+            Some(8),
+            Eligibility::Eligible,
+            Eligibility::DeviceResidencyLimit,
+        ),
+        (
+            MemoryTier::Device,
+            None,
+            Eligibility::Unsupported {
+                reason: "cross-process retention budget unavailable".into(),
+            },
+            Eligibility::Unsupported {
+                reason: "cross-process retention budget unavailable".into(),
+            },
+        ),
+    ] {
+        let manager = manager(
+            Arc::clone(&store),
+            OffloadConfig::new(ceiling, None, 1).unwrap(),
+            [spec("layer", 8, ResidencyPolicy::Cacheable, tier)],
+            [unit(
+                "layer",
+                [binding("weight", "weight", TensorSelection::Full, 8)],
+            )],
+        );
+        manager
+            .configure_parameter_conversion_retention(
+                Some(Policy::Unlimited),
+                requested_eligibility,
+            )
+            .unwrap();
+        manager.initialize().unwrap();
+        let lease = manager.acquire(&id("layer"), MemoryTier::Device).unwrap();
+        manager.enable_resident_parameter_conversions().unwrap();
+        let input = Array::from_slice(&[0.5f32, -0.25], &[1, 2]);
+        assert!(
+            promoted_weight(&input, lease.device_value("weight").unwrap(), &cpu_stream())
+                .unwrap()
+                .is_none()
+        );
+        let report = manager.report().unwrap();
+        let budgets = report
+            .offload()
+            .parameter_conversion_retention()
+            .value()
+            .unwrap();
+        assert_eq!(budgets.len(), 1);
+        let policy = budgets[0].policy.value().unwrap();
+        assert_eq!(policy.requested, Policy::Unlimited);
+        assert_eq!(policy.effective, Policy::Disabled);
+        assert_eq!(policy.eligibility, effective);
+        assert_eq!(budgets[0].usage.value().unwrap().retained_payload_bytes, 0);
+        assert_eq!(report.device_parameter_conversion_bytes(), 0);
+        assert!(matches!(
+            manager.configure_parameter_conversion_retention(None, Eligibility::Eligible),
+            Err(ResidencyError::ConversionRetentionAlreadyRegistered)
+        ));
+    }
 }

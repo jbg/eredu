@@ -52,6 +52,7 @@ impl ManagerInner {
 }
 
 pub(super) struct ManagerState {
+    pub(super) conversion_retention_registered: bool,
     pub(super) failed_transfer: Arc<AtomicBool>,
     pub(super) control: ResidencyController,
     pub(super) storage: BTreeMap<OffloadUnitId, UnitStorage>,

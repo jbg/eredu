@@ -1913,3 +1913,38 @@ This completes retirement of the independent aggregate evaluator, not coverage o
 every mechanism. Missing native contracts remain unknown; arbitrary in-flight
 outlooks remain unsupported. CUDA and native distributed execution were not
 validated in this phase.
+
+### Bounded native conversion retention (2026-09-24)
+
+Eligible resident MLX executions now enforce the initial managed 256 MiB conversion
+payload allowance, shared by all permanent units and embedded prediction owners.
+Admission counts retained plus reserved F32 payload; rejected weights follow the
+same temporary promotion path, preserving F16/BF16 rounding and logits. There is
+no automatic eviction. Reset preserves admitted copies and parameter publication
+revokes them. The allocator-cache limit remains independent, including at zero.
+The earlier 4,680,843,264-byte experiment describes the preceding unlimited
+behavior, not the new default. Full-checkpoint throughput calibration, public
+configuration and settled trimming remain later phases of the retention plan.
+
+Host-layerwise, disk-streamed and explicit device ceilings disable retention.
+Multi-rank native execution also reports typed unsupported eligibility and effective
+disabled retention until shared cross-process admission exists. Native inference
+still uses temporary conversions. Payload ceilings do not bound temporary casts,
+allocator padding, graph storage or process RSS.
+
+Focused nonzero native fixtures cover disabled, 1-byte, exact 16-byte, partial
+24-byte, exact 32-byte and unlimited policies; mixed F16/BF16 promotion; narrow
+activation bypass; exact logits and greedy-token parity; tied aliases; independent
+group claims; owner drop; replacement/restoration; a native shape failure; and
+invalidation during evaluation. The policy matrix runs with allocator caching zero.
+Reproduce with:
+
+```sh
+cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
+```
+
+Validation passed all nine selected tests on this macOS Metal host (native CPU
+fixture streams), with exact F32 logits and greedy-token equality. The sandbox
+could not initialize the Metal device; the same test binary passed with native
+device access. Multi-process retention is explicitly disabled and was not
+hardware-validated. No full-checkpoint throughput claim is made by these fixtures.

@@ -601,6 +601,11 @@ where
     ) -> Result<Self::ResidentPolicy, Self::Error> {
         let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
         let residency = policy.residency_manager().clone();
+        if let Some(exclusion) =
+            super::retention::partition_retention_exclusion(selected.topology())
+        {
+            residency.configure_parameter_conversion_retention(None, exclusion)?;
+        }
         let resident = policy.into_resident_units(units, context)?;
         self.resident_residency = Some(residency);
         MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)

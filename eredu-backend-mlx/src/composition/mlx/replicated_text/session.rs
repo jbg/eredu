@@ -5,6 +5,7 @@ mod composite;
 mod mechanisms;
 pub(super) mod prepared_parameters;
 mod replicated;
+mod retention;
 
 pub(super) use composite::*;
 pub(super) use mechanisms::*;

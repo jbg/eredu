@@ -966,6 +966,15 @@ impl ResidencyController {
         self
     }
 
+    /// Installs selection-time policy before native owners register conversions.
+    /// Callers must not replace the authority of already registered owners.
+    pub fn set_conversion_retention(
+        &mut self,
+        budget: conversion_retention::ConversionRetentionBudget,
+    ) {
+        self.conversion_retention = Some(budget);
+    }
+
     /// Selected execution's conversion admission authority, when installed.
     pub fn conversion_retention(&self) -> Option<&conversion_retention::ConversionRetentionBudget> {
         self.conversion_retention.as_ref()

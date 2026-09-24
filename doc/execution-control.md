@@ -1078,3 +1078,19 @@ verification and commit keep the configured proposal/lookahead ceilings. Request
 new outlook after restore, branch exchange, advancement, or a horizon change.
 For complete accounting and raw iterator settlement, see
 [mid-session memory forecasts](generation-memory.md#mid-session-continuation-forecasts).
+
+Resident parameter conversion retention is enforced by the shared native parameter
+owners used by ordinary and controlled execution. The initial managed 256 MiB
+budget covers retained plus reserved conversion payload across all permanent units
+and embedded prediction owners. A denied reservation uses the unchanged temporary
+cast path. Ordinary reset and controlled state advancement do not reset this budget
+or release admitted conversions; parameter replacement revokes obsolete claims.
+Forecasts and residency queries observe existing claims without populating caches.
+
+Host-layerwise, disk-streamed and explicit device-ceiling executions retain no
+optional conversions. Multi-rank native TP/PP/EP/DP construction reports typed
+unsupported retention eligibility and effective disabled policy, since the local
+controller cannot coordinate reservations across processes. This rejects retention
+only; ordinary and controlled inference remain available through temporary casts.
+Explicit settled-boundary trimming and its controlled-session operation contract
+remain later retention-plan work.

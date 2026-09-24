@@ -117,6 +117,14 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// Conversion registration or selection conflicts with its shared authority.
+    #[error(transparent)]
+    ConversionRetention(
+        #[from] eredu_runtime::residency::conversion_retention::ConversionRetentionError,
+    ),
+    /// Fixed retention selection cannot change after registering native owners.
+    #[error("parameter conversion retention is already registered")]
+    ConversionRetentionAlreadyRegistered,
     /// A backend resource observation violates its neutral accounting contract.
     #[error(transparent)]
     ResourceObservation(#[from] eredu_core::resources::ResourceDescriptionError),
@@ -339,7 +347,27 @@ impl ResidencyManager {
             units: unit_sources,
         };
         let units = units.into_iter().collect::<Vec<_>>();
-        let control = ResidencyController::new_with_catalogs(|id| sources.source(id), plan, units)?;
+        use eredu_core::residency::ParameterConversionRetentionEligibility as Eligibility;
+        let eligibility = if plan.config().device_budget_bytes().is_some() {
+            Eligibility::DeviceResidencyLimit
+        } else if plan
+            .units()
+            .iter()
+            .any(|unit| unit.tier() == MemoryTier::Disk)
+        {
+            Eligibility::DiskStreamed
+        } else if plan
+            .units()
+            .iter()
+            .any(|unit| unit.tier() == MemoryTier::Host)
+        {
+            Eligibility::HostLayerwise
+        } else {
+            Eligibility::Eligible
+        };
+        let budget = crate::backend::nn::parameter_conversion::execution_budget(None, eligibility)?;
+        let control = ResidencyController::new_with_catalogs(|id| sources.source(id), plan, units)?
+            .with_conversion_retention(budget);
         for id in sources.units.keys() {
             if control.unit(id).is_none() {
                 return Err(
@@ -379,6 +407,7 @@ impl ResidencyManager {
                 failed_transfer: Arc::clone(&failed_transfer),
                 state: Mutex::new(ManagerState {
                     failed_transfer,
+                    conversion_retention_registered: false,
                     control,
                     storage,
                     alias_owner_pins: BTreeSet::new(),
@@ -722,22 +751,44 @@ impl ResidencyManager {
         Ok(())
     }
 
+    /// Selects internal retention policy before permanent owners register.
+    pub(crate) fn configure_parameter_conversion_retention(
+        &self,
+        requested: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,
+        eligibility: eredu_core::residency::ParameterConversionRetentionEligibility,
+    ) -> Result<(), ResidencyError> {
+        use eredu_core::residency::ParameterConversionRetentionEligibility as Eligibility;
+        let mut state = self.lock()?;
+        if state.conversion_retention_registered {
+            return Err(ResidencyError::ConversionRetentionAlreadyRegistered);
+        }
+        let prior = state
+            .control
+            .conversion_retention()
+            .expect("manager selection")
+            .report();
+        // A caller cannot override residency exclusions by requesting retention.
+        let eligibility = match &prior.policy.value().expect("exact policy").eligibility {
+            Eligibility::DeviceResidencyLimit => Eligibility::DeviceResidencyLimit,
+            Eligibility::HostLayerwise => Eligibility::HostLayerwise,
+            Eligibility::DiskStreamed => Eligibility::DiskStreamed,
+            _ => eligibility,
+        };
+        let budget =
+            crate::backend::nn::parameter_conversion::execution_budget(requested, eligibility)?;
+        state.control.set_conversion_retention(budget);
+        Ok(())
+    }
+
     /// Enables reusable promotions only after all permanent device leases exist.
     pub(crate) fn enable_resident_parameter_conversions(&self) -> Result<(), ResidencyError> {
-        let state = self.lock()?;
-        // Conversion copies are not reservations in the original-parameter
-        // ledger. Never bypass an explicit device ceiling, including callers
-        // converting a bounded policy into a permanently resident one.
-        if state
+        let mut state = self.lock()?;
+        let budget = state
             .control
-            .ledger()
-            .plan()
-            .config()
-            .device_budget_bytes()
-            .is_some()
-        {
-            return Ok(());
-        }
+            .conversion_retention()
+            .expect("manager selection")
+            .clone();
+        state.conversion_retention_registered = true;
         for unit in state
             .storage
             .values()
@@ -746,7 +797,7 @@ impl ResidencyManager {
             unit.parameter_conversions
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .register(unit.arrays.values());
+                .register(unit.arrays.values(), &budget)?;
         }
         Ok(())
     }
@@ -754,6 +805,16 @@ impl ResidencyManager {
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
         let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
+        let retention = self
+            .lock()?
+            .control
+            .conversion_retention()
+            .expect("manager selection")
+            .report();
+        let offload = offload.with_parameter_conversion_retention(eredu_core::Observed::exact(
+            vec![retention],
+            "MLX execution conversion admission ledger",
+        ));
         Ok(ResidencyReport::new(
             initialized,
             offload,
