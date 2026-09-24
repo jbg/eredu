@@ -283,6 +283,10 @@ impl MlxDrafter {
             return Ok(None);
         };
         profile.geometry = model.memory_geometry()?;
+        profile.parameter_conversions = model
+            .residency_report()
+            .map_err(eredu_core::BackendFailure::from_error)?
+            .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
         profile.parameters = crate::composition::mlx::capability::static_memory_from_residency(
             model
                 .residency_report()

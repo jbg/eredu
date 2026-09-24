@@ -325,6 +325,17 @@ pub fn inspected_speculative_generation_memory_plan(
         ..Default::default()
     };
     let embedded = EmbeddedPredictionMemoryPlan::from_topology(&topology, &request, &calibration)?;
+    if let Some(retention) = &mut request.parameter_conversion_retention {
+        retention.refresh(
+            &request
+                .domains
+                .iter()
+                .flat_map(|d| &d.executions)
+                .chain(std::iter::once(&embedded.execution))
+                .filter_map(|e| e.execution_topology.as_ref())
+                .collect::<Vec<_>>(),
+        )?;
+    }
     Ok((
         request,
         SpeculativeMemoryPlan {
@@ -548,7 +559,68 @@ fn inspected_generation_memory_request_inner(
             vec![host, domain]
         }
     };
+    use eredu_core::residency::{
+        ParameterConversionRetentionEligibility as Eligibility, ParameterConversionRetentionGroup,
+        ParameterConversionRetentionPolicyReport, ParameterConversionRetentionReport,
+        ParameterConversionRetentionUsage,
+    };
+    let eligibility = match text.residency() {
+        LayerWeightResidency::FullyResident => Some(Eligibility::Eligible),
+        LayerWeightResidency::LayerwiseHost(load)
+            if load.offload().device_budget_bytes().is_some() =>
+        {
+            Some(Eligibility::DeviceResidencyLimit)
+        }
+        LayerWeightResidency::LayerwiseHost(_) => Some(Eligibility::HostLayerwise),
+        LayerWeightResidency::DenseDiskStream(_) => Some(Eligibility::DeviceResidencyLimit),
+        _ => None,
+    };
+    let policy = if partitioned && matches!(eligibility, Some(Eligibility::Eligible)) {
+        eredu_core::Observed::unavailable(
+            "cold selection has no cross-rank conversion retention authority fact",
+        )
+    } else if let Some(eligibility) = eligibility {
+        eredu_core::Observed::exact(
+            ParameterConversionRetentionPolicyReport::resolve(
+                text.parameter_conversion_retention(),
+                eligibility,
+            ),
+            "retained cold execution policy",
+        )
+    } else {
+        eredu_core::Observed::unavailable(
+            "selected residency has no conversion retention policy projection",
+        )
+    };
+    let report = ParameterConversionRetentionReport {
+        group: ParameterConversionRetentionGroup(eredu_core::resources::ResourceIdentity {
+            scope: "cold_selected_execution".into(),
+            key: "parameter_conversions".into(),
+        }),
+        policy,
+        usage: eredu_core::Observed::exact(
+            ParameterConversionRetentionUsage {
+                retained_claims: 0,
+                retained_payload_bytes: 0,
+                reserved_payload_bytes: 0,
+                retained_backing_capacity_bytes: eredu_core::Observed::exact(0, "before loading"),
+            },
+            "before loading; plan-local scope, not a native allocation identity",
+        ),
+    };
+    let parameter_conversion_retention = Some(
+        eredu_runtime::memory_forecast::ConversionRetentionMemoryPlan::observe(
+            &[report],
+            Some(Vec::new()),
+            &domains
+                .iter()
+                .flat_map(|d| &d.executions)
+                .filter_map(|e| e.execution_topology.as_ref())
+                .collect::<Vec<_>>(),
+        )?,
+    );
     Ok(GenerationMemoryRequest {
+        parameter_conversion_retention,
         input: options.input,
         max_output_tokens: options.max_output_tokens,
         forecast_output_tokens: options.forecast_output_tokens,

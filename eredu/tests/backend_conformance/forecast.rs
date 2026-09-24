@@ -1,5 +1,7 @@
 #[path = "forecast/embedded.rs"]
 mod embedded;
+#[path = "forecast/retention.rs"]
+mod retention;
 use super::*;
 use eredu::api::{
     ForecastExecutionContract, GenerationForecastOptions, LogitsWorkspace, MemoryBytes, MemoryFit,
@@ -29,9 +31,13 @@ impl GenerationForecastBackend for MockBackend {
     }
 
     fn loaded_memory_profile(
-        _: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self>,
     ) -> Result<LoadedMemoryProfile, GenerationForecastError> {
-        Ok(fixture_profile())
+        Ok(if runtime.session().retention_forecast {
+            retention::profile(runtime)
+        } else {
+            fixture_profile()
+        })
     }
 
     fn forecast_execution_contract(
@@ -900,6 +906,7 @@ fn continuation_payload_floors_cover_installed_state_without_capacity_or_optiona
 
 pub(super) fn fixture_profile() -> LoadedMemoryProfile {
     LoadedMemoryProfile {
+        parameter_conversions: None,
         geometry: LoadedMemoryGeometry {
             execution_topology: None,
             input_score_attention_mechanism: None,

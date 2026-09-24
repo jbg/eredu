@@ -10,6 +10,7 @@ use std::num::NonZeroU8;
 
 fn profile(cached: Observed<u64>, resident: u64) -> LoadedMemoryProfile {
     LoadedMemoryProfile {
+        parameter_conversions: None,
         geometry: LoadedMemoryGeometry {
             execution_topology: None,
             input_score_attention_mechanism: None,

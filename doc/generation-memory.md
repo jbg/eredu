@@ -2075,3 +2075,69 @@ unchanged. The MLX build without default features also passed.
 Full-checkpoint throughput calibration and native distributed validation remain
 in the later validation phase; these fixtures do not establish total-memory or
 RSS reclamation bounds.
+
+### Conversion-retention forecast subledger
+
+`GenerationMemoryRequest::parameter_conversion_retention` records the selected
+budget scopes, effective policies, current claims and reservations, and possible
+new admissions. Each group's `additional_admission_payload` is a **subset** of
+pending conversion workspace, not another contribution to the total. Published
+conversions already belong to resident parameters. The ordinary pending-cast
+allowance covers coexistence of future retained copies and temporary conversions;
+it is never clamped to the retention ceiling. A tensor larger than the remaining
+allowance can still require its full temporary cast during execution.
+
+Cold plans start with zero claims and reservations. Their scope is local to that
+cold request, and does not identify native backing or imply sharing between
+independently loaded executions. New admission payload is bounded by eligible
+selected payload and unreserved capacity. Exact attributed tensors too large to
+fit receive no potential retention, and first-admitted winners are not predicted.
+Unattributed geometry remains conservative. Cold partitioned selections currently
+lack a neutral cross-rank retention-authority observation, so their effective
+policy stays unavailable; this does not imply that native partitioned retention
+is supported. Loaded reports replace cold scope with actual execution identities.
+
+Loaded ordinary and speculative requests credit only complete matching selected
+bindings with a current claim in the observed budget scope. Binding names in an
+independent model do not establish reuse. Target and embedded prediction owners
+share their budget; external drafters keep their own request and budget reports.
+When target and external drafter observations identify the same conversion
+allocation in the same single execution pool, composed parameter residency and
+already-resident credit deduplicate its payload while retaining both admission
+claims. Unknown placement across multiple execution pools receives no sharing
+credit.
+
+Every continuation observation refreshes the conversion identities and bindings,
+including external drafters. Trim or parameter invalidation therefore removes
+credit on the next query, even if another owner still keeps that backing alive
+or an equal-sized replacement is admitted. Historical serialized requests with
+no retention facts retain their original accounting, including the historical
+aggregate loaded-profile credit; deserialization never supplies today's default.
+
+Reservations consume admission capacity but do not establish whether a native
+conversion has been materialized. Current group reports lack allocation/binding
+attribution for outstanding reservations. Forecasts therefore keep the observed
+parameter floor and an unknown phase upper end while reservations remain or their
+usage is unavailable,
+including a zero-query continuation boundary. They neither add a reservation as
+a second allocation nor settle it to make the forecast finite. Once publication
+is observed, the backing moves into the ordinary resident subset and exact
+binding credit can remove the matching pending cast. A finite payload policy
+never fills missing temporary-workspace, kernel, alignment or allocator facts.
+All these queries are read-only: they do not create tensors, reserve retention,
+trim owners, submit or settle execution, or consume observation budgets.
+
+Phase 6 validation (2026-09-24): 272 core tests, 649 runtime tests, 112 portable
+backend-conformance tests, 27 portable facade tests (one existing ignored test),
+and three facade forecast unit tests passed. The controlled trim regression
+checks that uncached workspace returns without changing the frontier, output,
+sampling state, or snapshot budgets; restoring a snapshot does not restore a
+released conversion claim. Strict Clippy passed for the five changed production
+crates below with default features disabled.
+
+```sh
+cargo test -p eredu-core -p eredu-runtime --lib --locked
+cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
+cargo test -p eredu --no-default-features --lib api::forecast --locked
+cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu-backend-mlx -p eredu --no-default-features --lib --locked -- -D warnings
+```

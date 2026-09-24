@@ -1949,6 +1949,7 @@ mod tests {
                 },
             },
             bindings: vec![ResidentParameterConversionBinding {
+                retention_group: None,
                 owner: ResourceIdentity {
                     scope: "test".into(),
                     key: "owner".into(),
@@ -2016,6 +2017,7 @@ mod tests {
                 .uses
                 .iter()
                 .map(|usage| ResidentParameterConversionBinding {
+                    retention_group: None,
                     owner: usage.owner.clone(),
                     unit: OffloadUnitId::new(usage.owner.key.clone()).unwrap(),
                     name: "weight".into(),

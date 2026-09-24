@@ -70,6 +70,9 @@ where
                     "embedded conversions receive binding-specific credit after shared residency composition",
                 );
             }
+            // Startup profiles retain immutable geometry, never live conversion
+            // credit: trim/invalidation can replace equal-sized allocations.
+            profile.parameter_conversions = native.parameter_conversions;
             profile.parameters = parameters;
             profile.available = native.available;
             profile.allocator_cache_limit = native.allocator_cache_limit;

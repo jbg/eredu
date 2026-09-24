@@ -68,6 +68,10 @@ pub struct SpeculativeProposalView {
 /// Read-only native storage facts for one independently executable model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeculativeModelMemoryObservation {
+    /// Fresh conversions retained by this participant at the observed boundary.
+    /// Absent historical attribution cannot reuse startup observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_conversions: Option<Vec<crate::residency::ResidentParameterConversion>>,
     /// Current canonical cache frontier, observed from the actual state owner.
     pub current_positions: u64,
     /// Current retained state and backing-capacity allowance.

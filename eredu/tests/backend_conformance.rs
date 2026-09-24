@@ -111,6 +111,7 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 struct MockSession {
+    retention_forecast: bool,
     retention_failure: bool,
     retention_claims: std::sync::Arc<
         std::sync::Mutex<
@@ -228,6 +229,7 @@ impl BackendProvider for MockBackend {
         eredu_core::SessionAdmission::new(model.capabilities())
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
+            retention_forecast: false,
             retention_failure: false,
             retention_claims: Default::default(),
             retention: model.into_parts().0,
@@ -1104,6 +1106,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     > {
         let profile = forecast::fixture_profile();
         let state = eredu_core::speculative::SpeculativeModelMemoryObservation {
+                parameter_conversions: None,
             current_positions: *cache as u64,
             current_state_bytes: Some(65536),
             peak_state_bytes: additional

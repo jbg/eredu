@@ -43,7 +43,25 @@ pub fn loaded_generation_request(
     let placements =
         crate::memory_estimation::static_parameter_placement(&profile.parameters, None)?;
     let mut geometry = profile.geometry;
-    if let Some(cached) = observed(&profile.parameters.current_device_parameter_conversion_bytes) {
+    let retention_reports = profile.parameters.parameter_conversion_retention.value();
+    if let Some(reports) = retention_reports {
+        if let Some(conversions) = &profile.parameter_conversions {
+            let cached =
+                crate::residency::conversion_payload_bytes(conversions).map_err(failure)?;
+            if observed(&profile.parameters.current_device_resident_bytes)
+                .is_some_and(|n| cached > n)
+            {
+                return Err(failure("conversion backing exceeds resident parameters"));
+            }
+            if let Some(topology) = &mut geometry.execution_topology {
+                let reused =
+                    super::retention::credit_topology(topology, conversions, Some(reports))?;
+                geometry.assumptions.push(format!("{reused} bytes of exact scoped retained conversion bindings replace future conversion work; retained payload remains in resident parameters."));
+            }
+        }
+    } else if let Some(cached) =
+        observed(&profile.parameters.current_device_parameter_conversion_bytes)
+    {
         if observed(&profile.parameters.current_device_resident_bytes)
             .is_some_and(|resident| cached > resident)
         {
@@ -153,6 +171,19 @@ pub fn loaded_generation_request(
     }
     let requested_chunk_tokens = chunk_tokens(prefill, input.model_positions);
     let mut request = GenerationMemoryRequest {
+        parameter_conversion_retention: retention_reports
+            .map(|reports| {
+                ConversionRetentionMemoryPlan::observe(
+                    reports,
+                    profile.parameter_conversions,
+                    &geometry
+                        .execution_topology
+                        .as_ref()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?,
         input,
         max_output_tokens: Some(output),
         forecast_output_tokens: output,

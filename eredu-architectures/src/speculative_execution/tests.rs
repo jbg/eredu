@@ -260,6 +260,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         };
         Ok(Some(SpeculativeContinuationObservation {
             target: SpeculativeModelMemoryObservation {
+                parameter_conversions: None,
                 current_positions: cache.target.len() as u64,
                 current_state_bytes: Some(cache.target.len() as u64 * 4),
                 peak_state_bytes: Some((cache.target.len() as u64 + additional) * 4),

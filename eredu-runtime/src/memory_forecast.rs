@@ -7,6 +7,8 @@ use eredu_core::{
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU8;
 
+mod retention;
+pub use retention::*;
 mod loaded;
 pub use loaded::*;
 mod continuation;
@@ -115,6 +117,9 @@ pub struct LoadedMemoryGeometry {
 /// Native observations; portable policy performs the physical-pool accounting.
 #[derive(Clone)]
 pub struct LoadedMemoryProfile {
+    /// Fresh allocation/binding observations from this execution's retaining
+    /// owners. None means unavailable, not an empty cache. Queries never populate it.
+    pub parameter_conversions: Option<Vec<crate::ResidentParameterConversion>>,
     /// Geometry retained by architecture-owned preparation.
     pub geometry: LoadedMemoryGeometry,
     /// Current model parameter residency; never inferred from process counters.

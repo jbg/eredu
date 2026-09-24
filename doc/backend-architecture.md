@@ -7028,3 +7028,26 @@ second ordinary topology or family forecast. Serialized report schemas remain
 readable, and old finite bounds, unknowns and checked arithmetic are retained.
 Frozen pre-migration requests and numeric bounds test this behavior; explanatory
 assumption strings may describe the unified evaluator.
+
+### Retention-aware forecast ownership
+
+The neutral `ResidentParameterConversionBinding` carries optional budget-group
+attribution. Backends observe that group alongside each current retaining binding
+and actual allocation identity; missing historical attribution grants no modern
+scoped credit. Runtime forecast composition matches complete selected payloads,
+not aggregate conversion bytes or names from another budget. MLX observations are
+refreshed for ordinary execution and each speculative participant, including
+settled continuation; startup geometry can be reused but startup conversion
+observations cannot. Shared native conversion identities deduplicate physical
+payload across external participants without merging their admission budgets.
+
+`eredu-runtime` owns the serialized conversion-retention forecast subledger and
+potential-admission bounds. The facade composes cold selection facts and a
+request-local cold scope without native allocation. Missing cross-rank authority
+facts remain unavailable. Native budget scopes replace this local scope after
+loading. Possible retained payload is already covered by the pending conversion
+envelope, and is never added again or used to clamp temporary workspace. Group
+reservations without allocation attribution preserve an unknown phase upper
+bound until publication is observed. Historical records without the new optional
+facts preserve historical accounting. Forecasting never reserves, evaluates,
+settles, trims, or advances execution.

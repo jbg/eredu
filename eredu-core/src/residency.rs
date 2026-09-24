@@ -34,6 +34,10 @@ pub use prefetch::{
 /// One binding whose resident parameter owner retains a cached conversion.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResidentParameterConversionBinding {
+    /// Budget whose current claim permits this binding to reuse the allocation.
+    /// Missing historical attribution cannot establish a modern scoped credit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_group: Option<ParameterConversionRetentionGroup>,
     /// Native-materialization lifetime identity, independent of an artifact name.
     pub owner: crate::resources::ResourceIdentity,
     /// Ordinary residency unit containing this binding.

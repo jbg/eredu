@@ -410,9 +410,8 @@ pub fn apply_embedded_parameter_conversion_credit(
     prediction: &mut EmbeddedPredictionMemoryPlan,
     conversions: Option<&[crate::ResidentParameterConversion]>,
 ) -> Result<Vec<String>, CapabilityError> {
-    let Some(conversions) = conversions else {
-        return Ok(vec!["Embedded conversion ownership observation unavailable; selected future-conversion allowances remain conservative.".into()]);
-    };
+    let observed_conversions = conversions;
+    let conversions = conversions.unwrap_or(&[]);
     let resident = crate::residency::conversion_payload_bytes(conversions)
         .map_err(|error| invalid(error.to_string()))?;
     let available = target
@@ -434,50 +433,27 @@ pub fn apply_embedded_parameter_conversion_credit(
         .chain(std::iter::once(&mut candidate_prediction.execution))
         .filter_map(|e| e.execution_topology.as_mut())
     {
-        let Some(total) = topology.selected_parameter_promotion_bytes.as_mut() else {
-            continue;
-        };
-        let attributed = topology
-            .selected_parameter_promotion_payloads
-            .values()
-            .try_fold(0, |n, &bytes| add(n, bytes))?;
-        if attributed > *total {
-            return Err(invalid(
-                "selected conversion attribution exceeds aggregate payload",
-            ));
-        }
-        let mut credited = 0;
-        for conversion in conversions {
-            let eredu_core::resources::ResourceSize::Fixed { extent } = &conversion.allocation.size
-            else {
-                unreachable!("validated current conversion");
-            };
-            let names = conversion
-                .bindings
+        let reports = target.parameter_conversion_retention.as_ref().map(|plan| {
+            plan.groups
                 .iter()
-                .filter_map(|binding| binding.logical_target.as_deref())
-                .collect::<std::collections::BTreeSet<_>>();
-            for name in names {
-                if let Some(remaining) =
-                    topology.selected_parameter_promotion_payloads.get_mut(name)
-                {
-                    // A binding identifies its complete tensor, not a subrange.
-                    // Partial observations or multiple smaller allocations do
-                    // not prove that its future conversion is already resident.
-                    if *remaining == extent.payload.lower_bytes {
-                        credited = add(credited, *remaining)?;
-                        *remaining = 0;
-                    }
-                }
-            }
-        }
-        if credited > *total {
-            return Err(invalid(
-                "attributed conversion credit exceeds selected conversion payload",
-            ));
-        }
-        *total -= credited;
-        removed = add(removed, credited)?;
+                .map(|g| g.report.clone())
+                .collect::<Vec<_>>()
+        });
+        removed = add(
+            removed,
+            super::super::retention::credit_topology(topology, conversions, reports.as_deref())?,
+        )?;
+    }
+    if let Some(plan) = &mut candidate_target.parameter_conversion_retention {
+        let topologies = candidate_target
+            .domains
+            .iter()
+            .flat_map(|d| &d.executions)
+            .chain(std::iter::once(&candidate_prediction.execution))
+            .filter_map(|e| e.execution_topology.as_ref())
+            .collect::<Vec<_>>();
+        plan.retained_conversions = observed_conversions.map(<[_]>::to_vec);
+        plan.refresh(&topologies)?;
     }
     *target = candidate_target;
     *prediction = candidate_prediction;

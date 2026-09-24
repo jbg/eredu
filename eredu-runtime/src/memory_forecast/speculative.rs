@@ -328,10 +328,22 @@ fn estimate_speculative_inner(
                 .find(|p| p.domain == pool.domain)
                 .map(|p| (r, p))
         });
+        let shared_conversions = plan
+            .draft
+            .as_ref()
+            .map(|draft| super::retention::shared_conversion_payload(target, draft, &pool.domain))
+            .transpose()?
+            .unwrap_or(0);
         let resident = add(
             t.map_or(0, |p| p.already_resident_bytes),
             d.map_or(0, |(_, p)| p.already_resident_bytes),
-        )?;
+        )?
+        .checked_sub(shared_conversions)
+        .ok_or_else(|| {
+            CapabilityError::Observation(
+                "shared conversion credit exceeds resident baseline".into(),
+            )
+        })?;
         let budget = match (t, d) {
             (Some(t), Some((_, d))) => MemoryBudget {
                 application_limit_bytes: stricter(
@@ -428,6 +440,16 @@ fn estimate_speculative_inner(
                 .expect("pool has an owner");
             if let (Some(t), Some(d)) = (&tp, &dp) {
                 p.parameters = t.parameters.add(&d.parameters)?;
+                p.parameters.lower_bytes = p
+                    .parameters
+                    .lower_bytes
+                    .checked_sub(shared_conversions)
+                    .ok_or_else(|| {
+                        CapabilityError::Observation(
+                            "shared conversion credit exceeds parameter baseline".into(),
+                        )
+                    })?;
+                p.parameters.upper_bytes = p.parameters.upper_bytes.map(|n| n - shared_conversions);
                 p.persistent_state = t.persistent_state.add(&d.persistent_state)?;
                 p.retained_input = t.retained_input.add(&d.retained_input)?;
                 p.retained_input.lower_bytes = t

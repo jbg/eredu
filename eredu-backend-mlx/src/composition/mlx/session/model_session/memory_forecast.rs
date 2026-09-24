@@ -210,21 +210,13 @@ fn memory_profile(
         }
         Err(error) => Observed::unavailable(error.to_string()),
     };
-    let mut parameters = crate::composition::mlx::capability::static_model_memory(session)?;
-    if session.capture_discovery.as_ref().is_some_and(|discovery| {
-        discovery
-            .embedded_prediction_topology()
-            .is_ok_and(|topology| topology.is_some())
-    }) {
-        // This aggregate spans target and prediction owners. Crediting all of
-        // it against target-only promotion could erase still-uncached target
-        // conversions. Keep actual conversions in parameter residency; the
-        // speculative composer applies exact owner/binding credit to both topologies.
-        parameters.current_device_parameter_conversion_bytes = Observed::unavailable(
-            "aggregate cached conversions span target and embedded prediction owners; no target-only workspace credit applied",
-        );
-    }
+    let parameters = crate::composition::mlx::capability::static_model_memory(session)?;
+    let parameter_conversions = session
+        .residency_report()
+        .map_err(eredu_core::BackendFailure::from_error)?
+        .and_then(|report| report.device_parameter_conversions().map(<[_]>::to_vec));
     Ok(LoadedMemoryProfile {
+        parameter_conversions,
         geometry,
         parameters,
         available: crate::composition::mlx::capability::available_memory()?,

@@ -1158,6 +1158,7 @@ where
         Ok(Some(
             eredu_core::speculative::SpeculativeContinuationObservation {
                 target: eredu_core::speculative::SpeculativeModelMemoryObservation {
+                    parameter_conversions: parameters.parameter_conversions.clone(),
                     current_positions: N::generation(target)
                         .map_err(eredu_core::BackendFailure::from_error)?,
                     current_state_bytes,

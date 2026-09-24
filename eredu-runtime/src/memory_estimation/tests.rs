@@ -15,6 +15,7 @@ fn request() -> GenerationMemoryRequest {
     )
     .unwrap();
     GenerationMemoryRequest {
+        parameter_conversion_retention: None,
         input: InputTokenCount::text(17),
         max_output_tokens: Some(4),
         forecast_output_tokens: 128,

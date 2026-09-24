@@ -6,6 +6,7 @@ use eredu_core::{
 
 fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
     GenerationMemoryRequest {
+        parameter_conversion_retention: None,
         input: InputTokenCount::text(17),
         max_output_tokens: Some(32),
         forecast_output_tokens: 32,
@@ -667,6 +668,7 @@ fn embedded_conversion_credit_uses_authoritative_backing_bindings_without_new_re
         bindings: names
             .iter()
             .map(|name| ResidentParameterConversionBinding {
+                retention_group: None,
                 owner: identity("owner"),
                 unit: eredu_core::residency::OffloadUnitId::new("unit").unwrap(),
                 name: (*name).into(),
@@ -900,5 +902,192 @@ fn legacy_external_continuation_wire_remains_compatible_without_embedded_field()
     assert_eq!(
         estimate_speculative_continuation_memory(&target, &plan, &state).unwrap(),
         estimate_speculative_continuation_memory(&target, &plan, &decoded).unwrap()
+    );
+}
+
+fn retention_fixture(group: &str, retained: u64, reserved: u64) -> ConversionRetentionMemoryPlan {
+    use eredu_core::{residency::*, resources::*, Observed};
+    let identity = |key: &str| ResourceIdentity {
+        scope: "retention-fixture".into(),
+        key: key.into(),
+    };
+    let group = ParameterConversionRetentionGroup(identity(group));
+    let report = ParameterConversionRetentionReport {
+        group: group.clone(),
+        policy: Observed::exact(
+            ParameterConversionRetentionPolicyReport::resolve(
+                Some(ParameterConversionRetentionPolicy::Bounded { max_bytes: 1024 }),
+                ParameterConversionRetentionEligibility::Eligible,
+            ),
+            "fixture",
+        ),
+        usage: Observed::exact(
+            ParameterConversionRetentionUsage {
+                retained_claims: u64::from(retained != 0),
+                retained_payload_bytes: retained,
+                reserved_payload_bytes: reserved,
+                retained_backing_capacity_bytes: Observed::unavailable("padding unknown"),
+            },
+            "fixture",
+        ),
+    };
+    let conversions = (retained != 0)
+        .then(|| crate::ResidentParameterConversion {
+            allocation: ResourceAllocation {
+                identity: identity("shared-conversion"),
+                uses: vec![ResourceUse {
+                    owner: identity(&group.0.key),
+                    role: ResourceRole::Parameters,
+                }],
+                placement: Observed::unavailable("single execution pool"),
+                size: ResourceSize::Fixed {
+                    extent: ResourceExtent {
+                        payload: ResourceByteBounds::exact(retained),
+                        capacity: ResourceByteBounds::unknown(retained, "padding unknown"),
+                    },
+                },
+            },
+            bindings: vec![crate::ResidentParameterConversionBinding {
+                retention_group: Some(group.clone()),
+                owner: identity(&group.0.key),
+                unit: OffloadUnitId::new("unit").unwrap(),
+                name: "shared".into(),
+                logical_target: Some("shared".into()),
+            }],
+        })
+        .into_iter()
+        .collect();
+    ConversionRetentionMemoryPlan::observe(&[report], Some(conversions), &[]).unwrap()
+}
+
+#[test]
+fn shared_conversion_backing_is_deduplicated_but_independent_claims_survive() {
+    let mut target = request(MemoryDomain::Unified);
+    let mut p = plan();
+    let historical = estimate_speculative_memory(&target, &p).unwrap();
+    target.parameter_conversion_retention = Some(retention_fixture("target", 100, 0));
+    p.draft.as_mut().unwrap().parameter_conversion_retention =
+        Some(retention_fixture("draft", 100, 0));
+    let composed = estimate_speculative_memory(&target, &p).unwrap();
+    for phase in composed.domains[0]
+        .phases
+        .iter()
+        .filter(|p| p.phase != MemoryPhase::Loading)
+    {
+        assert_eq!(phase.parameters.lower_bytes, 8192 - 100);
+        assert_eq!(phase.parameters.upper_bytes, Some(8192 - 100));
+    }
+    assert_eq!(upper(&composed), upper(&historical) - 100);
+    assert_eq!(
+        composed.domains[0].additional_generation_peak,
+        historical.domains[0].additional_generation_peak
+    );
+    assert_ne!(
+        target
+            .parameter_conversion_retention
+            .as_ref()
+            .unwrap()
+            .groups[0]
+            .report
+            .group,
+        p.draft
+            .as_ref()
+            .unwrap()
+            .parameter_conversion_retention
+            .as_ref()
+            .unwrap()
+            .groups[0]
+            .report
+            .group
+    );
+    // Trimming one independent claim removes only that model's residency. The
+    // other participant continues to retain exactly one physical conversion.
+    target.parameter_conversion_retention = Some(retention_fixture("target", 0, 0));
+    target.domains[0].resident_parameters = MemoryBytes::exact(3996);
+    target.domains[0].already_resident_bytes = 3996;
+    let trimmed = estimate_speculative_memory(&target, &p).unwrap();
+    assert_eq!(upper(&trimmed), upper(&composed));
+    assert_eq!(
+        trimmed.domains[0].additional_generation_peak,
+        composed.domains[0].additional_generation_peak
+    );
+}
+
+#[test]
+fn finite_retention_does_not_clamp_temporary_workspace_or_cover_missing_mechanisms() {
+    let mut request = request(MemoryDomain::Unified);
+    request.domains[0].executions[0]
+        .workspace
+        .as_mut()
+        .unwrap()
+        .mixed_precision_parameter_bytes = Some(65536);
+    let historical = estimate_generation_memory(&request).unwrap();
+    request.parameter_conversion_retention = Some(retention_fixture("target", 0, 0));
+    let bounded = estimate_generation_memory(&request).unwrap();
+    assert_eq!(bounded.domains, historical.domains);
+    assert!(bounded.domains[0].phases[0].workspace.upper_bytes.unwrap() > 1024);
+    request.domains[0].executions[0].workspace_overlap = WorkspaceOverlap::unknown();
+    assert!(estimate_generation_memory(&request).unwrap().domains[0]
+        .generation_peak
+        .upper_bytes
+        .is_none());
+    request.domains[0].executions[0].workspace = None;
+    assert!(estimate_generation_memory(&request).unwrap().domains[0]
+        .generation_peak
+        .upper_bytes
+        .is_none());
+}
+
+#[test]
+fn reservation_publication_never_claims_unobserved_allocations_or_finite_overlap() {
+    let mut request = request(MemoryDomain::Unified);
+    request.parameter_conversion_retention = Some(retention_fixture("target", 0, 100));
+    for (phase_name, query) in [
+        (MemoryPhase::ContinuationStart, 0),
+        (MemoryPhase::Decode, 1),
+    ] {
+        let phase = phase(&request.domains[0], &request, phase_name, 17, query).unwrap();
+        assert_eq!(phase.parameters.lower_bytes, 4096);
+        assert!(phase.parameters.upper_bytes.is_none());
+        assert!(phase.total.upper_bytes.is_none());
+    }
+    request
+        .parameter_conversion_retention
+        .as_mut()
+        .unwrap()
+        .groups[0]
+        .report
+        .usage = eredu_core::Observed::unavailable("reservation usage was not observed");
+    assert!(estimate_generation_memory(&request).unwrap().domains[0]
+        .generation_peak
+        .upper_bytes
+        .is_none());
+    request.parameter_conversion_retention = Some(retention_fixture("target", 100, 0));
+    request.domains[0].resident_parameters = MemoryBytes::exact(4196);
+    request.domains[0].already_resident_bytes = 4196;
+    let settled = estimate_generation_memory(&request).unwrap();
+    assert_eq!(settled.domains[0].phases[0].parameters.lower_bytes, 4196);
+    assert!(settled.domains[0].generation_peak.upper_bytes.is_some());
+}
+
+#[test]
+fn historical_requests_without_policy_recompute_their_original_accounting() {
+    let original = request(MemoryDomain::Unified);
+    let mut json = serde_json::to_value(&original).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("parameter_conversion_retention");
+    let decoded: GenerationMemoryRequest = serde_json::from_value(json).unwrap();
+    assert!(decoded.parameter_conversion_retention.is_none());
+    assert_eq!(
+        estimate_generation_memory(&decoded).unwrap(),
+        estimate_generation_memory(&original).unwrap()
+    );
+    let mut current = original;
+    current.parameter_conversion_retention = Some(retention_fixture("target", 100, 0));
+    assert_eq!(
+        serde_json::from_str::<GenerationMemoryRequest>(&serde_json::to_string(&current).unwrap())
+            .unwrap(),
+        current
     );
 }

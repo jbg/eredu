@@ -876,6 +876,12 @@ impl ResidencyManager {
 
         let state = self.lock()?;
         let mut observations = BTreeMap::new();
+        let retention_group = state
+            .control
+            .conversion_retention()
+            .expect("manager selection")
+            .report()
+            .group;
         for (unit_id, storage) in &state.storage {
             let Some(unit) = storage.device.as_ref() else {
                 continue;
@@ -926,6 +932,7 @@ impl ResidencyManager {
                 observation
                     .bindings
                     .push(ResidentParameterConversionBinding {
+                        retention_group: Some(retention_group.clone()),
                         owner: owner.clone(),
                         unit: unit_id.clone(),
                         name: name.clone(),

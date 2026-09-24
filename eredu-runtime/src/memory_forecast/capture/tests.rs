@@ -32,6 +32,7 @@ fn trace() -> TraceLimits {
 
 fn request(domain: MemoryDomain) -> GenerationMemoryRequest {
     GenerationMemoryRequest {
+        parameter_conversion_retention: None,
         input: InputTokenCount::text(2),
         max_output_tokens: Some(2),
         forecast_output_tokens: 2,

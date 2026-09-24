@@ -3,9 +3,10 @@ use super::*;
 use eredu_core::{CapabilityError, InputTokenCount};
 use eredu_runtime::memory_forecast::LoadedMemoryProfile;
 pub use eredu_runtime::memory_forecast::{
-    CaptureMemoryPlan, EmbeddedPredictionMemoryPlan, ForecastCalibration,
-    ForecastExecutionContract, GenerationForecastBackend, GenerationForecastError,
-    SpeculativeForecastBackend, SpeculativeMemoryPlan,
+    CaptureMemoryPlan, ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
+    EmbeddedPredictionMemoryPlan, ForecastCalibration, ForecastExecutionContract,
+    GenerationForecastBackend, GenerationForecastError, SpeculativeForecastBackend,
+    SpeculativeMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;

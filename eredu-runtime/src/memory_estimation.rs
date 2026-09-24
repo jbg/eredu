@@ -376,6 +376,12 @@ pub struct DomainMemoryPlan {
 /// One request and selected execution configuration, usable before native loading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMemoryRequest {
+    /// Scoped retention subledger. Its payload is already covered by resident
+    /// parameters and the pending conversion workspace; never add it to totals.
+    /// Absent historical records retain their original accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_conversion_retention:
+        Option<crate::memory_forecast::ConversionRetentionMemoryPlan>,
     /// Validated input geometry, including media workspace when known.
     pub input: InputTokenCount,
     /// Finite output allowance, or no lifetime bound.
@@ -590,8 +596,29 @@ pub(crate) fn phase(
             state_bytes,
         )?)?;
     }
-    let total = plan
-        .resident_parameters
+    let mut parameters = plan.resident_parameters.clone();
+    if !plan.executions.is_empty()
+        && request
+            .parameter_conversion_retention
+            .as_ref()
+            .is_some_and(|p| {
+                p.groups.iter().any(|g| {
+                    g.report
+                        .usage
+                        .value()
+                        .is_none_or(|u| u.reserved_payload_bytes != 0)
+                })
+            })
+    {
+        // Reservations have no native allocation/binding attribution. They may
+        // be unevaluated or already materialized outside this invocation. Do not
+        // invent a second allocation, subtract arbitrary casts, or omit them at
+        // a zero-query boundary.
+        parameters.upper_bytes = None;
+        parameters.kind = ObservationKind::Estimated;
+        parameters.detail = "outstanding or unobserved conversion reservations have no publication/backing attribution; current parameter floor retained, overlap upper unknown".into();
+    }
+    let total = parameters
         .add(&persistent)?
         .add(&retained)?
         .add(&transient)?
@@ -601,7 +628,7 @@ pub(crate) fn phase(
         phase,
         positions,
         query_positions: query,
-        parameters: plan.resident_parameters.clone(),
+        parameters,
         persistent_state: persistent,
         retained_input: retained,
         workspace: transient,

@@ -1137,3 +1137,13 @@ not a trim. Reports describe released claims and remaining admission usage, not
 bytes returned to the OS. Other owners or native graphs can retain backing;
 allocator-cache flushing is a separate operation. Ordinary reset continues to
 preserve retained conversions.
+
+Continuation forecasts refresh parameter-conversion allocation and retaining-binding
+observations at each canonical boundary, for both target and external drafter.
+They retain immutable selected geometry, never startup conversion credit. After
+trim or invalidation, subsequent forecasts project the newly uncached casts while
+preserving state frontiers and observation budgets. Retention policy and usage
+are a scoped subset of the forecast's existing parameter/workspace accounting;
+a finite ceiling does not bound temporary casts. If a backend reports outstanding
+reservations without publication/backing attribution, the phase upper bound stays
+unknown even at a zero-token horizon; forecasting does not settle those resources.

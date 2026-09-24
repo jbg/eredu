@@ -156,6 +156,10 @@ impl AutoregressiveMechanisms for MlxAutoregressiveMechanisms {
         .map_err(eredu_core::BackendFailure::from_error)?;
         Ok(Some(
             eredu_core::speculative::SpeculativeModelMemoryObservation {
+                parameter_conversions: model
+                    .residency_report()
+                    .map_err(eredu_core::BackendFailure::from_error)?
+                    .and_then(|r| r.device_parameter_conversions().map(<[_]>::to_vec)),
                 current_positions: position,
                 current_state_bytes: current,
                 peak_state_bytes: peak,
