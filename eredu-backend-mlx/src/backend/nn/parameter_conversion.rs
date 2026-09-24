@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_policy_matrix_bounds_mixed_promotions_with_allocator_cache_disabled() {
+    fn conversion_policy_matrix_bounds_mixed_promotions_independently_of_allocator_cache() {
         struct RestoreCache(usize);
         impl Drop for RestoreCache {
             fn drop(&mut self) {
@@ -547,79 +547,100 @@ mod tests {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let input = Array::from_slice(&[0.375f32, -0.625, 1.125, 0.25], &[2, 2]);
         use ParameterConversionRetentionPolicy::{Bounded, Disabled, Unlimited};
-        for (policy, expected_bytes) in [
-            (Disabled, 0),
-            (Bounded { max_bytes: 1 }, 0),
-            (Bounded { max_bytes: 16 }, 16),
-            (Bounded { max_bytes: 24 }, 16),
-            (Bounded { max_bytes: 32 }, 32),
-            (Unlimited, 32),
-        ] {
-            let budget = execution_budget(
-                Some(policy),
-                ParameterConversionRetentionEligibility::Eligible,
-            )
-            .unwrap();
-            let weights = [
-                fixture(Dtype::Float16, &stream),
-                fixture(Dtype::Bfloat16, &stream),
-            ];
-            // Distinct permanent units share exactly one allowance.
-            let mut owners = [
-                ResidentParameterConversions::default(),
-                ResidentParameterConversions::default(),
-            ];
-            for (owner, weight) in owners.iter_mut().zip(&weights) {
-                owner.register([weight, &weight.clone()], &budget).unwrap();
+        for allocator_cap in [0, 256 << 20] {
+            safemlx::memory::set_cache_limit(allocator_cap).unwrap();
+            for (policy, expected_bytes) in [
+                (Disabled, 0),
+                (Bounded { max_bytes: 1 }, 0),
+                (Bounded { max_bytes: 16 }, 16),
+                (Bounded { max_bytes: 24 }, 16),
+                (Bounded { max_bytes: 32 }, 32),
+                (
+                    Bounded {
+                        max_bytes: 32 << 20,
+                    },
+                    32,
+                ),
+                (
+                    Bounded {
+                        max_bytes: 256 << 20,
+                    },
+                    32,
+                ),
+                (
+                    Bounded {
+                        max_bytes: 512 << 20,
+                    },
+                    32,
+                ),
+                (Unlimited, 32),
+            ] {
+                let budget = execution_budget(
+                    Some(policy),
+                    ParameterConversionRetentionEligibility::Eligible,
+                )
+                .unwrap();
+                let weights = [
+                    fixture(Dtype::Float16, &stream),
+                    fixture(Dtype::Bfloat16, &stream),
+                ];
+                // Distinct permanent units share exactly one allowance.
+                let mut owners = [
+                    ResidentParameterConversions::default(),
+                    ResidentParameterConversions::default(),
+                ];
+                for (owner, weight) in owners.iter_mut().zip(&weights) {
+                    owner.register([weight, &weight.clone()], &budget).unwrap();
+                }
+                assert_eq!(usage(&budget).retained_payload_bytes, 0);
+                for weight in &weights {
+                    let narrow = input.as_dtype(weight.dtype(), &stream).unwrap();
+                    assert!(promoted_weight(&narrow, weight, &stream).unwrap().is_none());
+                    let promoted = promoted_weight(&input, weight, &stream).unwrap();
+                    let expected = input
+                        .matmul(weight.transpose(&stream).unwrap(), &stream)
+                        .unwrap();
+                    let actual = input
+                        .matmul(
+                            promoted
+                                .as_ref()
+                                .unwrap_or(weight)
+                                .transpose(&stream)
+                                .unwrap(),
+                            &stream,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        expected.evaluated().unwrap().as_slice::<f32>(),
+                        actual.evaluated().unwrap().as_slice::<f32>()
+                    );
+                    let expected_token =
+                        safemlx::ops::indexing::argmax_axis(&expected, -1, false, &stream).unwrap();
+                    let actual_token =
+                        safemlx::ops::indexing::argmax_axis(&actual, -1, false, &stream).unwrap();
+                    assert_eq!(
+                        expected_token.evaluated().unwrap().as_slice::<u32>(),
+                        actual_token.evaluated().unwrap().as_slice::<u32>()
+                    );
+                }
+                assert_eq!(usage(&budget).retained_payload_bytes, expected_bytes);
+                assert_eq!(usage(&budget).reserved_payload_bytes, 0);
+                let retained = promoted_weight(&input, &weights[0], &stream).unwrap();
+                if let Some(retained) = retained {
+                    assert_eq!(
+                        promoted_weight(&input, &weights[0], &stream)
+                            .unwrap()
+                            .unwrap()
+                            .graph_identity(),
+                        retained.graph_identity()
+                    );
+                }
+                drop(owners);
+                assert_eq!(usage(&budget).retained_payload_bytes, 0);
+                assert!(promoted_weight(&input, &weights[0], &stream)
+                    .unwrap()
+                    .is_none());
             }
-            assert_eq!(usage(&budget).retained_payload_bytes, 0);
-            for weight in &weights {
-                let narrow = input.as_dtype(weight.dtype(), &stream).unwrap();
-                assert!(promoted_weight(&narrow, weight, &stream).unwrap().is_none());
-                let promoted = promoted_weight(&input, weight, &stream).unwrap();
-                let expected = input
-                    .matmul(weight.transpose(&stream).unwrap(), &stream)
-                    .unwrap();
-                let actual = input
-                    .matmul(
-                        promoted
-                            .as_ref()
-                            .unwrap_or(weight)
-                            .transpose(&stream)
-                            .unwrap(),
-                        &stream,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    expected.evaluated().unwrap().as_slice::<f32>(),
-                    actual.evaluated().unwrap().as_slice::<f32>()
-                );
-                let expected_token =
-                    safemlx::ops::indexing::argmax_axis(&expected, -1, false, &stream).unwrap();
-                let actual_token =
-                    safemlx::ops::indexing::argmax_axis(&actual, -1, false, &stream).unwrap();
-                assert_eq!(
-                    expected_token.evaluated().unwrap().as_slice::<u32>(),
-                    actual_token.evaluated().unwrap().as_slice::<u32>()
-                );
-            }
-            assert_eq!(usage(&budget).retained_payload_bytes, expected_bytes);
-            assert_eq!(usage(&budget).reserved_payload_bytes, 0);
-            let retained = promoted_weight(&input, &weights[0], &stream).unwrap();
-            if let Some(retained) = retained {
-                assert_eq!(
-                    promoted_weight(&input, &weights[0], &stream)
-                        .unwrap()
-                        .unwrap()
-                        .graph_identity(),
-                    retained.graph_identity()
-                );
-            }
-            drop(owners);
-            assert_eq!(usage(&budget).retained_payload_bytes, 0);
-            assert!(promoted_weight(&input, &weights[0], &stream)
-                .unwrap()
-                .is_none());
         }
     }
 

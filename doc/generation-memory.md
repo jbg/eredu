@@ -1923,8 +1923,9 @@ same temporary promotion path, preserving F16/BF16 rounding and logits. There is
 no automatic eviction. Reset preserves admitted copies and parameter publication
 revokes them. The allocator-cache limit remains independent, including at zero.
 The earlier 4,680,843,264-byte experiment describes the preceding unlimited
-behavior, not the new default. Full-checkpoint throughput calibration remains later retention-plan work;
-settled trimming is described below.
+behavior, not the new default. The full-checkpoint policy/cache matrix and throughput tradeoff are recorded in
+[conversion-retention-validation.md](conversion-retention-validation.md); settled
+trimming is described below.
 
 Host-layerwise, disk-streamed and explicit device ceilings disable retention.
 Multi-rank native execution also reports typed unsupported eligibility and effective
@@ -1969,7 +1970,9 @@ Pass this plan to `LoadedModel::load_execution_plan`. The low-level portable
 256 MiB for each eligible loaded execution; `Disabled` opts out and `Unlimited`
 opts into the former unbounded reuse deliberately. A zero bound is explicitly
 requested but effectively disabled. The default changed from unlimited retention
-to finite first-admitted retention; throughput calibration is still pending.
+to finite first-admitted retention. The [native matrix](conversion-retention-validation.md)
+keeps the 256 MiB default and quantifies its substantial throughput cost relative
+to explicit unlimited retention on a mixed-width checkpoint.
 There is no process-global retention setting or live limit mutation.
 
 `LoadedModel::parameter_conversion_retention()` reads policy and current retained
@@ -2141,3 +2144,21 @@ cargo test -p eredu --no-default-features --test portable_facade --test backend_
 cargo test -p eredu --no-default-features --lib api::forecast --locked
 cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu-backend-mlx -p eredu --no-default-features --lib --locked -- -D warnings
 ```
+
+
+### Bounded retention validation matrix (2026-09-24)
+
+[Phase-7 validation evidence](conversion-retention-validation.md) crosses disabled,
+32 MiB, 256 MiB, 1 GiB and unlimited conversion retention with allocator settings
+zero and 256 MiB on the pinned mixed-width BF16 GGUF. All ten pairs preserve
+bit-exact full-vocabulary logits, greedy tokens and controlled trim parity against
+the pre-change reference. Fifty memory requests cover empty/warm caches, repeated
+reset, explicit trim, bounded readmission and settled native owner reclamation;
+measured active peaks and continuation growth stay within forecast bounds.
+
+The finite 256 MiB managed default remains. On this checkpoint at 128 positions,
+zero-allocator-cache warm decode was 11.52 tokens/s versus 73.89 with unlimited
+retention, while retaining 4,208 MiB less optional payload. The cap reduces idle
+residency; temporary casts leave generation peaks nearly unchanged. The evidence
+records timings, memory, allocator overshoot observations, speculative
+acceptance/rejection and snapshot/fork coverage, build commands and hardware.

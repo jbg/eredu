@@ -1,5 +1,51 @@
 use super::*;
+use eredu_core::residency::ParameterConversionRetentionPolicy;
 use eredu_core::{TextGenerationConfig, WeightTransformationPlan};
+
+// Explicit knobs shared by the memory and bit-exact parity harnesses. The
+// default still exercises managed policy; historical unlimited runs opt in.
+fn retention_policy() -> Option<ParameterConversionRetentionPolicy> {
+    std::env::var("EREDU_LFM2_RETENTION")
+        .ok()
+        .map(|value| match value.as_str() {
+            "disabled" => ParameterConversionRetentionPolicy::Disabled,
+            "unlimited" => ParameterConversionRetentionPolicy::Unlimited,
+            bytes => ParameterConversionRetentionPolicy::Bounded {
+                max_bytes: bytes
+                    .parse()
+                    .expect("retention is disabled, unlimited, or payload bytes"),
+            },
+        })
+}
+
+fn allocator_limit() -> usize {
+    std::env::var("EREDU_LFM2_ALLOCATOR_CACHE_BYTES")
+        .map(|value| value.parse().expect("allocator cache payload bytes"))
+        .unwrap_or(0)
+}
+
+fn assert_retention_bound(model: &LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>>) {
+    let observation = model.parameter_conversion_retention().unwrap();
+    let reports = observation.value().unwrap();
+    assert_eq!(
+        reports.len(),
+        1,
+        "one selected loaded execution has one budget"
+    );
+    let report = &reports[0];
+    let usage = report.usage.value().unwrap();
+    assert_eq!(
+        usage.reserved_payload_bytes, 0,
+        "settled publication releases reservations"
+    );
+    match report.policy.value().unwrap().effective {
+        ParameterConversionRetentionPolicy::Disabled => assert_eq!(usage.retained_payload_bytes, 0),
+        ParameterConversionRetentionPolicy::Bounded { max_bytes } => {
+            assert!(usage.retained_payload_bytes + usage.reserved_payload_bytes <= max_bytes);
+        }
+        ParameterConversionRetentionPolicy::Unlimited => {}
+    }
+}
 
 #[test]
 #[cfg_attr(
@@ -20,7 +66,8 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
     } else {
         LocalDevice::Cpu
     };
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap());
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap())
+        .with_parameter_conversion_retention(retention_policy());
     if quantized {
         plan = plan.with_weight_transformation(WeightTransformationPlan::Affine {
             bits: 4,
@@ -28,7 +75,7 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         });
     }
     let factory = MlxBackendFactory::default();
-    let previous = set_local_allocator_cache_limit(0).unwrap();
+    let previous = set_local_allocator_cache_limit(allocator_limit()).unwrap();
     struct Restore(usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -43,6 +90,9 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         ),
     )
     .unwrap();
+    let before_load_active = eredu_backend_mlx::allocator_memory()
+        .unwrap()
+        .active_bytes();
     let (mut model, _) = LoadedModel::load_execution_plan(&factory, &path, &plan)
         .unwrap()
         .into_parts();
@@ -69,7 +119,8 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             ..Default::default()
         })
         .unwrap();
-    for length in lengths {
+    let mut measurements = Vec::new();
+    for (iteration, length) in lengths.into_iter().enumerate() {
         model.reset().unwrap();
         model.synchronize().unwrap();
         let before = model.static_memory().unwrap();
@@ -123,13 +174,56 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             loaded.with_prefill_chunk(1).unwrap().estimate.domains[0].generation_peak,
             loaded.estimate.domains[0].generation_peak
         );
-        let mut expected_topology = cold.request.domains[0].executions[0].execution_topology.clone();
+        let mut expected_topology = cold.request.domains[0].executions[0]
+            .execution_topology
+            .clone();
         if let Some(bytes) = expected_topology
             .as_mut()
             .and_then(|w| w.selected_parameter_promotion_bytes.as_mut())
         {
             *bytes = bytes.saturating_sub(converted_before);
         }
+        // Phase-6 forecasts credit exact bindings as well as the aggregate.
+        // Verify those native observations independently before comparing every
+        // remaining architecture/mechanism field with cold inspection.
+        let retention = loaded
+            .request
+            .parameter_conversion_retention
+            .as_ref()
+            .unwrap();
+        assert_eq!(retention.groups.len(), 1);
+        let mut credited = 0;
+        for conversion in retention.retained_conversions.as_ref().unwrap() {
+            let eredu_core::resources::ResourceSize::Fixed { extent } = &conversion.allocation.size
+            else {
+                panic!("a retained conversion has fixed payload");
+            };
+            for binding in &conversion.bindings {
+                assert_eq!(
+                    binding.retention_group.as_ref(),
+                    Some(&retention.groups[0].report.group)
+                );
+                let name = binding.logical_target.as_ref().unwrap();
+                let bytes = expected_topology
+                    .as_mut()
+                    .unwrap()
+                    .selected_parameter_promotion_payloads
+                    .get_mut(name)
+                    .unwrap();
+                if *bytes != 0 {
+                    assert_eq!(
+                        *bytes, extent.payload.lower_bytes,
+                        "whole-binding credit for {name}"
+                    );
+                    credited += *bytes;
+                    *bytes = 0;
+                }
+            }
+        }
+        assert_eq!(
+            credited, converted_before,
+            "exact binding credits equal current retained payload"
+        );
         assert_eq!(
             expected_topology,
             loaded.request.domains[0].executions[0].execution_topology
@@ -138,8 +232,12 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             .execution_topology
             .as_ref()
             .unwrap()
-            .layers.iter().any(|layer| matches!(layer.mixer,
-                eredu_runtime::execution_topology::TokenMixerTopology::GatedConvolution { .. })));
+            .layers
+            .iter()
+            .any(|layer| matches!(
+                layer.mixer,
+                eredu_runtime::execution_topology::TokenMixerTopology::GatedConvolution { .. }
+            )));
         assert_eq!(
             eredu_backend_mlx::allocator_memory()
                 .unwrap()
@@ -149,12 +247,20 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         reset_local_allocator_peak().unwrap();
         let config =
             TextGenerationConfig::new(model.resolve_generation_config(settings.overrides).unwrap());
+        let mut sampled_cached_peak = eredu_backend_mlx::allocator_memory()
+            .unwrap()
+            .cached_bytes();
         let generation_started = std::time::Instant::now();
         let mut tokens = model.generate_tokens(ids.clone(), config).unwrap();
         let mut generated = Vec::new();
         let mut first_token_elapsed = std::time::Duration::ZERO;
         for _ in 0..4 {
             generated.push(tokens.next().unwrap().unwrap().token_id().unwrap());
+            sampled_cached_peak = sampled_cached_peak.max(
+                eredu_backend_mlx::allocator_memory()
+                    .unwrap()
+                    .cached_bytes(),
+            );
             if generated.len() == 1 {
                 first_token_elapsed = generation_started.elapsed();
             }
@@ -177,9 +283,15 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         let remainder_started = std::time::Instant::now();
         for token in tokens {
             generated.push(token.unwrap().token_id().unwrap());
+            sampled_cached_peak = sampled_cached_peak.max(
+                eredu_backend_mlx::allocator_memory()
+                    .unwrap()
+                    .cached_bytes(),
+            );
         }
         model.synchronize().unwrap();
-        let generation_elapsed = first_four_elapsed + remainder_started.elapsed();
+        let remainder_elapsed = remainder_started.elapsed();
+        let generation_elapsed = first_four_elapsed + remainder_elapsed;
         let measured = eredu_backend_mlx::allocator_memory().unwrap();
         let measured_growth = first_peak
             .max(measured.peak_bytes())
@@ -198,6 +310,15 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             "growth {measured_growth}, bound {upper}"
         );
         assert!(continued_growth <= continued_upper);
+        assert!(
+            first_peak.max(measured.peak_bytes())
+                <= loaded.estimate.domains[0]
+                    .generation_peak
+                    .upper_bytes
+                    .unwrap(),
+            "native active peak exceeds total modeled generation peak"
+        );
+        assert_retention_bound(&model);
         let after = model.static_memory().unwrap();
         let converted_after = *after
             .current_device_parameter_conversion_bytes
@@ -268,12 +389,100 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             run.run(|_| ControlFlow::Continue(())).unwrap();
         }
         assert_eq!(run.token_ids(), &generated[..run.token_ids().len()]);
+        drop(run);
+        let usage = model.parameter_conversion_retention().unwrap();
+        let mut measurement = serde_json::json!({
+            "positions": length, "iteration": iteration,
+            "allocator_cache_limit": allocator_limit(), "retention": usage,
+            "first_token_ms": first_token_elapsed.as_secs_f64() * 1000.0,
+            "generation_ms": generation_elapsed.as_secs_f64() * 1000.0,
+            "cached_decode_tokens_per_second": 4.0 / remainder_elapsed.as_secs_f64(),
+            "baseline_active": baseline, "active_peak": first_peak.max(measured.peak_bytes()),
+            "sampled_cached_peak": sampled_cached_peak,
+            "cold_overall_upper": cold.estimate.domains[0].overall_peak.upper_bytes,
+            "loaded_generation_upper": loaded.estimate.domains[0].generation_peak.upper_bytes,
+            "loaded_estimate": loaded.estimate.domains[0],
+            "loaded_additional_upper": upper, "measured_growth": measured_growth,
+            "continuation_upper": continued_upper, "continuation_growth": continued_growth,
+            "tokens": generated,
+        });
+        if std::env::var_os("EREDU_LFM2_MEMORY_TRIM").is_some() && iteration % 2 == 1 {
+            let before_trim = model.parameter_conversion_retention().unwrap();
+            let started = std::time::Instant::now();
+            let trimmed = model.trim_parameter_conversions().unwrap();
+            let trim_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(
+                trimmed[0].released_payload_bytes,
+                before_trim.value().unwrap()[0]
+                    .usage
+                    .value()
+                    .unwrap()
+                    .retained_payload_bytes
+            );
+            assert_eq!(trimmed[0].remaining.retained_payload_bytes, 0);
+            assert_eq!(
+                model.trim_parameter_conversions().unwrap()[0].released_payload_bytes,
+                0
+            );
+            assert_retention_bound(&model);
+            model.reset().unwrap();
+            let after_trim = model
+                .forecast_token_ids(&vec![1; length], settings, &options)
+                .unwrap();
+            assert!(
+                after_trim.estimate.domains[0]
+                    .additional_generation_peak
+                    .upper_bytes
+                    .unwrap()
+                    >= warm.estimate.domains[0]
+                        .additional_generation_peak
+                        .upper_bytes
+                        .unwrap()
+            );
+            measurement["trim_ms"] = trim_ms.into();
+            measurement["trim"] = serde_json::to_value(trimmed).unwrap();
+            measurement["post_trim_additional_upper"] = serde_json::to_value(
+                after_trim.estimate.domains[0]
+                    .additional_generation_peak
+                    .upper_bytes,
+            )
+            .unwrap();
+        }
+        measurements.push(measurement);
+
         eprintln!("LFM2 parameter conversions: positions={length}, resident_before={converted_before}, resident_after={converted_after}, warm_additional_upper={}", warm.estimate.domains[0].additional_generation_peak.upper_bytes.unwrap());
         eprintln!("LFM2 memory: model={}, quantized={quantized}, positions={length}, scalar_bytes={}, cold_upper={}, loaded_additional_upper={upper}, measured_growth={measured_growth}, continuation_upper={continued_upper}, continuation_growth={continued_growth}, controlled_forecast={checked_controlled}", path.display(), loaded.request.scalar_bytes, cold.estimate.domains[0].overall_peak.upper_bytes.unwrap());
         eprintln!("LFM2 timing: positions={length}, first_token_ms={:.3}, generation_ms={:.3}, generated_tokens={}", first_token_elapsed.as_secs_f64() * 1000.0, generation_elapsed.as_secs_f64() * 1000.0, generated.len());
         eprintln!(
             "LFM2 recalibration: positions={length}, budget_16_gib_fit={budget_16_gib_fit:?}"
         );
+    }
+    model.synchronize().unwrap();
+    drop(model);
+    let immediate_drop_active = eredu_backend_mlx::allocator_memory()
+        .unwrap()
+        .active_bytes();
+    // Session Drop deliberately stages potentially blocking destructors. Exercise
+    // the public ordinary-host reclamation boundary, including nested retirements.
+    for _ in 0..16 {
+        eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        if eredu_backend_mlx::allocator_memory()
+            .unwrap()
+            .active_bytes()
+            <= before_load_active
+        {
+            break;
+        }
+    }
+    let after_drop = eredu_backend_mlx::allocator_memory().unwrap();
+    assert!(after_drop.active_bytes() <= before_load_active,
+        "model drop must release live parameters and conversions: before={before_load_active}, after={}", after_drop.active_bytes());
+    if let Some(output) = std::env::var_os("EREDU_LFM2_MEMORY_WRITE") {
+        std::fs::write(output, serde_json::to_vec_pretty(&serde_json::json!({
+            "measurements": measurements, "before_load_active": before_load_active,
+            "immediate_drop_active": immediate_drop_active,
+            "after_drop_active": after_drop.active_bytes(), "after_drop_cached": after_drop.cached_bytes(),
+        })).unwrap()).unwrap();
     }
 }
 
@@ -296,14 +505,15 @@ fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
     } else {
         LocalDevice::Cpu
     };
-    let mut plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap());
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap())
+        .with_parameter_conversion_retention(retention_policy());
     if quantized {
         plan = plan.with_weight_transformation(WeightTransformationPlan::Affine {
             bits: 4,
             group_size: 64,
         });
     }
-    let previous = set_local_allocator_cache_limit(0).unwrap();
+    let previous = set_local_allocator_cache_limit(allocator_limit()).unwrap();
     struct Restore(usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -452,6 +662,9 @@ fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
                     .unwrap();
                 // Stop at every committed boundary, including cached decode.
                 while run.finish_reason().is_none() {
+                    if std::env::var_os("EREDU_LFM2_MEMORY_TRIM").is_some() {
+                        run.trim_parameter_conversions().unwrap();
+                    }
                     run.step(|r| collect(r.generation)).unwrap();
                 }
                 assert_eq!(run.token_ids(), raw);

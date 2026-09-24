@@ -1,5 +1,6 @@
 use super::*;
 use eredu_core::generation::SpeculativeRequestStatus;
+use eredu_core::residency::{ParameterConversionRetentionPolicy, ParameterConversionTrimError};
 
 #[test]
 #[cfg_attr(
@@ -7,7 +8,7 @@ use eredu_core::generation::SpeculativeRequestStatus;
     ignore = "run explicitly with an accessible Metal device"
 )]
 fn native_speculative_continuation_forecasts_cover_settled_state_without_advancement() {
-    let fixture = fixture(false);
+    let fixture = super::startup_forecast::attention_prediction_fixture(true);
     let path = std::env::var_os("EREDU_SPECULATIVE_CONTINUATION_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| fixture.0.clone());
@@ -30,6 +31,9 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
     for lookahead in [false, true] {
         let plan = ExecutionPlan::fully_resident(local_device_plan(device).unwrap())
             .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
+            .with_parameter_conversion_retention(Some(
+                ParameterConversionRetentionPolicy::Bounded { max_bytes: 1024 },
+            ))
             .with_drafting(DraftingPlan::External {
                 model: path.display().to_string(),
                 placement: if lookahead {
@@ -104,6 +108,8 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
             },
             |session| {
                 assert!(session.forecast_remaining_generation(16, &options).is_err());
+                assert!(matches!(session.trim_parameter_conversions(),
+                    Err(ParameterConversionTrimError::NotQuiescent)));
                 session.step()?.unwrap();
                 assert_eq!(session.status(), SpeculativeRequestStatus::ReadyToDraft);
                 let tokens = session.token_ids().to_vec();
@@ -140,6 +146,29 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 session.exchange(&branch)?;
                 let exchanged = session.forecast_remaining_generation(remaining, &options).unwrap();
                 assert_eq!(exchanged.continuation.target.current_positions, prompt);
+                let saved_usage = session.snapshot_usage();
+                let trimmed = session.trim_parameter_conversions().unwrap();
+                let draft_trimmed = trimmed.external_drafter.as_ref().unwrap();
+                assert_eq!(trimmed.target.len(), 1);
+                assert_eq!(draft_trimmed.len(), 1);
+                assert_ne!(trimmed.target[0].group, draft_trimmed[0].group);
+                for report in trimmed.target.iter().chain(draft_trimmed) {
+                    assert!(report.released_payload_bytes <= 1024);
+                    assert_eq!(report.remaining.retained_payload_bytes, 0);
+                    assert!(report.reclaimed_backing_bytes.value().is_none());
+                }
+                if std::env::var_os("EREDU_SPECULATIVE_CONTINUATION_MODEL").is_none() {
+                    assert!(trimmed.target[0].released_payload_bytes > 0);
+                    assert!(draft_trimmed[0].released_payload_bytes > 0);
+                }
+                let repeated_trim = session.trim_parameter_conversions().unwrap();
+                assert_eq!(repeated_trim.target[0].released_claims, 0);
+                assert_eq!(repeated_trim.external_drafter.unwrap()[0].released_claims, 0);
+                assert_eq!(session.snapshot_usage(), saved_usage);
+                assert_eq!(session.token_ids(), tokens);
+                assert_eq!(session.sampling_state(), sampling);
+                let after_trim = session.forecast_remaining_generation(remaining, &options).unwrap();
+                assert_eq!(after_trim.continuation, exchanged.continuation);
                 session.exchange(&branch)?;
                 session.release_branch(&branch)?;
 
@@ -147,23 +176,41 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 let forecast = session.forecast_remaining_generation(remaining, &options).unwrap();
                 reset_local_allocator_peak().unwrap();
                 let mut rejected_pending = false;
-                while session.step()?.is_some() {
+                let mut accepted = 0;
+                let mut rejected = 0;
+                while let Some(step) = session.step()? {
+                    if let Some(verification) = &step.verification {
+                        accepted += verification.dispositions.iter().filter(|d| **d == SpeculativeProposalDisposition::Accepted).count();
+                        rejected += verification.dispositions.iter().filter(|d| **d == SpeculativeProposalDisposition::Rejected).count();
+                    }
                     let status = session.status();
                     let outlook = session.forecast_remaining_generation(4, &options);
                     if !session.can_snapshot() || status == SpeculativeRequestStatus::Completed {
                         assert!(outlook.is_err());
                         rejected_pending |= status != SpeculativeRequestStatus::Completed;
+                        if matches!(status, SpeculativeRequestStatus::ReadyToSubmitVerification
+                            | SpeculativeRequestStatus::TargetVerificationInFlight) {
+                            assert!(matches!(session.trim_parameter_conversions(),
+                                Err(ParameterConversionTrimError::NotQuiescent)));
+                        }
                     } else {
                         let outlook = outlook.unwrap();
                         assert!(outlook.continuation.target.current_positions >= prompt);
                     }
                 }
                 assert!(rejected_pending);
+                assert!(accepted + rejected > 0);
+                eprintln!("Post-trim verification: lookahead={lookahead}, accepted={accepted}, rejected={rejected}");
                 let growth = eredu_backend_mlx::allocator_memory().unwrap().peak_bytes().saturating_sub(baseline);
                 let upper = forecast.estimate.domains[0].additional_generation_peak.upper_bytes.unwrap();
                 assert!(growth <= upper, "growth {growth}, forecast {upper}");
                 let committed = session.token_ids().to_vec();
                 session.restore(&saved)?;
+                let replay_usage = session.snapshot_usage();
+                let replay_sampling = session.sampling_state();
+                session.trim_parameter_conversions().unwrap();
+                assert_eq!(session.snapshot_usage(), replay_usage);
+                assert_eq!(session.sampling_state(), replay_sampling);
                 let restored = session.forecast_remaining_generation(remaining, &options).unwrap();
                 assert_eq!(restored.continuation.target.current_positions, prompt);
                 assert_eq!(restored.continuation.draft.as_ref().unwrap().current_positions, prompt);
