@@ -6406,6 +6406,48 @@ identity registry shares aliases without extending residency; evaluated conversi
 are released with their owner. Bounded host/disk policies do not enable the cache.
 Explicit device-residency ceilings also disable retention rather than allowing
 derived storage to bypass original-parameter admission.
+
+`eredu-core::residency` defines the portable parameter-conversion retention
+contract: disabled, bounded payload bytes, and explicitly unlimited policy.
+Pure normalization preserves the requested value and managed-default/explicit
+provenance, canonicalizes a zero-byte bound to disabled, and reports effective
+disabled policy for host-layerwise, disk-streamed, explicit device-ceiling or
+unsupported mechanisms. The initial managed policy is 256 MiB. These are contract
+definitions only: they do not yet install a limit or change native execution.
+Runtime owns shared admission and reservation policy; the backend owns native
+conversion storage, evaluation, completion safety and observations. Allocator
+caching remains an independent policy. A retained-payload ceiling covers retained
+plus reserved conversion payload, not backing capacity, temporary casts, graph
+storage, process RSS or total memory. Admission is first-admitted without automatic
+eviction; denied retention leaves temporary conversion execution available.
+
+`ParameterConversionRetentionGroup` wraps the existing scoped `ResourceIdentity`
+in a distinct budget namespace. One selected loaded execution shares this group
+across permanent units, embedded prediction owners and native partitions;
+separately loaded external drafters have independent groups. Existing conversion
+allocation identities and parameter-binding owners remain authoritative for
+physical storage. Aliases within a group charge once, while independent groups
+sharing an allocation each admit their own retention claim. Group charges cannot
+be summed as physical residency; allocation observations still deduplicate shared
+backing. Core `OffloadReport` can carry the separate group reports without adding
+their payload to its original-parameter ledger. Unsupported or unavailable
+observations differ from an observed empty cache or group list. Legacy records
+and current unwired telemetry default to unavailable, never today's managed policy.
+Native backing capacity is separately observable and is not added to payload.
+
+`ParameterConversionRetentionTrimReport` specifies released group claims and
+payload, remaining claims/reservations, and independently observed backing
+reclamation. Releasing one group's claims neither releases another's nor proves
+physical reclamation: snapshots, other owners or native graphs may retain storage,
+and allocator caches may retain backing even after its final live reference drops.
+No reported claim release means bytes returned to the OS. The future trim operation
+must use existing submission/completion authority at a settled boundary and preserve
+source weights, request state, budgets and eligibility for future admission.
+Controlled transactions need typed pending-work rejection unless their operation
+contract explicitly permits settlement. Ordinary reset preserves conversions;
+trim, parameter invalidation and allocator-cache flushing have separate semantics.
+Reports remain read-only and cannot evaluate, settle, trim or populate conversions.
+
 `safemlx` exposes immutable graph identity through its existing native safety
 boundary; no pointer or native dependency enters portable crates.
 `Tensor::publish_parameter` is the neutral, infallible publication hook used by

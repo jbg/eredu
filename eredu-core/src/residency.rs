@@ -13,7 +13,15 @@ use std::{
     time::Duration,
 };
 
+mod conversion_retention;
 mod prefetch;
+
+pub use conversion_retention::{
+    ParameterConversionRetentionEligibility, ParameterConversionRetentionGroup,
+    ParameterConversionRetentionPolicy, ParameterConversionRetentionPolicyReport,
+    ParameterConversionRetentionPolicySource, ParameterConversionRetentionReport,
+    ParameterConversionRetentionTrimReport, ParameterConversionRetentionUsage,
+};
 
 pub use prefetch::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
@@ -956,6 +964,7 @@ impl OffloadTelemetry {
             allocator_memory: self.allocator_memory,
             process: self.process,
             process_sampled: self.process_sampled,
+            parameter_conversion_retention: unreported_conversion_retention(),
         }
     }
 
@@ -981,9 +990,34 @@ pub struct OffloadReport {
     allocator_memory: Option<AllocatorMemoryMetrics>,
     process: ProcessMetrics,
     process_sampled: bool,
+    #[serde(default = "unreported_conversion_retention")]
+    parameter_conversion_retention: crate::Observed<Vec<ParameterConversionRetentionReport>>,
+}
+
+fn unreported_conversion_retention() -> crate::Observed<Vec<ParameterConversionRetentionReport>> {
+    crate::Observed::unavailable("parameter conversion retention groups were not reported")
 }
 
 impl OffloadReport {
+    /// Returns shared conversion-retention groups observed for this report's scope.
+    /// An available empty list means no groups; unavailable/unsupported does not.
+    /// Group payloads are claim charges, not additive physical residency totals.
+    pub fn parameter_conversion_retention(
+        &self,
+    ) -> &crate::Observed<Vec<ParameterConversionRetentionReport>> {
+        &self.parameter_conversion_retention
+    }
+
+    /// Attaches a read-only group observation without modifying the original
+    /// parameter ledger, allocator policy, or any execution resource.
+    pub fn with_parameter_conversion_retention(
+        mut self,
+        observation: crate::Observed<Vec<ParameterConversionRetentionReport>>,
+    ) -> Self {
+        self.parameter_conversion_retention = observation;
+        self
+    }
+
     /// Returns planned bytes per tier.
     pub const fn planned_bytes(&self) -> TierByteTotals {
         self.planned_bytes
