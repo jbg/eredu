@@ -384,7 +384,26 @@ impl ExecutionPlan {
     /// Selects optional retained F32 payload at load time for each loaded execution.
     /// Target and embedded owners share a budget; a separate external drafter has its own.
     /// `None` uses 256 MiB for eligible executions. This does not limit temporary casts,
-    /// allocator caching, or total memory. Bounded residency disables retention.
+    /// allocator caching, or total memory. A zero bound normalizes to disabled;
+    /// unlimited reuse requires an explicit request. Host-layerwise, disk-streamed,
+    /// explicit device ceilings and unsupported admission mechanisms report an
+    /// effective disabled policy even when unlimited was requested.
+    ///
+    /// The bound covers retained payload plus reservations, with first-admitted
+    /// reuse and no automatic eviction. Reset preserves conversions; explicit
+    /// settled trimming releases optional claims without changing this policy.
+    /// There is no live limit mutation. Inspect the loaded execution's policy and
+    /// usage reports for effective eligibility and scope.
+    ///
+    /// ```
+    /// use eredu_core::{DevicePlan, ExecutionPlan};
+    /// use eredu_core::residency::ParameterConversionRetentionPolicy;
+    /// let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "gpu:0")?)
+    ///     .with_parameter_conversion_retention(Some(
+    ///         ParameterConversionRetentionPolicy::Bounded { max_bytes: 32 << 20 },
+    ///     ));
+    /// # Ok::<(), eredu_core::ExecutionPlanError>(())
+    /// ```
     pub fn with_parameter_conversion_retention(
         mut self,
         policy: Option<crate::residency::ParameterConversionRetentionPolicy>,

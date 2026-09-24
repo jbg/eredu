@@ -1080,7 +1080,7 @@ For complete accounting and raw iterator settlement, see
 [mid-session memory forecasts](generation-memory.md#mid-session-continuation-forecasts).
 
 Resident parameter conversion retention is enforced by the shared native parameter
-owners used by ordinary and controlled execution. The initial managed 256 MiB
+owners used by ordinary and controlled execution. The managed 256 MiB
 budget covers retained plus reserved conversion payload across all permanent units
 and embedded prediction owners. A denied reservation uses the unchanged temporary
 cast path. Ordinary reset and controlled state advancement do not reset this budget
@@ -1111,7 +1111,17 @@ external-drafter scopes; embedded prediction remains in the target group. Querie
 never settle pending submissions, allocate execution resources, populate caches,
 change tokens or RNG, or consume capture, snapshot, transport or copy budgets.
 Missing backend observations remain unsupported or unavailable rather than zero.
-There is no live limit setter.
+There is no live limit setter. Read the effective policy and scope from these
+observations instead of maintaining a second limit ledger. Group charges are
+admission accounting: aliases within a group charge once, but separate groups
+sharing backing each admit their own claim. Do not sum these claims as physical
+residency or add retained payload to resident parameters a second time.
+
+The [consumer workflow](generation-memory.md#controlling-parameter-conversion-retention)
+and [facade example](../eredu/examples/conversion_retention.rs) show configuration,
+live reports and fresh-request forecasting. A finite conversion allowance and
+the independent allocator-cache allowance are not a combined memory limit;
+request state/workspace, original weights, graph/driver storage and padding remain.
 
 ### Trimming retained parameter conversions
 
@@ -1129,6 +1139,10 @@ epochs and capture, transport, snapshot, fork and copy accounting. Existing
 snapshots and branches remain valid. Embedded prediction participates in its
 target's group; separately loaded external drafters retain separate result scopes.
 The same backend claim-release operation serves ordinary and controlled runs.
+For ordinary `PlannedModel` trimming, the target is trimmed before the external
+drafter. An error from a later participant does not roll back earlier releases;
+re-query participant usage after an error. No cross-participant atomic trim is
+promised.
 
 Repeated trimming is idempotent and empty retention stays empty. Eligible source
 bindings remain registered, so later inference may repopulate within the original

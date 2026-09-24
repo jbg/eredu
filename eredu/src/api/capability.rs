@@ -86,6 +86,13 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
 impl<B: ModelCapabilityBackend> LoadedModel<B> {
     /// Reads this execution's conversion-retention budgets without evaluating,
     /// settling, or changing request state. Embedded owners share these budgets.
+    ///
+    /// Reports requested/effective policy, eligibility, scope and current retained
+    /// plus reserved payload. Use the effective policy rather than assuming the
+    /// load request was eligible. An unavailable/unsupported observation is not
+    /// zero usage. Retained payload is already a subset of resident parameters;
+    /// reservations are admission usage, not proof of materialized storage.
+    /// Reset preserves claims; [`Self::trim_parameter_conversions`] releases them.
     pub fn parameter_conversion_retention(
         &self,
     ) -> Result<
@@ -102,6 +109,8 @@ impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRet
     /// Reports every loaded participant's retention budget. External drafting
     /// has an independent allowance; embedded owners are included in the target.
     /// Queries never settle, evaluate, reserve, or advance execution.
+    /// Group usage is admission accounting, not an additive physical-residency
+    /// total: separate groups can claim the same allocation independently.
     pub fn parameter_conversion_retention(
         &self,
     ) -> Result<eredu_core::residency::ExecutionConversionRetentionReport, eredu_core::BackendFailure>
@@ -124,6 +133,11 @@ impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRet
     /// Releases optional conversions for the target and separately loaded drafter.
     /// Each participant establishes its ordinary settled boundary; no request
     /// state, sampling state or allocator-cache policy is changed.
+    /// Results describe released claims, not bytes returned to the OS. Repeated
+    /// trimming is idempotent, and future inference can admit conversions again.
+    /// The target is trimmed first; a subsequent drafter error does not undo that
+    /// release. Re-query usage after an error rather than assuming an atomic trim
+    /// across participants.
     pub fn trim_parameter_conversions(
         &mut self,
     ) -> Result<

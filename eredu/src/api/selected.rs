@@ -160,6 +160,11 @@ impl LocalLoadOptions {
     /// Selects model-scoped retained conversion payload at load time. `None`
     /// uses the finite 256 MiB managed default for eligible resident executions.
     /// This is independent of allocator caching and does not limit temporary casts.
+    /// Zero normalizes to disabled; unlimited reuse requires an explicit request.
+    /// Host-layerwise, disk-streamed and explicit device ceilings disable retention.
+    /// Inspect [`super::LoadedModel::parameter_conversion_retention`] for effective
+    /// policy and live usage. Reset preserves conversions; settled trimming releases
+    /// optional claims without reloading weights or changing the selected policy.
     pub fn with_parameter_conversion_retention(
         mut self,
         policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,

@@ -1058,6 +1058,10 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
     /// Releases optional conversions at a completed, drained boundary without
     /// settling pending work. Preserves tokens, sampling state, epochs, snapshots
     /// and observation budgets. Subsequent inference can repopulate retention.
+    /// Returns [`eredu_core::residency::ParameterConversionTrimError::NotQuiescent`]
+    /// if no canonical settled boundary is available. Released claims do not
+    /// promise physical reclamation or flush the allocator cache. Re-query
+    /// continuation forecasts after trimming to refresh pending conversion costs.
     pub fn trim_parameter_conversions(
         &mut self,
     ) -> Result<
@@ -1079,6 +1083,9 @@ impl<B: eredu_core::ModelCapabilityBackend> ControlledGenerationSession<'_, B> {
 
     /// Read-only model-scoped retention telemetry, shared with ordinary generation.
     /// This query does not settle pending work or change the controlled boundary.
+    /// Effective policy can be disabled despite the load request. Unsupported or
+    /// unavailable usage is not zero; retained payload already belongs to resident
+    /// parameters. External speculative participants report their separate scopes.
     pub fn parameter_conversion_retention(
         &self,
     ) -> Result<

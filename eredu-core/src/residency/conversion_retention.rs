@@ -15,6 +15,14 @@ use crate::{resources::ResourceIdentity, Observed};
 /// temporary casts, graph storage, process RSS, or total execution memory.
 /// Admission is first-admitted, without automatic eviction. A denied conversion
 /// uses the ordinary temporary execution path without changing precision.
+///
+/// Select the policy before loading with
+/// [`crate::ExecutionPlan::with_parameter_conversion_retention`]. An absent
+/// override uses [`Self::MANAGED_DEFAULT`] for eligible executions. Ordinary
+/// reset preserves admitted conversions; explicit settled trimming releases
+/// optional claims while preserving weights, request state and future eligibility.
+/// Requested and effective policy can differ: host-layerwise, disk-streamed,
+/// explicit device ceilings and unsupported mechanisms disable retention.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParameterConversionRetentionPolicy {
@@ -30,7 +38,7 @@ pub enum ParameterConversionRetentionPolicy {
 }
 
 impl ParameterConversionRetentionPolicy {
-    /// Initial finite managed policy for eligible executions: 256 MiB.
+    /// Finite managed policy for eligible executions: 256 MiB.
     ///
     /// Eligible loaded executions use this when the caller omits an override.
     /// Missing historical policy observations must remain unknown.
@@ -126,9 +134,11 @@ impl ParameterConversionRetentionPolicyReport {
 /// A retention-budget namespace, separate from parameter owners and allocations.
 ///
 /// The entire scoped identity is authoritative. One selected loaded execution
-/// shares a group across permanent units, embedded prediction owners and native
-/// partitions. Separately loaded external drafters use distinct groups. Equal
-/// checkpoint names never imply equal groups.
+/// shares a group across permanent units and embedded prediction owners. Native
+/// partitions must share that execution's admission authority; implementations
+/// without coordinated admission report unsupported eligibility and disable
+/// retention rather than grant an allowance per rank. Separately loaded external
+/// drafters use distinct groups. Equal checkpoint names never imply equal groups.
 ///
 /// This wrapper reuses resource identity conventions without replacing
 /// `ResidentParameterConversion` allocation identities or binding owners.
@@ -159,6 +169,11 @@ pub struct ParameterConversionRetentionUsage {
 }
 
 /// Policy and current usage for one selected execution's shared budget group.
+///
+/// Read the effective policy here instead of assuming a requested limit applies.
+/// Usage can be unavailable or unsupported rather than zero. Published payload
+/// is already included in resident parameter observations; do not add it again.
+/// Reservations consume allowance without proving a materialized allocation.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParameterConversionRetentionReport {
     /// Budget scope, independent of allocation and parameter identities.

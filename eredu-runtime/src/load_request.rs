@@ -271,7 +271,14 @@ impl NormalizedLoadRequest {
     /// Selects optional retained F32 payload at load time for each loaded execution.
     /// Target and embedded owners share a budget; a separate external drafter has its own.
     /// `None` uses 256 MiB for eligible executions. This does not limit temporary casts,
-    /// allocator caching, or total memory. Bounded residency disables retention.
+    /// allocator caching, or total memory. Zero normalizes to disabled; unlimited
+    /// requires an explicit request. Host-layerwise, disk-streamed, explicit device
+    /// ceilings and unsupported admission mechanisms report effective disabled
+    /// retention. Inspect loaded policy/usage reports rather than assuming eligibility.
+    ///
+    /// The bound covers retained payload plus reservations without automatic
+    /// eviction. Reset preserves conversions; settled trimming releases optional
+    /// claims and preserves this immutable policy and future admission eligibility.
     pub fn with_parameter_conversion_retention(
         mut self,
         policy: Option<eredu_core::residency::ParameterConversionRetentionPolicy>,

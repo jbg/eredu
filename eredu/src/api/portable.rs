@@ -331,6 +331,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     ///
     /// Retains loaded weights, admitted parameter conversions, tokenizer, model identity
     /// and execution placement.
+    /// Use [`Self::trim_parameter_conversions`] separately to release optional
+    /// conversions on backends that implement that operation.
     /// Success guarantees fresh-session behavior for the next generation with
     /// the same prompt and configuration. An error does not establish safe reuse.
     /// Failures use the same [`eredu_core::BackendFailure`] for every backend.
@@ -501,6 +503,13 @@ impl<B: eredu_core::ModelCapabilityBackend> LoadedModel<B> {
     /// preserving loaded weights and request state. Future inference can retain
     /// conversions again within the selected policy. Reset preserves conversions;
     /// this operation neither flushes allocator caches nor promises RSS reduction.
+    ///
+    /// Results contain released group claims/payload and remaining admission usage.
+    /// Shared owners, snapshots or native graphs may keep backing alive. Repeated
+    /// trimming is idempotent. Read [`Self::parameter_conversion_retention`] for
+    /// effective policy and fresh usage, and query forecasts again after trimming
+    /// so they project newly uncached casts. Unsupported backends return a typed
+    /// [`eredu_core::residency::ParameterConversionTrimError::Unsupported`].
     pub fn trim_parameter_conversions(
         &mut self,
     ) -> Result<

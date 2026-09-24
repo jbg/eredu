@@ -66,6 +66,11 @@ path = "examples/gguf_generate.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "conversion_retention"
+path = "examples/conversion_retention.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "native_tool_calling"
 path = "examples/native_tool_calling.rs"
 required-features = ["mlx"]

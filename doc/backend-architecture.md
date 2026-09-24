@@ -6412,7 +6412,7 @@ contract: disabled, bounded payload bytes, and explicitly unlimited policy.
 Pure normalization preserves the requested value and managed-default/explicit
 provenance, canonicalizes a zero-byte bound to disabled, and reports effective
 disabled policy for host-layerwise, disk-streamed, explicit device-ceiling or
-unsupported mechanisms. The initial managed policy is 256 MiB and is enforced by
+unsupported mechanisms. The managed policy is 256 MiB and is enforced by
 eligible MLX resident materializations. `ExecutionPlan::with_parameter_conversion_retention`
 and `NormalizedLoadRequest::with_parameter_conversion_retention` select a
 model-scoped optional override before preparation. `None` retains managed-default
@@ -6429,8 +6429,10 @@ eviction; denied retention leaves temporary conversion execution available.
 
 `ParameterConversionRetentionGroup` wraps the existing scoped `ResourceIdentity`
 in a distinct budget namespace. One selected loaded execution shares this group
-across permanent units, embedded prediction owners and native partitions;
-separately loaded external drafters have independent groups. Existing conversion
+across permanent units and embedded prediction owners. Native partitions must
+share admission for that execution; current multi-process MLX construction
+disables retention because it lacks cross-process reservation authority.
+Separately loaded external drafters have independent groups. Existing conversion
 allocation identities and parameter-binding owners remain authoritative for
 physical storage. Aliases within a group charge once, while independent groups
 sharing an allocation each admit their own retention claim. Group charges cannot
@@ -6472,7 +6474,11 @@ preserves backend errors as `BackendFailure` sources. These queries do not
 allocate native execution resources, evaluate or settle work, populate conversions,
 or consume state/observation budgets. This initial API has no live limit setter;
 a request is immutable once loaded. Explicit settled trimming is described below;
-retention-aware forecast arithmetic remains a separate change.
+[retention-aware forecasts](#retention-aware-forecast-ownership) consume the same
+neutral scope and live binding observations. The
+[consumer workflow](generation-memory.md#controlling-parameter-conversion-retention)
+and [facade example](../eredu/examples/conversion_retention.rs) use these contracts
+without managing another cache or importing native storage mechanisms.
 
 `eredu-runtime::residency::conversion_retention` implements the shared portable
 budget and weak registry. Composition may attach one `ConversionRetentionBudget`
@@ -6561,6 +6567,9 @@ the original source. Backends without the operation return typed `Unsupported`.
 MLX owns native reference detachment and healthy idle-authority validation;
 portable residency policy owns coherent claim accounting. Embedded prediction
 uses its target group, while composed external drafting keeps separate scopes.
+Ordinary composed trim visits the target and then external drafter; it is not an
+atomic transaction across participants. If a later participant fails, callers
+must re-query usage rather than assume earlier releases were rolled back.
 Bindings remain eligible for admission after trimming; invalidation alone retires
 them. Idempotent claim release and unknown physical reclamation are independent
 of allocator-cache flushing.
@@ -6573,10 +6582,12 @@ parameter; read-only discovery preserves it. Restored values use ordinary casts
 until a new resident materialization enables reuse.
 Runtime reports conversion payload separately from its original-parameter ledger.
 The backend includes it once in `StaticMemoryReport` device residency and exposes
-the subset as `current_device_parameter_conversion_bytes`. The facade subtracts
-that subset from the remaining parameter-cast workspace allowance, preserving
-promoted activation/state sizing. Cold forecasts retain the full potential cast
-allowance; neither forecasts nor reports populate conversion caches.
+the subset as `current_device_parameter_conversion_bytes`. Current forecast
+composition credits only complete selected bindings with a matching live claim
+and budget scope, preserving promoted activation/state sizing. Aggregate subset
+subtraction remains only for historical records lacking the scoped policy facts.
+Cold forecasts retain the full potential cast allowance and separately bound
+possible persistent admission; neither forecasts nor reports populate conversions.
 Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
 cache-copy overlap, layer workspace multiplier and graph allowance. Architecture
 preparation retains selected state, ordinary invocation topology and native

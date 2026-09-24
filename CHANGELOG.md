@@ -4,6 +4,32 @@ This file records consumer-facing compatibility changes and Git lineage notices.
 Workspace crates have independent release versions; see the
 [release guide](doc/releasing.md) for package release records.
 
+## 2026-09-24 — Bounded parameter-conversion retention
+
+Eligible resident executions now default to a shared **256 MiB** allowance for
+optional retained F32 weight conversions, replacing unbounded reuse. Select
+`ExecutionPlan::with_parameter_conversion_retention(Some(
+ParameterConversionRetentionPolicy::Unlimited))` to request the former behavior
+deliberately, or choose `Disabled` or a custom `Bounded { max_bytes }` allowance.
+The limit covers retained payload plus reservations; allocator caching is a
+separate policy, and neither is a total-memory limit. Denied admissions still use
+temporary casts with unchanged numerical behavior. The [validation matrix](doc/conversion-retention-validation.md)
+quantifies the throughput cost of the bounded default on a mixed-width checkpoint.
+
+`LoadedModel` exposes requested/effective policy and live usage through
+`parameter_conversion_retention()`, and releases optional claims through
+`trim_parameter_conversions()` without reloading weights or clearing request state.
+Reset preserves conversions. Controlled sessions trim only at a settled boundary;
+forecasts refresh retention credit after trim. Embedded prediction shares the
+target budget; external drafters have separate budgets. Host-layerwise,
+disk-streamed, explicit device ceilings and currently unsupported multi-rank
+admission report effective disabled retention, even for an unlimited request.
+
+See the [consumer contract](doc/generation-memory.md#controlling-parameter-conversion-retention)
+and runnable [facade example](eredu/examples/conversion_retention.rs). Existing
+serialized reports without policy facts retain historical accounting and unknown
+observations; deserialization does not insert the new default.
+
 ## 2026-09-23 — Generic resource lifetime and peak composition
 
 `eredu_runtime::resource_lifetimes` composes prepared and mechanism resources

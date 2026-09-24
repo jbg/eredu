@@ -5,6 +5,79 @@ current available capacity. They are planning estimates, not allocation limits o
 a guarantee about total process memory. Ordinary generation does not depend on
 estimation being available.
 
+## Controlling parameter-conversion retention
+
+Eligible fully resident MLX executions retain optional F32 weight conversions
+under a **256 MiB managed default**. Use
+`ExecutionPlan::with_parameter_conversion_retention` at load time to select
+`Bounded { max_bytes }`, `Disabled`, or explicitly `Unlimited`; `None` selects
+the managed default and a zero-byte bound normalizes to disabled. Admission is
+first-admitted, with no automatic eviction. A weight that does not fit still uses
+the ordinary temporary cast path without changing precision. The cap can reduce
+throughput substantially when repeated casts are expensive; the
+[measured policy matrix](conversion-retention-validation.md) records this tradeoff.
+
+The bound covers retained conversion **payload plus outstanding reservations**
+for one loaded execution, shared by permanent units and embedded prediction.
+An external drafter has its own budget: two independently loaded 32 MiB models
+can retain 64 MiB of claims. Aliases within a group charge once; independent groups
+sharing physical backing each admit their own claim. Their summed usage is not a
+physical-residency total. Host-layerwise, disk-streamed and explicit device-ceiling
+executions disable optional retention. Native multi-rank admission is currently
+unsupported and effectively disabled until cross-process reservation exists;
+temporary conversion execution remains available.
+
+Use `LoadedModel::parameter_conversion_retention()` for requested/effective
+policy, eligibility, scope and live retained/reserved usage. `PlannedModel` adds
+role-labelled target and external-drafter observations. Read effective policy
+from these reports rather than keeping a separate static limit. Unsupported or
+unavailable observations mean unknown, not an empty cache. Some models never
+need promotions, so an observed zero is also a valid result.
+
+`reset()` clears request state and **preserves admitted conversions**.
+`trim_parameter_conversions()` settles ordinary work and releases the caller's
+optional claims while preserving source weights and request state. Trimming is
+idempotent; later inference may admit conversions again within the same cap.
+Controlled sessions require a canonical completed, drained boundary and reject
+pending work instead of advancing implicitly. See
+[controlled trimming](execution-control.md#trimming-retained-parameter-conversions).
+Planned target/drafter trims run sequentially, so a later participant's error can
+follow a successful earlier release; re-query participant usage after an error.
+Other owners, snapshots, graphs or allocator caching can keep backing alive.
+Released claim payload is not bytes returned to the OS, and trim does not flush
+the allocator cache. There is no live policy setter.
+
+For a fresh next request, reset request state and call `forecast_token_ids` or
+`forecast_prepared_generation`; for a paused request use its controlled
+`forecast_remaining_generation`. Query again after trimming so forecasts remove
+stale retention credit. They read current claims without allocating execution
+resources, populating or trimming caches, settling work, or consuming budgets.
+Currently retained conversions are already included in resident parameters;
+potential new admissions are a subset of pending cast workspace. Do not add
+either again. Temporary casts are not capped by retention policy, and missing
+native workspace/capacity facts still produce unknown bounds.
+
+The combined memory picture includes original parameters, retained conversions,
+request state and temporary workspace, allocator cache, and graph/driver allowance.
+The allocator's separate 256 MiB cache setting plus the conversion default is
+**not a combined 256 MiB ceiling**. Neither limits total process memory, padding,
+or RSS, and retained native backing capacity can exceed its payload.
+
+The [conversion_retention facade example](../eredu/examples/conversion_retention.rs)
+configures 32 MiB, generates tokens, prints policy and usage, trims safely, then
+resets and forecasts a fresh request using public APIs:
+
+```sh
+cargo run -p eredu --example conversion_retention -- \
+  /path/to/model-with-tokenizer "Explain gravity briefly."
+```
+
+A model directory or GGUF with tokenizer metadata is accepted. Use the pinned
+mixed-width BF16 GGUF in the [validation report](conversion-retention-validation.md)
+to exercise nonzero retained F32 conversions; ordinary narrow-activation models
+may legitimately report zero. The example uses the default local device and
+prints full observations and forecasts, including unknown values.
+
 ## Neutral resource-description contract
 
 `eredu_core::resources` describes resources from ordinary execution contracts.
@@ -141,7 +214,7 @@ Eredu's 256 MiB cache ceiling to an untouched native default, preserving smaller
 defaults. Explicit limits remain authoritative. Pure cold queries still observe
 the current policy; they do not apply runtime configuration. To forecast with the
 managed default before loading, call `configure_local_runtime(&Default::default())`
-first. `--mlx-cache-limit-bytes 0` disables retention when desired.
+first. `--mlx-cache-limit-bytes 0` disables allocator-cache retention when desired.
 
 On macOS, `discover_local_hardware()` observes available host memory from Mach
 host VM statistics: free pages (which already include speculative pages) plus
@@ -1136,7 +1209,11 @@ architectures, backend and native facade test harness.
 
 ### Resident parameter conversion reuse (2026-09-23)
 
-Fully resident MLX dense projections now retain evaluated F32 conversions when
+This calibration measured the former unlimited policy. Current loads use the
+bounded default described in the [consumer contract](#controlling-parameter-conversion-retention);
+select explicit unlimited retention to reproduce these historical reuse results.
+
+Fully resident MLX dense projections can retain evaluated F32 conversions when
 F32 activations meet F16/BF16 parameters. This covers the mixed-width GGUF case
 without changing BF16 arithmetic or introducing casts for narrow activations.
 Tied aliases share a conversion. Reset preserves it; parameter publication
@@ -1179,7 +1256,8 @@ were 131.2 ms at 128 positions and 1,079–1,116 ms at 2,000; these are local
 observations, not a cross-device throughput guarantee.
 
 Reproduce the memory checks with the preceding native forecast command, the
-pinned GGUF path, `EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000` and
+pinned GGUF path, `EREDU_LFM2_RETENTION=unlimited`,
+`EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000` and
 `EREDU_LFM2_MEMORY_EXPECT_PARAMETER_CONVERSIONS=1`. The latter asserts that the
 public report actually contains the retained conversions and that warm requests
 reuse them. Tests also check unchanged logical bytes, exact device residency
@@ -1916,7 +1994,7 @@ validated in this phase.
 
 ### Bounded native conversion retention (2026-09-24)
 
-Eligible resident MLX executions now enforce the initial managed 256 MiB conversion
+Eligible resident MLX executions now enforce the managed 256 MiB conversion
 payload allowance, shared by all permanent units and embedded prediction owners.
 Admission counts retained plus reserved F32 payload; rejected weights follow the
 same temporary promotion path, preserving F16/BF16 rounding and logits. There is
@@ -1998,8 +2076,7 @@ allocator cache has its own independent allowance. Neither setting bounds total
 memory, transient casts, graph storage, allocator padding or process RSS. Queries
 leave native execution resources, generation state, completion authority and
 observation budgets unchanged. Reset preserves the policy and admitted copies.
-Explicit trimming is described below; forecast capacity arithmetic remains
-subsequent retention-plan work.
+Explicit trimming and the retention-aware forecast subledger are described below.
 
 
 The residency telemetry document preserves `current_device_bytes` and
@@ -2027,8 +2104,9 @@ Reproduce the native check with:
 cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
 ```
 
-These checks validate configuration and telemetry. Full-checkpoint throughput and
-retention-aware forecast calibration remain separate validation phases.
+These checks validate configuration and telemetry. Later full-checkpoint throughput
+and retention-aware forecast calibration are recorded in the
+[validation matrix](conversion-retention-validation.md).
 
 
 ### Settled-boundary conversion trimming (2026-09-24)
@@ -2075,9 +2153,10 @@ disk space, native test compilation used `CARGO_INCREMENTAL=0` and
 `--config 'profile.test.package.eredu-backend-mlx.debug=0'`; test behavior was
 unchanged. The MLX build without default features also passed.
 
-Full-checkpoint throughput calibration and native distributed validation remain
-in the later validation phase; these fixtures do not establish total-memory or
-RSS reclamation bounds.
+The subsequent [validation matrix](conversion-retention-validation.md) records
+full-checkpoint throughput calibration and local distributed coverage, with
+remaining multi-host/accelerator gaps. These fixtures do not establish total-memory
+or RSS reclamation bounds.
 
 ### Conversion-retention forecast subledger
 

@@ -278,6 +278,14 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
 
     /// Forecasts an encoded ordinary request using checkpoint-resolved output
     /// limits and the same settings as ordinary or controlled generation.
+    ///
+    /// Call on fresh/reset request state; use a controlled continuation forecast
+    /// for an existing request. Reads current conversion claims without settling,
+    /// allocating execution resources, trimming or consuming observation budgets.
+    /// After trim, query again to remove released bindings' cast credit. Retained
+    /// conversions are already part of resident parameters, while possible new
+    /// retention is a subset of pending workspace. A retention ceiling does not
+    /// clamp temporary casts or turn missing native facts into finite bounds.
     pub fn forecast_token_ids(
         &self,
         token_ids: &[u32],
