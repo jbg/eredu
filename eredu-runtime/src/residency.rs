@@ -1,5 +1,8 @@
 //! Backend-neutral immutable-weight residency declarations and control state.
 
+/// Shared execution-scoped admission for optional parameter conversions.
+pub mod conversion_retention;
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -639,6 +642,7 @@ pub struct OffloadUnit {
 /// validated before any backend allocation begins.
 #[derive(Debug)]
 pub struct ResidencyController {
+    conversion_retention: Option<conversion_retention::ConversionRetentionBudget>,
     ledger: ResidencyLedger,
     units: BTreeMap<OffloadUnitId, OffloadUnit>,
     alias_owners: BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>,
@@ -950,6 +954,23 @@ impl ResidencyAcquisition {
 }
 
 impl ResidencyController {
+    /// Attaches the selected execution's shared conversion budget before use.
+    /// Every partition and embedded owner must receive a clone of this same
+    /// budget; named layer windows never create an independent allowance.
+    /// Existing controllers remain unwired unless composition supplies a budget.
+    pub fn with_conversion_retention(
+        mut self,
+        budget: conversion_retention::ConversionRetentionBudget,
+    ) -> Self {
+        self.conversion_retention = Some(budget);
+        self
+    }
+
+    /// Selected execution's conversion admission authority, when installed.
+    pub fn conversion_retention(&self) -> Option<&conversion_retention::ConversionRetentionBudget> {
+        self.conversion_retention.as_ref()
+    }
+
     /// Validates declarations against checkpoint metadata and an explicit plan.
     pub fn new<C: RecipeCatalog + ?Sized>(
         catalog: &C,
@@ -1032,6 +1053,7 @@ impl ResidencyController {
         }
 
         Ok(Self {
+            conversion_retention: None,
             ledger: ResidencyLedger::new(plan),
             units: definitions,
             alias_owners,

@@ -6435,6 +6435,43 @@ observations differ from an observed empty cache or group list. Legacy records
 and current unwired telemetry default to unavailable, never today's managed policy.
 Native backing capacity is separately observable and is not added to payload.
 
+`eredu-runtime::residency::conversion_retention` implements the shared portable
+budget and weak registry. Composition may attach one `ConversionRetentionBudget`
+to each execution `ResidencyController`; target units, embedded owners and native
+partitions receive clones of the same selected budget. Named layer windows do not
+create allowances. Existing constructors remain unwired, so this mechanism does
+not yet change MLX behavior or install the managed default. Registry lookup joins
+live group identities only when policy facts agree, and immutable source identities
+only when payload agrees. Allocation descriptors preserve the actual backing
+identity and reject conflicting live payload observations across groups.
+
+Admission atomically counts retained plus reserved payload with checked arithmetic.
+A move-only reservation permits one publisher per immutable entry while native
+conversion and evaluation happen outside portable locks. Publication consumes the
+reservation and returns a group claim keyed by immutable source and actual backing;
+failed publication, abandoned tickets and unwinding cancel exactly once. Aliases
+share claims, and multiple parameter bindings to the same allocation share its
+charge within a group. Reusing another group's published allocation still requires
+independent admission; rejection grants no permission to attach its native value.
+Claim clones share ownership, and dropping the final allocation binding releases
+only that group's charge. Registry maps contain weak references and cannot retain
+parameters, models or native storage. Observations expose exact coherent payload
+accounting while native capacity remains explicitly unavailable.
+
+Portable lock order is registry, parameter entry, budget; claim release takes only
+the budget lock. No native handles, callbacks or lock guards enter or leave these
+operations. Backends pair claims with their own native storage and serialize
+native attachment/publication with parameter replacement. An `is_active` query
+alone is not a native fence. Invalidation permanently retires the old entry,
+cancels its reservation and revokes its parameter-specific claims in every group;
+it cannot release other parameter bindings to shared backing. Re-registration
+creates a distinct entry, and stale ticket publication or destruction cannot
+revive the retired entry or alter the replacement's reservations. Backends must
+detach revoked native values at a completion-safe boundary; logical release does
+not establish physical reclamation. This mechanism provides admission and
+ownership accounting only; settled-boundary trim and MLX integration remain
+separate work.
+
 `ParameterConversionRetentionTrimReport` specifies released group claims and
 payload, remaining claims/reservations, and independently observed backing
 reclamation. Releasing one group's claims neither releases another's nor proves
