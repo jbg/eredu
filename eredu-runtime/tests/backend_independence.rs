@@ -4,21 +4,21 @@ use std::{
     convert::Infallible,
     rc::Rc,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
 };
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::{
-    AttentionPolicy, CollectiveGroupId, Completion, DistributedCommitEpoch,
-    DistributedCommitOutcome, DistributedCommitPhase, InputModality, InputTensorIdentity,
-    LayerSchedule, Submission, TokenFilter,
     cache::{
         LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
         StateTensorPolicy, StateTensorRole,
     },
     checkpoint::TensorDtype,
+    AttentionPolicy, CollectiveGroupId, Completion, DistributedCommitEpoch,
+    DistributedCommitOutcome, DistributedCommitPhase, InputModality, InputTensorIdentity,
+    LayerSchedule, Submission, TokenFilter,
 };
 use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
@@ -28,6 +28,11 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
+    bind_materialized_unit, build_module_binding_plan, construct_replicated_text_session,
+    construct_replicated_text_session_with_runtime, materialize_bindings,
+    materialize_selected_bindings, prepare_layered_text_contract,
+    prepare_partitioned_session_runtime, prepare_replicated_text_contract,
+    realize_architecture_state, select_bindings, select_replicated_text_realization,
     ArchitectureBoundary, ArchitectureGroupKind, ArchitectureGroupPlacement,
     ArchitectureGroupTransport, ArchitectureMergeDestination, ArchitectureParameterDescription,
     ArchitectureParameters, ArchitecturePartition, ArchitectureStateFactory,
@@ -64,11 +69,7 @@ use eredu_runtime::{
     StaticParameterVisitor, StaticParameterVisitorMut, SubmissionBackend, SumReductionBackend,
     TensorPlacement, TokenDomain, TransactionalPromptCacheMechanisms, TransferBackend,
     UnevenGatherBackend, WeightBinding, WeightLoweringCapability, WeightLoweringKind,
-    WeightResidencyMechanism, bind_materialized_unit, build_module_binding_plan,
-    construct_replicated_text_session, construct_replicated_text_session_with_runtime,
-    materialize_bindings, materialize_selected_bindings, prepare_layered_text_contract,
-    prepare_partitioned_session_runtime, prepare_replicated_text_contract,
-    realize_architecture_state, select_bindings, select_replicated_text_realization,
+    WeightResidencyMechanism,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -997,16 +998,14 @@ fn uneven_gather_validates_distinct_input_and_completed_result_limits() {
         CommunicationManifest::new(
             2,
             0,
-            vec![
-                CommunicationGroupDescriptor::new(
-                    group_id,
-                    0,
-                    vec![0, 1],
-                    Some(0),
-                    CommunicationGroupRequirements::new([requirement]).unwrap(),
-                )
-                .unwrap(),
-            ],
+            vec![CommunicationGroupDescriptor::new(
+                group_id,
+                0,
+                vec![0, 1],
+                Some(0),
+                CommunicationGroupRequirements::new([requirement]).unwrap(),
+            )
+            .unwrap()],
             Vec::new(),
         )
         .unwrap()
@@ -1327,11 +1326,9 @@ fn final_agreement_submission_and_completion_failures_are_indeterminate_and_pois
         );
         let calls = FAILURE_AGREEMENT_COUNT.get();
         let retry_epoch = DistributedCommitEpoch::FIRST.next().unwrap();
-        assert!(
-            OpaqueFailureAgreement
-                .commit(&communication, CollectiveGroupId::new(1), retry_epoch, &(),)
-                .is_indeterminate()
-        );
+        assert!(OpaqueFailureAgreement
+            .commit(&communication, CollectiveGroupId::new(1), retry_epoch, &(),)
+            .is_indeterminate());
         assert_eq!(FAILURE_AGREEMENT_COUNT.get(), calls);
     }
 }
@@ -1352,22 +1349,30 @@ fn communication_failures_preserve_sources_and_poison_retry_before_backend_call(
         let failure = transfer_test_boundary(&communication).unwrap_err();
         match &failure {
             eredu_runtime::PartitionExecutionError::CommunicationSubmissionFailed {
-                operation: CommunicationOperation::SendReceive, route: Some(route), ..
+                operation: CommunicationOperation::SendReceive,
+                route: Some(route),
+                ..
             } if submission && *route == CommunicationRouteId::new(9) => {}
             eredu_runtime::PartitionExecutionError::CommunicationCompletionFailed {
-                operation: CommunicationOperation::SendReceive, route: Some(route), ..
+                operation: CommunicationOperation::SendReceive,
+                route: Some(route),
+                ..
             } if !submission && *route == CommunicationRouteId::new(9) => {}
             _ => panic!("unexpected communication failure: {failure}"),
         }
         let mut source: &(dyn std::error::Error + 'static) = &failure;
         loop {
             if let Some(original) = source.downcast_ref::<FakeCommunicationError>() {
-                assert!(matches!((submission, original),
+                assert!(matches!(
+                    (submission, original),
                     (true, FakeCommunicationError::Submission)
-                        | (false, FakeCommunicationError::CorruptBoundaryHeader)));
+                        | (false, FakeCommunicationError::CorruptBoundaryHeader)
+                ));
                 break;
             }
-            source = source.source().expect("original backend communication cause");
+            source = source
+                .source()
+                .expect("original backend communication cause");
         }
         assert_eq!(POINT_TO_POINT_COUNT.get(), 1);
         assert!(matches!(
@@ -1607,7 +1612,7 @@ fn minimal_text_backend_compiles_without_optional_execution_extensions() {
 #[test]
 fn neutral_loader_materializes_and_binds_the_fake_backend() {
     use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
-    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("model.safetensors");
@@ -1645,7 +1650,7 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
         recipe::{DerivedWeightRecipe, RecipeDtype},
         store::{MemoryWeightStore, TensorSelection},
     };
-    use eredu_runtime::{BindingPlan, BindingPlanError, PlannedBinding, place_weight_bindings};
+    use eredu_runtime::{place_weight_bindings, BindingPlan, BindingPlanError, PlannedBinding};
 
     let store = MemoryWeightStore::from_safetensors([(
         "weight".to_owned(),
@@ -2056,9 +2061,10 @@ fn device_state_retention_uses_local_ordinal_with_nonzero_partition_offset() {
     let state = DeviceState::<FakeBackend, RetainedOrdinalLayerState>::create(
         partition.layout().clone(),
         |ordinal, _| {
-            Ok::<_, Infallible>(RetainedOrdinalLayerState(FakeTensor(vec![
-                i32::try_from(ordinal).unwrap(),
-            ])))
+            Ok::<_, Infallible>(RetainedOrdinalLayerState(FakeTensor(vec![i32::try_from(
+                ordinal,
+            )
+            .unwrap()])))
         },
     )
     .unwrap();
@@ -3249,12 +3255,12 @@ impl<A> eredu_runtime::replicated_session::ReplicatedTextSnapshotMechanisms<A, F
     for ReferenceTextMechanisms
 where
     A: LayeredArchitecture<
-            FakeBackend,
-            DeviceState<FakeBackend, FakeLayerState>,
-            StaticModules = FakeOperator,
-            Unit = FakeUnit,
-            Error = Error,
-        >,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
 {
     fn estimate_snapshot_state(
         &self,
@@ -3289,12 +3295,12 @@ where
 impl<A> ReplicatedTextSessionMechanisms<A, FakeBackend> for ReferenceTextMechanisms
 where
     A: LayeredArchitecture<
-            FakeBackend,
-            DeviceState<FakeBackend, FakeLayerState>,
-            StaticModules = FakeOperator,
-            Unit = FakeUnit,
-            Error = Error,
-        >,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
 {
     type State = DeviceState<FakeBackend, FakeLayerState>;
     type PolicyError = &'static str;
@@ -3530,12 +3536,12 @@ where
 impl<A> TransactionalPromptCacheMechanisms<A, FakeBackend> for ReferenceTextMechanisms
 where
     A: LayeredArchitecture<
-            FakeBackend,
-            DeviceState<FakeBackend, FakeLayerState>,
-            StaticModules = FakeOperator,
-            Unit = FakeUnit,
-            Error = Error,
-        >,
+        FakeBackend,
+        DeviceState<FakeBackend, FakeLayerState>,
+        StaticModules = FakeOperator,
+        Unit = FakeUnit,
+        Error = Error,
+    >,
 {
     type PromptCacheSaveTransaction = ReferencePromptCacheSaveTransaction;
 
@@ -3695,17 +3701,15 @@ fn try_select_reference_text_with_completion(
     let parameter = ReplicatedTextParameterRequirement::new(
         "decoder.weight",
         vec!["decoder.weight".into()],
-        vec![
-            ReplicatedTextPhysicalSource::new(
-                "decoder.weight",
-                "decoder.weight",
-                "model.safetensors",
-                "decoder.weight",
-                source.clone(),
-                4,
-            )
-            .unwrap(),
-        ],
+        vec![ReplicatedTextPhysicalSource::new(
+            "decoder.weight",
+            "decoder.weight",
+            "model.safetensors",
+            "decoder.weight",
+            source.clone(),
+            4,
+        )
+        .unwrap()],
         vec!["decoder.weight.alias".into()],
         Some(source.clone()),
         Some(vec![1, 1]),
@@ -3884,10 +3888,10 @@ impl
     ) -> Result<Option<O::Output>, Error>
     where
         O: eredu_runtime::PredictionTargetOperation<
-                OrdinaryTextFixture,
-                FakeBackend,
-                DeviceState<FakeBackend, FakeLayerState>,
-            >,
+            OrdinaryTextFixture,
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >,
     {
         operation
             .apply(&mut self.architecture, state, None, context)
@@ -4118,15 +4122,13 @@ impl
                 return Err(Error::backend("destination fixture was asked to send"));
             }
             self.trace.borrow_mut().push("send");
-            return Ok(vec![
-                eredu_runtime::ArchitectureBoundaryValue::new(
-                    "hidden",
-                    pass.output
-                        .clone()
-                        .ok_or_else(|| Error::backend("middle-stage fixture has no output"))?,
-                )
-                .map_err(|error| Error::backend(error.to_string()))?,
-            ]);
+            return Ok(vec![eredu_runtime::ArchitectureBoundaryValue::new(
+                "hidden",
+                pass.output
+                    .clone()
+                    .ok_or_else(|| Error::backend("middle-stage fixture has no output"))?,
+            )
+            .map_err(|error| Error::backend(error.to_string()))?]);
         }
         self.trace.borrow_mut().push("receive");
         if self.fail_boundary_values {
@@ -4142,10 +4144,11 @@ impl
                     .unwrap(),
             ]);
         }
-        Ok(vec![
-            eredu_runtime::ArchitectureBoundaryValue::new("hidden", FakeTensor(vec![77]))
-                .map_err(|error| Error::backend(error.to_string()))?,
-        ])
+        Ok(vec![eredu_runtime::ArchitectureBoundaryValue::new(
+            "hidden",
+            FakeTensor(vec![77]),
+        )
+        .map_err(|error| Error::backend(error.to_string()))?])
     }
 
     fn boundary_schema(
@@ -4356,11 +4359,9 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         let prediction_error = session
             .prefill_prediction_target(&FakeTensor(vec![9, 10]), None, &())
             .expect_err("an architecture without a target capture must fail closed");
-        assert!(
-            prediction_error
-                .to_string()
-                .contains("did not retain its declared hidden capture")
-        );
+        assert!(prediction_error
+            .to_string()
+            .contains("did not retain its declared hidden capture"));
         assert_eq!(session.report().unwrap().state_report(), &before_prediction);
         assert_eq!(counters.snapshot().publications, 2);
         assert_eq!(counters.snapshot().completion_attempts, 2);
@@ -4439,11 +4440,9 @@ fn construction_report_failure_precedes_state_and_policy_native_work() {
         Ok(_) => panic!("the mechanism report failure must abort construction"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("injected construction report failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected construction report failure"));
     assert_eq!(
         counters.snapshot(),
         ReplicatedSessionCounts {
@@ -4550,11 +4549,9 @@ fn prediction_target_capture_uses_one_authoritative_transaction_and_publication(
     let restored_lane = session.prepare_prediction_target_state(&()).unwrap();
     assert_eq!(restored_lane.as_ref()[0].0, 1);
     let before_failure = session.report().unwrap().state_report().to_vec();
-    assert!(
-        session
-            .apply_prediction_target_operation(PredictionStateOperation { fail: true }, &())
-            .is_err()
-    );
+    assert!(session
+        .apply_prediction_target_operation(PredictionStateOperation { fail: true }, &())
+        .is_err());
     assert_eq!(session.report().unwrap().state_report(), &before_failure);
 }
 
@@ -4667,12 +4664,10 @@ fn observed_prediction_target_reuses_capture_transaction_and_recovers_delivery_f
                 session.decode_input_prediction_target_observed(&tokens, &(), observer)
             }
         };
-        assert!(
-            invoke(&mut observer)
-                .unwrap_err()
-                .to_string()
-                .contains("injected prediction target delivery failure")
-        );
+        assert!(invoke(&mut observer)
+            .unwrap_err()
+            .to_string()
+            .contains("injected prediction target delivery failure"));
         assert_eq!(
             observer.events,
             ["prepare", "coordinate", "observe", "deliver", "abort"]
@@ -4760,16 +4755,14 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         CommunicationManifest::new(
             1,
             0,
-            vec![
-                CommunicationGroupDescriptor::new(
-                    commit_group,
-                    0,
-                    vec![0],
-                    Some(0),
-                    commit_requirements,
-                )
-                .unwrap(),
-            ],
+            vec![CommunicationGroupDescriptor::new(
+                commit_group,
+                0,
+                vec![0],
+                Some(0),
+                commit_requirements,
+            )
+            .unwrap()],
             Vec::new(),
         )
         .unwrap()
@@ -4876,11 +4869,9 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
     fail_completion.set(true);
     commit_trace.borrow_mut().clear();
     PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = Some(Rc::clone(&commit_trace)));
-    assert!(
-        session
-            .forward_with_observer(&FakeTensor(vec![5]), None, &(), &mut CommitOrderingObserver,)
-            .is_err()
-    );
+    assert!(session
+        .forward_with_observer(&FakeTensor(vec![5]), None, &(), &mut CommitOrderingObserver,)
+        .is_err());
     PARTITION_COMMIT_TRACE.with(|trace| *trace.borrow_mut() = None);
     fail_completion.set(false);
     assert_eq!(*commit_trace.borrow(), ["observe", "complete"]);
@@ -4912,11 +4903,9 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
             error,
             eredu_runtime::ReplicatedTextSessionError::BeforeStateMutation(_)
         ));
-        assert!(
-            error
-                .to_string()
-                .contains("bounded all-rank preparation agreement")
-        );
+        assert!(error
+            .to_string()
+            .contains("bounded all-rank preparation agreement"));
         assert_eq!(counters.snapshot().forward_calls, before);
         assert_eq!(session.report().unwrap().state_report(), &[2]);
     }
@@ -5067,21 +5056,17 @@ fn production_partitioned_constructor_reuses_session_rollback_and_stateless_rank
         .describe_prepared_resources(&prepared_resource_query())
         .unwrap();
     assert!(described.allocations.is_empty());
-    assert!(
-        stateless_session
-            .report()
-            .unwrap()
-            .state_report()
-            .is_empty()
-    );
+    assert!(stateless_session
+        .report()
+        .unwrap()
+        .state_report()
+        .is_empty());
     stateless_session.reset(&()).unwrap();
-    assert!(
-        stateless_session
-            .report()
-            .unwrap()
-            .state_report()
-            .is_empty()
-    );
+    assert!(stateless_session
+        .report()
+        .unwrap()
+        .state_report()
+        .is_empty());
 }
 
 #[derive(Clone)]
@@ -5472,26 +5457,24 @@ fn partitioned_agreement_session(
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![
-            CommunicationGroupDescriptor::new(
-                group,
-                0,
-                vec![0, 1],
-                Some(rank),
-                CommunicationGroupRequirements::new([
-                    CommunicationOperationRequirement::tensors(
-                        CommunicationOperation::Broadcast,
-                        [TensorDtype::F32],
-                        CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
-                        true,
-                    )
-                    .unwrap(),
-                    CommunicationOperationRequirement::failure_agreement(true),
-                ])
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32],
+                    CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+                    true,
+                )
                 .unwrap(),
-            )
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
             .unwrap(),
-        ],
+        )
+        .unwrap()],
         Vec::new(),
     )
     .unwrap()
@@ -5637,26 +5620,24 @@ fn partitioned_cache_control_session(
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![
-            CommunicationGroupDescriptor::new(
-                group,
-                0,
-                vec![0, 1],
-                Some(rank),
-                CommunicationGroupRequirements::new([
-                    CommunicationOperationRequirement::tensors(
-                        CommunicationOperation::Broadcast,
-                        [TensorDtype::F32],
-                        CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
-                        true,
-                    )
-                    .unwrap(),
-                    CommunicationOperationRequirement::failure_agreement(true),
-                ])
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32],
+                    CommunicationTensorLimits::new(1, 3, 8, None).unwrap(),
+                    true,
+                )
                 .unwrap(),
-            )
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
             .unwrap(),
-        ],
+        )
+        .unwrap()],
         Vec::new(),
     )
     .unwrap()
@@ -5773,17 +5754,15 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
         ]
     );
     let call_count = local_calls.borrow().len();
-    assert!(
-        local_failure
-            .save_prompt_cache_distributed(
-                std::path::Path::new("unused"),
-                descriptor.clone(),
-                &[3],
-                &replacement_options,
-                &(),
-            )
-            .is_err()
-    );
+    assert!(local_failure
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .is_err());
     assert_eq!(local_calls.borrow().len(), call_count);
     assert_eq!(local_counters.snapshot().forward_calls, 0);
 
@@ -5802,16 +5781,15 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
     )
     .unwrap();
     let previous = reference_prompt_cache_snapshot(&peer_store);
-    assert!(
-        peer.save_prompt_cache_distributed(
+    assert!(peer
+        .save_prompt_cache_distributed(
             std::path::Path::new("unused"),
             descriptor,
             &[3],
             &replacement_options,
             &(),
         )
-        .is_err()
-    );
+        .is_err());
     assert_eq!(reference_prompt_cache_snapshot(&peer_store), previous);
     assert_eq!(
         peer_calls.borrow().last(),
@@ -5835,17 +5813,15 @@ fn distributed_prompt_cache_save_is_reversible_and_fences_one_rank_failures() {
         )
         .unwrap();
     let previous = reference_prompt_cache_snapshot(&replacement_store);
-    assert!(
-        replacement
-            .save_prompt_cache_distributed(
-                std::path::Path::new("unused"),
-                descriptor,
-                &[3],
-                &replacement_options,
-                &(),
-            )
-            .is_err()
-    );
+    assert!(replacement
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &replacement_options,
+            &(),
+        )
+        .is_err());
     assert_eq!(
         reference_prompt_cache_snapshot(&replacement_store),
         previous
@@ -5902,11 +5878,9 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
         None,
         true,
     );
-    assert!(
-        local_failure
-            .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
-            .is_err()
-    );
+    assert!(local_failure
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
     assert_eq!(local_failure.report().unwrap().state_report(), &[0]);
     assert!(store.borrow().is_none());
     assert_eq!(
@@ -5914,11 +5888,9 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
         Some(&(DistributedExecutionPhase::PromptCacheLoadPreparation, false))
     );
     let calls_before_retry = calls.borrow().len();
-    assert!(
-        local_failure
-            .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
-            .is_err()
-    );
+    assert!(local_failure
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
     assert_eq!(calls.borrow().len(), calls_before_retry);
     assert_eq!(counters.snapshot().forward_calls, 0);
 
@@ -5938,10 +5910,9 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
     .unwrap();
     peer.decode(&FakeTensor(vec![4]), &()).unwrap();
     assert_eq!(peer.report().unwrap().state_report(), &[1]);
-    assert!(
-        peer.load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
-            .is_err()
-    );
+    assert!(peer
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .is_err());
     assert_eq!(peer.report().unwrap().state_report(), &[1]);
     assert_eq!(
         peer_calls.borrow().last(),
@@ -5965,12 +5936,10 @@ fn distributed_prompt_cache_load_is_provisional_until_every_rank_succeeds() {
         .unwrap();
     successful.decode(&FakeTensor(vec![4]), &()).unwrap();
     assert_eq!(successful.report().unwrap().state_report(), &[1]);
-    assert!(
-        successful
-            .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
-            .unwrap()
-            .is_some()
-    );
+    assert!(successful
+        .load_prompt_cache_distributed(std::path::Path::new("unused"), &descriptor, &[3], &(),)
+        .unwrap()
+        .is_some());
     assert_eq!(successful.report().unwrap().state_report(), &[0]);
 }
 
@@ -6011,35 +5980,31 @@ fn distributed_prompt_cache_preflight_rejects_wrong_rank_and_input_before_io() {
     let input_identity = prepared_composite_input(99)
         .cache_identity(composite_content_fingerprint(99))
         .unwrap();
-    assert!(
-        wrong_input
-            .save_prompt_cache_for_input_distributed(
-                std::path::Path::new("unused"),
-                descriptor.clone(),
-                &[3],
-                &eredu_core::cache::PromptCacheOptions::default(),
-                &input_identity,
-                &(),
-            )
-            .is_err()
-    );
+    assert!(wrong_input
+        .save_prompt_cache_for_input_distributed(
+            std::path::Path::new("unused"),
+            descriptor.clone(),
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &input_identity,
+            &(),
+        )
+        .is_err());
     assert!(store.borrow().is_none());
     assert_eq!(
         calls.borrow().as_slice(),
         &[(DistributedExecutionPhase::PromptCacheSavePreflight, false)]
     );
     let agreement_count = calls.borrow().len();
-    assert!(
-        wrong_input
-            .save_prompt_cache_distributed(
-                std::path::Path::new("unused"),
-                descriptor,
-                &[3],
-                &eredu_core::cache::PromptCacheOptions::default(),
-                &(),
-            )
-            .is_err()
-    );
+    assert!(wrong_input
+        .save_prompt_cache_distributed(
+            std::path::Path::new("unused"),
+            descriptor,
+            &[3],
+            &eredu_core::cache::PromptCacheOptions::default(),
+            &(),
+        )
+        .is_err());
     assert_eq!(calls.borrow().len(), agreement_count);
     assert!(store.borrow().is_none());
 }
@@ -6052,20 +6017,16 @@ fn distributed_state_controls_prepare_on_all_ranks_and_fence_failed_retries() {
         None,
         true,
     );
-    assert!(
-        checkpoint_failure
-            .checkpoint_complete_distributed(&())
-            .is_err()
-    );
+    assert!(checkpoint_failure
+        .checkpoint_complete_distributed(&())
+        .is_err());
     assert_eq!(
         calls.borrow().as_slice(),
         &[(DistributedExecutionPhase::SessionCheckpoint, true)]
     );
-    assert!(
-        checkpoint_failure
-            .decode(&FakeTensor(vec![3]), &())
-            .is_err()
-    );
+    assert!(checkpoint_failure
+        .decode(&FakeTensor(vec![3]), &())
+        .is_err());
     assert_eq!(counters.snapshot().forward_calls, 0);
 
     let (mut rollback_failure, _, _, calls, counters) = partitioned_cache_control_session(
@@ -6080,11 +6041,9 @@ fn distributed_state_controls_prepare_on_all_ranks_and_fence_failed_retries() {
     rollback_failure.decode(&FakeTensor(vec![3]), &()).unwrap();
     assert_eq!(rollback_failure.report().unwrap().state_report(), &[1]);
     let forwards = counters.snapshot().forward_calls;
-    assert!(
-        rollback_failure
-            .rollback_complete_distributed(checkpoint, &())
-            .is_err()
-    );
+    assert!(rollback_failure
+        .rollback_complete_distributed(checkpoint, &())
+        .is_err());
     assert_eq!(rollback_failure.report().unwrap().state_report(), &[1]);
     assert_eq!(
         calls.borrow().last(),
@@ -6502,11 +6461,9 @@ fn partitioned_runtime_factory_rejects_independent_task_proof_before_factory_wor
     )
     .err()
     .expect("independent task proof reached the partition runtime factory");
-    assert!(
-        error
-            .to_string()
-            .contains("precomputed local materialization tasks differ")
-    );
+    assert!(error
+        .to_string()
+        .contains("precomputed local materialization tasks differ"));
     assert!(!factory_called.get());
 }
 
@@ -6987,19 +6944,17 @@ fn assert_destination_preparation_failure_is_agreed_before_transfer(
     let manifest = CommunicationManifest::new(
         2,
         1,
-        vec![
-            CommunicationGroupDescriptor::new(
-                group,
-                0,
-                vec![0, 1],
-                Some(1),
-                CommunicationGroupRequirements::new([
-                    CommunicationOperationRequirement::failure_agreement(true),
-                ])
-                .unwrap(),
-            )
+        vec![CommunicationGroupDescriptor::new(
+            group,
+            0,
+            vec![0, 1],
+            Some(1),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
             .unwrap(),
-        ],
+        )
+        .unwrap()],
         vec![test_boundary_route(route_id, 0, 0, 1, route_requirement)],
     )
     .unwrap()
@@ -8287,11 +8242,9 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
                 &(),
             )
             .unwrap_err();
-        assert!(
-            mismatch
-                .to_string()
-                .contains("content identity differs from the prepared input")
-        );
+        assert!(mismatch
+            .to_string()
+            .contains("content identity differs from the prepared input"));
         assert_eq!(
             session.report().unwrap().state_report(),
             &before_identity_mismatch
@@ -8329,11 +8282,9 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
             replace_vision: false,
             fail_path: Some("group.2.unit.0.output"),
         };
-        assert!(
-            session
-                .decode_input_with_observer(Some(&decode), &(), &mut failing_observer)
-                .is_err()
-        );
+        assert!(session
+            .decode_input_with_observer(Some(&decode), &(), &mut failing_observer)
+            .is_err());
         assert_eq!(session.report().unwrap().state_report(), &[0, 0, 1, 1]);
 
         fail_completion.set(true);
@@ -8913,18 +8864,16 @@ fn independent_backend_uses_retained_materialization_plans_and_transform_outputs
         LinearFormat::MxFp4,
         WeightLoweringKind::Transform,
     )
-    .with_output_companions(vec![
-        eredu_runtime::ReplicatedTextOutputCompanion::new(
-            "layers.1.scales",
-            eredu_nn::LinearCompanionRole::Scale,
-            vec![8, 1],
-            eredu_runtime::ParameterGroupOwner::execution_unit(
-                eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
-                1,
-            ),
-        )
-        .unwrap(),
-    ])
+    .with_output_companions(vec![eredu_runtime::ReplicatedTextOutputCompanion::new(
+        "layers.1.scales",
+        eredu_nn::LinearCompanionRole::Scale,
+        vec![8, 1],
+        eredu_runtime::ParameterGroupOwner::execution_unit(
+            eredu_runtime::ExecutionGroupId::new("decoder").unwrap(),
+            1,
+        ),
+    )
+    .unwrap()])
     .unwrap();
     let tasks = vec![static_task, direct_task, transform_task];
 
@@ -9105,11 +9054,9 @@ fn distributed_independent_branches_preserve_transaction_epochs() {
             .value(),
         7
     );
-    assert!(
-        calls
-            .borrow()
-            .contains(&(DistributedExecutionPhase::ControlExchangePreparation, true))
-    );
+    assert!(calls
+        .borrow()
+        .contains(&(DistributedExecutionPhase::ControlExchangePreparation, true)));
 }
 
 #[test]
@@ -9151,11 +9098,9 @@ fn parameter_state_publication_rolls_back_without_nested_collectives_or_epoch_re
         .unwrap();
     session.invalidate_parameter_snapshots();
     assert!(session.validate_control_state(&saved).is_err());
-    assert!(
-        session
-            .exchange_parameter_reset_state(&mut replacement)
-            .is_err()
-    );
+    assert!(session
+        .exchange_parameter_reset_state(&mut replacement)
+        .is_err());
     assert_eq!(session.report().unwrap().state_report(), &[0]);
     session.decode(&FakeTensor(vec![4]), &()).unwrap();
     assert_eq!(
@@ -9194,12 +9139,10 @@ fn distributed_independent_copy_and_exchange_failures_leave_state_and_fence_retr
                 session.exchange_control_state(&mut saved, &())
             }
         };
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("another rank failed")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("another rank failed"));
         assert_eq!(
             session.report().unwrap().state_report(),
             if phase == DistributedExecutionPhase::ControlExchangePreparation {
@@ -9276,19 +9219,17 @@ fn parameter_unit_loans_preserve_semantic_addresses_and_forward_order() {
         LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, RecordingPolicy::bounded(4));
     let mut markers = Vec::new();
     for ordinal in [3, 1] {
-        assert!(
-            runtime
-                .inspect_parameter_unit(
-                    ordinal,
-                    addresses.address(ordinal).unwrap(),
-                    |unit| {
-                        markers.push(unit.marker);
-                        Ok(())
-                    },
-                    &()
-                )
-                .unwrap()
-        );
+        assert!(runtime
+            .inspect_parameter_unit(
+                ordinal,
+                addresses.address(ordinal).unwrap(),
+                |unit| {
+                    markers.push(unit.marker);
+                    Ok(())
+                },
+                &()
+            )
+            .unwrap());
     }
     assert_eq!(markers, [21, 10]);
     let failed = runtime.inspect_parameter_unit(

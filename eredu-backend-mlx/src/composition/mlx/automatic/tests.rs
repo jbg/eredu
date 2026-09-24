@@ -15,7 +15,10 @@ fn macos_discovery_exposes_estimated_available_memory() {
             || (device.family == "metal"
                 && profile.physical_memory_semantics == HardwareMemorySemantics::Unified)
         {
-            assert_eq!(device.available_memory_bytes, profile.available_memory_bytes);
+            assert_eq!(
+                device.available_memory_bytes,
+                profile.available_memory_bytes
+            );
         }
     }
 }

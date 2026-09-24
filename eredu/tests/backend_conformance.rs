@@ -1106,7 +1106,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     > {
         let profile = forecast::fixture_profile();
         let state = eredu_core::speculative::SpeculativeModelMemoryObservation {
-                parameter_conversions: None,
+            parameter_conversions: None,
             current_positions: *cache as u64,
             current_state_bytes: Some(65536),
             peak_state_bytes: additional

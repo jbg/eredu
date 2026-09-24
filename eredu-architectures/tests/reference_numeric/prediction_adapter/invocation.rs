@@ -61,7 +61,8 @@ fn module(name: &str, context: &NumericContext) -> Module<NumericLinear> {
             output: 1,
             weight: ParameterSpec::trainable(name).unwrap(),
             bias: None,
-            format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap(),
+            format: eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
+                .unwrap(),
         },
         context,
     )

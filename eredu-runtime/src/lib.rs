@@ -36,8 +36,6 @@ pub mod execution_plan;
 pub mod execution_resources;
 /// Reusable module construction and invocation topology.
 pub mod execution_topology;
-/// Ordinary embedded prediction invocation and storage descriptions.
-pub mod prediction_resources;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
@@ -52,8 +50,6 @@ pub mod layered;
 pub mod load_request;
 /// Physical storage descriptions and retention facts for reusable mechanisms.
 pub mod mechanism_resources;
-/// Execution-order, retention and per-physical-pool resource peak composition.
-pub mod resource_lifetimes;
 /// Exact mechanism capability synthesis from neutral requirements.
 pub mod mechanism_synthesis;
 /// Request-specific generation-memory estimates and fit advice.
@@ -69,6 +65,8 @@ pub mod partition;
 /// Rank-local graph execution over opaque communication resources.
 pub mod partitioned_execution;
 pub mod placement;
+/// Ordinary embedded prediction invocation and storage descriptions.
+pub mod prediction_resources;
 /// Backend-neutral bounded background weight-prefetch execution.
 pub mod prefetch;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
@@ -96,6 +94,8 @@ pub mod replicated_session;
 pub mod replicated_text;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
+/// Execution-order, retention and per-physical-pool resource peak composition.
+pub mod resource_lifetimes;
 /// Bounded all-rank readiness and lifetime accounting before text execution.
 pub mod run_preparation;
 /// Backend-neutral speculative request lifecycle and fair scheduling.

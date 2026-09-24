@@ -135,7 +135,8 @@ impl PreparedModelDiscovery {
     /// Retained selected geometry for loaded request forecasts; never resolves source identity.
     pub fn generation_memory(
         &self,
-    ) -> Result<&eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError> {
+    ) -> Result<&eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError>
+    {
         self.generation_memory
             .as_ref()
             .map_err(|reason| eredu_core::CapabilityError::Observation(reason.clone()))

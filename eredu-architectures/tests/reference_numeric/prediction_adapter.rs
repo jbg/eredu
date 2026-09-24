@@ -17,10 +17,10 @@ mod invocation;
 mod qwen_components;
 #[path = "prediction_adapter/residency.rs"]
 mod residency;
-#[path = "prediction_adapter/v3_components.rs"]
-mod v3_components;
 #[path = "prediction_adapter/resources.rs"]
 mod resources;
+#[path = "prediction_adapter/v3_components.rs"]
+mod v3_components;
 
 type State = DeviceState<NumericBackend, NumericHybridLayerState>;
 type Snapshots = Rc<RefCell<Vec<State>>>;
@@ -910,7 +910,6 @@ fn execute_config(
         .all(|read| read.physically_bounded && read.encoded_bytes > 0));
     run
 }
-
 
 pub(super) fn assert_real_embedded_prediction() {
     let ordinary = execute(1.0, false);

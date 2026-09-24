@@ -814,12 +814,21 @@ pub(crate) fn memory_uncertainties(
             let prefix = format!("{:?} execution {rank}", plan.domain);
             if let Some(topology) = &execution.execution_topology {
                 uncertainties.push(format!("{prefix}: generic mechanism calibration v1 uses explicit lazy-evaluation envelopes; native scratch, alignment and arithmetic promotion are planning assumptions, not allocator guarantees"));
-                uncertainties.extend(topology.missing.iter().map(|reason| format!("{prefix}: {reason}")));
+                uncertainties.extend(
+                    topology
+                        .missing
+                        .iter()
+                        .map(|reason| format!("{prefix}: {reason}")),
+                );
                 for layer in &topology.layers {
-                    if let crate::execution_topology::TokenMixerTopology::Unknown { reason } = &layer.mixer {
+                    if let crate::execution_topology::TokenMixerTopology::Unknown { reason } =
+                        &layer.mixer
+                    {
                         uncertainties.push(format!("{prefix}: {reason}"));
                     }
-                    if let crate::execution_topology::FeedForwardTopology::Unknown { reason } = &layer.feed_forward {
+                    if let crate::execution_topology::FeedForwardTopology::Unknown { reason } =
+                        &layer.feed_forward
+                    {
                         uncertainties.push(format!("{prefix}: {reason}"));
                     }
                 }
@@ -848,16 +857,34 @@ pub(crate) fn memory_uncertainties(
                     "{prefix}: interior peaks of remainder-shaped state unavailable"
                 ));
             }
-            let fused_attention = execution.execution_topology.as_ref().is_none_or(|topology| topology.layers.iter().any(|layer| matches!(layer.mixer, crate::execution_topology::TokenMixerTopology::Attention { input_scores: false, softcap: false, .. })));
+            let fused_attention = execution
+                .execution_topology
+                .as_ref()
+                .is_none_or(|topology| {
+                    topology.layers.iter().any(|layer| {
+                        matches!(
+                            layer.mixer,
+                            crate::execution_topology::TokenMixerTopology::Attention {
+                                input_scores: false,
+                                softcap: false,
+                                ..
+                            }
+                        )
+                    })
+                });
             match &execution.attention {
                 AttentionWorkspace::Unknown if fused_attention => {
                     uncertainties.push(format!("{prefix}: attention kernel workspace unavailable"))
                 }
-                AttentionWorkspace::ScoreMatrixUpperBound if fused_attention => uncertainties.push(format!(
-                    "{prefix}: uncalibrated fused attention uses score-matrix upper estimate"
-                )),
+                AttentionWorkspace::ScoreMatrixUpperBound if fused_attention => {
+                    uncertainties.push(format!(
+                        "{prefix}: uncalibrated fused attention uses score-matrix upper estimate"
+                    ))
+                }
                 AttentionWorkspace::Fused { scratch }
-                    if fused_attention && (scratch.kind != ObservationKind::Exact || scratch.upper_bytes.is_none()) =>
+                    if fused_attention
+                        && (scratch.kind != ObservationKind::Exact
+                            || scratch.upper_bytes.is_none()) =>
                 {
                     uncertainties.push(format!("{prefix} attention scratch: {}", scratch.detail))
                 }

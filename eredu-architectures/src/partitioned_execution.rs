@@ -1588,10 +1588,10 @@ where
                         ),
                     }
                     .map_err(eredu_nn::Error::backend_source)?;
-                    if let Some(path) =
-                        self.architecture
-                            .group_input_observation_path(dependency)
-                            .map_err(eredu_nn::Error::backend_source)?
+                    if let Some(path) = self
+                        .architecture
+                        .group_input_observation_path(dependency)
+                        .map_err(eredu_nn::Error::backend_source)?
                     {
                         dependency_hidden = eredu_runtime::observe_and_intervene(
                             observer,

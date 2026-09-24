@@ -11,24 +11,24 @@ use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
 };
 use eredu_core::{
-    BoundedSubmissionOutcome, CollectiveGroupDescriptor, CollectiveGroupId, Submission,
-    checkpoint::TensorDtype,
+    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupDescriptor,
+    CollectiveGroupId, Submission,
 };
 use eredu_runtime::{
     CommunicationCapabilities, CommunicationCompletionCapabilities, CommunicationGroupDescriptor,
     CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,
     CommunicationRouteDescriptor, CommunicationRouteId, CommunicationTensorLimits, TensorPlacement,
 };
-use safemlx::{Array, Stream, distributed::Group as NativeGroup};
+use safemlx::{distributed::Group as NativeGroup, Array, Stream};
 
 use crate::{
     backend::error::Error, backend::runtime::checkpoint::store::MlxParameterMaterializationContext,
 };
 
-#[cfg(test)]
-use crate::backend::DeviceAssignment;
 use crate::backend::runtime::distributed::Group;
 use crate::backend::topology::MlxRankContext;
+#[cfg(test)]
+use crate::backend::DeviceAssignment;
 #[cfg(test)]
 use safemlx::{Device, DeviceType};
 
@@ -650,8 +650,8 @@ impl ParallelCommunicators {
 
 mod placement;
 pub use placement::{
-    PlacementPlan, RankPartition, load_partition_from_store_on_streams, load_safetensors_partition,
-    load_safetensors_partition_on_streams,
+    load_partition_from_store_on_streams, load_safetensors_partition,
+    load_safetensors_partition_on_streams, PlacementPlan, RankPartition,
 };
 
 #[cfg(test)]

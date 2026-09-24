@@ -27,20 +27,18 @@ fn worker() {
     let manifest = CommunicationManifest::new(
         8,
         rank,
-        vec![
-            CommunicationGroupDescriptor::new(
-                id,
-                0,
-                members.clone(),
-                Some((rank % 4) / 2),
-                CommunicationGroupRequirements::new([
-                    requirement(CommunicationOperation::AllReduceSum),
-                    requirement(CommunicationOperation::AllGatherEven),
-                ])
-                .unwrap(),
-            )
+        vec![CommunicationGroupDescriptor::new(
+            id,
+            0,
+            members.clone(),
+            Some((rank % 4) / 2),
+            CommunicationGroupRequirements::new([
+                requirement(CommunicationOperation::AllReduceSum),
+                requirement(CommunicationOperation::AllGatherEven),
+            ])
             .unwrap(),
-        ],
+        )
+        .unwrap()],
         vec![],
     )
     .unwrap()

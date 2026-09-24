@@ -157,9 +157,7 @@ fn run(device: DeviceType) {
             };
             let inspected = native::inspect_model_preparation(
                 root.path(),
-                native::MlxInspectionOptions::new(MlxLoadRequest::from_normalized(
-                    request.clone(),
-                )),
+                native::MlxInspectionOptions::new(MlxLoadRequest::from_normalized(request.clone())),
             )
             .unwrap();
             let cold_chunking = inspected
@@ -181,8 +179,8 @@ fn run(device: DeviceType) {
                 cold_chunking.is_ok(),
                 MlxBackend::text_prefill_chunking_support(&runtime).is_ok()
             );
-            use eredu_runtime::memory_forecast::GenerationForecastBackend;
             use eredu_runtime::memory_estimation::LogitsWorkspace;
+            use eredu_runtime::memory_forecast::GenerationForecastBackend;
             let profile = MlxBackend::loaded_memory_profile(&runtime).unwrap();
             assert!(profile.geometry.workspace.is_some());
             let ordinary = MlxBackend::forecast_execution_contract(&runtime, None, false);
@@ -213,8 +211,11 @@ fn run(device: DeviceType) {
                     &[1, length as i32, 64]
                 );
                 drop(submission);
-                assert!(MlxBackend::loaded_memory_profile(&runtime).unwrap()
-                    .geometry.workspace.is_none());
+                assert!(MlxBackend::loaded_memory_profile(&runtime)
+                    .unwrap()
+                    .geometry
+                    .workspace
+                    .is_none());
                 let mut decode_reference = Vec::new();
                 for token in [5_u32, 8, 13] {
                     let output = runtime
@@ -226,8 +227,11 @@ fn run(device: DeviceType) {
                 }
                 for chunk in [1, 2, 4, 32] {
                     runtime.reset().unwrap();
-                    assert!(MlxBackend::loaded_memory_profile(&runtime).unwrap()
-                        .geometry.workspace.is_some());
+                    assert!(MlxBackend::loaded_memory_profile(&runtime)
+                        .unwrap()
+                        .geometry
+                        .workspace
+                        .is_some());
                     let mut prompt =
                         MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
                     let identity = prompt.cache_identity().cloned();

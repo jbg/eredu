@@ -304,14 +304,12 @@ mod tests {
             }
             for rank in 0..2 {
                 let transport = transport(rank, &proposals);
-                assert!(
-                    establish_communication_session(
-                        &transport,
-                        &proposals[rank].manifest,
-                        proposals[rank].nonce
-                    )
-                    .is_err()
-                );
+                assert!(establish_communication_session(
+                    &transport,
+                    &proposals[rank].manifest,
+                    proposals[rank].nonce
+                )
+                .is_err());
                 assert_eq!(transport.calls.get(), 2);
             }
         }

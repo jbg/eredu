@@ -335,15 +335,12 @@ impl MlxDistributedSession {
         error: impl std::error::Error + Send + Sync + 'static,
         operation: eredu_runtime::CommunicationOperation,
     ) -> Error {
-        Error::Other(Box::new(
-            self.authority
-                .submission_failure(
-                    error,
-                    operation,
-                    eredu_runtime::DistributedExecutionPhase::Execution,
-                    None,
-                ),
-        ))
+        Error::Other(Box::new(self.authority.submission_failure(
+            error,
+            operation,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            None,
+        )))
     }
 
     fn selected_submission(

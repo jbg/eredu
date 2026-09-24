@@ -134,7 +134,9 @@ pub(crate) fn execution_topology(
     if args.is_moe() {
         crate::decoder::topology::text_with_feed_forward(args, |layer| {
             eredu_runtime::execution_topology::FeedForwardTopology::from_grouped_specs(
-                &selector_spec(args, layer)?, &expert_bank_spec(args, layer)?)
+                &selector_spec(args, layer)?,
+                &expert_bank_spec(args, layer)?,
+            )
         })
     } else {
         crate::decoder::topology::text(args)

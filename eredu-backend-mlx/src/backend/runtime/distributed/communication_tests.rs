@@ -6,30 +6,30 @@ use std::{
 };
 
 use eredu_core::{
-    BoundedSubmissionOutcome, CollectiveGroupId, Completion as _, ParallelTopology,
-    checkpoint::TensorDtype,
+    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupId, Completion as _,
+    ParallelTopology,
 };
 use eredu_runtime::{
-    BarrierBackend, BoundaryRoleContract, BroadcastBackend, CommunicationGroupDescriptor,
-    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
-    CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
-    CommunicationTensorLimits, DistributedExecutionPhase, EvenGatherBackend,
+    project_all_communication_manifests, BarrierBackend, BoundaryRoleContract, BroadcastBackend,
+    CommunicationGroupDescriptor, CommunicationGroupRequirements, CommunicationManifest,
+    CommunicationOperation, CommunicationOperationRequirement, CommunicationRouteDescriptor,
+    CommunicationRouteId, CommunicationTensorLimits, DistributedExecutionPhase, EvenGatherBackend,
     FailureAgreementBackend, OpaqueFailureAgreement, PartitionCommitAgreement,
     PartitionCommunication, PointToPointBackend, RealizedCommunicationGroup,
-    RoleExactBoundaryContract, TopologyCommunicationPlan, project_all_communication_manifests,
+    RoleExactBoundaryContract, TopologyCommunicationPlan,
 };
 use safemlx::{
-    Array, Device, DeviceType, Stream,
     distributed::{self, Backend},
+    Array, Device, DeviceType, Stream,
 };
 
 use crate::{
-    MlxTensor,
     backend::nn::shared::{MlxCommunicationTensorMetadata, MlxNeuralBackend},
+    MlxTensor,
 };
 
-use super::Group;
 use super::topology::{CommunicationRouteEndpoint, ParallelCommunicators};
+use super::Group;
 
 const WORKER_RANK: &str = "EREDU_FINE_COMMUNICATION_RING_WORKER";
 const MISMATCH_WORKER_RANK: &str = "EREDU_MANIFEST_MISMATCH_RING_WORKER";
@@ -348,16 +348,14 @@ fn point_to_point_worker() {
             )
             .unwrap(),
         ],
-        vec![
-            CommunicationRouteDescriptor::new(
-                CommunicationRouteId::new(41),
-                0,
-                0,
-                1,
-                route_requirement(),
-            )
-            .unwrap(),
-        ],
+        vec![CommunicationRouteDescriptor::new(
+            CommunicationRouteId::new(41),
+            0,
+            0,
+            1,
+            route_requirement(),
+        )
+        .unwrap()],
     )
     .unwrap()
     .with_completion_policy(completion_policy());
@@ -532,19 +530,17 @@ fn failure_agreement_worker() {
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![
-            CommunicationGroupDescriptor::new(
-                group_id,
-                0,
-                vec![0, 1],
-                Some(rank),
-                CommunicationGroupRequirements::new([
-                    CommunicationOperationRequirement::failure_agreement(true),
-                ])
-                .unwrap(),
-            )
+        vec![CommunicationGroupDescriptor::new(
+            group_id,
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([
+                CommunicationOperationRequirement::failure_agreement(true),
+            ])
             .unwrap(),
-        ],
+        )
+        .unwrap()],
         Vec::new(),
     )
     .unwrap()
@@ -613,16 +609,14 @@ fn manifest_mismatch_worker() {
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![
-            CommunicationGroupDescriptor::new(
-                CollectiveGroupId::new(47),
-                0,
-                vec![0, 1],
-                Some(rank),
-                CommunicationGroupRequirements::new([requirement]).unwrap(),
-            )
-            .unwrap(),
-        ],
+        vec![CommunicationGroupDescriptor::new(
+            CollectiveGroupId::new(47),
+            0,
+            vec![0, 1],
+            Some(rank),
+            CommunicationGroupRequirements::new([requirement]).unwrap(),
+        )
+        .unwrap()],
         Vec::new(),
     )
     .unwrap();

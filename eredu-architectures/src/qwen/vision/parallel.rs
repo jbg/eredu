@@ -207,12 +207,7 @@ pub fn owned_static_parallel_parameter_groups<
     groups.extend(
         merger_groups(&modules.merger, &rooted(root, "merger"), width)?
             .into_iter()
-            .map(|group| {
-                eredu_runtime::OwnedParameterGroupSpec::new(
-                    consumer(last_unit),
-                    group,
-                )
-            }),
+            .map(|group| eredu_runtime::OwnedParameterGroupSpec::new(consumer(last_unit), group)),
     );
     for (index, merger) in modules.deepstack_mergers.iter().enumerate() {
         let unit = usize::try_from(config.deepstack_layers()[index])

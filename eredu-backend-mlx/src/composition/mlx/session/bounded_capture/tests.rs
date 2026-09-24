@@ -766,7 +766,8 @@ fn bounded_native_estimate_scales_host_transfer_with_preview_or_reduction() {
 fn bounded_native_candidate_estimate_charges_the_row_not_the_prefill_source() {
     let vocabulary = 262_144;
     let request = selection(CaptureTransform::TopCandidates { count: 16 });
-    let decode = estimate_shape(&[1, 1, vocabulary], &request, &whole(&[1, 1, vocabulary])).unwrap();
+    let decode =
+        estimate_shape(&[1, 1, vocabulary], &request, &whole(&[1, 1, vocabulary])).unwrap();
     let prefill = estimate_shape(
         &[1, 4096, vocabulary],
         &request,

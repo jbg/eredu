@@ -3,16 +3,16 @@ use eredu_core::{DraftPlacementPlan, DraftingPlan};
 
 #[path = "speculative/activations.rs"]
 mod activations;
-#[path = "speculative/forecast.rs"]
-mod forecast;
 #[path = "speculative/continuation_forecast.rs"]
 mod continuation_forecast;
-#[path = "speculative/startup_forecast.rs"]
-mod startup_forecast;
+#[path = "speculative/forecast.rs"]
+mod forecast;
 #[path = "speculative/parameters.rs"]
 mod parameters;
 #[path = "speculative/pooling.rs"]
 mod pooling;
+#[path = "speculative/startup_forecast.rs"]
+mod startup_forecast;
 #[path = "speculative/v4_components.rs"]
 mod v4_components;
 

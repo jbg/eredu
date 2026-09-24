@@ -5894,7 +5894,14 @@ fn prepared_invocation_topology_matches_constructed_projection_geometry() {
             )
             .unwrap()
             .parameter_description(&())
-            .map(|description| description.groups().iter().flat_map(|group| group.group().members()).map(|member| (member.target().to_owned(), member.global_shape().to_vec())).collect::<BTreeMap<_, _>>())
+            .map(|description| {
+                description
+                    .groups()
+                    .iter()
+                    .flat_map(|group| group.group().members())
+                    .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
+                    .collect::<BTreeMap<_, _>>()
+            })
             .unwrap(),
             "gemma2" => {
                 // Construction needs no softcap execution capability: inspect the
@@ -5902,24 +5909,39 @@ fn prepared_invocation_topology_matches_constructed_projection_geometry() {
                 struct Shapes(BTreeMap<String, Vec<usize>>);
                 impl<'a> ParameterVisitor<'a, ReferenceTensor> for Shapes {
                     fn visit(&mut self, metadata: ParameterMetadata, value: &'a ReferenceTensor) {
-                        self.0.insert(metadata.id.to_string(), value.shape().iter().map(|&n| n as usize).collect());
+                        self.0.insert(
+                            metadata.id.to_string(),
+                            value.shape().iter().map(|&n| n as usize).collect(),
+                        );
                     }
                 }
-                let args = eredu_architectures::gemma2::model_args_from_config_value(&config).unwrap();
+                let args =
+                    eredu_architectures::gemma2::model_args_from_config_value(&config).unwrap();
                 let mut collector = Shapes(BTreeMap::new());
-                decoder::StaticModules::<ReferenceBackend>::new(&args, &()).unwrap().visit_parameters(&mut collector);
+                decoder::StaticModules::<ReferenceBackend>::new(&args, &())
+                    .unwrap()
+                    .visit_parameters(&mut collector);
                 for layer in 0..topology.layers.len() {
-                    TransformerBlock::<ReferenceBackend>::new(&args, layer, &()).unwrap().visit_parameters(&mut collector);
+                    TransformerBlock::<ReferenceBackend>::new(&args, layer, &())
+                        .unwrap()
+                        .visit_parameters(&mut collector);
                 }
                 collector.0
-            },
+            }
             "lfm2" => lfm2::LayeredModel::<ReferenceBackend>::new(
                 lfm2::model_args_from_config_value(&config).unwrap(),
                 &(),
             )
             .unwrap()
             .parameter_description(&())
-            .map(|description| description.groups().iter().flat_map(|group| group.group().members()).map(|member| (member.target().to_owned(), member.global_shape().to_vec())).collect::<BTreeMap<_, _>>())
+            .map(|description| {
+                description
+                    .groups()
+                    .iter()
+                    .flat_map(|group| group.group().members())
+                    .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
+                    .collect::<BTreeMap<_, _>>()
+            })
             .unwrap(),
             _ => unreachable!(),
         };
@@ -5936,7 +5958,9 @@ fn prepared_invocation_topology_matches_constructed_projection_geometry() {
                 mixer.iter().chain(projections.iter())
             }));
         for projection in projections {
-            let shape = shapes.get(&projection.parameter).unwrap_or_else(|| panic!("{kind}: missing {}", projection.parameter));
+            let shape = shapes
+                .get(&projection.parameter)
+                .unwrap_or_else(|| panic!("{kind}: missing {}", projection.parameter));
             assert_eq!(
                 shape.as_slice(),
                 [projection.output as usize, projection.input as usize],

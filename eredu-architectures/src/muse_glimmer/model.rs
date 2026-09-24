@@ -406,7 +406,10 @@ where
     }
 
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
-        forward.parts.iter().any(|part| matches!(part, PreparedPart::PendingText { .. }))
+        forward
+            .parts
+            .iter()
+            .any(|part| matches!(part, PreparedPart::PendingText { .. }))
     }
 
     fn external_prediction_capture_paths(

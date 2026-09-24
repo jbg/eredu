@@ -1333,10 +1333,16 @@ pub(crate) mod tests {
             .execution_topology()
             .is_some());
         let geometry = crate::memory_estimation::selected_generation_memory_geometry(
-            routed.architecture_plan(), selected.execution(),
-        ).unwrap();
+            routed.architecture_plan(),
+            selected.execution(),
+        )
+        .unwrap();
         assert!(geometry.execution_topology.is_some());
-        assert!(geometry.assumptions.is_empty(), "{:#?}", geometry.assumptions);
+        assert!(
+            geometry.assumptions.is_empty(),
+            "{:#?}",
+            geometry.assumptions
+        );
         for (config, reason) in [
             (
                 composite_config(),
