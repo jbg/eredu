@@ -1,0 +1,17 @@
+[package]
+name = "eredu-metadata-client"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+eredu = { path = "../../..", default-features = false }
+
+[features]
+mlx = ["eredu/mlx"]
+
+[[test]]
+name = "metadata_api"
+path = "../../metadata_api.rs"

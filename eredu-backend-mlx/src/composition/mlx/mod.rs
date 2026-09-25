@@ -21,7 +21,7 @@ pub mod speculative;
 pub mod structural;
 
 pub use inspection::{
-    inspect_model, inspect_model_metadata, inspect_model_preparation, MlxInspectionOptions,
+    inspect_model, inspect_model_preparation, inspection_mechanisms, MlxInspectionOptions,
 };
 pub use load_request::MlxLoadRequest;
 pub use loading::{MlxModelConfig, MlxSelectedPreparation};

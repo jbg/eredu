@@ -2,15 +2,22 @@
 
 Applications can inspect checkpoint metadata without downloading weight payloads
 or creating a native device. `eredu::api::inspect_model_metadata` accepts an
-`ArtifactMetadata` bundle, a `NormalizedLoadRequest`, cold backend mechanism facts
-and media feature availability. It returns the same `ModelInspectionOutcome`
-consumed by `forecast_inspected_generation` and
+`ArtifactMetadata` bundle and `MetadataInspectionOptions`. The options require an
+explicit `BackendId` and carry a `NormalizedLoadRequest` for quantization,
+residency, speculation and parallel policy. The facade obtains cold capability
+facts from that backend and invokes the shared architecture inspection driver.
+The returned `ModelInspectionOutcome` feeds `forecast_inspected_generation` and
 `estimate_inspected_generation_memory`.
 
-With the `mlx` feature, `eredu::api::inspect_local_model_metadata` supplies the
-selected local backend's cold mechanism facts from `LocalInspectionOptions`.
-The checkpoint itself can be remote. This function does not discover hardware,
-create a device, fetch objects or access local checkpoint files.
+Applications depend only on `eredu` and import these contracts through
+`eredu::api`. They do not construct capability providers or import backend crates.
+Selecting `BackendId::new("mlx")` requires eredu's `mlx` Cargo feature. A known
+backend without its feature returns `MetadataInspectionError::BackendNotCompiled`;
+an unknown identifier returns `MetadataInspectionError::UnknownBackend`. There is
+no default backend, automatic selection or fallback. Compiling an adapter makes
+its capabilities available; it does not select it or establish hardware
+availability. Inspection does not discover hardware, fetch objects, create a
+device or access local checkpoint files.
 
 ## Inputs and provenance
 
@@ -54,7 +61,6 @@ All model interpretation and memory arithmetic remain in eredu:
 
 ```rust,ignore
 use eredu::api::*;
-use eredu_core::InputTokenCount;
 use std::collections::BTreeMap;
 
 let metadata = ArtifactMetadata {
@@ -69,10 +75,11 @@ let metadata = ArtifactMetadata {
     },
     sidecars: BTreeMap::new(), // This revision has no applicable processor sidecars.
 };
-let inspection = inspect_local_model_metadata(
-    &metadata,
-    LocalInspectionOptions::default(),
-)?;
+let load_request = NormalizedLoadRequest::default()
+    .with_parameter_conversion_retention(Some(ParameterConversionRetentionPolicy::Unlimited));
+let inspection_options = MetadataInspectionOptions::new(BackendId::new("mlx")?)
+    .with_load_request(load_request);
+let inspection = inspect_model_metadata(&metadata, &inspection_options)?;
 if !inspection.report().is_compatible() {
     // Present structured issues or exclude this candidate.
     return Ok(());
@@ -97,10 +104,11 @@ memory placement and capacities of the target hardware, plus application limits
 and reserves. Request geometry, output allowance, concurrency, residency and
 conversion-retention policy are part of the candidate being evaluated.
 
-A portable caller without the `mlx` feature uses `inspect_model_metadata` with a
-`PreparationMechanismProvider` supplied by its backend. Supplying a backend's
-capabilities is distinct from claiming that backend or a particular device is
-available on the target machine.
+Target memory placement, capacity and application reserves remain separate from
+backend capabilities. All types needed to supply hardware facts, configure the
+portable load request, inspect metadata and forecast memory are available through
+`eredu::api`. Backend integrations implement `PreparationMechanismProvider` for
+the lower-level `eredu-architectures` driver; this is not an application input.
 
 ## Results and loading
 
@@ -124,6 +132,15 @@ paths remain explicit. Applications preserve indeterminate fit results and use
 the forecast's bounds and assumptions when ranking candidates.
 
 ## Validation
+
+`eredu/tests/fixtures/metadata-client` has `eredu` as its only dependency. Its
+behavioral tests exercise unknown and disabled backend errors, explicit MLX
+inspection, metadata rejection and forecasting using only facade imports:
+
+```sh
+cargo test --manifest-path eredu/tests/fixtures/metadata-client/Cargo.toml
+cargo test --manifest-path eredu/tests/fixtures/metadata-client/Cargo.toml --features mlx
+```
 
 `cargo test -p eredu --no-default-features --test metadata_forecast` compares
 local and supplied-header selection, complete forecast requests and estimates at

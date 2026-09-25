@@ -8,6 +8,8 @@ pub use crate::composition::mlx::automatic::{
 };
 pub use crate::composition::mlx::speculative::SpeculativeComponentTimingGuard;
 
+pub use crate::composition::mlx::inspection_mechanisms;
+
 /// Sets the process-global MLX allocator cache limit and returns its previous value.
 pub fn set_allocator_cache_limit(bytes: usize) -> Result<usize, Error> {
     safemlx::memory::set_cache_limit(bytes).map_err(Into::into)

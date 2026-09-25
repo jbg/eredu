@@ -1,6 +1,6 @@
 //! Backend-independent tokenizer, chat-template, and semantic inspection enrichment.
 
-pub use eredu_architectures::{inspect_model_metadata, ModelInspectionOutcome};
+pub use eredu_architectures::ModelInspectionOutcome;
 pub use eredu_core::artifact::SafetensorsHeader;
 pub use eredu_core::artifact::{
     ArtifactMetadata, CheckpointMetadata, GgufCompanionMetadata, MetadataProvenance,

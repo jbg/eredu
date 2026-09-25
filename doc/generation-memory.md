@@ -518,10 +518,12 @@ finite bound derived from token and decoded-input geometry.
 ### Supplied checkpoint metadata
 
 `inspect_model_metadata` accepts complete SafeTensors or GGUF headers and
-configuration without local weight files. Its retained selection feeds
-`forecast_inspected_generation` and the existing request builders. With the
-`mlx` feature, `inspect_local_model_metadata` supplies cold backend facts without
-creating a device. Metadata compatibility does not authorize payload loading;
+configuration without local weight files. `MetadataInspectionOptions` specifies
+an explicit backend ID and portable loading policy. The facade obtains that
+backend's cold capability facts without creating a device; unknown or disabled
+backends return typed errors. Its retained selection feeds
+`forecast_inspected_generation` and the existing request builders. Metadata
+compatibility does not authorize payload loading;
 `is_compatible()` and `is_loadable()` express these distinct outcomes. Source
 provenance, bundle requirements and examples are in
 [Forecasting from supplied checkpoint metadata](metadata-forecasting.md).

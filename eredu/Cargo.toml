@@ -105,6 +105,10 @@ name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 
 [[test]]
+name = "metadata_api"
+path = "tests/metadata_api.rs"
+
+[[test]]
 name = "metadata_forecast"
 path = "tests/metadata_forecast.rs"
 

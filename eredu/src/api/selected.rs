@@ -283,20 +283,6 @@ pub fn inspect_local_model(
     .map_err(|error| BackendFailure::from_error(error).with_operation("model inspection"))
 }
 
-/// Inspects supplied headers with the selected local backend's cold facts.
-/// No native device is created. The result supports forecasts and carries no
-/// payload admission; download and inspect local files before loading.
-pub fn inspect_local_model_metadata(
-    metadata: &super::ArtifactMetadata,
-    options: LocalInspectionOptions,
-) -> Result<eredu_architectures::ModelInspectionOutcome, BackendFailure> {
-    eredu_backend_mlx::native::inspect_model_metadata(
-        metadata,
-        eredu_backend_mlx::native::MlxInspectionOptions::new(options.load().into_backend()),
-    )
-    .map_err(|error| BackendFailure::from_error(error).with_operation("metadata inspection"))
-}
-
 /// A facade-level device class for the selected local backend.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LocalDevice {

@@ -168,7 +168,7 @@ fn independent_capability_adapters_produce_the_same_report_and_retained_admissio
     let first = eredu_architectures::inspect_selected_model(
         inspection.clone(),
         normalized,
-        &preparation_mechanisms(),
+        &crate::inspection_mechanisms(),
         media_feature_availability(),
     );
     let second = eredu_architectures::inspect_selected_model(

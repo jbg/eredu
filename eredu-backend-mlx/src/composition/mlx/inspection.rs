@@ -42,26 +42,11 @@ pub fn inspect_model_preparation(
     options: MlxInspectionOptions,
 ) -> Result<eredu_architectures::ModelInspectionOutcome, Error> {
     let (request, _rank) = options.load.checked_normalized()?;
-    let mechanisms = preparation_mechanisms();
+    let mechanisms = crate::inspection_mechanisms();
     Ok(eredu_architectures::inspect_model(
         path,
         request,
         &mechanisms,
-        media_feature_availability(),
-    ))
-}
-
-/// Inspects supplied headers using cold MLX mechanism facts, without creating
-/// a native device or granting payload access. The result supports forecasting.
-pub fn inspect_model_metadata(
-    metadata: &eredu_core::artifact::ArtifactMetadata,
-    options: MlxInspectionOptions,
-) -> Result<eredu_architectures::ModelInspectionOutcome, Error> {
-    let (request, _rank) = options.load.checked_normalized()?;
-    Ok(eredu_architectures::inspect_model_metadata(
-        metadata,
-        request,
-        &preparation_mechanisms(),
         media_feature_availability(),
     ))
 }
@@ -86,7 +71,7 @@ pub(crate) fn inspect_selected_preparation(
     options: &MlxInspectionOptions,
 ) -> Result<eredu_architectures::ModelInspectionOutcome, Error> {
     let (request, _rank) = options.load.checked_normalized()?;
-    let mechanisms = preparation_mechanisms();
+    let mechanisms = crate::inspection_mechanisms();
     Ok(eredu_architectures::inspect_selected_model(
         inspection,
         request,
@@ -95,7 +80,11 @@ pub(crate) fn inspect_selected_preparation(
     ))
 }
 
-fn preparation_mechanisms() -> super::loading::MlxPreparationMechanisms<'static> {
+/// Returns authoritative cold preparation capabilities for this MLX build.
+/// This provider performs no hardware discovery and creates no native device,
+/// stream or tensor. Facade composition uses it with the shared architecture
+/// inspection driver; it does not establish availability on a target machine.
+pub fn inspection_mechanisms() -> impl eredu_architectures::PreparationMechanismProvider {
     super::loading::MlxPreparationMechanisms::new(
         &super::replicated_text::GROUPED_OPERATION_CAPABILITIES,
     )

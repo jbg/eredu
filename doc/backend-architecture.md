@@ -7198,10 +7198,16 @@ native dependency or unsafe-code exception.
 
 ## Supplied metadata and local payload admission
 
-Cold recommendation clients supply `ArtifactMetadata` through
-`eredu::api::inspect_model_metadata`, or through
-`inspect_local_model_metadata` with the selected MLX backend's cold facts.
-Transport, caching and immutable-revision provenance belong to the application.
+Cold recommendation clients supply `ArtifactMetadata` and
+`MetadataInspectionOptions` through `eredu::api::inspect_model_metadata`.
+The options select an explicit `BackendId` and portable loading policy. The
+facade resolves the compiled adapter and obtains its cold capability provider;
+the shared architecture driver performs validation and execution selection.
+Unknown or disabled backends return typed errors, without fallback. Backend
+adapters own capability facts; applications import the complete inspection and
+forecasting surface through `eredu` without direct backend dependencies or
+capability-provider implementations. Transport, caching and immutable-revision
+provenance belong to the application.
 `eredu-gguf` and `eredu-checkpoint` own supplied-header parsing and structural
 validation, including full object lengths and complete shard membership.
 `eredu-core` retains provenance and enforces the distinction between metadata
