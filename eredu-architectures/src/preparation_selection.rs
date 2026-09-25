@@ -1616,6 +1616,7 @@ pub(crate) mod tests {
                 shared_key_value_copies: 4,
                 max_live_query_tiles: 3,
                 retained_output_copies: 2,
+                evaluates_input_dependencies: false,
             }),
         });
         for _ in 0..2 {

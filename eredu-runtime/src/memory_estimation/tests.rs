@@ -802,6 +802,7 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
         shared_key_value_copies: 4,
         max_live_query_tiles: 3,
         retained_output_copies: 2,
+        evaluates_input_dependencies: false,
     };
     let facts = InputScoreAttentionMechanism {
         score_tile_elements: 32,
@@ -896,6 +897,7 @@ fn full_key_attention_bounds_shared_layouts_live_scores_and_completed_outputs() 
         },
         FullKeyAttentionTiles {
             retained_output_copies: 0,
+            evaluates_input_dependencies: false,
             ..full
         },
     ] {
@@ -1154,6 +1156,7 @@ fn generic_explicit_attention_uses_native_tile_contract_without_score_matrix_fal
                 shared_key_value_copies: 4,
                 max_live_query_tiles: 2,
                 retained_output_copies: 2,
+                evaluates_input_dependencies: false,
             }),
         });
     let bounded = estimate_generation_memory(&r).unwrap();
@@ -1362,6 +1365,7 @@ fn archived_aggregate_mechanism_bounds_remain_exact_after_lifetime_lowering() {
                     shared_key_value_copies: 4,
                     max_live_query_tiles: 3,
                     retained_output_copies: 2,
+                    evaluates_input_dependencies: false,
                 })
             }
             5 => {
@@ -1418,4 +1422,163 @@ fn zero_query_workspace_has_no_invocation_for_current_or_archived_records() {
             ));
         }
     }
+}
+
+#[test]
+fn native_attention_frontiers_release_only_completed_transient_workspaces() {
+    use crate::execution_topology::TokenMixerTopology;
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.layers.resize(6, topology.layers[0].clone());
+    for layer in &mut topology.layers {
+        if let TokenMixerTopology::Attention { input_scores, .. } = &mut layer.mixer {
+            *input_scores = true;
+        }
+    }
+    let e = &mut r.domains[0].executions[0];
+    e.execution_topology = Some(topology);
+    e.input_score_attention_mechanism = Some(InputScoreAttentionMechanism {
+        score_tile_elements: 64,
+        max_query_rows: 4,
+        key_value_copies: 4,
+        score_bytes: 32,
+        full_key_tiles: Some(FullKeyAttentionTiles {
+            max_key_positions: 64,
+            shared_key_value_copies: 4,
+            max_live_query_tiles: 2,
+            retained_output_copies: 2,
+            evaluates_input_dependencies: true,
+        }),
+    });
+    crate::memory_forecast::ForecastCalibration::default()
+        .apply(&mut r)
+        .unwrap();
+    let e = r.domains[0].executions[0].clone();
+    let mut lazy = e.clone();
+    lazy.input_score_attention_mechanism
+        .as_mut()
+        .unwrap()
+        .full_key_tiles
+        .as_mut()
+        .unwrap()
+        .evaluates_input_dependencies = false;
+    // Untiled, exactly one batch, and the uncovered key-tiled path have no
+    // synchronous boundary even when the backend supplies the new fact.
+    for (keys, queries) in [(8, 8), (16, 8), (65, 16), (8193, 16)] {
+        assert_eq!(
+            workspace(&e, &r, keys, queries, 0).unwrap(),
+            workspace(&lazy, &r, keys, queries, 0).unwrap()
+        );
+    }
+    for (keys, queries) in [(16, 9), (32, 16), (64, 64)] {
+        let bounded = workspace(&e, &r, keys, queries, 0).unwrap();
+        let previous = workspace(&lazy, &r, keys, queries, 0).unwrap();
+        assert!(bounded.upper_bytes < previous.upper_bytes);
+        assert_eq!(bounded.lower_bytes, previous.lower_bytes);
+    }
+    // Completed outputs from all six layers survive the frontiers; the two
+    // extra calibrated layer sets also retain their output allowance.
+    let mut more_outputs = e.clone();
+    more_outputs
+        .input_score_attention_mechanism
+        .as_mut()
+        .unwrap()
+        .full_key_tiles
+        .as_mut()
+        .unwrap()
+        .retained_output_copies += 1;
+    let original = workspace(&e, &r, 32, 16, 0).unwrap().upper_bytes.unwrap();
+    let retained = workspace(&more_outputs, &r, 32, 16, 0)
+        .unwrap()
+        .upper_bytes
+        .unwrap();
+    assert_eq!(
+        retained - original,
+        8 * 32 * 16 * u64::from(r.scalar_bytes.get())
+    );
+    // Native completion does not remove conversion or state allowances.
+    let bounded = workspace(&e, &r, 32, 16, 1000).unwrap();
+    let mut promoted = e.clone();
+    promoted
+        .execution_topology
+        .as_mut()
+        .unwrap()
+        .selected_parameter_promotion_bytes = Some(100_000);
+    assert!(workspace(&promoted, &r, 32, 16, 1000).unwrap().upper_bytes > bounded.upper_bytes);
+    let mut unknown = e.clone();
+    unknown.workspace_overlap = WorkspaceOverlap::unknown();
+    assert!(workspace(&unknown, &r, 32, 16, 0)
+        .unwrap()
+        .upper_bytes
+        .is_none());
+    // Fused softcap still uses a full score matrix and cannot establish this
+    // InputScores-only evaluation boundary.
+    for layer in &mut promoted.execution_topology.as_mut().unwrap().layers {
+        if let TokenMixerTopology::Attention {
+            input_scores,
+            softcap,
+            ..
+        } = &mut layer.mixer
+        {
+            *input_scores = false;
+            *softcap = true;
+        }
+    }
+    let mut promoted_lazy = promoted.clone();
+    promoted_lazy
+        .input_score_attention_mechanism
+        .as_mut()
+        .unwrap()
+        .full_key_tiles
+        .as_mut()
+        .unwrap()
+        .evaluates_input_dependencies = false;
+    assert_eq!(
+        workspace(&promoted, &r, 32, 16, 1000).unwrap(),
+        workspace(&promoted_lazy, &r, 32, 16, 1000).unwrap()
+    );
+    // Force an interior peak: a large first FFN is consumed by the second
+    // attention frontier. Request-global conversion and cache allowances must
+    // overlap that peak, not just the smaller trailing output projection.
+    let mut interior = e.clone();
+    let topology = interior.execution_topology.as_mut().unwrap();
+    topology.selected_parameter_promotion_bytes = Some(0);
+    if let crate::execution_topology::FeedForwardTopology::Gated {
+        intermediate_size,
+        projections,
+    } = &mut topology.layers[0].feed_forward
+    {
+        *intermediate_size = 16_384;
+        projections[0].output = 16_384;
+        projections[1].output = 16_384;
+        projections[2].input = 16_384;
+    }
+    let base = workspace(&interior, &r, 32, 16, 0)
+        .unwrap()
+        .upper_bytes
+        .unwrap();
+    let with_state = workspace(&interior, &r, 32, 16, 1000)
+        .unwrap()
+        .upper_bytes
+        .unwrap();
+    assert_eq!(with_state - base, 3000); // replacement plus promoted state/replacement
+    interior
+        .execution_topology
+        .as_mut()
+        .unwrap()
+        .selected_parameter_promotion_bytes = Some(120_000);
+    let with_parameters = workspace(&interior, &r, 32, 16, 0)
+        .unwrap()
+        .upper_bytes
+        .unwrap();
+    assert_eq!(with_parameters - base, 160_000); // six layers, eight calibrated sets
+
+    // Old full-key facts describe local tile retention only, not upstream eval.
+    let mut wire = serde_json::to_value(e.input_score_attention_mechanism.unwrap()).unwrap();
+    wire["full_key_tiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("evaluates_input_dependencies");
+    let old: InputScoreAttentionMechanism = serde_json::from_value(wire).unwrap();
+    assert!(!old.full_key_tiles.unwrap().evaluates_input_dependencies);
 }

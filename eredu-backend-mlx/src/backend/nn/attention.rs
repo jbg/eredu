@@ -399,6 +399,7 @@ pub(crate) const INPUT_SCORE_WORKSPACE:
             shared_key_value_copies: 4,
             max_live_query_tiles: INPUT_SCORE_LIVE_TILE_BATCH as u64,
             retained_output_copies: 2,
+            evaluates_input_dependencies: true,
         }),
     };
 

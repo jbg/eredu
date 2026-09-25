@@ -143,6 +143,31 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         let cold =
             forecast_inspected_generation(&inspection, &cold_options, &Default::default()).unwrap();
         let loaded = model.forecast_token_ids(&ids, settings, &options).unwrap();
+        // Recompute the same request without upstream completion knowledge;
+        // this isolates lifetime accounting from geometry and native execution.
+        let mut lazy_request = loaded.request.clone();
+        for domain in &mut lazy_request.domains {
+            for execution in &mut domain.executions {
+                if let Some(full) = execution
+                    .input_score_attention_mechanism
+                    .as_mut()
+                    .and_then(|facts| facts.full_key_tiles.as_mut())
+                {
+                    full.evaluates_input_dependencies = false;
+                }
+            }
+        }
+        let lazy_upper = estimate_generation_memory(&lazy_request).unwrap().domains[0]
+            .additional_generation_peak
+            .upper_bytes
+            .unwrap();
+        assert!(
+            loaded.estimate.domains[0]
+                .additional_generation_peak
+                .upper_bytes
+                .unwrap()
+                <= lazy_upper
+        );
         let mut limited = loaded.request.clone();
         limited.domains[0].budget.application_limit_bytes = Some(16 << 30);
         let budget_16_gib_fit = estimate_generation_memory(&limited).unwrap().fit;
@@ -402,7 +427,8 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             "cold_overall_upper": cold.estimate.domains[0].overall_peak.upper_bytes,
             "loaded_generation_upper": loaded.estimate.domains[0].generation_peak.upper_bytes,
             "loaded_estimate": loaded.estimate.domains[0],
-            "loaded_additional_upper": upper, "measured_growth": measured_growth,
+            "loaded_additional_upper": upper, "without_evaluation_facts_upper": lazy_upper,
+            "measured_growth": measured_growth,
             "continuation_upper": continued_upper, "continuation_growth": continued_growth,
             "tokens": generated,
         });
@@ -452,6 +478,7 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
 
         eprintln!("LFM2 parameter conversions: positions={length}, resident_before={converted_before}, resident_after={converted_after}, warm_additional_upper={}", warm.estimate.domains[0].additional_generation_peak.upper_bytes.unwrap());
         eprintln!("LFM2 memory: model={}, quantized={quantized}, positions={length}, scalar_bytes={}, cold_upper={}, loaded_additional_upper={upper}, measured_growth={measured_growth}, continuation_upper={continued_upper}, continuation_growth={continued_growth}, controlled_forecast={checked_controlled}", path.display(), loaded.request.scalar_bytes, cold.estimate.domains[0].overall_peak.upper_bytes.unwrap());
+        eprintln!("LFM2 lifetimes: positions={length}, without_evaluation_facts_upper={lazy_upper}, with_evaluation_facts_upper={upper}");
         eprintln!("LFM2 timing: positions={length}, first_token_ms={:.3}, generation_ms={:.3}, generated_tokens={}", first_token_elapsed.as_secs_f64() * 1000.0, generation_elapsed.as_secs_f64() * 1000.0, generated.len());
         eprintln!(
             "LFM2 recalibration: positions={length}, budget_16_gib_fit={budget_16_gib_fit:?}"

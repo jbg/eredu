@@ -2246,3 +2246,84 @@ retention, while retaining 4,208 MiB less optional payload. The cap reduces idle
 residency; temporary casts leave generation peaks nearly unchanged. The evidence
 records timings, memory, allocator overshoot observations, speculative
 acceptance/rejection and snapshot/fork coverage, build commands and hardware.
+
+### Attention evaluation-aware transient lifetimes (2026-09-25)
+
+The generic estimator now consumes the selected backend's explicit upstream
+evaluation fact. MLX's full-key InputScores path evaluates every batch, including
+the final partial batch, when more than 32 query tiles are needed and the key row
+is at most 8,192 positions. Merely sharing K/V layouts does not establish this
+boundary. Short invocations, decode, Fused softcap, and the uncovered blockwise-key
+path keep their previous conservative retention model.
+
+At those frontiers, completed feed-forward intermediate projections/products and
+unfolded convolution scratch no longer overlap all later layers. The estimator
+releases the completed attention invocation's score/layout workspace separately
+from its retained outputs. It deliberately keeps residual, normalization, mixer,
+final feed-forward and completed attention outputs, plus convolution inputs and
+padded backing potentially held by history views. The original additional 25%
+layer-workspace calibration and global parameter-conversion/cache allowances are
+unchanged and overlap all interior peaks. This remains a conservative planning
+upper end, not an exact allocation schedule or process-memory prediction.
+
+Old serialized full-key facts default to no upstream evaluation knowledge, and
+aggregate-only archived forecasts retain their historical bounds. Portable tests
+cover batch thresholds, key limits, Fused arithmetic, unknown retention, old facts,
+and conversion/cache allowances at an early dominant peak. No numerical kernel or
+execution scheduling changes are part of this correction.
+
+Validation used macOS/aarch64 Metal, allocator cache disabled, default managed
+256 MiB conversion retention and the standard 64 MiB graph/driver allowance.
+The official SafeTensors revision and SHA-256 are the phase-10 values above;
+this run rehashed the checkpoint. Affine 4-bit uses group size 64. The official
+mixed-width GGUF is revision `6767265158422fb8a19c62ceb45f16f05363615b`, file
+`LFM2.5-1.2B-Instruct-BF16.gguf`, reverified SHA-256
+`3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b`.
+
+Each weight mode loads once, runs 128 then 2,000 positions, resetting state between
+requests. The comparison disables only the new evaluation fact on the same loaded
+request, so parameter placement, conversion credits and all calibration constants
+are identical. Values below are bytes above already resident model allocations:
+
+| Weights | Positions | Upper without evaluation fact | New upper | Measured growth | Continuation upper | Continuation growth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SafeTensors BF16 | 128 | 890,192,384 | 890,192,384 | 550,495,720 | 131,132,826 | 16,292,558 |
+| SafeTensors BF16 | 2,000 | 12,849,864,512 | 7,884,504,896 | 1,590,378,036 | 917,073,306 | 183,647,386 |
+| Affine 4-bit | 128 | 890,192,384 | 890,192,384 | 579,380,608 | 131,132,826 | 16,292,158 |
+| Affine 4-bit | 2,000 | 12,849,864,512 | 7,884,504,896 | 1,590,378,020 | 917,073,306 | 183,647,478 |
+| Mixed-width BF16 GGUF | 128 | 6,779,808,000 | 6,779,808,000 | 5,163,443,500 | 5,682,713,754 | 20,607,646 |
+| Mixed-width BF16 GGUF | 2,000 | 18,908,038,720 | 13,746,071,104 | 2,418,576,940 | 6,911,415,450 | 253,391,518 |
+
+For SafeTensors BF16 at 2,000 positions the cold lifecycle total upper decreases
+from 15,190,545,728 to 10,225,186,112 bytes (32.7%). This total includes parameters;
+the measured 1,590,378,036 bytes is additional active-allocation growth. They are
+different quantities. The remaining gap is intentional owner/overlap conservatism,
+not a newly measured 10 GB requirement. Mixed-width GGUF retains its broad global
+conversion allowance; its new cold total is 16,422,556,224 bytes. The loaded GGUF
+2,000-position row already credits the 256 MiB of conversions retained by the
+preceding request; the 128-position row starts without them.
+
+All six runs cover cold and loaded forecasts, eight predictions, settled
+continuation bounds, repeated read-only forecasts, reset, controlled token replay
+and ordinary/controlled request agreement. Native peaks remain inside total and
+additional envelopes. The short-prefill bounds are unchanged. No kernel equations
+or execution scheduling changed; this is forecast validation and controlled parity,
+not a fresh independent-reference model validation. CUDA, native distributed
+execution and a released-checkpoint run beyond the full-key limit were not exercised.
+The uncovered long-key path remains conservative and has portable boundary tests.
+
+Reproduce with each pinned checkpoint path:
+
+```sh
+EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct \
+EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
+EREDU_LFM2_MEMORY_WRITE=/tmp/lfm2-lifetimes-bf16.json \
+cargo test -p eredu --no-default-features --features mlx,metal \
+  --test native_execution_control native_lfm2_workspace_forecasts --locked \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Repeat with `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit, or point
+`EREDU_LFM2_MEMORY_MODEL` to the pinned `.gguf` file for mixed-width BF16.
+Run outside a sandbox that blocks Metal device access. The harness logs the
+same-request upper with the evaluation fact disabled as well as the new estimate.

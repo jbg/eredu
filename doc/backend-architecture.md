@@ -7071,3 +7071,27 @@ reservations without allocation attribution preserve an unknown phase upper
 bound until publication is observed. Historical records without the new optional
 facts preserve historical accounting. Forecasting never reserves, evaluates,
 settles, trims, or advances execution.
+
+### Native attention evaluation frontiers
+
+`FullKeyAttentionTiles::evaluates_input_dependencies` is an optional neutral
+mechanism fact, defaulting to false for historical records. MLX supplies it for
+synchronous full-key query-tile batches. Runtime combines that fact with selected
+ordinary topology and the invocation's query/key geometry; a short lazy invocation,
+Fused arithmetic, or an uncovered blockwise-key path establishes no such frontier.
+No family branch or native execution is introduced into cold inspection.
+
+The generic lifetime plan separates gated feed-forward intermediate projections
+and products and unfolded convolution scratch from retained module outputs.
+A covered attention evaluation releases preceding transient dependencies and its
+own score/layout workspace. It preserves completed tile outputs, final feed-forward
+outputs, residual/normalization/mixer outputs, and gated/padded convolution backing
+that cache/history views may own. Present-layer feed-forward acquisition follows
+attention completion; its workspace cannot be released by that earlier boundary.
+
+The existing additional overlap calibration, uncached parameter promotions,
+promoted state/replacement, cache replacement and fallback attention scratch remain
+conservative request-wide allowances and overlap every interior peak. Unknown
+retention remains unknown. Legacy aggregate-only forecasts retain their historical
+envelope because they do not describe invocation order. Loaded, cold and controlled
+continuation forecasts consume the same neutral facts and shared lifetime composer.

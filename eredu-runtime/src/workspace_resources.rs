@@ -7,7 +7,7 @@
 
 mod legacy;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_core::{resources::*, CapabilityError, ObservationKind, Observed};
 use eredu_nn::{
@@ -93,6 +93,19 @@ impl Schedule {
             },
             next: 0,
         }
+    }
+    // Global conversion/cache/calibration allowances overlap every phase of the
+    // lazy schedule, including peaks preceding a synchronous attention boundary.
+    fn global_allocation(
+        &mut self,
+        name: &str,
+        bytes: MemoryBytes,
+        hold: ResourceLifetime,
+    ) -> Result<(), CapabilityError> {
+        self.allocation(name, bytes, hold)?;
+        let event = self.plan.events.pop().expect("allocation appends an event");
+        self.plan.events.insert(0, event);
+        Ok(())
     }
     fn allocation(
         &mut self,
@@ -248,8 +261,10 @@ pub fn describe_text_workspace(
     )?;
     let mut max_layer = 0u64;
     let mut attention_scratch = MemoryBytes::exact(0);
+    let mut transient_pending = BTreeSet::new();
     for (index, layer) in topology.layers.iter().enumerate() {
         let hold = ResourceLifetime::Evaluation(id(format!("layer-{index}")));
+        let transient = ResourceLifetime::Evaluation(id(format!("transient-layer-{index}")));
         if let Some(copies) = copies {
             if index as u64 >= copies {
                 schedule
@@ -257,6 +272,17 @@ pub fn describe_text_workspace(
                     .events
                     .push(ResourceLifetimeEvent::Evaluate(id(format!(
                         "layer-{}",
+                        index as u64 - copies
+                    ))));
+            }
+        }
+        if let Some(copies) = copies {
+            if index as u64 >= copies && transient_pending.remove(&(index - copies as usize)) {
+                schedule
+                    .plan
+                    .events
+                    .push(ResourceLifetimeEvent::Evaluate(id(format!(
+                        "transient-layer-{}",
                         index as u64 - copies
                     ))));
             }
@@ -391,7 +417,66 @@ pub fn describe_text_workspace(
                             scalar_bytes
                         },
                     )?;
-                    schedule.allocation("explicit-attention", bytes, hold.clone())?;
+                    let completes = *input_scores
+                        && input_score_evaluates_dependencies(
+                            execution.input_score_attention_mechanism,
+                            query,
+                            positions,
+                        )?;
+                    if completes {
+                        // Finished tile outputs survive concatenation. Keep their
+                        // full allowance with other owner-held module outputs;
+                        // only invocation-local score/layout storage is released.
+                        let full = execution
+                            .input_score_attention_mechanism
+                            .and_then(|facts| facts.full_key_tiles)
+                            .unwrap();
+                        let retained = product(&[
+                            rows,
+                            *query_heads,
+                            (*key_width).max(*value_width),
+                            if topology.selected_parameter_promotion_bytes.is_some() {
+                                upper_scalar
+                            } else {
+                                scalar_bytes
+                            },
+                            full.retained_output_copies,
+                        ])?;
+                        schedule.allocation(
+                            "completed-attention-outputs",
+                            MemoryBytes::estimated(
+                                0,
+                                retained,
+                                "completed tile outputs and concatenation remain owner-held",
+                            ),
+                            hold.clone(),
+                        )?;
+                        let invocation = id(format!("attention-evaluation-{index}"));
+                        schedule.allocation(
+                            "explicit-attention",
+                            MemoryBytes {
+                                upper_bytes: bytes.upper_bytes.map(|upper| upper - retained),
+                                ..bytes
+                            },
+                            ResourceLifetime::Evaluation(invocation.clone()),
+                        )?;
+                        // Acquire before completion includes the first batch's
+                        // overlap with all preceding unevaluated dependencies.
+                        schedule
+                            .plan
+                            .events
+                            .push(ResourceLifetimeEvent::Evaluate(invocation));
+                        for prior in std::mem::take(&mut transient_pending) {
+                            schedule
+                                .plan
+                                .events
+                                .push(ResourceLifetimeEvent::Evaluate(id(format!(
+                                    "transient-layer-{prior}"
+                                ))));
+                        }
+                    } else {
+                        schedule.allocation("explicit-attention", bytes, hold.clone())?;
+                    }
                 } else {
                     let scratch = attention_scratch_bytes(
                         &execution.attention,
@@ -420,18 +505,38 @@ pub fn describe_text_workspace(
                     payload,
                     product(&[rows, *channels, upper_scalar])?,
                 )?;
+                // Gated inputs and padded/contiguous backing may be retained by
+                // history views. Keep those owners; only unfolded convolution
+                // scratch and the contiguous kernel use the transient frontier.
+                let intermediates = convolution_intermediates(
+                    request.batch_size,
+                    query,
+                    *channels,
+                    *kernel,
+                    upper_scalar,
+                )?;
+                let scratch = product(&[
+                    request.batch_size,
+                    *channels,
+                    add(mul(query, *kernel)?, *kernel)?,
+                    upper_scalar,
+                ])?;
                 charge(
                     &mut schedule,
-                    "convolution-intermediates",
+                    "convolution-retained-inputs",
                     0,
-                    convolution_intermediates(
-                        request.batch_size,
-                        query,
-                        *channels,
-                        *kernel,
-                        upper_scalar,
-                    )?,
+                    intermediates - scratch,
                 )?;
+                schedule.allocation(
+                    "convolution-scratch",
+                    MemoryBytes::estimated(
+                        0,
+                        scratch,
+                        "unfolded convolution and contiguous kernel scratch",
+                    ),
+                    transient.clone(),
+                )?;
+                transient_pending.insert(index);
             }
         }
         match &layer.feed_forward {
@@ -439,19 +544,30 @@ pub fn describe_text_workspace(
                 intermediate_size,
                 projections,
             } => {
-                for p in projections {
-                    charge(
-                        &mut schedule,
+                transient_pending.insert(index);
+                for (projection_index, p) in projections.iter().enumerate() {
+                    schedule.allocation(
                         "feed-forward-projection",
-                        output_bytes(&projection(p, rows, scalar))?,
-                        product(&[rows, p.output, upper_scalar])?,
+                        MemoryBytes::estimated(
+                            output_bytes(&projection(p, rows, scalar))?,
+                            product(&[rows, p.output, upper_scalar])?,
+                            "gated feed-forward projection; final output remains owner-held",
+                        ),
+                        if projection_index + 1 == projections.len() {
+                            hold.clone()
+                        } else {
+                            transient.clone()
+                        },
                     )?;
                 }
-                charge(
-                    &mut schedule,
+                schedule.allocation(
                     "gated-product",
-                    0,
-                    product(&[rows, *intermediate_size, upper_scalar])?,
+                    MemoryBytes::estimated(
+                        0,
+                        product(&[rows, *intermediate_size, upper_scalar])?,
+                        "gated feed-forward intermediate consumed before a later input evaluation",
+                    ),
+                    transient.clone(),
                 )?;
             }
             FeedForwardTopology::Routed {
@@ -527,7 +643,7 @@ pub fn describe_text_workspace(
     // Extra equivalent layer sets are explicit calibration, not invented copies
     // of parameter/state storage. Missing graph retention remains unbounded.
     if copies.is_none() || copies.is_some_and(|copies| copies > layers) {
-        schedule.allocation(
+        schedule.global_allocation(
             "additional-lazy-overlap",
             MemoryBytes {
                 lower_bytes: 0,
@@ -540,7 +656,7 @@ pub fn describe_text_workspace(
             global.clone(),
         )?;
     }
-    schedule.allocation("attention-scratch", attention_scratch, global.clone())?;
+    schedule.global_allocation("attention-scratch", attention_scratch, global.clone())?;
     let logits_rows = mul(
         mul(request.batch_size, topology.output_invocations)?,
         if execution.logits == LogitsWorkspace::EveryPosition {
@@ -581,13 +697,13 @@ pub fn describe_text_workspace(
     }
     schedule.allocation("sampling", MemoryBytes::estimated(0, product(&[logits_rows, topology.vocabulary_size, 4])?, "legacy portable float32 probability allowance; native sampling scratch is covered by backend overhead calibration"), global.clone())?;
     if let Some(parameters) = topology.selected_parameter_promotion_bytes {
-        schedule.allocation(
+        schedule.global_allocation(
             "uncached-parameter-conversions",
             parameter_conversions(parameters, layers, copies, persistent)?,
             global.clone(),
         )?;
     }
-    schedule.allocation(
+    schedule.global_allocation(
         "cache-update",
         cache_replacement(&execution.cache_update, persistent),
         global,
@@ -734,6 +850,27 @@ struct ExplicitAttentionGeometry {
     queries: u64,
     keys: u64,
     arithmetic: AttentionArithmetic,
+}
+
+/// Selection predicate for a real synchronous upstream evaluation, not merely
+/// bounded scratch. Small invocations stay lazy; blockwise key paths lack this release contract.
+fn input_score_evaluates_dependencies(
+    facts: Option<InputScoreAttentionMechanism>,
+    queries: u64,
+    keys: u64,
+) -> Result<bool, CapabilityError> {
+    let Some(facts) = facts else { return Ok(false) };
+    let Some(full) = facts.full_key_tiles else {
+        return Ok(false);
+    };
+    if !full.evaluates_input_dependencies
+        || keys > full.max_key_positions
+        || mul(queries, keys)? <= facts.score_tile_elements
+    {
+        return Ok(false);
+    }
+    let tile = (facts.score_tile_elements / keys.max(1)).clamp(1, facts.max_query_rows);
+    Ok(queries.div_ceil(tile) > full.max_live_query_tiles)
 }
 
 fn explicit_attention(

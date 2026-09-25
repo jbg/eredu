@@ -205,6 +205,13 @@ pub struct FullKeyAttentionTiles {
     pub max_live_query_tiles: u64,
     /// Whole-query output payloads retained, including final concatenation.
     pub retained_output_copies: u64,
+    /// When the query tile count exceeds `max_live_query_tiles`, each batch,
+    /// including the last, completes synchronously and detaches evaluated input
+    /// dependency graphs. This releases unowned intermediates, not owner-held
+    /// residuals, state views, completed outputs, parameters or allocator cache.
+    /// Absent legacy facts do not establish an upstream release boundary.
+    #[serde(default)]
+    pub evaluates_input_dependencies: bool,
 }
 
 /// Selected attention implementation's workspace behavior.
