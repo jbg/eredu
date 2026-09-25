@@ -24,11 +24,18 @@ storage dtype. Homogeneous kernel keys and ordinary Matmul promotion are unchang
 
 The native operation returns `None` without evaluation for unsupported inputs:
 only settled row-contiguous rank-two operands, `2 <= M <= 2000`,
-`2 <= N <= 65536`, `1 <= K <= 8192`, and the validated Apple M3 Ultra are admitted.
-Contiguous views with offsets are supported. Padded/column-major layouts, lazy
-operands, single-row GEMV, CPU, CUDA, other devices (including NAX), system MLX
-and non-JIT builds are excluded. These are prototype coverage limits, not model
-limitations. Native autodiff, vmap and compilation transformations are unsupported
+`2 <= N <= 65536`, `1 <= K <= 8192`, and native SIMD GEMM dispatch are admitted.
+There is no GPU model-name allowlist. MLX retains its device-specific tile and
+split-K selection. Contiguous views with offsets are supported.
+
+NAX/TF32 dispatch is excluded because its separate weight loader has not been
+extended; passing narrow weights into that path would read them as FP32. The
+prototype and ordinary Matmul share the same native NAX-selection predicate.
+NAX-capable hardware is eligible when native FP32 dispatch uses SIMD, for example
+with `MLX_ENABLE_TF32=0` set before native initialization. The prototype never
+changes that setting or substitutes a different arithmetic path. Padded/column-major
+layouts, lazy operands, single-row GEMV, CPU, CUDA, system MLX and non-JIT builds
+remain excluded. These are implementation coverage limits, not model limitations. Native autodiff, vmap and compilation transformations are unsupported
 by the distinct primitive.
 
 The operation creates the F32 output and, when selected by native dispatch,
@@ -43,7 +50,7 @@ Use the same official BF16 GGUF revision and SHA-256 as the
 the tracked tree. Run native tests serially because allocator counters are global:
 
 ```sh
-CARGO_INCREMENTAL=0 cargo test -p safemlx --release \
+MLX_ENABLE_TF32=0 CARGO_INCREMENTAL=0 cargo test -p safemlx --release \
   --test mixed_storage_gemm --locked --offline \
   -- --include-ignored --nocapture --test-threads=1
 CARGO_INCREMENTAL=0 cargo build -p eredu --release \
@@ -57,9 +64,16 @@ python3 validation/projection_baseline.py \
   --reference-manifest validation/results/projection-baseline-2026-09-25.json
 ```
 
+On NAX-capable hardware, add `--disable-tf32` to the Python runner to select
+native SIMD FP32 dispatch explicitly. The runner otherwise sanitizes MLX
+configuration overrides for reproducibility. Omit `--reference-manifest` when
+running on a different device: exactness is against that device's native
+cast-plus-matmul path, not another device's reduction or historical fingerprints.
+
 The two hardware-specific tests are ignored by default and fail if explicitly run
-on an unsupported device. The CPU rejection test runs normally and requires no
-GPU. The runner uses fresh processes for ordinary timing, real projection replay,
+without Metal SIMD GEMM. They measure output/partial workspace against native
+preconverted GEMM on the device under test, without hard-coded split-K thresholds
+or host page sizes. The CPU rejection test runs normally and requires no GPU. The runner uses fresh processes for ordinary timing, real projection replay,
 and kernel tracing, at 128 and 2,000 positions with disabled, 256 MiB and unlimited
 conversion retention. Timing runs disable kernel tracing and allocator caching.
 Short rows 2, 4, 8 and 16 slice actual 128-position activations. For the prototype,
@@ -83,6 +97,10 @@ not additive full-model attribution. Capturing retains array owners and invalida
 ordinary inference peak/latency measurement, as in stage one.
 
 ## Validation results, 2026-09-25
+
+The original stage-two measurements below used the initial model-name gate,
+which has since been replaced by mechanism-based eligibility. Their binary and
+patch hashes identify that historical measurement, not the later correction.
 
 Validation ran on Apple M3 Ultra, 256 GiB, macOS 26.6.2, Rust 1.98.0,
 with the pinned vendored MLX and a release build. The measured executable SHA-256
@@ -169,5 +187,23 @@ sessions and speculative verification, remains a stage-three requirement.
 The small-row replays validate verification-sized projections, not the speculative
 driver. Likewise, the ordinary timing/peak records in the JSON are unchanged-path
 baselines; repeated optimized full-prefill measurements under managed and unlimited
-retention belong with that integration. Other hardware and broader layouts need
-explicit validation before their native dispatch cases can be admitted.
+retention belong with that integration. Physical-device measurements so far cover M3 Ultra; other Metal hardware remains
+an explicit validation gap, not a runtime exclusion. Broader layouts and the NAX
+loader require implementation and validation before those mechanisms are admitted.
+
+
+## Device eligibility correction
+
+The original model-name gate was unnecessarily restrictive and has been removed.
+Admission now shares ordinary Matmul's actual SIMD/NAX selection predicate.
+The loader contains no GPU-model specialization; native tile geometry and split-K
+partitioning remain selected by MLX on the device in use. The separate NAX/TF32
+loader remains an implementation gap, so that selection returns `None` rather
+than using incorrect storage interpretation or changing arithmetic implicitly.
+
+After this correction the 290-case F16/BF16 bit/bias/allocation matrix and layout
+checks passed again on M3 Ultra with `MLX_ENABLE_TF32=0`. Allocation tests now
+compare with measured preconverted-GEMM workspace on the same device rather than
+reimplementing its split-K thresholds and allocator page rounding. CPU-only
+rejection, strict safemlx Clippy, the Python evidence tests and formatting checks
+also passed. No physical validation on another GPU is claimed.

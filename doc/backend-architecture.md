@@ -7136,10 +7136,14 @@ accumulation remain FP32 with their existing geometry and order. Separate bias
 addition stays with the caller.
 
 The native operation accepts only settled contiguous rank-two F32 activations
-and F16/BF16 `[N,K]` weights on the validated Apple M3 Ultra, within the bounded
-prototype geometry. It returns `None` without evaluation for unsupported cases,
-including CPU, CUDA, NAX devices, system/unpatched MLX, non-JIT builds, lazy
-operands, noncontiguous layouts and single-row GEMV. This is a safemlx/C-ABI/native
+and F16/BF16 `[N,K]` weights on Metal devices using native SIMD GEMM, within the
+bounded prototype geometry. Device model names do not control admission. The
+operation shares ordinary Matmul's native NAX-selection predicate and rejects
+NAX/TF32 dispatch because its separate loader is not implemented. NAX-capable
+hardware remains eligible when native FP32 dispatch selects SIMD. It returns
+`None` without evaluation for unsupported cases, including CPU, CUDA,
+system/unpatched MLX, non-JIT builds, lazy operands, noncontiguous layouts and
+single-row GEMV. This is a safemlx/C-ABI/native
 mechanism; no new unsafe exception, portable capability, or family policy is
 introduced. Its separate primitive rejects unsupported transformation APIs rather
 than inheriting homogeneous-Matmul gradient or compiler assumptions.

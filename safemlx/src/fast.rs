@@ -18,8 +18,11 @@ use safemlx_internal_macros::generate_macro;
 ///
 /// Returns `None` without evaluation for unsupported device, dtype, shape or
 /// layout. Currently requires settled row-contiguous rank-two operands, at
-/// `2 <= M <= 2000`, `2 <= N <= 65536`, `1 <= K <= 8192`, and Apple M3 Ultra
-/// with the vendored Metal JIT build.
+/// `2 <= M <= 2000`, `2 <= N <= 65536`, `1 <= K <= 8192`, and the vendored
+/// Metal JIT build. All devices using native SIMD GEMM are eligible; devices
+/// selecting NAX/TF32 return `None` because that loader is not implemented.
+/// NAX-capable hardware can use this operation when native FP32 dispatch uses
+/// SIMD (for example, with `MLX_ENABLE_TF32=0` before native initialization).
 /// It preserves native SIMD tile selection and split-K reduction. Autodiff,
 /// vmap and compilation transforms are unsupported. This operation is not
 /// selected by ordinary projections until backend integration is validated.

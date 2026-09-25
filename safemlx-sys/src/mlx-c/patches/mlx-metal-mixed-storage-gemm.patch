@@ -244,7 +244,25 @@ diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kerne
 diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
 --- a/mlx/backend/metal/matmul.cpp
 +++ b/mlx/backend/metal/matmul.cpp
-@@ -381,6 +381,7 @@
+@@ -14,11 +14,17 @@
+ #include "mlx/backend/metal/kernels/defines.h"
+ #include "mlx/backend/metal/kernels/steel/gemm/params.h"
+ #include "mlx/backend/metal/matmul.h"
++#include "mlx/backend/metal/metal.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/primitives.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core {
++
++bool metal::use_nax_matmul(Dtype dtype) {
++  return metal::is_nax_available() && !issubdtype(dtype, complexfloating) &&
++      (env::enable_tf32() || dtype != float32);
++}
+ 
+ namespace {
+ 
+@@ -381,6 +387,7 @@
          << (transpose_b ? 't' : 'n')
          << "_" << type_to_name(a)
          << "_" << type_to_name(out)
@@ -252,7 +270,7 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
          << "_bm" << bm << "_bn" << bn << "_bk" << bk
          << "_wm" << wm << "_wn" << wn; // clang-format on
  
-@@ -420,6 +421,7 @@
+@@ -420,6 +427,7 @@
        /* const std::string& hash_name = */ hash_name,
        /* const metal::MTLFCList& func_consts = */ func_consts,
        /* const array& out = */ out,
@@ -260,7 +278,7 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
        /* bool transpose_a = */ transpose_a,
        /* bool transpose_b = */ transpose_b,
        /* int bm = */ bm,
-@@ -552,6 +554,7 @@
+@@ -552,6 +560,7 @@
          << (transpose_b ? 't' : 'n')
          << "_" << type_to_name(a)
          << "_" << type_to_name(C_split)
@@ -268,7 +286,7 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
          << "_bm" << bm << "_bn" << bn << "_bk" << bk
          << "_wm" << wm << "_wn" << wn
          << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
-@@ -564,6 +567,7 @@
+@@ -564,6 +573,7 @@
        /* const std::string& kernel_name = */ kname.str(),
        /* const array& in = */ a,
        /* const array& out = */ C_split,
@@ -276,3 +294,48 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
        /* bool transpose_a = */ transpose_a,
        /* bool transpose_b = */ transpose_b,
        /* int bm = */ bm,
+@@ -912,9 +922,7 @@
+   int _tn = (N + 16 - 1) / 16;
+   int _tk = K / 16;
+   int64_t matrix_size = static_cast<int64_t>(M) * N;
+-  bool use_nax = metal::is_nax_available() &&
+-      !issubdtype(a.dtype(), complexfloating) &&
+-      (env::enable_tf32() || a.dtype() != float32);
++  bool use_nax = metal::use_nax_matmul(a.dtype());
+   char devc = d.get_architecture().back();
+   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
+ 
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -9,11 +9,16 @@
+ #include <variant>
+ 
+ #include "mlx/api.h"
++#include "mlx/dtype.h"
+ 
+ namespace mlx::core::metal {
+ 
+ /* Check if the Metal backend is available. */
+ MLX_API bool is_available();
++
++/* The exact arithmetic-path predicate used by ordinary SIMD/NAX matmul
++ * dispatch. Mixed-storage GEMM implements the SIMD loader only. */
++MLX_API bool use_nax_matmul(Dtype dtype);
+ 
+ /** Capture a GPU trace, saving it to an absolute file `path` */
+ MLX_API void start_capture(std::string path = "");
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -7,6 +7,10 @@
+ namespace mlx::core {
+ 
+ namespace metal {
++
++bool use_nax_matmul(Dtype) {
++  return false;
++}
+ 
+ bool is_available() {
+   return false;

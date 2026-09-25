@@ -119,6 +119,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mixed-storage-prototype", action="store_true",
                         help="also require exact replay of the loader-only native GEMM prototype")
+    parser.add_argument("--disable-tf32", action="store_true",
+                        help="explicitly select native SIMD FP32 dispatch on NAX-capable hardware")
     parser.add_argument("--reference-manifest", type=Path,
                         help="require original projection fingerprints and cached generation tokens")
     parser.add_argument("--binary", type=Path, required=True)
@@ -140,6 +142,7 @@ def main():
     patch = Path("safemlx-sys/src/mlx-c/patches/mlx-metal-kernel-selection-trace.patch")
     metadata = {
         "schema_version": 1, "mixed_storage_prototype": args.mixed_storage_prototype,
+        "tf32_disabled": args.disable_tf32,
         "reference_manifest_sha256": sha256(args.reference_manifest) if reference else None,
         "native_mixed_storage_patch_sha256": sha256(
             "safemlx-sys/src/mlx-c/patches/mlx-metal-mixed-storage-gemm.patch"),
@@ -178,6 +181,8 @@ def main():
                 for key in list(env):
                     if key.startswith(("EREDU_LFM2_", "MLX_")):
                         del env[key]
+                if args.disable_tf32:
+                    env["MLX_ENABLE_TF32"] = "0"
                 if mode == "trace":
                     env["MLX_METAL_LOG_KERNEL_SELECTION"] = "1"
                 execution_mode = "baseline" if mode == "baseline" else (

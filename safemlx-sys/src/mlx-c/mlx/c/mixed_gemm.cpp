@@ -4,7 +4,7 @@
 #include "mlx/c/private/mlx.h"
 
 #ifdef MLX_C_MIXED_STORAGE_GEMM
-#include "mlx/backend/gpu/device_info.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/primitives.h"
 
 namespace {
@@ -16,7 +16,7 @@ class MixedStorageGemm : public UnaryPrimitive {
  public:
   explicit MixedStorageGemm(Stream s) : UnaryPrimitive(s) {}
   void eval_cpu(const std::vector<array>&, array&) override {
-    throw std::runtime_error("MixedStorageGemm requires validated Metal execution");
+    throw std::runtime_error("MixedStorageGemm requires Metal execution");
   }
   void eval_gpu(const std::vector<array>& inputs, array& output) override {
     Matmul native(stream());
@@ -47,12 +47,10 @@ extern "C" int mlx_try_mixed_storage_gemm(
         !a.flags().row_contiguous || !w.flags().row_contiguous) {
       return 0;
     }
-    // Stage-two validation covers this device only. In particular, do not route
-    // NAX/TF32 hardware or unvalidated SIMD geometries through this prototype.
-    const auto& info = gpu::device_info(s.device.index);
-    auto name = info.find("device_name");
-    if (name == info.end() ||
-        std::get<std::string>(name->second) != "Apple M3 Ultra") {
+    // Reuse the actual native arithmetic-path predicate, not a device-name
+    // allowlist. Narrow loading is implemented for SIMD GEMM, not NAX/TF32.
+    // NAX-capable hardware remains eligible when native FP32 dispatch uses SIMD.
+    if (metal::use_nax_matmul(float32)) {
       return 0;
     }
     auto b = transpose(w, s);

@@ -37,7 +37,7 @@ fn same(a: &Array, b: &Array, context: &str) {
 }
 
 #[test]
-#[ignore = "requires validated Apple M3 Ultra Metal device; run explicitly"]
+#[ignore = "requires Metal SIMD GEMM; run explicitly with MLX_ENABLE_TF32=0"]
 fn loader_preserves_native_gemm_bits_and_allocations() {
     let s = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     memory::set_cache_limit(0).unwrap();
@@ -94,23 +94,25 @@ fn loader_preserves_native_gemm_bits_and_allocations() {
                 .as_dtype(dtype, &s)
                 .unwrap();
             transforms::eval([&a, &w]).unwrap();
-            let reference = a
-                .matmul(
-                    w.as_dtype(Dtype::Float32, &s)
-                        .unwrap()
-                        .transpose(&s)
-                        .unwrap(),
-                    &s,
-                )
-                .unwrap();
+            // Settle the reference weight first. Measure only the native GEMM
+            // output/partials, using this device's actual dispatch and allocator.
+            let converted = w.as_dtype(Dtype::Float32, &s).unwrap();
+            transforms::eval([&converted]).unwrap();
+            s.synchronize().unwrap();
+            let reference_baseline = memory::active_memory().unwrap();
+            memory::reset_peak_memory().unwrap();
+            let reference = a.matmul(converted.transpose(&s).unwrap(), &s).unwrap();
             let expected = bits(&reference);
+            s.synchronize().unwrap();
+            let reference_peak = memory::peak_memory().unwrap() - reference_baseline;
             drop(reference);
+            drop(converted);
             s.synchronize().unwrap();
             let baseline = memory::active_memory().unwrap();
             memory::reset_peak_memory().unwrap();
             let output = try_mixed_storage_gemm(&a, &w, &s)
                 .unwrap()
-                .expect("validated prototype device");
+                .expect("native SIMD GEMM device/configuration");
             transforms::eval([&output]).unwrap();
             s.synchronize().unwrap();
             let peak = memory::peak_memory().unwrap() - baseline;
@@ -121,30 +123,10 @@ fn loader_preserves_native_gemm_bits_and_allocations() {
                     actual[i], expected[i]
                 );
             }
-            // Account for exactly the pinned dispatch's output and split-K
-            // partials. There must be no full promoted weight allocation.
-            let split = (m.div_ceil(16) * n.div_ceil(16) <= 2048) && k / 16 >= 8 && k >= m.max(n);
-            let partials = if split {
-                let blocks = m.div_ceil(32) * n.div_ceil(32);
-                let partitions = ((k / 16 / blocks).max(1).next_power_of_two()).clamp(2, 32);
-                partitions * m * n * 4
-            } else {
-                0
-            };
-            // Pinned Metal allocator rounds buffers larger than this host's
-            // 16 KiB VM page size; smaller allocations retain their byte count.
-            let allocated = |bytes: usize| {
-                if bytes > 16384 {
-                    bytes.div_ceil(16384) * 16384
-                } else {
-                    bytes
-                }
-            };
-            assert_eq!(
-                peak,
-                allocated(m * n * 4) + allocated(partials),
-                "allocation {dtype:?} [{m},{n},{k}]"
-            );
+            // Same output and split-K workspace as native preconverted GEMM.
+            // This works across native device-specific split-K thresholds and
+            // host page sizes, without duplicating either selection policy.
+            assert_eq!(peak, reference_peak, "allocation {dtype:?} [{m},{n},{k}]");
             let bias = Array::from_slice(&values(n, 999), &[n as i32]);
             let reference = Array::from_slice(
                 &expected
@@ -165,7 +147,7 @@ fn loader_preserves_native_gemm_bits_and_allocations() {
 }
 
 #[test]
-#[ignore = "requires validated Apple M3 Ultra Metal device; run explicitly"]
+#[ignore = "requires Metal SIMD GEMM; run explicitly with MLX_ENABLE_TF32=0"]
 fn unsupported_layouts_and_types_do_not_evaluate_or_cast() {
     let s = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let a = Array::from_slice(&values(4 * 129, 123), &[4, 129]);
