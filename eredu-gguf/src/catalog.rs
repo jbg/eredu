@@ -7,7 +7,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
 const SPLIT_NO: &str = "split.no";
@@ -129,6 +129,26 @@ pub struct Checkpoint {
     shards: Vec<CatalogShard>,
     physical_tensor_count: usize,
     limits: Limits,
+    payload_access: bool,
+}
+
+/// Header bytes and declared full length of one immutable GGUF member.
+/// `bytes` contains the complete metadata and tensor descriptor prefix; payloads
+/// and alignment padding are unnecessary. `member` is a relative shard name.
+#[derive(Debug, Clone)]
+pub struct CheckpointHeader {
+    pub member: String,
+    pub bytes: Vec<u8>,
+    pub file_len: u64,
+}
+
+impl CheckpointHeader {
+    fn reader(&self, limits: Limits) -> Result<Reader<Cursor<&[u8]>>> {
+        if self.bytes.len() as u64 > self.file_len {
+            return Err(shard_error("GGUF header exceeds declared file length"));
+        }
+        Reader::with_file_size(Cursor::new(self.bytes.as_slice()), limits, self.file_len)
+    }
 }
 
 /// One materialized physical GGUF tensor and its converted logical output group.
@@ -292,6 +312,68 @@ impl Checkpoint {
         let path = path.as_ref();
         validate_extension(path)?;
         let first = open_reader(path, limits.clone())?;
+        Self::assemble(path, first, limits.clone(), true, |path| {
+            if !path.is_file() {
+                return Err(shard_error(format!(
+                    "missing GGUF shard {:?}",
+                    path.display()
+                )));
+            }
+            open_reader(path, limits.clone())
+        })
+    }
+
+    /// Validates a complete shard set without filesystem or payload access.
+    /// Full lengths are caller-supplied provenance, not payload integrity proofs.
+    pub fn from_headers(headers: &[CheckpointHeader], limits: Limits) -> Result<Self> {
+        let mut members = BTreeMap::new();
+        for header in headers {
+            let path = Path::new(&header.member);
+            if path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                || header.member.is_empty()
+                || header.member.contains('\\')
+                || members.insert(path.to_path_buf(), header).is_some()
+            {
+                return Err(shard_error("invalid or duplicate GGUF member"));
+            }
+        }
+        let first = headers
+            .first()
+            .ok_or_else(|| shard_error("empty GGUF header set"))?;
+        let path = Path::new(&first.member);
+        validate_extension(path)?;
+        let first_reader = first.reader(limits.clone())?;
+        let expected_shards = split_value(first_reader.metadata(), SPLIT_COUNT)?
+            .unwrap_or(1)
+            .max(1);
+        if expected_shards != headers.len() {
+            return Err(shard_error(
+                "supplied GGUF shard count does not match split metadata",
+            ));
+        }
+        let mut consumed = 1;
+        let result = Self::assemble(path, first_reader, limits.clone(), false, |path| {
+            consumed += 1;
+            members
+                .get(path)
+                .ok_or_else(|| shard_error(format!("missing GGUF member {}", path.display())))?
+                .reader(limits.clone())
+        })?;
+        if consumed != headers.len() {
+            return Err(shard_error("unexpected GGUF members"));
+        }
+        Ok(result)
+    }
+
+    fn assemble<R: Read + Seek>(
+        path: &Path,
+        first: Reader<R>,
+        limits: Limits,
+        payload_access: bool,
+        mut read: impl FnMut(&Path) -> Result<Reader<R>>,
+    ) -> Result<Self> {
         let metadata = first.metadata().clone();
         let split_count = split_value(&metadata, SPLIT_COUNT)?.unwrap_or(0);
         if split_count <= 1 {
@@ -325,6 +407,7 @@ impl Checkpoint {
                     tensors,
                 }],
                 limits,
+                payload_access,
             });
         }
 
@@ -354,13 +437,7 @@ impl Checkpoint {
         });
 
         for (split_no, shard_path) in paths.into_iter().enumerate().skip(1) {
-            if !shard_path.is_file() {
-                return Err(shard_error(format!(
-                    "missing GGUF shard {:?}",
-                    shard_path.display()
-                )));
-            }
-            let reader = open_reader(&shard_path, limits.clone())?;
+            let reader = read(&shard_path)?;
             let shard_metadata = reader.metadata();
             let actual_split_no = required_split_value(shard_metadata, SPLIT_NO, &shard_path)?;
             if actual_split_no != split_no {
@@ -420,7 +497,17 @@ impl Checkpoint {
             shards,
             physical_tensor_count,
             limits,
+            payload_access,
         })
+    }
+
+    fn require_payload_access(&self) -> Result<()> {
+        if !self.payload_access {
+            return Err(Error::InvalidHeader(
+                "metadata-only checkpoint has no payload admission".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
@@ -560,6 +647,7 @@ impl TensorMaterializer {
         &mut self,
         name: &str,
     ) -> Result<(TensorLocation, TensorDescriptor, Endian)> {
+        self.checkpoint.require_payload_access()?;
         let location = self
             .locations
             .get(name)
@@ -715,6 +803,10 @@ impl Iterator for ConvertedTensorIter<'_> {
                 self.tensor_index = 0;
                 self.reader = None;
                 continue;
+            }
+            if let Err(error) = self.checkpoint.require_payload_access() {
+                self.finished = true;
+                return Some(Err(error));
             }
             if self.reader.is_none() {
                 match open_reader(&shard.path, self.checkpoint.limits.clone())

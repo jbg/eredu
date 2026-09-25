@@ -21893,7 +21893,14 @@ fn prepare_numeric_qwen_image_request(
     let catalog = eredu_core::checkpoint::TensorCatalog::new(constraints.into_values()).unwrap();
     let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
         .artifact_plan(
-            root.path(),
+            &BTreeMap::from([(
+                eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME.to_owned(),
+                std::fs::read(
+                    root.path()
+                        .join(eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME),
+                )
+                .unwrap(),
+            )]),
             eredu_core::ArtifactFormat::SafeTensors,
             &configuration,
             &catalog,
@@ -21926,7 +21933,6 @@ fn prepare_numeric_qwen_image_request(
 fn numeric_processor_for_config(
     config: &serde_json::Value,
 ) -> eredu_architectures::processor_execution::PreparedProcessor {
-    let root = tempfile::tempdir().unwrap();
     let (configuration, resolved) = eredu_architectures::configuration::MODEL_CONFIGURATIONS
         .resolve_safetensors(config)
         .unwrap()
@@ -21956,7 +21962,7 @@ fn numeric_processor_for_config(
     let catalog = eredu_core::checkpoint::TensorCatalog::new(constraints).unwrap();
     let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
         .artifact_plan(
-            root.path(),
+            &BTreeMap::new(),
             eredu_core::ArtifactFormat::SafeTensors,
             &configuration,
             &catalog,

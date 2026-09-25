@@ -51,6 +51,21 @@ pub fn inspect_model_preparation(
     ))
 }
 
+/// Inspects supplied headers using cold MLX mechanism facts, without creating
+/// a native device or granting payload access. The result supports forecasting.
+pub fn inspect_model_metadata(
+    metadata: &eredu_core::artifact::ArtifactMetadata,
+    options: MlxInspectionOptions,
+) -> Result<eredu_architectures::ModelInspectionOutcome, Error> {
+    let (request, _rank) = options.load.checked_normalized()?;
+    Ok(eredu_architectures::inspect_model_metadata(
+        metadata,
+        request,
+        &preparation_mechanisms(),
+        media_feature_availability(),
+    ))
+}
+
 /// Inspects backend mechanisms against one already admitted portable artifact.
 pub(crate) fn inspect_selected_artifact(
     inspection: &eredu_core::ArtifactInspection<

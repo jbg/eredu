@@ -54,7 +54,11 @@ pub use eredu_core::{
     GenerationOutput, GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy,
 };
 pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
-pub use inspection::{inspect_architecture, inspect_text_model, TextInspectionOptions};
+pub use inspection::{
+    inspect_architecture, inspect_model_metadata, inspect_text_model, ArtifactMetadata,
+    CheckpointMetadata, GgufCompanionMetadata, GgufHeader, MetadataProvenance,
+    ModelInspectionOutcome, SafetensorsHeader, TextInspectionOptions,
+};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 pub use observed::{

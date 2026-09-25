@@ -498,7 +498,10 @@ fn mlx_processor_consumes_retained_qwen_plan_after_sidecar_removal() {
     .unwrap();
     let architecture_plan = eredu_architectures::configuration::MODEL_CONFIGURATIONS
         .artifact_plan(
-            root.path(),
+            &std::collections::BTreeMap::from([(
+                eredu_architectures::processor_plan::PROCESSOR_CONFIG_FILENAME.to_owned(),
+                std::fs::read(&sidecar).unwrap(),
+            )]),
             ArtifactFormat::SafeTensors,
             &configuration,
             &catalog,

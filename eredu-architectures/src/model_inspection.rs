@@ -159,6 +159,34 @@ where
     }
 }
 
+/// Inspects supplied immutable headers through the shared cold selection driver.
+/// No filesystem, payload, device or stream access occurs. A successful result
+/// supports forecasting; source preparation returns `ArtifactError::MetadataOnly`.
+pub fn inspect_model_metadata<P: PreparationMechanismProvider>(
+    metadata: &eredu_core::artifact::ArtifactMetadata,
+    request: &NormalizedLoadRequest,
+    mechanisms: &P,
+    media: MediaFeatureAvailability,
+) -> ModelInspectionOutcome {
+    match eredu_core::artifact::inspect_artifact_metadata(
+        metadata,
+        &crate::configuration::MODEL_CONFIGURATIONS,
+    ) {
+        Ok(inspection) => inspect_selected_model(inspection, request, mechanisms, media),
+        Err(error) => {
+            let path = Path::new(&metadata.provenance.source);
+            let format = metadata.format();
+            let mut report = ModelInspectionReport::unverified(path, format);
+            report.metadata_provenance = Some(metadata.provenance.clone());
+            reject_artifact(&mut report, path, format, &error);
+            ModelInspectionOutcome {
+                report,
+                selected: None,
+            }
+        }
+    }
+}
+
 /// Applies one normalized request and mechanism report to an admitted artifact.
 ///
 /// `select_preparation` is invoked exactly once. Its returned admission and

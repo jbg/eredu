@@ -360,16 +360,20 @@ pub struct InspectionRequirement {
     pub path: Option<PathBuf>,
 }
 
-/// Structured pre-preparation compatibility report for a local artifact.
+/// Structured compatibility report for local artifacts or supplied metadata.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelInspectionReport {
+    /// Immutable source supplied for metadata-only planning. Payload availability
+    /// and integrity are unverified; this report cannot authorize loading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_provenance: Option<crate::artifact::MetadataProvenance>,
     /// Logical architecture and declared captures, generated without backend resources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture_descriptor: Option<crate::ArchitectureDescriptor>,
     /// Capture support under the selected backend execution configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_support: Option<crate::ObservationSupportReport>,
-    /// Submitted local artifact path.
+    /// Local artifact path or metadata source label; labels are never opened.
     pub path: PathBuf,
     /// Detected artifact container.
     pub artifact_format: ArtifactFormat,
@@ -429,6 +433,7 @@ impl ModelInspectionReport {
     /// Creates an initially unverified report for backend-specific enrichment.
     pub fn unverified(path: &Path, artifact_format: ArtifactFormat) -> Self {
         Self {
+            metadata_provenance: None,
             architecture_descriptor: None,
             observation_support: None,
             path: path.to_path_buf(),
@@ -460,6 +465,13 @@ impl ModelInspectionReport {
 
     /// Returns whether artifact and requested backend policy passed preflight.
     pub fn is_loadable(&self) -> bool {
+        self.metadata_provenance.is_none() && self.is_compatible()
+    }
+
+    /// Returns whether the supplied structure and requested backend policy agree.
+    /// For metadata-only reports this is conditional on the declared source facts,
+    /// independently of payload availability, integrity, and tokenizer readiness.
+    pub fn is_compatible(&self) -> bool {
         self.container == InspectionReadiness::Ready
             && self.architecture_support == InspectionReadiness::Ready
             && self.structural_binding == InspectionReadiness::Ready
@@ -473,6 +485,7 @@ impl ModelInspectionReport {
 
     /// Applies reusable header/catalog facts from one admitted portable inspection.
     pub fn record_artifact_inspection<P>(&mut self, inspection: &ArtifactInspection<P>) {
+        self.metadata_provenance = inspection.metadata_provenance().cloned();
         self.path = inspection.path().to_owned();
         self.artifact_format = inspection.format();
         self.model_family = Some(inspection.configuration().family().to_owned());

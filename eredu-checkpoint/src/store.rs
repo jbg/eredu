@@ -2003,7 +2003,7 @@ fn read_safetensors_metadata(
     Ok(metadata)
 }
 
-fn read_safetensors_metadata_from(
+pub(crate) fn read_safetensors_metadata_from(
     path: &Path,
     reader: &mut impl Read,
     file_len: u64,
@@ -2574,7 +2574,7 @@ fn invalid_selection(key: &str, message: impl Into<String>) -> StoreError {
     }
 }
 
-fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
+pub(crate) fn stored_dtype_from_safetensors(dtype: Dtype) -> StoredDtype {
     match dtype {
         Dtype::BOOL => StoredDtype::Bool,
         Dtype::U8 => StoredDtype::U8,

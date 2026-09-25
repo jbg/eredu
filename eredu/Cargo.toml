@@ -105,6 +105,10 @@ name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 
 [[test]]
+name = "metadata_forecast"
+path = "tests/metadata_forecast.rs"
+
+[[test]]
 name = "portable_facade"
 path = "tests/portable_facade.rs"
 
@@ -184,6 +188,8 @@ llguidance = { version = "1.8.0", default-features = false, features = ["ahash",
 jsonschema = { version = "0.52.0", default-features = false }
 
 [dev-dependencies]
+eredu-nn.workspace = true
+tempfile.workspace = true
 anyhow = "1"
 eredu-checkpoint.workspace = true
 eredu-evaluation.workspace = true

@@ -1184,3 +1184,81 @@ fn rejects_inconsistent_shard_counts() {
     let error = Checkpoint::open(first).unwrap_err().to_string();
     assert!(error.contains("split.count=3, expected 2"), "{error}");
 }
+
+#[test]
+fn supplied_headers_validate_shards_and_never_open_payload_paths() {
+    use eredu_gguf::{CheckpointHeader, Limits, Reader};
+    let root = tempfile::tempdir().unwrap();
+    let mut headers = Vec::new();
+    for shard in 0..2 {
+        let member = format!("model-{:05}-of-00002.gguf", shard + 1);
+        let path = root.path().join(&member);
+        write_file(
+            &path,
+            Some((shard, 2, 2)),
+            "headers",
+            &[FixtureTensor {
+                name: if shard == 0 { "a.weight" } else { "b.weight" },
+                dimensions: &[32, 2],
+                ty: GgmlType::Q8_0,
+                data: &[0; 68],
+            }],
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        let reader = Reader::new(std::io::Cursor::new(&bytes)).unwrap();
+        let offset = reader.tensors()[0].data_offset as usize;
+        let file_len = bytes.len() as u64;
+        bytes.truncate(offset);
+        headers.push(CheckpointHeader {
+            member,
+            bytes,
+            file_len,
+        });
+    }
+    let local = Checkpoint::open(root.path().join(&headers[0].member)).unwrap();
+    root.close().unwrap();
+    let supplied = Checkpoint::from_headers(&headers, Limits::default()).unwrap();
+    assert_eq!(local.metadata(), supplied.metadata());
+    assert_eq!(
+        local.tensors().collect::<Vec<_>>(),
+        supplied.tensors().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        local.physical_tensor_count(),
+        supplied.physical_tensor_count()
+    );
+    assert!(supplied
+        .materializer()
+        .raw_tensor("a.weight")
+        .unwrap_err()
+        .to_string()
+        .contains("no payload admission"));
+    assert!(supplied
+        .converted_tensors()
+        .next()
+        .unwrap()
+        .unwrap_err()
+        .to_string()
+        .contains("no payload admission"));
+    assert!(Checkpoint::from_headers(&headers[..1], Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    invalid[1].member = invalid[0].member.clone();
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    invalid[0].file_len -= 1;
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    invalid[0].bytes.truncate(16);
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    invalid[0].member = "../model.gguf".into();
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    invalid.reverse();
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+    let mut invalid = headers.clone();
+    let mut extra = invalid[0].clone();
+    extra.member = "extra.gguf".into();
+    invalid.push(extra);
+    assert!(Checkpoint::from_headers(&invalid, Limits::default()).is_err());
+}

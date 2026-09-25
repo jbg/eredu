@@ -4135,11 +4135,6 @@ fn safetensors_inspection_recipe_source(
             "SafeTensors architecture omitted exact catalog admission".into(),
         )
     })?;
-    let shards = inspection.safetensors_shards().ok_or_else(|| {
-        ReplicatedTextRequirementsError::InvalidArtifact(
-            "SafeTensors inspection omitted its admitted shard set".into(),
-        )
-    })?;
     let mut metadata = BTreeMap::new();
     for key in selected.source_keys() {
         let descriptor = inspection.tensors().get(key).ok_or_else(|| {
@@ -4147,13 +4142,10 @@ fn safetensors_inspection_recipe_source(
                 "admitted SafeTensors source {key:?} is absent from its catalog"
             ))
         })?;
-        let backing_shard = shards
-            .tensor_locations()
-            .and_then(|locations| locations.get(key))
-            .cloned()
-            .or_else(|| {
-                (shards.payload_paths().len() == 1).then(|| shards.payload_paths()[0].clone())
-            });
+        let backing_shard = descriptor
+            .storage
+            .as_ref()
+            .map(|storage| std::path::PathBuf::from(&storage.member));
         metadata.insert(
             key.clone(),
             eredu_checkpoint::store::TensorMetadata {
@@ -4288,11 +4280,6 @@ fn replicated_text_requirements_for_structure(
         (Some(architecture), None, None) => safetensors_parameters(
             architecture,
             inspection.tensors(),
-            inspection.safetensors_shards().ok_or_else(|| {
-                ReplicatedTextRequirementsError::InvalidArtifact(
-                    "SafeTensors inspection omitted its admitted shard set".into(),
-                )
-            })?,
             &config,
             recipe_source.as_ref(),
         )?,
@@ -4437,15 +4424,9 @@ fn prediction_extension_materialization_parameters(
             ));
         }
     };
-    let shards = inspection.safetensors_shards().ok_or_else(|| {
-        ReplicatedTextRequirementsError::InvalidArtifact(
-            "prediction extension omitted its admitted SafeTensors shard set".into(),
-        )
-    })?;
     let parameters = safetensors_parameters(
         complete,
         inspection.tensors(),
-        shards,
         &config,
         recipe_source.as_ref(),
     )?;
@@ -5377,7 +5358,6 @@ fn exact_physical_source(
 fn safetensors_parameters(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
     catalog: &TensorCatalog,
-    _shards: &eredu_checkpoint::safetensors::SafetensorsShards,
     config: &EligibleConfig<'_>,
     source_catalog: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {

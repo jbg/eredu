@@ -71,8 +71,8 @@ pub mod native {
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{
-        inspect_model, inspect_model_preparation, MlxInspectionOptions, MlxModelInput,
-        MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
+        inspect_model, inspect_model_metadata, inspect_model_preparation, MlxInspectionOptions,
+        MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
         MlxTextSamplingState,
     };
     /// Converts a checkpoint with an explicitly selected native execution stream.

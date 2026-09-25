@@ -21,9 +21,9 @@ mod reader;
 mod writer;
 
 pub use catalog::{
-    CatalogShard, CatalogTensor, Checkpoint, ConvertedCheckpointTensor, ConvertedTensorIter,
-    LogicalDtype, LogicalTensorLayout, RawCheckpointTensor, TensorMaterializer,
-    TranslatedTensorLayout,
+    CatalogShard, CatalogTensor, Checkpoint, CheckpointHeader, ConvertedCheckpointTensor,
+    ConvertedTensorIter, LogicalDtype, LogicalTensorLayout, RawCheckpointTensor,
+    TensorMaterializer, TranslatedTensorLayout,
 };
 pub use codebook::IQuantCodebook;
 pub use convert::{

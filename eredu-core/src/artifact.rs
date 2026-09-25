@@ -455,6 +455,12 @@ impl<P> ResolvedModelConfiguration<P> {
     }
 }
 
+mod metadata;
+pub use metadata::{
+    inspect_artifact_metadata, ArtifactMetadata, CheckpointMetadata, GgufCompanionMetadata,
+    GgufHeader, MetadataProvenance, SafetensorsHeader,
+};
+
 /// Architecture-owned resolver used by neutral artifact inspection.
 ///
 /// Core owns the transport contract but deliberately does not recognize model
@@ -483,11 +489,16 @@ pub trait ModelConfigurationResolver {
         checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError>;
 
+    /// Optional sidecar member names consumed by architecture planning.
+    fn sidecar_names(&self, _plan: &Self::ArtifactPlan) -> &[&str] {
+        &[]
+    }
+
     /// Finalizes resolved architecture state against the inspected tensor catalog
     /// and exact sidecars selected by inspection.
     fn artifact_plan(
         &self,
-        _path: &Path,
+        _sidecars: &BTreeMap<String, Vec<u8>>,
         _format: ArtifactFormat,
         _configuration: &ModelConfiguration,
         _tensors: &TensorCatalog,
@@ -586,6 +597,7 @@ pub struct ArtifactInspection<P = ()> {
     safetensors_shards: Option<SafetensorsShards>,
     validated_gguf: Option<ValidatedGguf>,
     architecture_plan: P,
+    metadata_provenance: Option<MetadataProvenance>,
 }
 
 /// Portable GGUF facts admitted by core inspection.
@@ -651,7 +663,13 @@ impl<P> ArtifactInspection<P> {
     pub fn admission_token(&self) -> ArtifactAdmissionToken {
         self.admission_token.clone()
     }
-    /// Submitted artifact path.
+    /// Caller-supplied immutable source identity for metadata-only planning.
+    /// Presence means this inspection carries no authority to load payloads.
+    pub fn metadata_provenance(&self) -> Option<&MetadataProvenance> {
+        self.metadata_provenance.as_ref()
+    }
+
+    /// Local artifact path or metadata source label; metadata labels are never opened.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -702,6 +720,7 @@ impl<P> ArtifactInspection<P> {
             safetensors_shards: self.safetensors_shards,
             validated_gguf: self.validated_gguf,
             architecture_plan: map(self.architecture_plan),
+            metadata_provenance: self.metadata_provenance,
         }
     }
 }
@@ -835,6 +854,9 @@ impl<P> ModelPreparationPlan<P> {
         inspection: ArtifactInspection<P>,
         admission: crate::PreparationAdmission,
     ) -> Result<Self, ArtifactError> {
+        if inspection.metadata_provenance.is_some() {
+            return Err(ArtifactError::MetadataOnly);
+        }
         if admission.request().format() != inspection.format() {
             return Err(ArtifactError::InvalidArtifact(
                 "retained preparation admission has a different artifact format".into(),
@@ -1014,6 +1036,9 @@ pub fn plan_model_preparation<P>(
     policy: PreparationPolicy,
     admitted_session_capabilities: crate::backend::SessionCapabilities,
 ) -> Result<ModelPreparationPlan<P>, ArtifactError> {
+    if inspection.metadata_provenance.is_some() {
+        return Err(ArtifactError::MetadataOnly);
+    }
     let route = validate_preparation_policy(inspection.configuration.loading_protocol, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
@@ -1058,6 +1083,26 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         .into_parts();
     let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
     let companions = resolve_gguf_companions(path, &requirements)?;
+    finish_gguf_inspection(
+        path,
+        checkpoint,
+        companions,
+        configuration,
+        resolved_plan,
+        resolver,
+        None,
+    )
+}
+
+fn finish_gguf_inspection<R: ModelConfigurationResolver>(
+    path: &Path,
+    checkpoint: GgufCheckpoint,
+    companions: BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>,
+    configuration: ModelConfiguration,
+    resolved_plan: R::ArtifactPlan,
+    resolver: &R,
+    metadata_provenance: Option<MetadataProvenance>,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     validate_gguf_container(&checkpoint)?;
     let tensors = checkpoint
         .tensors()
@@ -1089,7 +1134,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         companions,
     };
     let architecture_plan = resolver.artifact_plan(
-        path,
+        &BTreeMap::new(),
         ArtifactFormat::Gguf,
         &configuration,
         &tensors,
@@ -1105,6 +1150,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         safetensors_shards: None,
         validated_gguf: Some(validated_gguf),
         architecture_plan,
+        metadata_provenance,
     })
 }
 
@@ -1271,31 +1317,72 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
     let (configuration, resolved_plan) = resolver.resolve_safetensors(&json)?.into_parts();
     let catalog = eredu_checkpoint::safetensors::SafetensorsMetadataCatalog::discover(path)?;
     let shards = catalog.admitted_shards();
-    let descriptors = catalog.tensors().values().map(|metadata| TensorDescriptor {
-        name: metadata.name.clone(),
-        shape: metadata.logical_shape.clone(),
-        dtype: stored_to_tensor_dtype(&metadata.stored_dtype),
-        storage: Some(TensorStorage {
-            member: metadata
-                .backing_shard
-                .as_ref()
-                .expect("admitted shard")
-                .display()
-                .to_string(),
-            offset: catalog
-                .tensor_offset(&metadata.name)
-                .expect("admitted tensor offset"),
-            length: metadata.encoded_byte_len,
-        }),
-    });
-    let tensors = TensorCatalog::new(descriptors)?;
+    let tensors =
+        safetensors_tensor_catalog(catalog.tensors(), |name| catalog.tensor_offset(name))?;
+    let mut sidecars = BTreeMap::new();
+    for name in resolver.sidecar_names(&resolved_plan) {
+        match std::fs::read(path.join(name)) {
+            Ok(bytes) => {
+                sidecars.insert((*name).to_owned(), bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    finish_safetensors_inspection(
+        path,
+        configuration,
+        resolved_plan,
+        tensors,
+        Some(shards),
+        &sidecars,
+        resolver,
+        None,
+    )
+}
+
+fn safetensors_tensor_catalog(
+    metadata: &BTreeMap<String, TensorMetadata>,
+    offset: impl Fn(&str) -> Option<u64>,
+) -> Result<TensorCatalog, ArtifactError> {
+    TensorCatalog::new(metadata.values().map(|tensor| {
+        TensorDescriptor {
+            name: tensor.name.clone(),
+            shape: tensor.logical_shape.clone(),
+            dtype: stored_to_tensor_dtype(&tensor.stored_dtype),
+            storage: Some(TensorStorage {
+                member: tensor
+                    .backing_shard
+                    .as_ref()
+                    .expect("validated member")
+                    .display()
+                    .to_string(),
+                offset: offset(&tensor.name).expect("validated offset"),
+                length: tensor.encoded_byte_len,
+            }),
+        }
+    }))
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_safetensors_inspection<R: ModelConfigurationResolver>(
+    path: &Path,
+    configuration: ModelConfiguration,
+    resolved_plan: R::ArtifactPlan,
+    tensors: TensorCatalog,
+    shards: Option<SafetensorsShards>,
+    sidecars: &BTreeMap<String, Vec<u8>>,
+    resolver: &R,
+    metadata_provenance: Option<MetadataProvenance>,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     if tensors.is_empty() {
         return Err(ArtifactError::InvalidArtifact(
             "SafeTensors checkpoint contains no tensors".into(),
         ));
     }
     let architecture_plan = resolver.artifact_plan(
-        path,
+        sidecars,
         ArtifactFormat::SafeTensors,
         &configuration,
         &tensors,
@@ -1308,9 +1395,10 @@ fn inspect_safetensors<R: ModelConfigurationResolver>(
         format: ArtifactFormat::SafeTensors,
         configuration,
         tensors,
-        safetensors_shards: Some(shards),
+        safetensors_shards: shards,
         validated_gguf: None,
         architecture_plan,
+        metadata_provenance,
     })
 }
 
@@ -1362,6 +1450,9 @@ fn is_gguf(path: &Path) -> bool {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArtifactError {
+    /// Supplied metadata supports planning but does not admit local payload access.
+    #[error("metadata-only inspection cannot prepare payload sources; inspect the downloaded checkpoint before loading")]
+    MetadataOnly,
     /// Artifact identity domain, membership, or logical roles are invalid.
     #[error("invalid artifact identity: {0}")]
     InvalidArtifactIdentity(String),
@@ -1713,7 +1804,7 @@ mod tests {
             let family = match model_type {
                 "llama" => "llama",
                 "gemma4" => "gemma4",
-                "future" => "future_family",
+                "future" | "future_required" => "future_family",
                 other => return Err(ArtifactError::UnsupportedModelType(other.into())),
             };
             Ok(ResolvedModelConfiguration::new(
@@ -1735,7 +1826,7 @@ mod tests {
         ) -> Result<ResolvedModelConfiguration<Self::ArtifactPlan>, ArtifactError> {
             let family = match architecture {
                 "llama" => "llama",
-                "future" => "future_family",
+                "future" | "future_required" => "future_family",
                 other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
             };
             Ok(ResolvedModelConfiguration::new(
@@ -1755,13 +1846,17 @@ mod tests {
             architecture: &str,
             _checkpoint: &GgufCheckpoint,
         ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
-            if architecture == "future" {
+            if matches!(architecture, "future" | "future_required") {
                 return Ok(vec![GgufCompanionRequirement::new(
                     GgufCompanionRole::MediaProjector,
-                    false,
+                    architecture == "future_required",
                     "mmproj",
                     0,
-                    GgufCompanionEncoding::DensePreferred,
+                    if architecture == "future_required" {
+                        GgufCompanionEncoding::DenseRequired
+                    } else {
+                        GgufCompanionEncoding::DensePreferred
+                    },
                 )?]);
             }
             Ok(Vec::new())
@@ -1769,7 +1864,7 @@ mod tests {
 
         fn artifact_plan(
             &self,
-            _path: &Path,
+            _sidecars: &BTreeMap<String, Vec<u8>>,
             format: ArtifactFormat,
             _configuration: &ModelConfiguration,
             _tensors: &TensorCatalog,
@@ -2289,5 +2384,112 @@ mod tests {
                 .path(),
             projector
         );
+    }
+    #[test]
+    fn supplied_gguf_companions_preserve_roles_and_encoding_requirements() {
+        use eredu_gguf::{CheckpointHeader, Reader, TensorInput, Writer};
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        let metadata = BTreeMap::from([(
+            "general.architecture".into(),
+            MetadataValue::String("future_required".into()),
+        )]);
+        Writer::default()
+            .write(
+                File::create(&primary).unwrap(),
+                &metadata,
+                &[TensorInput {
+                    name: "weight",
+                    dimensions: &[2, 2],
+                    ggml_type: GgmlType::F32,
+                    data: &[0; 16],
+                }],
+            )
+            .unwrap();
+        let companion = root.path().join("mmproj.gguf");
+        write_gguf_fixture(&companion, GgmlType::F32);
+        let header = |path: &Path| {
+            let mut bytes = std::fs::read(path).unwrap();
+            let file_len = bytes.len() as u64;
+            let reader = Reader::new(std::io::Cursor::new(&bytes)).unwrap();
+            let end = reader
+                .tensors()
+                .iter()
+                .map(|t| t.data_offset)
+                .min()
+                .unwrap() as usize;
+            bytes.truncate(end);
+            CheckpointHeader {
+                member: path.file_name().unwrap().to_str().unwrap().into(),
+                bytes,
+                file_len,
+            }
+        };
+        let local = inspect_artifact(&primary, &FixtureResolver).unwrap();
+        let mut bundle = ArtifactMetadata {
+            provenance: MetadataProvenance {
+                source: "remote/fixture".into(),
+                revision: "pinned".into(),
+            },
+            checkpoint: CheckpointMetadata::Gguf {
+                headers: vec![header(&primary)],
+                companions: vec![GgufCompanionMetadata {
+                    role: GgufCompanionRole::MediaProjector,
+                    headers: vec![header(&companion)],
+                }],
+            },
+            sidecars: BTreeMap::new(),
+        };
+        write_gguf_fixture(&companion, GgmlType::Q8_0);
+        let quantized = header(&companion);
+        root.close().unwrap();
+        let remote = inspect_artifact_metadata(&bundle, &FixtureResolver).unwrap();
+        assert_eq!(local.tensors(), remote.tensors());
+        let role = GgufCompanionRole::MediaProjector;
+        assert_eq!(
+            local
+                .validated_gguf()
+                .unwrap()
+                .companion(&role)
+                .unwrap()
+                .checkpoint()
+                .tensors()
+                .collect::<Vec<_>>(),
+            remote
+                .validated_gguf()
+                .unwrap()
+                .companion(&role)
+                .unwrap()
+                .checkpoint()
+                .tensors()
+                .collect::<Vec<_>>()
+        );
+        let CheckpointMetadata::Gguf { companions, .. } = &mut bundle.checkpoint else {
+            unreachable!()
+        };
+        let dense = companions[0].clone();
+        companions[0].headers = vec![quantized];
+        assert!(inspect_artifact_metadata(&bundle, &FixtureResolver).is_err());
+        let CheckpointMetadata::Gguf { companions, .. } = &mut bundle.checkpoint else {
+            unreachable!()
+        };
+        *companions = vec![dense.clone(), dense.clone()];
+        assert!(inspect_artifact_metadata(&bundle, &FixtureResolver).is_err());
+        let CheckpointMetadata::Gguf { companions, .. } = &mut bundle.checkpoint else {
+            unreachable!()
+        };
+        companions.clear();
+        assert!(matches!(
+            inspect_artifact_metadata(&bundle, &FixtureResolver),
+            Err(ArtifactError::MissingRequiredGgufCompanion { .. })
+        ));
+        let CheckpointMetadata::Gguf { companions, .. } = &mut bundle.checkpoint else {
+            unreachable!()
+        };
+        companions.push(GgufCompanionMetadata {
+            role: GgufCompanionRole::Named("unrecognized".into()),
+            ..dense
+        });
+        assert!(inspect_artifact_metadata(&bundle, &FixtureResolver).is_err());
     }
 }

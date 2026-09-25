@@ -17,6 +17,137 @@ use safetensors::tensor::{Metadata, TensorInfo};
 
 pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 
+/// Encoded SafeTensors header, including its eight-byte length prefix.
+/// The full member length is supplied separately; no payload bytes are needed.
+#[derive(Debug, Clone)]
+pub struct SafetensorsHeader {
+    /// Relative member name, matching the index when present.
+    pub member: String,
+    /// Eight-byte length prefix followed by exactly the JSON header bytes.
+    pub bytes: Vec<u8>,
+    /// Full source object length, including payload.
+    pub file_len: u64,
+}
+
+/// Structurally validated supplied headers, without filesystem admission.
+#[derive(Debug, Clone)]
+pub struct SafetensorsHeaderCatalog {
+    tensors: BTreeMap<String, TensorMetadata>,
+    offsets: BTreeMap<String, u64>,
+}
+
+impl SafetensorsHeaderCatalog {
+    /// Validates header geometry, full lengths and exact index membership.
+    /// A multi-member checkpoint requires its complete index. Source provenance
+    /// and payload integrity are the caller's responsibility.
+    pub fn from_headers(
+        headers: &[SafetensorsHeader],
+        index: Option<&[u8]>,
+    ) -> Result<Self, SafetensorsShardError> {
+        let index_path = Path::new("model.safetensors.index.json");
+        let expected = index
+            .map(|bytes| {
+                serde_json::from_slice::<SafetensorsIndex>(bytes)
+                    .map(|index| index.weight_map.0)
+                    .map_err(|error| SafetensorsShardError::MalformedIndex {
+                        path: index_path.into(),
+                        message: error.to_string(),
+                    })
+            })
+            .transpose()?;
+        if headers.is_empty() || (expected.is_none() && headers.len() != 1) {
+            return Err(malformed_shard(
+                index_path,
+                "a complete shard set and an index for multiple shards are required",
+            ));
+        }
+        if let Some(expected) = &expected {
+            if expected.is_empty() || expected.keys().any(String::is_empty) {
+                return Err(malformed_shard(index_path, "empty index or tensor name"));
+            }
+            for member in expected.values() {
+                validate_relative_shard_path(Path::new(member))?;
+            }
+        }
+        let mut members = BTreeSet::new();
+        let mut tensors = BTreeMap::new();
+        let mut offsets = BTreeMap::new();
+        let mut actual = BTreeMap::new();
+        for header in headers {
+            let member = Path::new(&header.member);
+            validate_relative_shard_path(member)?;
+            if header.member.contains('\\') || !members.insert(header.member.clone()) {
+                return Err(malformed_shard(member, "invalid or duplicate shard member"));
+            }
+            let (payload_offset, metadata) = crate::store::read_safetensors_metadata_from(
+                member,
+                &mut std::io::Cursor::new(&header.bytes),
+                header.file_len,
+            )
+            .map_err(|error| malformed_shard(member, error.to_string()))?;
+            if payload_offset != header.bytes.len() {
+                return Err(malformed_shard(
+                    member,
+                    "supply exactly the encoded header, without payload",
+                ));
+            }
+            for (name, info) in metadata.tensors() {
+                if name.is_empty() || actual.insert(name.clone(), header.member.clone()).is_some() {
+                    return Err(malformed_shard(member, "empty or duplicate tensor name"));
+                }
+                offsets.insert(name.clone(), (payload_offset + info.data_offsets.0) as u64);
+                tensors.insert(
+                    name.clone(),
+                    TensorMetadata {
+                        name,
+                        logical_shape: info.shape.clone(),
+                        physical_shape: info.shape.clone(),
+                        stored_dtype: crate::store::stored_dtype_from_safetensors(info.dtype),
+                        encoded_byte_len: (info.data_offsets.1 - info.data_offsets.0) as u64,
+                        backing_shard: Some(member.into()),
+                    },
+                );
+            }
+        }
+        if let Some(expected) = expected {
+            let expected_members = expected.values().cloned().collect::<BTreeSet<_>>();
+            if expected != actual || members != expected_members {
+                return Err(malformed_shard(
+                    index_path,
+                    "index does not exactly match supplied shard headers",
+                ));
+            }
+        }
+        Ok(Self { tensors, offsets })
+    }
+
+    /// Exact tensor metadata in deterministic order.
+    pub fn tensors(&self) -> &BTreeMap<String, TensorMetadata> {
+        &self.tensors
+    }
+
+    /// Absolute byte offset within the named source member.
+    pub fn tensor_offset(&self, name: &str) -> Option<u64> {
+        self.offsets.get(name).copied()
+    }
+}
+
+impl SafetensorsCatalog for SafetensorsHeaderCatalog {
+    fn keys(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        let tensor = self
+            .tensors
+            .get(key)
+            .ok_or_else(|| format!("missing tensor {key:?}"))?;
+        Ok(CatalogTensorMetadata {
+            shape: tensor.logical_shape.clone(),
+            stored_dtype: tensor.stored_dtype.clone(),
+        })
+    }
+}
+
 /// One canonically resolved SafeTensors checkpoint shard set.
 ///
 /// Discovery parses an optional Hugging Face index exactly once, requires its
@@ -844,5 +975,55 @@ mod tests {
             shards.logical_payload_paths(),
             &BTreeMap::from([("weights".into(), blob.canonicalize().unwrap())])
         );
+    }
+}
+
+#[cfg(test)]
+mod supplied_header_tests {
+    use super::*;
+    fn header(member: &str, name: &str) -> SafetensorsHeader {
+        let json = serde_json::to_vec(
+            &serde_json::json!({ name: {"dtype":"F16","shape":[32,2],"data_offsets":[0,128]} }),
+        )
+        .unwrap();
+        let bytes = [
+            (json.len() as u64).to_le_bytes().as_slice(),
+            json.as_slice(),
+        ]
+        .concat();
+        SafetensorsHeader {
+            member: member.into(),
+            file_len: bytes.len() as u64 + 128,
+            bytes,
+        }
+    }
+    #[test]
+    fn supplied_catalog_rejects_incomplete_and_contradictory_metadata() {
+        let headers = [header("a.safetensors", "a"), header("b.safetensors", "b")];
+        let index = br#"{"weight_map":{"a":"a.safetensors","b":"b.safetensors"}}"#;
+        let catalog = SafetensorsHeaderCatalog::from_headers(&headers, Some(index)).unwrap();
+        assert_eq!(catalog.tensors().len(), 2);
+        assert_eq!(catalog.tensors()["a"].encoded_byte_len, 128);
+        assert!(SafetensorsHeaderCatalog::from_headers(&headers, None).is_err());
+        assert!(SafetensorsHeaderCatalog::from_headers(&headers[..1], Some(index)).is_err());
+        let mut invalid = headers.clone();
+        invalid[0].file_len -= 1;
+        assert!(SafetensorsHeaderCatalog::from_headers(&invalid, Some(index)).is_err());
+        let mut invalid = headers.clone();
+        invalid[0].bytes.truncate(8);
+        assert!(SafetensorsHeaderCatalog::from_headers(&invalid, Some(index)).is_err());
+        let mut invalid = headers.clone();
+        invalid[1] = header("b.safetensors", "a");
+        assert!(SafetensorsHeaderCatalog::from_headers(&invalid, Some(index)).is_err());
+        let invalid = [header("../a.safetensors", "a")];
+        assert!(SafetensorsHeaderCatalog::from_headers(&invalid, None).is_err());
+        let duplicate_index = br#"{"weight_map":{"a":"a.safetensors","a":"b.safetensors"}}"#;
+        assert!(SafetensorsHeaderCatalog::from_headers(&headers, Some(duplicate_index)).is_err());
+        let overflow = [SafetensorsHeader {
+            member: "a.safetensors".into(),
+            bytes: u64::MAX.to_le_bytes().to_vec(),
+            file_len: u64::MAX,
+        }];
+        assert!(SafetensorsHeaderCatalog::from_headers(&overflow, None).is_err());
     }
 }

@@ -641,6 +641,10 @@ impl<R: Read + Seek> Reader<R> {
         let file_size = inner
             .seek(SeekFrom::End(0))
             .map_err(|source| Error::Io { offset: 0, source })?;
+        Self::with_file_size(inner, limits, file_size)
+    }
+
+    pub(crate) fn with_file_size(mut inner: R, limits: Limits, file_size: u64) -> Result<Self> {
         inner
             .seek(SeekFrom::Start(0))
             .map_err(|source| Error::Io { offset: 0, source })?;

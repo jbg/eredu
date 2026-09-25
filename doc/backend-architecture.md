@@ -7195,3 +7195,27 @@ allowances remain in the forecast. Backend `describe_bound_projection` exposes
 these same facts as a reusable mechanism contract; unbound/cold descriptions
 retain promotion and unknown native-workspace costs. No portable crate gains a
 native dependency or unsafe-code exception.
+
+## Supplied metadata and local payload admission
+
+Cold recommendation clients supply `ArtifactMetadata` through
+`eredu::api::inspect_model_metadata`, or through
+`inspect_local_model_metadata` with the selected MLX backend's cold facts.
+Transport, caching and immutable-revision provenance belong to the application.
+`eredu-gguf` and `eredu-checkpoint` own supplied-header parsing and structural
+validation, including full object lengths and complete shard membership.
+`eredu-core` retains provenance and enforces the distinction between metadata
+compatibility and local payload admission. Its model-preparation constructors
+reject metadata-only inspections with `ArtifactError::MetadataOnly`.
+
+`eredu-architectures` consumes explicit configuration, tensor catalogs, companion
+roles and processor sidecar bytes. Its resolver declares applicable sidecar names;
+local inspection reads those files, while supplied-metadata inspection uses only
+the provided bytes. Both feed the same architecture finalization and cold
+selection. SafeTensors recipe sizing uses catalog storage facts without requiring
+local shard handles. `eredu-runtime` owns the shared memory calculations, and the
+facade exposes their composition without native types. GGUF supplied-header
+catalogs reject payload access even when a materializer is constructed directly.
+
+See [Forecasting from supplied checkpoint metadata](metadata-forecasting.md) for
+bundle requirements, recommendation semantics and validation commands.

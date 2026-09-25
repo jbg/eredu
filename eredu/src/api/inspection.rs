@@ -1,5 +1,12 @@
 //! Backend-independent tokenizer, chat-template, and semantic inspection enrichment.
 
+pub use eredu_architectures::{inspect_model_metadata, ModelInspectionOutcome};
+pub use eredu_core::artifact::SafetensorsHeader;
+pub use eredu_core::artifact::{
+    ArtifactMetadata, CheckpointMetadata, GgufCompanionMetadata, MetadataProvenance,
+};
+pub use eredu_gguf::CheckpointHeader as GgufHeader;
+
 use std::path::Path;
 
 /// Inspects artifact headers and returns its logical architecture and capture catalog.
@@ -52,6 +59,11 @@ pub fn inspect_text_model(
     text_options: &TextModelOptions,
     options: TextInspectionOptions,
 ) -> ModelInspectionReport {
+    if report.metadata_provenance.is_some() {
+        // Text sidecar discovery is a local operation, never an interpretation
+        // of caller-supplied source identifiers as filesystem paths.
+        return report;
+    }
     let path = report.path.clone();
     match report.artifact_format {
         ArtifactFormat::SafeTensors => {

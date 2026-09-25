@@ -20,7 +20,7 @@ use eredu_core::{
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, path::Path};
 
 /// Stateless registry for every architecture family implemented by this crate.
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,9 +66,22 @@ impl ModelConfigurationResolver for ModelConfigurations {
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
     }
 
+    fn sidecar_names(&self, plan: &Self::ArtifactPlan) -> &[&str] {
+        match plan.model_kind() {
+            ModelKind::Gemma4 | ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe | ModelKind::Qwen35 => {
+                &[
+                    crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
+                    crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
+                ]
+            }
+            ModelKind::MuseGlimmer => &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME],
+            _ => &[],
+        }
+    }
+
     fn artifact_plan(
         &self,
-        path: &Path,
+        sidecars: &std::collections::BTreeMap<String, Vec<u8>>,
         format: ArtifactFormat,
         configuration: &ModelConfiguration,
         tensors: &TensorCatalog,
@@ -92,23 +105,20 @@ impl ModelConfigurationResolver for ModelConfigurations {
                         | ModelKind::Qwen35
                 ) {
                     (
-                        read_optional_sidecar(
-                            path,
-                            crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
-                        )?,
-                        read_optional_sidecar(
-                            path,
-                            crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
-                        )?,
+                        sidecars
+                            .get(crate::processor_plan::PROCESSOR_CONFIG_FILENAME)
+                            .cloned(),
+                        sidecars
+                            .get(crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME)
+                            .cloned(),
                     )
                 } else {
                     (None, None)
                 };
                 let muse = if kind == ModelKind::MuseGlimmer {
-                    read_optional_sidecar(
-                        path,
-                        crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME,
-                    )?
+                    sidecars
+                        .get(crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME)
+                        .cloned()
                 } else {
                     None
                 };
@@ -157,14 +167,6 @@ impl ModelConfigurationResolver for ModelConfigurations {
             }
         };
         plan.map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))
-    }
-}
-
-fn read_optional_sidecar(path: &Path, filename: &str) -> Result<Option<Vec<u8>>, ArtifactError> {
-    match fs::read(path.join(filename)) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -1714,7 +1716,7 @@ mod tests {
 
         let admitted = MODEL_CONFIGURATIONS
             .artifact_plan(
-                Path::new("fixture"),
+                &BTreeMap::new(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 &tensors,
@@ -1763,7 +1765,10 @@ mod tests {
         );
         let plan = MODEL_CONFIGURATIONS
             .artifact_plan(
-                root.path(),
+                &BTreeMap::from([(
+                    crate::processor_plan::PROCESSOR_CONFIG_FILENAME.to_owned(),
+                    std::fs::read(&processor_path).unwrap(),
+                )]),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 &tensors,
@@ -1791,7 +1796,10 @@ mod tests {
         );
         let next = MODEL_CONFIGURATIONS
             .artifact_plan(
-                root.path(),
+                &BTreeMap::from([(
+                    crate::processor_plan::PROCESSOR_CONFIG_FILENAME.to_owned(),
+                    std::fs::read(&processor_path).unwrap(),
+                )]),
                 ArtifactFormat::SafeTensors,
                 &next_configuration,
                 &next_tensors,
@@ -1880,7 +1888,7 @@ mod tests {
         );
         let admitted = MODEL_CONFIGURATIONS
             .artifact_plan(
-                Path::new("fixture"),
+                &BTreeMap::new(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 &catalog,
@@ -1896,7 +1904,7 @@ mod tests {
 
         let error = MODEL_CONFIGURATIONS
             .artifact_plan(
-                Path::new("fixture"),
+                &BTreeMap::new(),
                 ArtifactFormat::SafeTensors,
                 &configuration,
                 &TensorCatalog::new([]).unwrap(),
