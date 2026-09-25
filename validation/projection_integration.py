@@ -27,7 +27,7 @@ def main():
     parser.add_argument('--samples', type=int, default=5)
     parser.add_argument('--disable-tf32', action='store_true')
     parser.add_argument('--forecasts', action='store_true', help='validate cold, loaded and continuation forecasts')
-    parser.add_argument('--reference-manifest', type=Path, help='require historical projection bit fingerprints')
+    parser.add_argument('--reference-manifest', type=Path, help='require recorded projection bit fingerprints')
     args = parser.parse_args()
     if args.samples < 1 or sha256(args.model) != CHECKPOINT_SHA256:
         parser.error('positive sample count and pinned checkpoint required')

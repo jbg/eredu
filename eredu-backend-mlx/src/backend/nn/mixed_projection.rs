@@ -6,7 +6,7 @@ use safemlx::{error::Exception, Array, Stream};
 /// F32 GEMM with narrow weight loading. Neither path evaluates inputs to decide
 /// eligibility. Unsupported geometry, weight layout, dtype or native arithmetic
 /// path retains the caller's existing conversion-retention/matmul fallback.
-/// Forecasts remain conservative until per-invocation coverage is reported.
+/// Forecasts remove promotion allowances only for proven invocation coverage.
 pub(crate) fn project(
     input: &Array,
     weight: &Array,

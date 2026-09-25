@@ -1,7 +1,7 @@
 //! Calibrated, family-independent workspace planning over ordinary module topology.
 //!
-//! This is a planning envelope, not an exact native allocation inventory. Phase-4
-//! logical geometry determines the reusable mechanism extents; explicitly labeled
+//! This is a planning envelope, not an exact native allocation inventory. Logical
+//! invocation geometry determines reusable mechanism extents; explicitly labeled
 //! calibration supplies scratch and lazy-retention envelopes. Opaque native facts
 //! are never silently reclassified as exact observations.
 
@@ -160,8 +160,8 @@ impl Schedule {
 
 /// Describe a selected text invocation's calibrated workspace lifetimes.
 ///
-/// Ordinary topology is authoritative. Older aggregate-only reports are lowered
-/// through a compatibility envelope preserving their historical bounds without
+/// Ordinary topology is authoritative. Aggregate-only reports are lowered
+/// through a compatibility envelope preserving their declared bounds without
 /// inferring missing module identities, formats or invocation order.
 ///
 /// Parameters and installed state are owned by separate resource producers. Cache

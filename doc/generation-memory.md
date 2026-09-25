@@ -15,9 +15,10 @@ the managed default and a zero-byte bound normalizes to disabled. Admission is
 first-admitted, with no automatic eviction. Eligible single-row Metal projections
 read materialized row-major F16/BF16 weights directly with F32 activations,
 accumulation and output, avoiding full-weight casts and conversion admission.
-This covers dense linear and tied-embedding output projections. Multi-row
-prefill and speculative verification, unsettled or column-major weights, CPU
-and CUDA retain their ordinary native paths. Those paths use an admitted F32
+This covers dense linear and tied-embedding output projections. Eligible multi-row
+prefill and speculative verification use [mixed-storage GEMM](mixed-storage-gemm.md).
+Unsettled or unsupported weight layouts, geometry or native arithmetic, CPU and
+CUDA use their ordinary fallback paths. Those paths use an admitted F32
 conversion or a temporary cast when a weight does not fit, without changing
 precision. The [measured policy matrix](conversion-retention-validation.md)
 records the retention tradeoff and validation scope.
@@ -77,21 +78,21 @@ cargo run -p eredu --example conversion_retention -- \
   /path/to/model-with-tokenizer "Explain gravity briefly."
 ```
 
-A model directory or GGUF with tokenizer metadata is accepted. Use the pinned
-mixed-width BF16 GGUF in the [validation report](conversion-retention-validation.md)
-to exercise nonzero retained F32 conversions; ordinary narrow-activation models
-may legitimately report zero. The example uses the default local device and
+A model directory or GGUF with tokenizer metadata is accepted. The pinned mixed-width BF16 GGUF in the
+[validation report](conversion-retention-validation.md) can report zero retained
+conversions because mixed-storage kernels cover its projections. Narrow-activation
+models can also report zero; fallback fixtures exercise nonzero admission. The example uses the default local device and
 prints full observations and forecasts, including unknown values.
 
 ## Neutral resource-description contract
 
 `eredu_core::resources` describes resources from ordinary execution contracts.
-Target workspace forecasts now compose reusable mechanism descriptions with
+Target workspace forecasts compose reusable mechanism descriptions with
 explicit evaluation lifetimes. Parameter/state producers and native mechanism
 inventories remain descriptive contracts; their unknown allocation capacities
 are not silently converted into exact bounds. Embedded prediction resource
 descriptions feed speculative startup composition when both target and prediction
-mechanisms are covered. Embedded continuation verdicts remain a later phase.
+mechanisms are covered. Embedded continuation forecasts use settled state and retained-feature observations.
 
 A `ResourceDescription` records the current context and requested horizon as named
 logical extents, with fixed or evaluated context-dependent resource sizes. For
@@ -120,7 +121,7 @@ Descriptions carry no allocation authority, resident credit, lifetime ordering o
 fit verdict, and summing their entries is not a peak calculation. Producing one
 must not advance or synchronize execution or consume admission budgets. Existing
 `GenerationMemoryEstimate` reports retain their format; target workspace values
-now reflect the generic composition described below.
+reflect the generic composition described below.
 
 `eredu_runtime::execution_resources::PreparedResourceQuery` gives an execution
 instance namespace, batch extent, hypothetical persisted prefix, additional
@@ -153,8 +154,8 @@ horizon, and paged state needs block/tier decomposition; both remain named gaps.
 Exact logical payload does not establish native allocation capacity. Capacity,
 alignment, replacement copies, mechanism scratch, cached conversions and retained
 outputs remain unknown; descriptions name missing execution-unit and static-module
-contracts. They are always partial for the complete execution. No new fit verdict
-or embedded prediction support is enabled by these producers. They add no
+contracts. They are partial for the complete execution and do not independently
+establish a fit verdict or prediction coverage. They contain no
 family-specific forecasting dependencies or calibration constants. Production
 workspace forecasting uses ordinary invocation topology; the legacy aggregate
 workspace input remains supported for existing manually constructed or serialized
@@ -214,7 +215,7 @@ query the allocator's actual current limit. The allowance uses the larger of
 that limit and already retained cache, because lowering the limit may defer
 eviction. An explicit cache limit during cold inspection describes the proposed
 policy; reports after loading observe the policy in force. Query failures and
-arithmetic overflow remain explicit unknowns. Native model realization now applies
+arithmetic overflow remain explicit unknowns. Native model realization applies
 Eredu's 256 MiB cache ceiling to an untouched native default, preserving smaller
 defaults. Explicit limits remain authoritative. Pure cold queries still observe
 the current policy; they do not apply runtime configuration. To forecast with the
@@ -295,11 +296,7 @@ Attention workspace also uses a tagged object: `{"kind":"materialized"}`,
 Consumers can switch on `kind` for every variant; device identifiers and scratch
 estimates are never discarded to make a payload-bearing enum into a string.
 
-This replaces the initial PascalCase and externally tagged representation.
-Previously saved reports require migration: for example, `"LikelyFit"` becomes
-`"likely_fit"`, `"Unified"` becomes `{"kind":"unified"}`, and
-`{"Device":"cuda:0"}` becomes `{"kind":"device","device":"cuda:0"}`.
-Deserialization uses the new format as well.
+Serialization and deserialization both require this snake_case tagged format.
 
 ## API and ownership
 
@@ -370,16 +367,9 @@ instrumentation to existing input costs and preserves unrelated unknowns. It nei
 reserves nor consumes capture or trace budgets and applies equally to ordinary and
 controlled startup. Trace-only requests retain their ordinary forecast.
 
-Native calibration (2026-09-23): SmolLM2-135M-Instruct at revision
-`1d461723eec654e65efdc40cf49301c89c0c92f4`, Metal, top-k 8 for 32 predictions,
-1 GiB retained/host/encoded capture ceilings, and a 64 MiB trace allowance produced
-68,337,271 bytes of retained upper allowance (about 65.2 MiB). The projected
-capture host total was 37,088 bytes and the native step peak was 1,184,768 bytes.
-Increasing sufficient quotas did not change the result; increasing k raised it
-and capturing every other prediction lowered it. Four executed predictions stayed
-within the projected ledger usage; continuation forecasts preserved that history
-and neither forecasts nor quota comparisons changed native active allocations.
-Run against the pinned local checkpoint with:
+Native capture tests check top-k and prediction-schedule scaling, projected ledger
+usage and read-only continuation observations. Sufficient quotas do not change
+logical capture geometry. Run against a compatible local checkpoint with:
 
 ```sh
 EREDU_CONTINUATION_MODEL=/path/to/SmolLM2-135M-Instruct \
@@ -441,33 +431,11 @@ forecast; the API does not claim to bound subsequent user-controlled retention.
 
 ### Speculative startup validation
 
-Validation on 2026-09-23 used debug builds on macOS/aarch64 Metal with 256 GiB
-unified memory and the pinned `HuggingFaceTB/SmolLM-135M` checkpoint documented
-below (`1d461723eec654e65efdc40cf49301c89c0c92f4`). Two independently loaded copies
-used the original weights. In a separate fixture directory, only
-`tokenizer_config.json` was changed to add the literal template
-`{% for message in messages %}{{ message['content'] }}{% endfor %}`; the base
-checkpoint has no chat template. The original checkpoint remained unchanged.
-
-| Execution | Input/output positions | Forecast upper, bytes | MLX peak active, bytes |
-| --- | ---: | ---: | ---: |
-| One Metal stream, greedy, lookahead disabled | 9/32 | 1,515,947,000 | 1,101,895,909 |
-| Separate Metal streams, stochastic, lookahead enabled | 9/32 | 1,561,923,812 | 1,104,419,037 |
-| Separate Metal streams, longer prompt | 289/32 | 2,530,177,084 | 1,580,703,442 |
-| Metal target, CPU draft, unified pool | 9/16 | 1,549,377,956 | 1,099,604,507 |
-
-All four forecasts returned `likely_fit`. The short split-stream run created six
-optimistic blocks, reused two and discarded four; the longer run reused six.
-The two identical models accepted all verified draft tokens; rejection/replay
-and controlled/uninterrupted parity are covered by neutral conformance tests.
-These observations validate a small model's planning envelope, not a universal
-allocator or process-RSS bound. CUDA and separate physical device pools were not
-validated natively.
-
-To reproduce after building with `cargo build -p eredu-cli`, set `MODEL` to the
-fixture directory and run:
+The CLI can compare a target and independently loaded drafter on the same or
+separate streams. Set `MODEL` to a checkpoint directory with a chat template:
 
 ```sh
+cargo build -p eredu-cli --locked
 target/debug/eredu --no-auto --model "$MODEL" --draft-model "$MODEL" \
   --speculative-draft-device gpu:0 --speculative-draft-tokens 4 \
   --disable-speculative-adaptive-lookahead --max-tokens 32 \
@@ -475,10 +443,11 @@ target/debug/eredu --no-auto --model "$MODEL" --draft-model "$MODEL" \
   'The quick brown fox jumped over the fence and'
 ```
 
-For the serial row, omit `--speculative-draft-device`, use `--temperature 0`,
-and add `--disable-speculative-lookahead`. For the CPU row, select `cpu` and
-16 output tokens. For the long row, pipe 32 repetitions of
-`The quick brown fox jumped over the fence. ` as the prompt.
+Omit `--speculative-draft-device` for a shared stream. Use `--temperature 0` and
+`--disable-speculative-lookahead` for serial greedy execution, or select `cpu`
+for an independent CPU drafter. Neutral conformance covers rejection/replay and
+controlled/uninterrupted parity. The [mixed-storage suite](mixed-storage-gemm.md)
+provides pinned released-checkpoint parity and memory evidence on Metal.
 
 ### Settled speculative continuation
 
@@ -515,43 +484,23 @@ controllers or semantic parsers without a continuation storage contract keep the
 upper end unknown. This combined allowance includes native RNG storage and is
 conservatively charged in every physical pool until exact attribution is available.
 Instrumented speculative retention also remains unknown
-in this phase; native state/residency facts remain available. Returned records or
+for these requests; native state/residency facts remain available. Returned records or
 external application copies retained outside these declared allowances are excluded.
 
 Before prefill, terminal/cancelled/failed owners, retained proposals, optimistic
 transactions and in-flight verification are explicitly unsupported. The method
 does not make those states eligible by advancing execution. Embedded prediction
-uses the settled observations described in phase 9 below; feature-conditioned
+uses the settled observations described in the embedded continuation section; feature-conditioned
 external assistants remain unsupported. User snapshots and inactive
 branches are included from live non-rewindable reservations; restore and exchange
 change the state observed by the next call without refunding those reservations.
 
-Validation on 2026-09-23 used the same pinned SmolLM-135M revision below on
-macOS/aarch64 Metal with allocator caching disabled. Original checkpoint files were
-unchanged; a local `chat_template.jinja` supplied the literal content-only template
-shown in the startup validation. Two independent copies ran 32-token requests with
-proposal width four. Outlooks were taken after prefill committed the first token,
-with one live user snapshot, for 31 further tokens.
+Native continuation tests cover zero-token outlooks, read-only observation,
+serial and split-stream lookahead, snapshot/fork/exchange/restore and token parity.
+CUDA and separate physical-pool validation remain gaps.
 
-| Prompt positions | Lookahead | Additional forecast upper, bytes | Subsequent MLX peak growth, bytes |
-| ---: | --- | ---: | ---: |
-| 10 | Disabled, greedy | 388,148,363 | 23,401,674 |
-| 10 | Enabled, stochastic | 530,300,871 | 26,023,130 |
-| 289 | Disabled, greedy | 1,468,286,819 | 99,036,825 |
-| 289 | Enabled, stochastic | 1,996,132,275 | 114,372,220 |
-
-All four returned `likely_fit`. Forecasts preserved tokens, RNG state, epochs and
-snapshot budgets, and did not increase active native allocation. Snapshot restore
-and branch exchange preserved subsequent token output; controlled and uninterrupted
-speculative output matched exactly. In-flight calls were rejected. The native
-nonzero Qwen2 fixture passed the same checks; portable conformance exercises
-acceptance, rejection/replay and lookahead. These conservative bounds include
-current state/capacity and snapshot allowances, so they deliberately exceed just
-new allocation growth. Native separate physical pools and embedded prediction
-were not validated by this phase.
-
-Reproduce with the pinned checkpoint files and literal `chat_template.jinja` in
-`MODEL` (omit the environment variables to use the nonzero native fixture):
+Set `MODEL` to a checkpoint directory with a compatible chat template, or omit
+the environment variables to use the nonzero native fixture:
 
 ```sh
 EREDU_SPECULATIVE_CONTINUATION_MODEL="$MODEL" \
@@ -626,9 +575,7 @@ unknown and can be used without the `mlx` feature.
 Validation covers exact device matching, CPU/unified/separate pools, missing and
 zero availability, unknown physical relationships and invalid selections in seven
 portable tests. Native policy tests verify the constructor does not change the
-allocator policy. Cold CLI smoke tests on the pinned SmolLM checkpoint below, with
-64 input positions, 32 output tokens and `--mlx-cache-limit-bytes 0`, returned
-`likely_fit` without an application budget on both CPU (host) and Metal (unified).
+allocator policy. Cold CLI smoke coverage includes CPU host and Metal unified placement.
 
 `for_local_device` and the existing explicit-placement constructor
 `GenerationMemoryOptions::for_local_backend(input, placement)` both sample the
@@ -644,7 +591,7 @@ the subsequent cold inspection and estimation remain free of native queries.
 
 `local_allocator_cache_limit()` reads the native value without changing policy or
 evicting cache. `set_local_allocator_cache_limit(bytes)` returns the previous value
-for restoration; the backend adapter's setter now also preserves that result:
+for restoration; the backend adapter preserves that result:
 
 ```rust,ignore
 let previous = eredu::api::set_local_allocator_cache_limit(32 * 1024 * 1024)?;
@@ -725,87 +672,66 @@ Embedded startup composes the same evaluator with prediction invocations and
 transaction retention; uncovered prediction mechanisms remain explicit unknowns.
 Ordinary cold, loaded, settled continuation and external-drafter forecasts consume
 the same target evaluator. Legacy `WorkspaceGeometry` requests remain readable
-through the phase-10 compatibility lowerer and common lifetime evaluator; when
+through the aggregate compatibility lowerer and common lifetime evaluator; when
 ordinary topology is present it is authoritative.
 
-Ordinary shared dense readout projects the final row per chunk; capture contracts
-can require every row. Fused attention retains the configurable float32 score
+The selected logits contract distinguishes final-row projection from every-row
+projection, including capture and speculative verification requirements.
+Fused attention retains the configurable float32 score
 matrix fallback. Explicit input-score attention instead consumes its selected
 native tile/retention facts directly, without adding a second whole-score-matrix
 fallback. A whole extra state payload covers cache replacement by default.
-Unknown scratch or retention remains unbounded. New mechanism coverage is shared
-by all families using those ordinary construction contracts; measurements below
+Unknown scratch or retention remains unbounded. Mechanism coverage is shared
+by all families using those ordinary construction contracts; linked measurements
 are validation cases, not dispatch criteria.
 
-### Earlier LFM2/LFM2.5 hybrid calibration
+### Dense LFM2/LFM2.5 hybrid workspace
 
-The following records the legacy calibration and its measurement history. The
-generic migration below replaces its aggregate family geometry with ordinary
-module outputs and lifetimes, retaining the native tile facts and conservative
-conversion allowance.
+For complete key rows of at most 8,192 positions, MLX shares expanded K/V and
+contiguous BF16 projection layouts across query tiles in an invocation. Large
+calls evaluate batches of at most 32 query-tile outputs and retain completed
+outputs for final concatenation, releasing each batch's score/softmax graphs.
+Small calls remain lazy. The backend supplies an 8,192 query-by-key element
+threshold and at most 32 query rows per tile.
 
-Dense LFM2 selections projected the normalized feed-forward width, attention
-schedule, convolution channels and kernel width for SafeTensors and GGUF.
-Persistent convolution history remains in the state estimate. With batch `B`,
-query positions `Q`, channels `C`, kernel width `K` and floating element size `S`,
-one additional convolution set allows:
+For full-key calls the forecast charges four query-width K/V payloads per
+invocation, at most 32 live tiles of score scratch at 32 bytes per element
+(including a possible sink column), and two whole-query output payloads for
+completed tiles and concatenation. Mixed-width execution allows at least four
+bytes per scalar for K/V and output. Selection retains these native facts for
+cold inspection and cached-selection validation. Runtime composes them with
+ordinary attention geometry instead of adding another whole-score-matrix fallback.
 
-```text
-B * C * (6*Q + 2*(Q+K-1) + Q*K + K) * max(S, 4)
-```
+Above 8,192 key positions, the two-pass blockwise accumulator evaluates each
+block's running state and releases temporary layouts. Its FP32 accumulation
+differs from full-key BF16 projection. Those rows retain a conservative per-tile
+whole-context K/V allowance with 32 working bytes per score element. Serialized
+facts without `full_key_tiles` use their declared per-tile copy and score
+allowances. Missing native facts leave an unknown upper end; attention-free
+convolution schedules need no attention scratch declaration.
 
-This covers the three-way projection, two gate products, convolution output,
-padded/history input copies, kernel-width unfolded scratch and a contiguous
-kernel. The shared linear upper also permits float32 promotion. For either
-operator, `min(copies, operator_layers + max(copies - total_layers, 0))` bounds
-live sets using the existing layer-overlap calibration. The convolution lower
-contribution stays zero; these are conservative planning allowances.
+LFM2 requires full-pass prefill, so reducing its requested chunk size does not
+reduce the forecast. Dense and packed routed invocations use reusable mechanism
+topology. Distributed projections, nondevice state and uncovered prediction or
+residency combinations retain explicit gaps. Persistent convolution history stays
+in the state estimate; gated/unfolded convolution workspace uses the module's
+ordinary geometry and evaluation lifetimes.
 
-Explicit input-score attention needs more than a score-matrix allowance.
-For complete key rows of at most 8,192 positions, MLX now shares expanded K/V
-and contiguous BF16 projection layouts across query tiles in an invocation.
-Large tiled calls evaluate batches of at most 32 query-tile outputs and retain the
-completed outputs for final concatenation, releasing each batch's score/softmax
-graphs before building the next batch. Small calls remain lazy. The backend
-supplies its actual tile thresholds (8,192 query-by-key elements, at most 32 query
-rows). For these full-key calls, the forecast charges four query-width K/V
-payloads per invocation, at most 32 live tiles of score scratch at 32 bytes per
-element (including a possible sink column), and two whole-query output payloads
-for completed tiles and concatenation. Mixed-width execution promotes K/V and
-output allowances to at least four bytes per scalar. These facts are
-retained during selection, including cold inspection, and participate in cached
-selection validation. Runtime adds their layer-overlap envelope to the ordinary
-attention fallback. Above 8,192 key positions, attention still uses the existing
-two-pass blockwise accumulator, which evaluates each block's running state and
-releases temporary layouts. Retaining all prepared blocks would undermine that
-bounded residency strategy; its FP32 accumulation also differs from full-key
-BF16 projection. Those rows retain the conservative per-tile whole-context K/V
-allowance with 32 working bytes per score element. Legacy serialized facts without
-`full_key_tiles` retain their declared per-tile copy and score allowances.
-Missing native facts leave
-an unknown upper end. Attention-free convolution schedules need no attention
-scratch declaration.
+Mixed-width selected parameters carry a potential F32 promotion allowance and
+promoted-state/replacement storage above nominal state bytes. Selected task shapes
+and dtypes determine the allowance, not a file-format name. Loaded forecasts
+remove matrix promotions only where bound mechanism facts and activation dtype
+proofs cover every invocation; see [projection storage facts](#projection-storage-facts).
 
-This coverage applies to ordinary cold, loaded and settled continuation
-forecasts. LFM2 still requires full-pass prefill: reducing a requested chunk size
-does not reduce its estimate. The generic migration adds packed routed LFM2
-coverage; distributed projections, nondevice state and existing
-prediction/residency exclusions retain their explicit gaps.
-Mixed-width selected parameters add a separate float32 cast allowance, including
-promoted state and replacement storage above the nominal state estimate. The
-architecture computes this from selected logical parameter shapes and dtypes;
-no file-format name selects the allowance. It is especially relevant to the
-published BF16 GGUF, whose small convolution/norm tensors include float32.
+The aggregate `WorkspaceGeometry` JSON fields `gated_convolution`,
+`input_score_attention` and `mixed_precision_parameter_bytes` are optional.
+Records without them deserialize with absent values. Ordinary selected execution
+uses `TextExecutionTopology`.
 
-The new optional `WorkspaceGeometry` JSON fields `gated_convolution`,
-`input_score_attention` and `mixed_precision_parameter_bytes` are omitted for
-ordinary dense attention records; older records deserialize with them absent.
-Rust struct literals must initialize them.
-
-Unified memory describes shared capacity, not automatic identity of every host
-and device buffer. Separate devices are compared independently. The static-report
-adapter accepts declared shared backing or reports an overlap interval; global
-allocator counters are never added on top of parameter tensors.
+Unified memory describes shared capacity, not automatic identity of host/device
+buffers. Separate devices are compared independently. Declared shared backing or
+an overlap interval drives the static-report adapter; global allocator counters
+are never added on top of parameter tensors.
 
 ## Declaring already-resident memory
 
@@ -854,7 +780,7 @@ to account for independently resident host bytes too.
 
 ## Reproducing calibration
 
-Build the current source first. Old executables do not validate these changes.
+Build the executable from the source under validation.
 
 ```sh
 cargo build -p eredu-cli --locked
@@ -883,494 +809,28 @@ This release has 30 layers, hidden width 576, 9 query heads, 3 KV heads,
 configuration names bfloat16, this stored checkpoint contains float32 weights;
 estimation follows selected materialization/state metadata.
 
-## Observed calibration (2026-09-22)
+## Validation coverage
 
-Fresh debug builds ran on macOS/aarch64, MLX Metal, 256 GiB unified physical
-capacity. The backend could not observe current available capacity; application
-budget comparisons below therefore make no claim about free system memory.
-Allocator caching was disabled. All eight requested greedy output tokens matched
-between full and chunked prefill, for both weight formats and prompt lengths.
+[Mixed-storage validation](mixed-storage-gemm.md#validation-evidence) provides
+pinned GGUF release measurements, exact logits and cached-generation parity,
+controlled/speculative coverage, native allocation evidence and cold/loaded
+forecast comparisons. [Conversion retention](conversion-retention-validation.md)
+documents ownership, trim, fallback and policy/cache matrix checks.
 
-Values below are MiB. Forecast upper ends exclude the separate 256 MiB safety
-reserve. The error column is `(forecast upper / measured MLX peak - 1) × 100`.
-This is calibration on these cases, not independent validation of universal bounds.
-
-| Weights | Input positions | Chunk | MLX active peak | Forecast upper | Upper excess | Process peak RSS |
-|---|---:|---:|---:|---:|---:|---:|
-| float32 | 32 | full | 574.6 | 616.9 | 7.4% | 633.8 |
-| float32 | 32 | 512 | 574.6 | 616.9 | 7.4% | 636.4 |
-| float32 | 2000 | full | 2633.8 | 3310.2 | 25.7% | 637.9 |
-| float32 | 2000 | 512 | 1302.0 | 1350.8 | 3.7% | 635.6 |
-| affine 4-bit | 32 | full | 244.1 | 275.2 | 12.8% | 483.1 |
-| affine 4-bit | 32 | 512 | 250.0 | 275.2 | 10.1% | 475.2 |
-| affine 4-bit | 2000 | full | 2296.6 | 2968.5 | 29.3% | 479.1 |
-| affine 4-bit | 2000 | 512 | 866.5 | 1009.0 | 16.4% | 479.0 |
-
-Process footprint also demonstrates the estimate's coverage limit: it ranged
-from 968–2,089 MiB for float32 and 802–1,815 MiB for four-bit runs. The four-bit
-short-request footprint exceeded the modeled generation upper plus the default
-reserve. Executable/shared-library pages and unrelated process allocations need
-additional application headroom; this model/request forecast must not be used
-as a process-footprint bound. Library consumers can supply their own overhead
-interval and reserve after measuring their deployment.
-
-For the long prompt, chunking reduced measured active-allocation peaks by 50.6%
-(float32) and 62.3% (4-bit). Process RSS changed little: it is a different counter
-and must not be substituted for the MLX peak or added to it as disjoint storage.
-
-With a **2 GiB application budget**, float32 chunked cold inspection reported
-`LikelyFit`: its loading-inclusive upper was 1,414.3 MiB; with the 256 MiB reserve
-it remained below the budget. Full prefill reported `InsufficientInformation`
-because its interval crossed that budget; its actual 2,633.8 MiB MLX peak exceeded
-it. A **512 MiB** budget reported `LikelyShortfall`, and `--memory-policy refuse`
-exited with status 1 before model loading. These are modest application budgets,
-not the host's 256 GiB capacity. Cold inspection plus candidate recomputation
-took 37–39 ms per fresh process on this checkpoint.
-
-An earlier run of cached official `LiquidAI/LFM2.5-1.2B-Instruct` revision
-`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`, with 128 input positions and eight
-decode tokens, completed successfully while reporting an unavailable workspace
-upper bound. Its recurrent workspace was not treated as zero and ordinary
-generation remained available. This is coverage of the uncertainty path, not
-calibration of hybrid-model peak estimates. The new hybrid calibration below
-supersedes that workspace gap.
-
-Native distributed placement, media workspace and other model/hardware
-calibrations remain open. CUDA validation was explicitly deferred. The native
-fixture checks and portable domain tests do not establish those native results.
-
-## Hybrid calibration (2026-09-23)
-
-Native tests used macOS/aarch64, Metal and the same 256 GiB unified-memory host.
-The cached official `LiquidAI/LFM2.5-1.2B-Instruct` revision was
-`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`. Its 2,340,697,936-byte
-`model.safetensors` SHA-256 was verified as
-`1ba63d9adb03ae43581db0e136e4416febe0441aff7296397bd455fb6017f73a`.
-The model has 16 layers (10 convolution, six attention), hidden width 2,048,
-normalized MLP width 8,192, 32 query heads, eight KV heads and kernel width three.
-Selected state storage is BF16. A nonzero float32 fixture additionally covers
-one-token, 17-position and 39-position prompts.
-
-Each run disables allocator caching, requests eight greedy tokens and a
-four-token prefill chunk (correctly normalized to the full prompt). After four
-committed predictions it forecasts four more tokens at a synchronized boundary.
-It compares cold/loaded geometry, ordinary/controlled forecasts and output tokens,
-and verifies that forecasts allocate no active native bytes. The table records
-additional active-memory growth above loaded parameters, not process RSS. The
-256 GiB application budget makes these calibration cases observable. Before
-recalibration, a separate 16 GiB-budget check rejected `LikelyFit` for the
-2,000-position request; updated results appear below.
-
-The following measurements precede shared K/V preparation; updated measurements
-appear below. All values are MiB; upper ends are calibrated envelopes, not tight
-projections.
-
-| Source | Positions | Cold lifecycle upper | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
-|---|---:|---:|---:|---:|---:|---:|
-| SafeTensors BF16 | 128 | 5296.5 | 786.9 | 546.0 | 124.3 | 13.9 |
-| SafeTensors BF16 | 2000 | 187728.0 | 185495.7 | 67375.7 | 865.1 | 159.2 |
-| SafeTensors affine 4-bit / BF16 | 128 | 3876.2 | 786.9 | 572.5 | 124.3 | 13.1 |
-| SafeTensors affine 4-bit / BF16 | 2000 | 186307.7 | 185495.7 | 67485.1 | 865.1 | 159.5 |
-| GGUF BF16/mixed | 128 | 8686.2 | 6453.7 | 4960.2 | 5738.6 | 4483.7 |
-| GGUF BF16/mixed | 2000 | 349607.0 | 347374.5 | 110485.0 | 6901.7 | 4705.7 |
-
-The GGUF run used official `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` revision
-`6767265158422fb8a19c62ceb45f16f05363615b`, file
-`LFM2.5-1.2B-Instruct-BF16.gguf` (2,343,326,528 bytes), with verified SHA-256
-`3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b`.
-Pass that file as `EREDU_LFM2_MEMORY_MODEL` to reproduce. At this calibration stage,
-its 128-position fresh/continuation forecasts reported `LikelyFit`, while the
-2,000-position fresh forecast remained `InsufficientInformation` because its
-finite interval crossed host/application capacity. That was interval uncertainty rather than
-missing workspace coverage. Parameter casts explain much of the GGUF continuation
-cost; the broader envelope intentionally covers both promoted storage and casts.
-
-The first convolution-only extension underpredicted the SafeTensors cases. Before
-shared K/V preparation, the long case retained about 66 GiB of extra active allocations through explicit
-input-score attention. Query tiling does not imply bounded whole-graph retention.
-The native-copy envelope covers that measured behavior conservatively.
-
-Reproduce with a cached immutable snapshot (no downloads or cache edits occur):
+Portable tests cover physical pools, unknown bounds, checked arithmetic, cache
+frontiers, resource lifetimes, serialization, budget verdicts and read-only
+observations. Native tests validate allocation envelopes and unchanged request
+state at settled boundaries. Hardware coverage is explicit in each evidence
+manifest; it does not establish universal allocator or process-memory bounds.
 
 ```sh
-EREDU_LFM2_MEMORY_MODEL=/path/to/LFM2.5-1.2B-Instruct/snapshot \
-EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
-cargo test -p eredu --features mlx,metal --offline \
-  --test native_execution_control native_lfm2_workspace_forecasts \
+cargo test -p eredu-core -p eredu-runtime --locked
+cargo test -p eredu-architectures --lib --locked
+cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance --locked
+cargo test -p eredu --no-default-features --features mlx,metal \
+  --test native_execution_control native_generic_workspace --locked \
   -- --ignored --nocapture --test-threads=1
 ```
-
-Without environment variables the same test uses the small float32 fixture.
-The optional `EREDU_LFM2_MEMORY_QUANTIZED=1` requests affine 4-bit weights with
-64-value groups. The pinned BF16 SafeTensors checkpoint now passes the same
-128/2,000-position matrix, including continuation and controlled-session parity.
-The earlier failure compared an admitted BF16 recipe with an unloaded Float32
-source slot. Exact-task quantization now retains the recipe's precision and checks
-only the source slot's shape and floating category. Generated affine scales and
-biases remain BF16; quantization does not reduce activation or attention scratch
-precision. A nonzero native CPU regression covers F16, BF16 and F32 sources,
-compares packed weights/scales/biases with direct native quantization, and preserves
-rejections for incompatible source shapes and integer slots.
-
-### Shared K/V preparation validation (2026-09-23)
-
-Repeating the same pinned models, commands and 128/2,000-position matrix after
-sharing prepared K/V across query tiles produced these active-memory measurements
-(MiB). At that stage, forecast upper ends remained unchanged from the preceding table.
-
-| Source | Positions | Measured growth | Continuation growth |
-|---|---:|---:|---:|
-| SafeTensors BF16 | 128 | 525.0 | 15.5 |
-| SafeTensors BF16 | 2000 | 20641.3 | 175.1 |
-| SafeTensors affine 4-bit / BF16 | 128 | 552.5 | 15.5 |
-| SafeTensors affine 4-bit / BF16 | 2000 | 20641.3 | 175.1 |
-| GGUF BF16/mixed | 128 | 4924.2 | 4483.7 |
-| GGUF BF16/mixed | 2000 | 16922.5 | 4705.7 |
-
-Long-prompt SafeTensors growth fell from 65.8 GiB to 20.2 GiB (about 69%).
-Continuation measurements did not improve: SafeTensors growth increased modestly,
-while GGUF remained unchanged. All runs passed cold/loaded forecast checks,
-continuation bounds and controlled-session output parity. These observations do
-not establish a throughput improvement or bounded whole-graph retention.
-
-An isolated Metal allocation regression compares shared preparation with separate
-preparation for every query tile: 22,683,712 versus 69,869,632 peak bytes, with
-bit-identical output. Numerical coverage also includes an independent PyTorch
-fixture on CPU and Metal, F32/F16/BF16, grouped heads, multiple batches, unequal
-K/V widths, boolean/additive masks, sinks, softcaps, partial query tiles and both
-sides of the 8,192-key threshold. That change added no tile evaluation barriers;
-the subsequent bounded-batch change is measured separately below.
-
-### Bounded tile-graph validation (2026-09-23)
-
-The follow-up bounds live full-key tile graphs by evaluating 32-tile batches and
-keeping their completed output arrays for final concatenation. Shared prepared
-K/V stays resident across batches. Calls that fit within one batch remain lazy; the
-longer-than-8,192-key blockwise path is unchanged. This limits temporary graph
-retention, not total request memory: inputs, K/V, completed outputs and other
-model state still grow with request geometry. These measurements preceded the
-forecast recalibration below; their envelopes were unchanged and conservative.
-
-Measurements used an Apple M3 Ultra with 256 GiB unified memory, Metal, the default
-Cargo test profile and allocator cache limit zero. The isolated BF16 benchmark
-uses head width 64, four query heads per KV head, 2,000 key positions, a boolean
-mask, sink logits and softcap. Each configuration has two warmups and five
-synchronized samples; timing includes graph construction, evaluation and stream
-completion. Peak growth is active allocator bytes above already evaluated inputs,
-not process RSS. All batch sizes produce bit-identical outputs to fully lazy
-shared-K/V execution.
-
-| Queries / heads | Live tile batch | Peak growth (MiB) | Median time (ms) |
-|---|---:|---:|---:|
-| 513 / 16 | Fully lazy | 463.6 | 125.9 |
-| 513 / 16 | 1 | 16.2 | 272.8 |
-| 513 / 16 | 8 | 40.8 | 221.8 |
-| 513 / 16 | 16 | 68.9 | 149.5 |
-| 513 / 16 | 32 | 125.0 | 148.6 |
-| 2000 / 32 | Fully lazy | 3507.9 | 591.7 |
-| 2000 / 32 | 1 | 38.2 | 1742.8 |
-| 2000 / 32 | 8 | 86.7 | 809.8 |
-| 2000 / 32 | 16 | 142.2 | 731.6 |
-| 2000 / 32 | 32 | 253.0 | 609.9 |
-
-The selected 32-tile batch reduces peak growth by 92.8% with 3.1% more elapsed
-time for the larger case. For the smaller case it reduces peak growth by 73.0%
-with 18.0% more elapsed time. Smaller batches save more memory but incur more
-synchronization overhead.
-
-These numbers expose the synchronization cost rather than assuming a throughput
-win. Timing depends on device, geometry, cache policy and host build profile.
-There is no timing assertion in the regression; it checks exact output parity
-and a broad reduction in peak active memory. Reproduce the sweep with:
-
-```sh
-cargo test -p eredu-backend-mlx --features metal --offline --lib \
-  bounded_input_score_tile_graph_batches_release_temporaries \
-  -- --ignored --nocapture --test-threads=1
-```
-
-The pinned official SafeTensors BF16 model above was measured against
-`2776e4c5` (shared K/V, fully lazy tile graphs), using the same timing instrumentation
-in both binaries. For each prompt length, one warmup preceded three measured runs.
-Each run resets the model, supplies repeated token ID 1 and generates eight greedy
-tokens. The timing excludes loading, forecasting and the separate controlled
-parity run; total generation time includes synchronization after four and eight
-tokens. The first-token timer ends when the iterator returns the materialized
-prediction. All values below are warmed medians except peak active-memory growth.
-
-| Positions | Tile evaluation | Peak growth (MiB) | First token (ms) | Eight tokens (ms) |
-|---|---|---:|---:|---:|
-| 128 | Fully lazy | 525.0 | 308.0 | 509.3 |
-| 128 | Batches of 32 | 525.0 | 307.3 | 503.5 |
-| 2000 | Fully lazy | 20641.3 | 7700.9 | 7951.7 |
-| 2000 | Batches of 32 | 1516.7 | 7895.3 | 8149.6 |
-
-At 2,000 positions, peak growth fell 92.7% (20.16 to 1.48 GiB), with 2.5% longer
-median generation time. Effective prompt throughput through the first prediction
-was 259.7 versus 253.3 tokens/s. The measured eight-token ranges were
-7,947–8,035 ms before and 7,916–8,269 ms after; this short local experiment is not a
-cross-device performance guarantee. The 128-position case stays below the batching
-threshold, and its memory measurement is unchanged. Reproduce the full-model
-timing matrix with the preceding calibration command and
-`EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000,128,2000,128,2000`.
-
-The same 128/2,000-position validation passed for the pinned affine 4-bit
-SafeTensors and mixed-precision BF16 GGUF paths. Their 2,000-position peak growth
-was 1,516.7 and 4,908.4 MiB respectively, versus 20,641.3 and 16,922.5 MiB before
-batching. Continuation growth remained 175.1 and 4,705.7 MiB; GGUF parameter casts
-still dominate that continuation cost. Every source passed ordinary/controlled
-output parity and cold, loaded and continuation forecast checks. CPU and Metal
-F32/F16/BF16 numerical tests cross the 32-tile boundary with grouped heads,
-multiple batches, unequal K/V widths, masks, sinks, softcaps and a partial final
-group. The backend's Metal Clippy and portable feature check also pass.
-
-### Forecast recalibration after tile retention improvements (2026-09-23)
-
-The native retention facts now distinguish full-key reuse/batching from legacy
-per-tile retention. For a batch size `B`, query width `W`, query-head count `H`,
-key positions `K`, query positions `Q` and scalar width `S`, the full-key extra
-allowance per live layer is:
-
-```text
-4 * B * W * K * S                         shared K/V and contiguous layouts
-+ 32 * B * H * min(Q, tile_rows * 32) * (K + 1)  live score scratch, including a sink
-+ 2 * B * W * Q * S                       completed outputs and concatenation
-```
-
-`tile_rows` follows the native 8,192-element/32-query-row policy. Mixed-width
-execution uses at least four bytes for `S`. Existing layer overlap, score-matrix
-fallback, convolution, parameter-cast and graph allowances remain in place. These
-are upper planning envelopes, not expected allocations. Above 8,192 keys the
-old per-tile whole-context envelope is retained. Old serialized mechanism records
-without `full_key_tiles` keep their declared copy/score allowances; an absent
-mechanism still leaves the workspace upper unknown.
-
-The isolated softcap/mask/sink benchmark showed that 16 working bytes per score
-element was insufficient on its own. The new 32-byte allowance covers that
-measured per-invocation peak without depending on model-wide overlap to hide the
-difference. The regression now checks the published bound against active allocator
-telemetry. This calibration changes no attention arithmetic or BF16 rounding.
-
-The same pinned checkpoints, Metal host, zero allocator cache and eight-token
-128/2,000-position matrix produced the following results (MiB):
-
-| Source | Positions | Cold lifecycle upper | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
-|---|---:|---:|---:|---:|---:|---:|
-| SafeTensors BF16 | 128 | 5296.5 | 818.2 | 525.0 | 125.0 | 15.5 |
-| SafeTensors BF16 | 2000 | 14916.7 | 12684.5 | 1516.7 | 875.0 | 175.1 |
-| SafeTensors affine 4-bit / BF16 | 128 | 3876.2 | 818.2 | 552.5 | 125.0 | 15.5 |
-| SafeTensors affine 4-bit / BF16 | 2000 | 13496.5 | 12684.5 | 1516.7 | 875.0 | 175.1 |
-| GGUF BF16/mixed | 128 | 8667.4 | 6434.9 | 4924.2 | 5739.4 | 4483.7 |
-| GGUF BF16/mixed | 2000 | 21014.5 | 18782.0 | 4908.4 | 6911.7 | 4705.7 |
-
-Every measured peak remains below its forecast upper. At 2,000 positions the
-SafeTensors loaded additional upper falls from 181.15 GiB to 12.39 GiB; both
-original and affine 4-bit runs now report `LikelyFit` with a 16 GiB application
-budget. The GGUF run still reports `InsufficientInformation` at that budget: its
-remaining conservative cast/activation envelope crosses capacity. Small or
-single-query upper ends can rise slightly because the corrected score allowance
-also applies there. Budgets below the lower bound still report `LikelyShortfall`.
-
-The native allowance regression also covers F16 and F32 short prefill, 2,000-row
-batched prefill and single-row cached decode. For the long case, measured peaks
-were 256,512,512 and 147,587,584 bytes against allowances of 311,427,072 and
-360,579,072 bytes respectively. These isolated checks include softcap, boolean
-mask and sink logits. They validate the per-invocation facts independently of
-the model's layer-overlap allowance.
-
-Full-model numerical validation compares revision `1aa87493` with the recalibrated
-implementation using the same native test harness and pinned BF16 checkpoint.
-For both 128 and 2,000 input positions, every one of the 65,536 logits at each
-of eight predictions matches bit-for-bit: prefill plus seven cached decode
-steps. All eight greedy tokens match raw generation, and explicit controlled
-stepping matches ordinary observed execution at every prediction. The comparison
-stores float32 host-logit bit patterns rather than decimal float approximations.
-The small F32 fixture additionally covers 17/513 positions. This is regression
-parity against the previous implementation; independent PyTorch attention
-fixtures continue to validate the BF16 rounding contract.
-
-To reproduce the before/after comparison, build the previous revision with the
-same `native_lfm2_forecast_recalibration_preserves_logits` test harness, then run
-it with `EREDU_LFM2_PARITY_WRITE=/tmp/lfm2-parity.json`. Run the current revision
-with `EREDU_LFM2_PARITY_REFERENCE=/tmp/lfm2-parity.json`:
-
-```sh
-EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct/snapshot \
-EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
-EREDU_LFM2_PARITY_REFERENCE=/tmp/lfm2-parity.json \
-cargo test -p eredu --features mlx,metal --offline \
-  --test native_execution_control native_lfm2_forecast_recalibration_preserves_logits \
-  -- --ignored --nocapture --test-threads=1
-```
-
-Without a reference-file variable the test still checks raw/observed/controlled
-token parity and exact prefill/cached logits across ordinary and controlled runs.
-Native CUDA calibration remains unvalidated on this Metal host.
-
-Portable verification passed 28 memory-estimation tests, cold-selection cache
-invalidation, 96 backend-conformance tests and 27 portable-facade tests (one
-preexisting ignored case). Strict Clippy passed for the portable contracts,
-architectures, backend and native facade test harness.
-
-### Resident parameter conversion reuse (2026-09-23)
-
-This calibration measured the former unlimited policy. Current loads use the
-bounded default described in the [consumer contract](#controlling-parameter-conversion-retention);
-select explicit unlimited retention to reproduce these historical reuse results.
-
-Fully resident MLX dense projections can retain evaluated F32 conversions when
-F32 activations meet F16/BF16 parameters. This covers the mixed-width GGUF case
-without changing BF16 arithmetic or introducing casts for narrow activations.
-Tied aliases share a conversion. Reset preserves it; parameter publication
-revokes it, and dropping the resident owner releases it. Restoring a replaced
-parameter uses temporary casts until a new resident materialization enables reuse.
-Host-layerwise and disk-streamed policies keep temporary casts within their
-existing admission policy. An explicit device-residency ceiling also disables
-conversion retention, so derived storage cannot bypass that ceiling.
-
-`StaticMemoryReport.current_device_parameter_conversion_bytes` is the exact
-retained subset already included in `current_device_resident_bytes`. Do not add
-it again. Logical parameter sizes and bounded-residency ledger/telemetry remain
-the original parameter bytes. Resident session reports query their live owner,
-so later forecasts observe conversions created since loading. Loaded and
-continuation forecasts remove retained conversions from the pending cast allowance
-while preserving promoted activation/state sizing. Cold forecasts still reserve
-the full potential conversion payload; mixed-width detection now applies to all
-covered dense geometries. F32 activation and projection-logit upper allowances
-remain in force even when every cast is already resident; nominal lower bounds
-are unchanged. Neither inspection nor forecasting populates the cache.
-
-Using the same pinned BF16/mixed GGUF, Metal host, zero allocator cache and eight
-greedy output tokens as above, the first 128-position request retained exactly
-4,680,843,264 bytes (4,464.0 MiB). That count remained unchanged after reset and
-repeated 128/2,000-position requests. Measured incremental peaks and forecast
-upper bounds were (MiB):
-
-| Request | Loaded additional upper | Measured growth | Continuation upper | Continuation growth |
-|---|---:|---:|---:|---:|
-| 128, cache initially empty | 6450.9 | 4944.2 | 159.6 | 19.7 |
-| 128, conversions resident | 870.9 | 480.2 | 159.6 | 19.7 |
-| 2000, conversions resident | 13452.0 | 1332.1 | 1331.8 | 241.7 |
-
-The earlier 2,000-position continuation required 4,705.7 MiB of additional peak
-memory. Reuse trades those repeated casts for resident storage; smaller additional
-peaks do not imply lower total model memory. Cold lifecycle upper bounds are
-8,683.4/21,264.5 MiB for 128/2,000 positions. The conservative 2,000-position
-forecast still crosses a 16 GiB application budget. Warm eight-token timings
-were 131.2 ms at 128 positions and 1,079–1,116 ms at 2,000; these are local
-observations, not a cross-device throughput guarantee.
-
-Reproduce the memory checks with the preceding native forecast command, the
-pinned GGUF path, `EREDU_LFM2_RETENTION=unlimited`,
-`EREDU_LFM2_MEMORY_LENGTHS=128,2000,128,2000` and
-`EREDU_LFM2_MEMORY_EXPECT_PARAMETER_CONVERSIONS=1`. The latter asserts that the
-public report actually contains the retained conversions and that warm requests
-reuse them. Tests also check unchanged logical bytes, exact device residency
-growth, reset retention, ordinary/controlled forecasts and measured peaks.
-
-Against revision `a43a3171`, all 65,536 logits at each of eight predictions match
-bit-for-bit for both prompt lengths, including prefill, seven cached decode
-steps, raw tokens and ordinary/controlled execution. The same parity command
-above accepts this GGUF path and a reference exported from that revision.
-Focused native tests cover F16/BF16 promotions, alias reuse, narrow-input bypass,
-read-only parameter inspection, publication/restoration invalidation and owner
-release, and explicit device ceilings. The original BF16 SafeTensors checkpoint
-also passed the 128/2,000-position numerical, token, controlled-session and memory
-checks, retaining zero conversions and unchanged measured memory. Portable tests cover cold mixed-width Llama geometry, loaded forecast
-deductions and old JSON reports without the new observation.
-
-## Focused verification
-
-- Cold chunking follow-up: portable preparation tests cover supported and absent
-  backend mechanisms, Llama, LFM2, routed, composite, prediction and partitioned
-  selections. CPU/Metal fixture tests compare cold support with the loaded executor
-  across resident, host, disk and affine-quantized paths. Rebuilt CLI cold reports
-  on the pinned SmolLM and LFM2.5 checkpoints above used 2,000 input positions,
-  eight output positions, a requested 512-token chunk and zero allocator cache.
-  SmolLM retained 512 and recomputed smaller-chunk savings; LFM2.5 used all 2,000
-  positions, reported the architecture's full-pass reason and suggested no chunk
-  savings. At that time the workspace upper was unknown; the hybrid calibration
-  now supplies the missing coverage.
-- Prepared-request facade forecasts are covered with a neutral mock backend:
-  exact request settings, resident-byte deduction independent of allocator activity,
-  calibration overrides, chunk recomputation, trace-only controlled parity,
-  capture uncertainty and foreign-session rejection. Native CPU/Metal tests compare
-  declared final-row/full-logit contracts with actual output shapes and check that
-  reset restores fresh-request forecast coverage.
-- The loaded CLI smoke test on the pinned SmolLM checkpoint used `--no-auto --raw
-  --max-tokens 4 --mlx-cache-limit-bytes 0 --memory-report report.json Hello`.
-  It reported `LikelyFit`, resident parameters of 538,060,032 bytes, a generation
-  upper of 607,219,820 bytes and additional upper of 69,159,788 bytes. The loaded
-  lifecycle upper equaled the generation upper, excluding completed loading.
-
-- Cache-policy follow-up: native getter/setter/restore tests passed on CPU and
-  Metal, including a native C setter bypassing the Rust wrapper and repeated
-  queries preserving populated cache. Local facade policy tests passed on both
-  builds; portable facade/conformance tests passed (19 and 82, one preexisting
-  ignored test). CUDA getter implementation is present but was not run locally.
-- On the pinned SmolLM checkpoint above, `target/debug/eredu --model
-  /tmp/eredu-memory-validation/SmolLM-135M --no-auto --estimate-memory-tokens 16
-  --max-tokens 4` observed the native default cache limit of 261,134,011,596 bytes
-  and produced a finite loading-inclusive upper of 262,616,979,148 bytes without
-  a cache flag. Its interval crossed available memory and honestly remained
-  `InsufficientInformation`; an explicit proposed zero-cache policy reported
-  `LikelyFit`. Metal tests and the default-policy CLI observation ran outside
-  the sandbox; a denied Metal query remained an explicit unknown.
-- Managed cache-default calibration (2026-09-23): pinned SmolLM-135M above,
-  original weights, Metal on this 256 GiB Mac, 256/2,000 repetitions of ` hello`,
-  512-token prefill chunks, 32 generated tokens, temperature zero. Each case ran
-  in two fresh processes using `target/debug/eredu --model
-  /tmp/eredu-memory-validation/SmolLM-135M --no-auto --raw --max-tokens 32
-  --temperature 0 --prefill-chunk-size 512 --telemetry-json <output>` with
-  `--mlx-cache-limit-bytes 33554432`, `268435456`, or the prior untouched native
-  default (261,134,011,596 bytes on this host; supply that explicit byte limit
-  to reproduce the native-policy comparison after this default-policy change).
-  Checkpoint provenance is unchanged. Median observations:
-
-  | Prompt positions | Cache policy | Decode tokens/s | Retained cache MiB |
-  | --- | --- | --- | --- |
-  | 256 | 32 MiB | 73.84 | 31.6 |
-  | 256 | 256 MiB | 74.47 | 254.8 |
-  | 256 | Native | 75.56 | 419.6 |
-  | 2,000 | 32 MiB | 70.89 | 32.1 |
-  | 2,000 | 256 MiB | 71.21 | 255.5 |
-  | 2,000 | Native | 74.31 | 1,950.4 |
-
-  The selected 256 MiB ceiling traded about 1.4–4.2% decode throughput for
-  lower retention here. This short, single-model calibration does not establish
-  an optimal ceiling for large, routed, distributed or realtime models; those
-  applications can preserve native policy or choose an explicit limit. The
-  native limit is a retention policy, not a strict total-allocation guarantee.
-
-  After rebuilding with managed initialization, the loaded CLI smoke command
-  above with no cache flag reported `likely_fit`, a 268,435,456-byte managed cache
-  limit and a 875,655,276-byte generation upper bound. Native provenance tests
-  run in fresh CPU/Metal processes and cover default configuration, preservation,
-  unchanged-value direct native setters, setter/initializer races, and smaller
-  native defaults. Facade tests also verify that forecasts leave policy untouched.
-  CUDA carries the same native implementation but was not compiled or executed
-  on this macOS validation host.
-
-- `cargo test -p eredu-runtime --lib memory_estimation`: 20 tests, covering
-  overlap, placement, state growth, unknowns, overflow and recomputed candidates.
-- `cargo test -p eredu-architectures --lib memory_estimation::tests`: 3 tests.
-- `cargo test -p eredu-core`: 254 tests, including shared-driver parity and
-  between-chunk cancellation; facade cancellation without a first token is
-  covered separately.
-- `cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance`:
-  19 and 82 passed respectively; one preexisting ignored facade test.
-- `cargo test -p eredu-backend-mlx --features metal --test chunked_prefill --locked -- --test-threads=1`:
-  CPU and Metal passed, outside the sandbox. Nonzero dense/sliding GQA fixtures
-  cover prompts of 1, 3 and 9 tokens, chunk sizes 1, 2, 4 and 32, three cached
-  decode steps, resident/host/disk paths and affine four-bit weights. Full
-  observed logits and chunked results agree within absolute tolerance `2e-4`;
-  ordinary and controlled greedy token sequences match exactly.
-- Portable core/runtime/architecture checks, the portable facade check, and
-  `cargo check -p eredu-backend-mlx --no-default-features` passed. Package lists
-  and offline `cargo package --no-verify --allow-dirty` for core, runtime,
-  architectures and facade passed. This verifies archive inclusion/resolution,
-  not the full release script's extracted-package/all-target test matrix.
-
 
 ## Mid-session continuation forecasts
 
@@ -1409,7 +869,7 @@ bytes are not measured distinct backing and grant no already-resident credit.
 MLX combines installed native state storage with its existing continuation-growth
 mechanism. That mechanism covers capacity rounding, sliding-cache retention and
 interior peaks of remainder-shaped state. These are conservative logical storage
-allowances, not measured distinct backing. The same bound covers possible old and
+allowances, not measured distinct backing. The same bound covers possible installed and
 replacement cache overlap. Sampler/history/pending-input retention, admitted
 capture geometry (or explicit capture/intervention limit fallbacks) and the controlled facade's decoder, constraints,
 semantic records and trace are included. Live snapshots and branches contribute
@@ -1447,59 +907,29 @@ autoregressive and embedded lanes use the separate speculative continuation plan
 the prepared speculative forecast still covers fresh speculative runs.
 
 
-Initial continuation validation (2026-09-23, before tightening the semantic-history
-allowance below): portable tests cover pending-token offsets,
-zero and extended horizons, overflow/shortfall/unknown growth, interior remainder
-peaks, unchanged output/copy/trace budgets, restore, branch exchange and failed
-iterator settlement. Native Metal validation used the nonzero Qwen2 dense and
-mixed sliding-window fixtures (`sliding_window = 2`), each with a 33-position
-prefill, a saved continuation, and 16 further forced ordinary tokens. Additional
-upper allowances were 339,639,607 and 339,627,319 bytes; measured incremental native
-active peaks were 16,854 and 7,636 bytes. The Gemma2 fixture confirmed bounded
-native state while preserving its independently unmodeled workspace.
+Continuation conformance covers pending-token offsets, zero and extended horizons,
+overflow/shortfall/unknown growth, interior state maxima, restore, branch exchange
+and failed iterator settlement. Native fixtures check bounded state and unchanged
+allocation, tokens and snapshot usage during forecasting.
 
-The pinned original-weight SmolLM-135M checkpoint at revision
-`1d461723eec654e65efdc40cf49301c89c0c92f4` also passed on Metal: four prompt
-positions, 16 further forced ordinary tokens, restore, and an ordinary iterator
-forecast after explicit settlement. The additional upper was 352,293,335 bytes;
-measured incremental native active peak was 3,102,774 bytes. Default allocator and
-graph allowances dominate these small runs; these observations do not calibrate
-all models or make the logical envelopes allocation guarantees. The local
-`/tmp/eredu-spec-validation/model` copy uses the same original weights and a
-literal content-only chat template added to tokenizer metadata. Reproduce with:
+Semantic-history tests use a 64 MiB trace budget and cover empty, escaped, Unicode
+and large event payloads. Doubling the budget adds one budget to future semantic
+history and one to separately retained encoded trace; branch reservations charge
+only the fresh child's budget. Capture, restore and branch exchange preserve
+cumulative accounting.
 
 ```sh
 cargo test -p eredu --features mlx,metal --test native_execution_control \
   native_continuation_forecasts -- --ignored --nocapture --test-threads=1
-EREDU_CONTINUATION_MODEL=/tmp/eredu-spec-validation/model \
+EREDU_CONTINUATION_MODEL=/path/to/model-with-chat-template \
   cargo test -p eredu --features mlx,metal --test native_execution_control \
   native_continuation_forecasts -- --ignored --nocapture --test-threads=1
 ```
 
-The same fixture test can run without Metal using `--no-default-features
---features mlx` and omitting `--ignored`; this change was validated natively on
-Metal, not CUDA or a CPU-only MLX build.
+The fixture can also run with `--no-default-features --features mlx`, omitting
+`--ignored`. Metal validation does not establish CUDA or CPU-only MLX coverage.
 
-
-Semantic-history regression validation uses a 64 MiB trace budget, checks the
-logical-storage/charged-record relationship for every semantic event variant
-(including empty, escaped, Unicode and large string payloads), and exercises
-capture-enabled forecasts, restore and branch exchange. Doubling the budget adds
-one budget's worth to future semantic history and one to the separately retained
-encoded trace. Branch reservations grow only once with the fresh child budget.
-
-
-The updated native test uses a 64 MiB trace budget. On the same pinned original
-SmolLM-135M checkpoint, four prompt positions and 16 further forced tokens produced
-a retained upper of 136,357,159 bytes (about 130 MiB) and an additional generation
-upper of 482,707,361 bytes. The measured incremental native active peak remained
-3,102,774 bytes. Forecasting changed neither active native allocation nor snapshot
-usage. The earlier calibration above used a 64 KiB trace budget and the older
-semantic-history multiplier; use the commands above to reproduce the current
-64 MiB regression case.
-
-
-## Reusable mechanism descriptions (phase 4)
+## Reusable mechanism descriptions
 
 Low-level consumers can obtain `eredu_nn::mechanism_memory::MechanismInvocation`
 from ordinary projection/convolution/grouped-linear specs or actual attention and
@@ -1518,16 +948,15 @@ dequantization. Cache-instance queries validate installed geometry, preserve the
 frontier, and describe actual reserved capacity and backing reuse. Parameter
 conversions with unknown residency ownership do not become fresh allocations.
 
-These descriptions are inputs for generic lifetime composition, not a new
-bounded forecast. Logical tensor bytes and physical allocation capacity are
+These descriptions are inputs for generic lifetime composition, not standalone
+bounded forecasts. Logical tensor bytes and physical allocation capacity are
 separate: views/no-op casts can alias, lazy intermediate records are not a live
 peak, and query/key tiles can overlap until evaluation. Opaque MLX kernel scratch,
 allocator capacity, unresolved owner identity and unsupported native selection
-facts remain named gaps. Existing generation/continuation forecasts and wire
-records are unchanged in this phase; no previously unsupported family receives a
-verdict solely because its reusable mechanisms now expose descriptions.
+facts remain named gaps. Finite forecasts require covered invocation topology,
+native mechanism facts and resource lifetimes together.
 
-## Generic lifetime composition (phase 5)
+## Generic lifetime composition
 
 `eredu_runtime::resource_lifetimes::compose_resource_peaks` accepts a
 `ResourceLifetimePlan` containing acquisitions and explicit native-completion,
@@ -1549,106 +978,13 @@ Plans must declare their coverage. Unknown coverage, placement or retention
 prevents a finite complete peak. Unknown capacity remains separate from known
 payload, and independent resources' horizon maxima do not become a simultaneous
 lower bound. Composition reads descriptions only; it does not run inference,
-consume budgets or issue a fit verdict. Existing forecast APIs remain unchanged
-until their workspace projections are migrated in phase 6.
+consume budgets or issue a fit verdict. Forecast APIs use the composed resource
+peaks with their capacity and budget policy.
 
 
-### Generic target-workspace migration (2026-09-23)
+### Embedded prediction resource descriptions
 
-Phase 6 replaces production family workspace formulas with ordinary construction
-specifications and reusable mechanism/lifetime composition. The previous CLI
-baseline was revision `2bde9278`. Validation used the same pinned checkpoints,
-Metal device, greedy eight-token requests and disabled allocator cache before
-and after the migration. SmolLM-135M used HuggingFace revision
-`1d461723eec654e65efdc40cf49301c89c0c92f4`; LFM2.5-1.2B-Instruct used revision
-`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`. Load-time 4-bit runs used the CLI's
-affine transformation. Prompts were repetitions of `" hello"`; the table reports
-the resolved model-position count.
-
-The upper bounds below are total modeled generation memory in MiB; measured
-peaks are MLX active-allocation high-water marks. They exclude allocator cache
-here, and are not total process or unified-memory pressure. The 64 MiB graph
-allowance remains part of each forecast. Source checkpoint loading is excluded
-from this generation comparison.
-
-| Model / weights | Positions | Chunk | Previous upper MiB | Generic upper MiB | Measured peak MiB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| SmolLM F32 | 32 | 0 | 616.9 | 628.6 | 577.1 |
-| SmolLM F32 | 32 | 512 | 616.9 | 628.6 | 577.9 |
-| SmolLM F32 | 2000 | 0 | 3310.2 | 4042.6 | 2633.8 |
-| SmolLM F32 | 2000 | 512 | 1350.8 | 1538.3 | 1283.2 |
-| SmolLM 4-bit | 32 | 0 | 275.2 | 286.9 | 250.0 |
-| SmolLM 4-bit | 32 | 512 | 275.2 | 286.9 | 246.2 |
-| SmolLM 4-bit | 2000 | 0 | 2968.5 | 3700.9 | 2296.6 |
-| SmolLM 4-bit | 2000 | 512 | 1009.0 | 1196.6 | 866.5 |
-| LFM2.5 BF16 | 129 | 0 | 3057.5 | 3088.5 | 2768.3 |
-| LFM2.5 BF16 | 2001 | 0 | 14923.5 | 14492.9 | 3750.3 |
-| LFM2.5 4-bit | 129 | 0 | 1637.3 | 1668.3 | 1353.7 |
-| LFM2.5 4-bit | 2001 | 0 | 13503.3 | 13072.7 | 2330.1 |
-
-SmolLM's upper bounds increase because the generic description explicitly includes
-normalization, rotary and output allocations instead of the earlier aggregate
-layer formula. LFM2's long-prompt bound falls by replacing the extra full score
-matrix fallback with the selected explicit-score tile envelope; its smaller
-cases can rise. This is a migration of resource accounting, not a tighter-bound
-guarantee. All twelve measured peaks remained within the new planning upper
-bounds, and generated output matched byte-for-byte across the migration.
-
-Reproduce the matrix after building each revision, retaining the old binary:
-
-```sh
-cargo build -p eredu-cli --no-default-features --features mlx,metal --locked
-python3 validation/memory_estimation_matrix.py \
-  --model /path/to/pinned/SmolLM-135M --binary /path/to/eredu \
-  --output /tmp/smollm-matrix --prompt-lengths 32 2000 --chunks 0 512 \
-  --quantizations original 4
-python3 validation/memory_estimation_matrix.py \
-  --model /path/to/pinned/LFM2.5-1.2B-Instruct --binary /path/to/eredu \
-  --output /tmp/lfm-matrix --prompt-lengths 128 2000 --chunks 0 \
-  --quantizations original 4
-```
-
-Native LFM2.5 checks at 128 and 2,000 positions validated cold, loaded and
-settled continuation forecasts, ordinary/controlled forecast agreement and
-unchanged allocator activity during forecast calls. The pinned BF16 GGUF above
-was also exercised at 128, 2,000 and 128 positions in one loaded model: retained
-F32 conversions were credited once, reused after reset, and every measured
-startup/continuation growth stayed inside the forecast upper. The warm 128-row
-run retained 4,680,843,264 conversion bytes and forecast 928,753,920 additional
-bytes against 503,571,756 measured bytes.
-
-Before/after logit files compare every vocabulary value as an F32 bit pattern at
-eight predictions (prefill plus seven cached steps), for 17 and 513 input positions
-in both BF16 and affine 4-bit. All logits and token IDs match exactly. Ordinary
-observed and explicitly stepped controlled runs also match each other. Use the
-parity command above with `EREDU_LFM2_MEMORY_LENGTHS=17,513`; set
-`EREDU_LFM2_MEMORY_QUANTIZED=1` for the 4-bit comparison. The reference is the
-pre-migration native harness, so this is regression parity, not an independent
-model-quality validation.
-
-`native_generic_workspace_covers_softcapped_and_routed_modules` exercises nonzero
-Gemma2 and Qwen3-MoE fixtures through startup and settled continuation. Measured
-startup growth was 668,709 and 233,113 bytes, respectively; continuation growth
-was 51,394 and 11,734 bytes. Both stay inside their planning allowances, and
-forecast calls preserve native allocation counters. These small fixtures include
-the default 64 MiB overhead allowance and do not independently calibrate it.
-
-Portable validation passed the runtime, architecture and facade library suites,
-97 backend-conformance tests, 27 portable-facade tests, construction/topology
-consistency and strict portable/native Clippy. Tests cover retained selected
-quantization, tied ownership, custom-selector unknowns, malformed geometry,
-checked arithmetic, explicit evaluation overlap, zero-query continuation starts,
-speculative sampling vocabulary and legacy JSON round trips.
-
-Native CUDA, distributed invocation topology, other checkpoint scales and arbitrary
-mechanism combinations were not measured on this Metal host. Packed expert
-coverage has synthetic native validation; it has no released large-MoE calibration
-claim. Opaque native capacity facts remain unknown in the raw mechanism contract;
-finite forecast allowances are explicitly estimated.
-
-### Embedded prediction resource descriptions (phase 7)
-
-Embedded prediction now has an additional execution description built from the
+Embedded prediction has an additional execution description built from the
 ordinary selected strategy, architecture discovery, capture schema and actual
 prepared modules. `SelectedPreparation::embedded_prediction_topology()` exposes
 cold facts; retained `PreparedModelDiscovery` exposes the same description after
@@ -1685,11 +1021,9 @@ malformed ownership and arithmetic overflow. Target weights already represented
 by the target resource description are not added again simply because several
 prediction heads reference them.
 
-This phase supplies descriptions for subsequent composition. It does not enable
-finite embedded startup or continuation forecasts, settle pending work, consume
-observation budgets, or treat logical geometry as an exact native workspace
-bound. Those forecast paths retain their existing explicit unknowns until phases
-8 and 9 compose the additional resources with speculative transactions.
+Prediction descriptions feed startup and continuation composition with the
+speculative transaction plan. A description alone does not establish finite
+native workspace, settle pending work or consume observation budgets.
 
 Validation uses the neutral runtime and architecture unit suites, portable facade
 and backend conformance, and the reference numerical suite. Focused regressions
@@ -1699,11 +1033,6 @@ They also cover sliding-state ranges, state offsets, exact module-slot ownership
 shared feature views, arithmetic errors and atomic rejection of conflicting
 conversion observations. Native MLX tests cover conversion aliases, distinct
 owners, invalidation, replacement and final-owner eviction.
-
-The 278-case reference numerical suite and speculative production conformance
-passed, as did portable tests and strict Clippy. Metal activation parity passed
-for V3, V4 and DSpark; pooling prediction snapshot/restore passed across resident,
-host-layerwise and disk-streamed execution.
 
 Reproducible commands:
 
@@ -1719,14 +1048,13 @@ cargo test -p eredu --no-default-features --features mlx,metal --test native_exe
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control public_pooling_prediction_snapshots_metal --locked -- --ignored --nocapture --test-threads=1
 ```
 
-This phase makes no new measured peak-memory or released-checkpoint calibration
-claim. Native validation uses synthetic Metal fixtures; CUDA and native
-distributed prediction were not exercised.
+Native prediction fixture coverage does not substitute for released-checkpoint
+calibration. CUDA and native distributed prediction validation remain gaps.
 
-### Embedded startup forecasts (phase 8)
+### Embedded startup forecasts
 
 `forecast_prepared_speculative_generation` and `forecast_speculative_token_ids`
-now retain an optional `SpeculativeMemoryPlan.embedded` record. It composes ordinary target
+retain an optional `SpeculativeMemoryPlan.embedded` record. It composes ordinary target
 and prediction invocations with prediction state, retained target features,
 verification, rollback, replay and configured lookahead. Sequential prediction
 prepares all but the last prompt row; fused prediction prepares the full prefix.
@@ -1761,24 +1089,18 @@ embedded selection so it cannot silently omit prediction costs. The convenience
 cold estimate reports unknown sampling scratch until backend calibration is
 supplied. Loaded MLX forecasts reuse the adapter's sampling calibration.
 
-The optional embedded plan and new ordinary topology fields have serialization
-defaults for older records. JSON round trips and output-horizon recomputation
+The optional embedded plan and ordinary topology fields have serialization
+defaults when omitted. JSON round trips and output-horizon recomputation
 retain prediction costs. These operations do not allocate model tensors, populate
 conversion caches, advance lanes or consume capture/snapshot budgets. Startup
 forecasts describe a fresh isolated speculative lane even if an unrelated ordinary
 cache has advanced. They are shared by continuous and controlled execution;
-advanced embedded continuation outlooks use phase 9's settled observations below.
+advanced embedded continuation outlooks use settled observations.
 
-Native Metal startup tests use a nonzero, two-layer all-attention Qwen3.5 text
-fixture with two prediction modules, F32 or mixed BF16/F32 parameters, and lookahead
-off/on. With the graph-driver allowance set to zero and the allocator cache disabled,
-measured additional allocation peaks were 13,372 bytes for F32 and 21,221 bytes for
-mixed parameters. Forecast additional upper bounds were 102,592/139,032 bytes for
-F32 and 123,200/169,736 bytes for mixed parameters (lookahead off/on). Warm mixed
-parameter conversions receive owner-specific credit. Repeated forecast calls leave
-native active allocations unchanged. Serialized recomputation, horizon growth,
-budget shortfalls and fresh speculative forecasts after ordinary cache advancement
-are covered. Continuous and controlled tokens and full candidate captures match.
+Native Metal startup fixtures cover nonzero all-attention Qwen3.5 text with F32
+and mixed BF16/F32 parameters, two prediction modules and lookahead off/on. They
+check serialized recomputation, horizon growth, budget shortfalls, read-only
+allocator observations and continuous/controlled token and capture parity.
 V3 and DSpark fixtures preserve explicit unknown prediction mechanisms.
 
 The native startup checks are reproducible with:
@@ -1787,14 +1109,9 @@ The native startup checks are reproducible with:
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_embedded_startup --locked -- --ignored --nocapture --test-threads=1
 ```
 
-These are synthetic fixture measurements, not released-checkpoint calibration.
-CUDA and native distributed prediction were not exercised. Portable and reference
-regression commands are listed in the phase 7 validation section above. This phase
-passed 1,439 portable library tests, 125 facade/conformance tests, 278 numerical
-and 47 structural reference tests, and speculative production conformance. Native
-activation parity, pooling snapshot/restore and external-drafter continuation
-regressions also passed. Strict Clippy passed for the portable libraries/tests,
-MLX backend/tests and native execution-control harness.
+These are synthetic fixtures. CUDA and native distributed prediction validation
+remain gaps. Portable and reference checks use the commands in the prediction
+resource-description section.
 
 Additional validation commands:
 
@@ -1804,9 +1121,9 @@ cargo test -p eredu --no-default-features --features mlx,metal --test native_exe
 cargo clippy -p eredu --no-default-features --features mlx,metal --test native_execution_control --locked -- -D warnings
 ```
 
-### Embedded continuation forecasts (phase 9)
+### Embedded continuation forecasts
 
-`ControlledSpeculativeSession::forecast_remaining_generation` now supports
+`ControlledSpeculativeSession::forecast_remaining_generation` supports
 embedded prediction at the same canonical settled boundaries as independent
 autoregressive drafters. The operation observes the installed target frontier,
 each prediction layer's frontier, current and horizon-specific native state
@@ -1816,7 +1133,7 @@ rollback/replay and configured lookahead. It does not extrapolate an installed
 prediction frontier from the target's position or the cold context offsets.
 
 `SpeculativeContinuationMemoryPlan.embedded` retains those additional observations;
-`draft` is now optional and is present only for an independently resident drafter.
+`draft` is optional and is present only for an independently resident drafter.
 Existing serialized external-drafter records retain their draft object and read
 without an embedded field. Rust consumers should handle the optional draft.
 Recomputation validates that exactly one mechanism has matching observations and
@@ -1848,34 +1165,18 @@ retention remain outside this coverage. Arbitrary in-flight outlooks are still
 unsupported: forecasting never polls, synchronizes, submits, copies caches,
 advances a lane or consumes observation/snapshot budgets to make a query eligible.
 
-Validation on macOS/aarch64 Metal uses the nonzero all-attention Qwen3.5 text
-fixture from phase 8: eight prompt positions, two prediction modules, a 15-token
-continuation horizon, F32 or mixed BF16/F32 weights, and lookahead off/on. With
-allocator caching disabled, graph-driver allowance zero, a 256 KiB trace limit,
-and one live snapshot, the additional upper bounds were:
-
-| Weights | Lookahead | Additional forecast upper, bytes |
-| --- | --- | ---: |
-| F32 | Disabled | 1,995,972 |
-| F32 | Enabled | 3,308,582 |
-| Mixed BF16/F32 | Disabled | 2,095,512 |
-| Mixed BF16/F32 | Enabled | 3,508,926 |
-
-Measured subsequent native growth was about 11 KiB in every case. These estimates
-include conservative current capacity, host storage and snapshot reservations,
-not just newly allocated bytes. Repeated queries preserved tokens, sampling state,
-epochs and snapshot usage, and did not increase native active allocations.
-Zero/short/long horizons, JSON recomputation, budget shortfalls, later settled
-frontiers, pending-work rejection, restore/fork/exchange and final token parity
-were exercised. V3 and DSpark retain explicit unknowns; sequential/pooling native
-cache capacity is unknown even at zero horizon until its reusable backing-capacity
-contract is available. Startup and external-drafter continuation regressions passed.
+Native embedded continuation fixtures cover F32 and mixed BF16/F32 weights,
+lookahead off/on, live snapshots, zero/short/long horizons, JSON recomputation,
+shortfalls, pending-work rejection, restore/fork/exchange and final token parity.
+They require unchanged tokens, sampling state, epochs, snapshot usage and native
+active allocation during queries. V3 and DSpark preserve explicit unknowns;
+sequential/pooling cache capacity needs a reusable backing-capacity contract.
 
 Portable conformance runs the same read-only/restore/branch/parity loop for embedded
 and external mock mechanisms, including acceptance/rejection and lookahead. Runtime
 coverage includes unequal observed layer frontiers, native capacity, full-prefix
 feature retention, zero horizons, mismatched observations, unknowns, overflow,
-serialization and old external continuation records. The architecture observation
+serialization and external continuation records without an embedded field. The architecture observation
 test distinguishes canonical prediction state from the retained seed.
 
 Reproducible checks:
@@ -1891,92 +1192,34 @@ cargo test -p eredu --no-default-features --features mlx,metal --test native_exe
 cargo test -p eredu --no-default-features --features mlx,metal --test native_execution_control native_speculative_continuation_forecasts --locked -- --ignored --nocapture --test-threads=1
 ```
 
-These are synthetic fixture measurements, not released-checkpoint calibration.
-CUDA and native distributed embedded continuations were not exercised.
+These are synthetic fixture checks, not released-checkpoint calibration.
+CUDA and native distributed embedded continuation validation remain gaps.
 
 
-### Unified evaluation and compatibility validation (phase 10)
+### Unified evaluation and compatibility
 
-Generation-memory estimation no longer contains a separate aggregate workspace
-evaluator. All ordinary, speculative, startup and continuation paths use the
-resource-lifetime peak composer. The legacy wire adapter and ordinary topology
-share attention scratch, tiled attention retention, convolution intermediates,
-parameter-conversion and cache-replacement calibration.
+Ordinary, speculative, startup and continuation workspace estimates use
+`describe_text_workspace` and the resource-lifetime peak composer. The aggregate
+wire adapter and ordinary topology share attention scratch, tiled retention,
+convolution intermediates, parameter-conversion and cache-replacement calibration.
 
-Existing `WorkspaceGeometry` records remain accepted. They retain their historical
-aggregate linear/logit/coexistence envelope as one compatibility allocation: the
-record cannot supply exact projection formats, parameter aliases or invocation
-order, so it is not converted into an invented module topology. Production
-selection supplies ordinary topology, which takes precedence if both fields are
-present. There is no duplicate family-dispatched workspace formula. The small
-aggregate compatibility contract remains necessary to recompute older reports
-without silently changing their bounds.
+`WorkspaceGeometry` records carry an aggregate linear/logit/coexistence envelope
+as one compatibility allocation. They cannot supply exact projection formats,
+parameter aliases or invocation order. Production selection supplies ordinary
+topology, which takes precedence when both representations are present. The
+compatibility lowerer preserves declared finite bounds, unknowns and checked
+arithmetic without inventing a module topology or selecting family formulas.
 
-Frozen requests and reports from revision `86a6215e` cover exact lower/upper
-bounds, fit verdicts, old JSON round trips, overlap, cache copies, convolution,
-input-score tiling/full-key reuse and mixed parameter promotion. Unknown facts
-remain unknown and overflow remains a typed error. Descriptive assumption text
-may change to name the common evaluator; the report wire structure is preserved.
+Frozen serialization fixtures check bounds, verdicts, overlap, cache copies,
+convolution, input-score tiling and mixed-parameter promotion. Nonzero Gemma2 and
+Qwen3-MoE native fixtures set graph-driver overhead to zero so that allowance
+cannot hide an underestimate. They compare reset, uninterrupted and controlled
+generation and require forecasts to leave native allocation unchanged.
 
-Validation on 2026-09-24 used macOS/aarch64 Metal with allocator caching disabled.
-The nonzero Gemma2 softcap and Qwen3-MoE routed-expert fixtures now also set the
-graph-driver allowance to zero, so the default 64 MiB allowance cannot hide an
-underestimate in their mechanism envelope:
-
-| Fixture | Startup growth | Startup additional upper | Continuation growth | Continuation additional upper |
-| --- | ---: | ---: | ---: | ---: |
-| Gemma2 | 668,709 | 1,642,460 | 51,393 | 555,402 |
-| Qwen3-MoE | 233,113 | 350,220 | 11,734 | 164,298 |
-
-All values are bytes of additional modeled memory or measured MLX active-allocation
-growth, not process RSS. Repeated forecasts, serialized recomputation and forecasts
-after reset preserve the bounds and native active allocations. Reset replay and
-controlled execution produce the same token IDs as uninterrupted cached generation.
-
-The cached official `LiquidAI/LFM2.5-1.2B-Instruct` checkpoint is pinned to
-`0f604ada3f766f9f257460c4c9f0b5d6f69d431b`; `model.safetensors` SHA-256 is
-`1ba63d9adb03ae43581db0e136e4416febe0441aff7296397bd455fb6017f73a`.
-Against the pre-change harness at `86a6215e`, BF16 and affine 4-bit (group size 64)
-runs match every F32 logit bit and token ID at eight predictions (prefill plus
-seven cached decode steps), for 17 and 513 input positions. Ordinary and controlled
-runs match as well. This is regression parity against the earlier implementation,
-not a new independent-reference model validation.
-
-Cold, loaded and settled-continuation checks also pass at 128 and 2,000 positions.
-These released-checkpoint measurements retain the ordinary 64 MiB graph allowance:
-
-| Weights | Positions | Loaded additional upper | Measured growth | Continuation additional upper | Continuation growth |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| BF16 | 128 | 890,192,384 | 550,495,720 | 131,132,826 | 16,292,558 |
-| BF16 | 2,000 | 12,849,864,512 | 1,590,378,036 | 917,073,306 | 183,647,386 |
-| Affine 4-bit | 128 | 890,192,384 | 579,380,608 | 131,132,826 | 16,292,158 |
-| Affine 4-bit | 2,000 | 12,849,864,512 | 1,590,378,020 | 917,073,306 | 183,647,478 |
-
-Values are bytes; loaded parameters are already resident. These are planning
-bounds, not tight peak predictions. Cold/loaded topology agrees, controlled
-forecasts agree with ordinary forecasts, and insufficient budgets still produce
-a shortfall verdict.
-
-Embedded startup/continuation checks cover F32 and mixed BF16/F32, lookahead on/off,
-zero and positive horizons, settled-frontier observations and explicit unknown
-mechanisms. External-drafter continuation, V3/V4/DSpark activation parity and
-pooling snapshots across resident, host-layerwise and disk-streamed execution
-also pass. Portable conformance exercises acceptance/rejection, rollback,
-restore/fork/exchange and read-only forecasts without consuming observation or
-snapshot budgets. Native repeated-query checks preserve allocator activity,
-tokens, sampling state, epochs and snapshot usage. Forecasting does not allocate
-execution resources to discover a bound.
-
-The runtime, architecture and portable facade library suites, 98 backend-conformance
-tests, 27 portable-facade tests and production speculative reference conformance
-pass. Strict portable, MLX backend and native-harness Clippy checks pass. Reproduce
-with the phase 9 commands above, plus:
+Released LFM2 checks accept a pinned checkpoint via `EREDU_LFM2_MEMORY_MODEL` and
+cover cold, loaded and settled continuation at selected lengths:
 
 ```sh
-cargo test -p eredu-runtime --lib --locked
-cargo test -p eredu --no-default-features --features mlx,metal \
-  --test native_execution_control native_generic_workspace --locked \
-  -- --ignored --nocapture --test-threads=1
 EREDU_LFM2_MEMORY_MODEL=/path/to/pinned/LFM2.5-1.2B-Instruct \
 EREDU_LFM2_MEMORY_LENGTHS=128,2000 \
 cargo test -p eredu --no-default-features --features mlx,metal \
@@ -1984,31 +1227,25 @@ cargo test -p eredu --no-default-features --features mlx,metal \
   -- --ignored --nocapture --test-threads=1
 ```
 
-Repeat the last command with `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit.
-For numerical parity, use `native_lfm2_forecast_recalibration` and lengths `17,513`:
-export each weight mode's reference with `EREDU_LFM2_PARITY_WRITE` using the
-`86a6215e` harness, then compare with `EREDU_LFM2_PARITY_REFERENCE` using the current
-harness. The activation and pooling filters are
-`internal_activations_match_continuous_and_controlled_metal` and
-`public_pooling_prediction_snapshots_metal`, with the same native test flags.
+Set `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit with group size 64. Numerical
+fixture export/comparison uses `native_lfm2_forecast_recalibration` and
+`EREDU_LFM2_PARITY_WRITE` / `EREDU_LFM2_PARITY_REFERENCE`. Select a matching
+checkpoint, weight mode and reference. The [mixed-storage runner](mixed-storage-gemm.md)
+provides same-build reference comparison for the pinned BF16 GGUF.
 
-This completes retirement of the independent aggregate evaluator, not coverage of
-every mechanism. Missing native contracts remain unknown; arbitrary in-flight
-outlooks remain unsupported. CUDA and native distributed execution were not
-validated in this phase.
+Missing native contracts preserve unknown bounds; arbitrary in-flight outlooks
+remain unsupported. CUDA and native distributed workspace validation remain gaps.
 
-### Bounded native conversion retention (2026-09-24)
+### Bounded native conversion retention
 
-Eligible resident MLX executions now enforce the managed 256 MiB conversion
+Eligible resident MLX executions enforce the managed 256 MiB conversion
 payload allowance, shared by all permanent units and embedded prediction owners.
 Admission counts retained plus reserved F32 payload; rejected weights follow the
 same temporary promotion path, preserving F16/BF16 rounding and logits. There is
 no automatic eviction. Reset preserves admitted copies and parameter publication
 revokes them. The allocator-cache limit remains independent, including at zero.
-The earlier 4,680,843,264-byte experiment describes the preceding unlimited
-behavior, not the new default. The full-checkpoint policy/cache matrix and throughput tradeoff are recorded in
-[conversion-retention-validation.md](conversion-retention-validation.md); settled
-trimming is described below.
+See [conversion-retention validation](conversion-retention-validation.md) for the
+policy/cache harness and the mixed-storage selector's allocation evidence.
 
 Host-layerwise, disk-streamed and explicit device ceilings disable retention.
 Multi-rank native execution also reports typed unsupported eligibility and effective
@@ -2027,16 +1264,12 @@ Reproduce with:
 cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --locked -- --test-threads=1
 ```
 
-Validation passed all nine selected tests on this macOS Metal host (native CPU
-fixture streams), with exact F32 logits and greedy-token equality. The sandbox
-could not initialize the Metal device; the same test binary passed with native
-device access. Multi-process retention is explicitly disabled and was not
-hardware-validated. No full-checkpoint throughput claim is made by these fixtures.
+Native fixtures require device access. Multi-process retention is unsupported;
+these fixtures do not establish full-checkpoint throughput or process-memory bounds.
 
+### Load-scoped conversion configuration and telemetry
 
-### Load-scoped conversion configuration and telemetry (2026-09-24)
-
-Conversion retention can now be selected without MLX-specific configuration:
+Conversion retention can be selected without MLX-specific configuration:
 
 ```rust
 use eredu_core::{DevicePlan, ExecutionPlan};
@@ -2051,11 +1284,9 @@ let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "gpu:0")?)
 Pass this plan to `LoadedModel::load_execution_plan`. The low-level portable
 `NormalizedLoadRequest` has the same builder. Omitting the setting (`None`) uses
 256 MiB for each eligible loaded execution; `Disabled` opts out and `Unlimited`
-opts into the former unbounded reuse deliberately. A zero bound is explicitly
-requested but effectively disabled. The default changed from unlimited retention
-to finite first-admitted retention. The [native matrix](conversion-retention-validation.md)
-keeps the 256 MiB default and quantifies its substantial throughput cost relative
-to explicit unlimited retention on a mixed-width checkpoint.
+selects unbounded reuse deliberately. A zero bound is explicitly requested but
+effectively disabled. Performance depends on which invocations require conversion;
+see [native validation](conversion-retention-validation.md).
 There is no process-global retention setting or live limit mutation.
 
 `LoadedModel::parameter_conversion_retention()` reads policy and current retained
@@ -2070,7 +1301,7 @@ claim shared physical storage, so group usage is not an additive physical counte
 Requested policy and effective exclusions are both reported. Host-layerwise,
 disk-streamed, explicit device ceilings and unsupported multi-rank admission
 remain effectively disabled, even for an explicit unlimited request. Unsupported
-observation is distinct from zero usage, and historical serialized reports with
+observation is distinct from zero usage, and serialized reports with
 no retention facts remain unknown. Auxiliary MLX assistants currently expose an
 unsupported observation rather than inventing an empty ledger.
 
@@ -2090,31 +1321,24 @@ The residency telemetry document preserves `current_device_bytes` and
 parameters and deduplicated retained conversion payload;
 `current_device_parameter_conversion_bytes` is a named subset of that total.
 Use the total for current parameter accounting, without adding the subset again.
-The historical peak ledger is not a historical peak of optional conversions.
+The parameter admission peak does not include optional conversion peaks.
 An overflowing total is unavailable rather than saturated. This total covers the
 ordinary residency ledger; independently managed routed banks retain their
 separate telemetry. Use `StaticMemoryReport` for whole-model parameter composition,
 including those banks.
 
-Phase 4 validation passed the portable facade suite (27 tests, one existing
-ignored test), neutral backend conformance (106 tests), core contracts (272 tests),
-runtime contracts (640 tests), and focused architecture selection propagation.
-The native load-policy fixture verifies the managed default, explicit disabled,
+The native load-policy fixture checks the managed default, explicit disabled,
 17-byte bounded and unlimited policies, independent model identities, and matching
-live/static observations. It passed on this macOS host with native device access;
-the sandbox could not initialize Metal even though the fixture uses CPU streams.
-Reproduce the native check with:
+live/static observations. Reproduce with:
 
 ```sh
 cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
 ```
 
-These checks validate configuration and telemetry. Later full-checkpoint throughput
-and retention-aware forecast calibration are recorded in the
-[validation matrix](conversion-retention-validation.md).
+These checks cover configuration and telemetry; the
+[validation matrix](conversion-retention-validation.md) covers execution behavior.
 
-
-### Settled-boundary conversion trimming (2026-09-24)
+### Settled-boundary conversion trimming
 
 `LoadedModel::trim_parameter_conversions()` settles submitted work and releases
 optional retained parameter conversions without unloading source weights or
@@ -2137,7 +1361,7 @@ so later inference may retain conversions again within the same load-selected
 cap. Parameter editing invalidates obsolete bindings separately. Live telemetry
 reflects released claims; read-only queries never perform a trim.
 
-Phase 5 regression coverage checks atomic alias release, independent groups,
+Regression coverage checks atomic alias release, independent groups,
 idempotence, re-admission, pending reservations, retired bindings and delayed
 publication. Facade conformance compares trimmed continuations with ordinary
 output and retains snapshots and branches while checking sampling, sequence,
@@ -2150,18 +1374,9 @@ cargo test -p eredu-backend-mlx --features metal --lib parameter_conversion --lo
 cargo test -p eredu-backend-mlx --features metal --lib loaded_conversion_retention_policy_reaches_native_residency --locked -- --test-threads=1
 ```
 
-The portable suites passed, including all 111 backend-conformance tests after
-adding controlled speculative trimming. All seven selected native conversion
-tests and the loaded-session integration test passed on this macOS host with
-native device access. The sandbox could not initialize Metal. To fit available
-disk space, native test compilation used `CARGO_INCREMENTAL=0` and
-`--config 'profile.test.package.eredu-backend-mlx.debug=0'`; test behavior was
-unchanged. The MLX build without default features also passed.
-
-The subsequent [validation matrix](conversion-retention-validation.md) records
-full-checkpoint throughput calibration and local distributed coverage, with
-remaining multi-host/accelerator gaps. These fixtures do not establish total-memory
-or RSS reclamation bounds.
+The [validation matrix](conversion-retention-validation.md) documents checkpoint
+measurements and local distributed coverage, including multi-host/accelerator gaps.
+These fixtures do not establish total-memory or RSS reclamation bounds.
 
 ### Conversion-retention forecast subledger
 
@@ -2197,9 +1412,9 @@ credit.
 Every continuation observation refreshes the conversion identities and bindings,
 including external drafters. Trim or parameter invalidation therefore removes
 credit on the next query, even if another owner still keeps that backing alive
-or an equal-sized replacement is admitted. Historical serialized requests with
-no retention facts retain their original accounting, including the historical
-aggregate loaded-profile credit; deserialization never supplies today's default.
+or an equal-sized replacement is admitted. Serialized requests with no retention
+facts use aggregate loaded-profile credit; deserialization leaves the missing
+policy unavailable rather than supplying the managed default.
 
 Reservations consume admission capacity but do not establish whether a native
 conversion has been materialized. Current group reports lack allocation/binding
@@ -2214,13 +1429,9 @@ never fills missing temporary-workspace, kernel, alignment or allocator facts.
 All these queries are read-only: they do not create tensors, reserve retention,
 trim owners, submit or settle execution, or consume observation budgets.
 
-Phase 6 validation (2026-09-24): 272 core tests, 649 runtime tests, 112 portable
-backend-conformance tests, 27 portable facade tests (one existing ignored test),
-and three facade forecast unit tests passed. The controlled trim regression
-checks that uncached workspace returns without changing the frontier, output,
-sampling state, or snapshot budgets; restoring a snapshot does not restore a
-released conversion claim. Strict Clippy passed for the five changed production
-crates below with default features disabled.
+Controlled trim conformance checks that uncached workspace returns without
+changing the frontier, output, sampling state or snapshot budgets. Restoring a
+snapshot does not restore a released conversion claim. Reproduce with:
 
 ```sh
 cargo test -p eredu-core -p eredu-runtime --lib --locked
@@ -2230,87 +1441,35 @@ cargo clippy -p eredu-core -p eredu-runtime -p eredu-architectures -p eredu-back
 ```
 
 
-### Bounded retention validation matrix (2026-09-24)
+### Attention evaluation-aware transient lifetimes
 
-[Phase-7 validation evidence](conversion-retention-validation.md) crosses disabled,
-32 MiB, 256 MiB, 1 GiB and unlimited conversion retention with allocator settings
-zero and 256 MiB on the pinned mixed-width BF16 GGUF. All ten pairs preserve
-bit-exact full-vocabulary logits, greedy tokens and controlled trim parity against
-the pre-change reference. Fifty memory requests cover empty/warm caches, repeated
-reset, explicit trim, bounded readmission and settled native owner reclamation;
-measured active peaks and continuation growth stay within forecast bounds.
-
-The finite 256 MiB managed default remains. On this checkpoint at 128 positions,
-zero-allocator-cache warm decode was 11.52 tokens/s versus 73.89 with unlimited
-retention, while retaining 4,208 MiB less optional payload. The cap reduces idle
-residency; temporary casts leave generation peaks nearly unchanged. The evidence
-records timings, memory, allocator overshoot observations, speculative
-acceptance/rejection and snapshot/fork coverage, build commands and hardware.
-
-### Attention evaluation-aware transient lifetimes (2026-09-25)
-
-The generic estimator now consumes the selected backend's explicit upstream
+The generic estimator consumes the selected backend's explicit upstream
 evaluation fact. MLX's full-key InputScores path evaluates every batch, including
 the final partial batch, when more than 32 query tiles are needed and the key row
 is at most 8,192 positions. Merely sharing K/V layouts does not establish this
 boundary. Short invocations, decode, Fused softcap, and the uncovered blockwise-key
-path keep their previous conservative retention model.
+path use conservative retention bounds.
 
 At those frontiers, completed feed-forward intermediate projections/products and
-unfolded convolution scratch no longer overlap all later layers. The estimator
+unfolded convolution scratch end their lifetimes instead of overlapping subsequent
+layers. The estimator
 releases the completed attention invocation's score/layout workspace separately
 from its retained outputs. It deliberately keeps residual, normalization, mixer,
 final feed-forward and completed attention outputs, plus convolution inputs and
-padded backing potentially held by history views. The original additional 25%
-layer-workspace calibration and global parameter-conversion/cache allowances are
-unchanged and overlap all interior peaks. This remains a conservative planning
+padded backing potentially held by history views. The additional 25% layer-workspace calibration and global
+parameter-conversion/cache allowances overlap all interior peaks. This remains a conservative planning
 upper end, not an exact allocation schedule or process-memory prediction.
 
-Old serialized full-key facts default to no upstream evaluation knowledge, and
-aggregate-only archived forecasts retain their historical bounds. Portable tests
-cover batch thresholds, key limits, Fused arithmetic, unknown retention, old facts,
-and conversion/cache allowances at an early dominant peak. No numerical kernel or
-execution scheduling changes are part of this correction.
+Serialized full-key facts without an evaluation declaration default to no upstream
+evaluation knowledge. Aggregate-only forecasts use their declared aggregate bounds. Portable tests
+cover batch thresholds, key limits, Fused arithmetic, unknown retention, omitted facts,
+and conversion/cache allowances at an early dominant peak.
 
-Validation used macOS/aarch64 Metal, allocator cache disabled, default managed
-256 MiB conversion retention and the standard 64 MiB graph/driver allowance.
-The official SafeTensors revision and SHA-256 are the phase-10 values above;
-this run rehashed the checkpoint. Affine 4-bit uses group size 64. The official
-mixed-width GGUF is revision `6767265158422fb8a19c62ceb45f16f05363615b`, file
-`LFM2.5-1.2B-Instruct-BF16.gguf`, reverified SHA-256
-`3d80914b903cd6f3cc041208cf20ec46a3224f840c732e5fd7698832b4743d1b`.
-
-Each weight mode loads once, runs 128 then 2,000 positions, resetting state between
-requests. The comparison disables only the new evaluation fact on the same loaded
-request, so parameter placement, conversion credits and all calibration constants
-are identical. Values below are bytes above already resident model allocations:
-
-| Weights | Positions | Upper without evaluation fact | New upper | Measured growth | Continuation upper | Continuation growth |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| SafeTensors BF16 | 128 | 890,192,384 | 890,192,384 | 550,495,720 | 131,132,826 | 16,292,558 |
-| SafeTensors BF16 | 2,000 | 12,849,864,512 | 7,884,504,896 | 1,590,378,036 | 917,073,306 | 183,647,386 |
-| Affine 4-bit | 128 | 890,192,384 | 890,192,384 | 579,380,608 | 131,132,826 | 16,292,158 |
-| Affine 4-bit | 2,000 | 12,849,864,512 | 7,884,504,896 | 1,590,378,020 | 917,073,306 | 183,647,478 |
-| Mixed-width BF16 GGUF | 128 | 6,779,808,000 | 6,779,808,000 | 5,163,443,500 | 5,682,713,754 | 20,607,646 |
-| Mixed-width BF16 GGUF | 2,000 | 18,908,038,720 | 13,746,071,104 | 2,418,576,940 | 6,911,415,450 | 253,391,518 |
-
-For SafeTensors BF16 at 2,000 positions the cold lifecycle total upper decreases
-from 15,190,545,728 to 10,225,186,112 bytes (32.7%). This total includes parameters;
-the measured 1,590,378,036 bytes is additional active-allocation growth. They are
-different quantities. The remaining gap is intentional owner/overlap conservatism,
-not a newly measured 10 GB requirement. Mixed-width GGUF retains its broad global
-conversion allowance; its new cold total is 16,422,556,224 bytes. The loaded GGUF
-2,000-position row already credits the 256 MiB of conversions retained by the
-preceding request; the 128-position row starts without them.
-
-All six runs cover cold and loaded forecasts, eight predictions, settled
-continuation bounds, repeated read-only forecasts, reset, controlled token replay
-and ordinary/controlled request agreement. Native peaks remain inside total and
-additional envelopes. The short-prefill bounds are unchanged. No kernel equations
-or execution scheduling changed; this is forecast validation and controlled parity,
-not a fresh independent-reference model validation. CUDA, native distributed
-execution and a released-checkpoint run beyond the full-key limit were not exercised.
-The uncovered long-key path remains conservative and has portable boundary tests.
+The native lifetime harness checks the same request with and without the
+upstream evaluation fact, holding placement and calibration fixed. It covers cold,
+loaded and continuation forecasts, eight predictions, reset, read-only observations
+and controlled replay. Long-key, CUDA and native distributed validation remain gaps;
+the uncovered blockwise-key path keeps conservative costs and portable boundary tests.
 
 Reproduce with each pinned checkpoint path:
 
@@ -2326,4 +1485,34 @@ cargo test -p eredu --no-default-features --features mlx,metal \
 Repeat with `EREDU_LFM2_MEMORY_QUANTIZED=1` for affine 4-bit, or point
 `EREDU_LFM2_MEMORY_MODEL` to the pinned `.gguf` file for mixed-width BF16.
 Run outside a sandbox that blocks Metal device access. The harness logs the
-same-request upper with the evaluation fact disabled as well as the new estimate.
+same-request upper with the evaluation fact disabled as well as the selected estimate.
+
+## Projection storage facts
+
+Loaded fully resident, unmodified, nondistributed MLX executions attach bound
+`ProjectionStorageFacts` to ordinary and speculative target/drafter geometry.
+Facts require settled supported weight layout, exact shape/dtype and eligible
+native dispatch. Runtime separately requires an architecture declaration proving
+F32 projection inputs from the backend's observed normalization gain bindings;
+state storage width alone does not establish activation dtype.
+
+A parameter receives full-weight promotion credit only when all shared invocations
+are covered and its selected payload is exactly attributed. Existing retained
+conversion credit is not subtracted twice. Outputs and bias retain their ordinary
+allocation owners. Native split-K partials and possible activation-layout copies
+are explicit additional workspace, with the concurrent-layer calibration retained.
+The prefix envelope includes shorter-row split-K maxima because partial-buffer
+size is not monotone in row count.
+
+Cold inspection, missing dtype-flow declarations, unsupported dispatch, uncertain
+layouts, bounded residency, distributed bindings and active parameter overlays
+retain conservative costs. These observations create no native arrays, evaluate
+no tensors and reserve no conversion storage. Allocator rounding and GPU-private
+storage remain outside exact payload facts.
+
+See [mixed-storage GEMM](mixed-storage-gemm.md#forecast-contract) for eligibility,
+workspace details and measured cold/loaded forecasts. For the pinned BF16 GGUF,
+8 output tokens and zero allocator cache, the loaded 2,000-position upper bound is
+12.779 GiB, while the cold upper is 15.295 GiB. The loaded bound retains possible
+input copies, short-row partial maxima and other calibrated workspace; the
+measured prefill growth in that evidence is 1.301 GiB above loaded allocations.

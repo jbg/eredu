@@ -23,9 +23,10 @@ It converts weights in registers and preserves the pinned MLX F32 GEMV's lane,
 coefficient and reduction order; it neither rounds activations down nor creates
 a full F32 weight copy. A safe nonblocking availability query prevents using
 provisional strides from lazy parameter graphs. Unsettled or column-major
-weights, multi-row prefill/speculative verification, CPU and CUDA keep their
-ordinary native paths. Conversion retention therefore remains applicable to
-fallback invocations, and memory bounds still conservatively allow their casts.
+weights, unsupported geometry or native arithmetic, CPU and CUDA use fallback
+paths. Eligible multi-row prefill and speculative verification use mixed-storage
+FP32 GEMM through the same selector. Conversion retention applies to fallback
+invocations; forecasts remove promotion allowances only for proven coverage.
 These operators select by device, dtype and geometry. Router cutoff ties use
 value-only CPU partitioning of the small score/index tensors; expert parameters
 remain on their selected device. Independent PyTorch fixtures verify the native
@@ -110,8 +111,8 @@ declarations with discovery. Shared-stack projections retain distinct logical
 execution nodes and capture paths, map them to physical layers and passes, and
 declare exact weight aliases using the same architecture-owned mapping as
 checkpoint lowering. These declarations do not imply shared mutable state or
-native allocations. Architecture descriptor schema 4 is independent of the
-unchanged observation catalog/support schema 1. `eredu-runtime` combines phase/conditional
+native allocations. Architecture descriptor schema 14 and component schema 13
+are independent of observation catalog/support schema 1. `eredu-runtime` combines phase/conditional
 requirements with selected session and collector facts; a backend reports only
 native collection/conversion mechanisms. The facade exposes cold discovery and
 enriches ordinary inspection reports. No discovery step requires native
@@ -755,11 +756,9 @@ settings; the SHA-256 identity format, full-content reads and change detection
 are unchanged. Downstream workspaces control their own Cargo profiles and can
 apply the same `[profile.dev.package.sha2] opt-level = 3` override.
 `cargo run -p eredu-core --example artifact_fingerprint -- FILE [ITERATIONS]`
-measures fresh deferred resolutions and memoized lookups. With a warm filesystem
-cache on the M3 Ultra, a 2,156,600,968-byte checkpoint took a median 8.71 seconds
-with unoptimized SHA-2 and 1.03 seconds with this override (three runs each).
-Release took 0.92 seconds and `sha256sum` took 1.01 seconds on the same file.
-The artifact identity was identical in every run.
+measures fresh deferred resolutions and memoized lookups. Compare profiles on the
+same file and require identical artifact identities; throughput depends on build
+configuration, hardware and filesystem caching.
 
 Each uncached SafeTensors range is read once into an owned buffer, with file
 identity and change metadata checked before and after the read. The shard cache
@@ -1244,7 +1243,7 @@ interpret global component identities or dispatch public actions. No virtual
 expert-dense activation is allocated. `InterventionMechanisms::routed_units` is
 an independent native fact, combined with actual loaded hook/capture support.
 A contiguous completed-token receipt is required for success; `Unmatched` means
-no participating value was addressed. Original/effective sparse captures supply
+no participating value matches the address. Original/effective sparse captures supply
 attributed evidence; dense Preview/Summary operation evidence lacks participation
 coordinates and is rejected at sparse targets.
 
@@ -1279,7 +1278,7 @@ capture/intervention owners reject partition-tagged batches. Committed sparse
 producer admission, quota reservation, collective agreement and receipt delivery
 still require integration into the existing distributed capture owner.
 
-The existing runtime partition receipt protocol now admits sparse declarations
+The existing runtime partition receipt protocol admits sparse declarations
 through `PartitionCaptureReceiptPlan::new_routed`. Core's
 `RoutedUnitCaptureOwnership` carries separate expert/unit placement and the
 authoritative logical source peer; it does not confer native execution authority.
@@ -1294,7 +1293,7 @@ producer work. This reuses the existing bounded exchange and all-rank failure
 agreement. Connecting live observer admission and completed native invocations to
 these receipts remains necessary before advertising public partitioned support.
 
-Core now owns the checked borrowed `capture::RoutedUnitOrigins` coordinate view.
+Core owns the checked borrowed `capture::RoutedUnitOrigins` coordinate view.
 Runtime's provider adapter preserves its existing neural error contract and lends
 the same tags without copying them. `PartitionRoutedUnitCaptureSource` supplies
 actual provider columns and exchange tags; `PartitionRoutedUnitCaptureRequest`
@@ -1313,7 +1312,7 @@ Contiguous cold unit ranges are checked without expansion. This is a native
 collection mechanism; live sparse admission, source completion and committed
 delivery still belong to the existing partition observer/session integration.
 
-`CaptureSession::prepare_partition_routed_capture` now compiles those sparse
+`CaptureSession::prepare_partition_routed_capture` compiles those sparse
 declarations through the same private preparation driver as dense partition
 captures. It retains the original plan and run identities, prepays every producer
 and receiver, and spends local fragment credits before allocating accumulators.
@@ -1333,11 +1332,11 @@ and provider failure. Nested bank adapters preserve the active scope instead of
 repeating callbacks. Native composition forwards the same borrowed arrays, maps
 and origin tags without evaluating or retaining component values. The first local
 error remains the source when the final callback also rejects the invocation.
-Nemotron-H's partition adapter now forwards its routed ReLU² unit observations
+Nemotron-H's partition adapter forwards its routed ReLU² unit observations
 through this driver, including the TP execution path.
 
 These callbacks describe local execution; they do not certify native completion
-or committed capture delivery. The shared `PartitionCaptureObserver` now consumes
+or committed capture delivery. The shared `PartitionCaptureObserver` consumes
 architecture-supplied `PartitionRoutedCapturePlacement`: distinct producers plus
 all actual provider members, their expert/unit ownership, original source peers
 and input widths. It validates invocation identity and original/effective timing
@@ -1354,10 +1353,10 @@ and requires native settlement or teardown instead of further submission.
 Finish validates complete sparse chunks and settles the
 prepaid invocation-group vote before reverse exchange or downstream reduction.
 Receipt delivery remains provisional until the same whole-forward transaction
-commits. Errors and abort do not refund the ledger; no second execution or
-completion owner was introduced.
+commits. Errors and abort do not refund the ledger; execution and completion
+retain their existing owners.
 
-`ComponentPartitionLayouts` now retains sparse placement from the selected bank
+`ComponentPartitionLayouts` retains sparse placement from the selected bank
 and logical invocation. `ExpertRealizationPlan` retains the same ownership policy
 used by bank construction; cold rank projection uses that policy without creating
 local bank specifications. Scalar columns come from the actual physical write
@@ -1381,7 +1380,7 @@ when the same equations run through an expert-parallel provider. The layerwise
 runtime exposes an architecture failure as its error source, retaining nested
 observer causes.
 
-V3's resident and paged latent-attention paths now share the architecture-owned
+V3's resident and paged latent-attention paths share the architecture-owned
 post-aggregation channel boundary and existing projection-input observer. The
 dense-only and routed-capable block adapters share normalized inputs, scalar
 SwiGLU units, write vectors and residual sequencing through
@@ -1390,7 +1389,7 @@ remains intact. Compressed replicated traversal forwards its observer through a
 family callback, just as fixed-state traversal does. Native backends gain no V3
 equations or policy. These hooks alone do not establish complete discovery or
 parallel support: sparse tensor-parallel block hooks and prediction internals
-remain required integration. The target-only mixed V3 partition adapter now emits
+remain required integration. The target-only mixed V3 partition adapter emits
 embedding observations only on the input owner, carries the effective embedding
 in its typed boundary, and emits normalization/projection/readout observations only
 on the output owner. Serial and vocabulary-parallel readout share the same driver;
@@ -1400,7 +1399,7 @@ unverified. Local public native capture,
 parameter-edit and controlled snapshot tests cover direct/low-rank query variants
 and all three weight-residency modes.
 
-All-dense prediction-free V3 partitions now use architecture-owned direct
+All-dense prediction-free V3 partitions use architecture-owned direct
 construction from the retained selection. The constructor derives the target unit
 range, compressed state, static ownership, and source/target layouts for transformed
 weights. It creates no expert bank and requests no grouped mechanism. V3 static
@@ -1409,7 +1408,7 @@ layer defaults still leave those statics dense. V3/V4 format expansion uses the
 shared runtime mechanism, retaining companion-to-primary metadata and independent
 fused FP8 row blocks rather than duplicating packing arithmetic.
 
-V3 query rotation now receives `[batch, heads, sequence, features]`, following the
+V3 query rotation receives `[batch, heads, sequence, features]`, following the
 neutral rotary operator's penultimate sequence-axis contract. This fixes a prior
 equation error in both ordinary and partitioned execution. The V3 cache fingerprint
 includes MLA equation revision 2 so earlier states cannot be silently reused.
@@ -1418,17 +1417,16 @@ host-layerwise and disk-streamed SafeTensors and GGUF weights, including the GGU
 split KV-B layout, public capture, masks, queries, coordinated edits and rollback.
 All nine topology/residency cases also pass SafeTensors load-time affine
 4-bit/group-32 transforms, exercising source/target layouts and packed companion
-bindings in actual native execution. No family equations moved into the backend.
+bindings in actual native execution. Family equations belong to the architecture layer.
 
-Component schema 2 adds ordered effective input projections to a read, carried by
-architecture descriptor schema 4. Core owns this neutral relationship; architecture
+Component descriptions declare ordered effective input projections to a read. Core owns this neutral relationship; architecture
 discovery supplies V3's query bottleneck and the normalized latent part of KV-A.
 The shared rotary key is a separate direct dependency and does not acquire the
 latent normalization. `eredu-nn::LowRankProjection` supplies a normalized-rank
 callback while keeping one projection implementation; architecture instrumentation
 uses it to observe and edit the value consumed by the second matrix. The current
 KV latent value is observed before cache insertion. Descriptions do not promise
-that historical cache rows were captured, nor replace measured normalization or
+capture of existing cache-history rows, nor replace measured normalization or
 selected input-quantization facts with a fixed matrix product.
 
 Retained component placement also covers intermediate read stages. The architecture
@@ -1444,7 +1442,7 @@ Resident copies compact the logical latent and rotary arrays into independent
 storage; continuation estimates include chunk growth separately. Paged copies
 duplicate the tail and the model-wide catalog, then bind each copied layer to that
 catalog. They preserve the ordinary neutral snapshot admission, completion and
-cumulative copy accounting; no family-specific controlled driver is introduced.
+cumulative copy accounting through the shared controlled driver.
 
 The architecture-owned `RoutedPlusShared` equation exposes shared-expert gated
 units and the actual down-projection input through its ordinary component
@@ -3051,8 +3049,7 @@ including grammar checks and absolute speculative positions. Ordinary and specul
 samplers share temperature/RNG validation. Core snapshots retain configuration,
 choice, both RNG streams and semantic state; the native adapter supplies only seed
 construction and existing sampling primitives. Tensor-edit discovery is a distinct
-speculative capability, re-admitted against the loaded source/session. MLX initially
-exposes prediction-row logits for each model role and uses the shared `CaptureSession`
+speculative capability, re-admitted against the loaded source/session. MLX exposes prediction-row logits for each model role and uses the shared `CaptureSession`
 and intervention engine for transforms, evidence and cumulative budgets. Selecting
 a role's immutable plan between drained rows never resets that ledger. Additional
 layer/routing hooks require architecture-owned speculative attribution before they
@@ -3467,7 +3464,7 @@ streams, and defers the host boolean read until that event completes. Because
 upstream MLX exposes no event abort, timed-out work is retained in a
 thread-affine quarantine and its native communicator cannot be realized again
 until a later safe reap observes terminal native evidence. Failed submissions
-also retain these resources when no public event was returned. If the
+also retain these resources without a returned public event. If the
 originating thread exits first, teardown does not block: unresolved arrays,
 count storage, groups, routes, streams, and native execution owners remain
 retained permanently. This bounded-teardown policy can retain memory after an
@@ -3888,7 +3885,7 @@ pinned/resident handles and resumes the untouched prepared sources for bounded
 units. The ordinary residency ledger accounts for unit materialization separately
 from cumulative query and overlay work reservations.
 Publication clears incompatible state and invalidates native snapshots; facade
-session identities invalidate previously prepared requests. Parameter queries and
+session identities invalidate outstanding prepared requests. Parameter queries and
 edit records carry the effective execution version. Packed-format verification and
 additional residency/partition mechanisms remain explicit outstanding work in
 the component-analysis support matrix.
@@ -4032,14 +4029,14 @@ including their current projection-input transformation.
 Component read mappings distinguish a scalar row from a complete query/key head.
 An optional head stride and scalar `Blocked` mapping describe interleaved fused
 head segments without exposing checkpoint-name parsing to applications. Absent
-head stride retains contiguous geometry and old serialized records. Range
+head stride denotes contiguous geometry, including in serialized records. Range
 construction rejects zero widths, overlapping strides and arithmetic overflow.
 Architecture declarations supply the mapping; backends still receive only exact
 bounded parameter regions. Hybrid-family declarations and shared execution hooks
 have neutral and native coverage in the component-analysis matrix.
 
 
-Qwen hybrid target blocks now share one instrumented residual driver between
+Qwen hybrid target blocks share one instrumented residual driver between
 resident and rebuilt units. Their dense SwiGLU units and gated self-attention
 channels reuse the ordinary decoder hooks; the gated-delta mixer and routed/shared
 expert sum remain explicit whole residual writes. Query/gate reads describe the
@@ -4064,7 +4061,7 @@ inputs and reduced residual writes retain their ordinary block equations. These
 operator seams add no collectives; global component coordinates, capture delivery
 and parameter transactions remain responsibilities of the partition driver.
 The new seams alone do not establish public partitioned component support.
-The parallel layered contract now has an internal-observation unit entry. The
+The parallel layered contract has an internal-observation unit entry. The
 ordinary parallel residency traversal supplies its shared observer to that entry,
 retains forward resources for completion, and keeps group/unit boundaries in the
 existing traversal hook. Shared full/local decoders and transparent composite
@@ -4079,11 +4076,11 @@ absent observer does not construct component paths or request transformed input
 copies. Global coordinate admission, specialized pipeline propagation and
 capture transport remain unfinished integration work.
 
-Direct pipeline and composite unit strategies now forward the supplied observer
+Direct pipeline and composite unit strategies forward the supplied observer
 to the selected architecture's serial or tensor-parallel internal-unit entry.
 The partition executor retains its existing boundary, residency and completion
 sequence. Local shared decoder blocks validate ownership and index local state
-before using the shared observed equations. This change propagates unit internals;
+before using the shared observed equations. These entries propagate unit internals;
 the ordinary pipeline driver also forwards observed ingress and final readout.
 Its existing optional-observer implementation shares state-layout validation,
 group entry/exit and output ownership. Shared decoder ingress marks embeddings
@@ -4222,7 +4219,7 @@ runtime's exact admission check and execution-plan target proof.
 `eredu_nn::Error::backend_source` preserves the typed original
 preparation cause while keeping concrete error types out of portable signatures.
 
-Architecture capture placement now retains a `PartitionedObservation` separately
+Architecture capture placement retains a `PartitionedObservation` separately
 from scalar component groups. Each observation declares its own axis and local
 coordinates. Normalized sublayer inputs follow their logical invocation and use
 the full hidden axis; embedding observations follow input ownership, while final
@@ -4372,7 +4369,7 @@ one local operation for permuted axes. A valid global logit mask can exclude an
 entire local vocabulary shard; the original global admission must still leave a
 candidate. These local contracts do not establish distributed session/epoch
 authority, group agreement or global outcome publication. The shared capture
-owner and forward protocol now compose those responsibilities through
+owner and forward protocol compose those responsibilities through
 `SessionPartitionIntervention`, as described below.
 
 The shared decoder declares attention components independently of its feed-forward
@@ -4469,7 +4466,7 @@ that scheduler. Local setup errors retain their typed cause; successful peers
 receive `SpeculativeDriverError::Preparation` or the corresponding neutral control
 error. This does not make failed native operations reusable or establish completion.
 
-Speculative action selection now has a neutral host-fact contract separate from
+Speculative action selection has a neutral host-fact contract separate from
 native model execution. Runtime coordinates exact request identities/lifecycles,
 per-request cancellation, completion, deadlines and optimistic eligibility using
 confirmed fixed-size frames on the retained session transport. Completion and
@@ -4500,7 +4497,7 @@ The ordinary generation machine and detached controlled driver use the same
 fallible preparation composition. Facade code supplies tokenizer, semantic policy,
 trace delivery and cancellation decisions; native prompt and sampler construction
 remain backend mechanisms. Exact token IDs can enter `PreparedChatInput::TokenIds`
-without early native construction. Raw token iteration now returns the neutral
+without early native construction. Raw token iteration returns the neutral
 `BackendFailure`; capture installation separates typed `CaptureError` from
 preparation/transport failure with `TextCaptureSetupError`.
 
@@ -4559,7 +4556,7 @@ contract, declaring both distinct producers and all invocation participants,
 including replicas. A separate, prepaid `SessionPartitionHook` uses only those
 participants for failure agreement before the next tensor collective. Inactive
 pipeline ranks participate in common preparation and final receipt delivery.
-The architecture manifest now selects exact failure agreement on tensor groups
+The architecture manifest selects exact failure agreement on tensor groups
 even when pipeline parallelism is active. MLX supplies retained group lookup,
 native status submission and bounded completion; it does not infer family ownership.
 
@@ -4594,7 +4591,7 @@ rejection: independent status would require inactive peers to participate in a
 coordinated world wave. This limitation does not exclude the prepared model
 placements covered by the component-analysis matrix.
 
-Loaded MLX capture now caches architecture-declared component layouts on discovery
+Loaded MLX capture caches architecture-declared component layouts on discovery
 demand and selects `PartitionCaptureObserver` through the same ordinary and
 controlled prefill/decode entrypoints. Runtime
 `observation_support_with_partition` applies placement/collector facts only after
@@ -4643,7 +4640,7 @@ mapping to the latter, including nonzero pipeline offsets. Both resident and
 bounded policies reject a foreign unit address before traversal or construction.
 
 These methods are prerequisites for distributed parameter operations. The live
-runtime now provides `PartitionParameterReadPlan` and `ParameterOperationCoordinator`.
+runtime provides `PartitionParameterReadPlan` and `ParameterOperationCoordinator`.
 The read plan assigns each selected source cell to one producer, including partial
 replica overlaps and different permutation tilings. It rejects incomplete coverage
 before native work and assembles exact payload counts; contractions sum disjoint
@@ -4793,7 +4790,7 @@ retain their original cause; healthy peers receive a typed rejection, carried by
 These votes do not replace native completion ownership or establish recovery from a failed
 communication operation.
 
-Nemotron-H partition adapters now reuse the block's ordinary component hooks and
+Nemotron-H partition adapters reuse the block's ordinary component hooks and
 the shared readout instrumentation for local, tensor-parallel and pipeline
 execution. Effective embedding values remain in the typed boundary payload used
 by downstream target/prediction stages. Discovery joins the Mamba operator to its
@@ -4821,7 +4818,7 @@ Aborted batches retain charged usage and cannot establish a snapshot boundary or
 safe native reuse. A committed forward also does not imply successful sampling.
 
 
-Partition activation interventions now share `CaptureSession` and
+Partition activation interventions share `CaptureSession` and
 `PartitionCaptureObserver` with ordinary bounded capture. Runtime owns move-only
 operation authority, local admission/epoch checks, globally prepaid projection and
 dependency work, exact coordinate/intent agreement, active-member failure votes,
@@ -4846,7 +4843,7 @@ layout derives their hidden-axis replica placement from the same logical write
 parameter that owns the component invocation; shared source storage does not
 transfer execution ownership. `ComponentWritePartition::Complete` observes after
 projection reduction; unit/channel observations retain sharded scalar coordinates.
-Component schema 3 also declares `TensorParallelSum`: every TP rank supplies an
+Component descriptions declare `TensorParallelSum`: every TP rank supplies an
 additive full-hidden-width term before an ordinary, possibly fused reduction.
 Architecture layouts retain every TP term, remove only true replicas, and require
 complete TP invocation membership. Each replica sum designates TP rank zero for
@@ -4880,12 +4877,12 @@ parameterized operator, learned-offset form and direct weighted operation share
 that mechanism; mixed-precision gains retain the native promotion behavior.
 
 
-The V3 provider-aware TP traversal now invokes the additive shared-write hooks and
+The V3 provider-aware TP traversal invokes the additive shared-write hooks and
 preserves its ordinary fused reduction through a shared helper. A nonzero neutral
 test covers complete/partial provider results and literal post-bias across five
 shared-branch experiments (15 cases), with exactly one reduction. All eleven V3
 component numerical tests pass (2.45 seconds). Nine partition-coordinate tests also
-pass, including TP2/EP2 term ownership and one offset owner per replica sum. Target-only mixed-TP traversal hooks are now enabled after neutral execution
+pass, including TP2/EP2 term ownership and one offset owner per replica sum. Target-only mixed-TP traversal hooks are enabled after neutral execution
 conformance. Native F32 SafeTensors/GGUF and load-time affine public
 capture/intervention acceptance passes all 63 TP/PP/EP and ordinary-residency cases.
 
@@ -4899,7 +4896,7 @@ unit is therefore not assumed to be one neuron. Nonuniform chunk layouts need
 their own explicit mapping. Mixed affine V3 native acceptance passes all 21
 TP/PP/EP and ordinary-residency cases.
 
-Routed partition construction now retains an optional typed source architecture
+Routed partition construction retains an optional typed source architecture
 and its exact local layout alongside the selected target. The runtime handoff
 revalidates source parameter addresses and layout before forwarding both to the
 existing materialization driver. V3 constructs this source from retained encoding
@@ -4934,7 +4931,7 @@ Exact replicated-text affine transforms preserve the admitted floating source pr
 generated scales and biases, matching independent-bank materialization and neutral
 selected-byte accounting. Unloaded native destination dtypes describe placeholders
 and cannot silently request an F16 cast. Reusable prompt-cache schema 9 rejects
-older persisted state because its metadata cannot distinguish these numerical
+incompatible persisted metadata that cannot distinguish these numerical
 policies. Reconstruction uses exact token-ID replay.
 
 V3 embedded prediction primitives share fusion and head execution between ordinary
@@ -4942,7 +4939,7 @@ and observed paths. Architecture-owned hooks surround normalized embedding/hidde
 inputs, the fusion result and the prediction head; the existing V3 block supplies
 MLA, routed and shared component hooks. Editing the prediction readout residual
 precedes head normalization and changes both returned hidden state and draft logits.
-The older `mtp.{depth}.output` point remains after head computation. Low-level
+The `mtp.{depth}.output` point follows head computation. Low-level
 ordinary/provider/TP traversal forwards these hooks. Prediction scopes are declared
 separately; public speculative admission still requires phase-aware integration.
 Their loaded component capability remains unadvertised until that integration is complete.
@@ -4953,7 +4950,7 @@ an EP owner with no routed work from a missing bank: exact ownership remains, id
 owners construct no compact banks, and every routed pipeline stage has an active
 owner. The numerical/query/overlay checks remain unchanged.
 
-Architecture descriptor schema 5 and component schema 4 describe separately
+Architecture and component descriptions identify separately
 invoked component scopes. V3 prediction depths own their decoder groups, fused
 residual base and `ComponentReadoutEquation`; primary target component lists retain
 their existing meaning. `ComponentResidualBase::LinearFusion` declares ordered
@@ -4971,7 +4968,7 @@ Ordinary target and cold declarations alone leave it unverified. Loaded
 prediction construction supplies the complete selected-hook fact before public
 speculative capture admission.
 
-The typed prediction extension now accepts optional internal observers for V3
+The typed prediction extension accepts optional internal observers for V3
 prefill, proposal and retained-input replay. Architecture-owned prediction
 operations forward those observers through the target's ordinary embedding and
 selected serial/TP equations, preserving outer unit timing. Absence calls the
@@ -4983,7 +4980,7 @@ phase-aware admitted authority; the component-analysis guide records the
 implemented family and encoding matrix.
 
 
-The architecture-owned embedded strategy now accepts a separately installed
+The architecture-owned embedded strategy accepts a separately installed
 `SpeculativeActivationObserver`. The common driver passes it to target prefill,
 prediction seed, depth-specific proposals, target verification, prediction replay
 and target replay. Runtime brackets each attempted invocation with its actual
@@ -5012,7 +5009,7 @@ sources and distributed producer bindings are verified through the shared
 collector; the component-analysis guide records family-specific acceptance.
 
 
-Core now separates `CaptureInvocationShape` (exact batch, physical sequence and
+Core separates `CaptureInvocationShape` (exact batch, physical sequence and
 optional actual context) from prediction schedule coordinates. Capture and
 intervention plans can be admitted with `CaptureInvocationBounds`; their immutable
 identity includes this mode and bounds, while ordinary admission digests retain
@@ -5026,7 +5023,7 @@ inactive intervention outcomes. Every invocation reserves its geometry envelope;
 repeated prediction coordinates spend cumulative resources. Checkpoint restoration
 never refunds these charges, and child re-admission preserves the geometry mode.
 
-Partition capture now accepts independently admitted invocation geometry. Core's
+Partition capture accepts independently admitted invocation geometry. Core's
 partition receipt/evidence schema 3 retains the optional exact batch, sequence and
 context in `PartitionCaptureContext`. Runtime binds it to producer admission,
 fragment validation, all-rank coordination and final assembly; a different context
@@ -5047,7 +5044,7 @@ across internal target/prediction callbacks and binds the selected prediction
 producers and native transport. Public distributed admission requires those
 loaded bindings; the neutral invocation protocol alone grants no authority.
 
-The shared speculative scheduler now supplies `SpeculativeActivationOrigin` to
+The shared speculative scheduler supplies `SpeculativeActivationOrigin` to
 internal observers: request identity, committed frontier, logical prediction
 coordinate, an exact-prefix digest and optimistic-work status. The operation
 scope clears on errors and unwinding. Architecture executor erasure forwards this
@@ -5056,13 +5053,13 @@ applicability comes from declared node ancestry and prediction depths, not nativ
 checkpoint-name parsing. Runtime `SpeculativeCaptureObserver` borrows ordinary
 capture/intervention mechanisms through `CaptureBackendProvider`; it retains one
 request's existing ledger and charges each queued invocation envelope before work.
-A separate loaded speculative discovery and admission contract now binds this
+A separate loaded speculative discovery and admission contract binds this
 collector. Ordinary prediction inspection stays disabled for ordinary generation.
 Partition producer agreement uses the selected layout and retained transport.
 Explicit CPU/Metal collector binding and distributed execution have native
 conformance coverage.
 
-Native session adapters now drain the architecture observer set's already charged
+Native session adapters drain the architecture observer set's already charged
 speculative records and neutral failures after the shared executor scope returns.
 The collector's error propagation signal may cross a native error domain, but its
 first original failure remains owned as `SpeculativeControlError::Capture` or a
@@ -5165,7 +5162,7 @@ returns that history plus every submitted key, and applies the existing final-wi
 retention to persistent state. Ordinary key/value and key-only storage share this
 mechanism, normalization, validation and append rollback. A long prefill therefore
 uses the same logical attention extent as resident storage even when its earliest
-keys are no longer retained for the next call.
+keys are absent from the retained state for the next call.
 
 Blockwise paged attention likewise retains the current query span until native
 attention completes, then discards history outside the final window. Both arithmetic
@@ -5272,7 +5269,7 @@ The full admitted artifact remains available as provenance; this does not author
 auxiliary materialization. Neutral coverage compares the requirements retained by
 selection and source preparation across all four drafting modes.
 
-Component schema five can declare an optional grouped linear stage before the
+Component descriptions can declare an optional grouped linear stage before the
 final write matrix. The neutral `ComponentGroup::write_column` joins one scalar
 to exact regions of actual loaded factors, preserving loaded support and alias
 facts. It allocates only the small region descriptions and grants no execution
@@ -5291,8 +5288,8 @@ inside a group are rejected. Repeated invocations retain separate paths while
 sharing each factor's declared source identity. These projections are architecture
 contracts and do not select a device or materialize a factor product.
 
-Architecture descriptor schema six carries these grouped write semantics; readers
-must check that wire version before interpreting final write columns. The first
+Architecture descriptors carry these grouped write semantics; readers
+must check the descriptor wire version before interpreting final write columns. The first
 factor's actual input retains `[batch, group, sequence, channels_per_group]`
 geometry and partitions on complete groups. `GroupedNeuralBackend` supplies a
 projection-input observer with the same deferred admission contract as ordinary
@@ -5301,7 +5298,7 @@ including FP8 input rounding, before selecting the grouped diagonal outputs.
 Architecture instrumentation forwards that evidence without an eager diagnostic
 reshape. An absent observer creates no additional paths, views or evidence tensors.
 
-V4 attention instrumentation now lives in its portable attention driver: the
+V4 attention instrumentation lives in its portable attention driver: the
 mutable channel boundary follows inverse rotary aggregation, before either output
 factor. Its ordinary path keeps the existing tensor operations when no observer
 is installed. V4 block serial, provider and tensor-parallel entry points share one
@@ -5412,7 +5409,7 @@ history-retention admission can fail before speculative work. Native visible-ran
 fetches also reject incomplete history before returning an attention tensor.
 
 
-Component schema 7 and architecture descriptor schema 8 add a measured scalar
+Component and architecture descriptions include a measured scalar
 output gate to a component group. The neutral declaration identifies its affine
 read, actual multiplication input, activation, and original/effective gate. Its
 position is after the group's projected write and optional output normalization,
@@ -5433,7 +5430,7 @@ projection and observes the actual multiplication input. Native adapters still
 supply mechanisms and collectors. Prediction-unit primitives do not by themselves
 enable prepared prediction or conditional-media component capabilities.
 
-Prediction-free Qwen hybrid text partitions now use the neutral dense/routed
+Prediction-free Qwen hybrid text partitions use the neutral dense/routed
 prepared constructors for TP, PP and EP. Cold state selection derives heterogeneous
 attention and recurrent geometry without a native context. Construction retains the
 global parameter description separately from local modules, binds selected local
@@ -5514,7 +5511,7 @@ commitment, so their absence fails through the existing transactional driver.
 No backend parses condition descriptions or promotes them to unconditional
 support. Unsupported and unverified phases remain inadmissible.
 
-Prepared-input accounting now goes through the retained executable adapter.
+Prepared-input accounting goes through the retained executable adapter.
 Composite architectures project their ordinary whole-request admitted part plans
 into neutral accounting plans; the backend adds native payload/metadata bytes to
 those architecture-owned workspace estimates. Processor selection checks are
@@ -5529,7 +5526,7 @@ as text partition banks. The scope encloses all chunks and closes on failure;
 nested expert exchange borrows the scope. Disabled observations use the ordinary
 provider path without creating tensors or coordinate payloads.
 
-Each successful composite partition group now finishes its layerwise policy
+Each successful composite partition group finishes its layerwise policy
 with the actual completed output or transport boundary, just as text pipeline
 execution does. Dropping the guard remains the failure path. This closes dense
 streaming windows before later parameter operations and prevents a successful
@@ -5563,14 +5560,14 @@ owner. A timeout quarantines those resources and fences group reuse until safe
 completion; ordering does not introduce an unbounded wait into a contracted
 communication path.
 
-Prepared Qwen text prediction now pairs with the ordinary replicated text target
+Prepared Qwen text prediction pairs with the ordinary replicated text target
 as well as the conditional target. Both call one architecture-owned fusion and
 prediction-state driver; their adapters supply only token embedding and shared
 vocabulary projection. The generic replicated decoder reuses its existing
 prediction capture and readout helpers. Source construction selects text or
 conditional parameter descriptions before deriving the same text/MTP geometry.
 
-Prepared Qwen hybrid prediction executors now borrow the ordinary target embedding
+Prepared Qwen hybrid prediction executors borrow the ordinary target embedding
 and output head and thread internal observers through the shared fusion/decoder
 driver in prefill, proposal and accepted-token replay. Discovery places each
 prediction decoder in its own score scope while retaining canonical shared fusion
@@ -5678,7 +5675,7 @@ there is no RMS denominator for this case. The evaluation layer consumes this
 neutral declaration when constructing measured readout directions, including a
 zero residual. Family declarations select the equation from normalized configuration.
 
-Architecture descriptor schema 11 and component schema 10 retain
+Architecture and component descriptions retain
 `component_transforms`, explicit identity normalization, and typed tensor-transform equations.
 Transform records join actual input/output observations to their owning nodes
 and effective parameter groups. Constant/learned scaling, normalization and causal
@@ -5749,7 +5746,7 @@ chain norm uses the neutral identity normalization equation when disabled. These
 semantics remain architecture-owned; native adapters consume ordinary prepared
 modules, exact tasks and observation paths.
 
-Prepared Inkling prediction now retains the parameter declaration and exact local
+Prepared Inkling prediction retains the parameter declaration and exact local
 layout lent to materialization. Its depth weights remain replicated, while shared
 embedding and output parameters retain their ordinary tensor-axis placement.
 Prediction selection retains embedding, embedding-normalization and output roles
@@ -5852,7 +5849,7 @@ companions replicated when their primary matrix is sharded.
 LFM2 routed expert ownership expands encoded logical partition units through the
 shared checked range contract before deriving component and bank coordinates.
 
-Qwen hybrid's recurrent attention now declares scalar value-head output channels.
+Qwen hybrid's recurrent attention declares scalar value-head output channels.
 The same ordinary, provider and parallel block drivers observe fused projected
 Q/K/V, their causal SiLU convolution, control projections and the consumed
 normalized/gated channels. Original/effective channel hooks precede the actual
@@ -5867,7 +5864,7 @@ normalization of Q/K, contiguous head repetition, per-head decay and a SiLU outp
 gate. Kimi uses its declared RMS/scaling convention and per-key-channel decay.
 L2 is explicitly `x / sqrt(sum(x*x) + epsilon)`. Evaluation readout directions
 honor this denominator without substituting RMS or a clamped norm. Recurrent
-writes with scalar component declarations no longer appear again as opaque
+writes with scalar component declarations do not also appear as opaque
 readout terms, while routed combined FFN contributions remain explicit.
 
 Composite partitions retain the same immutable partition-bank selection as
@@ -5907,7 +5904,7 @@ readout handles tied and untied heads and retains output multiplication after
 the actual vocabulary projection. Backends continue to supply ordinary tensor,
 projection, sparse-unit, and collective mechanisms.
 
-Descriptor schema 12/component schema 11 adds an explicit normalized-head
+Component descriptions include an explicit normalized-head
 `output_scale`, token-only embedding normalization before media assembly, and
 `scaled_softcap` for `cap * tanh(affine_score * scale / cap)`. The captured
 assembled embedding remains the residual base. Additive score contributions
@@ -5978,7 +5975,7 @@ as separate residual terms, with their own original and effective captures.
 Traversal continues to own unit boundaries, so unit output includes the vision
 addition. Family equations and semantic branching remain in architectures.
 
-Qwen3-VL's selected transforms now use the same typed source-partition handoff:
+Qwen3-VL's selected transforms use the same typed source-partition handoff:
 source encodings and local layout remain distinct from packed target slots,
 while execution units, state, static ownership and DeepStack roles must agree.
 Optional vision packing uses the neutral alignment constraint and retains dense
@@ -5990,14 +5987,14 @@ The Qwen vision position table remains an ordinary dense lookup and is excluded
 from transformable projection geometry, in both Qwen3-VL and conditional Qwen.
 Its rank-two storage alone does not authorize affine weight packing.
 
-Component schema 12 / architecture descriptor 13 adds two neutral relationships
+Component and architecture descriptions include two neutral relationships
 for shared-state and residual equations. A read can identify the attention
 component group that actually publishes its projected state; its consumer does
 not acquire a fictitious local projection or a capture of historical positions.
 Readout equations can reference ordered transformations of the whole residual,
 including learned scalar parameters, after each layer's writes. These transform
 references affect the embedding and all prior writes. They grant no parameter
-query or edit authority. Older serialized descriptions default to local reads
+query or edit authority. Serialized descriptions with those fields omitted default to local reads
 and no additional block transformations.
 
 Gemma4 component integration uses its existing portable dense/routed block and
@@ -6062,7 +6059,7 @@ masks/rotary state and shape placeholders; they do not execute unowned embedding
 or input encoders. Only the first decoder stage performs segmented vocabulary
 lookups, and the declared inactive collective waves reflect that ownership.
 
-Component schema 13 / architecture descriptor 14 adds optional routed-bank
+Component and architecture descriptions include optional routed-bank
 `write_output` and `output` boundaries. They describe the complete bank write
 after route weighting and distributed reduction, and its transformed output
 before combination with other branches. Architecture declarations join these
@@ -6117,7 +6114,7 @@ selects the required replicas. Geometry validation must not replace that
 consumer role with a physical parameter name when weights are tied.
 
 
-Prepared prediction modules now receive the complete execution's retained weight
+Prepared prediction modules receive the complete execution's retained weight
 residency policy from the total construction driver. Physical owners remain
 separate from logical depths: shared normalization/fusion modules receive one
 policy and unit identity regardless of their number of consumers. The typed
@@ -6126,7 +6123,7 @@ output and changed-state dependencies even when the equation fails. Unit and
 shared owners overlap until those dependencies settle. DSpark's context and
 proposal loops use the same equations through this scoped module mechanism.
 Backends retain native completion and parameter leases; architectures enumerate
-the actual state and output roots. MLX now keeps exact bindings and unloaded
+the actual state and output roots. MLX keeps exact bindings and unloaded
 module placeholders until invocation. Target construction registers the additional
 physical owners and their exact stores before initializing one common residency
 manager. Queries acquire one owner through the same loan; reversible edits live
@@ -6160,7 +6157,7 @@ counted alongside the largest active unit; their shared checkpoint ownership
 must not force all prediction units into one resident block. The generic native
 module-transfer helper retains both changed-state and output roots with the
 source transfer through existing submission recovery, including equation errors.
-The prediction materializer now uses this helper for both execution and scoped
+The prediction materializer uses this helper for both execution and scoped
 parameter queries. Runtime's `AuxiliaryWeightRequirements` computes the shared
 plus largest sequential owner requirement for paged execution and the complete
 physical total for resident execution. Native load admission and cold support
@@ -6174,7 +6171,7 @@ physical units, including Nemotron's full physical pattern and DSpark's shared
 input/readout modules. Prepared module construction checks that a declared group
 matches the actual module's task set and shared/sequential role. Runtime sizes
 shared owners plus the largest sequential owner for a bounded phase; resident
-execution counts all owners. Ordinary bounded admission now includes auxiliary
+execution counts all owners. Ordinary bounded admission includes auxiliary
 tasks as well as the target tasks. Rank-local sizing uses the same tensor-only
 prediction placement as construction, counting a complete prediction schedule
 on every target pipeline and expert coordinate. The caller supplies the complete
@@ -6361,8 +6358,7 @@ Native backends execute the same operation order without selecting family branch
 
 Final source adaptation and partition error wrappers preserve owned errors as
 `Error::source`, including cold model/preflight failures and non-architecture
-`LayerwiseRuntimeError` variants. This changes diagnostic retention only; the
-architecture/runtime layers still own preparation and residency policy, and the
+`LayerwiseRuntimeError` variants. The architecture/runtime layers own preparation and residency policy, and the
 native backend still establishes completion before releasing native resources.
 
 ### Request memory forecasts and prefill chunks
@@ -6404,7 +6400,7 @@ these facts with architecture geometry for K/V projection buffers, score convers
 convolution scratch and overlap. Missing native facts preserve an unknown bound.
 Legacy records lacking the full-key contract retain per-tile allowances; longer
 key rows keep that conservative fallback. Selection-cache identity includes the
-new retention facts. No native device is needed to select or estimate them.
+retention facts. No native device is needed to select or estimate them.
 Persistent convolution history remains in the state layout. Mixed-width selected
 parameter metadata adds a float32 cast allowance and promoted-state/replacement
 storage above nominal state bytes; it is derived from task shapes and dtypes,
@@ -6449,7 +6445,7 @@ be summed as physical residency; allocation observations still deduplicate share
 backing. Core `OffloadReport` can carry the separate group reports without adding
 their payload to its original-parameter ledger. Unsupported or unavailable
 observations differ from an observed empty cache or group list. Legacy records
-and unsupported telemetry default to unavailable, never today's managed policy.
+and unsupported telemetry default to unavailable, not the managed policy.
 Native backing capacity is separately observable and is not added to payload.
 
 `StaticMemoryReport::parameter_conversion_retention` and
@@ -6472,7 +6468,7 @@ The residency telemetry document preserves `current_device_bytes` and
 parameters and deduplicated retained conversion payload;
 `current_device_parameter_conversion_bytes` is a named subset of that total.
 Use the total for current parameter accounting, without adding the subset again.
-The historical peak ledger is not a historical peak of optional conversions.
+The parameter admission peak does not include optional conversion peaks.
 An overflowing total is unavailable rather than saturated. This total covers the
 ordinary residency ledger; independently managed routed banks retain their
 separate telemetry. Use `StaticMemoryReport` for whole-model parameter composition,
@@ -6481,7 +6477,7 @@ including those banks.
 Ordinary and controlled reporting uses the same native owner observations and
 preserves backend errors as `BackendFailure` sources. These queries do not
 allocate native execution resources, evaluate or settle work, populate conversions,
-or consume state/observation budgets. This initial API has no live limit setter;
+or consume state/observation budgets. This API has no live limit setter;
 a request is immutable once loaded. Explicit settled trimming is described below;
 [retention-aware forecasts](#retention-aware-forecast-ownership) consume the same
 neutral scope and live binding observations. The
@@ -6494,7 +6490,7 @@ budget and weak registry. Composition may attach one `ConversionRetentionBudget`
 to each execution `ResidencyController`; target units, embedded owners and
 in-process partitions can receive clones of the same selected budget. MLX
 multi-process partitions reject retention as described below. Named layer windows
-do not create allowances. MLX residency constructors now install the managed budget
+do not create allowances. MLX residency constructors install the managed budget
 without creating conversions. Registry lookup joins live group identities only
 when policy facts agree, and immutable source identities only when payload agrees.
 Allocation descriptors preserve the actual backing
@@ -6578,7 +6574,7 @@ portable residency policy owns coherent claim accounting. Embedded prediction
 uses its target group, while composed external drafting keeps separate scopes.
 Ordinary composed trim visits the target and then external drafter; it is not an
 atomic transaction across participants. If a later participant fails, callers
-must re-query usage rather than assume earlier releases were rolled back.
+must re-query usage rather than assume rollback of completed releases.
 Bindings remain eligible for admission after trimming; invalidation alone retires
 them. Idempotent claim release and unknown physical reclamation are independent
 of allocator-cache flushing.
@@ -6594,7 +6590,7 @@ The backend includes it once in `StaticMemoryReport` device residency and expose
 the subset as `current_device_parameter_conversion_bytes`. Current forecast
 composition credits only complete selected bindings with a matching live claim
 and budget scope, preserving promoted activation/state sizing. Aggregate subset
-subtraction remains only for historical records lacking the scoped policy facts.
+subtraction applies only to records lacking scoped policy facts.
 Cold forecasts retain the full potential cast allowance and separately bound
 possible persistent admission; neither forecasts nor reports populate conversions.
 Runtime also owns `ForecastCalibration`, including the labeled attention fallback,
@@ -6621,7 +6617,7 @@ usage. `GenerationForecastBackend::capture_memory_projection` supplies complete
 native source/transform cost observations without submission or reservation. MLX
 reuses its admission estimator for ordinary logits; deferred sources, partition
 transport and intervention evidence without full projection coverage retain an
-explicit admitted-limit fallback. Backend cost observations never migrate into
+explicit admitted-limit fallback. Backend cost observations do not belong in
 the portable runtime or facade.
 
 Runtime's serializable `CaptureMemoryPlan` caps complete geometry projections by
@@ -6678,7 +6674,7 @@ configuration exposes automatic, preserved-native and fixed policies; portable
 `AllocatorCachePolicyReport` and `AllocatorCachePolicySource` describe observations.
 Explicit settings and earlier initialization win across sessions. Reclamation is
 still native; existing retention and graph allowances remain in the forecast.
-No new unsafe-code boundary is introduced.
+The native wrapper owns the unsafe-code boundary.
 
 Cold prefix support is an explicit architecture declaration in
 `ReplicatedTextRequirements`, combined with the backend's settled-prefix mechanism
@@ -6739,7 +6735,7 @@ Runtime owns physical-pool request composition (`loaded_generation_request`),
 object-safe controlled outlook. The facade reexports the options at the existing
 API path and supplies selection profiles before lending execution resources.
 Native observations refresh mutable residency/capacity on every outlook; geometry
-continues to belong to architecture preparation. No family dispatch was added.
+belongs to architecture preparation; the adapter contains no family dispatch.
 Sampler/controller/semantic continuation-storage contracts default to unknown;
 the facade supplies tokenizer/parser-specific host facts. Live snapshot/branch
 reservations are conservative allowances and never resident credits. Instrumented
@@ -6806,10 +6802,10 @@ capacity is unknown until an implementation contract supplies allocation facts.
 
 Selected execution-unit/static identities name missing workspace and retention
 contracts. Reusable mechanisms supply per-invocation sizing facts through the
-contracts below; runtime owns generic lifetime/overlap composition separately from fit policy. These producers do not migrate
-forecasting, derive embedded prediction invocations, or calibrate kernels.
-These producers add no family-specific forecasting dependencies or calibration
-constants. Existing forecast records and legacy estimation paths are unchanged.
+contracts below; runtime owns generic lifetime/overlap composition separately from
+fit policy. These producers neither derive embedded prediction invocations nor
+calibrate kernels; they contain no family-specific forecasting dependencies or
+calibration constants.
 
 
 ### Reusable mechanism memory contracts
@@ -6858,7 +6854,7 @@ physical pools, validates compatible facts for shared owners, and retains the
 original contract and storage-name bindings. Unknown owner/alias identity,
 placement, capacity and retention remain explicit. This bridge never sums a live
 peak or treats logical input/output shapes as allocation proof. The lifetime
-composer below consumes these descriptions. Production target forecasts now use
+composer below consumes these descriptions. Production target forecasts use
 ordinary module topology and explicitly labeled planning envelopes; opaque native
 scratch and allocator capacity in the raw mechanism contract remain unknown.
 
@@ -6929,11 +6925,11 @@ calibration constants. Selected projection formats come from exact physical
 realizations, preserving tied owners and load-time quantization.
 
 Runtime composes target workspace by reusable mechanism kind and explicit lazy
-retention boundaries. Llama, dense Qwen, Nanbeige and dense LFM2 migrate through
+retention boundaries. Llama, dense Qwen, Nanbeige and dense LFM2 use
 these contracts. Shared Gemma2 and packed Qwen/LFM routed experts inherit the
 same mechanism composition. New shared-decoder families require no independent
-workspace formula. The old `WorkspaceGeometry` wire contract remains a
-compatibility input for serialized and manually constructed requests. It lowers its historical aggregate
+workspace formula. The aggregate `WorkspaceGeometry` wire contract is a
+compatibility input for serialized and manually constructed requests. It lowers its declared aggregate
 envelope into the same resource-lifetime plan and peak evaluator, reusing the
 ordinary mechanism calibrations. It does not reconstruct missing module identities
 or invocation order. Ordinary selected production requests use topology directly.
@@ -6941,7 +6937,7 @@ or invocation order. Ordinary selected production requests use topology directly
 Finite planning estimates remain estimates. Native scratch, aliasing and
 allocator alignment are not proved by logical shapes: explicit calibrated
 mechanism envelopes account for their planning allowance without rewriting the
-raw phase-4 storage contract as exact. Unsupported equation providers, missing
+raw mechanism storage contract as exact. Unsupported equation providers, missing
 rank-local topology and unsupported residency lifetimes retain named gaps.
 An embedded selection keeps ordinary request-only forecasts explicitly unbounded;
 startup forecasts retain target topology only alongside the prediction and
@@ -6980,7 +6976,7 @@ weights, populate conversion caches, evaluate tensors or advance execution.
 
 Logical resource descriptions do not establish native capacity. Missing dtype,
 local geometry, target-feature backing, mechanism scratch and evaluation retention
-remain explicit. Startup forecasts now compose covered ordinary target and
+remain explicit. Startup forecasts compose covered ordinary target and
 prediction invocations with the speculative transaction envelopes; settled
 embedded continuations substitute observed live state and feature retention.
 
@@ -7015,14 +7011,14 @@ mechanisms report state-capacity allowances and current parameter ownership.
 ordinary session is lent to the embedded executor during a controlled run.
 The MLX adapter projects its existing residency report through this operation.
 
-Resident parameter conversion allocation and binding records now live in
+Resident parameter conversion allocation and binding records live in
 `eredu-core::residency`, with their existing runtime paths reexported. This lets the
 neutral observation carry fresh native ownership after prefill without introducing
 a dependency from core to runtime. The runtime retains validation and forecast
 credit policy. Embedded conversions belong to the shared target parameter owner;
 prediction invocations never acquire a second parameter-residency charge.
 
-The portable runtime composes the phase-8 prediction/transaction plan with observed
+The portable runtime composes the prediction/transaction plan with observed
 current frontiers and horizon-specific capacity. Current feature and seed retention
 survive a zero-token outlook. Loading and prefill do not reappear in continuation
 phases. Missing native bounds or ordinary invocation mechanisms remain explicit.
@@ -7032,29 +7028,24 @@ settle, snapshot, advance execution or consume capture/transport/copy budgets.
 
 ### Unified workspace evaluation and legacy compatibility
 
-All workspace estimates now flow through `describe_text_workspace` and
-`compose_resource_peaks`. Ordinary topology remains authoritative when both old
-and new fields are present. Attention score scratch, explicit input-score tile
-retention, convolution intermediates, parameter conversion and cache replacement
-share the same runtime calibration helpers. The old aggregate workspace evaluator
-is removed from generation-memory estimation. No backend or architecture family
+All workspace estimates flow through `describe_text_workspace` and
+`compose_resource_peaks`. Ordinary topology is authoritative when both topology
+and aggregate fields are present. Attention score scratch, explicit input-score
+tile retention, convolution intermediates, parameter conversion and cache
+replacement share runtime calibration helpers. No backend or architecture family
 selects a compatibility equation.
 
-Old `WorkspaceGeometry` records lack exact projection encodings, parameter
-identities and invocation lifetimes. A compatibility lowerer preserves their
-historical aggregate linear/logit and overlap contract as one conservative
-allocation. This remaining arithmetic is a wire-compatibility obligation, not a
-second ordinary topology or family forecast. Serialized report schemas remain
-readable, and old finite bounds, unknowns and checked arithmetic are retained.
-Frozen pre-migration requests and numeric bounds test this behavior; explanatory
-assumption strings may describe the unified evaluator.
+`WorkspaceGeometry` records lack exact projection encodings, parameter identities
+and invocation lifetimes. A compatibility lowerer preserves their declared
+aggregate linear/logit and overlap contract as one conservative allocation. This
+wire contract supplies no second ordinary topology or family forecast. Frozen
+serialization fixtures check finite bounds, unknowns and checked arithmetic.
 
 ### Retention-aware forecast ownership
 
 The neutral `ResidentParameterConversionBinding` carries optional budget-group
 attribution. Backends observe that group alongside each current retaining binding
-and actual allocation identity; missing historical attribution grants no modern
-scoped credit. Runtime forecast composition matches complete selected payloads,
+and actual allocation identity; missing attribution grants no scoped credit. Runtime forecast composition matches complete selected payloads,
 not aggregate conversion bytes or names from another budget. MLX observations are
 refreshed for ordinary execution and each speculative participant, including
 settled continuation; startup geometry can be reused but startup conversion
@@ -7068,18 +7059,18 @@ facts remain unavailable. Native budget scopes replace this local scope after
 loading. Possible retained payload is already covered by the pending conversion
 envelope, and is never added again or used to clamp temporary workspace. Group
 reservations without allocation attribution preserve an unknown phase upper
-bound until publication is observed. Historical records without the new optional
-facts preserve historical accounting. Forecasting never reserves, evaluates,
+bound until publication is observed. Records without optional scope facts use
+aggregate accounting. Forecasting never reserves, evaluates,
 settles, trims, or advances execution.
 
 ### Native attention evaluation frontiers
 
 `FullKeyAttentionTiles::evaluates_input_dependencies` is an optional neutral
-mechanism fact, defaulting to false for historical records. MLX supplies it for
+mechanism fact, defaulting to false when omitted from a record. MLX supplies it for
 synchronous full-key query-tile batches. Runtime combines that fact with selected
 ordinary topology and the invocation's query/key geometry; a short lazy invocation,
 Fused arithmetic, or an uncovered blockwise-key path establishes no such frontier.
-No family branch or native execution is introduced into cold inspection.
+Cold inspection contains no family branch or native execution.
 
 The generic lifetime plan separates gated feed-forward intermediate projections
 and products and unfolded convolution scratch from retained module outputs.
@@ -7092,7 +7083,7 @@ attention completion; its workspace cannot be released by that earlier boundary.
 The existing additional overlap calibration, uncached parameter promotions,
 promoted state/replacement, cache replacement and fallback attention scratch remain
 conservative request-wide allowances and overlap every interior peak. Unknown
-retention remains unknown. Legacy aggregate-only forecasts retain their historical
+retention remains unknown. Aggregate-only forecasts use their declared
 envelope because they do not describe invocation order. Loaded, cold and controlled
 continuation forecasts consume the same neutral facts and shared lifetime composer.
 
@@ -7123,12 +7114,11 @@ It records native pipeline requests during graph evaluation, including cache hit
 it is not a duration or an executed-GPU-instruction counter. Tracing is silent by
 default and changes no dispatch choice, kernel equation, precision policy or
 completion ownership. All native work continues through `safemlx`; no additional
-unsafe-code exception or public inference error type is introduced.
+unsafe-code exception or public inference error type is required.
 
 ### Mixed-storage FP32 GEMM
 
-Stage two exposes `safemlx::fast::try_mixed_storage_gemm` as a native,
-inference-only experiment. Its distinct primitive delegates dispatch to the pinned
+`safemlx::fast::try_mixed_storage_gemm` is a native inference operation. Its distinct primitive delegates dispatch to the pinned
 MLX FP32 SIMD Matmul implementation. The vendored patch adds a weight storage
 type to the existing regular and split-K GEMM loaders; activations, shared-memory
 tiles/padding, MMA, epilogues, output dtype, partition selection and split-K
@@ -7144,18 +7134,18 @@ predicate and rejects NAX/TF32 dispatch because its separate loader is not
 implemented. NAX-capable hardware remains eligible when native FP32 dispatch
 selects SIMD. It returns `None` without evaluation for unsupported cases, including
 CPU, CUDA, system/unpatched MLX, non-JIT builds, lazy/noncontiguous weights and
-single-row GEMV. This is a safemlx/C-ABI/native mechanism; no new unsafe exception,
-portable capability, or family policy is introduced. Its separate primitive
+single-row GEMV. This safemlx/C-ABI/native mechanism uses the native wrapper's
+unsafe-code boundary and contains no family policy. Its separate primitive
 rejects unsupported transformation APIs rather than inheriting homogeneous-Matmul
 gradient or compiler assumptions.
 
-Stage three integrates multi-row GEMM into the same backend projection selector
-already shared by ordinary dense linear layers and tied-embedding readout.
+Multi-row GEMM uses the backend projection selector shared by ordinary dense
+linear layers and tied-embedding readout.
 Single-row mixed GEMV and each caller's existing unsupported-case fallback remain
 in place. Bias handling stays outside the selector. Ordinary, controlled and
 speculative execution consume this shared mechanism without driver-specific
-branches. Forecast allowances remain conservative until stage four can report
-per-invocation eligibility and workspace facts.
+branches. Loaded forecasts consume proven invocation eligibility and workspace
+facts; cold and unsupported invocations retain conservative allowances.
 
 The nondefault projection profiler provides a thread-affine `CastGemmReference`
 guard for same-build A/B validation; it disables only the multi-row optimization
@@ -7167,7 +7157,7 @@ kernel selections and repeated release timings. See
 
 ### Projection storage facts and forecast refinement
 
-The backend now attaches `ProjectionStorageFacts` to residency reports for current
+The backend attaches `ProjectionStorageFacts` to residency reports for current
 permanent bindings. It establishes settled weight dtype/layout and selected
 native device arithmetic without evaluating tensors. Overlays, bounded residency,
 missing bindings and conflicting aliases retain conservative coverage. The
@@ -7177,7 +7167,7 @@ no native handles or hardware dispatch rules.
 
 Loaded ordinary and continuation geometry and independent drafter geometry copy
 these facts into the shared execution topology. Cold preparation initializes an
-empty map, including old serialized reports with no field. Runtime matches the
+empty map; serialized reports without that field also default to no coverage. Runtime matches the
 logical F32 invocation, shape, ordinary dense encoding and canonical task
 attribution. Every shared use must be covered before its full conversion payload
 is credited once. Retained-conversion credits remain separate and cannot be

@@ -122,7 +122,7 @@ pub enum MemoryDomain {
 ///
 /// Current preparation supplies [`crate::execution_topology::TextExecutionTopology`]
 /// from ordinary module construction. Existing aggregate-only records preserve
-/// their historical envelope through the same resource lifetime evaluator; they
+/// their declared envelope through the same resource lifetime evaluator; they
 /// do not supply enough facts to reconstruct a module topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceGeometry {
@@ -385,7 +385,7 @@ pub struct DomainMemoryPlan {
 pub struct GenerationMemoryRequest {
     /// Scoped retention subledger. Its payload is already covered by resident
     /// parameters and the pending conversion workspace; never add it to totals.
-    /// Absent historical records retain their original accounting.
+    /// Requests without this field use aggregate conversion accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameter_conversion_retention:
         Option<crate::memory_forecast::ConversionRetentionMemoryPlan>,

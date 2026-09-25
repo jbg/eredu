@@ -3,7 +3,7 @@ use eredu_core::residency::ParameterConversionRetentionPolicy;
 use eredu_core::{TextGenerationConfig, WeightTransformationPlan};
 
 // Explicit knobs shared by the memory and bit-exact parity harnesses. The
-// default still exercises managed policy; historical unlimited runs opt in.
+// default exercises managed policy; unlimited retention requires opt-in.
 fn retention_policy() -> Option<ParameterConversionRetentionPolicy> {
     std::env::var("EREDU_LFM2_RETENTION")
         .ok()
@@ -208,7 +208,7 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         {
             *bytes = bytes.saturating_sub(converted_before);
         }
-        // Phase-6 forecasts credit exact bindings as well as the aggregate.
+        // Forecasts credit exact bindings as well as the aggregate.
         // Verify those native observations independently before comparing every
         // remaining architecture/mechanism field with cold inspection.
         let retention = loaded
