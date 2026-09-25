@@ -811,6 +811,45 @@ fn unavailable_memory_is_not_zero() {
 }
 
 #[test]
+fn supported_apple_silicon_targets_have_unified_memory() {
+    // iPadOS uses the iOS target; ARM64 simulators use the same OS/architecture
+    // pair as their device target and run on an Apple silicon host.
+    for os in ["macos", "ios", "tvos", "visionos"] {
+        assert_eq!(
+            physical_memory_semantics(os, "aarch64"),
+            PhysicalMemorySemantics::Unified,
+            "{os}"
+        );
+    }
+    for (os, arch) in [
+        ("linux", "x86_64"),
+        ("windows", "x86_64"),
+        ("linux", "aarch64"),
+        ("macos", "x86_64"),
+        ("ios", "x86_64"),
+        ("watchos", "aarch64"),
+    ] {
+        assert_eq!(
+            physical_memory_semantics(os, arch),
+            PhysicalMemorySemantics::Unknown,
+            "{os}/{arch}"
+        );
+    }
+}
+
+#[test]
+fn static_and_available_reports_use_the_same_platform_relationship() {
+    let expected = physical_memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(
+        static_memory_from_residency(None, None)
+            .unwrap()
+            .physical_semantics,
+        expected
+    );
+    assert_eq!(available_memory().unwrap().physical_semantics, expected);
+}
+
+#[test]
 fn apple_unified_semantics_do_not_create_two_capacities() {
     let report = AvailableMemory {
         physical_memory_bytes: Observed::Available {

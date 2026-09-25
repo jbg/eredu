@@ -298,3 +298,78 @@ fn cpu_chunked_prefill_matches_full_observed_logits_and_controlled_generation() 
 fn metal_chunked_prefill_matches_full_observed_logits_and_controlled_generation() {
     run(DeviceType::Gpu);
 }
+
+// This exercises the GPU path on iOS devices as well as the other supported
+// Apple silicon targets. CPU execution would mask an unknown relationship by
+// assigning parameters to the host pool in the portable forecast driver.
+#[cfg(all(
+    feature = "metal",
+    target_arch = "aarch64",
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos"
+    )
+))]
+#[test]
+fn apple_metal_loaded_request_forecast_uses_one_physical_pool() {
+    use eredu_core::{InputTokenCount, Observed, PhysicalMemorySemantics};
+    use eredu_runtime::memory_estimation::{estimate_generation_memory, MemoryDomain, MemoryFit};
+    use eredu_runtime::memory_forecast::{
+        loaded_generation_request, GenerationForecastBackend, GenerationForecastOptions,
+    };
+
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let root = fixture(false);
+    let backend = native::backend(&stream, &weights_stream);
+    let model = eredu_core::load_model(
+        &backend,
+        root.path(),
+        MlxLoadRequest::from_normalized(NormalizedLoadRequest::default()),
+    )
+    .unwrap();
+    let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+    let mut profile = MlxBackend::loaded_memory_profile(&runtime).unwrap();
+    assert!(!profile.host_execution);
+    assert_eq!(
+        profile.parameters.physical_semantics,
+        PhysicalMemorySemantics::Unified
+    );
+    assert_eq!(
+        profile.available.physical_semantics,
+        PhysicalMemorySemantics::Unified
+    );
+    // Exercise mobile's absent capacity observations on desktop runners too.
+    profile.available.physical_memory_bytes = Observed::unavailable("mobile capacity unavailable");
+    profile.available.available_memory_bytes = Observed::unavailable("mobile capacity unavailable");
+    let mut options = GenerationForecastOptions::default();
+    for budget in [None, Some(1 << 30)] {
+        options.budget.available_bytes = budget;
+        let (request, _) = loaded_generation_request(
+            profile.clone(),
+            InputTokenCount::text(9),
+            4,
+            PrefillChunkPolicy::Bounded(NonZeroUsize::new(2).unwrap()),
+            MlxBackend::forecast_execution_contract(&runtime, None, false),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(request.domains.len(), 1);
+        assert_eq!(request.domains[0].domain, MemoryDomain::Unified);
+        assert_eq!(request.domains[0].budget.available_bytes, budget);
+        assert!(request.domains[0].resident_parameters.lower_bytes > 0);
+        let estimate = estimate_generation_memory(&request).unwrap();
+        assert_eq!(estimate.requested_positions, 13);
+        assert!(estimate.domains[0].generation_peak.upper_bytes.is_some());
+        assert_eq!(
+            estimate.domains[0].generation_fit,
+            if budget.is_some() {
+                MemoryFit::LikelyFit
+            } else {
+                MemoryFit::InsufficientInformation
+            }
+        );
+    }
+}

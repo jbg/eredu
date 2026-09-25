@@ -60,6 +60,15 @@ normal packaging.
 The build honors `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, and
 `XROS_DEPLOYMENT_TARGET`. Mac Catalyst and watchOS are not supported.
 
+Static and available-memory reports identify one unified physical pool on all
+supported ARM64 Apple targets, including iOS/iPadOS, tvOS, visionOS, and their
+Apple silicon simulators. Loaded Metal request forecasts therefore combine
+logical host/device residency in that pool. Mobile host capacity counters remain
+unavailable; forecasting still returns memory estimates, while a fit conclusion
+requires a caller-supplied budget. Installed RAM is not a process allocation limit.
+Linux and Windows reports retain an unknown host/device relationship until native
+device facts establish it; CUDA support alone does not imply unified memory.
+
 ## Linux CPU
 
 CPU-only x86-64 Linux builds require Git, a C++20 compiler, CMake 3.25 or newer,

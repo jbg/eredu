@@ -14,6 +14,17 @@ use super::{Executable, MlxBackend, MlxModelInput, MlxModelSession};
 use crate::backend::runtime::media::input::{self, InputPayload};
 use eredu_core::residency::MemoryTier;
 
+fn physical_memory_semantics(os: &str, arch: &str) -> PhysicalMemorySemantics {
+    // Supported Apple silicon devices and ARM64 simulators share physical RAM
+    // between CPU and Metal. Other targets need device facts before we can
+    // claim a relationship (CUDA managed memory alone does not establish one).
+    if arch == "aarch64" && matches!(os, "macos" | "ios" | "tvos" | "visionos") {
+        PhysicalMemorySemantics::Unified
+    } else {
+        PhysicalMemorySemantics::Unknown
+    }
+}
+
 fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
     left.checked_add(right)
         .ok_or(CapabilityError::ArithmeticOverflow { operation })
@@ -341,11 +352,7 @@ pub(crate) fn static_memory_from_residency(
             safemlx::memory::cache_memory,
             "process-global MLX allocator cache counter",
         ),
-        physical_semantics: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            PhysicalMemorySemantics::Unified
-        } else {
-            PhysicalMemorySemantics::Unknown
-        },
+        physical_semantics: physical_memory_semantics(std::env::consts::OS, std::env::consts::ARCH),
         currently_cached_shards: cached_shards,
     })
 }
@@ -452,11 +459,7 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
     Ok(AvailableMemory {
         physical_memory_bytes,
         available_memory_bytes,
-        physical_semantics: if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            PhysicalMemorySemantics::Unified
-        } else {
-            PhysicalMemorySemantics::Unknown
-        },
+        physical_semantics: physical_memory_semantics(std::env::consts::OS, std::env::consts::ARCH),
     })
 }
 
