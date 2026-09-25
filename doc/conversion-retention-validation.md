@@ -291,7 +291,10 @@ and six accepted/seven rejected with lookahead on. Together with the matrix's
 controlled settled-trim parity, these cover reuse of the new native projection
 through controlled and speculative drivers. Projection-level cast/allocation
 profiling was not added: these end-to-end results demonstrate the gain, but do
-not attribute every millisecond to an individual native operation.
+not attribute every millisecond to an individual native operation. The subsequent
+[projection baseline](projection-baseline.md) records real prefill layouts, native
+GEMM selection, separate conversion/GEMM allocations and timing, including short
+verification-sized projection replays.
 
 Focused regression checks also passed: four mixed-projection Metal tests,
 11 existing conversion/residency tests, and the nonblocking availability test.

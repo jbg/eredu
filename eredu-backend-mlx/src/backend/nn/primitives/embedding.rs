@@ -46,6 +46,15 @@ impl Embedding {
         if let Some(output) =
             crate::backend::nn::mixed_projection::project(x, self.weight.as_ref(), stream)?
         {
+            #[cfg(feature = "projection-profiling")]
+            crate::backend::nn::projection_profile::record(
+                x,
+                self.weight.as_ref(),
+                &output,
+                "tied_embedding",
+                "mixed_gemv",
+                stream,
+            );
             return Ok(output);
         }
         let promoted = crate::backend::nn::parameter_conversion::promoted_weight(
@@ -54,7 +63,21 @@ impl Embedding {
             stream,
         )?;
         let weight = promoted.as_ref().unwrap_or(self.weight.as_ref());
-        crate::ops::matmul(x, weight.transpose(stream)?, stream)
+        let output = crate::ops::matmul(x, weight.transpose(stream)?, stream)?;
+        #[cfg(feature = "projection-profiling")]
+        crate::backend::nn::projection_profile::record(
+            x,
+            self.weight.as_ref(),
+            &output,
+            "tied_embedding",
+            if promoted.is_some() {
+                "native_with_retained_conversion"
+            } else {
+                "native_fallback"
+            },
+            stream,
+        );
+        Ok(output)
     }
 }
 

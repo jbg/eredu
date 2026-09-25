@@ -71,6 +71,11 @@ path = "examples/conversion_retention.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "projection_baseline"
+path = "examples/projection_baseline.rs"
+required-features = ["mlx", "metal", "projection-profiling"]
+
+[[example]]
 name = "native_tool_calling"
 path = "examples/native_tool_calling.rs"
 required-features = ["mlx"]
@@ -135,6 +140,7 @@ features = ["mlx", "metal", "image", "audio"]
 default = ["mlx", "metal", "onig", "esaxx_fast"]
 
 mlx = ["dep:eredu-backend-mlx"]
+projection-profiling = ["mlx", "eredu-backend-mlx/projection-profiling"]
 metal = [
     "eredu-backend-mlx?/accelerate",
     "eredu-backend-mlx?/metal",

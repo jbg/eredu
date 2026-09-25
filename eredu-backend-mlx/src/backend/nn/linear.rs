@@ -16,19 +16,39 @@ use crate::{
 };
 
 /// Shared dense dispatch for ordinary and restored packed parameters.
-fn dense_projection(input: &Array, weight: &Array, stream: &Stream) -> Result<Array, Exception> {
+pub(crate) fn dense_projection(
+    input: &Array,
+    weight: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     if let Some(output) = super::mixed_projection::project(input, weight, stream)? {
+        #[cfg(feature = "projection-profiling")]
+        super::projection_profile::record(input, weight, &output, "dense", "mixed_gemv", stream);
         return Ok(output);
     }
     if let Some(output) = super::matrix::bf16_row_projection(input, weight, None, stream)? {
         return Ok(output);
     }
     let promoted = super::parameter_conversion::promoted_weight(input, weight, stream)?;
-    matmul(
+    let output = matmul(
         input,
         promoted.as_ref().unwrap_or(weight).transpose(stream)?,
         stream,
-    )
+    )?;
+    #[cfg(feature = "projection-profiling")]
+    super::projection_profile::record(
+        input,
+        weight,
+        &output,
+        "dense",
+        if promoted.is_some() {
+            "native_with_retained_conversion"
+        } else {
+            "native_fallback"
+        },
+        stream,
+    );
+    Ok(output)
 }
 
 fn ceil_div(value: i32, divisor: i32) -> i32 {

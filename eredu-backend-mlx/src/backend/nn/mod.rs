@@ -23,6 +23,9 @@ pub(crate) mod nested;
 pub(crate) mod normalization;
 pub(crate) mod parameter_conversion;
 pub(crate) mod primitives;
+/// Opt-in capture and isolated replay for native projection diagnostics.
+#[cfg(feature = "projection-profiling")]
+pub mod projection_profile;
 pub(crate) mod relative_attention;
 pub(crate) mod rope;
 /// Backend-neutral architecture operators specialized to MLX.

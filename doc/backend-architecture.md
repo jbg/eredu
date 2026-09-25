@@ -7095,3 +7095,32 @@ conservative request-wide allowances and overlap every interior peak. Unknown
 retention remains unknown. Legacy aggregate-only forecasts retain their historical
 envelope because they do not describe invocation order. Loaded, cold and controlled
 continuation forecasts consume the same neutral facts and shared lifetime composer.
+
+### Opt-in projection baseline diagnostics
+
+The backend's nondefault `projection-profiling` feature provides bounded,
+thread-affine collection of native mixed-width dense and tied-embedding
+projection inputs, weights and outputs. Hooks do not evaluate arrays or change
+mechanism selection. At the explicit finish boundary, diagnostic tooling settles
+samples and groups them by actual dtype, shape, strides and selected backend path.
+One real representative and the invocation count are retained for each class.
+Capture owns additional arrays, so its peak and latency are explicitly excluded
+from ordinary inference measurements. The feature is forwarded by the facade
+solely for its native `projection_baseline` example; portable defaults and neutral
+contracts gain no native dependencies.
+
+The example belongs to application/validation tooling. It performs separate
+ordinary inference and isolated projection replay, using native allocator counters
+and completion timing. Short verification-sized replays slice captured prefill
+activations; they do not claim to execute a speculative inference driver.
+`validation/projection_baseline.py` validates the pinned checkpoint and runs kernel
+selection tracing in separate processes from timing measurements.
+
+The native MLX patch `mlx-metal-kernel-selection-trace.patch` logs selected
+pipeline names, including specialization keys, when
+`MLX_METAL_LOG_KERNEL_SELECTION=1` is present before native initialization.
+It records native pipeline requests during graph evaluation, including cache hits;
+it is not a duration or an executed-GPU-instruction counter. Tracing is silent by
+default and changes no dispatch choice, kernel equation, precision policy or
+completion ownership. All native work continues through `safemlx`; no additional
+unsafe-code exception or public inference error type is introduced.

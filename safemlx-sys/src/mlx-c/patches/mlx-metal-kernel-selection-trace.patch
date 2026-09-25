@@ -1,0 +1,27 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <compression.h>
+ #include <cstdlib>
++#include <cstdio>
+ #include <dispatch/dispatch.h>
+ #include <sstream>
+ #include <vector>
+@@ -1024,6 +1025,15 @@
+     const MTLFCList& func_consts /* = {} */,
+     const std::vector<MTL::Function*>& linked_functions /* = {} */) {
+   const auto& kname = hash_name.empty() ? base_name : hash_name;
++  // Diagnostic selection trace only. Read once; leave ordinary execution silent.
++  // This logs pipeline requests during graph evaluation, not GPU durations.
++  static const bool trace_kernels = []() {
++    const char* value = std::getenv("MLX_METAL_LOG_KERNEL_SELECTION");
++    return value && value[0] == '1' && value[1] == '\0';
++  }();
++  if (trace_kernels) {
++    std::fprintf(stderr, "[mlx-metal-kernel] %s\n", kname.c_str());
++  }
+   {
+     // Multiple readers allowed
+     std::shared_lock lock(kernel_mtx_);

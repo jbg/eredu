@@ -51,6 +51,8 @@ cuda = ["safemlx/cuda"]
 nccl = ["cuda", "safemlx/nccl"]
 image = ["eredu-architectures/image"]
 audio = ["eredu-architectures/audio"]
+# Opt-in native diagnostic tooling; no collection in ordinary builds.
+projection-profiling = []
 
 [lints]
 workspace = true
