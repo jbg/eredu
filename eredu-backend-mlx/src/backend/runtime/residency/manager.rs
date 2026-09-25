@@ -847,6 +847,8 @@ impl ResidencyManager {
             self.inner.sources.primary.source_diagnostics()?,
         )
         .with_device_parameter_conversions(self.parameter_conversion_observations()?)?
+        .with_projection_storage(self.projection_storage_observations()?)
+        .with_f32_rms_normalization_gains(self.f32_rms_normalization_gains()?)
         .with_unit_sources(
             self.inner
                 .sources
@@ -859,6 +861,94 @@ impl ResidencyManager {
                 })
                 .collect::<Result<_, _>>()?,
         ))
+    }
+
+    // MLX's ungrouped learned RMS output uses result_type(input, gain). A
+    // rank-one F32 gain therefore guarantees F32 for supported floating inputs.
+    // This reports representation, not whether a family uses an array as a gain;
+    // that association and all downstream dtype preservation belong to topology.
+    fn f32_rms_normalization_gains(&self) -> Result<BTreeSet<String>, ResidencyError> {
+        let state = self.lock()?;
+        let mut gains = BTreeSet::new();
+        let mut conflicts = BTreeSet::new();
+        for (unit_id, storage) in &state.storage {
+            let Some(unit) = &storage.device else {
+                continue;
+            };
+            for (name, array) in &unit.arrays {
+                let logical = state
+                    .control
+                    .unit(unit_id)
+                    .and_then(|unit| unit.bindings().iter().find(|b| b.name() == name))
+                    .and_then(WeightBinding::logical_target)
+                    .unwrap_or(name)
+                    .to_owned();
+                if array.ndim() == 1 && array.dtype() == safemlx::Dtype::Float32 {
+                    gains.insert(logical);
+                } else {
+                    conflicts.insert(logical);
+                }
+            }
+        }
+        gains.retain(|name| !conflicts.contains(name));
+        Ok(gains)
+    }
+
+    fn projection_storage_observations(
+        &self,
+    ) -> Result<
+        BTreeMap<String, eredu_runtime::projection_memory::ProjectionStorageFacts>,
+        ResidencyError,
+    > {
+        let state = self.lock()?;
+        let eligible = state
+            .control
+            .conversion_retention()
+            .and_then(|budget| budget.report().policy.value().cloned())
+            .is_some_and(|policy| {
+                policy.eligibility
+                    == eredu_core::residency::ParameterConversionRetentionEligibility::Eligible
+            });
+        let mut facts = BTreeMap::new();
+        if !eligible || !state.conversion_retention_registered {
+            return Ok(facts);
+        }
+        let mut conflicts = BTreeSet::new();
+        for (unit_id, storage) in &state.storage {
+            let Some(unit) = &storage.device else {
+                continue;
+            };
+            for (name, array) in &unit.arrays {
+                let logical = state
+                    .control
+                    .unit(unit_id)
+                    .and_then(|unit| unit.bindings().iter().find(|b| b.name() == name))
+                    .and_then(WeightBinding::logical_target)
+                    .unwrap_or(name)
+                    .to_owned();
+                let Some(fact) = crate::backend::nn::mixed_projection::storage_facts(
+                    array,
+                    &state.device_stream,
+                )
+                .map_err(|source| ResidencyError::Mlx {
+                    id: unit_id.clone(),
+                    operation: "projection storage facts",
+                    source,
+                })?
+                else {
+                    conflicts.insert(logical);
+                    continue;
+                };
+                if facts.get(&logical).is_some_and(|prior| prior != &fact) {
+                    conflicts.insert(logical.clone());
+                }
+                facts.insert(logical, fact);
+            }
+        }
+        for name in conflicts {
+            facts.remove(&name);
+        }
+        Ok(facts)
     }
 
     /// Observe existing cache entries without evaluating or creating conversions.

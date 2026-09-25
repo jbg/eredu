@@ -2,6 +2,7 @@
 #ifndef MLX_MIXED_GEMM_H
 #define MLX_MIXED_GEMM_H
 #include <stdbool.h>
+#include <stdint.h>
 #include "mlx/c/array.h"
 #include "mlx/c/stream.h"
 #ifdef __cplusplus
@@ -11,6 +12,10 @@ extern "C" {
  * Unsupported cases return success with supported=false and leave res unchanged.
  * Does not evaluate inputs. Requires settled contiguous weights and native SIMD
  * Metal GEMM dispatch. Bias remains a separate ordinary add operation. */
+/* Shape/device-only planning query. No tensors, evaluation or allocations.
+ * Reports exact logical split-K partial payload, excluding output/activation copy. */
+int mlx_mixed_storage_gemm_workspace(bool* supported, uint64_t* partial_bytes,
+    int rows, int outputs, int width, mlx_stream stream);
 int mlx_try_mixed_storage_gemm(
     mlx_array* res, bool* supported, mlx_array input, mlx_array weight,
     mlx_stream stream);

@@ -318,3 +318,174 @@ mod tests {
         }
     }
 }
+
+/// Current weight layout plus the native dispatch's row-dependent workspace.
+/// This query creates host records only; it neither evaluates nor retains arrays.
+pub(crate) fn storage_facts(
+    weight: &Array,
+    stream: &Stream,
+) -> Result<Option<eredu_runtime::projection_memory::ProjectionStorageFacts>, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        use eredu_core::checkpoint::TensorDtype;
+        use eredu_runtime::projection_memory::{ProjectionRowStorage, ProjectionStorageFacts};
+        use safemlx::{DeviceType, Dtype};
+        if weight.ndim() != 2
+            || !matches!(weight.dtype(), Dtype::Float16 | Dtype::Bfloat16)
+            || !weight.is_available()?
+            || weight.dim(0) <= 1
+            || weight.dim(0) > 65536
+            || weight.dim(1) <= 0
+            || weight.dim(1) > 8192
+            || weight.strides() != [weight.dim(1) as usize, 1]
+            || stream.get_device()?.get_type()? != DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        #[cfg(feature = "projection-profiling")]
+        let reference = super::projection_profile::cast_gemm_reference_enabled();
+        #[cfg(not(feature = "projection-profiling"))]
+        let reference = false;
+        // Geometry-only tables are reusable across equal-shaped resident bindings.
+        // The native arithmetic configuration is process-immutable. Keep the cache
+        // thread-local and bounded; no array, model, stream or parameter owner is kept.
+        thread_local! {
+            static TABLES: std::cell::RefCell<std::collections::BTreeMap<(i32, i32, i32), Vec<ProjectionRowStorage>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+        }
+        let key = (
+            stream.get_device()?.get_index()?,
+            weight.dim(0),
+            weight.dim(1),
+        );
+        let mut rows = vec![ProjectionRowStorage {
+            first: 1,
+            last: 1,
+            mechanism: "mlx.mixed_f32_narrow_gemv".into(),
+            partial_bytes_per_row: 0,
+        }];
+        if !reference {
+            let cached = TABLES.with(|tables| tables.borrow().get(&key).cloned());
+            let ranges = if let Some(cached) = cached {
+                cached
+            } else {
+                let mut ranges: Vec<ProjectionRowStorage> = Vec::new();
+                for m in 2..=2000 {
+                    if let Some(partials) =
+                        safemlx::fast::mixed_storage_gemm_workspace(m, key.1, key.2, stream)?
+                    {
+                        let per_row = partials / m as u64;
+                        if let Some(last) = ranges.last_mut().filter(|r| {
+                            r.last + 1 == m as u64 && r.partial_bytes_per_row == per_row
+                        }) {
+                            last.last = m as u64;
+                        } else {
+                            ranges.push(ProjectionRowStorage {
+                                first: m as u64,
+                                last: m as u64,
+                                mechanism: "mlx.mixed_storage_f32_gemm".into(),
+                                partial_bytes_per_row: per_row,
+                            });
+                        }
+                    }
+                }
+                TABLES.with(|tables| {
+                    let mut tables = tables.borrow_mut();
+                    if tables.len() >= 256 {
+                        tables.clear();
+                    }
+                    tables.insert(key, ranges.clone());
+                });
+                ranges
+            };
+            rows.extend(ranges);
+        }
+        Ok(Some(ProjectionStorageFacts {
+            input: key.2 as u64,
+            output: key.1 as u64,
+            activation: TensorDtype::F32,
+            weight: if weight.dtype() == Dtype::Float16 {
+                TensorDtype::F16
+            } else {
+                TensorDtype::Bf16
+            },
+            output_scalar_bytes: 4,
+            activation_copy_bytes_per_row: key.2 as u64 * 4,
+            rows,
+        }))
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (weight, stream);
+        Ok(None)
+    }
+}
+
+#[cfg(all(test, feature = "metal", not(feature = "cuda")))]
+mod storage_tests {
+    use super::*;
+    use eredu_nn::{mechanism_memory::MechanismInvocation, TensorElementType};
+    use safemlx::{Device, DeviceType, Dtype};
+    #[test]
+    fn projection_storage_facts_preserve_laziness_and_report_native_partials() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        for (dtype, element) in [
+            (Dtype::Float16, TensorElementType::F16),
+            (Dtype::Bfloat16, TensorElementType::Bf16),
+        ] {
+            let weight = Array::from_slice(&vec![0.25f32; 129 * 257], &[129, 257])
+                .as_dtype(dtype, &stream)
+                .unwrap();
+            assert!(storage_facts(&weight, &stream).unwrap().is_none());
+            assert!(!weight.is_available().unwrap());
+            safemlx::transforms::eval([&weight]).unwrap();
+            stream.synchronize().unwrap();
+            let before = safemlx::memory::active_memory().unwrap();
+            let facts = storage_facts(&weight, &stream).unwrap().unwrap();
+            assert_eq!(before, safemlx::memory::active_memory().unwrap());
+            let partial = safemlx::fast::mixed_storage_gemm_workspace(8, 129, 257, &stream)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                facts
+                    .for_invocation(257, 129, &eredu_core::checkpoint::TensorDtype::F32, 8)
+                    .unwrap()
+                    .partial_bytes_per_row
+                    * 8,
+                partial
+            );
+            assert!(facts
+                .for_invocation(257, 129, &eredu_core::checkpoint::TensorDtype::F32, 2001)
+                .is_none());
+            let invocation = MechanismInvocation::Projection {
+                rows: 8,
+                input: 257,
+                output: 129,
+                format: eredu_checkpoint::LinearFormat::Dense,
+                element: TensorElementType::F32,
+                weight_element: Some(element),
+                bias: true,
+            };
+            let contract =
+                super::super::memory::describe_bound_projection(&invocation, &weight, &stream)
+                    .unwrap();
+            assert!(!contract.storage.iter().any(|s| s.name == "promoted_weight"));
+            assert_eq!(
+                contract
+                    .storage
+                    .iter()
+                    .find(|s| s.name == "split_k_partials")
+                    .unwrap()
+                    .payload
+                    .upper,
+                Some(partial)
+            );
+            assert!(super::super::memory::describe(&invocation)
+                .unwrap()
+                .storage
+                .iter()
+                .any(|s| s.name == "promoted_weight"));
+            let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+            assert!(storage_facts(&weight, &cpu).unwrap().is_none());
+        }
+    }
+}

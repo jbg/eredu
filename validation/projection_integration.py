@@ -15,7 +15,7 @@ import subprocess
 import time
 
 from projection_baseline import (
-    CHECKPOINT_REVISION, CHECKPOINT_SHA256, command_output, sha256, summarize,
+    CHECKPOINT_REVISION, CHECKPOINT_SHA256, command_output, sha256, summarize, compare_reference_case,
 )
 
 
@@ -26,9 +26,12 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--samples', type=int, default=5)
     parser.add_argument('--disable-tf32', action='store_true')
+    parser.add_argument('--forecasts', action='store_true', help='validate cold, loaded and continuation forecasts')
+    parser.add_argument('--reference-manifest', type=Path, help='require historical projection bit fingerprints')
     args = parser.parse_args()
     if args.samples < 1 or sha256(args.model) != CHECKPOINT_SHA256:
         parser.error('positive sample count and pinned checkpoint required')
+    reference = json.loads(args.reference_manifest.read_text()) if args.reference_manifest else None
     args.output.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('MLX_', 'EREDU_LFM2_'))}
     if args.disable_tf32:
@@ -39,10 +42,16 @@ def main():
         'platform': platform.platform(), 'tf32_disabled': args.disable_tf32,
         'git_revision': command_output(['git', 'rev-parse', 'HEAD']),
         'tracked_diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD', '--'])).hexdigest(),
-        'binary_sha256': {name: sha256(args.binary_dir / name) for name in ['projection_baseline', 'projection_parity']},
+        'binary_sha256': {name: sha256(args.binary_dir / name) for name in (['projection_baseline', 'projection_parity'] + (['projection_forecast'] if args.forecasts else []))},
         'runner_sha256': sha256(__file__),
+        'reference_manifest_sha256': sha256(args.reference_manifest) if reference else None,
         'source_sha256': {name: sha256(name) for name in [
             'eredu/examples/projection_parity.rs', 'eredu/examples/projection_baseline.rs',
+            'eredu/examples/projection_forecast.rs', 'eredu-runtime/src/projection_memory.rs',
+            'eredu-runtime/src/workspace_resources.rs',
+            'eredu-architectures/src/lfm2/block.rs',
+            'eredu-backend-mlx/src/backend/nn/mixed_projection.rs',
+            'eredu-backend-mlx/src/backend/runtime/residency/manager.rs',
             'safemlx-sys/src/mlx-c/mlx/c/mixed_gemm.cpp',
             'safemlx-sys/src/mlx-c/patches/mlx-metal-mixed-storage-gemm.patch']},
         'samples': args.samples, 'runs': [], 'cases': [],
@@ -75,6 +84,9 @@ def main():
     for policy in ['268435456', 'unlimited']:
         for positions in [128, 2000]:
             label = f'{policy}-{positions}'
+            forecast = None
+            if args.forecasts:
+                forecast, _ = run(label + '-forecast', 'projection_forecast', [policy, str(positions)])
             parity, _ = run(label + '-parity', 'projection_parity', [policy, str(positions)])
             baseline = {}
             for selection in ['reference', 'mixed']:
@@ -101,6 +113,36 @@ def main():
                 normalized = {k.replace('_storage_bfloat16', '').replace('_storage_float16', '') for k in mixed['kernel_selections']}
                 assert normalized == set(native['kernel_selections']), 'native arithmetic dispatch changed'
                 assert mixed['peak_growth_bytes'] == native['peak_growth_bytes'], 'unexpected allocation beyond native workspace'
+            if reference:
+                previous = next(c for c in reference['cases'] if c['positions'] == positions and c['retention_policy'] == policy)
+                compare_reference_case(case, previous)
+                case['matches_reference_manifest'] = True
+            if forecast:
+                topology = forecast['loaded']['request']['domains'][0]['executions'][0]['execution_topology']
+                assert forecast['native_binding_count'] == 93
+                assert len(topology['projection_input_normalizations']) == 93
+                gains = set(topology['f32_rms_normalization_gains'])
+                assert all(sources and set(sources) <= gains for sources in topology['projection_input_normalizations'].values())
+                def peak(doc):
+                    return doc['estimate']['domains'][0]['generation_peak']['upper_bytes']
+                case['forecast'] = {
+                    'cold_overall_upper': forecast['cold']['estimate']['domains'][0]['overall_peak']['upper_bytes'],
+                    'loaded_generation_upper': peak(forecast['loaded']),
+                    'without_projection_facts_upper': forecast['unrefined_estimate']['domains'][0]['generation_peak']['upper_bytes'],
+                    'observed_prefill_active_growth': forecast['observed_prefill_active_growth'],
+                    'loaded_additional_upper': forecast['loaded']['estimate']['domains'][0]['additional_generation_peak']['upper_bytes'],
+                    'native_binding_count': forecast['native_binding_count'],
+                    'workspace_resources': forecast['workspace_resources'],
+                    'projection_storage': topology['projection_storage'],
+                    'projection_input_normalizations': topology['projection_input_normalizations'],
+                    'f32_rms_normalization_gains': topology['f32_rms_normalization_gains'],
+                    'unsupported_2001_preserves_prefill_bound': forecast['unsupported_2001_preserves_prefill_bound'],
+                    'forecast_allocates_native_storage': forecast['forecast_allocates_native_storage'],
+                    'ordinary_continuation_upper': peak(forecast['continuation']),
+                    'controlled_continuation_upper': peak(forecast['controlled']),
+                    'speculative_upper': peak(forecast['speculative']),
+                    'speculative_continuation_upper': peak(forecast['speculative_continuation']),
+                }
             case['parity'] = parity
             case['reference_ordinary'] = baseline['reference']['ordinary']
             case['summary'] = {selection: {

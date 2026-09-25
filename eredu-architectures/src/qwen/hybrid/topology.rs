@@ -64,6 +64,9 @@ fn stack(
         output_softcap: false,
         selected_parameter_promotion_bytes: None,
         selected_parameter_promotion_payloads: Default::default(),
+        projection_storage: Default::default(),
+        projection_input_normalizations: Default::default(),
+        f32_rms_normalization_gains: Default::default(),
         missing: Vec::new(),
     })
 }

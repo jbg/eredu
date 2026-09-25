@@ -69,6 +69,8 @@ pub mod placement;
 pub mod prediction_resources;
 /// Backend-neutral bounded background weight-prefetch execution.
 pub mod prefetch;
+/// Explicit native projection storage coverage without native handles.
+pub mod projection_memory;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
 /// Complete family-blind realtime frame coordination.

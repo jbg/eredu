@@ -105,6 +105,15 @@ fn loader_preserves_native_gemm_bits_and_allocations() {
             let expected = bits(&reference);
             s.synchronize().unwrap();
             let reference_peak = memory::peak_memory().unwrap() - reference_baseline;
+            let partials =
+                safemlx::fast::mixed_storage_gemm_workspace(m as i32, n as i32, k as i32, &s)
+                    .unwrap()
+                    .unwrap();
+            let payload = (m * n * 4) as u64 + partials;
+            assert!(reference_peak as u64 >= payload);
+            if (m, n, k) == (8, 2048, 8192) {
+                assert_eq!(partials, 8 * 8 * 2048 * 4);
+            }
             drop(reference);
             drop(converted);
             s.synchronize().unwrap();
@@ -254,6 +263,11 @@ fn unsupported_layouts_and_types_do_not_evaluate_or_cast() {
 #[test]
 fn cpu_prototype_rejection_needs_no_gpu_or_evaluation() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    assert!(
+        safemlx::fast::mixed_storage_gemm_workspace(8, 2048, 8192, &stream)
+            .unwrap()
+            .is_none()
+    );
     let a = Array::from_slice(&[1.0f32; 6], &[2, 3]);
     let w = a.as_dtype(Dtype::Float16, &stream).unwrap();
     assert!(!w.is_available().unwrap());

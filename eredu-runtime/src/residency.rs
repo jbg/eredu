@@ -148,6 +148,8 @@ pub struct ResidencyReport {
     materialization: Option<WeightMaterializationReport>,
     device_parameter_conversion_bytes: u64,
     device_parameter_conversions: Option<Vec<ResidentParameterConversion>>,
+    projection_storage: BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
+    f32_rms_normalization_gains: std::collections::BTreeSet<String>,
 }
 
 impl ResidencyReport {
@@ -169,7 +171,37 @@ impl ResidencyReport {
             materialization: None,
             device_parameter_conversion_bytes: 0,
             device_parameter_conversions: None,
+            projection_storage: BTreeMap::new(),
+            f32_rms_normalization_gains: Default::default(),
         }
+    }
+
+    /// Storage coverage established by current permanent native parameter bindings.
+    pub fn projection_storage(
+        &self,
+    ) -> &BTreeMap<String, crate::projection_memory::ProjectionStorageFacts> {
+        &self.projection_storage
+    }
+    /// Attaches allocation-free backend facts. Missing bindings remain uncovered.
+    pub fn with_projection_storage(
+        mut self,
+        facts: BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
+    ) -> Self {
+        self.projection_storage = facts;
+        self
+    }
+
+    /// Gains whose current binding guarantees F32 ungrouped learned RMS output.
+    pub fn f32_rms_normalization_gains(&self) -> &std::collections::BTreeSet<String> {
+        &self.f32_rms_normalization_gains
+    }
+    /// Attaches backend normalization dtype facts without native handles.
+    pub fn with_f32_rms_normalization_gains(
+        mut self,
+        gains: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.f32_rms_normalization_gains = gains;
+        self
     }
 
     /// Additional device payload retained as reusable parameter conversions.

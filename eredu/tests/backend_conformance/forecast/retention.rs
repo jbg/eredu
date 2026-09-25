@@ -95,6 +95,9 @@ pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfil
         output_softcap: false,
         selected_parameter_promotion_bytes: Some(16),
         selected_parameter_promotion_payloads: [("output.weight".into(), 16)].into(),
+        projection_storage: Default::default(),
+        projection_input_normalizations: Default::default(),
+        f32_rms_normalization_gains: Default::default(),
         missing: vec![],
     });
     profile

@@ -75,7 +75,8 @@ impl MlxModel {
         &self,
     ) -> Result<eredu_runtime::memory_forecast::LoadedMemoryGeometry, eredu_core::CapabilityError>
     {
-        self.capture_discovery
+        let mut geometry = self
+            .capture_discovery
             .as_ref()
             .ok_or_else(|| {
                 eredu_core::CapabilityError::Observation(
@@ -83,7 +84,18 @@ impl MlxModel {
                 )
             })?
             .generation_memory()
-            .cloned()
+            .cloned()?;
+        if geometry.fully_resident && self.distributed.is_none() {
+            if let (Some(topology), Some(report)) = (
+                geometry.execution_topology.as_mut(),
+                self.residency_report()
+                    .map_err(|e| eredu_core::CapabilityError::Observation(e.to_string()))?,
+            ) {
+                topology.projection_storage = report.projection_storage().clone();
+                topology.f32_rms_normalization_gains = report.f32_rms_normalization_gains().clone();
+            }
+        }
+        Ok(geometry)
     }
 
     pub(crate) const fn state_residency(&self) -> &eredu_runtime::CacheResidencyPolicy {

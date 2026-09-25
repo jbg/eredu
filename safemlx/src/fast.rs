@@ -12,6 +12,34 @@ use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
 
+/// Exact logical split-K partial payload for the pinned mixed-storage GEMM.
+/// A shape/device query only: it does not inspect tensors, evaluate or allocate.
+/// `None` means unsupported geometry/arithmetic path. The caller must establish
+/// settled contiguous narrow weights and F32 activations separately. Output is
+/// `rows * outputs * 4`; activation layout may additionally require a copy.
+/// Allocator rounding and private GPU register/threadgroup storage are excluded.
+pub fn mixed_storage_gemm_workspace(
+    rows: i32,
+    outputs: i32,
+    width: i32,
+    stream: &Stream,
+) -> Result<Option<u64>> {
+    let mut supported = false;
+    let mut partial_bytes = 0;
+    // SAFETY: valid borrowed stream, initialized writable scalar outputs only.
+    <()>::try_from_op(|_| unsafe {
+        safemlx_sys::mlx_mixed_storage_gemm_workspace(
+            &mut supported,
+            &mut partial_bytes,
+            rows,
+            outputs,
+            width,
+            stream.as_ptr(),
+        )
+    })?;
+    Ok(supported.then_some(partial_bytes))
+}
+
 /// Inference-only operation using the pinned FP32 Metal GEMM with F16/BF16
 /// weight storage. Computes `input @ weight.T`, returning F32. Bias, if any,
 /// must be added separately with the ordinary add operation.

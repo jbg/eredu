@@ -228,6 +228,9 @@ pub(crate) fn text_with_feed_forward<C: Config>(
         output_softcap: config.output_softcap().is_some(),
         selected_parameter_promotion_bytes: None,
         selected_parameter_promotion_payloads: Default::default(),
+        projection_storage: Default::default(),
+        projection_input_normalizations: Default::default(),
+        f32_rms_normalization_gains: Default::default(),
         missing,
     })
 }

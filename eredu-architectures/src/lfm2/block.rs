@@ -825,15 +825,48 @@ pub(crate) fn execution_topology(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    // Learned, ungrouped RMS normalization promotes through its gain. LFM2's
+    // attention/short-convolution and dense SwiGLU equations preserve its dtype
+    // through their downstream projections (there is no narrowing cast).
+    let mut projection_input_normalizations = std::collections::BTreeMap::new();
+    for (index, layer) in layers.iter().enumerate() {
+        let root = format!("model.layers.{index}");
+        if let TokenMixerTopology::Attention { projections, .. }
+        | TokenMixerTopology::GatedConvolution { projections, .. } = &layer.mixer
+        {
+            for projection in projections {
+                projection_input_normalizations.insert(
+                    projection.parameter.clone(),
+                    vec![format!("{root}.operator_norm.weight")],
+                );
+            }
+        }
+        // Routed bank arithmetic has a separate contract; leave it conservative.
+        if let FeedForwardTopology::Gated { projections, .. } = &layer.feed_forward {
+            for projection in projections {
+                projection_input_normalizations.insert(
+                    projection.parameter.clone(),
+                    vec![format!("{root}.ffn_norm.weight")],
+                );
+            }
+        }
+    }
+    let spec = super::static_spec(args);
+    let output = spec.output_topology()?;
+    projection_input_normalizations
+        .insert(output.parameter.clone(), vec![spec.normalization_weight]);
     Ok(TextExecutionTopology {
         hidden_size: positive(args.hidden_size)?,
         vocabulary_size: positive(args.vocab_size)?,
         layers,
-        output: super::static_spec(args).output_topology()?,
+        output,
         output_invocations: 1,
         output_softcap: false,
         selected_parameter_promotion_bytes: None,
         selected_parameter_promotion_payloads: Default::default(),
+        projection_storage: Default::default(),
+        projection_input_normalizations,
+        f32_rms_normalization_gains: Default::default(),
         missing: Vec::new(),
     })
 }

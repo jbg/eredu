@@ -8,7 +8,7 @@ use eredu_nn::{mechanism_memory::*, Error, TensorElementType};
 /// Describes the selected ordinary MLX invocation without a device or stream.
 /// Cache-specific allocation reuse is refined by the cache instance hook.
 pub fn describe(invocation: &MechanismInvocation) -> Result<MechanismMemoryContract, Error> {
-    describe_selected(invocation, None)
+    describe_selected(invocation, None, None)
 }
 
 /// Refines native path facts using the already-selected device kind, without
@@ -18,12 +18,63 @@ pub fn describe_for_device(
     invocation: &MechanismInvocation,
     device: safemlx::DeviceType,
 ) -> Result<MechanismMemoryContract, Error> {
-    describe_selected(invocation, Some(device))
+    describe_selected(invocation, Some(device), None)
+}
+
+/// Describe an ordinary projection against its actual bound weight, without
+/// evaluating it. Unknown/lazy layouts retain the same conservative contract.
+/// Exact partial payload and a layout-dependent activation-copy envelope replace
+/// the generic promotion allowance only when the shared selector is covered.
+pub fn describe_bound_projection(
+    invocation: &MechanismInvocation,
+    weight: &safemlx::Array,
+    stream: &safemlx::Stream,
+) -> Result<MechanismMemoryContract, Error> {
+    let device = stream
+        .get_device()
+        .and_then(|d| d.get_type())
+        .map_err(Error::backend)?;
+    let mut workspace = None;
+    if let MechanismInvocation::Projection {
+        rows,
+        input,
+        output,
+        format: LinearFormat::Dense,
+        element: TensorElementType::F32,
+        weight_element: Some(element),
+        ..
+    } = invocation
+    {
+        let expected = match element {
+            TensorElementType::F16 => Some(safemlx::Dtype::Float16),
+            TensorElementType::Bf16 => Some(safemlx::Dtype::Bfloat16),
+            _ => None,
+        };
+        if expected == Some(weight.dtype()) {
+            if let Some(facts) =
+                super::mixed_projection::storage_facts(weight, stream).map_err(Error::backend)?
+            {
+                if let Some(range) = facts.for_invocation(
+                    *input,
+                    *output,
+                    &eredu_core::checkpoint::TensorDtype::F32,
+                    *rows,
+                ) {
+                    workspace = Some((
+                        bytes(&[*rows, range.partial_bytes_per_row], 1)?,
+                        bytes(&[*rows, facts.activation_copy_bytes_per_row], 1)?,
+                    ));
+                }
+            }
+        }
+    }
+    describe_selected(invocation, Some(device), workspace)
 }
 
 fn describe_selected(
     invocation: &MechanismInvocation,
     device: Option<safemlx::DeviceType>,
+    projection_workspace: Option<(u64, u64)>,
 ) -> Result<MechanismMemoryContract, Error> {
     use MechanismInvocation::*;
     let mut result = MechanismMemoryContract {
@@ -133,7 +184,8 @@ fn describe_selected(
         } => {
             match format {
                 LinearFormat::Dense => {
-                    if element == TensorElementType::F32
+                    if projection_workspace.is_none()
+                        && element == TensorElementType::F32
                         && matches!(
                             weight_element,
                             Some(TensorElementType::Bf16 | TensorElementType::F16)
@@ -492,6 +544,29 @@ fn describe_selected(
             }
             result.missing.push("sampling random state, filtered logits, reductions and sorting workspace depend on native lowering and owned sampler state".into());
         }
+    }
+    if let Some((partials, activation_copy)) = projection_workspace {
+        result.storage.push(allocation(
+            "split_k_partials",
+            partials,
+            MechanismStorageRole::Scratch,
+            StorageRetention::NativeCompletion,
+        ));
+        let mut copy = allocation(
+            "activation_layout_copy",
+            activation_copy,
+            MechanismStorageRole::Scratch,
+            StorageRetention::NativeCompletion,
+        );
+        copy.payload = MechanismBytes {
+            lower: 0,
+            upper: Some(activation_copy),
+        };
+        copy.capacity = MechanismBytes::unknown(0);
+        copy.detail = "native activation layout is resolved at evaluation; logical copy upper payload, no full-weight promotion".into();
+        result.storage.push(copy);
+        result.missing.push("allocator rounding/capacity and GPU-private registers/threadgroup scratch are not exposed; native partial payload is exact".into());
+        return Ok(result);
     }
     result.storage.push(MechanismStorage {
         name: "native_workspace".into(),

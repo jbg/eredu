@@ -4942,3 +4942,9 @@ extern "C" {
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn mlx_mixed_storage_gemm_workspace(supported: *mut bool, partial_bytes: *mut u64,
+        rows: ::std::os::raw::c_int, outputs: ::std::os::raw::c_int,
+        width: ::std::os::raw::c_int, stream: mlx_stream) -> ::std::os::raw::c_int;
+}

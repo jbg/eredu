@@ -3,8 +3,10 @@
 Stage two added a loader-only native operation for the pinned MLX 0.32.0 FP32
 GEMM. Stage three selects it through the MLX backend's shared projection selector
 for both ordinary linear layers and tied-embedding readout. Ordinary, controlled
-and speculative execution consume those same mechanisms. Forecast mechanism facts
-remain stage four; cold and runtime conversion allowances are still conservative.
+and speculative execution consume those same mechanisms. Stage four reports bound
+projection coverage and native workspace to loaded forecasts. Cold inspection
+retains conservative conversion allowances because it cannot establish the final
+weight layout and native dispatch without a loaded binding.
 
 ## Arithmetic and storage contract
 
@@ -292,5 +294,126 @@ logit fingerprints and native pipeline selections. Raw output is retained in
 Only M3 Ultra hardware was available for native validation. Eligibility is based
 on native arithmetic dispatch, not device name; the exactness/allocation suite is
 portable to other supported SIMD Metal devices, but those runs are still a
-validation gap. NAX/TF32 retains its existing fallback. Stage four must expose
-per-invocation coverage/workspace before forecasts remove conversion allowances.
+validation gap. NAX/TF32 retains its existing fallback. Stage-three forecasts
+retained conversion allowances pending the mechanism facts described below.
+
+## Stage-four forecast contract
+
+Loaded residency reports expose current immutable parameter binding facts: exact
+matrix dimensions, narrow weight dtype, F32 activation/output dtype, covered row
+intervals, native split-K partial bytes per row and a possible activation-copy
+bound. The shape/device query uses the same split-K partition helper as native
+GEMM; the refactor leaves its arithmetic and dispatch decisions unchanged. It
+creates no arrays and does not evaluate lazy weights to establish eligibility.
+The backend also provides `describe_bound_projection` for an individual logical
+invocation. Unbound descriptions retain promotion and opaque-workspace costs.
+
+Runtime requires a separate activation dtype proof. LFM2 declares that its dense
+mixer, FFN and tied-readout projection inputs preserve the dtype from their
+ungrouped learned RMS normalizations. MLX reports which actual gain bindings
+produce F32 output. This distinction matters here: the pinned checkpoint's state
+storage is two bytes, but its F32 gains produce F32 projection inputs. Unknown
+flows and narrow gains get no conversion credit. This declaration lives with the
+architecture equations, not in a backend family-specific branch.
+
+A full-weight conversion allowance is removed only for an exactly attributed
+canonical parameter whose **every invocation** is covered. Retained conversion
+credits are not subtracted twice. Regular output and separate bias allocations
+stay in their existing owners. Native split-K partials and possible input-layout
+copies are additional workspace, summed conservatively across invocations with
+the existing concurrent-layer overlap calibration retained. A
+forecast for up to M rows includes partial-buffer maxima at smaller row counts:
+split-K storage is not monotone in M, and short verification/final chunks matter.
+The report distinguishes actual-M partial payload from this prefix envelope.
+Allocator rounding and GPU-private storage remain unknown; existing calibrated
+allocator, attention, state and graph-retention envelopes remain in place.
+
+Cold inspection, absent/lazy/unsupported bindings, conflicting aliases, active
+parameter overlays, distributed bindings and bounded residency retain their
+previous allowance. Other architectures retain it until they supply a dtype-flow
+declaration. Device eligibility follows the shared native selector; there is no
+GPU model-name restriction. An unsupported 2,001-row invocation retains its
+conversion allowance even when a one-row continuation is covered. The retention
+subledger still describes potential admissions across future invocations (which
+can exceed the current request's admitted rows); it is not an additional charge
+on top of the request workspace.
+
+The validation runner includes cold, loaded, ordinary/controlled continuation,
+and external-drafter speculative forecasts. It checks that forecasting leaves
+native allocations, conversion admission and token advancement unchanged, that
+loaded bounds cover observed prefill growth, and that unsupported rows retain the
+unrefined prefill bound. Reproduce with:
+
+```sh
+CARGO_INCREMENTAL=0 cargo build -p eredu --release \
+  --example projection_forecast --example projection_baseline \
+  --example projection_parity --no-default-features \
+  --features mlx,metal,projection-profiling --locked --offline
+python3 validation/projection_integration.py \
+  --model /path/to/pinned/LFM2.5-1.2B-Instruct-BF16.gguf \
+  --output /tmp/eredu-projection-forecast-2026-09-25 \
+  --samples 5 --disable-tf32 --forecasts \
+  --reference-manifest validation/results/projection-integration-2026-09-25.json
+```
+
+The historical manifest is an extra same-device arithmetic regression gate;
+omit it on other hardware. Same-build exact comparisons remain mandatory there.
+
+## Stage-four results, 2026-09-25
+
+[Machine-readable evidence](../validation/results/projection-forecast-2026-09-25.json)
+records 24 serial release processes on the same Apple M3 Ultra, including exact
+commands, checkpoint/source/binary hashes, native selection traces, forecasts and
+five warm measurements after each first request. Raw outputs are in
+`/tmp/eredu-projection-forecast-2026-09-25`. All 72 real projection replays retained
+stage-three fingerprints and native dispatch, matched preconverted GEMM peak
+allocation, and selected no full-weight conversion. All 93 bound projections have
+F32 input proofs and covered storage facts. Their 4,464 MiB of full-weight promotion
+is credited; other conversion and state allowances remain.
+
+The native suite passed all 290 F16/BF16 exact-bit, separate-bias and allocation
+cases, layout/tail cases and CPU/lazy rejection. Its workspace query agrees with
+native partial-buffer allocation. Full released-checkpoint logits, eight
+predictions (prefill plus seven cached steps), controlled execution and two-proposal speculative verification pass
+bit-exact comparisons against the same-build reference. Loaded/continuation
+forecasts work for both target and external drafter without advancing tokens.
+Forecast queries allocate no native storage or conversion reservations. The
+2,001-row fallback check passes for both retention policies.
+
+For the pinned checkpoint, 8 output tokens, one full prefill chunk and allocator
+cache disabled, forecast values are **GiB**, not measured peaks:
+
+| Positions | Loaded upper without facts | Loaded upper with facts | Measured prefill growth | Additional-generation upper with facts |
+|---:|---:|---:|---:|---:|
+| 128 | 8.494 | 3.317 | 0.469 | 1.137 |
+| 2,000 | 15.295 | 12.779 | 1.301 | 10.599 |
+
+Both retention policies produce these forecast bounds before any conversions are
+retained. Cold overall upper bounds remain **8.494 / 15.295 GiB** respectively.
+The remaining gap is explicit: future activation strides are unknown, so the
+forecast retains possible F32 input copies, smaller-row split-K maxima, concurrent
+workspace calibration, attention/state and other native overhead. It does not
+replace those unknowns with measured timings or peaks. For example, a `[2048,8192]`
+weight at 8 rows needs 0.5 MiB of split-K partials; at 2,000 rows it needs none, but
+the up-to-2,000-row envelope retains the 4 MiB maximum at 256 rows.
+
+Repeated ordinary prefill measurements below are **reference → mixed**, median
+warm first-token latency over five samples and maximum warm MLX active allocation.
+Loading is excluded, and capture/tracing run in separate processes:
+
+| Retention | Positions | Latency (ms) | Active peak (GiB) |
+|---|---:|---:|---:|
+| 256 MiB | 128 | 94.04 → 22.60 | 6.989 → 2.649 |
+| 256 MiB | 2,000 | 720.48 → 687.96 | 4.683 → 3.481 |
+| Unlimited | 128 | 23.70 → 22.66 | 7.009 → 2.649 |
+| Unlimited | 2,000 | 692.84 → 688.46 | 7.840 → 3.481 |
+
+The forecast integration preserves stage-three execution behavior. These timings
+revalidate the optimization on this device; they are not a universal speedup claim.
+Other Metal devices still need hardware validation, with eligibility continuing to
+use native SIMD dispatch rather than a GPU model-name allowlist.
+
+All 654 runtime unit tests, the five shared-selector/storage-contract backend
+tests, portable backend conformance (112), portable facade (27 passed, one existing
+ignored), non-Metal backend compilation, strict Clippy for the three examples,
+Python evidence-validator tests, formatting and diff checks passed.

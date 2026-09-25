@@ -244,7 +244,7 @@ diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kerne
 diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
 --- a/mlx/backend/metal/matmul.cpp
 +++ b/mlx/backend/metal/matmul.cpp
-@@ -14,11 +14,17 @@
+@@ -14,11 +14,30 @@
  #include "mlx/backend/metal/kernels/defines.h"
  #include "mlx/backend/metal/kernels/steel/gemm/params.h"
  #include "mlx/backend/metal/matmul.h"
@@ -259,10 +259,23 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
 +  return metal::is_nax_available() && !issubdtype(dtype, complexfloating) &&
 +      (env::enable_tf32() || dtype != float32);
 +}
++
++// One source of truth for native SIMD split-K dispatch and its partial buffer.
++int metal::simd_gemm_split_k_partitions(int M, int N, int K, const mlx::core::Device& dev) {
++  auto& d = metal::device(dev);
++  const char arch = d.get_architecture().back();
++  const int threshold = (arch == 's' || arch == 'd') ? 2048 : 1024;
++  const int tm16 = (M + 15) / 16, tn16 = (N + 15) / 16, tk = K / 16;
++  if (int64_t(tm16) * tn16 > threshold || tk < 8 || K < std::max(M, N)) {
++    return 1;
++  }
++  const int tm32 = (M + 31) / 32, tn32 = (N + 31) / 32;
++  return std::min(std::max(2, next_power_of_2(tk / (tm32 * tn32))), 32);
++}
  
  namespace {
  
-@@ -381,6 +387,7 @@
+@@ -381,6 +400,7 @@
          << (transpose_b ? 't' : 'n')
          << "_" << type_to_name(a)
          << "_" << type_to_name(out)
@@ -270,7 +283,7 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
          << "_bm" << bm << "_bn" << bn << "_bk" << bk
          << "_wm" << wm << "_wn" << wn; // clang-format on
  
-@@ -420,6 +427,7 @@
+@@ -420,6 +440,7 @@
        /* const std::string& hash_name = */ hash_name,
        /* const metal::MTLFCList& func_consts = */ func_consts,
        /* const array& out = */ out,
@@ -278,7 +291,27 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
        /* bool transpose_a = */ transpose_a,
        /* bool transpose_b = */ transpose_b,
        /* int bm = */ bm,
-@@ -552,6 +560,7 @@
+@@ -518,10 +539,6 @@
+     float beta = 0.0f) {
+   using namespace mlx::steel;
+ 
+-  int _tm = (M + 32 - 1) / 32;
+-  int _tn = (N + 32 - 1) / 32;
+-  int _tk = K / 16;
+-
+   int bm = M < 40 ? 16 : 32;
+   int bn = N < 40 ? 16 : 32;
+   int bk = 16;
+@@ -529,7 +546,7 @@
+ 
+   // As _tk grows use more partitions, as _tm * _tn grow use fewer partitions
+   int split_k_partitions =
+-      std::min(std::max(2, next_power_of_2(_tk / (_tm * _tn))), 32);
++      metal::simd_gemm_split_k_partitions(M, N, K, s.device);
+   int split_k_partition_stride = M * N;
+   int gemm_k_iterations = (K / bk) / split_k_partitions;
+   int split_k_partition_size = gemm_k_iterations * bk;
+@@ -552,6 +569,7 @@
          << (transpose_b ? 't' : 'n')
          << "_" << type_to_name(a)
          << "_" << type_to_name(C_split)
@@ -286,7 +319,7 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
          << "_bm" << bm << "_bn" << bn << "_bk" << bk
          << "_wm" << wm << "_wn" << wn
          << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
-@@ -564,6 +573,7 @@
+@@ -564,6 +582,7 @@
        /* const std::string& kernel_name = */ kname.str(),
        /* const array& in = */ a,
        /* const array& out = */ C_split,
@@ -294,25 +327,35 @@ diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
        /* bool transpose_a = */ transpose_a,
        /* bool transpose_b = */ transpose_b,
        /* int bm = */ bm,
-@@ -912,9 +922,7 @@
+@@ -912,16 +931,12 @@
    int _tn = (N + 16 - 1) / 16;
    int _tk = K / 16;
    int64_t matrix_size = static_cast<int64_t>(M) * N;
 -  bool use_nax = metal::is_nax_available() &&
 -      !issubdtype(a.dtype(), complexfloating) &&
 -      (env::enable_tf32() || a.dtype() != float32);
+-  char devc = d.get_architecture().back();
+-  int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
 +  bool use_nax = metal::use_nax_matmul(a.dtype());
-   char devc = d.get_architecture().back();
-   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
  
+   // Case 1: Small M×N with large K, use SIMD split-K
+   // Max and Ultra dispatch larger sizes to splitk
+-  if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
+-      _tk >= 8 && K >= std::max(M, N)) {
++  if (!use_nax && batch_size_out == 1 &&
++      metal::simd_gemm_split_k_partitions(M, N, K, s.device) > 1) {
+     return steel_gemm_splitk_axpby<CHECK_AB>(
+         /* const Stream& s = */ s,
+         /* metal::Device& d = */ d,
 diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
 --- a/mlx/backend/metal/metal.h
 +++ b/mlx/backend/metal/metal.h
-@@ -9,11 +9,16 @@
+@@ -9,11 +9,19 @@
  #include <variant>
  
  #include "mlx/api.h"
 +#include "mlx/dtype.h"
++#include "mlx/device.h"
  
  namespace mlx::core::metal {
  
@@ -322,16 +365,20 @@ diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
 +/* The exact arithmetic-path predicate used by ordinary SIMD/NAX matmul
 + * dispatch. Mixed-storage GEMM implements the SIMD loader only. */
 +MLX_API bool use_nax_matmul(Dtype dtype);
++/* Native batch-one SIMD GEMM partition count; one means no partial buffer. */
++MLX_API int simd_gemm_split_k_partitions(int M, int N, int K, const mlx::core::Device& device);
  
  /** Capture a GPU trace, saving it to an absolute file `path` */
  MLX_API void start_capture(std::string path = "");
 diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
 --- a/mlx/backend/metal/no_metal.cpp
 +++ b/mlx/backend/metal/no_metal.cpp
-@@ -7,6 +7,10 @@
+@@ -7,6 +7,12 @@
  namespace mlx::core {
  
  namespace metal {
++
++int simd_gemm_split_k_partitions(int, int, int, const mlx::core::Device&) { return 1; }
 +
 +bool use_nax_matmul(Dtype) {
 +  return false;

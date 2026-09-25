@@ -696,7 +696,35 @@ pub fn describe_text_workspace(
         )?;
     }
     schedule.allocation("sampling", MemoryBytes::estimated(0, product(&[logits_rows, topology.vocabulary_size, 4])?, "legacy portable float32 probability allowance; native sampling scratch is covered by backend overhead calibration"), global.clone())?;
+    let (credit, projection_scratch, projection_details) =
+        crate::projection_memory::refine(topology, rows, logits_rows)?;
+    if !projection_details.is_empty() {
+        schedule.global_allocation(
+            "covered-projection-workspace",
+            MemoryBytes {
+                lower_bytes: 0,
+                upper_bytes: copies
+                    .map(|copies| {
+                        add(
+                            projection_scratch,
+                            mul(projection_scratch, copies.saturating_sub(layers))?
+                                .div_ceil(layers),
+                        )
+                    })
+                    .transpose()?,
+                kind: ObservationKind::Estimated,
+                detail: format!(
+                    "{}; summed native payload plus existing concurrent-layer workspace calibration",
+                    projection_details.join("; ")
+                ),
+            },
+            global.clone(),
+        )?;
+    }
     if let Some(parameters) = topology.selected_parameter_promotion_bytes {
+        let parameters = parameters
+            .checked_sub(credit)
+            .ok_or_else(|| invalid("projection promotion credit exceeds selected task payload"))?;
         schedule.global_allocation(
             "uncached-parameter-conversions",
             parameter_conversions(parameters, layers, copies, persistent)?,

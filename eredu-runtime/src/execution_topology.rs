@@ -1,7 +1,8 @@
 //! Ordinary reusable text-module topology retained by cold preparation.
 //!
-//! These records describe construction and invocation geometry, not byte costs,
-//! allocator policy, retention calibration, or model-family identities.
+//! Architecture records describe construction and invocation geometry. Optional
+//! backend storage refinements attach only to loaded observations; allocator
+//! policy and native hardware selection remain outside this topology.
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{Error, LinearSpec};
@@ -228,6 +229,21 @@ pub struct TextExecutionTopology {
     /// Empty means attribution is unavailable, so observed conversions cannot credit it.
     #[serde(default)]
     pub selected_parameter_promotion_payloads: std::collections::BTreeMap<String, u64>,
+    /// Architecture dtype-flow declarations. For each ordinary projection owner,
+    /// all listed ungrouped learned RMS gains must produce F32 for its input to
+    /// be F32. The equations between normalization and projection must preserve
+    /// that dtype. List every source when an owner has multiple invocations.
+    /// Absence means unknown; state storage width is not an activation contract.
+    #[serde(default)]
+    pub projection_input_normalizations: std::collections::BTreeMap<String, Vec<String>>,
+    /// Backend observations: these bound gains make ungrouped learned RMS output
+    /// F32 for every supported floating activation dtype, without evaluation.
+    #[serde(default)]
+    pub f32_rms_normalization_gains: std::collections::BTreeSet<String>,
+    /// Current backend binding facts. Cold/older reports default to no coverage.
+    #[serde(default)]
+    pub projection_storage:
+        std::collections::BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
     /// Additional unsupported module equations or invocation facts.
     pub missing: Vec<String>,
 }

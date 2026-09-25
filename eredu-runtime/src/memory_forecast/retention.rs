@@ -310,6 +310,9 @@ mod tests {
             output_softcap: false,
             selected_parameter_promotion_bytes: Some(300),
             selected_parameter_promotion_payloads: [("a".into(), 100), ("b".into(), 200)].into(),
+            projection_storage: Default::default(),
+            projection_input_normalizations: Default::default(),
+            f32_rms_normalization_gains: Default::default(),
             missing: vec![],
         }
     }

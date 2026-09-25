@@ -211,6 +211,20 @@ fn memory_profile(
         Err(error) => Observed::unavailable(error.to_string()),
     };
     let parameters = crate::composition::mlx::capability::static_model_memory(session)?;
+    if geometry.fully_resident
+        && session.payload.distributed.is_none()
+        && session.payload.parameter_state.active.is_none()
+    {
+        if let (Some(topology), Some(report)) = (
+            geometry.execution_topology.as_mut(),
+            session
+                .residency_report()
+                .map_err(eredu_core::BackendFailure::from_error)?,
+        ) {
+            topology.projection_storage = report.projection_storage().clone();
+            topology.f32_rms_normalization_gains = report.f32_rms_normalization_gains().clone();
+        }
+    }
     let parameter_conversions = session
         .residency_report()
         .map_err(eredu_core::BackendFailure::from_error)?

@@ -187,6 +187,9 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
             output_softcap: false,
             selected_parameter_promotion_bytes: Some(1024),
             selected_parameter_promotion_payloads: Default::default(),
+            projection_storage: Default::default(),
+            projection_input_normalizations: Default::default(),
+            f32_rms_normalization_gains: Default::default(),
             missing: vec![],
             layers: vec![
                 TextLayerTopology {

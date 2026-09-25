@@ -7164,3 +7164,44 @@ options. The validation examples compare exact logits and cached tokens through
 ordinary, controlled and speculative paths, and separately measure allocations,
 kernel selections and repeated release timings. See
 [integration validation](mixed-storage-gemm.md).
+
+### Projection storage facts and forecast refinement
+
+The backend now attaches `ProjectionStorageFacts` to residency reports for current
+permanent bindings. It establishes settled weight dtype/layout and selected
+native device arithmetic without evaluating tensors. Overlays, bounded residency,
+missing bindings and conflicting aliases retain conservative coverage. The
+portable records carry canonical identities, exact geometry, activation/output
+representations and row intervals with native partial-result payloads; they carry
+no native handles or hardware dispatch rules.
+
+Loaded ordinary and continuation geometry and independent drafter geometry copy
+these facts into the shared execution topology. Cold preparation initializes an
+empty map, including old serialized reports with no field. Runtime matches the
+logical F32 invocation, shape, ordinary dense encoding and canonical task
+attribution. Every shared use must be covered before its full conversion payload
+is credited once. Retained-conversion credits remain separate and cannot be
+subtracted twice. Native partials and possible activation-layout copies are
+charged per invocation. Split-K partial storage can peak at an interior row count;
+the envelope includes those smaller-row maxima for short verification/final
+chunks. Output and bias storage remain with the existing topology producers.
+
+State storage width does not establish projection activation dtype. Architecture
+topology declares which ungrouped learned RMS normalizations feed each projection
+through dtype-preserving equations. LFM2 supplies this declaration for its dense
+mixer/FFN projections and final readout. The backend independently reports actual
+F32 rank-one gain bindings: MLX ungrouped learned RMS promotes its output through
+the gain. Runtime requires every declared source to have that guarantee. Missing
+declarations, narrow gains, grouped normalization and conflicting aliases receive
+no credit. This is a neutral dtype-flow contract, not a backend family branch.
+
+The narrow safemlx workspace query shares the exact native SIMD split-K partition
+helper with GEMM dispatch. It returns logical partial-buffer payload only and
+never evaluates or creates arrays. Native output payload is separately known;
+activation copying remains a zero-to-full-input bound until strides are known.
+Allocator capacity/rounding and GPU-private registers/threadgroup storage are not
+claimed exact. Existing calibrated graph, state, attention and allocator
+allowances remain in the forecast. Backend `describe_bound_projection` exposes
+these same facts as a reusable mechanism contract; unbound/cold descriptions
+retain promotion and unknown native-workspace costs. No portable crate gains a
+native dependency or unsafe-code exception.

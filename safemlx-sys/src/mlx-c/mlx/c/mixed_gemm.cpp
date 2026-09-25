@@ -9,6 +9,11 @@
 
 namespace {
 using namespace mlx::core;
+bool supported_geometry(size_t rows, int outputs, int width, const Stream& s) {
+  return s.device.type == Device::gpu && rows > 1 && rows <= 2000 &&
+      outputs > 1 && outputs <= 65536 && width > 0 && width <= 8192 &&
+      !metal::use_nax_matmul(float32);
+}
 // A distinct inference-only primitive prevents native Matmul transforms or
 // graph optimizations from assuming equal operand dtypes. Unsupported transforms
 // retain Primitive's typed exception; no implicit cast or alternate reduction.
@@ -26,6 +31,27 @@ class MixedStorageGemm : public UnaryPrimitive {
 };
 } // namespace
 #endif
+
+extern "C" int mlx_mixed_storage_gemm_workspace(
+    bool* supported, uint64_t* partial_bytes, int rows, int outputs, int width,
+    mlx_stream stream) {
+  try {
+    if (!supported || !partial_bytes) throw std::invalid_argument("MixedStorageGemm workspace requires non-null outputs");
+    *supported = false;
+    *partial_bytes = 0;
+#ifdef MLX_C_MIXED_STORAGE_GEMM
+    const auto& s = mlx_stream_get_(stream);
+    if (rows <= 0 || !supported_geometry(rows, outputs, width, s)) return 0;
+    const auto partitions = metal::simd_gemm_split_k_partitions(rows, outputs, width, s.device);
+    *partial_bytes = partitions > 1 ? uint64_t(partitions) * rows * outputs * 4 : 0;
+    *supported = true;
+#endif
+    return 0;
+  } catch (const std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
 
 extern "C" int mlx_try_mixed_storage_gemm(
     mlx_array* res, bool* supported, mlx_array input, mlx_array weight,
@@ -48,7 +74,7 @@ extern "C" int mlx_try_mixed_storage_gemm(
       return 0;
     }
     const auto rows = a.size() / a.shape(-1);
-    if (rows <= 1 || rows > 2000) {
+    if (!supported_geometry(rows, w.shape(0), w.shape(1), s)) {
       return 0;
     }
     // Reuse the actual native arithmetic-path predicate, not a device-name
