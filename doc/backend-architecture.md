@@ -7100,13 +7100,13 @@ continuation forecasts consume the same neutral facts and shared lifetime compos
 
 The backend's nondefault `projection-profiling` feature provides bounded,
 thread-affine collection of native mixed-width dense and tied-embedding
-projection inputs, weights and outputs. Hooks do not evaluate arrays or change
+projection inputs, weights and outputs. Capture hooks do not evaluate arrays or change
 mechanism selection. At the explicit finish boundary, diagnostic tooling settles
 samples and groups them by actual dtype, shape, strides and selected backend path.
 One real representative and the invocation count are retained for each class.
 Capture owns additional arrays, so its peak and latency are explicitly excluded
 from ordinary inference measurements. The feature is forwarded by the facade
-solely for its native `projection_baseline` example; portable defaults and neutral
+solely for native projection validation examples; portable defaults and neutral
 contracts gain no native dependencies.
 
 The example belongs to application/validation tooling. It performs separate
@@ -7125,7 +7125,7 @@ default and changes no dispatch choice, kernel equation, precision policy or
 completion ownership. All native work continues through `safemlx`; no additional
 unsafe-code exception or public inference error type is introduced.
 
-### Mixed-storage FP32 GEMM prototype
+### Mixed-storage FP32 GEMM
 
 Stage two exposes `safemlx::fast::try_mixed_storage_gemm` as a native,
 inference-only experiment. Its distinct primitive delegates dispatch to the pinned
@@ -7135,21 +7135,32 @@ tiles/padding, MMA, epilogues, output dtype, partition selection and split-K
 accumulation remain FP32 with their existing geometry and order. Separate bias
 addition stays with the caller.
 
-The native operation accepts only settled contiguous rank-two F32 activations
-and F16/BF16 `[N,K]` weights on Metal devices using native SIMD GEMM, within the
-bounded prototype geometry. Device model names do not control admission. The
-operation shares ordinary Matmul's native NAX-selection predicate and rejects
-NAX/TF32 dispatch because its separate loader is not implemented. NAX-capable
-hardware remains eligible when native FP32 dispatch selects SIMD. It returns
-`None` without evaluation for unsupported cases, including CPU, CUDA,
-system/unpatched MLX, non-JIT builds, lazy operands, noncontiguous layouts and
-single-row GEMV. This is a safemlx/C-ABI/native
-mechanism; no new unsafe exception, portable capability, or family policy is
-introduced. Its separate primitive rejects unsupported transformation APIs rather
-than inheriting homogeneous-Matmul gradient or compiler assumptions.
+The native operation accepts settled contiguous rank-two F16/BF16 `[N,K]`
+weights and rank-two-or-higher F32 activations on Metal devices using native SIMD
+GEMM, within the bounded validated geometry. Activations may be lazy or strided;
+flatten/unflatten and layout handling match native Matmul. Device model names do
+not control admission. The operation shares ordinary Matmul's native NAX-selection
+predicate and rejects NAX/TF32 dispatch because its separate loader is not
+implemented. NAX-capable hardware remains eligible when native FP32 dispatch
+selects SIMD. It returns `None` without evaluation for unsupported cases, including
+CPU, CUDA, system/unpatched MLX, non-JIT builds, lazy/noncontiguous weights and
+single-row GEMV. This is a safemlx/C-ABI/native mechanism; no new unsafe exception,
+portable capability, or family policy is introduced. Its separate primitive
+rejects unsupported transformation APIs rather than inheriting homogeneous-Matmul
+gradient or compiler assumptions.
 
-The opt-in projection profiler can replay this operation on real captured inputs.
-Ordinary dense and tied-embedding selection, conversion-retention admission and
-workspace forecasts do not yet select or advertise it. Shared projection routing
-and full inference validation belong to stage three; explicit forecast mechanism
-facts belong to stage four. See [prototype validation](mixed-storage-gemm.md).
+Stage three integrates multi-row GEMM into the same backend projection selector
+already shared by ordinary dense linear layers and tied-embedding readout.
+Single-row mixed GEMV and each caller's existing unsupported-case fallback remain
+in place. Bias handling stays outside the selector. Ordinary, controlled and
+speculative execution consume this shared mechanism without driver-specific
+branches. Forecast allowances remain conservative until stage four can report
+per-invocation eligibility and workspace facts.
+
+The nondefault projection profiler provides a thread-affine `CastGemmReference`
+guard for same-build A/B validation; it disables only the multi-row optimization
+until dropped. This control is absent from production builds and public inference
+options. The validation examples compare exact logits and cached tokens through
+ordinary, controlled and speculative paths, and separately measure allocations,
+kernel selections and repeated release timings. See
+[integration validation](mixed-storage-gemm.md).

@@ -12,20 +12,21 @@ use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
 
-/// Inference-only prototype of the pinned FP32 Metal GEMM with F16/BF16
+/// Inference-only operation using the pinned FP32 Metal GEMM with F16/BF16
 /// weight storage. Computes `input @ weight.T`, returning F32. Bias, if any,
 /// must be added separately with the ordinary add operation.
 ///
 /// Returns `None` without evaluation for unsupported device, dtype, shape or
-/// layout. Currently requires settled row-contiguous rank-two operands, at
+/// weight layout. Requires settled row-contiguous rank-two weights and F32
+/// activations of rank >= 2 (which may be lazy or strided), at
 /// `2 <= M <= 2000`, `2 <= N <= 65536`, `1 <= K <= 8192`, and the vendored
 /// Metal JIT build. All devices using native SIMD GEMM are eligible; devices
 /// selecting NAX/TF32 return `None` because that loader is not implemented.
 /// NAX-capable hardware can use this operation when native FP32 dispatch uses
 /// SIMD (for example, with `MLX_ENABLE_TF32=0` before native initialization).
 /// It preserves native SIMD tile selection and split-K reduction. Autodiff,
-/// vmap and compilation transforms are unsupported. This operation is not
-/// selected by ordinary projections until backend integration is validated.
+/// vmap and compilation transforms are unsupported. This operation is
+/// selected by the backend shared projection mechanism for eligible invocations.
 pub fn try_mixed_storage_gemm(
     input: &Array,
     weight: &Array,

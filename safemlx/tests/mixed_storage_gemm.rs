@@ -1,4 +1,4 @@
-//! Stage-two loader-only prototype. Run serially: allocator counters are global.
+//! Mixed-storage GEMM exactness and allocation coverage. Run serially: allocator counters are global.
 use safemlx::{
     fast::try_mixed_storage_gemm, memory, ops::indexing::TryIndexOp, transforms, Array, Device,
     DeviceType, Dtype, Stream,
@@ -193,17 +193,43 @@ fn unsupported_layouts_and_types_do_not_evaluate_or_cast() {
         .is_none());
     let lazy_input = a.add(&a, &s).unwrap();
     assert!(!lazy_input.is_available().unwrap());
-    assert!(try_mixed_storage_gemm(&lazy_input, &w, &s)
+    let output = try_mixed_storage_gemm(&lazy_input, &w, &s)
         .unwrap()
-        .is_none());
+        .unwrap();
     assert!(!lazy_input.is_available().unwrap());
+    assert!(!output.is_available().unwrap());
+    same(
+        &output,
+        &lazy_input
+            .matmul(
+                w.as_dtype(Dtype::Float32, &s)
+                    .unwrap()
+                    .transpose(&s)
+                    .unwrap(),
+                &s,
+            )
+            .unwrap(),
+        "lazy activation",
+    );
     let column_input = Array::from_slice(&values(4 * 129, 123), &[129, 4])
         .transpose(&s)
         .unwrap();
     transforms::eval([&column_input]).unwrap();
-    assert!(try_mixed_storage_gemm(&column_input, &w, &s)
-        .unwrap()
-        .is_none());
+    same(
+        &try_mixed_storage_gemm(&column_input, &w, &s)
+            .unwrap()
+            .unwrap(),
+        &column_input
+            .matmul(
+                w.as_dtype(Dtype::Float32, &s)
+                    .unwrap()
+                    .transpose(&s)
+                    .unwrap(),
+                &s,
+            )
+            .unwrap(),
+        "column activation",
+    );
     let one = a.try_index_device((..1, ..), &s).unwrap();
     transforms::eval([&one]).unwrap();
     assert!(try_mixed_storage_gemm(&one, &w, &s).unwrap().is_none());
@@ -233,4 +259,55 @@ fn cpu_prototype_rejection_needs_no_gpu_or_evaluation() {
     assert!(!w.is_available().unwrap());
     assert!(try_mixed_storage_gemm(&a, &w, &stream).unwrap().is_none());
     assert!(!w.is_available().unwrap());
+}
+
+#[test]
+#[ignore = "requires Metal SIMD GEMM; run explicitly with MLX_ENABLE_TF32=0"]
+fn lazy_batched_and_strided_activations_preserve_bits() {
+    let s = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+        // Exercise transposed-A kernel families, tile/K tails, split-K and the
+        // same flatten/copy/unflatten operations as native high-rank matmul.
+        for (m, n, k) in [(4, 33, 129), (32, 64, 128), (66, 65, 257), (128, 129, 513)] {
+            let w = Array::from_slice(&values(n * k, 567), &[n as i32, k as i32])
+                .as_dtype(dtype, &s)
+                .unwrap();
+            transforms::eval([&w]).unwrap();
+            let contiguous = Array::from_slice(&values(m * k, 123), &[m as i32, k as i32]);
+            let column = Array::from_slice(&values(m * k, 123), &[k as i32, m as i32])
+                .transpose(&s)
+                .unwrap();
+            let padded = Array::from_slice(&values(m * (k + 3), 123), &[m as i32, (k + 3) as i32])
+                .try_index_device((.., ..k as i32), &s)
+                .unwrap();
+            let sliced = Array::from_slice(&values(m * k * 2, 123), &[m as i32, k as i32, 2])
+                .try_index_device((.., .., 0), &s)
+                .unwrap();
+            for a in [contiguous, column, padded, sliced] {
+                for batched in [false, true] {
+                    let a = if batched {
+                        a.reshape(&[2, 1, (m / 2) as i32, k as i32], &s).unwrap()
+                    } else {
+                        a.clone()
+                    };
+                    let output = try_mixed_storage_gemm(&a, &w, &s).unwrap().unwrap();
+                    assert!(!output.is_available().unwrap());
+                    let expected = a
+                        .matmul(
+                            w.as_dtype(Dtype::Float32, &s)
+                                .unwrap()
+                                .transpose(&s)
+                                .unwrap(),
+                            &s,
+                        )
+                        .unwrap();
+                    same(
+                        &output,
+                        &expected,
+                        &format!("{dtype:?} {m} {n} {k} batched={batched}"),
+                    );
+                }
+            }
+        }
+    }
 }

@@ -23,7 +23,14 @@ pub(crate) fn dense_projection(
 ) -> Result<Array, Exception> {
     if let Some(output) = super::mixed_projection::project(input, weight, stream)? {
         #[cfg(feature = "projection-profiling")]
-        super::projection_profile::record(input, weight, &output, "dense", "mixed_gemv", stream);
+        super::projection_profile::record(
+            input,
+            weight,
+            &output,
+            "dense",
+            super::mixed_projection::profile_path(input),
+            stream,
+        );
         return Ok(output);
     }
     if let Some(output) = super::matrix::bf16_row_projection(input, weight, None, stream)? {

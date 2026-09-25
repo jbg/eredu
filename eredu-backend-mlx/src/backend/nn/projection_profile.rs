@@ -10,6 +10,31 @@ use sha2::{Digest, Sha256};
 thread_local! {
     static CAPTURE: RefCell<Option<Collector>> = const { RefCell::new(None) };
 }
+thread_local! {
+    static CAST_GEMM_REFERENCE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Same-thread diagnostic guard selecting the pre-integration multi-row fallback.
+/// Available only with `projection-profiling`; leaves single-row GEMV unchanged.
+/// Keep alive throughout graph construction, including iterator advancement.
+#[derive(Debug)]
+pub struct CastGemmReference(std::marker::PhantomData<std::rc::Rc<()>>);
+impl CastGemmReference {
+    /// Enable the reference path until this guard is dropped. Guards may nest.
+    pub fn begin() -> Self {
+        CAST_GEMM_REFERENCE.with(|depth| depth.set(depth.get() + 1));
+        Self(std::marker::PhantomData)
+    }
+}
+impl Drop for CastGemmReference {
+    fn drop(&mut self) {
+        CAST_GEMM_REFERENCE.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+pub(crate) fn cast_gemm_reference_enabled() -> bool {
+    CAST_GEMM_REFERENCE.with(|depth| depth.get() > 0)
+}
+
 struct Collector {
     cases: Vec<ProjectionCase>,
     limit: usize,

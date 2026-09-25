@@ -117,6 +117,8 @@ def compare_reference_case(case, reference):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference-dispatch", action="store_true",
+                        help="select the diagnostic pre-integration cast-GEMM path")
     parser.add_argument("--mixed-storage-prototype", action="store_true",
                         help="also require exact replay of the loader-only native GEMM prototype")
     parser.add_argument("--disable-tf32", action="store_true",
@@ -142,7 +144,7 @@ def main():
     patch = Path("safemlx-sys/src/mlx-c/patches/mlx-metal-kernel-selection-trace.patch")
     metadata = {
         "schema_version": 1, "mixed_storage_prototype": args.mixed_storage_prototype,
-        "tf32_disabled": args.disable_tf32,
+        "tf32_disabled": args.disable_tf32, "reference_dispatch": args.reference_dispatch,
         "reference_manifest_sha256": sha256(args.reference_manifest) if reference else None,
         "native_mixed_storage_patch_sha256": sha256(
             "safemlx-sys/src/mlx-c/patches/mlx-metal-mixed-storage-gemm.patch"),
@@ -189,7 +191,8 @@ def main():
                     "capture-prototype" if args.mixed_storage_prototype else "capture")
                 command = [str(args.binary.resolve()), str(args.model.absolute()), str(output.resolve()),
                            execution_mode, policy, str(positions),
-                           str(1 if mode == "trace" else args.samples)]
+                           str(1 if mode == "trace" else args.samples),
+                           "reference" if args.reference_dispatch else "mixed"]
                 print(name, flush=True)
                 started = time.monotonic()
                 with log.open("w") as stream:

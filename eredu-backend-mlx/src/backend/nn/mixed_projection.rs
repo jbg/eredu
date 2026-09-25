@@ -1,15 +1,12 @@
 //! Mixed F32-activation / narrow-weight projections without full-weight casts.
 use safemlx::{error::Exception, Array, Stream};
 
-/// Matches the native F32 GEMV reduction while converting each weight on load.
-///
-/// Only one logical input row is eligible. Multi-row prefill and speculative
-/// verification keep native GEMM, whose reduction depends on its tile/device
-/// selection. Column-major weights similarly keep the native transposed GEMV.
-/// Unevaluated weights also use native fallback because their strides are not
-/// final yet. A contiguous copy, when necessary, stays in the narrow dtype.
-/// Conversion-retention estimates remain conservative: these same weights can
-/// still need their F32 conversions on a later multi-row invocation.
+/// Shared selector for ordinary linear layers and tied embedding readout.
+/// Single rows use native-equivalent GEMV; multiple rows use the pinned native
+/// F32 GEMM with narrow weight loading. Neither path evaluates inputs to decide
+/// eligibility. Unsupported geometry, weight layout, dtype or native arithmetic
+/// path retains the caller's existing conversion-retention/matmul fallback.
+/// Forecasts remain conservative until per-invocation coverage is reported.
 pub(crate) fn project(
     input: &Array,
     weight: &Array,
@@ -32,12 +29,18 @@ pub(crate) fn project(
             || input.dim(-1) <= 0
             || weight.dim(0) <= 0
             || weight.dim(1) != input.dim(-1)
-            || input.size() != input.dim(-1) as usize
             || !weight.is_available()?
             || weight.strides()[1] != 1
             || stream.get_device()?.get_type()? != DeviceType::Gpu
         {
             return Ok(None);
+        }
+        if input.size() != input.dim(-1) as usize {
+            #[cfg(feature = "projection-profiling")]
+            if super::projection_profile::cast_gemm_reference_enabled() {
+                return Ok(None);
+            }
+            return safemlx::fast::try_mixed_storage_gemm(input, weight, stream);
         }
         let width = input.dim(-1);
         let outputs = weight.dim(0);
@@ -92,6 +95,15 @@ pub(crate) fn project(
     {
         let _ = (input, weight, stream);
         Ok(None)
+    }
+}
+
+#[cfg(feature = "projection-profiling")]
+pub(crate) fn profile_path(input: &Array) -> &'static str {
+    if input.size() == input.dim(-1) as usize {
+        "mixed_gemv"
+    } else {
+        "mixed_gemm"
     }
 }
 
@@ -196,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_projection_keeps_native_gemm_and_transposed_matrix_fallbacks() {
+    fn mixed_projection_selects_gemm_and_keeps_unsupported_fallbacks() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
         let weight = Array::from_slice(&values(128 * 17, 567), &[128, 17])
             .as_dtype(Dtype::Bfloat16, &stream)
@@ -211,7 +223,7 @@ mod tests {
         let weight = weight.reshape(&[17, 128], &stream).unwrap();
         safemlx::transforms::eval([&weight]).unwrap();
         let batch = Array::from_slice(&values(256, 123), &[2, 128]);
-        assert!(project(&batch, &weight, &stream).unwrap().is_none());
+        assert_same(&batch, &weight, &stream);
         assert!(project(
             &input.as_dtype(Dtype::Bfloat16, &stream).unwrap(),
             &weight,
@@ -260,7 +272,7 @@ mod tests {
             .unwrap();
             let mut owner = ResidentParameterConversions::default();
             owner.register([&weight], &budget).unwrap();
-            for rows in [1, 3, 1] {
+            for rows in [1, 3, 2001, 1] {
                 let input = Array::from_slice(&values(rows * 128, 123), &[rows as i32, 128]);
                 let expected = safemlx::ops::matmul(
                     &input,
@@ -298,7 +310,9 @@ mod tests {
                     .value()
                     .unwrap()
                     .retained_payload_bytes;
-                assert_eq!(retained, if rows == 1 { 0 } else { 17 * 128 * 4 });
+                // Beyond the admitted GEMM bounds, both callers still use
+                // the existing retained-conversion fallback.
+                assert_eq!(retained, if rows == 2001 { 17 * 128 * 4 } else { 0 });
                 trim_budget(&budget).unwrap();
             }
         }

@@ -52,7 +52,7 @@ impl Embedding {
                 self.weight.as_ref(),
                 &output,
                 "tied_embedding",
-                "mixed_gemv",
+                crate::backend::nn::mixed_projection::profile_path(x),
                 stream,
             );
             return Ok(output);

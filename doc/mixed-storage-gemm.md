@@ -1,11 +1,10 @@
-# Mixed-storage FP32 GEMM prototype
+# Mixed-storage FP32 GEMM
 
-Stage two adds a loader-only native operation for the pinned MLX 0.32.0 FP32
-GEMM. It is available explicitly through
-`safemlx::fast::try_mixed_storage_gemm` and the optional projection profiler.
-Ordinary inference selection and memory forecasts remain at their existing
-stage-one behavior. Shared projection integration is stage three; forecast
-mechanism facts are stage four.
+Stage two added a loader-only native operation for the pinned MLX 0.32.0 FP32
+GEMM. Stage three selects it through the MLX backend's shared projection selector
+for both ordinary linear layers and tied-embedding readout. Ordinary, controlled
+and speculative execution consume those same mechanisms. Forecast mechanism facts
+remain stage four; cold and runtime conversion allowances are still conservative.
 
 ## Arithmetic and storage contract
 
@@ -23,25 +22,34 @@ there is no fused epilogue substitution. Kernel cache keys include the weight
 storage dtype. Homogeneous kernel keys and ordinary Matmul promotion are unchanged.
 
 The native operation returns `None` without evaluation for unsupported inputs:
-only settled row-contiguous rank-two operands, `2 <= M <= 2000`,
+settled row-contiguous rank-two weights and rank-two-or-higher F32 activations,
+`2 <= M <= 2000` (total logical input rows),
 `2 <= N <= 65536`, `1 <= K <= 8192`, and native SIMD GEMM dispatch are admitted.
 There is no GPU model-name allowlist. MLX retains its device-specific tile and
 split-K selection. Contiguous views with offsets are supported.
 
 NAX/TF32 dispatch is excluded because its separate weight loader has not been
 extended; passing narrow weights into that path would read them as FP32. The
-prototype and ordinary Matmul share the same native NAX-selection predicate.
+operation and ordinary Matmul share the same native NAX-selection predicate.
 NAX-capable hardware is eligible when native FP32 dispatch uses SIMD, for example
-with `MLX_ENABLE_TF32=0` set before native initialization. The prototype never
+with `MLX_ENABLE_TF32=0` set before native initialization. The operation never
 changes that setting or substitutes a different arithmetic path. Padded/column-major
-layouts, lazy operands, single-row GEMV, CPU, CUDA, system MLX and non-JIT builds
-remain excluded. These are implementation coverage limits, not model limitations. Native autodiff, vmap and compilation transformations are unsupported
+weights, lazy weights, single-row GEMV, CPU, CUDA, system MLX and non-JIT builds
+remain excluded from this GEMM operation. The backend retains its existing
+single-row mixed GEMV selector and all other native fallbacks. These are implementation coverage limits, not model limitations. Native autodiff, vmap and compilation transformations are unsupported
 by the distinct primitive.
 
 The operation creates the F32 output and, when selected by native dispatch,
-F32 split-K partials. It creates no full promoted weight. Input readiness is a
-validation boundary in this prototype; stage-three integration must preserve lazy
-execution rather than introducing per-projection evaluations to satisfy it.
+F32 split-K partials. It creates no full promoted weight. Activations may be lazy,
+transposed, padded or sliced. Rank normalization uses exactly the native public
+matmul's flatten/unflatten graph operations; native Matmul resolves activation
+strides and performs any necessary FP32 activation copy at evaluation. Selection
+never forces evaluation. The separate bias add is unchanged.
+
+Unsupported cases flow through each caller's existing parameter-conversion
+retention and native matmul path. In particular, this change does not alter
+narrow-activation dispatch or promote a noncontiguous/lazy weight to obtain
+eligibility. Linear and tied readout call the same backend selector.
 
 ## Reproduction
 
@@ -60,7 +68,7 @@ python3 validation/projection_baseline.py \
   --binary target/release/examples/projection_baseline \
   --model /path/to/pinned/LFM2.5-1.2B-Instruct-BF16.gguf \
   --output /tmp/eredu-mixed-storage-gemm --samples 5 \
-  --mixed-storage-prototype \
+  --mixed-storage-prototype --reference-dispatch \
   --reference-manifest validation/results/projection-baseline-2026-09-25.json
 ```
 
@@ -70,7 +78,7 @@ configuration overrides for reproducibility. Omit `--reference-manifest` when
 running on a different device: exactness is against that device's native
 cast-plus-matmul path, not another device's reduction or historical fingerprints.
 
-The two hardware-specific tests are ignored by default and fail if explicitly run
+The hardware-specific tests are ignored by default and fail if explicitly run
 without Metal SIMD GEMM. They measure output/partial workspace against native
 preconverted GEMM on the device under test, without hard-coded split-K thresholds
 or host page sizes. The CPU rejection test runs normally and requires no GPU. The runner uses fresh processes for ordinary timing, real projection replay,
@@ -78,8 +86,7 @@ and kernel tracing, at 128 and 2,000 positions with disabled, 256 MiB and unlimi
 conversion retention. Timing runs disable kernel tracing and allocator caching.
 Short rows 2, 4, 8 and 16 slice actual 128-position activations. For the prototype,
 the profiler settles a contiguous `[M,K]` view before timing and compares all
-flattened output bits. Restoring the original leading dimensions belongs to the
-shared projection integration.
+flattened output bits. The integrated selector also restores the original leading dimensions lazily.
 
 Each eligible replay adds `mixed_storage_prototype` to the four baseline phases.
 It must match every output bit of the captured projection (or the explicit-F32
@@ -87,7 +94,7 @@ reference for sliced inputs). Native selection traces must match preconverted
 GEMM after removing only the weight-storage suffix; the split-K accumulator must
 remain present and unchanged. Measured peak growth must equal preconverted GEMM's
 output/partial workspace. Unsupported replays fail rather than benchmarking a
-fallback under the prototype label. The reference manifest additionally gates all
+fallback under the prototype label. With `--reference-dispatch`, the reference manifest additionally gates all
 projection fingerprints, class inventories and ordinary cached-generation tokens
 against the original pre-patch stage-one evidence.
 
@@ -96,7 +103,7 @@ its incremental peak is not total storage. Replay timings are isolated operation
 not additive full-model attribution. Capturing retains array owners and invalidates
 ordinary inference peak/latency measurement, as in stage one.
 
-## Validation results, 2026-09-25
+## Stage-two results, 2026-09-25
 
 The original stage-two measurements below used the initial model-name gate,
 which has since been replaced by mechanism-based eligibility. Their binary and
@@ -177,20 +184,14 @@ capture owner even during prototype replay; the experiment proves the operation
 does not allocate or require a promoted weight, not that current sessions have
 already released their retained copies.
 
-## Remaining integration validation
+## Scope of stage-two evidence
 
-The real vocabulary replay matches captured logits and their original stage-one
-fingerprints. Ordinary cached generation also retains its original tokens, but
-it still uses the existing selector. Full released-checkpoint forward/logit and
-generation parity with the prototype selected throughout, including controlled
-sessions and speculative verification, remains a stage-three requirement.
-The small-row replays validate verification-sized projections, not the speculative
-driver. Likewise, the ordinary timing/peak records in the JSON are unchanged-path
-baselines; repeated optimized full-prefill measurements under managed and unlimited
-retention belong with that integration. Physical-device measurements so far cover M3 Ultra; other Metal hardware remains
-an explicit validation gap, not a runtime exclusion. Broader layouts and the NAX
-loader require implementation and validation before those mechanisms are admitted.
-
+The stage-two records above exercised the new operation only in isolated replay;
+ordinary timing/peak records still used the previous selector. Those measurements
+established loader arithmetic and allocation parity. Full integrated forward,
+controlled/speculative and ordinary timing validation is recorded in the
+stage-three section below. Broader weight layouts and the NAX loader still need
+implementation and validation before admission.
 
 ## Device eligibility correction
 
@@ -207,3 +208,89 @@ compare with measured preconverted-GEMM workspace on the same device rather than
 reimplementing its split-K thresholds and allocator page rounding. CPU-only
 rejection, strict safemlx Clippy, the Python evidence tests and formatting checks
 also passed. No physical validation on another GPU is claimed.
+
+## Stage-three integration validation
+
+Build the two release diagnostic examples and run the integration matrix:
+
+```sh
+CARGO_INCREMENTAL=0 cargo build -p eredu --release \
+  --example projection_baseline --example projection_parity \
+  --no-default-features --features mlx,metal,projection-profiling --locked --offline
+python3 validation/projection_integration.py \
+  --model /path/to/pinned/LFM2.5-1.2B-Instruct-BF16.gguf \
+  --output /tmp/eredu-projection-integration --samples 5 --disable-tf32
+```
+
+The nondefault `projection-profiling` feature exposes `CastGemmReference`, a
+thread-affine, nestable guard that disables only multi-row mixed GEMM while alive.
+It is a validation control, absent from production builds and inference options.
+Both comparison paths use the same executable, checkpoint and native settings;
+single-row mixed GEMV remains enabled. No execution driver gains another selector.
+
+The parity executable compares full 65,536-entry F32 logit bit arrays, not just
+argmax or tolerances, through prefill and seven cached predictions. Ordinary and
+controlled paths are compared with each other and with the cast-GEMM reference.
+Self-drafting with two proposals exercises actual speculative verification;
+ordinary and controlled speculative tokens match ordinary generation, and every
+target/draft capture matches the same speculative path with cast GEMM. Different
+GEMV/GEMM batch reductions need not match each other; the comparison preserves each
+path's native arithmetic. Captured projection classes must prove that short
+verification batches selected mixed GEMM.
+
+The runner uses fresh serial processes for parity, ordinary timings, real
+projection replay and kernel tracing. It tests 128 and 2,000 positions with
+256 MiB managed and unlimited conversion retention. Each ordinary run includes a
+first request and five warm reset requests, with allocator caching disabled.
+Every integrated replay must preserve native kernel geometry/reduction and have
+the same peak allocation as preconverted GEMM, including split-K partials.
+Capture and trace runs are excluded from ordinary timing/memory results.
+
+Stage-three results on Apple M3 Ultra / macOS 26.6.2, release build, pinned
+checkpoint, native SIMD dispatch (`MLX_ENABLE_TF32=0`), 2026-09-25:
+
+| Conversion retention | Positions | Warm first-token ms, reference → integrated | Peak active GiB, reference → integrated |
+|---|---:|---:|---:|
+| Managed, 256 MiB | 128 | 93.57 → 22.64 | 6.989 → 2.649 |
+| Managed, 256 MiB | 2,000 | 715.70 → 685.55 | 4.683 → 3.481 |
+| Unlimited | 128 | 23.60 → 22.67 | 7.009 → 2.649 |
+| Unlimited | 2,000 | 693.65 → 686.62 | 7.840 → 3.481 |
+
+Times are medians of five warm reset requests, through the first generated token;
+loading is excluded. Peaks are total MLX active allocation during prefill, not
+process RSS or a cold-lifecycle forecast. Small latency differences are descriptive
+measurements on this host, not a cross-device throughput guarantee. First-request
+latency and peaks are recorded separately in the evidence.
+
+[Stage-three machine-readable evidence](../validation/results/projection-integration-2026-09-25.json)
+records 20 isolated processes, exact checkpoint/binary/source hashes, all samples,
+logit fingerprints and native pipeline selections. Raw output is retained in
+`/tmp/eredu-projection-integration-2026-09-25`.
+
+- All four policy/length pairs passed exact 65,536-entry logits for eight
+  predictions across reference/integrated and ordinary/controlled execution.
+  Ordinary and controlled speculative generation produced the same eight tokens.
+  Each reference/integrated speculative pair matched all 13 target/draft logit
+  captures across three actual verification blocks; short verification projections
+  selected mixed GEMM.
+- All 93 prefill projections (six weight-shape classes) selected mixed GEMM in
+  every case. Conversion-retention reports remained zero for every integrated
+  cold and warm request, including unlimited policy.
+- All **72 real projection replays** at 2/4/8/16/128/2,000 rows passed exact bits.
+  Integrated pipeline selection matched preconverted native GEMM after removing
+  only the storage suffix, with no conversion pipeline. Every measured peak
+  equaled native output/partial workspace, including split-K.
+- Native tests passed all 290 existing F16/BF16 arithmetic/bias/allocation cases
+  plus 64 transposed/padded/sliced/batched activation cases. Lazy selection stayed
+  unevaluated; unsupported weights, devices and shapes retained fallback behavior.
+  Four shared-selector tests passed, including linear bias, tied readout and
+  retained-conversion admission beyond the 2,000-row bound.
+- Portable backend conformance (112 tests), portable facade (27 passed, one
+  existing ignored), non-Metal backend build, strict release Clippy for both
+  examples, Python evidence-validator tests, formatting and diff checks passed.
+
+Only M3 Ultra hardware was available for native validation. Eligibility is based
+on native arithmetic dispatch, not device name; the exactness/allocation suite is
+portable to other supported SIMD Metal devices, but those runs are still a
+validation gap. NAX/TF32 retains its existing fallback. Stage four must expose
+per-invocation coverage/workspace before forecasts remove conversion allowances.

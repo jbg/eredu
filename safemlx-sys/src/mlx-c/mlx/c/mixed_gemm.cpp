@@ -39,12 +39,16 @@ extern "C" int mlx_try_mixed_storage_gemm(
     const auto& a = mlx_array_get_(input);
     const auto& w = mlx_array_get_(weight);
     const auto& s = mlx_stream_get_(stream);
-    if (s.device.type != Device::gpu || a.ndim() != 2 || w.ndim() != 2 ||
+    if (s.device.type != Device::gpu || a.ndim() < 2 || w.ndim() != 2 ||
         a.dtype() != float32 || (w.dtype() != float16 && w.dtype() != bfloat16) ||
-        a.shape(0) <= 1 || w.shape(0) <= 1 || a.shape(1) <= 0 ||
-        a.shape(0) > 2000 || w.shape(0) > 65536 || a.shape(1) > 8192 ||
-        a.shape(1) != w.shape(1) || !a.is_available() || !w.is_available() ||
-        !a.flags().row_contiguous || !w.flags().row_contiguous) {
+        w.shape(0) <= 1 || a.shape(-1) <= 0 ||
+        w.shape(0) > 65536 || a.shape(-1) > 8192 ||
+        a.shape(-1) != w.shape(1) || !w.is_available() ||
+        !w.flags().row_contiguous) {
+      return 0;
+    }
+    const auto rows = a.size() / a.shape(-1);
+    if (rows <= 1 || rows > 2000) {
       return 0;
     }
     // Reuse the actual native arithmetic-path predicate, not a device-name
@@ -53,9 +57,18 @@ extern "C" int mlx_try_mixed_storage_gemm(
     if (metal::use_nax_matmul(float32)) {
       return 0;
     }
+    // Match ops::matmul's rank normalization exactly. Activation strides may
+    // still be lazy: native Matmul resolves them and performs any required
+    // activation copy during evaluation, just as the homogeneous path does.
+    auto matrix = a.ndim() > 2 ? flatten(a, 0, -2, s) : a;
     auto b = transpose(w, s);
-    array output({a.shape(0), w.shape(0)}, float32,
-        std::make_shared<MixedStorageGemm>(s), {a, b});
+    array output({static_cast<int>(rows), w.shape(0)}, float32,
+        std::make_shared<MixedStorageGemm>(s), {matrix, b});
+    if (a.ndim() > 2) {
+      auto leading = a.shape();
+      leading.pop_back();
+      output = unflatten(output, 0, std::move(leading), s);
+    }
     mlx_array_set_(*res, std::move(output));
     *supported = true;
 #endif

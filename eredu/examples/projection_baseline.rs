@@ -3,7 +3,10 @@ use anyhow::{ensure, Context};
 use eredu::api::{local_device_plan, LoadedModel, LocalDevice};
 use eredu::api::{reset_local_allocator_peak, set_local_allocator_cache_limit};
 use eredu_backend_mlx::allocator_memory;
-use eredu_backend_mlx::{backend::nn::projection_profile::ProjectionCapture, MlxBackendFactory};
+use eredu_backend_mlx::{
+    backend::nn::projection_profile::{CastGemmReference, ProjectionCapture},
+    MlxBackendFactory,
+};
 use eredu_core::{
     residency::ParameterConversionRetentionPolicy, ExecutionPlan, GenerationConfigOverrides,
     TextGenerationConfig,
@@ -13,7 +16,13 @@ use std::{path::PathBuf, time::Instant};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    ensure!(args.len() == 6, "usage: projection_baseline MODEL OUTPUT_JSON baseline|capture|capture-prototype disabled|BYTES|unlimited POSITIONS SAMPLES");
+    ensure!(matches!(args.len(), 6 | 7), "usage: projection_baseline MODEL OUTPUT_JSON baseline|capture|capture-prototype disabled|BYTES|unlimited POSITIONS SAMPLES [mixed|reference]");
+    let selection = args.get(6).map(String::as_str).unwrap_or("mixed");
+    ensure!(
+        matches!(selection, "mixed" | "reference"),
+        "unknown selector"
+    );
+    let _reference = (selection == "reference").then(CastGemmReference::begin);
     let path = PathBuf::from(&args[0]);
     let mode = args[2].as_str();
     ensure!(
@@ -116,7 +125,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let result = json!({"schema_version": 1, "model": path, "mode": mode, "positions": positions,
+    let result = json!({"schema_version": 1, "selector": selection, "model": path, "mode": mode, "positions": positions,
         "retention_policy": args[3], "allocator_cache_bytes": 0, "samples": samples,
         "ordinary": ordinary, "classes": classes, "replays": replays,
         "notes": ["Capture retains actual array owners and changes graph retention; its timings and peaks are not ordinary inference metrics.",

@@ -71,6 +71,11 @@ path = "examples/conversion_retention.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "projection_parity"
+path = "examples/projection_parity.rs"
+required-features = ["mlx", "metal", "projection-profiling"]
+
+[[example]]
 name = "projection_baseline"
 path = "examples/projection_baseline.rs"
 required-features = ["mlx", "metal", "projection-profiling"]

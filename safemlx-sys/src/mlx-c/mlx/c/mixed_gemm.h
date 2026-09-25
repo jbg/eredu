@@ -7,9 +7,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Inference-only prototype: F32 [M,K] times narrow [N,K] transposed.
+/* Inference-only operation: F32 [...,K] times narrow [N,K] transposed.
  * Unsupported cases return success with supported=false and leave res unchanged.
- * Does not evaluate inputs. Requires settled contiguous operands and native SIMD
+ * Does not evaluate inputs. Requires settled contiguous weights and native SIMD
  * Metal GEMM dispatch. Bias remains a separate ordinary add operation. */
 int mlx_try_mixed_storage_gemm(
     mlx_array* res, bool* supported, mlx_array input, mlx_array weight,
