@@ -169,6 +169,10 @@ The baseline does not isolate each of those host costs further.
 
 ## Validation and next implementation target
 
+The loader-only implementation and its follow-up evidence are documented in
+[stage two](mixed-storage-gemm.md). The measurements below remain the original
+stage-one baseline.
+
 All six policy/position pairs passed in 18 fresh processes. There are 132 replay
 workloads and 528 phase profiles. Every replay's non-cast outputs matched the
 specified reference bits. Ordinary reset replay, capture and native-selection

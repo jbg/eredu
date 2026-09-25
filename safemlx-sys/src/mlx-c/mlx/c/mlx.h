@@ -24,6 +24,7 @@
 #include "mlx/c/map.h"
 #include "mlx/c/memory.h"
 #include "mlx/c/metal.h"
+#include "mlx/c/mixed_gemm.h"
 #include "mlx/c/ops.h"
 #include "mlx/c/optional.h"
 #include "mlx/c/random.h"

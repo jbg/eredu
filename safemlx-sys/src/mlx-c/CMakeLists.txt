@@ -87,7 +87,8 @@ else()
       mlx-gpu-submission-progress.patch
       mlx-submission-recovery.patch
       mlx-cache-limit-query.patch
-      mlx-metal-kernel-selection-trace.patch)
+      mlx-metal-kernel-selection-trace.patch
+      mlx-metal-mixed-storage-gemm.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -172,6 +173,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/map.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/memory.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/metal.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/mixed_gemm.cpp
     # ${CMAKE_CURRENT_LIST_DIR}/mlx/c/object.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ops.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/random.cpp
@@ -184,6 +186,9 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/version.cpp)
 
 add_library(mlxc ${mlxc-src})
+if(MLX_BUILD_METAL AND MLX_METAL_JIT AND NOT MLX_C_USE_SYSTEM_MLX)
+  target_compile_definitions(mlxc PRIVATE MLX_C_MIXED_STORAGE_GEMM)
+endif()
 
 target_link_libraries(mlxc PRIVATE mlx)
 target_include_directories(mlxc

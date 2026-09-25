@@ -56,6 +56,22 @@ def kernel_selections(log):
     return selections
 
 
+def validate_prototype_phases(phases):
+    """Require the same native geometry/reduction and output/partial allocations."""
+    by_name = {phase["phase"]: phase for phase in phases}
+    if "mixed_storage_prototype" in by_name:
+        prototype = by_name["mixed_storage_prototype"]
+        reference = by_name["preconverted_gemm"]
+        # Storage is the only specialization change; split-K accumulator
+        # selections and all geometry/tail keys must remain identical.
+        normalized = {key.replace("_storage_bfloat16", "").replace("_storage_float16", "")
+                      for key in prototype["kernel_selections"]}
+        if normalized != set(reference["kernel_selections"]):
+            raise ValueError("prototype changed native dispatch beyond weight storage")
+        if prototype["peak_growth_bytes"] != reference["peak_growth_bytes"]:
+            raise ValueError("prototype allocated beyond the native output/partial workspace")
+
+
 def summarize(capture, baseline, trace):
     selections = kernel_selections(trace)
     if baseline["ordinary"][0]["tokens"] != capture["ordinary"][0]["tokens"]:
@@ -80,13 +96,31 @@ def summarize(capture, baseline, trace):
                 "peak_growth_bytes": max(s["peak_growth_bytes"] for s in warm),
                 "kernel_selections": dict(selections[keys]),
             })
+        validate_prototype_phases(phases)
         cases.append({**{key: value for key, value in case.items() if key != "phases"}, "phases": phases})
     return {"positions": capture["positions"], "retention_policy": capture["retention_policy"],
             "ordinary": baseline["ordinary"], "classes": capture["classes"], "replays": cases}
 
 
+
+def compare_reference_case(case, reference):
+    """Compare with pre-patch evidence, not only a same-build arithmetic oracle."""
+    if case["classes"] != reference["classes"]:
+        raise ValueError("projection classes differ from reference manifest")
+    fingerprint = lambda item: [(r["label"], r["rows"], r["output_f32_bits_sha256"])
+                                for r in item["replays"]]
+    if fingerprint(case) != fingerprint(reference):
+        raise ValueError("projection output bits differ from reference manifest")
+    expected = reference["ordinary"][0]["tokens"]
+    if any(request["tokens"] != expected for request in case["ordinary"]):
+        raise ValueError("generation tokens differ from reference manifest")
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mixed-storage-prototype", action="store_true",
+                        help="also require exact replay of the loader-only native GEMM prototype")
+    parser.add_argument("--reference-manifest", type=Path,
+                        help="require original projection fingerprints and cached generation tokens")
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -99,10 +133,17 @@ def main():
         parser.error("samples/positions must be positive")
     if sha256(args.model) != CHECKPOINT_SHA256:
         parser.error("checkpoint SHA-256 differs from pinned official BF16 GGUF")
+    reference = json.loads(args.reference_manifest.read_text()) if args.reference_manifest else None
+    if reference and reference["checkpoint_sha256"] != CHECKPOINT_SHA256:
+        parser.error("reference manifest uses a different checkpoint")
     args.output.mkdir(parents=True, exist_ok=True)
     patch = Path("safemlx-sys/src/mlx-c/patches/mlx-metal-kernel-selection-trace.patch")
     metadata = {
-        "schema_version": 1, "checkpoint_revision": CHECKPOINT_REVISION,
+        "schema_version": 1, "mixed_storage_prototype": args.mixed_storage_prototype,
+        "reference_manifest_sha256": sha256(args.reference_manifest) if reference else None,
+        "native_mixed_storage_patch_sha256": sha256(
+            "safemlx-sys/src/mlx-c/patches/mlx-metal-mixed-storage-gemm.patch"),
+        "checkpoint_revision": CHECKPOINT_REVISION,
         "checkpoint_sha256": CHECKPOINT_SHA256, "checkpoint_bytes": args.model.stat().st_size,
         "binary_sha256": sha256(args.binary), "runner_sha256": sha256(__file__),
         "native_trace_patch_sha256": sha256(patch),
@@ -139,8 +180,10 @@ def main():
                         del env[key]
                 if mode == "trace":
                     env["MLX_METAL_LOG_KERNEL_SELECTION"] = "1"
+                execution_mode = "baseline" if mode == "baseline" else (
+                    "capture-prototype" if args.mixed_storage_prototype else "capture")
                 command = [str(args.binary.resolve()), str(args.model.absolute()), str(output.resolve()),
-                           "capture" if mode == "trace" else mode, policy, str(positions),
+                           execution_mode, policy, str(positions),
                            str(1 if mode == "trace" else args.samples)]
                 print(name, flush=True)
                 started = time.monotonic()
@@ -161,7 +204,13 @@ def main():
                         raise ValueError("kernel selection tracing changed tokens")
                 else:
                     payloads[mode] = payload
-            metadata["cases"].append(summarize(payloads["capture"], payloads["baseline"], trace_text))
+            case = summarize(payloads["capture"], payloads["baseline"], trace_text)
+            if reference:
+                reference_case = next(c for c in reference["cases"]
+                                      if c["positions"] == positions and c["retention_policy"] == policy)
+                compare_reference_case(case, reference_case)
+                case["matches_reference_manifest"] = True
+            metadata["cases"].append(case)
             (args.output / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"All {len(metadata['cases'])} policy/position cases passed; {args.output / 'manifest.json'}")
 

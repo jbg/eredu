@@ -13,10 +13,13 @@ use std::{path::PathBuf, time::Instant};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    ensure!(args.len() == 6, "usage: projection_baseline MODEL OUTPUT_JSON baseline|capture disabled|BYTES|unlimited POSITIONS SAMPLES");
+    ensure!(args.len() == 6, "usage: projection_baseline MODEL OUTPUT_JSON baseline|capture|capture-prototype disabled|BYTES|unlimited POSITIONS SAMPLES");
     let path = PathBuf::from(&args[0]);
     let mode = args[2].as_str();
-    ensure!(matches!(mode, "baseline" | "capture"), "unknown mode");
+    ensure!(
+        matches!(mode, "baseline" | "capture" | "capture-prototype"),
+        "unknown mode"
+    );
     let policy = match args[3].as_str() {
         "disabled" => ParameterConversionRetentionPolicy::Disabled,
         "unlimited" => ParameterConversionRetentionPolicy::Unlimited,
@@ -50,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         let before = allocator_memory()?.active_bytes();
         let retained_before = model.parameter_conversion_retention()?;
         reset_local_allocator_peak()?;
-        let capture = if mode == "capture" {
+        let capture = if mode != "baseline" {
             Some(ProjectionCapture::begin(128)?)
         } else {
             None
@@ -88,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mut classes = Vec::new();
     let mut replays = Vec::new();
-    if mode == "capture" {
+    if mode != "baseline" {
         ensure!(
             !capture_cases.is_empty(),
             "no mixed-width projections observed"
@@ -104,7 +107,12 @@ fn main() -> anyhow::Result<()> {
             rows.sort_unstable();
             rows.dedup();
             for rows in rows {
-                replays.push(case.replay(rows, samples, &format!("case-{index}"))?);
+                let label = format!("case-{index}");
+                replays.push(if mode == "capture-prototype" {
+                    case.replay_with_mixed_storage(rows, samples, &label)?
+                } else {
+                    case.replay(rows, samples, &label)?
+                });
             }
         }
     }

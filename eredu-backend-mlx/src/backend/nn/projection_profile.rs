@@ -176,6 +176,28 @@ impl ProjectionCase {
     /// for a new row count. GPU duration excludes eager work during graph building;
     /// build and total wall durations retain that cost.
     pub fn replay(&self, rows: usize, samples: usize, label: &str) -> Result<Value, Exception> {
+        self.replay_impl(rows, samples, label, false)
+    }
+
+    /// Replay baseline phases plus the loader-only native GEMM prototype.
+    /// Unsupported cases are errors: this diagnostic must not silently benchmark
+    /// the fallback while claiming to validate the new loader.
+    pub fn replay_with_mixed_storage(
+        &self,
+        rows: usize,
+        samples: usize,
+        label: &str,
+    ) -> Result<Value, Exception> {
+        self.replay_impl(rows, samples, label, true)
+    }
+
+    fn replay_impl(
+        &self,
+        rows: usize,
+        samples: usize,
+        label: &str,
+        mixed_storage: bool,
+    ) -> Result<Value, Exception> {
         let stream = &self.stream;
         if rows == 0 || rows > self.rows() || samples == 0 {
             return Err(Exception::custom("invalid projection replay rows/samples"));
@@ -204,16 +226,27 @@ impl ProjectionCase {
         // Do not keep the reference conversion live during cast/mixed phases.
         drop(converted);
         stream.synchronize()?;
+        let prototype_input = if mixed_storage {
+            let flattened = input.reshape(&[-1, input.dim(-1)], stream)?;
+            safemlx::transforms::eval([&flattened])?;
+            Some(flattened)
+        } else {
+            None
+        };
         let embedding = crate::nn::Embedding {
             weight: crate::module::PhysicalParam::new(self.weight.clone()),
         };
         let mut phases = Vec::new();
-        for phase in [
+        let mut phase_names = vec![
             "cast",
             "preconverted_gemm",
             "native_mixed",
             "eredu_dispatch",
-        ] {
+        ];
+        if mixed_storage {
+            phase_names.push("mixed_storage_prototype");
+        }
+        for phase in phase_names {
             let preconverted = if phase == "preconverted_gemm" {
                 let weight = self.weight.as_dtype(Dtype::Float32, stream)?;
                 safemlx::transforms::eval([&weight])?;
@@ -235,6 +268,14 @@ impl ProjectionCase {
                         preconverted.as_ref().unwrap().transpose(stream)?,
                         stream,
                     )?,
+                    "mixed_storage_prototype" => safemlx::fast::try_mixed_storage_gemm(
+                        prototype_input.as_ref().unwrap(),
+                        &self.weight,
+                        stream,
+                    )?
+                    .ok_or_else(|| {
+                        Exception::custom("mixed-storage prototype does not support this replay")
+                    })?,
                     "native_mixed" => {
                         safemlx::ops::matmul(&input, self.weight.transpose(stream)?, stream)?
                     }

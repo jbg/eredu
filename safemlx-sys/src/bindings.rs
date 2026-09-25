@@ -4932,3 +4932,13 @@ extern "C" {
 unsafe extern "C" {
     pub fn _mlx_array_is_available(res: *mut bool, arr: mlx_array) -> ::std::os::raw::c_int;
 }
+
+extern "C" {
+    pub fn mlx_try_mixed_storage_gemm(
+        res: *mut mlx_array,
+        supported: *mut bool,
+        input: mlx_array,
+        weight: mlx_array,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+}

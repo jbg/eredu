@@ -1,0 +1,278 @@
+diff --git a/mlx/backend/metal/kernels/steel/gemm/loader.h b/mlx/backend/metal/kernels/steel/gemm/loader.h
+--- a/mlx/backend/metal/kernels/steel/gemm/loader.h
++++ b/mlx/backend/metal/kernels/steel/gemm/loader.h
+@@ -18,11 +18,12 @@
+     short dst_ld,
+     short reduction_dim,
+     short tgp_size,
++    typename Storage = T,
+     short alignment = 1,
+     short n_reads = (BCOLS * BROWS) / (tgp_size),
+     short TCOLS = BCOLS / n_reads,
+     short TROWS = tgp_size / TCOLS>
+-struct BlockLoader {
++struct StorageBlockLoader {
+   STEEL_CONST short n_rows = (BROWS + TROWS - 1) / TROWS;
+   STEEL_CONST short vec_size = n_reads;
+ 
+@@ -37,15 +38,15 @@
+ 
+   // threadgroup and device memory
+   threadgroup T* dst;
+-  const device T* src;
++  const device Storage* src;
+ 
+   struct alignas(alignment * sizeof(T)) ReadVector {
+     uint8_t v[sizeof(T) * vec_size];
+   };
+ 
+   /* Constructor */
+-  METAL_FUNC BlockLoader(
+-      const device T* src_,
++  METAL_FUNC StorageBlockLoader(
++      const device Storage* src_,
+       const int src_ld_,
+       threadgroup T* dst_,
+       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+@@ -74,8 +75,15 @@
+   METAL_FUNC void load_unsafe() const {
+     STEEL_PRAGMA_UNROLL
+     for (short i = 0; i < BROWS; i += TROWS) {
+-      *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
+-          *((const device ReadVector*)(&src[i * src_ld]));
++      if constexpr (metal::is_same_v<T, Storage>) {
++        *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
++            *((const device ReadVector*)(&src[i * src_ld]));
++      } else {
++        STEEL_PRAGMA_UNROLL
++        for (short j = 0; j < vec_size; j++) {
++          dst[i * dst_ld + j] = T(src[i * src_ld + j]);
++        }
++      }
+     }
+   }
+ 
+@@ -133,5 +141,14 @@
+   }
+ };
+ 
++
++template <
++    typename T, short BROWS, short BCOLS, short dst_ld, short reduction_dim,
++    short tgp_size, short alignment = 1,
++    short n_reads = (BCOLS * BROWS) / tgp_size,
++    short TCOLS = BCOLS / n_reads, short TROWS = tgp_size / TCOLS>
++using BlockLoader = StorageBlockLoader<T, BROWS, BCOLS, dst_ld, reduction_dim,
++    tgp_size, T, alignment, n_reads, TCOLS, TROWS>;
++
+ } // namespace steel
+ } // namespace mlx
+diff --git a/mlx/backend/metal/kernels/steel/gemm/gemm.h b/mlx/backend/metal/kernels/steel/gemm/gemm.h
+--- a/mlx/backend/metal/kernels/steel/gemm/gemm.h
++++ b/mlx/backend/metal/kernels/steel/gemm/gemm.h
+@@ -33,7 +33,8 @@
+     bool MN_aligned,
+     bool K_aligned,
+     typename AccumType = typename AccumHelper<T>::accum_type,
+-    typename Epilogue = TransformNone<U, AccumType>>
++    typename Epilogue = TransformNone<U, AccumType>,
++    typename StorageB = T>
+ struct GEMMKernel {
+   STEEL_CONST short tgp_padding_a = 16 / sizeof(T);
+   STEEL_CONST short tgp_padding_b = 16 / sizeof(T);
+@@ -52,13 +53,14 @@
+       transpose_a ? BM + tgp_padding_a : BK + tgp_padding_a,
+       !transpose_a,
+       tgp_size>;
+-  using loader_b_t = BlockLoader<
++  using loader_b_t = StorageBlockLoader<
+       T,
+       transpose_b ? BN : BK,
+       transpose_b ? BK : BN,
+       transpose_b ? BK + tgp_padding_b : BN + tgp_padding_b,
+       transpose_b,
+-      tgp_size>;
++      tgp_size,
++      StorageB>;
+   using mma_t = BlockMMA<
+       T,
+       U,
+@@ -139,7 +141,7 @@
+   /* Main kernel function */
+   static METAL_FUNC void run(
+       const device T* A [[buffer(0)]],
+-      const device T* B [[buffer(1)]],
++      const device StorageB* B [[buffer(1)]],
+       device U* D [[buffer(2)]],
+       const constant GEMMParams* params [[buffer(3)]],
+       threadgroup T* As [[threadgroup(0)]],
+diff --git a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
+--- a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
++++ b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
+@@ -25,10 +25,11 @@
+     int WN,
+     bool transpose_a,
+     bool transpose_b,
+-    typename AccumType = float>
++    typename AccumType = float,
++    typename StorageB = T>
+ [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
+     const device T* A [[buffer(0)]],
+-    const device T* B [[buffer(1)]],
++    const device StorageB* B [[buffer(1)]],
+     const device T* C [[buffer(2), function_constant(use_out_source)]],
+     device T* D [[buffer(3)]],
+     const constant GEMMParams* params [[buffer(4)]],
+@@ -54,7 +55,9 @@
+       transpose_b,
+       true,
+       true,
+-      AccumType>;
++      AccumType,
++      TransformNone<T, AccumType>,
++      StorageB>;
+ 
+   using loader_a_t = typename gemm_kernel::loader_a_t;
+   using loader_b_t = typename gemm_kernel::loader_b_t;
+diff --git a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.h b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.h
+--- a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.h
++++ b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.h
+@@ -17,10 +17,11 @@
+     bool transpose_a,
+     bool transpose_b,
+     bool MN_aligned,
+-    bool K_aligned>
++    bool K_aligned,
++    typename StorageB = T>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void gemm_splitk(
+     const device T* A [[buffer(0)]],
+-    const device T* B [[buffer(1)]],
++    const device StorageB* B [[buffer(1)]],
+     device U* C [[buffer(2)]],
+     const constant GEMMSpiltKParams* params [[buffer(3)]],
+     uint simd_lane_id [[thread_index_in_simdgroup]],
+@@ -40,7 +41,10 @@
+       transpose_a,
+       transpose_b,
+       MN_aligned,
+-      K_aligned>;
++      K_aligned,
++      typename AccumHelper<T>::accum_type,
++      TransformNone<U, typename AccumHelper<T>::accum_type>,
++      StorageB>;
+   using loader_a_t = typename gemm_kernel::loader_a_t;
+   using loader_b_t = typename gemm_kernel::loader_b_t;
+   using mma_t = typename gemm_kernel::mma_t;
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -490,6 +490,7 @@
+     const std::string& hash_name,
+     const metal::MTLFCList& func_consts,
+     const array& out,
++    Dtype storage_b,
+     bool transpose_a,
+     bool transpose_b,
+     int bm,
+@@ -512,7 +513,9 @@
+                          wm,
+                          wn,
+                          transpose_a,
+-                         transpose_b);
++                         transpose_b,
++                         "float",
++                         get_type_string(storage_b));
+     return kernel_source.str();
+   });
+   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+@@ -523,6 +526,7 @@
+     const std::string& kernel_name,
+     const array& in,
+     const array& out,
++    Dtype storage_b,
+     bool transpose_a,
+     bool transpose_b,
+     int bm,
+@@ -550,7 +554,8 @@
+                          transpose_a,
+                          transpose_b,
+                          mn_aligned,
+-                         k_aligned);
++                         k_aligned,
++                         get_type_string(storage_b));
+     return kernel_source.str();
+   });
+   return d.get_kernel(kernel_name, lib);
+diff --git a/mlx/backend/metal/kernels.h b/mlx/backend/metal/kernels.h
+--- a/mlx/backend/metal/kernels.h
++++ b/mlx/backend/metal/kernels.h
+@@ -114,6 +114,7 @@
+     const std::string& hash_name,
+     const metal::MTLFCList& func_consts,
+     const array& out,
++    Dtype storage_b,
+     bool transpose_a,
+     bool transpose_b,
+     int bm,
+@@ -127,6 +128,7 @@
+     const std::string& kernel_name,
+     const array& in,
+     const array& out,
++    Dtype storage_b,
+     bool transpose_a,
+     bool transpose_b,
+     int bm,
+diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kernels.cpp
+--- a/mlx/backend/metal/nojit_kernels.cpp
++++ b/mlx/backend/metal/nojit_kernels.cpp
+@@ -139,6 +139,7 @@
+     const std::string& hash_name,
+     const metal::MTLFCList& func_consts,
+     const array&,
++    Dtype,
+     bool,
+     bool,
+     int,
+@@ -154,6 +155,7 @@
+     const std::string& kernel_name,
+     const array&,
+     const array&,
++    Dtype,
+     bool,
+     bool,
+     int,
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -381,6 +381,7 @@
+         << (transpose_b ? 't' : 'n')
+         << "_" << type_to_name(a)
+         << "_" << type_to_name(out)
++        << (a.dtype() == b.dtype() ? "" : "_storage_" + type_to_name(b))
+         << "_bm" << bm << "_bn" << bn << "_bk" << bk
+         << "_wm" << wm << "_wn" << wn; // clang-format on
+ 
+@@ -420,6 +421,7 @@
+       /* const std::string& hash_name = */ hash_name,
+       /* const metal::MTLFCList& func_consts = */ func_consts,
+       /* const array& out = */ out,
++      /* Dtype storage_b = */ b.dtype(),
+       /* bool transpose_a = */ transpose_a,
+       /* bool transpose_b = */ transpose_b,
+       /* int bm = */ bm,
+@@ -552,6 +554,7 @@
+         << (transpose_b ? 't' : 'n')
+         << "_" << type_to_name(a)
+         << "_" << type_to_name(C_split)
++        << (a.dtype() == b.dtype() ? "" : "_storage_" + type_to_name(b))
+         << "_bm" << bm << "_bn" << bn << "_bk" << bk
+         << "_wm" << wm << "_wn" << wn
+         << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
+@@ -564,6 +567,7 @@
+       /* const std::string& kernel_name = */ kname.str(),
+       /* const array& in = */ a,
+       /* const array& out = */ C_split,
++      /* Dtype storage_b = */ b.dtype(),
+       /* bool transpose_a = */ transpose_a,
+       /* bool transpose_b = */ transpose_b,
+       /* int bm = */ bm,

@@ -7124,3 +7124,28 @@ it is not a duration or an executed-GPU-instruction counter. Tracing is silent b
 default and changes no dispatch choice, kernel equation, precision policy or
 completion ownership. All native work continues through `safemlx`; no additional
 unsafe-code exception or public inference error type is introduced.
+
+### Mixed-storage FP32 GEMM prototype
+
+Stage two exposes `safemlx::fast::try_mixed_storage_gemm` as a native,
+inference-only experiment. Its distinct primitive delegates dispatch to the pinned
+MLX FP32 SIMD Matmul implementation. The vendored patch adds a weight storage
+type to the existing regular and split-K GEMM loaders; activations, shared-memory
+tiles/padding, MMA, epilogues, output dtype, partition selection and split-K
+accumulation remain FP32 with their existing geometry and order. Separate bias
+addition stays with the caller.
+
+The native operation accepts only settled contiguous rank-two F32 activations
+and F16/BF16 `[N,K]` weights on the validated Apple M3 Ultra, within the bounded
+prototype geometry. It returns `None` without evaluation for unsupported cases,
+including CPU, CUDA, NAX devices, system/unpatched MLX, non-JIT builds, lazy
+operands, noncontiguous layouts and single-row GEMV. This is a safemlx/C-ABI/native
+mechanism; no new unsafe exception, portable capability, or family policy is
+introduced. Its separate primitive rejects unsupported transformation APIs rather
+than inheriting homogeneous-Matmul gradient or compiler assumptions.
+
+The opt-in projection profiler can replay this operation on real captured inputs.
+Ordinary dense and tied-embedding selection, conversion-retention admission and
+workspace forecasts do not yet select or advertise it. Shared projection routing
+and full inference validation belong to stage three; explicit forecast mechanism
+facts belong to stage four. See [prototype validation](mixed-storage-gemm.md).

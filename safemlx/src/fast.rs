@@ -12,6 +12,45 @@ use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
 
+/// Inference-only prototype of the pinned FP32 Metal GEMM with F16/BF16
+/// weight storage. Computes `input @ weight.T`, returning F32. Bias, if any,
+/// must be added separately with the ordinary add operation.
+///
+/// Returns `None` without evaluation for unsupported device, dtype, shape or
+/// layout. Currently requires settled row-contiguous rank-two operands, at
+/// `2 <= M <= 2000`, `2 <= N <= 65536`, `1 <= K <= 8192`, and Apple M3 Ultra
+/// with the vendored Metal JIT build.
+/// It preserves native SIMD tile selection and split-K reduction. Autodiff,
+/// vmap and compilation transforms are unsupported. This operation is not
+/// selected by ordinary projections until backend integration is validated.
+pub fn try_mixed_storage_gemm(
+    input: &Array,
+    weight: &Array,
+    stream: &Stream,
+) -> Result<Option<Array>> {
+    use crate::utils::guard::{Guard, MaybeUninitArray};
+    let mut supported = false;
+    let mut output = MaybeUninitArray::new();
+    // SAFETY: all handles remain borrowed for the call; MLX retains input
+    // owners in the returned graph. Native code validates geometry/layout and
+    // writes only the initialized output handle and the supported flag.
+    <()>::try_from_op(|_| unsafe {
+        safemlx_sys::mlx_try_mixed_storage_gemm(
+            output.as_mut_raw_ptr(),
+            &mut supported,
+            input.as_ptr(),
+            weight.as_ptr(),
+            stream.as_ptr(),
+        )
+    })?;
+    if supported {
+        output.set_init_success(true);
+        output.try_into_guarded().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// A compiled custom Metal kernel.
 ///
 /// The kernel owns the underlying MLX fast-metal handle and can be applied
