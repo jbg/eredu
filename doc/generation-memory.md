@@ -233,6 +233,15 @@ work, and other processes can consume the capacity after observation. Failed
 queries remain unavailable, while a successful zero-capacity observation is zero.
 The calculation follows Apple's [VM statistics definitions](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h).
 
+On iOS/iPadOS, tvOS and visionOS, availability instead comes from
+`os_proc_available_memory()`: the current app's remaining allocation allowance.
+Cold, loaded and continuation forecasts compare additional demand with this
+freshly sampled headroom. Installed RAM is reported separately via `hw.memsize`
+and is never substituted for app headroom. A zero allowance remains zero (also
+possible for non-app/simulator runners), so a known positive additional demand
+reports a shortfall instead of insufficient information. Both observations are
+advisory; app limits and memory usage can change immediately after a query.
+
 Reports show phase contributions, interval bounds, missing coverage, state growth,
 effective prefill size, and the dominant contributor. Smaller chunk and output
 candidates are recomputed; recommendations are shown only when their modeled

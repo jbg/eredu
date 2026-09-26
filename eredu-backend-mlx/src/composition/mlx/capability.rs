@@ -450,6 +450,12 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
             kind: ObservationKind::Estimated,
             source: if cfg!(target_os = "macos") {
                 "point-in-time Mach host VM free (including speculative) plus inactive pages"
+            } else if cfg!(any(
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "visionos"
+            )) {
+                "point-in-time app allocation headroom from os_proc_available_memory"
             } else {
                 "point-in-time host available-memory observation"
             }

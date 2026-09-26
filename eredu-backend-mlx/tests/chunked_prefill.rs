@@ -341,12 +341,18 @@ fn apple_metal_loaded_request_forecast_uses_one_physical_pool() {
         profile.available.physical_semantics,
         PhysicalMemorySemantics::Unified
     );
-    // Exercise mobile's absent capacity observations on desktop runners too.
+    // Exercise missing, exhausted and sufficient app headroom on desktop runners too.
     profile.available.physical_memory_bytes = Observed::unavailable("mobile capacity unavailable");
-    profile.available.available_memory_bytes = Observed::unavailable("mobile capacity unavailable");
-    let mut options = GenerationForecastOptions::default();
-    for budget in [None, Some(1 << 30)] {
-        options.budget.available_bytes = budget;
+    let options = GenerationForecastOptions::default();
+    for budget in [None, Some(0), Some(1 << 30)] {
+        profile.available.available_memory_bytes = budget.map_or_else(
+            || Observed::unavailable("app headroom unavailable"),
+            |value| Observed::Available {
+                value,
+                kind: eredu_core::ObservationKind::Estimated,
+                source: "app allocation headroom".into(),
+            },
+        );
         let (request, _) = loaded_generation_request(
             profile.clone(),
             InputTokenCount::text(9),
@@ -365,10 +371,10 @@ fn apple_metal_loaded_request_forecast_uses_one_physical_pool() {
         assert!(estimate.domains[0].generation_peak.upper_bytes.is_some());
         assert_eq!(
             estimate.domains[0].generation_fit,
-            if budget.is_some() {
-                MemoryFit::LikelyFit
-            } else {
-                MemoryFit::InsufficientInformation
+            match budget {
+                None => MemoryFit::InsufficientInformation,
+                Some(0) => MemoryFit::LikelyShortfall,
+                Some(_) => MemoryFit::LikelyFit,
             }
         );
     }

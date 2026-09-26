@@ -1,12 +1,13 @@
 //! Safe process and operating-system resource observations used by runtimes.
 
-/// Host physical-memory observations in bytes.
+/// Installed memory and advisory allocation headroom in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemMemory {
     /// Installed physical memory, when available.
     pub total: Option<u64>,
-    /// Point-in-time estimate of available host physical memory, when available.
-    /// This is advisory capacity, not a reservation or a process allocation limit.
+    /// Point-in-time allocation headroom, when available. Apple mobile platforms
+    /// report the current app's remaining memory allowance; desktop platforms
+    /// report available host physical memory. This is advisory, not a reservation.
     pub available: Option<u64>,
 }
 
@@ -21,12 +22,34 @@ pub struct ProcessUsage {
     pub major_page_faults: u64,
 }
 
-/// Observes host physical memory.
-#[cfg(target_os = "macos")]
+/// Observes installed memory and current allocation headroom on supported Apple targets.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
 pub fn system_memory() -> std::io::Result<SystemMemory> {
+    let total = apple_physical_memory();
+    #[cfg(target_os = "macos")]
+    let available = macos_available_memory();
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "visionos"))]
+    let available = Some(apple_app_available_memory());
+    Ok(SystemMemory { total, available })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos"
+))]
+fn apple_physical_memory() -> Option<u64> {
     let name = c"hw.memsize";
     let mut total = 0u64;
     let mut size = std::mem::size_of::<u64>();
+    // SAFETY: The NUL-terminated name and writable u64 buffer are valid for the
+    // declared lengths. Null new-value arguments make this a read-only query.
     let status = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -36,9 +59,20 @@ pub fn system_memory() -> std::io::Result<SystemMemory> {
             0,
         )
     };
-    let total = (status == 0 && size == std::mem::size_of::<u64>()).then_some(total);
-    let available = macos_available_memory();
-    Ok(SystemMemory { total, available })
+    (status == 0 && size == std::mem::size_of::<u64>()).then_some(total)
+}
+
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "visionos"))]
+fn apple_app_available_memory() -> u64 {
+    unsafe extern "C" {
+        fn os_proc_available_memory() -> libc::size_t;
+    }
+    // SAFETY: This argument-free libSystem query is available on every supported
+    // mobile deployment target (iOS/tvOS 13+, visionOS 1+). It returns size_t and
+    // transfers no resources. Query on every call: app limits and usage can change.
+    // Preserve zero, including for non-app processes/simulators: it can also mean
+    // an exhausted app limit, so falling back to installed/free RAM is unsafe.
+    unsafe { os_proc_available_memory() as u64 }
 }
 
 #[cfg(target_os = "macos")]
@@ -145,7 +179,14 @@ pub fn system_memory() -> std::io::Result<SystemMemory> {
 }
 
 /// Observes host physical memory.
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "windows"
+)))]
 pub fn system_memory() -> std::io::Result<SystemMemory> {
     Ok(SystemMemory {
         total: None,
@@ -223,8 +264,25 @@ mod tests {
         let memory = system_memory().unwrap();
         if let (Some(total), Some(available)) = (memory.total, memory.available) {
             assert!(total > 0);
-            assert!(available <= total);
+            // App headroom is relative to a dynamic process limit, which need
+            // not correspond to installed physical RAM (including simulators).
+            if !cfg!(any(
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "visionos"
+            )) {
+                assert!(available <= total);
+            }
         }
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "visionos"))]
+    #[test]
+    fn apple_mobile_memory_observation_is_available() {
+        let memory = system_memory().unwrap();
+        assert!(memory.total.expect("Apple installed memory") > 0);
+        // Zero is valid for an exhausted allowance or a non-app test runner.
+        assert!(memory.available.is_some());
     }
 
     #[test]

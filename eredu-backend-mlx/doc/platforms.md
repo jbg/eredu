@@ -63,9 +63,15 @@ The build honors `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`, and
 Static and available-memory reports identify one unified physical pool on all
 supported ARM64 Apple targets, including iOS/iPadOS, tvOS, visionOS, and their
 Apple silicon simulators. Loaded Metal request forecasts therefore combine
-logical host/device residency in that pool. Mobile host capacity counters remain
-unavailable; forecasting still returns memory estimates, while a fit conclusion
-requires a caller-supplied budget. Installed RAM is not a process allocation limit.
+logical host/device residency in that pool. On iOS/iPadOS, tvOS and visionOS,
+`safemlx::system::system_memory()` reads installed RAM through `hw.memsize` and
+samples the current app's remaining allocation allowance with
+[`os_proc_available_memory()`](https://developer.apple.com/documentation/os/os_proc_available_memory).
+Forecasts compare additional request memory against that allowance without
+requiring a caller-supplied budget. The allowance is refreshed on each query and
+is advisory; it is not system-wide free RAM or a reservation. Zero remains zero,
+including when a simulator or non-app runner has no app allowance; it never falls
+back to installed RAM. Installed RAM is not a process allocation limit.
 Linux and Windows reports retain an unknown host/device relationship until native
 device facts establish it; CUDA support alone does not imply unified memory.
 

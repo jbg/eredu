@@ -6736,6 +6736,14 @@ object-safe controlled outlook. The facade reexports the options at the existing
 API path and supplies selection profiles before lending execution resources.
 Native observations refresh mutable residency/capacity on every outlook; geometry
 belongs to architecture preparation; the adapter contains no family dispatch.
+For iOS/iPadOS, tvOS and visionOS, the native `safemlx::system` boundary samples
+installed RAM with `hw.memsize` and app allocation headroom with
+`os_proc_available_memory()`. The MLX adapter labels that headroom as estimated
+available capacity in the unified pool. Runtime compares additional request
+memory against it using the existing neutral budget contract. Zero headroom is
+preserved, and installed RAM is never used as a substitute for an app allowance.
+The argument-free libSystem query and read-only sysctl remain inside the existing
+`safemlx` unsafe boundary; portable crates acquire no native dependencies.
 Sampler/controller/semantic continuation-storage contracts default to unknown;
 the facade supplies tokenizer/parser-specific host facts. Live snapshot/branch
 reservations are conservative allowances and never resident credits. Instrumented
