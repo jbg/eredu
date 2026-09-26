@@ -454,7 +454,7 @@ pub fn forecast_inspected_generation(
             .domains
             .iter()
             .flat_map(|d| &d.executions)
-            .all(|e| e.workspace.is_some());
+            .all(|e| e.execution_topology.is_some());
     let execution = ForecastExecutionContract {
         full_pass_reason,
         logits: if modeled_final_position {

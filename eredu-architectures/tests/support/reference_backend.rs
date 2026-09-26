@@ -37,6 +37,10 @@ impl ReferenceTensor {
 impl eredu_nn::Tensor for ReferenceTensor {
     type Context = ();
 
+    fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+
     fn shape(&self) -> &[i32] {
         if self.0.last().is_some_and(|value| *value < -1_000) {
             &self.0[..self.0.len() - 1]

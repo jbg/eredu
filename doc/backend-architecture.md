@@ -7233,3 +7233,31 @@ catalogs reject payload access even when a materializer is constructed directly.
 
 See [Forecasting from supplied checkpoint metadata](metadata-forecasting.md) for
 bundle requirements, recommendation semantics and validation commands.
+
+
+### Completed causal prefill and compact retained tensors
+
+`eredu-nn::Tensor::compact` is a required neutral storage contract: after
+completion its backing storage is bounded by logical payload plus bounded backend
+allocation overhead, independently of the size of a source view. It preserves
+dtype and values and may remain lazy until the execution owner completes it.
+The general causal depthwise convolution uses it for its retained history.
+MLX realizes it with its bounded contiguous-materialization primitive; an MLX
+`copy` alone shares storage and does not satisfy this contract. Shape-only and
+owned numerical reference backends implement their ordinary owned representation.
+
+The neutral replicated-session driver completes ordinary text-prefill output and
+retained state before committing publication. This invocation-level requirement
+uses the existing backend completion mechanism and rollback protocol; it does
+not force asynchronous decode to become synchronous or impose an allocator policy.
+Native submission owners continue to retain leases until safe completion, terminal
+failure or teardown. Cancellation is checked by the shared core generation driver
+between those completed prefix passes.
+
+Architecture declarations enable dense and routed LFM2/LFM2.5 incremental prefill
+for the existing resident/host/disk text execution strategies. Both cold selection
+and typed executables consume the same family declaration. Shared heterogeneous
+and dense decoder readout helpers select the final hidden position before ordinary
+vocabulary projection. Observed, speculative and partitioned full-output entry
+points retain their established contracts. No backend family branch or facade
+scheduling policy is introduced.

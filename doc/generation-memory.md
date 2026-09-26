@@ -265,9 +265,9 @@ workspace coverage is explicit rather than silently assigned zero.
 Cold callers can query `inspection.selected().unwrap().preparation()
 .prefill_chunking_support()` before loading. This reports ordinary unobserved
 plain-text support from retained architecture and backend facts, including
-prediction, composite and distributed restrictions. LFM2.5 currently reports
-unsupported; the Llama path used by SmolLM2 supports it. This describes current
-implementation coverage, not an inherent limitation of the LFM architecture.
+prediction, composite and distributed restrictions. Dense/routed LFM2 and LFM2.5
+and the Llama path used by SmolLM2 support it. This describes validated execution
+coverage; it is independent of device memory capacity.
 Prepared media, capture/intervention and external speculation can still require
 a full pass after selection.
 
@@ -732,9 +732,12 @@ facts without `full_key_tiles` use their declared per-tile copy and score
 allowances. Missing native facts leave an unknown upper end; attention-free
 convolution schedules need no attention scratch declaration.
 
-LFM2 requires full-pass prefill, so reducing its requested chunk size does not
-reduce the forecast. Dense and packed routed invocations use reusable mechanism
-topology. Distributed projections, nondevice state and uncovered prediction or
+Ordinary replicated LFM2/LFM2.5 prefill supports caller-selected chunks. Cold
+selection and loaded request forecasts use the effective chunk size and a
+final-position vocabulary projection; attention state still follows total context
+length. Capture/intervention, structured-input, prediction and distributed paths
+retain their declared full-pass requirements and forecasts. Dense and packed
+routed invocations use reusable mechanism topology. Distributed projections, nondevice state and uncovered prediction or
 residency combinations retain explicit gaps. Persistent convolution history stays
 in the state estimate; gated/unfolded convolution workspace uses the module's
 ordinary geometry and evaluation lifetimes.

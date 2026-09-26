@@ -788,6 +788,10 @@ impl PlanningTensor {
 impl Tensor for PlanningTensor {
     type Context = ();
 
+    fn compact(&self, _: &Self::Context) -> Result<Self, eredu_nn::Error> {
+        Self::unavailable()
+    }
+
     fn shape(&self) -> &[i32] {
         &self.0
     }

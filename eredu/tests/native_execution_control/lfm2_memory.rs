@@ -192,12 +192,24 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             assert_eq!(cold.estimate.fit, MemoryFit::LikelyFit);
             assert_eq!(loaded.estimate.fit, MemoryFit::LikelyFit);
         }
-        assert_eq!(cold.request.prefill_chunk_tokens, length as u64);
-        assert_eq!(loaded.request.prefill_chunk_tokens, length as u64);
-        assert!(loaded.execution.full_pass_reason.is_some());
+        assert_eq!(cold.request.prefill_chunk_tokens, 4);
+        assert_eq!(loaded.request.prefill_chunk_tokens, 4);
+        assert!(loaded.execution.full_pass_reason.is_none());
         assert_eq!(
-            loaded.with_prefill_chunk(1).unwrap().estimate.domains[0].generation_peak,
-            loaded.estimate.domains[0].generation_peak
+            loaded.execution.logits,
+            eredu_runtime::memory_estimation::LogitsWorkspace::FinalPosition
+        );
+        let single = loaded.with_prefill_chunk(1).unwrap();
+        assert_eq!(single.request.prefill_chunk_tokens, 1);
+        assert!(
+            single.estimate.domains[0]
+                .generation_peak
+                .upper_bytes
+                .unwrap()
+                <= loaded.estimate.domains[0]
+                    .generation_peak
+                    .upper_bytes
+                    .unwrap()
         );
         let mut expected_topology = cold.request.domains[0].executions[0]
             .execution_topology
@@ -249,10 +261,20 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             credited, converted_before,
             "exact binding credits equal current retained payload"
         );
-        assert_eq!(
-            expected_topology,
-            loaded.request.domains[0].executions[0].execution_topology
-        );
+        let mut loaded_topology = loaded.request.domains[0].executions[0]
+            .execution_topology
+            .clone();
+        // Cold inspection cannot observe bound native storage or gain dtypes.
+        // Compare the architecture and retained conversion accounting separately
+        // from those loaded-only mechanism facts.
+        for topology in [&mut expected_topology, &mut loaded_topology]
+            .into_iter()
+            .flatten()
+        {
+            topology.projection_storage.clear();
+            topology.f32_rms_normalization_gains.clear();
+        }
+        assert_eq!(expected_topology, loaded_topology);
         assert!(loaded.request.domains[0].executions[0]
             .execution_topology
             .as_ref()
@@ -271,7 +293,8 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
         );
         reset_local_allocator_peak().unwrap();
         let config =
-            TextGenerationConfig::new(model.resolve_generation_config(settings.overrides).unwrap());
+            TextGenerationConfig::new(model.resolve_generation_config(settings.overrides).unwrap())
+                .with_prefill_chunk_policy(settings.prefill);
         let mut sampled_cached_peak = eredu_backend_mlx::allocator_memory()
             .unwrap()
             .cached_bytes();

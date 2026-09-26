@@ -33,6 +33,22 @@ use eredu_runtime::{
     TensorPlacement,
 };
 
+/// Narrows a causal decoder's position-independent readout before projection.
+pub(crate) fn final_hidden_position<T: Tensor>(
+    hidden: &T,
+    context: &T::Context,
+) -> Result<T, Error> {
+    let sequence = hidden.dim(1);
+    hidden.index(
+        &[
+            Index::Full,
+            Index::Range(sequence - 1, sequence),
+            Index::Full,
+        ],
+        context,
+    )
+}
+
 /// Optional component instrumentation at the values actually consumed downstream.
 /// An absent observer neither clones nor retains tensors and constructs no paths.
 pub struct ComponentInstrumentation<'a, T> {
@@ -6463,16 +6479,7 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let sequence = hidden.dim(1);
-        let last = hidden.index(
-            &[
-                Index::Full,
-                Index::Range(sequence - 1, sequence),
-                Index::Full,
-            ],
-            context,
-        )?;
-        self.finish_hidden(&last, context)
+        self.finish_hidden(&final_hidden_position(hidden, context)?, context)
     }
 
     fn finish_forward_observed<O>(

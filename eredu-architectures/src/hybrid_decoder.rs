@@ -201,6 +201,18 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
         )
     }
 
+    /// Projects only the final position of an unobserved causal-text pass.
+    pub(crate) fn finish_text_logits(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish_logits(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            context,
+        )
+    }
+
     pub(crate) fn finish_logits_instrumented(
         &mut self,
         hidden: &B::Tensor,

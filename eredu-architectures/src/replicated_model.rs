@@ -27,6 +27,8 @@ pub(crate) struct ReplicatedForwardContext<T> {
 }
 
 pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
+    /// Validated equivalence of consecutive causal prefix passes.
+    const CHUNKED_PREFILL: bool = false;
     type Config: Clone;
     type Unit: Parameterized<B::Tensor>;
 
@@ -801,6 +803,18 @@ macro_rules! common_layered_methods {
         ) -> Result<B::Tensor, Error> {
             self.decoder.finish_logits(hidden, context)
         }
+        fn projects_final_text_position() -> bool {
+            true
+        }
+        fn finish_text_forward(
+            &mut self,
+            hidden: &B::Tensor,
+            _state: &mut S,
+            _forward: &Self::ForwardContext,
+            context: &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error> {
+            self.decoder.finish_text_logits(hidden, context)
+        }
         fn finish_forward_observed<O>(
             &mut self,
             hidden: &B::Tensor,
@@ -970,6 +984,10 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     F: FixedReplicatedFamily<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        F::CHUNKED_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
@@ -1091,6 +1109,10 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
     F: FixedReplicatedFamily<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        F::CHUNKED_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
@@ -1204,6 +1226,10 @@ where
     S::LayerState: RuntimeStateComponents<B>,
     F: FixedReplicatedFamily<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        F::CHUNKED_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }
@@ -1319,6 +1345,10 @@ where
     S: LayerRuntimeState<B>,
     F: FixedReplicatedFamily<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        F::CHUNKED_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         LayeredInput { tokens, mask }
     }

@@ -215,6 +215,10 @@ mod tests {
 
     impl Tensor for ShapeTensor {
         type Context = ();
+        fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
+            Ok(self.clone())
+        }
+
         fn shape(&self) -> &[i32] {
             &self.0
         }

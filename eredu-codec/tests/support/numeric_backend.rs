@@ -305,6 +305,10 @@ impl NumericTensor {
 impl Tensor for NumericTensor {
     type Context = Context;
 
+    fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+
     fn shape(&self) -> &[i32] {
         &self.shape
     }

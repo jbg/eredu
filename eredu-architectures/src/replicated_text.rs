@@ -97,6 +97,7 @@ impl eredu_checkpoint::store::CheckpointSource for InspectionCheckpointSource {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
+    const CHUNKED_PREFILL: bool = crate::lfm2::CHUNKED_TEXT_PREFILL;
     type Config = crate::lfm2::ModelArgs;
     type Unit = crate::lfm2::block::ReplicatedBlock<B>;
 
@@ -2498,6 +2499,7 @@ impl EligibleConfig<'_> {
             | Self::Gemma2(_)
             | Self::K2Horizon(_)
             | Self::GptOss(_) => crate::decoder::CHUNKED_TEXT_PREFILL,
+            Self::Lfm2(_) => crate::lfm2::CHUNKED_TEXT_PREFILL,
             _ => false,
         }
     }
@@ -8437,6 +8439,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        crate::lfm2::CHUNKED_TEXT_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         crate::decoder::LayeredInput { tokens, mask }
     }

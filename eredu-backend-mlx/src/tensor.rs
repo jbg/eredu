@@ -107,6 +107,12 @@ impl Tensor for MlxTensor {
         *self = replacement.clone();
     }
 
+    fn compact(&self, context: &Self::Context) -> Result<Self, Error> {
+        // MLX contiguous also bounds excess backing storage (including already
+        // contiguous slices). `copy` alone shares the original allocation.
+        tensor(self.0.contiguous(false, context))
+    }
+
     fn unloaded_f32(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::zeros::<f32>(shape, context))
     }

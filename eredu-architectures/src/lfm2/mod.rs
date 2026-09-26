@@ -54,6 +54,9 @@ use crate::{
     hybrid_decoder::HybridDecoder,
 };
 
+/// Shared cold and executable declaration for validated incremental text passes.
+pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
+
 /// Architecture-owned values retained for one LFM2 forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
@@ -709,6 +712,20 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.decoder.finish_logits(hidden, context)
+    }
+
+    fn projects_final_text_position() -> bool {
+        true
+    }
+
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.decoder.finish_text_logits(hidden, context)
     }
 
     fn finish_forward_observed<O>(

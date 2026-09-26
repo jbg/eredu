@@ -907,6 +907,12 @@ where
 {
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
 
+    const SELECTS_FINAL_TEXT_OUTPUT: bool = true;
+
+    fn set_last_text_output_only(runtime: &mut Self::Runtime, enabled: bool) {
+        runtime.set_last_text_output_only(enabled);
+    }
+
     fn visit_loaded_parameters(
         runtime: &mut Self::Runtime,
         visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
@@ -1065,6 +1071,7 @@ where
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
+    complete_text_prefill: bool,
     active_commit_epoch: Option<DistributedCommitEpoch>,
     last_commit_outcome: Option<DistributedCommitOutcome>,
     successful_state_restorations: Option<u64>,
@@ -2130,6 +2137,7 @@ where
         prompt_cache_identity: Some(prompt_cache_identity),
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
+        complete_text_prefill: false,
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
@@ -2227,6 +2235,7 @@ where
         prompt_cache_identity,
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
+        complete_text_prefill: false,
         active_commit_epoch: None,
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
@@ -2617,16 +2626,25 @@ where
     }
 
     /// Runs ordinary unobserved causal prefill with a final-position readout
-    /// where the architecture implements it. Full-output, capture, prediction,
+    /// where the architecture implements it. Retained state and output complete
+    /// before publication so a subsequent prefix cannot retain this pass's lazy
+    /// graph. Full-output, capture, prediction,
     /// and partition contracts continue through their existing entry points.
     pub fn prefill_input_final_position<'a>(
         &mut self,
         input: Result<A::Input<'a>, A::Error>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if !self.selected.exact_completion_available() {
+            return Err(ReplicatedTextSessionError::Contract(
+                "completed text prefill requires exact output and state completion".into(),
+            ));
+        }
         D::set_last_text_output_only(&mut self.execution, true);
+        self.complete_text_prefill = true;
         let output =
             self.prefill_input_result_with_observer(input, None, context, &mut crate::NoopObserver);
+        self.complete_text_prefill = false;
         D::set_last_text_output_only(&mut self.execution, false);
         output
     }
@@ -4108,9 +4126,11 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let completion = (self.selected.exact_completion() || observer.transactional())
-            .then(|| self.mechanisms.complete(&output, &self.state, context))
-            .transpose();
+        let completion = (self.complete_text_prefill
+            || self.selected.exact_completion()
+            || observer.transactional())
+        .then(|| self.mechanisms.complete(&output, &self.state, context))
+        .transpose();
         let completion_agreed = match D::agree_distributed_phase(
             &mut self.execution,
             crate::DistributedExecutionPhase::MechanismCompletion,

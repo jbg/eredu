@@ -78,6 +78,10 @@ struct FakeTensor(Vec<i32>);
 impl Tensor for FakeTensor {
     type Context = ();
 
+    fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+
     fn shape(&self) -> &[i32] {
         &self.0
     }
@@ -9674,3 +9678,70 @@ fn asymmetric_input_rejection_precedes_capture_and_preserves_state_for_retry() {
 
 #[path = "backend_independence/auxiliary_observation.rs"]
 mod auxiliary_observation;
+
+#[test]
+fn completed_text_prefill_settles_state_and_rolls_back_before_publication() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let counters = ReplicatedSessionCounters::default();
+        let architecture = OrdinaryTextFixture {
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+            counters: counters.clone(),
+            inconsistent_transport: false,
+            inconsistent_identity: false,
+        };
+        let selected =
+            try_select_reference_text_with_completion(&architecture, residency, None, false)
+                .unwrap();
+        assert!(!selected.exact_completion());
+        let identity = selected.requirements().architecture_identity().to_owned();
+        let contract = prepare_replicated_text_contract::<
+            _,
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >(&architecture, None, selected, &identity, &())
+        .unwrap();
+        let fail_completion = Rc::new(Cell::new(false));
+        let mut session = construct_replicated_text_session::<_, FakeBackend, _>(
+            architecture,
+            None,
+            contract,
+            ReferenceTextMechanisms {
+                tasks: Rc::new(RefCell::new(Vec::new())),
+                completions: Rc::new(RefCell::new(Vec::new())),
+                counters: counters.clone(),
+                fail_completion: fail_completion.clone(),
+                fail_checkpoint: false,
+                fail_construction_report: false,
+                prepared_partition: None,
+                prompt_cache: None,
+            },
+            &(),
+        )
+        .unwrap();
+        let tokens = FakeTensor(vec![1, 2]);
+        session
+            .prefill_input_final_position(Ok(&tokens), &())
+            .unwrap();
+        assert_eq!(counters.snapshot().completion_attempts, 1);
+        assert_eq!(session.report().unwrap().state_report(), &[1]);
+        fail_completion.set(true);
+        assert!(session
+            .prefill_input_final_position(Ok(&tokens), &())
+            .is_err());
+        assert_eq!(session.report().unwrap().state_report(), &[1]);
+        assert_eq!(counters.snapshot().publications, 1);
+        fail_completion.set(false);
+        session
+            .prefill_input_final_position(Ok(&tokens), &())
+            .unwrap();
+        assert_eq!(session.report().unwrap().state_report(), &[2]);
+        assert_eq!(counters.snapshot().completion_attempts, 3);
+        // Per-prefill completion does not change ordinary decode scheduling.
+        session.decode(&FakeTensor(vec![3]), &()).unwrap();
+        assert_eq!(counters.snapshot().completion_attempts, 3);
+    }
+}

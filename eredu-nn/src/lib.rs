@@ -5076,6 +5076,12 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn squeeze_axes(&self, axes: &[i32], context: &Self::Context) -> Result<Self, Error>;
     /// Creates a tensor view using backend-neutral axis indexes.
     fn index(&self, indexes: &[Index], context: &Self::Context) -> Result<Self, Error>;
+    /// Bounds retained storage by this tensor's logical payload plus bounded
+    /// backend allocation overhead, preserving shape, dtype and values. Unlike
+    /// a view or clone, it cannot retain storage proportional to a larger source.
+    /// Evaluation may remain deferred; the execution owner completes retained
+    /// state at publication boundaries.
+    fn compact(&self, context: &Self::Context) -> Result<Self, Error>;
     /// Takes rows along one axis using a backend index tensor.
     /// Indices outside the supported axis domain must fail; deferred validation must prevent the
     /// native gather from reading outside its source while work is pending.
@@ -5574,14 +5580,16 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
         }
         let history = (history_len > 0)
             .then(|| {
-                padded.index(
-                    &[
-                        Index::Full,
-                        Index::Range(shape[1], shape[1] + history_len),
-                        Index::Full,
-                    ],
-                    context,
-                )
+                padded
+                    .index(
+                        &[
+                            Index::Full,
+                            Index::Range(shape[1], shape[1] + history_len),
+                            Index::Full,
+                        ],
+                        context,
+                    )?
+                    .compact(context)
             })
             .transpose()?;
         Ok(CausalDepthwiseConvolutionOutput { output, history })

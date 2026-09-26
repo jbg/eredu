@@ -42,8 +42,10 @@ a different request. Chunk boundaries are internal to the first controlled step,
 so snapshots and pause/resume remain at completed-token boundaries.
 
 The MLX adapter enables chunking for ordinary replicated plain-text execution
-through the shared dense decoder architecture (including grouped-query and
-sliding attention). Other architecture drivers retain a complete pass until
+through the shared decoder architecture (including grouped-query and sliding
+attention) and dense/routed LFM2 and LFM2.5. LFM2 retains convolution history,
+attention caches and absolute positions across passes; convolution-only schedules
+use the same driver. Other architecture drivers retain a complete pass until
 their incremental state semantics have conformance coverage.
 `LoadedModel::prefill_chunking_support()` reports the executable's support or a
 fallback reason. Prepared media/structured inputs, nonempty capture/intervention
@@ -51,9 +53,24 @@ plans, prediction extensions and distributed sessions retain a complete prefill
 pass: their existing coordinates, transaction or publication contracts describe
 one whole prompt. Speculative execution also retains its existing prefill path.
 These are current implementation gaps, not architectural impossibilities. Memory
-estimates for these paths must use the complete prompt. Dense shared decoder
-readout projects only the last hidden position for an unobserved ordinary pass;
-observed and speculative full-output contracts remain unchanged.
+estimates for these paths must use the complete prompt. The shared dense and heterogeneous decoder shells project only the last hidden
+position for an unobserved ordinary pass. Observed and speculative full-output
+contracts retain every required row. Nonfinal prefixes currently compute one
+unused vocabulary row; they never sample or commit a token.
+
+Ordinary prefill completes both output and retained mutable state before
+publication, including when ordinary decode is asynchronous. Completing logits
+alone is insufficient: a convolution-history slice can otherwise retain an
+unevaluated graph. The neutral convolution compacts its retained history; native
+backends bound its backing storage independently of prompt length. Completion
+failure follows the existing rollback/terminal-failure protocol. Cancellation
+stops further submission between completed chunks and does not preempt native
+work already submitted. Chunk size controls work per submission, not a fixed
+wall-clock cancellation deadline or the total attention-cache size.
+
+Chunk size remains caller-selected, with the existing 512-token default and
+`Unchunked` option. No allocator cap, prompt limit or device-size heuristic is
+introduced. See [LFM2 prefill validation](lfm2-prefill-validation.md).
 
 The focused native regression runs outside the sandbox:
 

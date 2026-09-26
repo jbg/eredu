@@ -781,6 +781,10 @@ fn unsupported<T>(operation: &str) -> Result<T, Error> {
 impl Tensor for NumericTensor {
     type Context = NumericContext;
 
+    fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
+        Ok(self.clone())
+    }
+
     fn shape(&self) -> &[i32] {
         &self.shape
     }
@@ -28228,3 +28232,6 @@ fn deepseek_prediction_free_boundaries_preserve_exact_roles_and_values() {
 
 #[path = "reference_numeric/routed_units.rs"]
 mod routed_units;
+
+#[path = "reference_numeric/lfm2_prefill.rs"]
+mod lfm2_prefill;

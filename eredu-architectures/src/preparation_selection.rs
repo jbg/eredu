@@ -1316,10 +1316,7 @@ pub(crate) mod tests {
             "block_auto_adjust_ff_dim": true, "tie_word_embeddings": false
         }));
         let selected = select_preparation(&lfm, &request, &mechanisms).unwrap();
-        assert_eq!(
-            selected.prefill_chunking_support(),
-            Err("selected architecture does not implement chunked prefill")
-        );
+        assert_eq!(selected.prefill_chunking_support(), Ok(()));
 
         // Routed Qwen retains the shared causal decoder and the ordinary
         // packed expert invocation topology through cold selection.
