@@ -65,7 +65,7 @@ native workspace/capacity facts still produce unknown bounds.
 
 The combined memory picture includes original parameters, retained conversions,
 request state and temporary workspace, allocator cache, and graph/driver allowance.
-The allocator's separate 256 MiB cache setting plus the conversion default is
+The allocator's separate adaptive cache setting plus the conversion default is
 **not a combined 256 MiB ceiling**. Neither limits total process memory, padding,
 or RSS, and retained native backing capacity can exceed its payload.
 
@@ -216,8 +216,10 @@ that limit and already retained cache, because lowering the limit may defer
 eviction. An explicit cache limit during cold inspection describes the proposed
 policy; reports after loading observe the policy in force. Query failures and
 arithmetic overflow remain explicit unknowns. Native model realization applies
-Eredu's 256 MiB cache ceiling to an untouched native default, preserving smaller
-defaults. Explicit limits remain authoritative. Pure cold queries still observe
+a ceiling of 1/32 of currently available memory, capped at 2 GiB, to an untouched
+native default, preserving smaller defaults. If available memory is unknown, the
+ceiling is 256 MiB. This is a one-time process policy; later memory pressure does
+not resize the cache. Explicit limits remain authoritative. Pure cold queries still observe
 the current policy; they do not apply runtime configuration. To forecast with the
 managed default before loading, call `configure_local_runtime(&Default::default())`
 first. `--mlx-cache-limit-bytes 0` disables allocator-cache retention when desired.
@@ -635,7 +637,8 @@ outside Rust are included. Restoring a saved numeric limit also counts as explic
 
 The MLX adapter initializes an untouched policy at native target/model realization,
 including ordinary, controlled and realtime loading. The automatic ceiling is
-256 MiB; CPU's smaller native default stays smaller. Initialization is atomic with
+1/32 of currently available memory, capped at 2 GiB, with a 256 MiB fallback
+when unavailable; CPU's smaller native default stays smaller. Initialization is atomic with
 setters and idempotent across sessions. It never overrides explicit settings or
 an earlier initialization, and does not forcibly evict already retained cache.
 Forecasts continue using `max(limit, retained)` plus their graph/driver allowance.

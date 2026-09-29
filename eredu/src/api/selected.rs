@@ -323,7 +323,8 @@ pub const fn default_local_device() -> LocalDevice {
 /// Process-global allocator policy, selected before native model realization.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalAllocatorCachePolicy {
-    /// Cap an untouched native default at 256 MiB, preserving smaller defaults.
+    /// Cap an untouched native default at 1/32 of available memory, up to 2 GiB.
+    /// Missing memory observations use 256 MiB; smaller native defaults remain.
     /// Explicit settings and earlier initialization always take precedence.
     #[default]
     Automatic,

@@ -222,10 +222,20 @@ An M5 Max with 128 GiB unified memory runs
 `agentionai/Qwen3.8-Flash-Next-AP-GGUF:AP-Q4_K_XL`, revision
 `0061a60e46ad672a73cec31cb627dc841d4760a4`, with 74,132,044,800 bytes of
 resident executable parameters. The checkpoint remains in its original packed
-formats; drafting is disabled. A 65-token prompt followed by 512 generated tokens
-measures 10.72 decode tokens/s, 8.852 s to the first token, 56.512 s generation time,
-and 70.80 GiB peak MLX memory. Generated tokens include the model's reasoning.
-This is one unprofiled local run, not a hardware-independent throughput guarantee.
+formats; drafting is disabled. With automatic residency and cache initialization,
+a 65-token prompt followed by 512 generated tokens measures 13.20 decode tokens/s,
+8.721 s to the first token, 47.432 s generation time and 70.80 GiB peak active MLX
+memory. Generated tokens include the model's reasoning. At completion, active
+memory is 69.26 GiB and cached memory is 2.00 GiB. Cached memory is additional to
+active memory. These are unprofiled local measurements, not hardware-independent
+throughput guarantees.
+
+The same prompt with an explicit 2 GiB cache measures 13.24 decode tokens/s;
+an explicit 256 MiB control measures 10.93 decode tokens/s. Output and reasoning
+match exactly across the automatic and fixed-cache runs. Automatic initialization
+selects 1/32 of available memory, capped at 2 GiB, reaching the cap when at least
+64 GiB is available and the native default allows it. It does not increase
+model-weight residency or resize the cache during a request.
 
 ```sh
 CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu" \
@@ -233,7 +243,7 @@ CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu" \
 HF_HUB_CACHE="/Volumes/External SSD/hf" target/release/eredu \
   -m agentionai/Qwen3.8-Flash-Next-AP-GGUF:AP-Q4_K_XL \
   --revision 0061a60e46ad672a73cec31cb627dc841d4760a4 \
-  --no-auto --speculative-draft-tokens 0 --verbose --max-tokens 512 \
+  --verbose --max-tokens 512 \
   'Explain the physics of why the sky is blue in detail.'
 ```
 

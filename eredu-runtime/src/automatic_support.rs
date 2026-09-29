@@ -13,6 +13,19 @@ use crate::{
     ResidencyReport, SelectedReplicatedTextRealization,
 };
 
+/// Sizes the initial reusable allocator cache from current available memory.
+///
+/// One thirty-second of available memory balances buffer reuse with admission
+/// headroom; the 2 GiB ceiling bounds idle retention on large machines. Missing
+/// observations retain the conservative 256 MiB fallback. There is no minimum:
+/// memory-constrained processes can select a smaller cache, including zero.
+/// Native adapters preserve smaller native defaults and explicit overrides.
+pub fn default_allocator_cache_bytes(available_memory_bytes: Option<u64>) -> u64 {
+    available_memory_bytes
+        .map(|bytes| (bytes / 32).min(2 * 1024 * 1024 * 1024))
+        .unwrap_or(256 * 1024 * 1024)
+}
+
 /// Invalid exact resource sizing for selected bounded execution.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
@@ -599,6 +612,20 @@ pub fn residency_telemetry(report: &ResidencyReport) -> ResidencyTelemetry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn allocator_cache_scales_with_available_memory_and_caps_idle_retention() {
+        use super::default_allocator_cache_bytes;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(default_allocator_cache_bytes(Some(0)), 0);
+        assert_eq!(
+            default_allocator_cache_bytes(Some(4 * GIB)),
+            128 * 1024 * 1024
+        );
+        assert_eq!(default_allocator_cache_bytes(Some(32 * GIB)), GIB);
+        assert_eq!(default_allocator_cache_bytes(Some(64 * GIB)), 2 * GIB);
+        assert_eq!(default_allocator_cache_bytes(Some(u64::MAX)), 2 * GIB);
+        assert_eq!(default_allocator_cache_bytes(None), 256 * 1024 * 1024);
+    }
     use super::*;
     use eredu_core::residency::{OffloadConfig, OffloadTelemetry, TierByteTotals};
 

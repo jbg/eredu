@@ -6774,13 +6774,19 @@ estimator and cold architecture-selection driver do not perform native queries.
 The native allocator also retains cache-policy provenance. Its locked getter
 returns the limit and origin together; direct native setters mark explicit
 ownership even for unchanged values. Conditional initialization under that same
-lock caps only untouched defaults at the adapter's 256 MiB ceiling, or records
-an explicit choice to preserve the native policy. The MLX adapter applies this
+lock caps only untouched defaults at a ceiling sized by portable runtime policy:
+1/32 of currently available host memory, capped at 2 GiB, with a 256 MiB fallback
+when the observation is unavailable. Smaller native defaults remain smaller;
+there is no minimum for constrained processes. The adapter supplies the host
+observation without selecting model-family behavior. Initialization can instead
+record an explicit choice to preserve the native policy. The MLX adapter applies this
 native cache policy at target/model realization, including controlled and realtime
 paths. It never applies it during cold selection or forecasting. Selected facade
 configuration exposes automatic, preserved-native and fixed policies; portable
 `AllocatorCachePolicyReport` and `AllocatorCachePolicySource` describe observations.
-Explicit settings and earlier initialization win across sessions. Reclamation is
+Explicit settings and earlier initialization win across sessions. The adaptive
+ceiling is selected once, not resized during active requests or in response to
+later memory pressure. Reclamation is
 still native; existing retention and graph allowances remain in the forecast.
 The native wrapper owns the unsafe-code boundary.
 

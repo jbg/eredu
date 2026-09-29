@@ -14,7 +14,7 @@ fn runtime_default_policy_and_forecast_observation() {
         AllocatorCachePolicySource as Source, LocalAllocatorCachePolicy, LocalRuntimeConfiguration,
     };
     let Ok(scenario) = std::env::var("EREDU_LOCAL_CACHE_POLICY_SCENARIO") else {
-        for scenario in ["automatic", "preserved", "explicit"] {
+        for scenario in ["automatic", "preserved", "explicit", "disabled"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -71,6 +71,7 @@ fn runtime_default_policy_and_forecast_observation() {
             .with_allocator_cache_policy(LocalAllocatorCachePolicy::PreserveNative),
         "explicit" => LocalRuntimeConfiguration::default()
             .with_allocator_cache_limit(initial.limit_bytes as usize),
+        "disabled" => LocalRuntimeConfiguration::default().with_allocator_cache_limit(0),
         _ => panic!("unknown scenario"),
     };
     configure_local_runtime(&configuration).unwrap();
@@ -78,10 +79,10 @@ fn runtime_default_policy_and_forecast_observation() {
     match scenario.as_str() {
         "automatic" => {
             assert_eq!(configured.source, Source::ManagedDefault);
-            assert_eq!(
-                configured.limit_bytes,
-                initial.limit_bytes.min(256 * 1024 * 1024)
-            );
+            // Available memory is observed at initialization, so its exact
+            // value can change between calls. Portable sizing tests cover the
+            // fraction; this integration checks native caps and ownership.
+            assert!(configured.limit_bytes <= initial.limit_bytes.min(2 * 1024 * 1024 * 1024));
             assert_eq!(
                 serde_json::to_value(configured).unwrap()["source"],
                 "managed_default"
@@ -90,6 +91,10 @@ fn runtime_default_policy_and_forecast_observation() {
         "preserved" => {
             assert_eq!(configured.source, Source::Preserved);
             assert_eq!(configured.limit_bytes, initial.limit_bytes);
+        }
+        "disabled" => {
+            assert_eq!(configured.source, Source::Explicit);
+            assert_eq!(configured.limit_bytes, 0);
         }
         _ => {
             assert_eq!(configured.source, Source::Explicit);

@@ -21,7 +21,7 @@ pub fn allocator_cache_limit() -> Result<usize, Error> {
     safemlx::memory::cache_limit().map_err(Into::into)
 }
 
-/// Eredu's default cache ceiling. Smaller native defaults remain smaller.
+/// Fallback cache ceiling when available memory cannot be observed.
 pub const DEFAULT_ALLOCATOR_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 
 fn cache_policy_report(
@@ -53,7 +53,21 @@ pub fn allocator_cache_policy() -> Result<eredu_core::AllocatorCachePolicyReport
 pub fn initialize_allocator_cache_policy(
     preserve: bool,
 ) -> Result<eredu_core::AllocatorCachePolicyReport, Error> {
-    safemlx::memory::configure_default_cache_policy(DEFAULT_ALLOCATOR_CACHE_LIMIT, preserve)
+    let current = safemlx::memory::cache_policy()?;
+    if current.source != safemlx::memory::CacheLimitSource::NativeDefault {
+        return Ok(cache_policy_report(current));
+    }
+    let ceiling = if preserve {
+        DEFAULT_ALLOCATOR_CACHE_LIMIT
+    } else {
+        let available = safemlx::system::system_memory()
+            .ok()
+            .and_then(|memory| memory.available);
+        eredu_runtime::automatic_support::default_allocator_cache_bytes(available) as usize
+    };
+    // The native conditional setter remains authoritative if an explicit setter
+    // or another session wins initialization during the host observation.
+    safemlx::memory::configure_default_cache_policy(ceiling, preserve)
         .map(cache_policy_report)
         .map_err(Into::into)
 }
