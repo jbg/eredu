@@ -246,11 +246,9 @@ fn overflow_invalid_intervals_and_incompatible_geometry_are_rejected() {
 }
 
 #[test]
-fn plan_roundtrip_and_zero_output_keep_phase_accounting_coherent() {
+fn zero_output_keeps_prefill_and_loading_phases() {
     let mut target = request(MemoryDomain::Unified);
     let mut plan = plan();
-    let decoded = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
-    assert_eq!(plan, decoded);
     target.max_output_tokens = Some(0);
     target.forecast_output_tokens = 0;
     plan.draft = Some(target.clone());

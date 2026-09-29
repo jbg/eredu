@@ -91,10 +91,10 @@ impl PreparationMechanismProvider for Mechanisms {
     fn communication_capabilities(&self) -> CommunicationCapabilities {
         CommunicationCapabilities::new([]).unwrap()
     }
-    fn recipe_materialization_workspace(
+    fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
         &self,
         recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        source: &C,
     ) -> Result<u64, String> {
         recipe
             .peak_materialization_bytes(source)

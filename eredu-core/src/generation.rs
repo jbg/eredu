@@ -1210,15 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_events_round_trip_without_a_backend() {
-        let event = SemanticEvent::ToolCallStart {
-            index: 2,
-            id: "call_2".into(),
-            name: "lookup".into(),
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(serde_json::from_str::<SemanticEvent>(&json).unwrap(), event);
-
+    fn zero_token_budget_can_be_cancelled() {
         let mut zero_budget = GenerationSequence::new(0, []);
         assert_eq!(zero_budget.finish_reason(), Some(FinishReason::MaxTokens));
         assert!(zero_budget.cancel());

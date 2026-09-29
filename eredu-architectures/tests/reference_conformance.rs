@@ -31,7 +31,7 @@ mod realtime;
     unused_imports,
     reason = "the unified harness compiles only its explicitly shared support paths"
 )]
-#[path = "reference_speculative_execution.rs"]
+#[path = "support/reference_speculative_execution.rs"]
 mod speculative;
 
 fn assert_exact_payload_handoff(evidence: &numeric::ReferenceStageEvidence) {

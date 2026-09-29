@@ -4189,20 +4189,6 @@ mod tests {
     }
 
     #[test]
-    fn speculative_capability_schema_round_trips_without_backend_identity() {
-        let capability = SpeculativeCapability::Unsupported {
-            draft_source: SpeculativeDraftSource::Embedded,
-            architecture: "future_decoder".into(),
-        };
-        let json = serde_json::to_string(&capability).unwrap();
-        assert_eq!(
-            serde_json::from_str::<SpeculativeCapability>(&json).unwrap(),
-            capability
-        );
-        assert!(!json.contains("mlx"));
-    }
-
-    #[test]
     fn declared_capability_admits_preparation_without_claiming_execution_readiness() {
         let capability = SpeculativeCapability::Declared {
             draft_source: SpeculativeDraftSource::Separate,

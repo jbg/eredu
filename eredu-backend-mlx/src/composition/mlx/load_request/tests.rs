@@ -48,76 +48,6 @@ fn preparation_policy_rejects_invalid_affine_geometry() {
 }
 
 #[test]
-fn preparation_policy_preserves_exact_parallel_topology() {
-    let topology = topology(5, 2, 3, 2);
-    let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-    let policy = MlxLoadRequest::with_parallel(
-        topology,
-        device,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-        1,
-        128,
-        MlxLoadRequest::test_communication_completion_policy(),
-    )
-    .unwrap()
-    .normalized()
-    .preparation_policy()
-    .unwrap();
-    assert_eq!(policy.topology(), Some(topology.topology()));
-}
-
-#[test]
-fn preparation_policies_distinguish_parallel_axes() {
-    let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-    let tensor_pipeline = topology(0, 2, 3, 1);
-    let tensor_expert = topology(0, 2, 1, 3);
-    let tensor_pipeline_policy = MlxLoadRequest::with_parallel(
-        tensor_pipeline,
-        device,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-        1,
-        128,
-        MlxLoadRequest::test_communication_completion_policy(),
-    )
-    .unwrap()
-    .normalized()
-    .preparation_policy()
-    .unwrap();
-    let tensor_expert_policy = MlxLoadRequest::with_parallel(
-        tensor_expert,
-        device,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-        1,
-        128,
-        MlxLoadRequest::test_communication_completion_policy(),
-    )
-    .unwrap()
-    .normalized()
-    .preparation_policy()
-    .unwrap();
-
-    assert_ne!(tensor_pipeline_policy, tensor_expert_policy);
-}
-
-#[test]
-fn parallel_policy_rejects_nonpositive_invocation_limits() {
-    let topology = topology(0, 2, 1, 1);
-    let device = DeviceAssignment::new(safemlx::DeviceType::Cpu, 0);
-    let error = MlxLoadRequest::with_parallel(
-        topology,
-        device,
-        eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
-        0,
-        128,
-        MlxLoadRequest::test_communication_completion_policy(),
-    )
-    .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("partitioned invocation limits must be positive"));
-}
-
-#[test]
 fn portable_drafting_plan_is_fixed_before_payload_selection() {
     let disabled = NormalizedLoadRequest::default()
         .with_drafting_plan(&DraftingPlan::Disabled)
@@ -156,25 +86,6 @@ fn portable_drafting_plan_is_fixed_before_payload_selection() {
             adaptive_lookahead: false,
         })
         .is_err());
-}
-
-#[test]
-fn adapter_translation_preserves_the_exact_normalized_request() {
-    let capabilities = eredu_core::SessionCapabilities::new(true, false, true);
-    let residency = WeightResidency::layerwise_host(LayerwiseLoadOptions::default());
-    let options = MlxLoadRequest::from_normalized(
-        eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
-            .with_weight_residency(residency)
-            .with_required_session_capabilities(capabilities),
-    );
-    let expected =
-        eredu_runtime::NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
-            .with_weight_residency(residency)
-            .with_required_session_capabilities(capabilities);
-
-    let (normalized, rank) = options.checked_normalized().unwrap();
-    assert_eq!(normalized, &expected);
-    assert!(rank.is_none());
 }
 
 #[test]

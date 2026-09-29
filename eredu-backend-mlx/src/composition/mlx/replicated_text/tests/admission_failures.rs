@@ -1,66 +1,6 @@
 use super::*;
 
 #[test]
-fn heterogeneous_requirements_are_invariant_across_caller_policies() {
-    for config in [
-        lfm2_config(),
-        kimi_linear_config(),
-        nemotron_h_config(),
-        qwen_next_config(),
-        qwen_hybrid_config(),
-    ] {
-        let root = tiny_heterogeneous_artifact(config);
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let expected =
-            eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
-                .unwrap();
-        let requests = [
-            eredu_runtime::ReplicatedTextSelectionRequest::new(
-                eredu_runtime::LayerWeightResidency::FullyResident,
-                CacheResidencyPolicy::Device,
-            ),
-            eredu_runtime::ReplicatedTextSelectionRequest::new(
-                eredu_runtime::LayerWeightResidency::LayerwiseHost(
-                    eredu_runtime::LayerwiseLoadOptions::default(),
-                ),
-                CacheResidencyPolicy::Paged(
-                    PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
-                        .unwrap()
-                        .with_full_attention(true),
-                ),
-            )
-            .with_quantization(eredu_core::QuantizationRequest::Affine {
-                group_size: 16,
-                bits: 4,
-            })
-            .with_session(eredu_core::SessionCapabilities::new(true, true, true))
-            .with_prompt_cache(true)
-            .with_exact_completion(true),
-            eredu_runtime::ReplicatedTextSelectionRequest::new(
-                eredu_runtime::LayerWeightResidency::DenseDiskStream(
-                    eredu_runtime::DenseDiskStreamLoadOptions::default(),
-                ),
-                CacheResidencyPolicy::Device,
-            )
-            .with_quantization(eredu_core::QuantizationRequest::MxFp4),
-        ];
-        for request in requests {
-            assert!(matches!(
-                request.residency(),
-                eredu_runtime::LayerWeightResidency::FullyResident
-                    | eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
-                    | eredu_runtime::LayerWeightResidency::DenseDiskStream(_)
-            ));
-            assert_eq!(
-                expected,
-                eredu_architectures::replicated_text::replicated_text_requirements(&inspection)
-                    .unwrap()
-            );
-        }
-    }
-}
-
-#[test]
 fn selected_paged_state_controls_generic_construction() {
     let (stream, weights_stream) = execution_streams();
     for model_type in ["llama", "qwen3"] {

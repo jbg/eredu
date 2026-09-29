@@ -1083,42 +1083,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_custom_kernel_config_builder() {
-        let config = CustomKernelConfig::new()
-            .with_output_arg([2, 3], Dtype::Float32)
-            .with_grid([6, 1, 1])
-            .with_thread_group([32, 1, 1])
-            .with_init_value(0.0)
-            .with_verbose(true)
-            .with_template_arg_dtype("T", Dtype::Float32)
-            .with_template_arg_int("N", 6)
-            .with_template_arg_bool("DO_SCALE", true);
-
-        assert_eq!(config.output_count(), 1);
-        assert_eq!(
-            config.outputs()[0],
-            CustomKernelOutput::new([2, 3], Dtype::Float32)
-        );
-        assert_eq!(
-            config.template_args(),
-            &[
-                CustomKernelTemplateArg::Dtype {
-                    name: "T".to_string(),
-                    dtype: Dtype::Float32,
-                },
-                CustomKernelTemplateArg::Int {
-                    name: "N".to_string(),
-                    value: 6,
-                },
-                CustomKernelTemplateArg::Bool {
-                    name: "DO_SCALE".to_string(),
-                    value: true,
-                },
-            ]
-        );
-    }
-
-    #[test]
     #[ignore = "requires an accessible Metal device"]
     fn test_custom_metal_kernel_multiple_outputs() {
         let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);

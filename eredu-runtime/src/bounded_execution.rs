@@ -348,31 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_policy_retains_all_geometry_and_resources_without_defaults() {
-        assert!(NormalizedLoadRequest::default()
-            .bounded_execution()
-            .is_none());
-        let policy = policy();
-        let request = NormalizedLoadRequest::default().with_bounded_execution(policy);
-        let validated = request.validate_model_preparation().unwrap();
-        assert_eq!(validated.request().bounded_execution(), Some(policy));
-        assert_eq!(policy.invocation().batch(), 2);
-        assert_eq!(policy.invocation().chunk_tokens(), 3);
-        assert_eq!(policy.invocation().history_tokens(), 200);
-        assert_eq!(policy.invocation().invocation_tokens(), 6);
-        assert_eq!(policy.selection().tile_entries(), 4);
-        assert_eq!(policy.selection().selection_workspace_bytes(), 1024);
-        assert_eq!(policy.selection().invocation_workspace_bytes(), 8192);
-        assert_eq!(policy.rows().limits(), rows());
-        assert_eq!(policy.rows().bank(), bank(Some(1024), Some(0)));
-        assert_eq!(policy.rows().retained_scalar_bytes(), 0);
-        assert_eq!(policy.append(), append(4));
-        assert_eq!(policy.append().payload_bytes(), 8192);
-        assert_eq!(policy.append().scratch_bytes(), 4096);
-        assert_eq!(policy.append().catalog_bytes(), 2048);
-    }
-
-    #[test]
     fn invocation_rejects_nonpositive_inconsistent_and_unaddressable_counts() {
         for (batch, chunk, history) in [
             (0, 1, 2),

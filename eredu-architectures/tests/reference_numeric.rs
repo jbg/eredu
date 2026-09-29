@@ -152,100 +152,6 @@ fn dense_linear_format() -> eredu_nn::LinearFormatSpec {
     eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense).unwrap()
 }
 
-#[cfg(test)]
-mod unified_conformance_compatibility_wrappers {
-    use super::*;
-
-    fn run_on_reference_stack(case: fn()) {
-        std::thread::Builder::new()
-            .name("reference-numeric-compatibility-wrapper".into())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(case)
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[test]
-    fn typed_routed_extension() {
-        run_on_reference_stack(
-            new_architecture_uses_production_selection_materialization_and_session_without_backend_case,
-        );
-    }
-
-    #[test]
-    fn dense_stream_failure_timing() {
-        run_on_reference_stack(dense_stream_acquisition_failure_is_atomic_before_first_real_unit);
-    }
-
-    #[test]
-    fn compressed_cache_rollback() {
-        run_on_reference_stack(compressed_cache_growth_boundaries_and_rollback_are_backend_neutral);
-    }
-
-    #[test]
-    fn authoritative_partitioned_sessions() {
-        run_on_reference_stack(
-            authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference,
-        );
-    }
-
-    #[test]
-    fn deepseek_cartesian_sessions() {
-        run_on_reference_stack(
-            prediction_free_deepseek_v3_v4_routed_sessions_cover_cartesian_state_cache_and_failure,
-        );
-    }
-
-    #[test]
-    fn resident_and_addressable_routing() {
-        run_on_reference_stack(
-            non_mlx_session_executes_resident_and_addressable_routing_through_one_driver,
-        );
-    }
-
-    #[test]
-    fn relu2_routing() {
-        run_on_reference_stack(non_mlx_session_executes_relu2_routing_through_the_same_driver);
-    }
-
-    #[test]
-    fn routed_composite_partition_axes() {
-        run_on_reference_stack(
-            routed_muse_and_inkling_use_the_ordinary_partition_session_across_admitted_axes,
-        );
-    }
-
-    #[test]
-    fn routed_composite_observation_transaction() {
-        run_on_reference_stack(placed_routed_composite_observation_intervention_is_transactional);
-    }
-
-    #[test]
-    fn transformed_replicated_materialization() {
-        run_on_reference_stack(|| {
-            let evidence = run_reference_conformance_transformed_replicated_production();
-            assert!(evidence
-                .lowering_kinds
-                .iter()
-                .any(|kind| kind == "Transform"));
-            assert!(evidence.generated_companions > 0);
-        });
-    }
-
-    #[test]
-    fn transformed_addressable_materialization() {
-        run_on_reference_stack(|| {
-            let evidence = run_reference_conformance_transformed_addressable_route();
-            assert!(evidence
-                .lowering_kinds
-                .iter()
-                .any(|kind| kind == "Transform"));
-            assert!(evidence.generated_companions > 0);
-        });
-    }
-}
-
 #[derive(Debug, Clone)]
 struct NumericTensor {
     shape: Vec<i32>,
@@ -22757,6 +22663,10 @@ pub fn non_mlx_processor_uses_exact_neutral_media_before_native_lowering() {
     assert_eq!(failed_mechanisms.tensors, 0);
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode() {
     let config = serde_json::json!({
         "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
@@ -23027,6 +22937,10 @@ fn non_mlx_composite_preserves_video_and_projected_part_order() {
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
     let config = serde_json::json!({
         "model_type": "qwen3_vl_moe", "image_token_id": 5, "video_token_id": 6,
@@ -23161,6 +23075,10 @@ pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
     assert!(report.evictions > 0);
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
     non_mlx_inkling_composite_with_shared_banks(1);
 }
@@ -23287,6 +23205,10 @@ fn non_mlx_inkling_composite_with_shared_banks(shared: i32) {
     assert!(report.evictions > 0);
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_text_graph() {
     let config = serde_json::json!({
         "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
@@ -23454,6 +23376,10 @@ pub(crate) fn non_mlx_muse_glimmer_composite_matches_established_image_video_tex
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth() {
     let config = serde_json::json!({
         "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,
@@ -23570,6 +23496,10 @@ pub(crate) fn non_mlx_conditional_qwen_composite_runs_without_prediction_depth()
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_decode() {
     let config = serde_json::json!({
         "model_type":"gemma4_unified", "tie_word_embeddings":false,
@@ -23745,6 +23675,10 @@ pub(crate) fn non_mlx_composite_session_runs_mixed_audio_prefill_and_repeated_de
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn run_reference_conformance_composite_families() -> Vec<&'static str> {
     non_mlx_composite_session_runs_image_prefill_and_repeated_text_decode();
     non_mlx_routed_composite_reuses_the_planned_provider();
@@ -23760,17 +23694,6 @@ pub(crate) fn run_reference_conformance_composite_families() -> Vec<&'static str
         "qwen3_vl",
         "qwen3_vl_moe",
     ]
-}
-
-#[test]
-fn reference_conformance_composite_families() {
-    std::thread::Builder::new()
-        .name("reference-composite-families".into())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| assert_eq!(run_reference_conformance_composite_families().len(), 6))
-        .unwrap()
-        .join()
-        .unwrap();
 }
 
 #[allow(
@@ -23871,6 +23794,10 @@ pub(crate) fn non_mlx_session_executes_relu2_routing_through_the_same_driver() {
     assert!(report.peak_entries <= 2);
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn run_reference_conformance_routed_safetensors_families() -> Vec<String> {
     let cases = [
         config("qwen3_moe", false),
@@ -23954,14 +23881,6 @@ pub(crate) fn run_reference_conformance_routed_safetensors_families() -> Vec<Str
         families.push(config["model_type"].as_str().unwrap().to_owned());
     }
     families
-}
-
-#[test]
-pub(crate) fn reference_conformance_routed_safetensors_families() {
-    assert_eq!(
-        run_reference_conformance_routed_safetensors_families().len(),
-        7
-    );
 }
 
 #[allow(
@@ -24183,6 +24102,10 @@ fn required_safetensors_parameters(config: &serde_json::Value) -> Vec<(String, V
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn new_architecture_uses_production_selection_materialization_and_session_without_backend_case(
 ) {
     use safetensors::tensor::{serialize_to_file, TensorView};
@@ -24288,6 +24211,10 @@ pub(crate) fn new_architecture_uses_production_selection_materialization_and_ses
     );
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn run_reference_conformance_replicated_safetensors_families(
 ) -> Vec<ReferenceStageEvidence> {
     let mut cases = vec![
@@ -24325,14 +24252,6 @@ pub(crate) fn run_reference_conformance_replicated_safetensors_families(
     evidence
 }
 
-#[test]
-pub(crate) fn reference_conformance_replicated_safetensors_families() {
-    assert_eq!(
-        run_reference_conformance_replicated_safetensors_families().len(),
-        11
-    );
-}
-
 #[allow(
     dead_code,
     reason = "called by the unified reference_conformance integration target"
@@ -24359,6 +24278,10 @@ pub(crate) fn run_reference_conformance_transformed_replicated_production() -> R
     last_reference_stage_evidence()
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
 pub(crate) fn run_reference_conformance_gguf_replicated_production() -> ReferenceStageEvidence {
     use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
     use std::fs::File;
@@ -24430,12 +24353,6 @@ pub(crate) fn run_reference_conformance_gguf_replicated_production() -> Referenc
     );
     assert_eq!(run.outputs.len(), 3);
     last_reference_stage_evidence()
-}
-
-#[test]
-pub(crate) fn reference_conformance_gguf_replicated_production() {
-    let evidence = run_reference_conformance_gguf_replicated_production();
-    assert_eq!(evidence.format, "Gguf");
 }
 
 #[test]

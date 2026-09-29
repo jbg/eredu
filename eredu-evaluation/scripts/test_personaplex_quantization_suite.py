@@ -26,20 +26,6 @@ def quality(distributions, value):
 
 
 class QuantizationSuiteTests(unittest.TestCase):
-    def test_builds_neutral_codec_example(self):
-        self.assertEqual(
-            suite.build_command(),
-            [
-                "cargo",
-                "build",
-                "--release",
-                "-p",
-                "eredu-backend-mlx",
-                "--example",
-                "personaplex_quantization_eval",
-            ],
-        )
-
     def test_rejects_silent_and_duplicate_case_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

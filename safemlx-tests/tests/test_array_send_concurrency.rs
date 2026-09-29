@@ -3,10 +3,7 @@ use std::{
     thread,
 };
 
-use safemlx::{
-    error::Exception, transforms::compile::compile, Array, Device, DeviceType, EvaluatedArray,
-    Stream,
-};
+use safemlx::{error::Exception, transforms::compile::compile, Array, Device, DeviceType, Stream};
 
 const THREADS: usize = 8;
 const ITERS: usize = 50;
@@ -14,20 +11,6 @@ const LEN: usize = 256;
 
 fn cpu_stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
-}
-
-fn assert_send<T: Send>() {}
-fn assert_sync<T: Sync>() {}
-
-#[test]
-fn array_send_marker_allows_owned_transfer() {
-    assert_send::<Array>();
-}
-
-#[test]
-fn array_sync_marker_allows_shared_references() {
-    assert_sync::<Array>();
-    assert_sync::<EvaluatedArray<'static>>();
 }
 
 #[test]

@@ -16,7 +16,6 @@ use crate::backend::{
 use crate::MlxTensor;
 
 include!("mlx_architecture_conformance/support.rs");
-include!("mlx_architecture_conformance/foundations.rs");
 include!("mlx_architecture_conformance/text_profiles.rs");
 include!("mlx_architecture_conformance/dense_profiles.rs");
 include!("mlx_architecture_conformance/multimodal_moe.rs");

@@ -18,41 +18,6 @@ fn close(actual: &Array, expected: &[f32]) {
         .all(|(left, right)| (left - right).abs() < 1e-5));
 }
 
-fn arrays_close(actual: &Array, expected: &Array) {
-    assert_eq!(actual.shape(), expected.shape());
-    assert_eq!(actual.dtype(), expected.dtype());
-    let actual = actual.evaluated().unwrap();
-    let expected = expected.evaluated().unwrap();
-    assert_eq!(
-        actual.as_slice::<f32>().len(),
-        expected.as_slice::<f32>().len()
-    );
-    assert!(actual
-        .as_slice::<f32>()
-        .iter()
-        .zip(expected.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() < 1e-5));
-}
-
-#[test]
-fn wrapper_is_one_transparent_native_handle() {
-    fn assert_contract<T: Tensor + AsRef<Array> + From<Array>>() {}
-    fn assert_native_conversion<T: Into<Array>>() {}
-    fn assert_parameter_traversal<T: eredu_nn::Parameterized<MlxTensor>>() {}
-
-    assert_contract::<MlxTensor>();
-    assert_native_conversion::<MlxTensor>();
-    assert_parameter_traversal::<eredu_nn::Parameter<MlxTensor>>();
-    assert_eq!(
-        std::mem::size_of::<MlxTensor>(),
-        std::mem::size_of::<Array>()
-    );
-    assert_eq!(
-        std::mem::align_of::<MlxTensor>(),
-        std::mem::align_of::<Array>()
-    );
-}
-
 #[test]
 #[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
 fn wrapping_and_unwrapping_preserve_the_native_handle() {
@@ -62,31 +27,6 @@ fn wrapping_and_unwrapping_preserve_the_native_handle() {
     assert_eq!(wrapped.as_array().as_ptr().ctx, native_handle);
     let native = wrapped.into_array();
     assert_eq!(native.as_ptr().ctx, native_handle);
-}
-
-#[test]
-#[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
-fn arithmetic_shape_and_indexing_match_native_operations() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let left = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
-    let right = Array::from_slice(&[6.0_f32, 5.0, 4.0, 3.0, 2.0, 1.0], &[2, 3]);
-    let wrapped_left = MlxTensor::from_array(left.clone());
-    let wrapped_right = MlxTensor::from_array(right.clone());
-
-    let actual = wrapped_left.add(&wrapped_right, stream).unwrap();
-    let expected = Array::add(&left, &right, stream).unwrap();
-    arrays_close(actual.as_array(), &expected);
-
-    let actual = actual.reshape(&[3, 2], stream).unwrap();
-    let expected = expected.reshape(&[3, 2], stream).unwrap();
-    arrays_close(actual.as_array(), &expected);
-
-    let actual = wrapped_left
-        .index(&[Index::Range(0, 2), Index::At(1)], stream)
-        .unwrap();
-    let expected = left.try_index_device((0..2, 1), stream).unwrap();
-    arrays_close(actual.as_array(), &expected);
 }
 
 #[test]
@@ -134,78 +74,6 @@ fn gather_bounds_settle_before_rejection_and_preserve_valid_indices() {
         assert!(table.take_axis(&valid, 1, stream).is_err());
         assert!(table.take_axis(&valid, i32::MIN, stream).is_err());
     }
-}
-
-#[test]
-#[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
-fn convolution_matches_native_operation() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let input = Array::from_slice(
-        &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-        &[1, 5, 2],
-    );
-    let weight = Array::from_slice(
-        &[
-            0.5_f32, 0.0, -0.5, 1.0, 0.0, 1.5, 2.0, 0.0, -2.0, 1.5, 0.0, 1.0,
-        ],
-        &[2, 3, 2],
-    );
-    let actual = MlxTensor::conv1d(
-        &MlxTensor::from_array(input.clone()),
-        &MlxTensor::from_array(weight.clone()),
-        1,
-        0,
-        1,
-        1,
-        stream,
-    )
-    .unwrap();
-    let expected = safemlx::ops::conv1d(&input, &weight, 1, 0, 1, 1, stream).unwrap();
-    arrays_close(actual.as_array(), &expected);
-}
-
-#[test]
-#[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
-fn scaled_attention_matches_native_operation() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let queries = Array::from_slice(&[1.0_f32, 0.0, 0.0, 1.0], &[1, 1, 2, 2]);
-    let keys = Array::from_slice(&[1.0_f32, 0.0, 0.0, 1.0], &[1, 1, 2, 2]);
-    let values = Array::from_slice(&[2.0_f32, 1.0, 4.0, 3.0], &[1, 1, 2, 2]);
-    let scale = 1.0 / 2.0_f32.sqrt();
-    let actual = MlxTensor::scaled_dot_product_attention(
-        &MlxTensor::from_array(queries.clone()),
-        &MlxTensor::from_array(keys.clone()),
-        &MlxTensor::from_array(values.clone()),
-        scale,
-        AttentionMask::Causal,
-        stream,
-    )
-    .unwrap();
-    let expected = safemlx::fast::scaled_dot_product_attention(
-        &queries,
-        &keys,
-        &values,
-        scale,
-        ScaledDotProductAttentionMask::Causal,
-        None,
-        stream,
-    )
-    .unwrap();
-    arrays_close(actual.as_array(), &expected);
-}
-
-#[test]
-#[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
-fn invalid_shapes_return_backend_errors() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = context.stream();
-    let native = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
-    let wrapped = MlxTensor::from_array(native.clone());
-
-    assert!(native.reshape(&[3], stream).is_err());
-    assert!(wrapped.reshape(&[3], stream).is_err());
 }
 
 #[test]

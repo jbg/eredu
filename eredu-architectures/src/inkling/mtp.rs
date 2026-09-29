@@ -318,14 +318,3 @@ pub(crate) fn mtp_text_args(
     text.num_hidden_layers = 1;
     Ok(text)
 }
-
-#[cfg(test)]
-mod tests {
-    use eredu_core::AttentionPolicy;
-
-    #[test]
-    fn cyclic_depth_selection_is_stable() {
-        let policies = [AttentionPolicy::Full, AttentionPolicy::Full];
-        assert_eq!(policies[5 % policies.len()], AttentionPolicy::Full);
-    }
-}

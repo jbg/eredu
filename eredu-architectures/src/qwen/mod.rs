@@ -346,10 +346,4 @@ mod tests {
         let _: Result<TransformerBlock<B>, Error> = new_block::<B>(&args, 0, context);
         let _: Result<LayeredModel<B>, Error> = LayeredModel::<B>::new(args, context);
     }
-
-    #[test]
-    fn dense_qwen_api_has_no_routed_backend_bound() {
-        // The generic helper above is type-checked even though no concrete
-        // backend is needed to exercise this compile-time assertion.
-    }
 }

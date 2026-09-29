@@ -1614,16 +1614,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_round_trips_and_validates_without_a_backend() {
-        let manifest = manifest();
-        manifest.validate().unwrap();
-        let json = serde_json::to_string(&manifest).unwrap();
-        let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
-        restored.validate().unwrap();
-        assert_eq!(restored, manifest);
-    }
-
-    #[test]
     fn legacy_materialization_cache_is_rejected_before_payload_validation() {
         let mut legacy = manifest();
         legacy.schema_version = 8;

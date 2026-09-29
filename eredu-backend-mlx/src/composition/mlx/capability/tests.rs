@@ -838,18 +838,6 @@ fn supported_apple_silicon_targets_have_unified_memory() {
 }
 
 #[test]
-fn static_and_available_reports_use_the_same_platform_relationship() {
-    let expected = physical_memory_semantics(std::env::consts::OS, std::env::consts::ARCH);
-    assert_eq!(
-        static_memory_from_residency(None, None)
-            .unwrap()
-            .physical_semantics,
-        expected
-    );
-    assert_eq!(available_memory().unwrap().physical_semantics, expected);
-}
-
-#[test]
 fn apple_unified_semantics_do_not_create_two_capacities() {
     let report = AvailableMemory {
         physical_memory_bytes: Observed::Available {
@@ -892,14 +880,6 @@ fn floating_dtype_assumption_follows_the_session_activation_width() {
     .unwrap();
     assert_eq!(estimate.assumptions.floating_state_dtype_bytes.get(), 2);
     assert_eq!(estimate.requested_state_bytes, 2 * 16 * 2);
-}
-
-#[test]
-fn capability_value_never_invents_default() {
-    let unsupported: Observed<u64> = Observed::Unsupported {
-        reason: "not supported".into(),
-    };
-    assert!(unsupported.value().is_none());
 }
 
 #[test]

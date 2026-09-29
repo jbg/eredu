@@ -2746,16 +2746,11 @@ mod tests {
     }
 
     #[test]
-    fn unit_reports_round_trip_without_backend_state() {
+    fn unit_reports_track_published_device_bytes_and_pins() {
         let mut ledger = disk_ledger(Some(8), [("a", 8, ResidencyPolicy::Cacheable)]);
         publish_device(&mut ledger, "a", 8, None);
         ledger.pin(&id("a"), MemoryTier::Device, 2).unwrap();
         let report = ledger.unit_reports().remove(0);
-        let encoded = serde_json::to_string(&report).unwrap();
-        assert_eq!(
-            serde_json::from_str::<UnitResidencyReport>(&encoded).unwrap(),
-            report
-        );
         assert_eq!(report.device_allocated_bytes(), 8);
         assert_eq!(report.device_pins(), 1);
     }

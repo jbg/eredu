@@ -97,18 +97,6 @@ fn ring_qwen3_moe_gguf_pipeline_parameter_bank() {
     );
 }
 
-/// Verifies one session owns both pipeline communication and expert caches.
-#[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_qwen3_moe_pipeline_parameter_bank_session() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen3Moe,
-        "pp-ep",
-        WorkerMode::AddressableParameterBank,
-    );
-}
-
 /// Verifies PP-only stages cache all of their local layers' experts without
 /// constructing an EP communicator. Prefill, decode, prompt persistence, and
 /// synchronized generation are exercised by the shared worker.

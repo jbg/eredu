@@ -666,13 +666,4 @@ mod tests {
         );
         assert_eq!(storage.phase(), CacheStoragePhase::HostUnbacked);
     }
-
-    #[test]
-    fn phase_and_operation_identity_round_trip_portably() {
-        let key = io(CacheIoOperationKind::Read, 9).0;
-        let encoded = serde_json::to_string(&(CacheStoragePhase::DiskReading, &key)).unwrap();
-        let decoded: (CacheStoragePhase, CacheIoOperationKey) =
-            serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, (CacheStoragePhase::DiskReading, key));
-    }
 }

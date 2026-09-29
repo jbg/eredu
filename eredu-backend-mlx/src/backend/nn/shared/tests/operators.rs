@@ -249,44 +249,6 @@ fn mlx_weighted_rms_norm_preserves_bfloat16_input_dtype() {
     output.as_array().evaluated().unwrap();
 }
 
-#[test]
-fn hot_path_api_construction_keeps_values_backend_native() {
-    fn lookup(
-        embedding: &mut MlxEmbedding,
-        tokens: &MlxTensor,
-        stream: &safemlx::Stream,
-    ) -> Result<MlxTensor, eredu_nn::Error> {
-        embedding.lookup(tokens, EmbeddingLookupPolicy::ZeroSentinel(-1), stream)
-    }
-    fn project(
-        linear: &mut MlxLinear,
-        input: &MlxTensor,
-        stream: &safemlx::Stream,
-    ) -> Result<MlxTensor, eredu_nn::Error> {
-        linear.forward(input, stream)
-    }
-    fn sum(
-        embeddings: &mut MultiTableEmbedding<MlxNeuralBackend>,
-        tokens: &[&MlxTensor],
-        stream: &safemlx::Stream,
-    ) -> Result<MlxTensor, eredu_nn::Error> {
-        embeddings.forward(tokens, stream)
-    }
-
-    let _: fn(
-        &mut MlxEmbedding,
-        &MlxTensor,
-        &safemlx::Stream,
-    ) -> Result<MlxTensor, eredu_nn::Error> = lookup;
-    let _: fn(&mut MlxLinear, &MlxTensor, &safemlx::Stream) -> Result<MlxTensor, eredu_nn::Error> =
-        project;
-    let _: fn(
-        &mut MultiTableEmbedding<MlxNeuralBackend>,
-        &[&MlxTensor],
-        &safemlx::Stream,
-    ) -> Result<MlxTensor, eredu_nn::Error> = sum;
-}
-
 fn assert_fused_split_equivalence(format: LinearFormat) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let stream = execution.stream();

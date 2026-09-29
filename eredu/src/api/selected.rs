@@ -664,8 +664,8 @@ pub fn benchmark_local_expert_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
-        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
+        local_device_plan, validate_expert_cache_benchmark_prompt, DevicePlanError,
+        ExpertCacheBenchmarkError, LocalDevice,
     };
 
     #[test]
@@ -725,20 +725,5 @@ mod tests {
         } else {
             assert_eq!(plan, Err(DevicePlanError::AcceleratorNotCompiled));
         }
-    }
-
-    #[test]
-    fn default_device_uses_an_available_accelerator_or_cpu() {
-        let expected = if cfg!(any(
-            feature = "cuda",
-            all(feature = "metal", target_vendor = "apple")
-        )) {
-            LocalDevice::Accelerator(0)
-        } else {
-            LocalDevice::Cpu
-        };
-        let device = default_local_device();
-        assert_eq!(device, expected);
-        assert!(local_device_plan(device).is_ok());
     }
 }

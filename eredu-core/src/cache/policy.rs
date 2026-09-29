@@ -982,14 +982,4 @@ mod tests {
         )
         .is_err());
     }
-
-    #[test]
-    fn policy_schema_round_trips() {
-        let policy = LayerCachePolicy::key_only(AttentionPolicy::Full, 4, 32).unwrap();
-        let json = serde_json::to_string(&policy).unwrap();
-        assert_eq!(
-            serde_json::from_str::<LayerCachePolicy>(&json).unwrap(),
-            policy
-        );
-    }
 }

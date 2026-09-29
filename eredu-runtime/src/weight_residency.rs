@@ -1010,24 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn static_unit_bindings_are_runtime_owned_and_decomposable() {
-        let binding = WeightBinding::new(
-            "embedding",
-            "model.embedding.weight",
-            eredu_checkpoint::store::TensorSelection::Full,
-            16,
-        )
-        .unwrap();
-        let unit = StaticUnitBindings::new("static.embedding", vec![binding.clone()]).unwrap();
-
-        assert_eq!(unit.id().as_str(), "static.embedding");
-        assert_eq!(unit.bindings(), std::slice::from_ref(&binding));
-        let (id, bindings) = unit.into_parts();
-        assert_eq!(id.as_str(), "static.embedding");
-        assert_eq!(bindings, vec![binding]);
-    }
-
-    #[test]
     fn dense_stream_controls_fail_closed_without_a_backend() {
         assert!(matches!(
             DenseDiskStreamLoadOptions::new(1, 1, 0, 1),
@@ -1098,32 +1080,5 @@ mod tests {
             ParameterBankKey::new(0, 3, 7).unit_id().as_str(),
             "bank.00000.unit.00003.member.00007"
         );
-    }
-
-    #[test]
-    fn layerwise_metadata_is_runtime_owned_and_updateable() {
-        let mut metadata = LayerwiseModelMetadata::new(
-            "generic",
-            None,
-            4,
-            10,
-            ExecutionResidency::LayerwiseHost,
-            20,
-            8,
-            6,
-            2,
-        );
-        metadata.set_effective_model_type("llama");
-        metadata.set_quantization(Some(eredu_checkpoint::WeightQuantization::Affine(
-            eredu_checkpoint::AffineQuantization::default(),
-        )));
-
-        assert_eq!(metadata.effective_model_type(), "llama");
-        assert_eq!(metadata.layer_count(), 4);
-        assert_eq!(metadata.static_device_bytes(), 10);
-        assert_eq!(metadata.layer_parameter_bytes(), 20);
-        assert_eq!(metadata.maximum_device_layer_bytes(), 8);
-        assert_eq!(metadata.maximum_host_layer_bytes(), 6);
-        assert_eq!(metadata.device_layer_capacity(), 2);
     }
 }

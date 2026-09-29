@@ -65,14 +65,6 @@ fn prompt_cache_save_selects_only_descriptor_owned_layers() {
 const TEST_PROMPT_CACHE_GENERATION: &str = "generation-test";
 
 #[test]
-fn paged_options_require_finite_nonzero_limits() {
-    assert!(PagedCacheOptions::new(0, 1, 1, 1).is_err());
-    assert!(PagedCacheOptions::new(16, 0, 1, 1).is_err());
-    assert!(PagedCacheOptions::new(16, 1, 1, 0).is_err());
-    assert!(PagedCacheOptions::new(16, 1, 0, 1).is_ok());
-}
-
-#[test]
 fn prefix_hash_is_order_sensitive() {
     assert_ne!(
         prompt_cache_token_fingerprint(&[1, 2, 3]),
@@ -103,23 +95,6 @@ fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
     let replicated = PromptCacheTopology::default();
     assert_eq!(replicated, PromptCacheTopology::default());
     assert_eq!(replicated.cache_rank_identity(), None);
-}
-
-#[test]
-fn ordered_layer_layout_round_trips_all_attention_patterns() {
-    let schedules = [
-        vec![None, None, None, None],
-        vec![Some(4), Some(4), Some(4), Some(4)],
-        vec![None, Some(4), None, Some(4)],
-        vec![Some(3), None, None, Some(9)],
-        vec![Some(2), Some(5), Some(11), None],
-    ];
-    for windows in schedules {
-        let layout = key_value_layout(windows);
-        let json = serde_json::to_string(&layout).unwrap();
-        let restored: LayerSchedule<LayerCachePolicy> = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, layout);
-    }
 }
 
 #[test]

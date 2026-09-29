@@ -174,12 +174,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn streams_can_move_between_threads() {
-        fn assert_send<T: Send>() {}
-        assert_send::<Stream>();
-    }
-
     #[cfg(not(any(feature = "metal", feature = "cuda")))]
     #[test]
     fn gpu_stream_initialization_returns_the_original_error() {

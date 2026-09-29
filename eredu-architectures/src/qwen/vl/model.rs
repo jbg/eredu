@@ -3320,12 +3320,4 @@ mod boundary_tests {
         assert_eq!(tensors.auxiliary()[3].role(), "deepstack.0");
         assert_eq!(tensors.auxiliary()[3].shape(), [2, 5, 32]);
     }
-
-    #[test]
-    fn routed_partition_declares_attention_and_expert_output_sums() {
-        assert_eq!(
-            qwen_vl_routed_tensor_reductions(),
-            crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1)
-        );
-    }
 }

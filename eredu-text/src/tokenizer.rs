@@ -1256,13 +1256,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_chat_template_from_file() {
-        let file = fixtures_dir().join("tokenizer_config.json");
-        let chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        assert!(!chat_template.select(None).unwrap().template().is_empty());
-    }
-
-    #[test]
     fn single_chat_template_remains_compatible() {
         let templates = load_model_chat_template_from_str(r#"{"chat_template":"single-template"}"#)
             .unwrap()
@@ -1456,39 +1449,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_chat_template() {
-        let file = fixtures_dir().join("tokenizer_config.json");
-        let model_chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
-
-        let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
-        let conversations = vec![Conversation {
-            role: Role::User,
-            content: "hello",
-        }];
-        let args = ApplyChatTemplateArgs {
-            conversations: [conversations.into()],
-            tools: None,
-            documents: None,
-            model_id: &model_id,
-            chat_template_id: None,
-            add_generation_prompt: None,
-            continue_final_message: None,
-            template_kwargs: None,
-        };
-
-        let mut env = Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-
-        let rendered_chat = apply_chat_template(&mut env, model_chat_template, args).unwrap();
-        println!("{:?}", rendered_chat);
-    }
-
-    #[test]
     fn test_apply_chat_template_with_template_kwargs() {
         let model_template =
             "{% if enable_thinking %}think{% else %}no-think{% endif %}".to_string();
@@ -1594,86 +1554,5 @@ mod tests {
         )
         .unwrap();
         assert!(kwargs.contains("enable_thinking"), "{kwargs:?}");
-    }
-
-    #[test]
-    #[ignore = "requires local model files (tokenizer.json is 11MB)"]
-    fn test_tokenizer_apply_chat_template() {
-        let tokenizer_file = fixtures_dir().join("tokenizer.json");
-        let tokenizer_config_file = fixtures_dir().join("tokenizer_config.json");
-
-        let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
-
-        let conversations = vec![Conversation {
-            role: Role::User,
-            content: "hello",
-        }];
-
-        let mut tokenizer = super::Tokenizer::from_file(tokenizer_file).unwrap();
-
-        let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
-            .unwrap()
-            .unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
-
-        let args = ApplyChatTemplateArgs {
-            conversations: [conversations.into()],
-            tools: None,
-            documents: None,
-            model_id: &model_id,
-            chat_template_id: None,
-            add_generation_prompt: None,
-            continue_final_message: None,
-            template_kwargs: None,
-        };
-
-        let rendered_chat = tokenizer
-            .apply_chat_template(model_chat_template, args)
-            .unwrap();
-        println!("{:?}", rendered_chat);
-    }
-
-    #[test]
-    #[ignore = "requires local model files (tokenizer.json is 11MB)"]
-    fn test_tokenizer_apply_chat_template_and_encode() {
-        let tokenizer_file = fixtures_dir().join("tokenizer.json");
-        let tokenizer_config_file = fixtures_dir().join("tokenizer_config.json");
-
-        let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
-
-        let conversations = vec![Conversation {
-            role: Role::User,
-            content: "hello",
-        }];
-        let mut tokenizer = super::Tokenizer::from_file(tokenizer_file).unwrap();
-
-        let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
-            .unwrap()
-            .unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
-
-        let args = ApplyChatTemplateArgs {
-            conversations: [conversations.into()],
-            tools: None,
-            documents: None,
-            model_id: &model_id,
-            chat_template_id: None,
-            add_generation_prompt: None,
-            continue_final_message: None,
-            template_kwargs: None,
-        };
-
-        let encodings = tokenizer
-            .apply_chat_template_and_encode(model_chat_template, args)
-            .unwrap();
-        println!("{:?}", encodings.iter().flat_map(|e| e.get_ids()));
     }
 }

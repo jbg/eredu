@@ -267,14 +267,6 @@ fn ring_two_process_opaque_model_session() {
     run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
-/// Verifies fair multi-request scheduling, independent request caches, exact
-/// schedule consensus, variable prompt shapes, decode parity, EOS, and cancel.
-#[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_pipeline_opaque_session_repeated_decode() {
-    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
-}
-
 /// Verifies the public Llama PP session genuinely selects disk-streamed local
 /// layers while preserving numeric output, cache isolation, and neutral ownership.
 #[test]
@@ -300,14 +292,6 @@ fn ring_two_process_mistral_layerwise_host_tensor_parallel_opaque_session() {
         checkpoint_path,
         Some("tp"),
     );
-}
-
-/// Verifies that divergent rank-local schedules fail before point-to-point
-/// Exercises paged cache selection through the opaque session lifecycle.
-#[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_pipeline_opaque_session_cache_policy() {
-    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
 }
 
 /// Run with:

@@ -29,8 +29,8 @@ use eredu_runtime::{
     RuntimeStateComponents, Sampler, SamplingBackend, StateError, SubmissionBackend, TokenDomain,
 };
 
-include!("support/reference_backend.rs");
-include!("support/reference_composite.rs");
+include!("reference_backend.rs");
+include!("reference_composite.rs");
 
 #[derive(Default)]
 struct Constraint;
@@ -392,34 +392,4 @@ pub(crate) fn released_muse_dflash_runs_the_inspected_materialized_scheduler_pat
         .unwrap()
         .join()
         .unwrap();
-}
-
-#[cfg(test)]
-mod unified_conformance_compatibility_wrappers {
-    use super::*;
-
-    #[test]
-    fn sequential_embedded() {
-        sequential_embedded_runs_the_inspected_materialized_scheduler_path();
-    }
-
-    #[test]
-    fn fused_dspark() {
-        fused_dspark_runs_the_inspected_materialized_scheduler_path();
-    }
-
-    #[test]
-    fn gemma_external() {
-        gemma_runs_the_inspected_materialized_scheduler_path();
-    }
-
-    #[test]
-    fn exact_completion_lifetime_and_failure() {
-        exact_completion_retains_resources_and_failure_rolls_back_before_publication();
-    }
-
-    #[test]
-    fn muse_dflash_external() {
-        released_muse_dflash_runs_the_inspected_materialized_scheduler_path();
-    }
 }

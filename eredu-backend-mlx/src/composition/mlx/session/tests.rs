@@ -43,14 +43,6 @@ fn owned_input_preserves_multimodal_parts_and_metadata() {
 }
 
 #[test]
-fn model_session_is_the_backend_session_implementation() {
-    fn assert_session<T: BackendSession<MlxBackend<'static>>>() {}
-    fn assert_inspectable<T: InspectableBackendSession<MlxBackend<'static>>>() {}
-    assert_session::<MlxModelSession>();
-    assert_inspectable::<MlxModelSession>();
-}
-
-#[test]
 fn completed_model_submission_validates_tokens_and_releases_its_gate() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();

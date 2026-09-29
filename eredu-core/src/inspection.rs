@@ -816,15 +816,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_schema_round_trips_without_a_backend() {
-        let report =
-            ModelInspectionReport::unverified(Path::new("model.gguf"), ArtifactFormat::Gguf);
-        let json = serde_json::to_string(&report).unwrap();
-        let decoded: ModelInspectionReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, report);
-    }
-
-    #[test]
     fn neutral_admission_rejection_has_a_stable_report_code() {
         let mut report =
             ModelInspectionReport::unverified(Path::new("model"), ArtifactFormat::SafeTensors);

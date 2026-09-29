@@ -1355,14 +1355,3 @@ impl SelectedPreparation {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn public_selection_types_are_owned_and_thread_safe() {
-        fn assert_owned<T: Clone + Send + Sync + 'static>() {}
-
-        assert_owned::<super::SelectedExecution>();
-        assert_owned::<super::SelectedPreparation>();
-    }
-}

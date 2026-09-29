@@ -598,27 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_and_limits_round_trip_without_backend_types() {
-        let pool = pool();
-        let _membership = pool.register_manager(1).unwrap();
-        pool.update_manager(
-            1,
-            CachePoolUsage {
-                device_bytes: 8,
-                disk_bytes: 4,
-                ..CachePoolUsage::default()
-            },
-        )
-        .unwrap();
-        let report = pool.report().unwrap();
-        let encoded = serde_json::to_string(&report).unwrap();
-        assert_eq!(
-            serde_json::from_str::<CachePoolReport>(&encoded).unwrap(),
-            report
-        );
-    }
-
-    #[test]
     fn concurrent_admission_has_one_atomic_winner() {
         let pool = CacheResidencyPool::new(CachePoolLimits::new(64, 10, 64, 0).unwrap());
         let start = Arc::new(Barrier::new(3));

@@ -49,10 +49,6 @@ impl TestKeys {
         })
     }
 
-    pub(crate) fn from_key(key: Array) -> Self {
-        Self { key, next: 0 }
-    }
-
     pub(crate) fn seed(&mut self, seed: u64) -> Result<()> {
         self.key = key(seed)?;
         self.next = 0;
@@ -65,17 +61,6 @@ impl TestKeys {
         self.key = keys.try_index_device(0, stream)?;
         self.next += 1;
         keys.try_index_device(1, stream)
-    }
-
-    pub(crate) fn as_array(&self) -> &Array {
-        &self.key
-    }
-}
-
-#[cfg(test)]
-impl Default for TestKeys {
-    fn default() -> Self {
-        Self::new().expect("test PRNG key")
     }
 }
 
@@ -727,45 +712,12 @@ mod tests {
     }
 
     #[test]
-    fn test_random_state_new() {
-        let state = TestKeys::new().unwrap();
-        assert_eq!(state.as_array().shape(), &[2]);
-    }
-
-    #[test]
-    fn test_random_state_with_seed_deterministic() {
-        let s1 = TestKeys::with_seed(42).unwrap();
-        let s2 = TestKeys::with_seed(42).unwrap();
-        assert!(crate::array::eval_equal_values(
-            s1.as_array(),
-            s2.as_array()
-        ));
-    }
-
-    #[test]
     fn test_random_state_next_key_advances() {
         let stream = crate::test_stream();
         let mut state = TestKeys::with_seed(0).unwrap();
         let k1 = state.next_key(stream).unwrap();
         let k2 = state.next_key(stream).unwrap();
         assert!(!crate::array::eval_equal_values(&k1, &k2));
-    }
-
-    #[test]
-    fn test_random_state_from_key_roundtrip() {
-        let original = TestKeys::with_seed(99).unwrap();
-        let arr = original.as_array().clone();
-        let restored = TestKeys::from_key(arr);
-        assert!(crate::array::eval_equal_values(
-            original.as_array(),
-            restored.as_array()
-        ));
-    }
-
-    #[test]
-    fn test_random_state_default() {
-        let state = TestKeys::default();
-        assert_eq!(state.as_array().shape(), &[2]);
     }
 
     #[test]

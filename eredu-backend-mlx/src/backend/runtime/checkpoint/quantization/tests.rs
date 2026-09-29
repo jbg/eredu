@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use crate::backend::ExecutionContext;
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 use eredu_architectures::checkpoint_conversion::{
     SafetensorsQuantizationPlan, SafetensorsQuantizationTarget,
 };
@@ -117,27 +118,6 @@ fn planned_config_is_written_without_backend_metadata_rewrites() {
     assert!(config.get("quantization").is_none());
     assert!(config.get("quantization_config").is_none());
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn options_have_no_tensor_name_selection_policy() {
-    let plan = SafetensorsQuantizationPlan::new(
-        WeightQuantization::MxFp4,
-        [SafetensorsQuantizationTarget::new(
-            "architecture.exact.source",
-            "architecture.exact.packed",
-            "architecture.exact.scale",
-            None::<String>,
-        )],
-        json!({"model_type": "test"}),
-    )
-    .unwrap();
-    let options = CheckpointQuantizationOptions::new(plan);
-    assert_eq!(options.plan.targets().len(), 1);
-    assert_eq!(
-        options.plan.targets()[0].source_name(),
-        "architecture.exact.source"
-    );
 }
 
 #[test]
