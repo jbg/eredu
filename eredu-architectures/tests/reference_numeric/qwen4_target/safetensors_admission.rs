@@ -363,7 +363,7 @@ fn safetensors_target_header_rejects_ordinary_catalog_before_integer_reads() {
         cold_execution.requirements()
     );
     assert_eq!(counted.source_diagnostics().unwrap().physical_reads, before);
-    let selected = selected_cold.bind(counted.clone()).unwrap();
+    let selected = selected_cold.bind(counted.clone(), None).unwrap();
     assert_eq!(
         selected.realization().text().requirements(),
         cold_execution.requirements().text()
@@ -494,7 +494,7 @@ fn safetensors_complete_cold_plan_rejects_replaced_physical_identity_before_cont
         Change::Alias,
     ] {
         let changed = CountedSource::new(source.clone(), change);
-        assert!(selected.clone().bind(changed.clone()).is_err());
+        assert!(selected.clone().bind(changed.clone(), None).is_err());
         changed.assert_unread();
     }
 }

@@ -23,6 +23,17 @@ capture drivers. `Unchunked` adds no caller-imposed chunk limit; architecture in
 limits apply. Complete-input cache identity publishes on the final chunk. Restore does not
 refund observation, transport or copy usage.
 
+SafeTensors and GGUF header admission normalize target formats, ordinary/unit/expert
+recipes and compact table declarations before request-specific selection.
+`TargetPreparationPlan` retains load policy and row admission; `SelectedTargetPreparation`
+binds the selected target and prediction roles without rebuilding family recipes.
+Conditional and partitioned plans consume the same target declaration. Embedded prediction
+shares the primary SafeTensors artifact; a separately admitted prediction companion retains
+its own source identity while using the target's embedding and output parameters.
+Metadata-only catalogs support cold preparation without payload reads. Binding validates
+source metadata and provenance before deferred SafeTensors hash controls and scalar table
+scales are read; GGUF hash controls retain their admitted integer values.
+
 ## Support boundaries
 
 - Full released-checkpoint numerical parity and throughput are unverified. Small fixtures

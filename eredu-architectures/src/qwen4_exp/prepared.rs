@@ -15,8 +15,8 @@ use super::{
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     store::{
-        PreparedCheckpointSource, PreparedTensorSource, ResolvedCheckpointSource,
-        RestrictedCheckpointSource, SharedCheckpointSource, StoreError,
+        PreparedCheckpointSource, PreparedTensorSource, RestrictedCheckpointSource,
+        SharedCheckpointSource, StoreError,
     },
     validation::resolve_safetensors_plan,
     LinearFormat,
@@ -143,6 +143,10 @@ fn retain(
 /// Table payloads are never concatenated or decoded during this preparation.
 #[derive(Clone)]
 pub struct PreparedTarget {
+    prediction_recipes: Option<(
+        BTreeMap<String, DerivedWeightRecipe>,
+        Vec<BTreeMap<String, DerivedWeightRecipe>>,
+    )>,
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
     expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
@@ -280,6 +284,7 @@ impl PreparedTarget {
         )?)
     }
 }
+#[derive(Debug)]
 struct PreparedExpertBank {
     recipes: BTreeMap<String, DerivedWeightRecipe>,
     members: Vec<BTreeMap<String, DerivedWeightRecipe>>,
@@ -323,7 +328,7 @@ fn select_expert(
 
 /// Exact formats retained after container-specific preparation. Missing identities
 /// are errors; native construction cannot reconstruct a checkpoint policy.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ParameterFormats(
     BTreeMap<String, LinearFormat>,
     BTreeMap<String, eredu_nn::LinearRowLayout>,
@@ -382,12 +387,14 @@ pub use partition_selection::{
 };
 
 mod gguf_target;
-pub use gguf_target::{GgufTargetExecutionPlan, GgufTargetPlan, SelectedGgufTargetExecution};
+pub use gguf_target::GgufTargetPlan;
+mod target_preparation;
+pub use target_preparation::{
+    SelectedTargetPreparation, TargetArtifactDeclaration, TargetPreparationPlan,
+};
 
 mod safetensors_target;
-pub use safetensors_target::{
-    SafetensorsTargetExecutionPlan, SafetensorsTargetPlan, SelectedSafetensorsTargetExecution,
-};
+pub use safetensors_target::SafetensorsTargetPlan;
 
 mod load_defaults;
 mod load_policy;
@@ -411,35 +418,6 @@ mod observations;
 mod resources;
 pub use observations::{PredictionDiscovery, PredictionObservationBinding};
 pub use resources::TargetResourceReport;
-
-fn prepare_safetensors_formats(
-    artifact: &SharedCheckpointSource,
-    config: &Config,
-    encoding: &SafetensorsEncoding,
-    roots: impl IntoIterator<Item = String>,
-) -> Result<(ParameterFormats, BTreeMap<String, Arc<PreparedExpertBank>>), PreparationError> {
-    let (formats, recipes) = safetensors_format_recipes(
-        artifact.as_ref(),
-        &artifact.source_keys(),
-        config,
-        encoding,
-        roots,
-    )?;
-    let banks = recipes
-        .into_iter()
-        .map(|(root, recipes)| {
-            Ok((
-                root,
-                Arc::new(PreparedExpertBank::new(
-                    artifact.as_ref(),
-                    recipes,
-                    config.experts.count as usize,
-                )?),
-            ))
-        })
-        .collect::<Result<_, PreparationError>>()?;
-    Ok((formats, banks))
-}
 
 fn safetensors_format_recipes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     catalog: &C,

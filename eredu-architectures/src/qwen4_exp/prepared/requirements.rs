@@ -36,13 +36,21 @@ impl PreparedTarget {
             .iter()
             .map(|unit| unit.recipes().clone())
             .collect::<Vec<_>>();
-        let requirements = target_requirements(
-            &self.spec,
+        let parameters = target_parameters(
+            &self.spec.config,
             &self.formats,
             self.artifact.as_ref(),
             &physical,
             self.static_parameters.recipes(),
             &unit_recipes,
+            &self.expert_banks,
+        )?;
+        let requirements = target_requirements(
+            &self.spec,
+            &self.formats,
+            self.artifact.as_ref(),
+            &parameters,
+            self.static_parameters.recipes(),
             &self.expert_banks,
             streams,
             row_admission.clone(),
@@ -105,14 +113,80 @@ impl PreparedTarget {
     }
 }
 
-/// One family authoring algorithm shared by header admission and bound artifacts.
-pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
-    spec: &TargetSpec,
+pub(super) fn target_parameters<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+    config: &Config,
     formats: &ParameterFormats,
     source: &C,
     physical: &BTreeMap<String, eredu_runtime::ReplicatedTextPhysicalSource>,
     static_recipes: &BTreeMap<String, DerivedWeightRecipe>,
     unit_recipes: &[BTreeMap<String, DerivedWeightRecipe>],
+    banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
+) -> Result<
+    (
+        Vec<Parameter>,
+        BTreeMap<String, DerivedWeightRecipe>,
+        BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+    ),
+    PreparationError,
+> {
+    let mut declared = ParameterRequirements::new(source, physical, formats);
+    for (name, recipe) in static_recipes {
+        let role = if name.starts_with("model.embed_tokens.") {
+            "embedding"
+        } else if name.starts_with("lm_head.") {
+            "output"
+        } else {
+            "norm"
+        };
+        declared.add(name, recipe, Owner::StaticRole(role.into()), false)?;
+    }
+    let mut ordinal = 0;
+    for layer in 0..config.layers.len() {
+        if config.ngram.layers.contains(&layer) {
+            for (name, recipe) in &unit_recipes[ordinal] {
+                declared.add(
+                    name,
+                    recipe,
+                    Owner::ExecutionUnit {
+                        group: crate::decoder::TARGET_EXECUTION_GROUP.into(),
+                        unit: ordinal,
+                    },
+                    false,
+                )?;
+            }
+            ordinal += 1;
+        }
+        let owner = Owner::ExecutionUnit {
+            group: crate::decoder::TARGET_EXECUTION_GROUP.into(),
+            unit: ordinal,
+        };
+        for (name, recipe) in &unit_recipes[ordinal] {
+            declared.add(name, recipe, owner.clone(), false)?;
+        }
+        let root = format!("model.layers.{layer}.mlp.experts");
+        for (name, recipe) in &banks
+            .get(&root)
+            .ok_or_else(|| invalid("missing prepared expert bank"))?
+            .recipes
+        {
+            declared.add(&format!("{root}.{name}"), recipe, owner.clone(), true)?;
+        }
+        ordinal += 1;
+    }
+    Ok((declared.parameters, declared.derived, declared.outputs))
+}
+
+/// One family authoring algorithm shared by header admission and bound artifacts.
+pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+    spec: &TargetSpec,
+    formats: &ParameterFormats,
+    source: &C,
+    parameters: &(
+        Vec<Parameter>,
+        BTreeMap<String, DerivedWeightRecipe>,
+        BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
+    ),
+    static_recipes: &BTreeMap<String, DerivedWeightRecipe>,
     expert_banks: &BTreeMap<String, Arc<PreparedExpertBank>>,
     streams: Vec<AppendStreamBinding>,
     row_admission: SelectedRowLookupPlans,
@@ -135,28 +209,10 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
     let graph = ExecutionGraph::chain([crate::decoder::TARGET_EXECUTION_GROUP]).map_err(invalid)?;
     let units = ExecutionUnitLayout::new(&graph, [spec.units.len()]).map_err(invalid)?;
     let owner = ExecutionGroupId::new(crate::decoder::TARGET_EXECUTION_GROUP).map_err(invalid)?;
-    let mut declared = ParameterRequirements::new(source, physical, formats);
-    for (name, recipe) in static_recipes {
-        let role = if name.starts_with("model.embed_tokens.") {
-            "embedding"
-        } else if name.starts_with("lm_head.") {
-            "output"
-        } else {
-            "norm"
-        };
-        declared.add(name, recipe, Owner::StaticRole(role.into()), false)?;
-    }
     let mut specs = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut members = Vec::new();
     for (ordinal, unit) in spec.units.iter().enumerate() {
-        let parameter_owner = Owner::ExecutionUnit {
-            group: owner.as_str().into(),
-            unit: ordinal,
-        };
-        for (name, recipe) in &unit_recipes[ordinal] {
-            declared.add(name, recipe, parameter_owner.clone(), false)?;
-        }
         let UnitSpec::Decoder {
             layer,
             feed_forward,
@@ -166,17 +222,6 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
             continue;
         };
         let root = format!("model.layers.{layer}.mlp.experts");
-        let complete = expert_banks
-            .get(&root)
-            .ok_or_else(|| invalid("missing prepared expert bank"))?;
-        for (local, recipe) in &complete.recipes {
-            declared.add(
-                &format!("{root}.{local}"),
-                recipe,
-                parameter_owner.clone(),
-                true,
-            )?;
-        }
         specs.insert(
             (owner.clone(), ordinal),
             feed_forward.feed_forward.experts.clone(),
@@ -249,12 +294,12 @@ pub(super) fn target_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?
         vec![crate::transport::decoder()],
         state_layout,
         ReplicatedTextStateAccess::AttentionWithStreams,
-        declared.parameters,
+        parameters.0.clone(),
     )
     .map_err(invalid)?
     .with_floating_state_source(dtype)
     .with_chunked_prefill(true)
-    .with_derived_recipes(declared.derived, declared.outputs)
+    .with_derived_recipes(parameters.1.clone(), parameters.2.clone())
     .map_err(invalid)?
     .with_append_streams(streams)
     .map_err(invalid)?;

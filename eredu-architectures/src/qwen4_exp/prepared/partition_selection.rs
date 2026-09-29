@@ -1,5 +1,4 @@
 //! Retained cold tensor/pipeline/expert admission over exact target header authority.
-use super::conditional_header::TargetHeader;
 use super::*;
 use crate::partitioned_execution::{
     routed_partitioned_admission_from_requirements, select_routed_partitioned_admission,
@@ -36,7 +35,7 @@ pub(crate) fn load_partition_request(
 /// Source-free tensor/pipeline/expert authority. This plan does not publish an executable.
 #[derive(Clone)]
 pub struct TargetPartitionExecutionPlan {
-    header: TargetHeader,
+    header: TargetPreparationPlan,
     tensor: TargetTensorPartition,
     requirements: RoutedPartitionedAdmission,
     local_state: StateRealizationRequirements,
@@ -64,28 +63,19 @@ pub struct PreparedTargetPartition {
     prediction: Option<SelectedPartitionPrediction>,
 }
 
-impl SafetensorsTargetExecutionPlan {
-    /// Retains exact TP selections and PP/EP ownership without readable sources.
+impl TargetPreparationPlan {
+    /// Retains the same canonical target through TP/PP/EP selection.
     pub fn partition(
         self,
         request: PartitionedSelectionRequest,
     ) -> Result<TargetPartitionExecutionPlan, PreparationError> {
-        TargetPartitionExecutionPlan::new(TargetHeader::Safetensors(Box::new(self)), request)
-    }
-}
-impl GgufTargetExecutionPlan {
-    /// Retains published GGUF header authority through cold TP/PP/EP admission.
-    pub fn partition(
-        self,
-        request: PartitionedSelectionRequest,
-    ) -> Result<TargetPartitionExecutionPlan, PreparationError> {
-        TargetPartitionExecutionPlan::new(TargetHeader::Gguf(Box::new(self)), request)
+        TargetPartitionExecutionPlan::new(self, request)
     }
 }
 
 impl TargetPartitionExecutionPlan {
     pub(super) fn new(
-        header: TargetHeader,
+        header: TargetPreparationPlan,
         request: PartitionedSelectionRequest,
     ) -> Result<Self, PreparationError> {
         let invalid = |e: String| PreparationError::Contract(e);
@@ -97,7 +87,7 @@ impl TargetPartitionExecutionPlan {
         }
         let rank = ParallelRankTopology::new(topology, request.global_rank())
             .map_err(|e| invalid(e.to_string()))?;
-        let spec = header.spec()?;
+        let spec = header.target_spec()?;
         if request.maximum_batch_size() != spec.limits.qsa.batch
             || request.maximum_sequence_length() != spec.limits.qsa.tokens
         {
@@ -201,7 +191,7 @@ impl TargetPartitionExecutionPlan {
         &self,
         selected: &crate::SelectedRoutedTextRealization,
     ) -> Result<TargetSpec, PreparationError> {
-        self.header.selected_spec(selected)
+        self.header.selected_target_spec(selected)
     }
     /// Rank-local ownership, source tasks, state and checked communication requirements.
     pub fn requirements(&self) -> &RoutedPartitionedAdmission {
@@ -225,7 +215,7 @@ impl TargetPartitionExecutionPlan {
     }
     /// Exact normalized weight/state policy, if this plan was prepared from a load request.
     pub fn load_selection_request(&self) -> Option<&RoutedTextSelectionRequest> {
-        self.header.selection_request()
+        self.header.load_selection_request()
     }
     /// Selects weight, state and communication mechanisms without source or native access.
     pub fn select(
@@ -237,7 +227,7 @@ impl TargetPartitionExecutionPlan {
     ) -> Result<SelectedTargetPartitionExecution, TargetSelectionError> {
         if self
             .header
-            .selection_request()
+            .load_selection_request()
             .is_some_and(|retained| retained != request)
         {
             return Err(TargetSelectionError::LoadRequestMismatch);
@@ -262,20 +252,11 @@ impl SelectedTargetPartitionExecution {
     pub fn selected(&self) -> &SelectedRoutedPartitionedExecution {
         &self.selected
     }
-    /// Retained SafeTensors headers for the existing source factory.
-    pub fn safetensors_plan(&self) -> Option<&SafetensorsTargetPlan> {
-        match &self.plan.header {
-            TargetHeader::Safetensors(plan) => Some(plan.header_plan()),
-            _ => None,
-        }
+    /// Common artifact authority retained through partition selection.
+    pub fn target_artifact(&self) -> &TargetArtifactDeclaration {
+        self.plan.header.artifact()
     }
-    /// Retained GGUF metadata/mappings for the existing source factory.
-    pub fn gguf_plan(&self) -> Option<&GgufTargetPlan> {
-        match &self.plan.header {
-            TargetHeader::Gguf(plan) => Some(plan.header_plan()),
-            _ => None,
-        }
-    }
+
     /// Conservative recipe workspace over exact retained header recipes.
     pub fn parameter_materialization_workspace(
         &self,
@@ -437,10 +418,7 @@ impl TargetPartitionExecutionPlan {
     }
     /// Separate SafeTensors prediction headers retained for a GGUF target.
     pub fn prediction_header(&self) -> Option<&SafetensorsPredictionPlan> {
-        match &self.header {
-            TargetHeader::Gguf(plan) => plan.prediction_header(),
-            TargetHeader::Safetensors(_) => None,
-        }
+        self.header.prediction_header()
     }
     pub(super) fn select_prediction(
         &self,
@@ -503,7 +481,7 @@ impl SelectedTargetPartitionExecution {
     pub(crate) fn prediction_descriptor(
         &self,
     ) -> Result<eredu_core::ArchitectureDescriptor, PreparationError> {
-        let target = self.plan.header.spec()?;
+        let target = self.plan.header.target_spec()?;
         let prediction = self
             .prediction
             .as_ref()

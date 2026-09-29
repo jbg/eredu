@@ -4,10 +4,7 @@
 //! Logical execution units have independent residency and state ownership, so
 //! ordinary decoder drivers handle pipeline cuts, tensor sharding and offloading.
 
-use eredu_checkpoint::{
-    recipe::DerivedWeightRecipe,
-    store::{CheckpointSource, TensorSelection},
-};
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use std::collections::BTreeMap;
 
@@ -48,7 +45,7 @@ pub fn source_name(root: &str, physical_layers: usize, name: &str) -> String {
 /// Self aliases keep shared originals in the executable catalog when another
 /// invocation consumes them through a recipe.
 pub fn recipes(
-    source: &dyn CheckpointSource,
+    source: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     root: &str,
     physical_layers: usize,
     repetitions: usize,

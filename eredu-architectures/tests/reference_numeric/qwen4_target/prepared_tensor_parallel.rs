@@ -144,7 +144,7 @@ fn run(target: &PreparedTarget, ranks: usize) -> Vec<(Vec<NumericTensor>, State)
                         prepared
                             .entries()
                             .iter()
-                            .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                            .map(|(id, e)| (id.clone(), super::super::row_bank::SourceRows::new(e)))
                             .collect()
                     } else {
                         BTreeMap::new()
@@ -614,11 +614,11 @@ fn prepared_row_binding_rejects_wrong_native_rank_and_nonowner_banks() {
     let banks = || {
         rows.entries()
             .iter()
-            .map(|(id, entry)| (id.clone(), crate::row_bank::SourceRows::new(entry)))
+            .map(|(id, entry)| (id.clone(), super::super::row_bank::SourceRows::new(entry)))
             .collect()
     };
     assert!(matches!(
-        rows.bind_tensor_parallel::<NumericBackend, crate::row_bank::SourceRows, _>(
+        rows.bind_tensor_parallel::<NumericBackend, super::super::row_bank::SourceRows, _>(
             BTreeMap::new(),
             &owner,
             &owner,
@@ -628,7 +628,7 @@ fn prepared_row_binding_rejects_wrong_native_rank_and_nonowner_banks() {
         Err(RowLookupError::Geometry)
     ));
     assert!(matches!(
-        rows.bind_tensor_parallel::<NumericBackend, crate::row_bank::SourceRows, _>(
+        rows.bind_tensor_parallel::<NumericBackend, super::super::row_bank::SourceRows, _>(
             BTreeMap::new(),
             &owner,
             &owner,
@@ -642,7 +642,7 @@ fn prepared_row_binding_rejects_wrong_native_rank_and_nonowner_banks() {
         Err(RowLookupError::Specification(_))
     ));
     assert!(rows
-        .bind_tensor_parallel::<NumericBackend, crate::row_bank::SourceRows, _>(
+        .bind_tensor_parallel::<NumericBackend, super::super::row_bank::SourceRows, _>(
             BTreeMap::new(),
             &peer,
             &peer,

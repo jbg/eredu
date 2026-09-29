@@ -13,7 +13,10 @@ use eredu_runtime::ReplicatedTextPhysicalSource;
 #[derive(Debug, Clone)]
 pub struct SafetensorsPredictionPlan {
     config: Config,
-    encoding: SafetensorsEncoding,
+    formats: ParameterFormats,
+    banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    shared_recipes: BTreeMap<String, DerivedWeightRecipe>,
+    unit_recipes: Vec<BTreeMap<String, DerivedWeightRecipe>>,
     catalog: HeaderCatalog,
     resolution: ResolvedCheckpointPlan,
     physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
@@ -57,7 +60,7 @@ impl SafetensorsPredictionPlan {
 
     // Already retained in-memory or generated sources need exact tensor metadata,
     // but have no file identity. Public cold plans additionally pin physical files.
-    fn prepare_metadata<C: SafetensorsCatalog + ?Sized>(
+    pub(super) fn prepare_metadata<C: SafetensorsCatalog + ?Sized>(
         catalog: &C,
         config: Config,
         encoding: SafetensorsEncoding,
@@ -83,15 +86,59 @@ impl SafetensorsPredictionPlan {
             .map_err(PreparationError::Contract)?;
         let resolution = resolve_safetensors_plan(&catalog, &checkpoint)
             .map_err(|error| PreparationError::Contract(format!("{error:?}")))?;
+        let keys = resolution.source_keys().iter().cloned().collect::<Vec<_>>();
+        let depth = config
+            .prediction
+            .as_ref()
+            .expect("prediction admission")
+            .layers
+            .len();
+        let roots = (0..depth).map(|d| format!("mtp.layers.{d}.mlp.experts"));
+        let (formats, recipes) =
+            safetensors_format_recipes(&catalog, &keys, &config, &encoding, roots)?;
+        let banks = recipes
+            .into_iter()
+            .map(|(root, recipes)| {
+                Ok((
+                    root,
+                    Arc::new(PreparedExpertBank::new(
+                        &catalog,
+                        recipes,
+                        config.experts.count as usize,
+                    )?),
+                ))
+            })
+            .collect::<Result<_, PreparationError>>()?;
+        let mut shared_recipes =
+            recipes::parameter_recipes(keys.clone(), &config, ParameterScope::Static)
+                .map_err(PreparationError::Contract)?;
+        shared_recipes.retain(|name, _| name.starts_with("mtp."));
+        let unit_recipes = (0..depth)
+            .map(|d| {
+                recipes::parameter_recipes(keys.clone(), &config, ParameterScope::Prediction(d))
+                    .map_err(PreparationError::Contract)
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             config,
-            encoding,
+            formats,
+            banks,
+            shared_recipes,
+            unit_recipes,
             catalog,
             resolution,
             physical: BTreeMap::new(),
         })
     }
 
+    pub(super) fn recipes(
+        &self,
+    ) -> (
+        BTreeMap<String, DerivedWeightRecipe>,
+        Vec<BTreeMap<String, DerivedWeightRecipe>>,
+    ) {
+        (self.shared_recipes.clone(), self.unit_recipes.clone())
+    }
     /// Exact family geometry supplied with the prediction artifact.
     pub fn configuration(&self) -> &Config {
         &self.config
@@ -126,34 +173,7 @@ impl SafetensorsPredictionPlan {
         ),
         PreparationError,
     > {
-        let prediction = self
-            .config
-            .prediction
-            .as_ref()
-            .ok_or(PreparationError::MissingPrediction)?;
-        let keys = self
-            .resolution
-            .source_keys()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let roots =
-            (0..prediction.layers.len()).map(|depth| format!("mtp.layers.{depth}.mlp.experts"));
-        let (formats, recipes) =
-            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
-        let banks = recipes
-            .into_iter()
-            .map(|(root, recipes)| {
-                Ok((
-                    root,
-                    Arc::new(PreparedExpertBank::new(
-                        &self.catalog,
-                        recipes,
-                        self.config.experts.count as usize,
-                    )?),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
+        let formats = &self.formats;
         let bank = eredu_runtime::RoutedBankId::new(
             u32::try_from(self.config.ngram.layers.len() + 1).map_err(|_| {
                 PreparationError::Contract("prediction bank identity exceeds u32".into())
@@ -172,7 +192,7 @@ impl SafetensorsPredictionPlan {
             },
             |name| formats.ordinary(name),
         )?;
-        Ok((spec, formats, banks))
+        Ok((spec, self.formats.clone(), self.banks.clone()))
     }
     /// Pins the exact admitted prediction headers and provenance. Target payloads
     /// of a complete companion checkpoint are excluded from the retained source.
@@ -215,20 +235,12 @@ impl SafetensorsPredictionPlan {
                 }
             }
         }
-        let prediction = self
-            .config
-            .prediction
-            .as_ref()
-            .ok_or(PreparationError::MissingPrediction)?;
-        let roots =
-            (0..prediction.layers.len()).map(|depth| format!("mtp.layers.{depth}.mlp.experts"));
-        let (formats, expert_banks) =
-            prepare_safetensors_formats(&artifact, &self.config, &self.encoding, roots)?;
         Ok(PreparedPredictionSource {
             config: self.config,
             artifact,
-            formats,
-            expert_banks,
+            formats: self.formats,
+            expert_banks: self.banks,
+            recipes: (self.shared_recipes, self.unit_recipes),
         })
     }
 }
@@ -250,6 +262,10 @@ pub struct PreparedPredictionSource {
     artifact: SharedCheckpointSource,
     formats: ParameterFormats,
     expert_banks: BTreeMap<String, Arc<PreparedExpertBank>>,
+    recipes: (
+        BTreeMap<String, DerivedWeightRecipe>,
+        Vec<BTreeMap<String, DerivedWeightRecipe>>,
+    ),
 }
 impl PreparedPredictionSource {
     /// Prepares either a standalone MTP checkpoint or only the prediction role of
@@ -288,6 +304,7 @@ impl PreparedTarget {
         self.formats.0.extend(source.formats.0);
         self.formats.1.extend(source.formats.1);
         self.expert_banks.extend(source.expert_banks);
+        self.prediction_recipes = Some(source.recipes);
         self.spec.config.prediction = source.config.prediction;
         Ok(self)
     }

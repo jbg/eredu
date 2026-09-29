@@ -9,99 +9,6 @@ use crate::routed_text::{
 };
 use eredu_checkpoint::recipe::RecipeCatalog;
 
-#[derive(Clone)]
-pub(super) enum TargetHeader {
-    Safetensors(Box<SafetensorsTargetExecutionPlan>),
-    Gguf(Box<GgufTargetExecutionPlan>),
-}
-impl TargetHeader {
-    pub(super) fn spec(&self) -> Result<TargetSpec, PreparationError> {
-        match self {
-            Self::Safetensors(p) => p.target_spec(),
-            Self::Gguf(p) => p.target_spec(),
-        }
-    }
-    pub(super) fn selected_spec(
-        &self,
-        selected: &SelectedRoutedTextRealization,
-    ) -> Result<TargetSpec, PreparationError> {
-        match self {
-            Self::Safetensors(plan) => plan.selected_target_spec(selected),
-            Self::Gguf(plan) => plan.selected_target_spec(selected),
-        }
-    }
-    pub(super) fn requirements(&self) -> &RoutedTextRequirements {
-        match self {
-            Self::Safetensors(p) => p.requirements(),
-            Self::Gguf(p) => p.requirements(),
-        }
-    }
-    pub(super) fn prediction_spec(&self) -> Option<&PredictionSpec> {
-        match self {
-            Self::Safetensors(p) => p.prediction_spec(),
-            Self::Gguf(p) => p.prediction_spec(),
-        }
-    }
-    pub(super) fn selected_prediction_spec(
-        &self,
-        selected: &SelectedRoutedTextRealization,
-    ) -> Result<PredictionSpec, PreparationError> {
-        match self {
-            Self::Safetensors(p) => p.selected_prediction_spec(selected),
-            Self::Gguf(p) => p.selected_prediction_spec(selected),
-        }
-    }
-    pub(super) fn prediction_state_requirements(
-        &self,
-    ) -> Option<&eredu_runtime::StateRealizationRequirements> {
-        match self {
-            Self::Safetensors(p) => p.prediction_state_requirements(),
-            Self::Gguf(p) => p.prediction_state_requirements(),
-        }
-    }
-    pub(super) fn selection_request(&self) -> Option<&RoutedTextSelectionRequest> {
-        match self {
-            Self::Safetensors(p) => p.load_selection_request(),
-            Self::Gguf(p) => p.load_selection_request(),
-        }
-    }
-    pub(super) fn bind(
-        self,
-        source: SharedCheckpointSource,
-        prediction: Option<SharedCheckpointSource>,
-    ) -> Result<TargetExecutionPlan, PreparationError> {
-        match self {
-            Self::Safetensors(p) => {
-                if prediction.is_some() {
-                    return Err(PreparationError::Contract(
-                        "embedded SafeTensors prediction does not accept a separate source".into(),
-                    ));
-                }
-                p.bind(source)
-            }
-            Self::Gguf(p) => p.bind(source, prediction),
-        }
-    }
-}
-impl RecipeCatalog for TargetHeader {
-    fn tensor_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
-        match self {
-            Self::Safetensors(p) => p.catalog().tensor_metadata(key),
-            Self::Gguf(p) => {
-                if let Some(prediction) = p.prediction_header() {
-                    if prediction.physical_sources().contains_key(key) {
-                        return prediction.tensor_metadata(key);
-                    }
-                }
-                p.catalog().tensor_metadata(key)
-            }
-        }
-    }
-}
-
 pub(super) struct JointCatalog<'a> {
     pub(super) target: &'a dyn RecipeCatalog,
     pub(super) vision: &'a VisionPlan,
@@ -123,7 +30,7 @@ impl RecipeCatalog for JointCatalog<'_> {
 /// This authority contains no readable source, native context or backend tensor.
 #[derive(Clone)]
 pub struct ConditionalHeaderExecutionPlan {
-    target: TargetHeader,
+    target: TargetPreparationPlan,
     vision: VisionPlan,
     policy: MediaAdmissionConfig,
     requirements: RoutedTextRequirements,
@@ -142,18 +49,18 @@ pub struct SelectedConditionalHeaderExecution {
 }
 
 impl ConditionalHeaderExecutionPlan {
-    pub(super) fn target_header(&self) -> &TargetHeader {
+    pub(super) fn target_header(&self) -> &TargetPreparationPlan {
         &self.target
     }
-    pub(super) fn new(target: TargetHeader, vision: VisionPlan) -> Result<Self, PreparationError> {
+    pub(super) fn new(
+        target: TargetPreparationPlan,
+        vision: VisionPlan,
+    ) -> Result<Self, PreparationError> {
         let invalid = |error: crate::qwen4_exp::media::MediaInputError| {
             PreparationError::Contract(error.to_string())
         };
-        let spec = target.spec()?;
-        let reset_token = match &target {
-            TargetHeader::Safetensors(_) => None,
-            TargetHeader::Gguf(plan) => plan.vision_reset_token_id()?,
-        };
+        let spec = target.target_spec()?;
+        let reset_token = target.vision_reset_token_id()?;
         vision.validate_target(&spec.config, reset_token)?;
         let policy = MediaAdmissionConfig::new(&spec, vision.config(), vision.media_tokens())
             .map_err(invalid)?;
@@ -219,19 +126,9 @@ impl ConditionalHeaderExecutionPlan {
     pub fn vision_plan(&self) -> &VisionPlan {
         &self.vision
     }
-    /// Retained SafeTensors target declaration, when this plan uses that container.
-    pub fn safetensors_target_plan(&self) -> Option<&SafetensorsTargetPlan> {
-        match &self.target {
-            TargetHeader::Safetensors(plan) => Some(plan.header_plan()),
-            _ => None,
-        }
-    }
-    /// Retained GGUF target declaration, when this plan uses that container.
-    pub fn gguf_target_plan(&self) -> Option<&GgufTargetPlan> {
-        match &self.target {
-            TargetHeader::Gguf(plan) => Some(plan.header_plan()),
-            _ => None,
-        }
+    /// Common artifact authority retained by the conditional target.
+    pub fn target_artifact(&self) -> &TargetArtifactDeclaration {
+        self.target.artifact()
     }
     /// Independent mutable predictor state, selected alongside the conditional target.
     pub fn prediction_state_requirements(
@@ -245,10 +142,7 @@ impl ConditionalHeaderExecutionPlan {
     }
     /// Separate GGUF predictor headers, when admitted.
     pub fn prediction_header(&self) -> Option<&SafetensorsPredictionPlan> {
-        match &self.target {
-            TargetHeader::Gguf(plan) => plan.prediction_header(),
-            TargetHeader::Safetensors(_) => None,
-        }
+        self.target.prediction_header()
     }
     /// Source-independent geometry, original-ID and sequence-limit policy.
     pub fn media_policy(&self) -> &MediaAdmissionConfig {
@@ -256,7 +150,7 @@ impl ConditionalHeaderExecutionPlan {
     }
     /// Normalized target policy retained before adding the vision role.
     pub fn load_selection_request(&self) -> Option<&RoutedTextSelectionRequest> {
-        self.target.selection_request()
+        self.target.load_selection_request()
     }
     /// Raw, prepared and projected input requirements from retained processor artifacts.
     pub fn processor_requirements(
@@ -283,7 +177,7 @@ impl ConditionalHeaderExecutionPlan {
         }
         if self
             .target
-            .selection_request()
+            .load_selection_request()
             .is_some_and(|retained| retained != request)
         {
             return Err(TargetSelectionError::LoadRequestMismatch);
@@ -330,7 +224,7 @@ impl SelectedConditionalHeaderExecution {
     pub(crate) fn prediction_descriptor(
         &self,
     ) -> Result<eredu_core::ArchitectureDescriptor, PreparationError> {
-        let target = self.plan.target.spec()?;
+        let target = self.plan.target.target_spec()?;
         let prediction = self.prediction_spec()?;
         super::graph::Graph::new(&target, &prediction)
             .with_prediction_observations(&target, &prediction)

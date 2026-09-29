@@ -1,18 +1,13 @@
 //! Complete header admission followed by exact source binding and bounded literals.
 use super::*;
 use crate::qwen4_exp::mtp::{PredictionLimits, PredictionSpec};
-use crate::routed_text::{
-    RoutedTextRequirements, RoutedTextSelectionRequest, SelectedRoutedTextRealization,
-};
+use crate::routed_text::SelectedRoutedTextRealization;
 use checkpoint::SafetensorsTableSourcePlan;
 use eredu_checkpoint::{
     schema::SafetensorsCheckpointPlan,
     validation::{CatalogTensorMetadata, ResolvedCheckpointPlan, SafetensorsCatalog},
 };
-use eredu_runtime::{
-    AppendStreamBinding, BackendMechanismCapabilities, ReplicatedTextPhysicalSource,
-    SelectedRowLookupPlans,
-};
+use eredu_runtime::{AppendStreamBinding, ReplicatedTextPhysicalSource, SelectedRowLookupPlans};
 
 /// Header-only target, prediction and vision contract. This value needs neither a
 /// readable source nor backend resources. Source provenance becomes authoritative
@@ -25,286 +20,6 @@ pub struct SafetensorsTargetPlan {
     checkpoint: SafetensorsCheckpointPlan,
     resolution: ResolvedCheckpointPlan,
     tables: BTreeMap<usize, SafetensorsTableSourcePlan>,
-}
-
-/// Complete source-free ordinary, routed and row execution requirements. Physical
-/// declarations are retained exactly and checked again before any literal reads.
-#[derive(Clone)]
-pub struct SafetensorsTargetExecutionPlan {
-    header: SafetensorsTargetPlan,
-    limits: TargetLimits,
-    physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
-    requirements: RoutedTextRequirements,
-    capability: crate::capability::CapabilityEstimate,
-    load_selection: Option<RoutedTextSelectionRequest>,
-    prediction: Option<(
-        PredictionSpec,
-        ParameterFormats,
-        eredu_runtime::StateRealizationRequirements,
-    )>,
-}
-
-/// Exact mechanism selection retained before any readable sources are supplied.
-#[derive(Clone)]
-pub struct SelectedSafetensorsTargetExecution {
-    plan: SafetensorsTargetExecutionPlan,
-    selected: SelectedRoutedTextRealization,
-    prediction_state: Option<eredu_runtime::SelectedStateRealization>,
-}
-
-impl SafetensorsTargetExecutionPlan {
-    /// Exact target source declaration retained before combined role selection.
-    pub fn header_plan(&self) -> &SafetensorsTargetPlan {
-        &self.header
-    }
-    pub(super) fn selected_target_spec(
-        &self,
-        selected: &SelectedRoutedTextRealization,
-    ) -> Result<TargetSpec, PreparationError> {
-        self.header
-            .target_spec_selected(self.limits, Some(selected))
-    }
-    pub(super) fn target_spec(&self) -> Result<TargetSpec, PreparationError> {
-        self.header.target_spec(self.limits)
-    }
-
-    pub(super) fn catalog(&self) -> &dyn eredu_checkpoint::recipe::RecipeCatalog {
-        &self.header.catalog
-    }
-
-    /// Adds embedded prediction parameters and independent state using admitted headers only.
-    pub fn with_prediction(
-        mut self,
-        limits: PredictionLimits,
-        streams: Vec<AppendStreamBinding>,
-    ) -> Result<Self, PreparationError> {
-        if self.prediction.is_some() {
-            return Err(PreparationError::Contract(
-                "prediction is already prepared".into(),
-            ));
-        }
-        let (spec, formats, banks) = self.header.prediction_parts(limits)?;
-        let keys = self
-            .header
-            .resolution
-            .source_keys()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut shared =
-            recipes::parameter_recipes(keys.clone(), &self.header.config, ParameterScope::Static)
-                .map_err(PreparationError::Contract)?;
-        shared.retain(|name, _| name.starts_with("mtp."));
-        let units = (0..spec.units.len())
-            .map(|depth| {
-                recipes::parameter_recipes(
-                    keys.clone(),
-                    &self.header.config,
-                    ParameterScope::Prediction(depth),
-                )
-                .map_err(PreparationError::Contract)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let (requirements, state) = super::prediction_plan::prediction_requirements(
-            &spec,
-            &self.target_spec()?,
-            &formats,
-            &self.header.catalog,
-            &self.physical,
-            &shared,
-            &units,
-            &banks,
-            &self.requirements,
-            streams,
-        )?;
-        self.requirements = requirements;
-        self.capability = crate::capability::qwen4_exp_prediction(&self.target_spec()?, &spec)?;
-        self.prediction = Some((spec, formats, state));
-        Ok(self)
-    }
-
-    /// Exact independent prediction state for cold mechanism queries.
-    pub fn prediction_state_requirements(
-        &self,
-    ) -> Option<&eredu_runtime::StateRealizationRequirements> {
-        self.prediction.as_ref().map(|(_, _, state)| state)
-    }
-
-    /// Header-authored prediction geometry before parameter transform selection.
-    pub fn prediction_spec(&self) -> Option<&PredictionSpec> {
-        self.prediction.as_ref().map(|(spec, _, _)| spec)
-    }
-
-    pub(super) fn selected_prediction_spec(
-        &self,
-        selected: &SelectedRoutedTextRealization,
-    ) -> Result<PredictionSpec, PreparationError> {
-        let (spec, formats, _) = self
-            .prediction
-            .as_ref()
-            .ok_or(PreparationError::MissingPrediction)?;
-        super::prediction_plan::selected_prediction_spec(
-            &self.header.config,
-            spec,
-            formats,
-            selected,
-        )
-    }
-
-    /// Adds a source-free vision role before selecting the combined graph.
-    pub fn with_vision(
-        self,
-        vision: VisionPlan,
-    ) -> Result<ConditionalHeaderExecutionPlan, PreparationError> {
-        super::conditional_header::ConditionalHeaderExecutionPlan::new(
-            super::conditional_header::TargetHeader::Safetensors(Box::new(self)),
-            vision,
-        )
-    }
-
-    /// Exact normalized load policy retained through cold selection and binding.
-    pub fn load_selection_request(&self) -> Option<&RoutedTextSelectionRequest> {
-        self.load_selection.as_ref()
-    }
-
-    /// Header-derived context and state estimates, before source binding.
-    pub fn capability_estimate(&self) -> &crate::capability::CapabilityEstimate {
-        &self.capability
-    }
-
-    /// Complete geometry and exact physical declarations; contains no source handle.
-    pub fn requirements(&self) -> &RoutedTextRequirements {
-        &self.requirements
-    }
-
-    /// Selects complete target mechanisms before controls or scales are acquired.
-    pub fn select(
-        self,
-        request: &RoutedTextSelectionRequest,
-        mechanisms: &BackendMechanismCapabilities,
-        prediction_mechanisms: Option<&eredu_runtime::StateMechanismCapabilities>,
-    ) -> Result<SelectedSafetensorsTargetExecution, TargetSelectionError> {
-        if self
-            .load_selection
-            .as_ref()
-            .is_some_and(|retained| retained != request)
-        {
-            return Err(TargetSelectionError::LoadRequestMismatch);
-        }
-        let prediction_state = match (self.prediction_state_requirements(), prediction_mechanisms) {
-            (Some(state), Some(mechanisms)) => Some(eredu_runtime::select_state_realization(
-                state,
-                request.text(),
-                mechanisms,
-            )?),
-            (None, None) => None,
-            _ => return Err(TargetSelectionError::PredictionStatePresence),
-        };
-        let selected = crate::routed_text::select_routed_text_realization(
-            &self.requirements,
-            request,
-            mechanisms,
-        )?;
-        super::execution::selected_stream_allowances(&selected, prediction_state.as_ref())?;
-        Ok(SelectedSafetensorsTargetExecution {
-            plan: self,
-            selected,
-            prediction_state,
-        })
-    }
-
-    /// Pins and checks the exact admitted physical source set before reading
-    /// bounded integer controls. Ordinary, expert and table payloads remain lazy.
-    pub fn bind(
-        self,
-        source: SharedCheckpointSource,
-    ) -> Result<TargetExecutionPlan, PreparationError> {
-        let source = retain(source.clone(), source.source_keys().into_iter().collect())?;
-        for (key, expected) in &self.physical {
-            let actual = crate::replicated_text::exact_physical_source(source.as_ref(), key)
-                .map_err(|error| PreparationError::Contract(error.to_string()))?;
-            if &actual != expected {
-                return Err(PreparationError::Contract(format!(
-                    "physical source changed for {key}"
-                )));
-            }
-        }
-        let target = self.header.bind(source, self.limits)?;
-        let row_sources = if let Some(rows) = self.requirements.row_lookups() {
-            target.bind_rows(rows)?
-        } else {
-            eredu_runtime::PreparedRowLookups::new([], target.spec.units.len())?
-        };
-        let prediction = self
-            .prediction
-            .map(|(spec, _, state)| {
-                Ok::<_, PreparationError>((target.prediction(spec.limits)?, state))
-            })
-            .transpose()?;
-        Ok(TargetExecutionPlan {
-            target,
-            prediction,
-            load_selection: self.load_selection,
-            requirements: self.requirements,
-            row_sources,
-            capability: self.capability,
-        })
-    }
-}
-
-impl SelectedSafetensorsTargetExecution {
-    /// Exact source-free artifact contract retained by this mechanism selection.
-    pub fn header_plan(&self) -> &SafetensorsTargetPlan {
-        &self.plan.header
-    }
-
-    /// Conservative selected recipe workspace from retained headers alone.
-    /// Row lookup buffers are accounted for by the separate row contracts.
-    pub fn parameter_materialization_workspace(
-        &self,
-        mechanisms: &impl crate::PreparationMechanismProvider,
-    ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
-        crate::SelectedExecution::routed(self.selected.clone()).parameter_materialization_workspace(
-            &self.plan.header.catalog,
-            None,
-            mechanisms,
-        )
-    }
-
-    /// Retained cold selection, available for inspection without payload reads.
-    pub fn selected(&self) -> &SelectedRoutedTextRealization {
-        &self.selected
-    }
-
-    /// Exact independent prediction state retained by cold selection.
-    pub fn prediction_state(&self) -> Option<&eredu_runtime::SelectedStateRealization> {
-        self.prediction_state.as_ref()
-    }
-
-    /// Prediction construction after selected parameter transformations.
-    pub fn prediction_spec(&self) -> Result<PredictionSpec, PreparationError> {
-        self.plan.selected_prediction_spec(&self.selected)
-    }
-
-    pub(crate) fn prediction_descriptor(
-        &self,
-    ) -> Result<eredu_core::ArchitectureDescriptor, PreparationError> {
-        let target = self.plan.target_spec()?;
-        let prediction = self.prediction_spec()?;
-        super::graph::Graph::new(&target, &prediction)
-            .with_prediction_observations(&target, &prediction)
-    }
-
-    /// Binds the retained selection without requerying or reselecting mechanisms.
-    pub fn bind(
-        self,
-        source: SharedCheckpointSource,
-    ) -> Result<SelectedTargetExecution, PreparationError> {
-        self.plan
-            .bind(source)?
-            .bind_selected(self.selected, self.prediction_state)
-            .map_err(|error| PreparationError::Contract(error.to_string()))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +134,177 @@ impl SafetensorsTargetPlan {
             checkpoint,
             resolution,
             tables,
+        })
+    }
+
+    /// Normalizes admitted layout, formats and recipes before execution policy.
+    pub fn normalize(
+        &self,
+        physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
+    ) -> Result<TargetArtifactDeclaration, PreparationError> {
+        self.declarations(physical, true)
+    }
+    fn declarations(
+        &self,
+        physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
+        exact: bool,
+    ) -> Result<TargetArtifactDeclaration, PreparationError> {
+        if exact
+            && physical.keys().collect::<BTreeSet<_>>()
+                != self.resolution.source_keys().iter().collect()
+        {
+            return Err(PreparationError::Contract(
+                "physical declarations differ from admitted source set".into(),
+            ));
+        }
+        for (key, entry) in &physical {
+            let header = &self.catalog.0[key];
+            if entry.catalog_key() != key
+                || entry.source_encoding()
+                    != &eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                        header.stored_dtype.clone(),
+                    )
+                || Some(entry.encoded_byte_len()) != HeaderCatalog::tensor_bytes(header)
+            {
+                return Err(PreparationError::Contract(format!(
+                    "physical declaration differs from header {key}"
+                )));
+            }
+        }
+        let keys = self
+            .resolution
+            .source_keys()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let roots = (0..self.config.layers.len())
+            .map(|l| format!("model.layers.{l}.mlp.experts"))
+            .chain(
+                (0..self
+                    .config
+                    .prediction
+                    .as_ref()
+                    .map_or(0, |p| p.layers.len()))
+                    .map(|d| format!("mtp.layers.{d}.mlp.experts")),
+            );
+        let (formats, recipes) =
+            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
+        let banks = recipes
+            .into_iter()
+            .map(|(root, recipes)| {
+                Ok((
+                    root,
+                    Arc::new(PreparedExpertBank::new(
+                        &self.catalog,
+                        recipes,
+                        self.config.experts.count as usize,
+                    )?),
+                ))
+            })
+            .collect::<Result<_, PreparationError>>()?;
+        let mut static_recipes =
+            recipes::parameter_recipes(keys.clone(), &self.config, ParameterScope::Static)
+                .map_err(PreparationError::Contract)?;
+        static_recipes.retain(|name, _| {
+            name.starts_with("model.embed_tokens.")
+                || name.starts_with("model.hyper_connection_mixer.")
+                || name.starts_with("lm_head.")
+        });
+        let mut unit_recipes = Vec::new();
+        for layer in 0..self.config.layers.len() {
+            if self.tables.contains_key(&layer) {
+                unit_recipes.push(
+                    recipes::parameter_recipes(
+                        keys.clone(),
+                        &self.config,
+                        ParameterScope::Lexical(layer),
+                    )
+                    .map_err(PreparationError::Contract)?,
+                );
+            }
+            unit_recipes.push(
+                recipes::parameter_recipes(
+                    keys.clone(),
+                    &self.config,
+                    ParameterScope::Target(layer),
+                )
+                .map_err(PreparationError::Contract)?,
+            );
+        }
+        let prediction = self
+            .config
+            .prediction
+            .as_ref()
+            .map(|_| {
+                if exact {
+                    SafetensorsPredictionPlan::prepare(
+                        &self.catalog,
+                        self.config.clone(),
+                        self.encoding.clone(),
+                        physical.clone(),
+                    )
+                } else {
+                    SafetensorsPredictionPlan::prepare_metadata(
+                        &self.catalog,
+                        self.config.clone(),
+                        self.encoding.clone(),
+                    )
+                }
+            })
+            .transpose()?;
+        let metadata = self
+            .catalog
+            .0
+            .iter()
+            .map(|(key, header)| {
+                (
+                    key.clone(),
+                    eredu_checkpoint::store::TensorMetadata {
+                        name: key.clone(),
+                        logical_shape: header.shape.clone(),
+                        physical_shape: header.shape.clone(),
+                        stored_dtype: header.stored_dtype.clone(),
+                        encoded_byte_len: HeaderCatalog::tensor_bytes(header).unwrap_or_default(),
+                        backing_shard: None,
+                    },
+                )
+            })
+            .collect();
+        let parameters = if exact {
+            super::requirements::target_parameters(
+                &self.config,
+                &formats,
+                &self.catalog,
+                &physical,
+                &static_recipes,
+                &unit_recipes,
+                &banks,
+            )?
+        } else {
+            Default::default()
+        };
+        let normalized = Arc::new(
+            crate::artifact_preparation::NormalizedArtifactPreparation::from_parameters(
+                metadata, physical, parameters,
+            ),
+        );
+        Ok(TargetArtifactDeclaration {
+            config: self.config.clone(),
+            formats,
+            normalized,
+            binding_keys: self.resolution.source_keys().clone(),
+            resolution: self.resolution.clone(),
+            gguf_source: None,
+            tables: self
+                .tables
+                .iter()
+                .map(|(&layer, table)| Ok((layer, table.normalized()?)))
+                .collect::<Result<_, checkpoint::NGramArtifactError>>()?,
+            banks,
+            static_recipes,
+            unit_recipes,
+            embedded_prediction: prediction,
+            vision_reset: None,
         })
     }
 
@@ -595,13 +481,9 @@ impl SafetensorsTargetPlan {
         element: eredu_nn::TensorElementType,
         support: &impl eredu_runtime::RowLookupMechanismSupport,
         physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
-    ) -> Result<SafetensorsTargetExecutionPlan, TargetLoadError> {
-        let projection = if request.has_parallel_execution() {
-            super::load_policy::TargetLoadProjection::partitioned(request, &self.config, element)?
-        } else {
-            super::load_policy::TargetLoadProjection::new(request, &self.config, element)?
-        };
-        self.execution_plan_from_projection(projection, support, physical)
+    ) -> Result<TargetPreparationPlan, TargetLoadError> {
+        self.normalize(physical)?
+            .execution_plan_for_load(request, element, support)
     }
 
     /// Retains a normalized TP/PP request through source-free mechanism selection.
@@ -618,25 +500,6 @@ impl SafetensorsTargetPlan {
             .partition(partition)?)
     }
 
-    fn execution_plan_from_projection(
-        &self,
-        projection: super::load_policy::TargetLoadProjection,
-        support: &impl eredu_runtime::RowLookupMechanismSupport,
-        physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
-    ) -> Result<SafetensorsTargetExecutionPlan, TargetLoadError> {
-        let spec = self.target_spec(projection.limits)?;
-        let descriptors = self.row_descriptors(
-            projection.limits,
-            projection.row_limits(),
-            ResidencyPolicy::Cacheable,
-        )?;
-        let rows = projection.select_rows(descriptors, support)?;
-        let mut plan =
-            self.execution_plan(projection.limits, projection.streams(&spec), rows, physical)?;
-        plan.load_selection = Some(projection.selection);
-        Ok(plan)
-    }
-
     /// Authors complete target requirements using headers and exact physical
     /// provenance supplied by artifact admission. No readable source is accepted.
     pub fn execution_plan(
@@ -645,113 +508,9 @@ impl SafetensorsTargetPlan {
         streams: Vec<AppendStreamBinding>,
         row_admission: SelectedRowLookupPlans,
         physical: BTreeMap<String, ReplicatedTextPhysicalSource>,
-    ) -> Result<SafetensorsTargetExecutionPlan, PreparationError> {
-        if physical.keys().collect::<BTreeSet<_>>()
-            != self.resolution.source_keys().iter().collect()
-        {
-            return Err(PreparationError::Contract(
-                "physical declarations differ from admitted source set".into(),
-            ));
-        }
-        for (key, entry) in &physical {
-            let header = &self.catalog.0[key];
-            if entry.catalog_key() != key
-                || entry.source_encoding()
-                    != &eredu_checkpoint::SourceTensorEncoding::Safetensors(
-                        header.stored_dtype.clone(),
-                    )
-                || Some(entry.encoded_byte_len()) != HeaderCatalog::tensor_bytes(header)
-            {
-                return Err(PreparationError::Contract(format!(
-                    "physical declaration differs from header {key}"
-                )));
-            }
-        }
-        let spec = self.target_spec(limits)?;
-        // Check every selected compact bank against this exact header plan, not
-        // just its owner geometry, before authoring ordinary/expert requirements.
-        let mut expected_rows = Vec::new();
-        for (ordinal, unit) in spec.units.iter().enumerate() {
-            if let UnitSpec::Lexical {
-                layer,
-                spec: lexical,
-            } = unit
-            {
-                let descriptor = row_admission
-                    .descriptors()
-                    .entries()
-                    .get(&lexical.embedding.lookup_spec().parameter)
-                    .ok_or_else(|| {
-                        PreparationError::Contract("missing admitted lexical row bank".into())
-                    })?;
-                if descriptor.limits().requests < limits.lookup_rows {
-                    return Err(eredu_runtime::RowLookupError::Budget {
-                        resource: "target lookup requests",
-                        required: limits.lookup_rows as u64,
-                        limit: descriptor.limits().requests as u64,
-                    }
-                    .into());
-                }
-                expected_rows.push(self.tables[layer].row_descriptor(
-                    expected_rows.len() + 1,
-                    ordinal,
-                    limits.element,
-                    descriptor.limits(),
-                    descriptor.range().policy(),
-                )?);
-            }
-        }
-        let expected_rows =
-            eredu_runtime::RowLookupDescriptors::new(expected_rows, spec.units.len())?;
-        if &expected_rows != row_admission.descriptors() {
-            return Err(PreparationError::Contract(
-                "selected row declarations differ from target headers".into(),
-            ));
-        }
-        let keys = self
-            .resolution
-            .source_keys()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let roots =
-            (0..self.config.layers.len()).map(|layer| format!("model.layers.{layer}.mlp.experts"));
-        let (formats, recipes) =
-            safetensors_format_recipes(&self.catalog, &keys, &self.config, &self.encoding, roots)?;
-        let banks = recipes
-            .into_iter()
-            .map(|(root, recipes)| {
-                Ok((
-                    root,
-                    Arc::new(PreparedExpertBank::new(
-                        &self.catalog,
-                        recipes,
-                        self.config.experts.count as usize,
-                    )?),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, PreparationError>>()?;
-        let (static_recipes, unit_recipes) = target_parameter_recipes(&keys, &self.config, &spec)?;
-        let requirements = super::requirements::target_requirements(
-            &spec,
-            &formats,
-            &self.catalog,
-            &physical,
-            &static_recipes,
-            &unit_recipes,
-            &banks,
-            streams,
-            row_admission,
-        )?;
-        Ok(SafetensorsTargetExecutionPlan {
-            header: self.clone(),
-            limits,
-            physical,
-            requirements,
-            capability: crate::capability::qwen4_exp_target(&spec)?,
-            load_selection: None,
-            prediction: None,
-        })
+    ) -> Result<TargetPreparationPlan, PreparationError> {
+        self.normalize(physical)?
+            .execution_plan(limits, streams, row_admission)
     }
 
     /// Consumes header authority and pins exact metadata/provenance before reading
@@ -762,126 +521,7 @@ impl SafetensorsTargetPlan {
         source: SharedCheckpointSource,
         limits: TargetLimits,
     ) -> Result<PreparedTarget, PreparationError> {
-        let spec = self.target_spec(limits)?;
-        let keys: BTreeSet<_> = source.source_keys().into_iter().collect();
-        let all: BTreeSet<_> = self.catalog.0.keys().cloned().collect();
-        if keys != all && keys != *self.resolution.source_keys() {
-            return Err(PreparationError::Contract(
-                "source set differs from admitted SafeTensors headers".into(),
-            ));
-        }
-        let source = retain(source, keys)?;
-        for key in source.source_keys() {
-            let metadata = source.source_metadata(&key)?;
-            let admitted = &self.catalog.0[&key];
-            if metadata.logical_shape != admitted.shape
-                || metadata.stored_dtype != admitted.stored_dtype
-            {
-                return Err(PreparationError::Contract(format!(
-                    "source header changed for {key}"
-                )));
-            }
-            // Claimed SafeTensors tensors use the released scalar encodings.
-            // Check all owners before any injection reads its literal buffers.
-            if self.resolution.source_keys().contains(&key) {
-                let bytes = HeaderCatalog::tensor_bytes(admitted);
-                if metadata.physical_shape != admitted.shape
-                    || bytes != Some(metadata.encoded_byte_len)
-                {
-                    return Err(PreparationError::Contract(format!(
-                        "source physical header changed for {key}"
-                    )));
-                }
-            }
-        }
-        let resolution = resolve_safetensors_plan(source.as_ref(), &self.checkpoint)
-            .map_err(|error| PreparationError::Contract(format!("{error:?}")))?;
-        if resolution.source_keys() != self.resolution.source_keys() {
-            return Err(PreparationError::Contract(
-                "source layout differs from admitted SafeTensors headers".into(),
-            ));
-        }
-        let artifact: SharedCheckpointSource =
-            Arc::new(ResolvedCheckpointSource::new(source, resolution));
-        let config = self.config;
-        let encoding = self.encoding;
-        let roots = (0..config.layers.len())
-            .map(|l| format!("model.layers.{l}.mlp.experts"))
-            .chain(
-                (0..config.prediction.as_ref().map_or(0, |p| p.layers.len()))
-                    .map(|d| format!("mtp.layers.{d}.mlp.experts")),
-            );
-        let (formats, expert_banks) =
-            prepare_safetensors_formats(&artifact, &config, &encoding, roots)?;
-        let mut tables = BTreeMap::new();
-        let mut ordinal = 0;
-        for layer in 0..config.layers.len() {
-            if let Some(table) = self.tables.get(&layer) {
-                tables.insert(
-                    layer,
-                    table.bind(artifact.clone(), tables.len() + 1, ordinal, limits.element)?,
-                );
-                ordinal += 1;
-            }
-            ordinal += 1;
-        }
-        // Literal controls must satisfy the header-authored construction exactly.
-        BoundTargetSpec::new(
-            spec.clone(),
-            tables
-                .iter()
-                .map(|(&layer, table)| (layer, table.hash.clone()))
-                .collect(),
-        )?;
-        let (static_recipes, unit_recipes) =
-            target_parameter_recipes(&artifact.source_keys(), &config, &spec)?;
-        let static_parameters = PreparedParameters::new(artifact.clone(), static_recipes)?;
-        let units = unit_recipes
-            .into_iter()
-            .map(|recipes| PreparedParameters::new(artifact.clone(), recipes))
-            .collect::<Result<_, _>>()?;
-        Ok(PreparedTarget {
-            artifact,
-            formats,
-            expert_banks,
-            spec,
-            tables,
-            static_parameters,
-            units,
-        })
+        self.declarations(BTreeMap::new(), false)?
+            .bind(source, limits)
     }
-}
-
-fn target_parameter_recipes(
-    keys: &[String],
-    config: &Config,
-    spec: &TargetSpec,
-) -> Result<
-    (
-        BTreeMap<String, DerivedWeightRecipe>,
-        Vec<BTreeMap<String, DerivedWeightRecipe>>,
-    ),
-    PreparationError,
-> {
-    let mut static_recipes =
-        recipes::parameter_recipes(keys.iter().cloned(), config, ParameterScope::Static)
-            .map_err(PreparationError::Contract)?;
-    static_recipes.retain(|name, _| {
-        name.starts_with("model.embed_tokens.")
-            || name.starts_with("model.hyper_connection_mixer.")
-            || name.starts_with("lm_head.")
-    });
-    let units = spec
-        .units
-        .iter()
-        .map(|unit| {
-            let scope = match unit {
-                UnitSpec::Lexical { layer, .. } => ParameterScope::Lexical(*layer),
-                UnitSpec::Decoder { layer, .. } => ParameterScope::Target(*layer),
-            };
-            recipes::parameter_recipes(keys.iter().cloned(), config, scope)
-                .map_err(PreparationError::Contract)
-        })
-        .collect::<Result<_, _>>()?;
-    Ok((static_recipes, units))
 }

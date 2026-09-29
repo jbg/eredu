@@ -258,7 +258,12 @@ fn selected_media_target_sessions_restore_fork_and_reset_persistent_rotary_posit
                             rows.prepared()
                                 .entries()
                                 .iter()
-                                .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                                .map(|(id, e)| {
+                                    (
+                                        id.clone(),
+                                        super::super::super::row_bank::SourceRows::new(e),
+                                    )
+                                })
                                 .collect(),
                         )
                         .unwrap();

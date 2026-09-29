@@ -2840,7 +2840,7 @@ fn derive_routed_text_requirements(
         let text =
             crate::replicated_text::k2_horizon_replicated_text_requirements(inspection, args)
                 .map_err(|e| invalid(e.to_string()))?;
-        let source = crate::replicated_text::inspection_recipe_source(inspection)
+        let source = crate::replicated_text::artifact::catalog(inspection)
             .map_err(|e| invalid(e.to_string()))?;
         let rank = eredu_core::ParallelRankTopology::new(
             eredu_core::ParallelTopology::new(1, 1, 1, 1).map_err(|e| invalid(e.to_string()))?,
@@ -3041,7 +3041,7 @@ fn derive_routed_text_requirements(
             .map(|unit| (("target".to_owned(), unit), format!("layers.{unit}")))
             .collect(),
     };
-    let recipe_source = crate::replicated_text::inspection_recipe_source(inspection)
+    let recipe_source = crate::replicated_text::artifact::catalog(inspection)
         .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
     if let Family::NemotronH(args) = family {
         let text =

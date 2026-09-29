@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
     schema::SafetensorsCheckpointPlan,
-    store::{CheckpointSource, TensorSelection, WeightStoreBackend},
+    store::{TensorSelection, WeightStoreBackend},
     validation::SafetensorsCatalog,
 };
 
@@ -99,16 +99,11 @@ fn canonical_name(physical: &str) -> Option<String> {
 /// These recipes consume exact admitted sources; they never reinterpret GGUF.
 /// Filtering by logical owner keeps layerwise and partitioned loads bounded.
 pub(super) fn recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     owns: impl Fn(&str) -> bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     let mut recipes = BTreeMap::new();
-    if store
-        .source_diagnostics()
-        .map_err(|error| error.to_string())?
-        .backend
-        == WeightStoreBackend::Gguf
-    {
+    if store.source_backend().map_err(|error| error.to_string())? == WeightStoreBackend::Gguf {
         return Ok(recipes);
     }
     for physical in store.source_keys() {

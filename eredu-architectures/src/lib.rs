@@ -51,6 +51,7 @@ pub mod expert_residency;
 mod gguf_admission;
 mod gguf_catalog;
 pub use gguf_catalog::GgufTensorCatalog;
+pub mod artifact_preparation;
 /// Backend-neutral family and checkpoint admission for sibling GGUF projectors.
 pub mod gguf_companion;
 mod inspection_validation;

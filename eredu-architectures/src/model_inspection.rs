@@ -281,7 +281,7 @@ where
                     let workspace = if let Some(target) = preparation.qwen4_construction() {
                         target.parameter_materialization_workspace(mechanisms)
                     } else {
-                        crate::replicated_text::inspection_recipe_source(&inspection)
+                        crate::replicated_text::artifact::catalog(&inspection)
                             .map_err(|error| error.to_string())
                             .and_then(|source| {
                                 preparation.execution().parameter_materialization_workspace(
@@ -416,8 +416,8 @@ fn record_rank_resources(
             };
             cache_bytes_per_position += 2 * width as u64 * u64::from(scalar_bytes.get());
         }
-        let source = crate::replicated_text::inspection_recipe_source(inspection)
-            .map_err(|e| e.to_string())?;
+        let source =
+            crate::replicated_text::artifact::catalog(inspection).map_err(|e| e.to_string())?;
         let workspace = selected.parameter_materialization_workspace(
             source.as_ref(),
             layout.as_ref(),

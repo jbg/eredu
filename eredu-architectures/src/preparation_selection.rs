@@ -184,7 +184,7 @@ impl<P: PreparationMechanismProvider + ?Sized> eredu_runtime::RowLookupMechanism
     }
 }
 
-mod qwen4;
+pub(crate) mod qwen4;
 
 /// Structured failure from total cold preparation selection.
 #[derive(Debug, Clone, thiserror::Error)]

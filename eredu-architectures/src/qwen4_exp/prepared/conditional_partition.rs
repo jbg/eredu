@@ -61,7 +61,7 @@ impl ConditionalHeaderExecutionPlan {
         request: PartitionedSelectionRequest,
     ) -> Result<ConditionalPartitionExecutionPlan, PreparationError> {
         let target = TargetPartitionExecutionPlan::new(self.target_header().clone(), request)?;
-        let spec = self.target_header().spec()?;
+        let spec = self.target_header().target_spec()?;
         let vision = self.vision_plan().config();
         // One request encodes media before target chunking. Its vision edges use
         // the retained complete-request ceiling rather than a target chunk size.
@@ -555,7 +555,7 @@ impl SelectedConditionalPartitionExecution {
     pub(crate) fn prediction_descriptor(
         &self,
     ) -> Result<eredu_core::ArchitectureDescriptor, PreparationError> {
-        let target = self.plan.header.target_header().spec()?;
+        let target = self.plan.header.target_header().target_spec()?;
         let prediction = self
             .prediction
             .as_ref()

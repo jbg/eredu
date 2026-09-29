@@ -195,7 +195,7 @@ fn run_with_header(
         assert_eq!(cold.load_selection_request(), plan.load_selection_request());
         cold.select(&request, &capabilities, None)
             .unwrap()
-            .bind(target.artifact().clone())
+            .bind(target.artifact().clone(), None)
             .unwrap()
     } else {
         plan.select(&request, &capabilities, None).unwrap()
@@ -290,7 +290,7 @@ fn run_with_header(
     }
     eredu_architectures::prepared_execution::construct_selected_routed_session(prepared,mechanisms,&ctx,|_,_,rows| {
         let rows=rows.unwrap();
-        let providers=rows.prepared().bind(rows.prepared().entries().iter().map(|(id,e)|(id.clone(),crate::row_bank::SourceRows::new(e))).collect()).unwrap();
+        let providers=rows.prepared().bind(rows.prepared().entries().iter().map(|(id,e)|(id.clone(),super::super::row_bank::SourceRows::new(e))).collect()).unwrap();
         Ok::<_,String>((BTreeMap::<RoutedBankId,(NumericGroupedBankMechanism,NumericIndexedMovement)>::new(),Some(providers)))
     },(),|_,s,_|exercise!(s),|_,s,_|exercise!(s)).unwrap()
 }

@@ -8,6 +8,7 @@ pub mod gguf_text;
 pub mod recipes;
 mod safetensors_table;
 pub mod schema;
+pub(in crate::qwen4_exp) mod table;
 use super::{
     config::{Config, NGramSourceLayout},
     ngram::{NGramError, NGramHashSpec},

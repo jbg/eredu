@@ -42,13 +42,10 @@ impl PreparedTarget {
             },
             |name| self.formats.ordinary(name),
         )?;
-        let mut shared = recipes::parameter_recipes(
-            self.artifact.source_keys(),
-            &self.spec.config,
-            ParameterScope::Static,
-        )
-        .map_err(PreparationError::Contract)?;
-        shared.retain(|name, _| name.starts_with("mtp."));
+        let (shared, recipes) = self
+            .prediction_recipes
+            .as_ref()
+            .ok_or(PreparationError::MissingPrediction)?;
         let vocabulary = self
             .static_parameters
             .recipes
@@ -59,22 +56,13 @@ impl PreparedTarget {
             })
             .map(|(name, recipe)| (name.clone(), recipe.clone()))
             .collect();
-        let units = (0..spec.units.len())
-            .map(|depth| {
-                PreparedParameters::new(
-                    self.artifact.clone(),
-                    recipes::parameter_recipes(
-                        self.artifact.source_keys(),
-                        &self.spec.config,
-                        ParameterScope::Prediction(depth),
-                    )
-                    .map_err(PreparationError::Contract)?,
-                )
-            })
-            .collect::<Result<_, PreparationError>>()?;
+        let units = recipes
+            .iter()
+            .map(|recipes| PreparedParameters::new(self.artifact.clone(), recipes.clone()))
+            .collect::<Result<_, _>>()?;
         Ok(PreparedPrediction {
             spec,
-            shared: PreparedParameters::new(self.artifact.clone(), shared)?,
+            shared: PreparedParameters::new(self.artifact.clone(), shared.clone())?,
             vocabulary: PreparedParameters::new(self.artifact.clone(), vocabulary)?,
             units,
             artifact: self.artifact.clone(),

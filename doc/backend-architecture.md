@@ -518,6 +518,38 @@ selection instead of repeating route selection after native resources exist.
 Core carries the neutral preparation plan and backend selection in one opaque
 `SelectedModelPreparation`; callers cannot re-pair either half before
 `ModelLoadingBackend` consumes it.
+Artifact preparation follows one immutable boundary in `eredu-architectures`:
+format admission → normalized artifact declarations → family execution requirements
+→ mechanism selection → exact source binding → typed construction.
+`NormalizedArtifactPreparation` retains canonical parameter requirements and recipes,
+metadata-only recipe catalogs, exact physical source provenance and resolutions,
+and logical target/prediction/vision roles. Admission caches retain these declarations
+without retaining their owning inspection cache. Projected prediction views share
+physical artifact ownership and keep their exact source authorization.
+
+`eredu-checkpoint::recipe::ArtifactCatalog` exposes enumerated headers and provenance
+without payload acquisition. SafeTensors adapters resolve aliases, optional parameters
+and quantization companions; GGUF adapters preserve native physical encodings and
+canonical mappings. Family recipes remain in `eredu-architectures`. Cold inspection
+uses these catalogs rather than constructing readable weight stores. Load limits,
+residency policy, selected transformations and backend mechanisms belong to execution
+preparation, outside the immutable artifact declarations.
+
+Flash-Next's format-specific admission plans normalize into the same target declaration.
+`TargetPreparationPlan` and `SelectedTargetPreparation` retain ordinary, routed, row and
+prediction-state selection for both containers; conditional and partitioned composition
+consume that common target. Compact table recipes retain either deferred bounded integer
+reads or exact admitted GGUF integers. Scalar E4M3 table scaling remains independent of
+block-scaled expert companions. Binding checks every required role's headers and provenance
+before family literal acquisition and consumes retained parameter recipes.
+
+A shared physical-artifact opener consumes admitted shard identities, resolutions and
+mappings under the selected cache policy. Restricted role views share its source objects:
+an embedded SafeTensors predictor and vision tower need no extra physical source, while
+GGUF companions have independent artifact declarations. Backends receive the bound source
+graph and retained selection without container parsing or alias rediscovery. Realtime Moshi
+and codec construction use their separate preparation contracts.
+
 External drafting follows the same two-stage boundary: the facade supplies the
 architecture-inspected assistant to the factory's cold drafting-selection hook
 before target realization. That hook establishes architecture-owned

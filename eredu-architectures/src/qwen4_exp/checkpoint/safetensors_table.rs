@@ -198,54 +198,59 @@ impl SafetensorsTableSourcePlan {
         self.scale_name.is_some()
     }
 
-    /// Declares the logical provider identity and row encoding without payload access.
+    pub(in crate::qwen4_exp) fn normalized(
+        &self,
+    ) -> Result<super::table::TableDeclaration, NGramArtifactError> {
+        let scale = self
+            .scale_name
+            .as_ref()
+            .map(|_| {
+                ParameterId::new(format!(
+                    "model.layers.{}.ple.ple_embedding.ngram_embedding.weight_scale",
+                    self.layer
+                ))
+                .map_err(|e| invalid(e.to_string()))
+            })
+            .transpose()?;
+        Ok(super::table::TableDeclaration {
+            layer: self.layer,
+            rows: self.total,
+            dimensions: self.width,
+            encoding: scale.map_or(RowEncoding::Dense, |scale| RowEncoding::ScalarE4M3 {
+                scale,
+            }),
+            recipe: DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: self
+                    .shards
+                    .iter()
+                    .map(|key| DerivedWeightRecipe::source(key, TensorSelection::Full))
+                    .collect(),
+            },
+            metadata: self
+                .catalog
+                .keys()
+                .map(|key| Ok((key.clone(), self.tensor_metadata(key)?)))
+                .collect::<Result<_, StoreError>>()?,
+            provenance: BTreeMap::new(),
+            literals: super::table::HashLiterals::Deferred {
+                config: self.config.clone(),
+                names: self.names.clone(),
+                heads: self.heads,
+            },
+            scale_name: self.scale_name.clone(),
+        })
+    }
+    /// Declares a logical row owner from compact admitted recipes.
     pub fn lookup_spec(
         &self,
         bank: usize,
         unit: usize,
         output_type: TensorElementType,
     ) -> Result<RowLookupSpec, NGramArtifactError> {
-        let canonical = format!(
-            "model.layers.{}.ple.ple_embedding.ngram_embedding",
-            self.layer
-        );
-        let scale_parameter = self
-            .scale_name
-            .as_ref()
-            .map(|_| ParameterId::new(format!("{canonical}.weight_scale")))
-            .transpose()
-            .map_err(|e| invalid(e.to_string()))?;
-        let lookup = RowLookupSpec {
-            parameter: ParameterId::new(format!("{canonical}.weight"))
-                .map_err(|e| invalid(e.to_string()))?,
-            bank,
-            unit,
-            rows: self.total,
-            dimensions: self.width,
-            encoding: scale_parameter
-                .as_ref()
-                .map_or(RowEncoding::Dense, |scale| RowEncoding::ScalarE4M3 {
-                    scale: scale.clone(),
-                }),
-            output_type,
-        };
-        lookup.validate().map_err(|e| invalid(e.to_string()))?;
-        Ok(lookup)
+        self.normalized()?.lookup_spec(bank, unit, output_type)
     }
-
-    fn row_recipe(&self) -> DerivedWeightRecipe {
-        DerivedWeightRecipe::Concatenate {
-            axis: 0,
-            inputs: self
-                .shards
-                .iter()
-                .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full))
-                .collect(),
-        }
-    }
-
-    /// Complete cold row mechanism contract, inferred from compact shard recipes
-    /// and scalar headers. Contains no readable sources or artifact paths.
+    /// Header-only row mechanism contract.
     pub fn row_descriptor(
         &self,
         bank: usize,
@@ -254,38 +259,10 @@ impl SafetensorsTableSourcePlan {
         limits: eredu_runtime::RowLookupLimits,
         policy: eredu_core::residency::ResidencyPolicy,
     ) -> Result<eredu_runtime::RowLookupDescriptor, NGramArtifactError> {
-        use eredu_runtime::{RowLookupDescriptor, RowScaleDescriptor, RowScaleSource};
-        let lookup = self.lookup_spec(bank, unit, output_type)?;
-        let metadata = self
-            .row_recipe()
-            .infer(self)
-            .map_err(|e| invalid(e.to_string()))?;
-        let range = table_row_range(&lookup, &metadata, policy)?;
-        let scale = self
-            .scale_name
-            .as_ref()
-            .map(|name| {
-                let RowEncoding::ScalarE4M3 { scale } = &lookup.encoding else {
-                    unreachable!("declared scalar encoding")
-                };
-                let metadata = self.tensor_metadata(name)?;
-                let encoding = eredu_checkpoint::SourceTensorEncoding::Safetensors(
-                    metadata.stored_dtype.clone(),
-                );
-                Ok::<_, NGramArtifactError>(RowScaleDescriptor::new(
-                    scale.clone(),
-                    DerivedWeightRecipe::source(name, TensorSelection::Full),
-                    BTreeMap::from([(name.clone(), RowScaleSource { metadata, encoding })]),
-                )?)
-            })
-            .transpose()?;
-        Ok(RowLookupDescriptor::new(
-            range, metadata, lookup, scale, limits,
-        )?)
+        self.normalized()?
+            .row_descriptor(bank, unit, output_type, limits, policy)
     }
-
-    /// Pins exact physical sources, then reads only bounded integer controls and
-    /// the optional scalar scale. Table bytes remain deferred to row acquisition.
+    /// Acquires bounded literals while retaining lazy compact rows.
     pub fn bind(
         &self,
         source: SharedCheckpointSource,
@@ -293,76 +270,6 @@ impl SafetensorsTableSourcePlan {
         unit: usize,
         output_type: TensorElementType,
     ) -> Result<PreparedNGramTable, NGramArtifactError> {
-        let lookup = self.lookup_spec(bank, unit, output_type)?;
-        let source = retain(source, self.catalog.keys().cloned().collect())?;
-        // Validate every source before the first payload acquisition.
-        for key in self.catalog.keys() {
-            let meta = source.source_metadata(key)?;
-            let admitted = self.tensor_metadata(key)?;
-            if meta.logical_shape != admitted.logical_shape
-                || meta.physical_shape != admitted.physical_shape
-                || meta.stored_dtype != admitted.stored_dtype
-                || meta.encoded_byte_len != admitted.encoded_byte_len
-            {
-                return Err(invalid(format!(
-                    "retained SafeTensors source {key} differs from its admitted header"
-                )));
-            }
-        }
-        let rows = PreparedRowSource::new(source.clone(), self.row_recipe())?;
-        let multipliers = integers(
-            source.as_ref(),
-            &self.names[0],
-            self.config.ngram.order as usize,
-        )?;
-        let moduli = integers(source.as_ref(), &self.names[1], self.heads)?;
-        let offsets = integers(source.as_ref(), &self.names[2], self.heads)?;
-        let hash = hash_spec(&self.config, multipliers, moduli, offsets, self.total)?;
-        let scale = if let Some(name) = &self.scale_name {
-            let lease = source.acquire_lease(TensorReadRequest {
-                key: name.clone(),
-                selection: TensorSelection::Full,
-                policy: ReadPolicy::RequireBounded,
-            })?;
-            let bytes = lease
-                .encoded_bytes()
-                .ok_or_else(|| invalid("scale has no encoded bytes"))?;
-            let value = match (&self.catalog[name].stored_dtype, bytes) {
-                (StoredDtype::BF16, [a, b]) => {
-                    half::bf16::from_bits(u16::from_le_bytes([*a, *b])).to_f32()
-                }
-                (StoredDtype::F16, [a, b]) => {
-                    half::f16::from_bits(u16::from_le_bytes([*a, *b])).to_f32()
-                }
-                (StoredDtype::F32, [a, b, c, d]) => f32::from_le_bytes([*a, *b, *c, *d]),
-                _ => {
-                    return Err(invalid(
-                        "scale payload length differs from its scalar dtype",
-                    ))
-                }
-            };
-            if !value.is_finite() || value <= 0. || !lease.bounded_read_proof().physically_bounded {
-                return Err(invalid(
-                    "FP8 table scale must be finite, positive and bounded",
-                ));
-            }
-            Some(PreparedRowScale {
-                parameter: match &lookup.encoding {
-                    RowEncoding::ScalarE4M3 { scale } => scale.clone(),
-                    _ => unreachable!("declared scalar scale"),
-                },
-                source: retain(source.clone(), vec![name.clone()])?,
-                recipe: DerivedWeightRecipe::source(name, TensorSelection::Full),
-            })
-        } else {
-            None
-        };
-        Ok(PreparedNGramTable {
-            rows,
-            hash,
-            controls: NGramControls::Safetensors(retain(source, self.names.to_vec())?),
-            lookup,
-            scale,
-        })
+        self.normalized()?.bind(source, bank, unit, output_type)
     }
 }

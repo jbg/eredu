@@ -8,10 +8,7 @@ use eredu_checkpoint::schema::{
     LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
     TensorOperation,
 };
-use eredu_checkpoint::{
-    recipe::DerivedWeightRecipe,
-    store::{CheckpointSource, TensorSelection},
-};
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 use eredu_core::AttentionPolicy;
 
@@ -48,7 +45,7 @@ pub fn with_checkpoint_formats(
 }
 
 fn expert_source(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     prefix: &str,
     expert: i32,
     projections: &[&str],
@@ -66,7 +63,7 @@ fn expert_source(
 
 /// Returns the complete derived-weight catalog for one LFM2 execution unit.
 pub fn unit_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     layer: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
@@ -157,7 +154,7 @@ pub fn unit_recipes(
 
 /// Returns canonical lazy-loading recipes for one LFM2 routed expert.
 pub fn expert_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     layer: usize,
     expert: usize,
@@ -277,7 +274,7 @@ pub fn expert_recipes(
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
     if !args.has_sparse_moe_layers() {

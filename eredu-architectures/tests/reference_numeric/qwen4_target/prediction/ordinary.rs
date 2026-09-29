@@ -183,7 +183,7 @@ type Session<A> = ReplicatedTextSession<
     RoutedReplicatedTextExecution<
         ParameterProviders<
             Providers,
-            Option<RowLookupProviders<BoundedRowLookup<crate::row_bank::SourceRows>>>,
+            Option<RowLookupProviders<BoundedRowLookup<super::super::super::row_bank::SourceRows>>>,
         >,
     >,
 >;
@@ -283,7 +283,12 @@ impl RoutedTextArchitectureVisitor<NumericBackend, State> for Binding<'_> {
             .bind(
                 rows.entries()
                     .iter()
-                    .map(|(id, entry)| (id.clone(), crate::row_bank::SourceRows::new(entry)))
+                    .map(|(id, entry)| {
+                        (
+                            id.clone(),
+                            super::super::super::row_bank::SourceRows::new(entry),
+                        )
+                    })
                     .collect(),
             )
             .unwrap();

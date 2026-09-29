@@ -214,7 +214,12 @@ fn run_tensor_rank(
     let banks = if rank == 0 {
         rows.entries()
             .iter()
-            .map(|(id, row)| (id.clone(), crate::row_bank::SourceRows::new(row)))
+            .map(|(id, row)| {
+                (
+                    id.clone(),
+                    super::super::super::row_bank::SourceRows::new(row),
+                )
+            })
             .collect()
     } else {
         BTreeMap::new()
@@ -467,7 +472,12 @@ fn conditional_pp_decoder_boundaries_preserve_media_ids_and_cached_text_after_in
                 .bind(
                     rows.entries()
                         .iter()
-                        .map(|(id, row)| (id.clone(), crate::row_bank::SourceRows::new(row)))
+                        .map(|(id, row)| {
+                            (
+                                id.clone(),
+                                super::super::super::row_bank::SourceRows::new(row),
+                            )
+                        })
                         .collect(),
                 )
                 .unwrap(),

@@ -1,5 +1,7 @@
 //! Pure Kimi Linear checkpoint plans, naming, and derived-weight recipes.
 
+#[cfg(test)]
+use eredu_checkpoint::store::CheckpointSource;
 use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
@@ -9,7 +11,7 @@ use eredu_checkpoint::schema::{
 };
 use eredu_checkpoint::{
     recipe::DerivedWeightRecipe,
-    store::{CheckpointSource, TensorSelection, WeightStoreBackend},
+    store::{TensorSelection, WeightStoreBackend},
     StoredDtype, WeightQuantization,
 };
 
@@ -47,7 +49,9 @@ fn canonical_recipe_name(name: &str) -> String {
     name.replace(".block_sparse_moe.", ".mlp.")
 }
 
-fn normalized_checkpoint_keys(store: &dyn CheckpointSource) -> BTreeMap<String, String> {
+fn normalized_checkpoint_keys(
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
+) -> BTreeMap<String, String> {
     store
         .source_keys()
         .into_iter()
@@ -78,7 +82,7 @@ fn expert_source(
 
 /// Returns the complete neutral recipe catalog for one Kimi execution unit.
 pub fn unit_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     layer: usize,
     include_experts: bool,
@@ -135,12 +139,7 @@ pub fn unit_recipes(
                 1,
             ],
         };
-        if store
-            .source_diagnostics()
-            .map_err(|error| error.to_string())?
-            .backend
-            == WeightStoreBackend::Gguf
-        {
+        if store.source_backend().map_err(|error| error.to_string())? == WeightStoreBackend::Gguf {
             recipe = DerivedWeightRecipe::NegLog {
                 input: Box::new(recipe),
             };
@@ -223,7 +222,7 @@ pub fn unit_recipes(
 
 /// Returns neutral lazy-loading recipes for one Kimi routed expert.
 pub fn expert_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     layer: usize,
     expert: usize,
@@ -353,7 +352,7 @@ pub fn expert_recipes(
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
     if !args.has_sparse_moe_layers() {
@@ -1420,7 +1419,7 @@ mod tests {
             tensors,
             backend: WeightStoreBackend::Gguf,
         };
-        let kda = unit_recipes(&catalog, &args, 0, true).unwrap();
+        let kda = unit_recipes(&catalog as &dyn CheckpointSource, &args, 0, true).unwrap();
         assert!(matches!(
             kda.get("model.layers.0.self_attn.q_conv1d.weight"),
             Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[12, 1, 3]
@@ -1429,7 +1428,7 @@ mod tests {
             kda.get("model.layers.0.self_attn.A_log"),
             Some(DerivedWeightRecipe::NegLog { .. })
         ));
-        let sparse = unit_recipes(&catalog, &args, 1, true).unwrap();
+        let sparse = unit_recipes(&catalog as &dyn CheckpointSource, &args, 1, true).unwrap();
         assert!(matches!(
             sparse.get("model.layers.1.mlp.experts.gate_up_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 2
@@ -1438,12 +1437,12 @@ mod tests {
             .keys()
             .any(|name| name.contains(".mlp.experts.0.") || name.contains(".mlp.experts.1.")));
         assert!(matches!(
-            expert_recipes(&catalog, &args, 1, 0)
+            expert_recipes(&catalog as &dyn CheckpointSource, &args, 1, 0)
                 .unwrap()
                 .get("gate_up_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 1
         ));
-        let residency = expert_residency_catalog(&catalog, &args).unwrap();
+        let residency = expert_residency_catalog(&catalog as &dyn CheckpointSource, &args).unwrap();
         assert_eq!(residency.units().len(), 2);
         assert_eq!(residency.units()[0].unit_path(), "model.layers.1");
         assert!(residency.units()[0]

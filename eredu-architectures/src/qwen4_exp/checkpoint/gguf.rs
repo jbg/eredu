@@ -148,8 +148,32 @@ impl GgufTableSourcePlan {
     pub fn constraint(&self) -> &GgufTensorConstraint {
         &self.constraint
     }
-    /// Declares one injection owner's logical identity and exact row encoding
-    /// using only admitted container headers.
+    pub(in crate::qwen4_exp) fn normalized(
+        &self,
+        layer: usize,
+    ) -> Result<super::table::TableDeclaration, NGramArtifactError> {
+        if !self.layers.contains(&layer) {
+            return Err(invalid(
+                "GGUF table owner is not a declared injection layer",
+            ));
+        }
+        Ok(super::table::TableDeclaration {
+            layer,
+            rows: self.controls.rows,
+            dimensions: self.controls.width,
+            encoding: self.encoding.clone(),
+            recipe: DerivedWeightRecipe::source(TABLE, TensorSelection::Full),
+            metadata: BTreeMap::from([(TABLE.into(), self.tensor_metadata(TABLE)?)]),
+            provenance: BTreeMap::from([(TABLE.into(), self.provenance.clone())]),
+            literals: super::table::HashLiterals::Admitted {
+                hash: self.controls.hash.clone(),
+                metadata: self.controls.metadata.clone(),
+                table: self.provenance.clone(),
+            },
+            scale_name: None,
+        })
+    }
+    /// Declares a logical row owner from compact admitted recipes.
     pub fn lookup_spec(
         &self,
         layer: usize,
@@ -157,33 +181,9 @@ impl GgufTableSourcePlan {
         unit: usize,
         output_type: TensorElementType,
     ) -> Result<RowLookupSpec, NGramArtifactError> {
-        if !self.layers.contains(&layer) {
-            return Err(invalid(
-                "GGUF table owner is not a declared injection layer",
-            ));
-        }
-        let lookup = RowLookupSpec {
-            parameter: ParameterId::new(format!(
-                "model.layers.{layer}.ple.ple_embedding.ngram_embedding.weight"
-            ))
-            .map_err(|e| invalid(e.to_string()))?,
-            bank,
-            unit,
-            rows: self.controls.rows,
-            dimensions: self.controls.width,
-            encoding: self.encoding.clone(),
-            output_type,
-        };
-        lookup.validate().map_err(|e| invalid(e.to_string()))?;
-        Ok(lookup)
+        self.normalized(layer)?.lookup_spec(bank, unit, output_type)
     }
-
-    fn row_recipe(&self) -> DerivedWeightRecipe {
-        DerivedWeightRecipe::source(TABLE, TensorSelection::Full)
-    }
-
-    /// Complete cold mechanism contract for a compact encoded table range.
-    /// No table payload, reader cache or readable source is constructed.
+    /// Header-only row mechanism contract.
     pub fn row_descriptor(
         &self,
         layer: usize,
@@ -193,18 +193,10 @@ impl GgufTableSourcePlan {
         limits: eredu_runtime::RowLookupLimits,
         policy: eredu_core::residency::ResidencyPolicy,
     ) -> Result<eredu_runtime::RowLookupDescriptor, NGramArtifactError> {
-        let lookup = self.lookup_spec(layer, bank, unit, output_type)?;
-        let metadata = self
-            .row_recipe()
-            .infer(self)
-            .map_err(|e| invalid(e.to_string()))?;
-        let range = table_row_range(&lookup, &metadata, policy)?;
-        Ok(eredu_runtime::RowLookupDescriptor::new(
-            range, metadata, lookup, None, limits,
-        )?)
+        self.normalized(layer)?
+            .row_descriptor(bank, unit, output_type, limits, policy)
     }
-    /// Binds one logical injection owner to the retained table source. Distinct
-    /// parameter/bank identities share the same physical key and reader cache.
+    /// Binds exact integer metadata while retaining lazy compact rows.
     pub fn bind(
         &self,
         source: SharedCheckpointSource,
@@ -213,25 +205,8 @@ impl GgufTableSourcePlan {
         unit: usize,
         output_type: TensorElementType,
     ) -> Result<PreparedNGramTable, NGramArtifactError> {
-        let lookup = self.lookup_spec(layer, bank, unit, output_type)?;
-        if source.source_metadata(TABLE)? != self.metadata
-            || source.source_provenance(TABLE)? != self.provenance
-        {
-            return Err(invalid(
-                "retained GGUF table source differs from its admitted header",
-            ));
-        }
-        let rows = PreparedRowSource::new(source, self.row_recipe())?;
-        Ok(PreparedNGramTable {
-            rows,
-            hash: self.controls.hash.clone(),
-            controls: NGramControls::Gguf {
-                metadata: self.controls.metadata.clone(),
-                table: self.provenance.clone(),
-            },
-            lookup,
-            scale: None,
-        })
+        self.normalized(layer)?
+            .bind(source, bank, unit, output_type)
     }
 }
 

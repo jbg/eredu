@@ -77,7 +77,12 @@ fn reference(
         .bind(
             rows.entries()
                 .iter()
-                .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                .map(|(id, e)| {
+                    (
+                        id.clone(),
+                        super::super::super::row_bank::SourceRows::new(e),
+                    )
+                })
                 .collect(),
         )
         .unwrap();
@@ -479,7 +484,10 @@ impl eredu_architectures::replicated_text::CompositeTextArchitectureVisitor<Nume
                             .entries()
                             .iter()
                             .map(|(id, entry)| {
-                                (id.clone(), crate::row_bank::SourceRows::new(entry))
+                                (
+                                    id.clone(),
+                                    super::super::super::row_bank::SourceRows::new(entry),
+                                )
                             })
                             .collect(),
                     )
@@ -799,7 +807,12 @@ fn run_joint(target: &PreparedTarget, ingress: &MediaIngress) {
                         rows.prepared()
                             .entries()
                             .iter()
-                            .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                            .map(|(id, e)| {
+                                (
+                                    id.clone(),
+                                    super::super::super::row_bank::SourceRows::new(e),
+                                )
+                            })
                             .collect(),
                     )
                     .unwrap();

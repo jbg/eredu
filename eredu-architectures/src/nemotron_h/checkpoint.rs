@@ -2,10 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eredu_checkpoint::{
-    recipe::DerivedWeightRecipe,
-    store::{CheckpointSource, TensorSelection},
-};
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
@@ -81,7 +78,7 @@ fn unit_root(
 
 /// Resolves all released Nemotron-H names to canonical runtime names.
 pub fn normalized_checkpoint_keys(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
 ) -> Result<BTreeMap<String, String>, String> {
     let mtp = args.mtp_policies().map_err(|error| error.to_string())?;
@@ -140,7 +137,7 @@ pub fn normalized_checkpoint_keys(
 
 /// Returns canonical recipes for selected Nemotron-H static modules.
 pub fn static_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     root: Option<&str>,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
@@ -164,7 +161,7 @@ pub fn static_recipes(
 
 /// Returns the complete recipe catalog for one Nemotron-H execution unit.
 pub fn unit_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     group: usize,
     index: usize,
@@ -270,7 +267,7 @@ pub fn unit_recipes(
 
 /// Returns the unit recipe catalog for one flat target/MTP residency ordinal.
 pub fn unit_recipes_flat(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     flat: usize,
     include_experts: bool,
@@ -305,7 +302,7 @@ pub fn unit_recipes_flat(
 
 /// Returns canonical lazy-loading recipes for one Nemotron-H routed expert.
 pub fn expert_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     identity_layer: usize,
     expert: usize,
@@ -394,7 +391,7 @@ pub fn expert_recipes(
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
 ) -> Result<crate::ExpertResidencyCatalog, String> {
     args.validate().map_err(|error| error.to_string())?;
@@ -490,7 +487,7 @@ struct SparseUnitResidency {
 
 fn add_expert_residency_units(
     units: &mut Vec<crate::ExpertResidencyUnit>,
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
     topology: SparseUnitResidency,
     experts: usize,

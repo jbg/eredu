@@ -563,7 +563,12 @@ fn vision_ingress_target_prefill_cached_decode_and_restore_keep_original_ngram_s
             .bind(
                 rows.entries()
                     .iter()
-                    .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                    .map(|(id, e)| {
+                        (
+                            id.clone(),
+                            super::super::super::row_bank::SourceRows::new(e),
+                        )
+                    })
                     .collect(),
             )
             .unwrap();

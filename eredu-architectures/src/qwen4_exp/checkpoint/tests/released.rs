@@ -622,7 +622,11 @@ fn pinned_target_cold_requirements_cover_sources_banks_and_state_without_payload
             .map(|key| {
                 (
                     key.clone(),
-                    crate::replicated_text::exact_physical_source(source.as_ref(), key).unwrap(),
+                    crate::replicated_text::exact_physical_source(
+                        source.as_ref() as &dyn CheckpointSource,
+                        key,
+                    )
+                    .unwrap(),
                 )
             })
             .collect();

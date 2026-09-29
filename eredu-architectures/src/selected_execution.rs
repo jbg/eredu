@@ -33,9 +33,8 @@ pub(crate) enum SelectedQwen4Construction {
         selected: crate::qwen4_exp::prepared::SelectedConditionalPartitionExecution,
         prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
     },
-    Safetensors(crate::qwen4_exp::prepared::SelectedSafetensorsTargetExecution),
-    Gguf {
-        selected: crate::qwen4_exp::prepared::SelectedGgufTargetExecution,
+    Target {
+        selected: crate::qwen4_exp::prepared::SelectedTargetPreparation,
         prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
     },
     Conditional {
@@ -124,8 +123,7 @@ impl SelectedQwen4Construction {
                     unreachable!("retained routed conditional selection")
                 }
             },
-            Self::Safetensors(selected) => selected.selected(),
-            Self::Gguf { selected, .. } => selected.selected(),
+            Self::Target { selected, .. } => selected.selected(),
             Self::Conditional { selected, .. } => selected.realization(),
         }
     }
@@ -140,20 +138,12 @@ impl SelectedQwen4Construction {
         }
     }
 
-    pub(crate) fn safetensors_plan(
+    pub(crate) fn target_artifact(
         &self,
-    ) -> Option<&crate::qwen4_exp::prepared::SafetensorsTargetPlan> {
+    ) -> Option<&crate::qwen4_exp::prepared::TargetArtifactDeclaration> {
         match self {
-            Self::Safetensors(selected) => Some(selected.header_plan()),
-            Self::Partitioned { selected, .. } => selected.safetensors_plan(),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn gguf_plan(&self) -> Option<&crate::qwen4_exp::prepared::GgufTargetPlan> {
-        match self {
-            Self::Gguf { selected, .. } => Some(selected.header_plan()),
-            Self::Partitioned { selected, .. } => selected.gguf_plan(),
+            Self::Target { selected, .. } => Some(selected.artifact()),
+            Self::Partitioned { selected, .. } => Some(selected.target_artifact()),
             _ => None,
         }
     }
@@ -162,11 +152,10 @@ impl SelectedQwen4Construction {
         &self,
     ) -> Option<&crate::prepared_sources::prediction::InspectedPredictionSource> {
         match self {
-            Self::Gguf { prediction, .. }
+            Self::Target { prediction, .. }
             | Self::Conditional { prediction, .. }
             | Self::Partitioned { prediction, .. }
             | Self::ConditionalPartitioned { prediction, .. } => prediction.as_deref(),
-            _ => None,
         }
     }
 
@@ -196,15 +185,7 @@ impl SelectedQwen4Construction {
                         .map(|descriptor| (descriptor, state))
                 })
                 .transpose(),
-            Self::Safetensors(selected) => selected
-                .prediction_state()
-                .map(|state| {
-                    selected
-                        .prediction_descriptor()
-                        .map(|descriptor| (descriptor, state))
-                })
-                .transpose(),
-            Self::Gguf { selected, .. } => selected
+            Self::Target { selected, .. } => selected
                 .prediction_state()
                 .map(|state| {
                     selected
@@ -223,27 +204,6 @@ impl SelectedQwen4Construction {
         }
     }
 
-    pub(crate) fn bind(
-        self,
-        source: eredu_checkpoint::store::SharedCheckpointSource,
-        prediction: Option<eredu_checkpoint::store::SharedCheckpointSource>,
-    ) -> Result<
-        crate::qwen4_exp::prepared::SelectedTargetExecution,
-        crate::qwen4_exp::prepared::PreparationError,
-    > {
-        match self {
-            Self::Safetensors(selected) => selected.bind(source),
-            Self::Gguf { selected, .. } => selected.bind(source, prediction),
-            Self::Conditional { .. }
-            | Self::Partitioned { .. }
-            | Self::ConditionalPartitioned { .. } => {
-                Err(crate::qwen4_exp::prepared::PreparationError::Contract(
-                    "construction requires its retained partition or composite source roles".into(),
-                ))
-            }
-        }
-    }
-
     pub(crate) fn parameter_materialization_workspace(
         &self,
         mechanisms: &impl crate::PreparationMechanismProvider,
@@ -255,8 +215,9 @@ impl SelectedQwen4Construction {
             Self::ConditionalPartitioned { selected, .. } => {
                 selected.parameter_materialization_workspace(mechanisms)
             }
-            Self::Safetensors(selected) => selected.parameter_materialization_workspace(mechanisms),
-            Self::Gguf { selected, .. } => selected.parameter_materialization_workspace(mechanisms),
+            Self::Target { selected, .. } => {
+                selected.parameter_materialization_workspace(mechanisms)
+            }
             Self::Conditional { selected, .. } => {
                 selected.parameter_materialization_workspace(mechanisms)
             }

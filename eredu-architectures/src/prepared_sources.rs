@@ -6,12 +6,11 @@ use std::{
 };
 
 use eredu_checkpoint::{
-    gguf_store::open_prepared_gguf_source,
     store::{
         CheckpointSource, CompositeCheckpointSource, RestrictedCheckpointSource,
         SharedCheckpointSource, StoreError, TensorMetadata,
     },
-    validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
+    validation::ResolvedCheckpointPlan,
 };
 use eredu_core::{
     artifact::{
@@ -1018,37 +1017,15 @@ pub fn prepare_model_sources(
             max_cached_sources,
         )
     } else {
-        match plan.into_artifact() {
-            ModelArtifact::SafeTensors {
-                tensors, shards, ..
-            } => prepare_safetensors_sources(
-                source_identity,
-                execution_identity,
-                architecture,
-                prediction_extension,
-                tensors,
-                shards,
-                max_cached_sources,
-            ),
-            ModelArtifact::Gguf { validated, .. } => {
-                if prediction_extension.is_some() {
-                    return Err(PreparedModelSourcesError::InvalidSelection(
-                        "GGUF artifacts do not admit embedded prediction source projections".into(),
-                    ));
-                }
-                prepare_gguf_sources(
-                    source_identity,
-                    execution_identity,
-                    architecture,
-                    validated,
-                    max_cached_sources,
-                    media_projector,
-                )
-            }
-            _ => Err(PreparedModelSourcesError::InvalidSelection(
-                "unsupported artifact format for prepared model sources".into(),
-            )),
-        }
+        prepare_ordinary_sources(
+            source_identity,
+            execution_identity,
+            architecture,
+            prediction_extension,
+            &execution_inspection,
+            max_cached_sources,
+            media_projector,
+        )
     }?;
     Ok(PreparedModelSources {
         selected,
@@ -1057,177 +1034,53 @@ pub fn prepare_model_sources(
     })
 }
 
-/// Realizes the exact cold header contract once; no family rediscovery or recipe
-/// reconstruction is allowed after request-specific selection.
-fn prepare_retained_qwen4_sources(
-    source_identity: DeferredArtifactIdentity,
-    execution_identity: String,
-    architecture: ArtifactArchitecturePlan,
-    artifact: ModelArtifact,
-    retained: crate::selected_execution::SelectedQwen4Construction,
-    max_cached_sources: usize,
-) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
-    use crate::selected_execution::SelectedQwen4Construction;
-    if matches!(
-        retained,
-        SelectedQwen4Construction::Conditional { .. }
-            | SelectedQwen4Construction::ConditionalPartitioned { .. }
-    ) {
-        return prepare_retained_qwen4_conditional_sources(
-            source_identity,
-            execution_identity,
-            architecture,
-            artifact,
-            retained,
-            max_cached_sources,
-        );
-    }
-    let invalid = || {
-        PreparedModelSourcesError::InvalidSelection(
-            "retained target authority does not match the admitted artifact container".into(),
-        )
+fn retained_source_declarations(
+    artifact: &ModelArtifact,
+    selected: &crate::selected_execution::SelectedQwen4Construction,
+) -> Result<crate::artifact_preparation::ArtifactSourceDeclarations, PreparedModelSourcesError> {
+    use crate::artifact_preparation::{
+        ArtifactSourceRole, PhysicalArtifactId, PhysicalArtifactPreparation,
     };
-    let (format, primary, resolution): (_, SharedCheckpointSource, _) = match artifact {
-        ModelArtifact::SafeTensors {
-            tensors, shards, ..
-        } => {
-            let header = retained.safetensors_plan().ok_or_else(invalid)?;
-            let resolution = header.resolution().clone();
-            let source = eredu_core::artifact::open_prepared_safetensors_artifact(
-                &tensors,
-                shards,
-                resolution.clone(),
-                max_cached_sources,
-            )?;
-            (ArtifactFormat::SafeTensors, source, resolution)
-        }
-        ModelArtifact::Gguf { validated, .. } => {
-            if validated.companions().next().is_some() {
-                return Err(PreparedModelSourcesError::InvalidSelection(
-                    "target-only retained GGUF construction cannot consume companion source roles"
-                        .into(),
-                ));
-            }
-            let header = retained.gguf_plan().ok_or_else(invalid)?.text_plan();
-            let resolution = header.resolution().clone();
-            let source = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                .max_cached_readers(max_cached_sources)?
-                .add_resolved_checkpoint(
-                    header.checkpoint().clone(),
-                    &resolution,
-                    header.mapping(),
-                )?
-                .build()?;
-            (ArtifactFormat::Gguf, Arc::new(source), resolution)
-        }
-        _ => return Err(invalid()),
-    };
-    let prediction = retained
-        .prediction_source()
-        .map(|source| {
-            source
-                .open_source(max_cached_sources)
-                .map(|physical| (physical, source.header_plan().resolution().clone()))
-        })
-        .transpose()?;
-    let complete: SharedCheckpointSource = match &prediction {
-        Some((source, _)) => Arc::new(CompositeCheckpointSource::new([
-            Arc::clone(&primary),
-            Arc::clone(source),
-        ])?),
-        None => Arc::clone(&primary),
-    };
-    let prediction_present = retained
-        .prediction_discovery()
-        .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?
-        .is_some();
-    let extension_keys: BTreeSet<_> = retained
-        .selected()
-        .text()
-        .requirements()
-        .auxiliary_parameters()
-        .iter()
-        .flat_map(|parameter| parameter.sources().iter().cloned())
-        .collect();
-    use crate::prepared_execution::RetainedArchitectureConstruction;
-    let retained_construction = match retained {
-        SelectedQwen4Construction::Partitioned { selected, .. } => {
-            RetainedArchitectureConstruction::Qwen4Partition(Box::new(
-                selected
-                    .bind(
-                        primary.clone(),
-                        prediction.as_ref().map(|(source, _)| source.clone()),
-                    )
-                    .map_err(|error| {
-                        PreparedModelSourcesError::InvalidSelection(error.to_string())
-                    })?,
+    let invalid = |s: &str| PreparedModelSourcesError::InvalidSelection(s.into());
+    let conditional = selected.conditional_header_plan();
+    let target = conditional
+        .map(|p| p.target_artifact())
+        .or_else(|| selected.target_artifact())
+        .ok_or_else(|| invalid("retained target artifact is absent"))?;
+    let mut declarations = target.normalized().sources().clone();
+    let primary = declarations
+        .artifacts
+        .get(&PhysicalArtifactId::Primary)
+        .ok_or_else(|| invalid("retained physical source is absent"))?;
+    match (artifact, primary) {
+        (ModelArtifact::SafeTensors { .. }, PhysicalArtifactPreparation::Safetensors { .. }) => {}
+        (ModelArtifact::Gguf { validated, .. }, PhysicalArtifactPreparation::Gguf { .. })
+            if validated.companions().count() == usize::from(conditional.is_some()) => {}
+        _ => {
+            return Err(invalid(
+                "retained artifact container or companion roles differ from admission",
             ))
         }
-        retained => RetainedArchitectureConstruction::Qwen4Exp(Box::new(
-            retained
-                .bind(
-                    primary.clone(),
-                    prediction.as_ref().map(|(source, _)| source.clone()),
-                )
-                .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?,
-        )),
-    };
-    let source_metadata = metadata_snapshot(complete.as_ref())?;
-    let (target, extension, target_resolution) = if let Some((source, _)) = &prediction {
-        (
-            Arc::clone(&primary),
-            Some(Arc::clone(source)),
-            resolution.clone(),
-        )
-    } else if prediction_present {
-        let target_keys: BTreeSet<_> = resolution
-            .source_keys()
-            .difference(&extension_keys)
-            .cloned()
-            .collect();
-        let target_resolution = resolution
-            .project_claimed_sources(format!("{execution_identity}/target"), target_keys.clone())
-            .map_err(PreparedModelSourcesError::InvalidSelection)?;
-        let (target, extension) =
-            projected_prediction_views(&complete, target_keys, extension_keys)?;
-        (target, extension, target_resolution)
-    } else {
-        (Arc::clone(&primary), None, resolution.clone())
-    };
-    let (companions, companion_resolutions) = match prediction {
-        Some((source, resolution)) => {
-            let role = GgufCompanionRole::Named("prediction".into());
-            (
-                BTreeMap::from([(role.clone(), source)]),
-                BTreeMap::from([(role, resolution)]),
-            )
-        }
-        None => (BTreeMap::new(), BTreeMap::new()),
-    };
-    Ok(PreparedModelSourceGraph {
-        prediction_placement: Arc::default(),
-        source_identity,
-        execution_identity,
-        format,
-        architecture,
-        prediction_extension: None,
-        complete,
-        target,
-        primary,
-        companions,
-        extension,
-        resolutions: PreparedSourceResolutions {
-            primary: resolution.clone(),
-            target: target_resolution,
-            companions: companion_resolutions,
-            target_companions: BTreeMap::new(),
-        },
-        source_metadata,
-        retained_construction: Some(retained_construction),
-    })
+    }
+    // Embedded prediction shares primary ownership. The complete role remains
+    // available to typed construction; its final projection uses selected keys.
+    declarations.roles.remove(&ArtifactSourceRole::Prediction);
+    if conditional.is_none() {
+        declarations.roles.remove(&ArtifactSourceRole::Vision);
+    }
+    if let Some(prediction) = selected.prediction_source() {
+        let id = PhysicalArtifactId::Companion(GgufCompanionRole::Named("prediction".into()));
+        let artifact = prediction.artifact_declaration()?;
+        declarations.roles.insert(
+            ArtifactSourceRole::Prediction,
+            BTreeMap::from([(id.clone(), artifact.resolution().source_keys().clone())]),
+        );
+        declarations.artifacts.insert(id, artifact);
+    }
+    Ok(declarations)
 }
 
-fn prepare_retained_qwen4_conditional_sources(
+fn prepare_retained_qwen4_sources(
     source_identity: DeferredArtifactIdentity,
     execution_identity: String,
     architecture: ArtifactArchitecturePlan,
@@ -1236,86 +1089,42 @@ fn prepare_retained_qwen4_conditional_sources(
     max_cached_sources: usize,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let invalid = |message: &str| PreparedModelSourcesError::InvalidSelection(message.into());
-    let plan = selected
-        .conditional_header_plan()
-        .ok_or_else(|| invalid("conditional construction omitted its retained header"))?;
-    let mut companions = BTreeMap::new();
-    let mut companion_resolutions = BTreeMap::new();
-    let (format, primary, vision, resolution): (
-        _,
-        SharedCheckpointSource,
-        SharedCheckpointSource,
-        _,
-    ) = match artifact {
-        ModelArtifact::SafeTensors {
-            tensors, shards, ..
-        } => {
-            let header = plan.safetensors_target_plan().ok_or_else(|| {
-                invalid("conditional target container differs from selected SafeTensors headers")
-            })?;
-            let resolution = header.resolution().clone();
-            let primary = eredu_core::artifact::open_prepared_safetensors_artifact(
-                &tensors,
-                shards,
-                resolution.clone(),
-                max_cached_sources,
-            )?;
-            (
-                ArtifactFormat::SafeTensors,
-                primary.clone(),
-                primary,
-                resolution,
-            )
-        }
-        ModelArtifact::Gguf { validated, .. } => {
-            if validated.companions().count() != 1
-                || validated
-                    .companions()
-                    .any(|(role, _)| *role != GgufCompanionRole::MediaProjector)
-            {
-                return Err(invalid(
-                    "conditional GGUF requires exactly its admitted media-projector source",
-                ));
-            }
-            let header = plan
-                .gguf_target_plan()
-                .ok_or_else(|| {
-                    invalid("conditional target container differs from selected GGUF headers")
-                })?
-                .text_plan();
-            let vision_header = plan.vision_plan().gguf_source().ok_or_else(|| {
-                invalid("conditional GGUF projector omitted retained source authority")
-            })?;
-            let resolution = header.resolution().clone();
-            let primary: SharedCheckpointSource = Arc::new(
-                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                    .max_cached_readers(max_cached_sources)?
-                    .add_resolved_checkpoint(
-                        header.checkpoint().clone(),
-                        &resolution,
-                        header.mapping(),
-                    )?
-                    .build()?,
-            );
-            let vision: SharedCheckpointSource = Arc::new(
-                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                    .max_cached_readers(max_cached_sources)?
-                    .add_resolved_checkpoint(
-                        vision_header.checkpoint().clone(),
-                        vision_header.resolution(),
-                        vision_header.mapping(),
-                    )?
-                    .build()?,
-            );
-            companions.insert(GgufCompanionRole::MediaProjector, vision.clone());
-            companion_resolutions.insert(
-                GgufCompanionRole::MediaProjector,
-                vision_header.resolution().clone(),
-            );
-            (ArtifactFormat::Gguf, primary, vision, resolution)
-        }
-        _ => return Err(invalid("unsupported conditional source container")),
+    let declarations = retained_source_declarations(&artifact, &selected)?;
+    let mut bound = declarations.bind(max_cached_sources)?;
+    use crate::artifact_preparation::{ArtifactSourceRole, PhysicalArtifactId};
+    let primary = bound
+        .physical
+        .remove(&PhysicalArtifactId::Primary)
+        .expect("primary declaration");
+    let resolution = declarations.artifacts()[&PhysicalArtifactId::Primary]
+        .resolution()
+        .clone();
+    let format = match artifact {
+        ModelArtifact::SafeTensors { .. } => ArtifactFormat::SafeTensors,
+        ModelArtifact::Gguf { .. } => ArtifactFormat::Gguf,
+        _ => unreachable!("validated artifact"),
     };
+    let vision = bound.roles.remove(&ArtifactSourceRole::Vision);
+    let mut companions = bound
+        .physical
+        .iter()
+        .filter_map(|(id, source)| match id {
+            PhysicalArtifactId::Companion(role) if *role == GgufCompanionRole::MediaProjector => {
+                Some((role.clone(), source.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut companion_resolutions = declarations
+        .artifacts()
+        .iter()
+        .filter_map(|(id, artifact)| match id {
+            PhysicalArtifactId::Companion(role) if *role == GgufCompanionRole::MediaProjector => {
+                Some((role.clone(), artifact.resolution().clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let target_complete: SharedCheckpointSource = if companions.is_empty() {
         primary.clone()
     } else {
@@ -1323,14 +1132,13 @@ fn prepare_retained_qwen4_conditional_sources(
             std::iter::once(primary.clone()).chain(companions.values().cloned()),
         )?)
     };
-    let prediction = selected
-        .prediction_source()
-        .map(|prediction| {
-            prediction
-                .open_source(max_cached_sources)
-                .map(|source| (source, prediction.header_plan().resolution().clone()))
-        })
-        .transpose()?;
+    let prediction = bound
+        .roles
+        .remove(&ArtifactSourceRole::Prediction)
+        .map(|source| {
+            let role = PhysicalArtifactId::Companion(GgufCompanionRole::Named("prediction".into()));
+            (source, declarations.artifacts()[&role].resolution().clone())
+        });
     use crate::prepared_execution::RetainedArchitectureConstruction;
     use crate::selected_execution::SelectedQwen4Construction;
     let prediction_keys = selected
@@ -1351,7 +1159,9 @@ fn prepare_retained_qwen4_conditional_sources(
             let bound = selected
                 .bind(
                     primary.clone(),
-                    vision,
+                    vision
+                        .clone()
+                        .ok_or_else(|| invalid("conditional vision role is missing"))?,
                     prediction.as_ref().map(|(source, _)| source.clone()),
                 )
                 .map_err(|error| invalid(&error.to_string()))?;
@@ -1374,7 +1184,9 @@ fn prepare_retained_qwen4_conditional_sources(
             let bound = selected
                 .bind(
                     primary.clone(),
-                    vision,
+                    vision
+                        .clone()
+                        .ok_or_else(|| invalid("conditional vision role is missing"))?,
                     prediction.as_ref().map(|(source, _)| source.clone()),
                 )
                 .map_err(|error| invalid(&error.to_string()))?;
@@ -1383,11 +1195,28 @@ fn prepare_retained_qwen4_conditional_sources(
                 prediction_keys,
             )
         }
-        _ => {
-            return Err(invalid(
-                "conditional source construction requires retained composite authority",
-            ))
-        }
+        SelectedQwen4Construction::Target { selected, .. } => (
+            RetainedArchitectureConstruction::Qwen4Exp(Box::new(
+                selected
+                    .bind(
+                        primary.clone(),
+                        prediction.as_ref().map(|(source, _)| source.clone()),
+                    )
+                    .map_err(|e| invalid(&e.to_string()))?,
+            )),
+            prediction_keys,
+        ),
+        SelectedQwen4Construction::Partitioned { selected, .. } => (
+            RetainedArchitectureConstruction::Qwen4Partition(Box::new(
+                selected
+                    .bind(
+                        primary.clone(),
+                        prediction.as_ref().map(|(source, _)| source.clone()),
+                    )
+                    .map_err(|e| invalid(&e.to_string()))?,
+            )),
+            prediction_keys,
+        ),
     };
     let complete: SharedCheckpointSource = match &prediction {
         Some((source, _)) => Arc::new(CompositeCheckpointSource::new([
@@ -1496,184 +1325,91 @@ fn source_graph_identity(
     }
 }
 
-fn prepare_safetensors_sources(
+fn prepare_ordinary_sources(
     source_identity: DeferredArtifactIdentity,
     execution_identity: String,
     architecture: ArtifactArchitecturePlan,
     prediction_extension: Option<PredictionExtensionPlan>,
-    tensors: eredu_core::checkpoint::TensorCatalog,
-    shards: eredu_checkpoint::safetensors::SafetensorsShards,
-    max_cached_shards: usize,
+    inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    cache: usize,
+    media: MediaProjectorSourcePolicy,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
-    let target_architecture = architecture.safetensors_architecture().ok_or_else(|| {
-        PreparedModelSourcesError::InvalidSelection(
-            "SafeTensors artifact omitted its architecture plan".into(),
-        )
-    })?;
-    let target_resolution = target_architecture
-        .checkpoint_resolution()
-        .ok_or_else(|| {
-            PreparedModelSourcesError::InvalidSelection(
-                "SafeTensors target omitted its admitted checkpoint resolution".into(),
-            )
-        })?
-        .clone();
-    let source_resolution = prediction_extension
-        .as_ref()
-        .map(PredictionExtensionPlan::complete_architecture)
-        .unwrap_or(target_architecture)
-        .checkpoint_resolution()
-        .ok_or_else(|| {
-            PreparedModelSourcesError::InvalidSelection(
-                "SafeTensors source omitted its admitted checkpoint resolution".into(),
-            )
-        })?
-        .clone();
-    let primary = eredu_core::artifact::open_prepared_safetensors_artifact(
-        &tensors,
-        shards,
-        source_resolution.clone(),
-        max_cached_shards,
-    )?;
-    let complete = Arc::clone(&primary);
-    let (target, extension) = match prediction_extension.as_ref() {
-        Some(extension) => {
-            let extension_keys = extension.source_keys(target_architecture)?;
-            let target_keys = target_resolution.source_keys().clone();
-            projected_prediction_views(&complete, target_keys, extension_keys)?
-        }
-        None => (Arc::clone(&complete), None),
-    };
-    let source_metadata = metadata_snapshot(complete.as_ref())?;
-    Ok(PreparedModelSourceGraph {
-        prediction_placement: Arc::default(),
-        source_identity,
-        execution_identity,
-        format: ArtifactFormat::SafeTensors,
-        architecture,
-        prediction_extension,
-        primary,
-        companions: BTreeMap::new(),
-        complete,
-        target,
-        extension,
-        resolutions: PreparedSourceResolutions {
-            primary: source_resolution,
-            target: target_resolution,
-            companions: BTreeMap::new(),
-            target_companions: BTreeMap::new(),
-        },
-        source_metadata,
-        retained_construction: None,
-    })
-}
-
-fn prepare_gguf_sources(
-    source_identity: DeferredArtifactIdentity,
-    execution_identity: String,
-    architecture: ArtifactArchitecturePlan,
-    validated: eredu_core::ValidatedGguf,
-    max_cached_readers: usize,
-    media_projector: MediaProjectorSourcePolicy,
-) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
-    let primary_plan = architecture.gguf_plan().ok_or_else(|| {
-        PreparedModelSourcesError::InvalidSelection(
-            "GGUF artifact omitted its architecture plan".into(),
-        )
-    })?;
-    let projector_plan = architecture.gguf_media_projector();
-    let (checkpoint, mut admitted_companions) = validated.into_parts();
-    let admitted_projector = admitted_companions.remove(&GgufCompanionRole::MediaProjector);
-    if let Some(role) = admitted_companions.keys().next() {
-        return Err(PreparedModelSourcesError::InvalidSelection(format!(
-            "GGUF artifact retained an unsupported companion role {role:?}"
-        )));
-    }
-    if media_projector == MediaProjectorSourcePolicy::Forbidden
-        && (projector_plan.is_some() || admitted_projector.is_some())
+    use crate::artifact_preparation::{ArtifactSourceRole, PhysicalArtifactId};
+    let declarations = crate::artifact_preparation::source_declarations(inspection)
+        .map_err(|e| PreparedModelSourcesError::InvalidSelection(e.to_string()))?;
+    if media == MediaProjectorSourcePolicy::Forbidden
+        && declarations
+            .artifacts()
+            .contains_key(&PhysicalArtifactId::Companion(
+                GgufCompanionRole::MediaProjector,
+            ))
     {
         return Err(PreparedModelSourcesError::InvalidSelection(
             "selected execution cannot consume the admitted GGUF media projector".into(),
         ));
     }
-    let admitted_projector = match (projector_plan, admitted_projector) {
-        (Some(plan), Some(checkpoint)) => Some((plan, checkpoint)),
-        (None, None) => None,
-        (Some(_), None) => {
-            return Err(PreparedModelSourcesError::InvalidSelection(
-                "GGUF projector plan omitted its admitted companion checkpoint".into(),
-            ))
-        }
-        (None, Some(_)) => {
-            return Err(PreparedModelSourcesError::InvalidSelection(
-                "GGUF projector checkpoint omitted its typed architecture plan".into(),
-            ))
-        }
-    };
-
-    let primary_mapping = admitted_projector
-        .as_ref()
-        .map_or(primary_plan.tensor_mapping(), |(plan, _)| {
-            plan.primary_tensor_mapping()
-        });
-    let primary_resolution =
-        resolve_gguf_plan(&checkpoint, primary_plan.checkpoint()).map_err(|validation| {
-            PreparedModelSourcesError::InvalidSelection(format!(
-                "GGUF primary checkpoint contract no longer resolves: {validation:?}"
-            ))
-        })?;
-    let primary: SharedCheckpointSource = Arc::new(open_prepared_gguf_source(
-        checkpoint,
-        primary_plan.checkpoint(),
-        primary_mapping,
-        max_cached_readers,
-    )?);
-    let mut companions = BTreeMap::new();
-    let mut companion_resolutions = BTreeMap::new();
-    if let Some((plan, admitted)) = admitted_projector {
-        let resolution =
-            resolve_gguf_plan(admitted.checkpoint(), plan.checkpoint()).map_err(|validation| {
-                PreparedModelSourcesError::InvalidSelection(format!(
-                    "GGUF media-projector contract no longer resolves: {validation:?}"
-                ))
-            })?;
-        let source: SharedCheckpointSource = Arc::new(open_prepared_gguf_source(
-            admitted.checkpoint().clone(),
-            plan.checkpoint(),
-            plan.tensor_mapping(),
-            max_cached_readers,
-        )?);
-        companions.insert(GgufCompanionRole::MediaProjector, source);
-        companion_resolutions.insert(GgufCompanionRole::MediaProjector, resolution);
-    }
-    let complete = if companions.is_empty() {
-        Arc::clone(&primary)
+    let mut bound = declarations.bind(cache)?;
+    let primary = bound
+        .physical
+        .remove(&PhysicalArtifactId::Primary)
+        .expect("primary declaration");
+    let companions = bound
+        .physical
+        .into_iter()
+        .filter_map(|(id, source)| match id {
+            PhysicalArtifactId::Companion(role) => Some((role, source)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let complete: SharedCheckpointSource = if companions.is_empty() {
+        primary.clone()
     } else {
         Arc::new(CompositeCheckpointSource::new(
-            std::iter::once(Arc::clone(&primary)).chain(companions.values().cloned()),
+            std::iter::once(primary.clone()).chain(companions.values().cloned()),
         )?)
     };
-    let source_metadata = metadata_snapshot(complete.as_ref())?;
-    let target_companion_resolutions = companion_resolutions.clone();
+    let target = bound
+        .roles
+        .remove(&ArtifactSourceRole::Target)
+        .expect("target declaration");
+    let extension = bound.roles.remove(&ArtifactSourceRole::Prediction);
+    let primary_resolution = declarations.artifacts()[&PhysicalArtifactId::Primary]
+        .resolution()
+        .clone();
+    let target_resolution = if let Some(plan) = architecture.safetensors_architecture() {
+        plan.checkpoint_resolution()
+            .expect("admitted target")
+            .clone()
+    } else {
+        primary_resolution.clone()
+    };
+    let companion_resolutions = declarations
+        .artifacts()
+        .iter()
+        .filter_map(|(id, a)| match id {
+            PhysicalArtifactId::Companion(role) => Some((role.clone(), a.resolution().clone())),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     Ok(PreparedModelSourceGraph {
         prediction_placement: Arc::default(),
         source_identity,
         execution_identity,
-        format: ArtifactFormat::Gguf,
+        format: inspection.format(),
         architecture,
-        prediction_extension: None,
-        primary: Arc::clone(&primary),
+        prediction_extension,
+        source_metadata: metadata_snapshot(complete.as_ref())?,
+        primary,
         companions,
-        complete: Arc::clone(&complete),
-        target: complete,
-        extension: None,
+        complete,
+        target,
+        extension,
         resolutions: PreparedSourceResolutions {
-            primary: primary_resolution.clone(),
-            target: primary_resolution,
+            primary: primary_resolution,
+            target: target_resolution,
+            target_companions: companion_resolutions.clone(),
             companions: companion_resolutions,
-            target_companions: target_companion_resolutions,
         },
-        source_metadata,
         retained_construction: None,
     })
 }

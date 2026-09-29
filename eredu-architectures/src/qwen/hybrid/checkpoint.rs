@@ -1,5 +1,7 @@
 //! SafeTensors contracts and fused-projection recipes for the hybrid decoder.
 
+#[cfg(test)]
+use eredu_checkpoint::store::CheckpointSource;
 use std::collections::{BTreeMap, HashMap};
 
 use super::text_checkpoint_aliases as aliases;
@@ -12,7 +14,7 @@ use eredu_checkpoint::{
         SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
         TensorOperation,
     },
-    store::{CheckpointSource, TensorSelection, WeightStoreBackend},
+    store::{TensorSelection, WeightStoreBackend},
     WeightQuantization,
 };
 
@@ -112,7 +114,7 @@ pub fn conditional_projector_gguf_plan(
 
 /// Returns all derived recipes owned by Qwen hybrid static modules.
 pub fn static_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
     let mut recipes = super::safetensors::recipes(store, |name| {
         !name.starts_with("model.layers.") && !name.starts_with("model.visual.blocks.")
@@ -128,12 +130,7 @@ pub fn static_recipes(
             ]),
         );
     }
-    if store
-        .source_diagnostics()
-        .map_err(|error| error.to_string())?
-        .backend
-        == WeightStoreBackend::Gguf
-    {
+    if store.source_backend().map_err(|error| error.to_string())? == WeightStoreBackend::Gguf {
         let name = "model.norm.weight";
         if store.source_metadata(name).is_ok() {
             recipes.insert(
@@ -149,7 +146,7 @@ pub fn static_recipes(
 
 /// Returns the complete derived-weight catalog for one target or MTP unit.
 pub fn unit_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     config: &HybridConfig,
     flat: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
@@ -173,12 +170,7 @@ pub fn unit_recipes(
             );
         }
     }
-    if store
-        .source_diagnostics()
-        .map_err(|error| error.to_string())?
-        .backend
-        == WeightStoreBackend::Gguf
-    {
+    if store.source_backend().map_err(|error| error.to_string())? == WeightStoreBackend::Gguf {
         add_gguf_unit_transforms(&mut recipes, store, config, flat)?;
     }
     if !config.is_moe() {
@@ -210,7 +202,7 @@ pub fn unit_recipes(
 /// that translation here makes the architecture's flat execution layout, rather
 /// than a backend's reconstruction of group numbers, authoritative for recipes.
 pub fn conditional_unit_recipes(
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     config: &ParsedHybridConfig,
     ordinal: usize,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
@@ -360,7 +352,7 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
 
 fn add_gguf_unit_transforms(
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
-    store: &dyn CheckpointSource,
+    store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     config: &HybridConfig,
     flat: usize,
 ) -> Result<(), String> {

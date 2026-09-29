@@ -2,7 +2,6 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::{
     artifact::{ArtifactError, ArtifactFile},
     checkpoint::TensorCatalog,
@@ -53,19 +52,19 @@ impl InspectedPredictionSource {
         self.inspection.architecture_plan()
     }
 
-    pub(crate) fn open_source(
+    pub(crate) fn artifact_declaration(
         &self,
-        max_cached_sources: usize,
-    ) -> Result<SharedCheckpointSource, ArtifactError> {
+    ) -> Result<crate::artifact_preparation::PhysicalArtifactPreparation, ArtifactError> {
         let shards = self
             .inspection
             .safetensors_shards()
             .ok_or_else(|| invalid("prediction companion has no retained SafeTensors shards"))?;
-        eredu_core::artifact::open_prepared_safetensors_artifact(
-            self.inspection.tensors(),
-            shards.clone(),
-            self.header_plan().resolution().clone(),
-            max_cached_sources,
+        Ok(
+            crate::artifact_preparation::PhysicalArtifactPreparation::Safetensors {
+                tensors: self.inspection.tensors().clone(),
+                shards: shards.clone(),
+                resolution: self.header_plan().resolution().clone(),
+            },
         )
     }
 

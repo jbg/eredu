@@ -248,7 +248,7 @@ fn qwen4_normalized_headers_retain_request_specific_policy_without_source_access
     let physical = super::safetensors_admission::physical_sources(st_source.as_ref());
     let support = CountedRows::default();
     macro_rules! check {
-        ($source:expr, $make:expr, $reopen:expr, $control_reads:expr $(, $prediction_source:expr)?) => {{
+        ($source:expr, $make:expr, $reopen:expr, $control_reads:expr) => {{
             let source = $source;
             let make = $make;
             let paths = source
@@ -379,13 +379,24 @@ fn qwen4_normalized_headers_retain_request_specific_policy_without_source_access
             .unwrap();
             // Header preparation precedes joint prediction/partition construction.
             // It retains policy without prematurely selecting an ordinary executable.
-            let partition_request = eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-                parallel.rank().topology(), parallel.rank().global_rank(), 2, 32,
-                PipelineActivationDtype::Float32,
-            ).unwrap().with_completion_policy(parallel.completion());
+            let partition_request =
+                eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
+                    parallel.rank().topology(),
+                    parallel.rank().global_rank(),
+                    2,
+                    32,
+                    PipelineActivationDtype::Float32,
+                )
+                .unwrap()
+                .with_completion_policy(parallel.completion());
             let partition = make(&base.clone().with_parallel_execution(parallel).unwrap())
-                .unwrap().partition(partition_request).unwrap();
-            assert_eq!(partition.requirements().topology().tensor_parallel_size(), 2);
+                .unwrap()
+                .partition(partition_request)
+                .unwrap();
+            assert_eq!(
+                partition.requirements().topology().tensor_parallel_size(),
+                2
+            );
             assert_eq!(partition.requirements().topology().global_rank(), 0);
             let mut plans = Vec::new();
             for (history, batch, chunk, residency) in [
@@ -472,7 +483,7 @@ fn qwen4_normalized_headers_retain_request_specific_policy_without_source_access
             for (plan, selected, request, cold_workspace) in plans {
                 let queries = support.0.get();
                 let before = source.source_diagnostics().unwrap().physical_reads;
-                let bound = plan.clone().bind(source.clone() $(, $prediction_source)?).unwrap();
+                let bound = plan.clone().bind(source.clone(), None).unwrap();
                 assert_eq!(bound.requirements(), plan.requirements());
                 assert_eq!(
                     bound.load_selection_request(),
@@ -492,7 +503,7 @@ fn qwen4_normalized_headers_retain_request_specific_policy_without_source_access
                     ),
                     Err(TargetSelectionError::LoadRequestMismatch)
                 ));
-                let selected_bound = selected.bind(source.clone() $(, $prediction_source)?).unwrap();
+                let selected_bound = selected.bind(source.clone(), None).unwrap();
                 assert_eq!(
                     selected_bound.realization().text().requirements(),
                     plan.requirements().text()
@@ -547,7 +558,6 @@ fn qwen4_normalized_headers_retain_request_specific_policy_without_source_access
             &support
         ),
         super::super::qwen4_gguf::open_text_source(gguf.text_plan()),
-        0,
-        None
+        0
     );
 }

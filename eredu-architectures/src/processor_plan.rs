@@ -570,7 +570,7 @@ impl ArtifactArchitecturePlan {
     // Requirements retain their immutable source snapshot, but must not retain
     // the cache that owns those same requirements (an Arc ownership cycle).
     pub(crate) fn without_validation(mut self) -> Self {
-        self.validation = Default::default();
+        self.validation = self.validation.declarations_only();
         self
     }
 

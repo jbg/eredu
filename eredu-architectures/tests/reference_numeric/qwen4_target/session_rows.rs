@@ -30,7 +30,7 @@ impl RowLookupMechanismSupport for Support {
         }))
     }
 }
-use crate::row_bank::SourceRows;
+use super::super::row_bank::SourceRows;
 fn row_selection(
     source: SharedCheckpointSource,
     options: ParameterBankLoadOptions,

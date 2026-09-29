@@ -145,7 +145,7 @@ pub(super) fn check(
             before,
             "cold selection must not read weights"
         );
-        let selected = selected.bind(source.clone()).unwrap();
+        let selected = selected.bind(source.clone(), None).unwrap();
         assert_eq!(
             source.source_diagnostics().unwrap().physical_reads,
             before + 3,
@@ -278,7 +278,7 @@ impl RoutedTextArchitectureVisitor<NumericBackend, State> for Binding<'_> {
                             .entries()
                             .iter()
                             .map(|(id, entry)| {
-                                (id.clone(), crate::row_bank::SourceRows::new(entry))
+                                (id.clone(), super::super::row_bank::SourceRows::new(entry))
                             })
                             .collect(),
                     )

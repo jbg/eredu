@@ -39,7 +39,7 @@ fn baseline(target: &PreparedTarget) -> Vec<NumericTensor> {
             .bind(
                 rows.entries()
                     .iter()
-                    .map(|(id, row)| (id.clone(), crate::row_bank::SourceRows::new(row)))
+                    .map(|(id, row)| (id.clone(), super::super::row_bank::SourceRows::new(row)))
                     .collect(),
             )
             .unwrap(),

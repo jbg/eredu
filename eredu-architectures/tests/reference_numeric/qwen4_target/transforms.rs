@@ -397,7 +397,7 @@ impl RoutedTextArchitectureVisitor<NumericBackend, State> for TraceBinding<'_> {
                             .entries()
                             .iter()
                             .map(|(id, entry)| {
-                                (id.clone(), crate::row_bank::SourceRows::new(entry))
+                                (id.clone(), super::super::row_bank::SourceRows::new(entry))
                             })
                             .collect(),
                     )

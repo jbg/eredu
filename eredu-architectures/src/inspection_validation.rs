@@ -21,6 +21,38 @@ pub(crate) struct InspectionValidation {
 }
 
 impl InspectionValidation {
+    /// Retains immutable artifact declarations without execution requirements or
+    /// selections that may own an inspection projection.
+    pub fn declarations_only(&self) -> Arc<Self> {
+        let admissions = self
+            .admissions
+            .lock()
+            .expect("inspection validation poisoned");
+        let retained = admissions
+            .iter()
+            .map(|(token, facts)| {
+                let copy = AdmittedValidation::default();
+                if let Some(value) = facts.catalog.get() {
+                    let _ = copy.catalog.set(value.clone());
+                }
+                if let Some(value) = facts.sources.get() {
+                    let _ = copy.sources.set(value.clone());
+                }
+                if let Some(value) = facts.normalized.get() {
+                    let _ = copy.normalized.set(value.clone());
+                }
+                if let Some(value) = facts.qwen4.get() {
+                    let _ = copy.qwen4.set(value.clone());
+                }
+                (token.clone(), Arc::new(copy))
+            })
+            .collect();
+        Arc::new(Self {
+            projection: OnceLock::new(),
+            admissions: Mutex::new(retained),
+        })
+    }
+
     pub fn for_admission(&self, token: ArtifactAdmissionToken) -> Arc<AdmittedValidation> {
         let mut admissions = self
             .admissions
@@ -42,6 +74,30 @@ impl InspectionValidation {
 pub(crate) struct AdmittedValidation {
     #[cfg(test)]
     pub selection_runs: std::sync::atomic::AtomicUsize,
+    pub qwen4: OnceLock<
+        Result<
+            Arc<crate::preparation_selection::qwen4::AdmittedTarget>,
+            crate::PreparationSelectionError,
+        >,
+    >,
+    pub sources: OnceLock<
+        Result<
+            Arc<crate::artifact_preparation::ArtifactSourceDeclarations>,
+            ReplicatedTextRequirementsError,
+        >,
+    >,
+    pub catalog: OnceLock<
+        Result<
+            Arc<crate::replicated_text::artifact::ArtifactRecipeCatalog>,
+            ReplicatedTextRequirementsError,
+        >,
+    >,
+    pub normalized: OnceLock<
+        Result<
+            Arc<crate::replicated_text::artifact::NormalizedArtifactPreparation>,
+            ReplicatedTextRequirementsError,
+        >,
+    >,
     pub replicated: OnceLock<Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError>>,
     pub routed: OnceLock<Result<RoutedTextRequirements, RoutedTextRequirementsError>>,
     pub composite: OnceLock<Result<CompositeTextRequirements, ReplicatedTextRequirementsError>>,

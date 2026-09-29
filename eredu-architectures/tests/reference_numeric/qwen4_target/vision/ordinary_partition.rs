@@ -109,12 +109,11 @@ fn run(
                     .name(format!("qwen4-media-rank-{rank}"))
                     .stack_size(32 * 1024 * 1024)
                     .spawn_scoped(scope, move || {
-                        let request =
-                            crate::qwen4_target::partition_selection::request(tp, pp, ep, rank)
-                                .with_media_execution(MediaLoadRequest::Required(
-                                    MediaExecutionPolicy::new(processor_request()).unwrap(),
-                                ))
-                                .with_weight_residency(WeightResidency::with_layers(residency));
+                        let request = super::super::partition_selection::request(tp, pp, ep, rank)
+                            .with_media_execution(MediaLoadRequest::Required(
+                                MediaExecutionPolicy::new(processor_request()).unwrap(),
+                            ))
+                            .with_weight_residency(WeightResidency::with_layers(residency));
                         let selected = eredu_architectures::select_preparation(
                             &inspection,
                             &request,

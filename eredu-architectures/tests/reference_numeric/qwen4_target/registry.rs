@@ -296,7 +296,7 @@ impl eredu_architectures::routed_text::RoutedTextArchitectureVisitor<NumericBack
                             .entries()
                             .iter()
                             .map(|(id, entry)| {
-                                (id.clone(), crate::row_bank::SourceRows::new(entry))
+                                (id.clone(), super::super::row_bank::SourceRows::new(entry))
                             })
                             .collect(),
                     )

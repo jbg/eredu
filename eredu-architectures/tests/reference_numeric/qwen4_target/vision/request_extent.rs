@@ -224,7 +224,10 @@ fn single_lane_long_media_request_keeps_rows_and_assembly_chunk_bounded() {
                             .entries()
                             .iter()
                             .map(|(id, entry)| {
-                                (id.clone(), crate::row_bank::SourceRows::new(entry))
+                                (
+                                    id.clone(),
+                                    super::super::super::row_bank::SourceRows::new(entry),
+                                )
                             })
                             .collect(),
                     )

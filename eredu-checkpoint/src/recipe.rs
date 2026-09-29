@@ -21,6 +21,39 @@ pub trait RecipeCatalog {
     }
 }
 
+/// Enumerated metadata and provenance for cold architecture recipe normalization.
+/// This contract cannot acquire payloads or open physical artifacts.
+pub trait ArtifactCatalog: RecipeCatalog {
+    /// Exact logical keys in the admitted source view.
+    fn source_keys(&self) -> Vec<String>;
+    /// Container storage kind used by family layout adapters.
+    fn source_backend(&self) -> Result<crate::store::WeightStoreBackend, StoreError>;
+    /// Exact physical tensor identity and encoding.
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<crate::store::TensorSourceProvenance, StoreError>;
+    /// Header metadata for one admitted key.
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.tensor_metadata(key)
+    }
+}
+
+impl<T: CheckpointSource + RecipeCatalog + ?Sized> ArtifactCatalog for T {
+    fn source_keys(&self) -> Vec<String> {
+        CheckpointSource::source_keys(self)
+    }
+    fn source_backend(&self) -> Result<crate::store::WeightStoreBackend, StoreError> {
+        Ok(self.source_diagnostics()?.backend)
+    }
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<crate::store::TensorSourceProvenance, StoreError> {
+        CheckpointSource::source_provenance(self, key)
+    }
+}
+
 /// Inference results owned by one immutable catalog, including failed results.
 /// Shared subrecipes and concurrent callers compute each result only once.
 #[derive(Debug, Default)]

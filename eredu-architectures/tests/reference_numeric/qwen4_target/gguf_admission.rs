@@ -114,13 +114,13 @@ impl RowLookupMechanismSupport for Support {
 
 pub(super) fn cold_plan(
     header: GgufTargetPlan,
-) -> eredu_architectures::qwen4_exp::prepared::GgufTargetExecutionPlan {
+) -> eredu_architectures::qwen4_exp::prepared::TargetPreparationPlan {
     cold_plan_with_support(header, &Support::default())
 }
 fn cold_plan_with_support(
     header: GgufTargetPlan,
     support: &Support,
-) -> eredu_architectures::qwen4_exp::prepared::GgufTargetExecutionPlan {
+) -> eredu_architectures::qwen4_exp::prepared::TargetPreparationPlan {
     let limits = eredu_evaluation::qwen4_exp::limits();
     let spec = header.target_spec(limits).unwrap();
     let descriptors = header

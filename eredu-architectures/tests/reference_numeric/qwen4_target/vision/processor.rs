@@ -1120,7 +1120,12 @@ pub(super) fn run_processor(target: &PreparedTarget, ingress: &MediaIngress) {
                         rows.prepared()
                             .entries()
                             .iter()
-                            .map(|(id, e)| (id.clone(), crate::row_bank::SourceRows::new(e)))
+                            .map(|(id, e)| {
+                                (
+                                    id.clone(),
+                                    super::super::super::row_bank::SourceRows::new(e),
+                                )
+                            })
                             .collect(),
                     )
                     .unwrap();

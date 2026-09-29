@@ -1,7 +1,7 @@
 //! Exact selected state reaches construction and the common prediction executor.
+use super::super::super::row_bank::SourceRows;
 use super::executor::{Lane, Materializer, SourceBinding};
 use super::*;
-use crate::row_bank::SourceRows;
 use eredu_architectures::prediction_extension::*;
 use eredu_architectures::qwen4_exp::prepared::SelectedTargetExecution;
 use eredu_architectures::routed_text::PlannedResidentBank;
