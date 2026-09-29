@@ -16,6 +16,7 @@ use std::{
 
 /// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
+    pub(super) resource_identity: eredu_core::resources::ResourceIdentity,
     pub(super) sources: ResidencySources,
     pub(super) state: Mutex<ManagerState>,
     pub(super) changed: Condvar,
@@ -90,6 +91,9 @@ pub(super) fn release_backend_copies(
         if !removed {
             return Err(ResidencyError::StatePoisoned);
         }
+        if state.control.retire_unit_if_unused(&copy.id)? {
+            state.storage.remove(&copy.id);
+        }
     }
     Ok(())
 }
@@ -103,7 +107,8 @@ pub struct ResidentArrays {
 
 /// Named immutable host buffers retained by one resident unit.
 pub struct ResidentHostBuffers {
-    pub(super) buffers: BTreeMap<String, Arc<ImmutableHostTransferBuffer>>,
+    pub(super) owner: eredu_core::resources::ResourceIdentity,
+    pub(super) buffers: BTreeMap<String, Arc<ResidentHostAllocation>>,
 }
 
 /// Source and destination resources retained through an asynchronous transfer.
@@ -128,6 +133,7 @@ struct TransferStatus {
 }
 
 struct TransferApplication {
+    resource_identity: eredu_core::resources::ResourceIdentity,
     leases: OnceCell<Vec<ResidentUnitLease>>,
     owner: RefCell<Weak<ManagerInner>>,
     ids: Vec<OffloadUnitId>,
@@ -140,6 +146,7 @@ struct TransferApplication {
 impl TransferApplication {
     fn new(ids: Vec<OffloadUnitId>, tier: MemoryTier, failed_transfer: Arc<AtomicBool>) -> Self {
         Self {
+            resource_identity: host_resources::identity("mlx.residency_transfer"),
             leases: OnceCell::new(),
             owner: RefCell::new(Weak::new()),
             ids,
@@ -183,7 +190,59 @@ impl Drop for TransferApplication {
     }
 }
 
+impl ResidentTransferResources {
+    fn source_host_storage_resources(
+        &self,
+    ) -> Result<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription, ResidencyError>
+    {
+        use eredu_runtime::resource_lifetimes::{ResourceLifetime, ResourceLifetimeDescription};
+        let owner = &self.application.resource_identity;
+        let resources = host_resources::describe(
+            owner.clone(),
+            self.retained_host.iter().map(Arc::as_ref),
+            Some(owner),
+        )?;
+        let lifetimes = resources
+            .allocations
+            .iter()
+            .map(|a| {
+                (
+                    a.identity.clone(),
+                    vec![ResourceLifetime::Owner(owner.clone())],
+                )
+            })
+            .collect();
+        Ok(ResourceLifetimeDescription {
+            resources,
+            lifetimes,
+            live_at_acquire: true,
+        })
+    }
+}
+
 impl Retention for ResidentTransferResources {
+    fn describe_resources(
+        &self,
+        maximum: usize,
+    ) -> Result<
+        Option<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription>,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        // Check the retained compact bindings before constructing metadata. An
+        // alias can consume reporting allowance without implying extra storage.
+        let count = self.retained_host.iter().try_fold(0usize, |n, host| {
+            n.checked_add(host.buffers.len())
+                .filter(|&count| count <= maximum)
+        });
+        if count.is_none() {
+            return Ok(None);
+        }
+        self.source_host_storage_resources()
+            .map(Some)
+            .map_err(|error| {
+                eredu_core::resources::ResourceDescriptionError::Invalid(error.to_string())
+            })
+    }
     fn observe(&self, status: Status) {
         self.application.status.settled.set(status.settled);
         if status.failed || status.blocked {
@@ -198,6 +257,16 @@ struct TransferObservation {
 }
 
 impl Retention for TransferObservation {
+    fn describe_resources(
+        &self,
+        maximum: usize,
+    ) -> Result<
+        Option<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription>,
+        eredu_core::resources::ResourceDescriptionError,
+    > {
+        self.owner.describe_resources(maximum)
+    }
+
     fn observe(&self, status: Status) {
         if status.failed || status.blocked {
             self.owner.application.mark_failed();
@@ -250,6 +319,15 @@ fn transfer_error(operation: &'static str, source: safemlx::error::Exception) ->
 
 impl ResidentTransfer {
     #[cfg(test)]
+    pub(super) fn retained_resources_for_test(&self) -> Rc<ResidentTransferResources> {
+        Rc::clone(
+            self.retained
+                .as_ref()
+                .expect("submitted transfer")
+                .retention(),
+        )
+    }
+    #[cfg(test)]
     pub(super) fn mark_failed_for_test(&self) {
         self.application.mark_failed();
     }
@@ -280,6 +358,27 @@ impl ResidentTransfer {
     /// The exact resident unit leases carried by this transfer.
     pub fn leases(&self) -> &[ResidentUnitLease] {
         self.application.leases.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Describes host source buffers still owned by this transfer, without
+    /// polling or advancing it. The owner lifetime ends only after successful
+    /// retirement of the transfer and its ordered consumers, never on a polling
+    /// error or dropping a failed handle. Device/source-store storage is uncovered.
+    /// Destination leases and cache ownership are separate retention references.
+    pub fn source_host_storage_resources(
+        &self,
+    ) -> Result<eredu_runtime::resource_lifetimes::ResourceLifetimeDescription, ResidencyError>
+    {
+        if let Some(retained) = &self.retained {
+            return retained.retention().source_host_storage_resources();
+        }
+        use eredu_runtime::resource_lifetimes::ResourceLifetimeDescription;
+        let owner = &self.application.resource_identity;
+        Ok(ResourceLifetimeDescription {
+            resources: host_resources::describe(owner.clone(), std::iter::empty(), Some(owner))?,
+            lifetimes: BTreeMap::new(),
+            live_at_acquire: true,
+        })
     }
 
     /// Whether this transfer carries no resident unit leases.
@@ -449,6 +548,49 @@ pub(super) fn ensure_many_resident(
     return_transfer: bool,
     initializing: bool,
 ) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
+    state.control.ledger().validate_batch(ids, tier)?;
+    if !initializing {
+        state.control.ledger().require_initialized()?;
+    }
+    let new = ids
+        .iter()
+        .filter(|id| state.control.unit(id).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    state.control.prepare_units(ids)?;
+    let result = (|| {
+        for id in &new {
+            let unit = state
+                .control
+                .unit(id)
+                .ok_or(ResidencyError::StatePoisoned)?;
+            eredu_runtime::preflight_bindings::<MlxNeuralBackend>(
+                sources.source(id),
+                unit.bindings(),
+            )
+            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
+            state.storage.entry(id.clone()).or_default();
+        }
+        ensure_many_prepared(state, sources, ids, tier, return_transfer, initializing)
+    })();
+    // Failed demand must not leave an ever-growing catalog of uncached rows.
+    // Reservations and unresolved native transfers remain charged and retained.
+    for id in ids {
+        if state.control.retire_unit_if_unused(id)? {
+            state.storage.remove(id);
+        }
+    }
+    result
+}
+
+fn ensure_many_prepared(
+    state: &mut ManagerState,
+    sources: &ResidencySources,
+    ids: &[OffloadUnitId],
+    tier: MemoryTier,
+    return_transfer: bool,
+    initializing: bool,
+) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
     validate_target(tier, "residency transition")?;
     if ids.is_empty() {
         return Ok((Vec::new(), None));
@@ -590,9 +732,20 @@ pub(super) fn ensure_many_resident(
             application,
         }))
         .map_err(|error| transfer_error("prepare resident transfer recovery", error))?;
+        let mut direct = super::materialization::prepare_direct_units(
+            state,
+            sources,
+            ids,
+            &created,
+            Rc::get_mut(retained.retention_mut()).expect("unpublished transfer"),
+        )?;
         let mut prepared = Vec::new();
         for (id, is_missing) in ids.iter().zip(&created) {
             if !is_missing {
+                continue;
+            }
+            if let Some(item) = direct.remove(id) {
+                prepared.push((id.clone(), item));
                 continue;
             }
             let bindings = state

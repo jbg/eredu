@@ -51,76 +51,155 @@ pub(crate) fn materialize_model_plan(
     let routes = PreparedExecutionRoutes::new()
         .with_replicated(
             ReplicatedRoute::<MlxNeuralBackend, _>::new(
-                stream, weights_stream,
+                stream,
+                weights_stream,
                 eredu_architectures::replicated_text::SharedReplicatedTextVisitor::<
-                    binding::MlxReplicatedStateProfiles, _
-                >::new(binding::BindingVisitor { stream, weights_stream }),
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize, prediction_visitor,
+                    binding::MlxReplicatedStateProfiles,
+                    _,
+                >::new(binding::BindingVisitor {
+                    stream,
+                    weights_stream,
+                }),
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                prediction_visitor,
+            ),
         )
         .with_routed(
-            RoutedRoute::<MlxNeuralBackend, MlxHybridState, MlxPoolingAttentionState, _, _, _>::new(
-                stream, weights_stream,
-                binding::RoutedBindingVisitor { stream, weights_stream },
-                binding::Relu2RoutedBindingVisitor { stream, weights_stream },
-                binding::PoolingRoutedBindingVisitor { stream, weights_stream },
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize, prediction_visitor,
+            RoutedRoute::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxPoolingAttentionState,
+                MlxHybridState,
+                _,
+                _,
+                _,
+                _,
+            >::new(
+                stream,
+                weights_stream,
+                binding::RoutedBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
+                binding::Relu2RoutedBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
+                binding::PoolingRoutedBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
+                binding::RoutedBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                prediction_visitor,
+            ),
         )
         .with_composite(
             CompositeRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
-                stream, weights_stream, binding::CompositeBindingVisitor { stream, weights_stream },
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize, prediction_visitor,
+                stream,
+                weights_stream,
+                binding::CompositeBindingVisitor {
+                    stream,
+                    weights_stream,
+                },
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                prediction_visitor,
+            ),
         )
         .with_partitioned_dense(
             PartitionedDenseRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
-                stream, weights_stream, |resources: PreparedPartitionResources<MlxDistributedSession>| {
+                stream,
+                weights_stream,
+                |resources: PreparedPartitionResources<MlxDistributedSession>| {
                     binding::PartitionedDenseDecoderBindingVisitor {
                         distributed: resources.communication().clone(),
                         additional_claimed_sources: resources.extension_sources().clone(),
-                        stream, weights_stream,
+                        stream,
+                        weights_stream,
                     }
                 },
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize, partition_prediction_visitor,
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                partition_prediction_visitor,
+            ),
         )
         .with_partitioned_routed(
-            PartitionedRoutedRoute::<MlxNeuralBackend, MlxHybridState, MlxPoolingAttentionState, _, _>::new(
-                stream, weights_stream,
-                |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedRoutedDecoderBindingVisitor {
-                    distributed: resources.communication().clone(),
-                    additional_claimed_sources: resources.extension_sources().clone(),
-                    stream, weights_stream,
+            PartitionedRoutedRoute::<
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxPoolingAttentionState,
+                MlxHybridState,
+                _,
+                _,
+                _,
+            >::new(
+                stream,
+                weights_stream,
+                |resources: PreparedPartitionResources<MlxDistributedSession>| {
+                    binding::PartitionedRoutedDecoderBindingVisitor {
+                        distributed: resources.communication().clone(),
+                        additional_claimed_sources: resources.extension_sources().clone(),
+                        stream,
+                        weights_stream,
+                    }
                 },
-                |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedPoolingRoutedDecoderBindingVisitor {
-                    distributed: resources.into_communication(), stream, weights_stream,
+                |resources: PreparedPartitionResources<MlxDistributedSession>| {
+                    binding::PartitionedPoolingRoutedDecoderBindingVisitor {
+                        distributed: resources.into_communication(),
+                        stream,
+                        weights_stream,
+                    }
                 },
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize, partition_prediction_visitor,
+                |resources: PreparedPartitionResources<MlxDistributedSession>| {
+                    binding::PartitionedRoutedDecoderBindingVisitor {
+                        distributed: resources.communication().clone(),
+                        additional_claimed_sources: resources.extension_sources().clone(),
+                        stream,
+                        weights_stream,
+                    }
+                },
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                partition_prediction_visitor,
+            ),
         )
         .with_partitioned_composite(
             PartitionedCompositeRoute::<MlxNeuralBackend, MlxHybridState, _>::new(
-                stream, weights_stream,
-                |resources: PreparedPartitionResources<MlxDistributedSession>| binding::PartitionedCompositeBindingVisitor {
-                    store: Arc::clone(resources.target()),
-                    distributed: resources.into_communication(), stream, weights_stream,
-                },
-            ).with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
-                materialize,
-                |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| binding::PartitionedCompositePredictionBindingVisitor {
-                    store: Arc::clone(facts.partition().target()),
-                    distributed: facts.partition().communication().clone(),
-                    selected: facts.prediction().selected().clone(),
-                    capability: facts.prediction().capability().clone(),
-                    stream, weights_stream,
+                stream,
+                weights_stream,
+                |resources: PreparedPartitionResources<MlxDistributedSession>| {
+                    binding::PartitionedCompositeBindingVisitor {
+                        store: Arc::clone(resources.target()),
+                        distributed: resources.into_communication(),
+                        stream,
+                        weights_stream,
+                    }
                 },
             )
+            .with_prediction::<binding::MlxEmbeddedPredictionMaterializer, _, _>(
+                materialize,
+                |facts: PreparedPartitionPredictionResources<MlxDistributedSession>| {
+                    binding::PartitionedCompositePredictionBindingVisitor {
+                        store: Arc::clone(facts.partition().target()),
+                        distributed: facts.partition().communication().clone(),
+                        selected: facts.prediction().selected().clone(),
+                        capability: facts.prediction().capability().clone(),
+                        stream,
+                        weights_stream,
+                    }
+                },
+            ),
         );
     construct_prepared_execution(
         sources,

@@ -8,9 +8,9 @@ struct DiskLocation {
     first_name: String,
     second_name: String,
     persistent: bool,
-    buffered: Option<Arc<[u8]>>,
+    source: Option<Arc<eredu_runtime::RetainedCacheShard>>,
+    logical_bytes: u64,
     payload_sha256: Option<String>,
-    payload_verification: Arc<OnceLock<Result<(), String>>>,
 }
 
 enum DiskTask {

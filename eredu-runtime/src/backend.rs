@@ -311,15 +311,20 @@ pub trait BarrierBackend: CommunicationBackend {
 /// All-rank success-status agreement on an opaque communication group.
 ///
 /// Unlike a barrier, this operation carries one boolean status from every
-/// member and returns `true` only when every submitted status was `true`.
+/// member and returns `true` only when every submitted status was `true` and
+/// any supplied fixed descriptor agrees exactly across members.
 pub trait FailureAgreementBackend: CommunicationBackend {
     /// Backend-owned result whose host boolean becomes authoritative only after
     /// exact communication completion.
     type FailureAgreementOutput;
 
     /// Submits one local phase status without reading the lazy result eagerly.
+    /// Members must choose the same descriptor mode for a collective phase.
+    /// A descriptor compares all integer bits without float conversion or hashing;
+    /// even a locally failed participant must submit its fixed descriptor.
     fn agree_success(
         local_success: bool,
+        descriptor: Option<[u64; 8]>,
         group: &Self::CommunicationGroup,
         executor: &Self::Executor,
     ) -> Result<

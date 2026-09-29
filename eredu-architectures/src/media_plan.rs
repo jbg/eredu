@@ -195,9 +195,9 @@ pub enum QwenVlInputPartPlan {
     },
 }
 
-/// Qwen3.5/Qwen3-Next admission and execution plan for one prepared input part.
+/// Shared Qwen text/projected/image/video admission plan for one prepared input part.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QwenHybridInputPartPlan {
+pub enum QwenInputPartPlan {
     /// Ordinary text token IDs.
     TextTokens {
         /// Decoder positions occupied by the part.
@@ -284,18 +284,18 @@ impl From<QwenVlInputPartPlan> for PreparedInputPartPlan {
     }
 }
 
-impl From<QwenHybridInputPartPlan> for PreparedInputPartPlan {
-    fn from(plan: QwenHybridInputPartPlan) -> Self {
+impl From<QwenInputPartPlan> for PreparedInputPartPlan {
+    fn from(plan: QwenInputPartPlan) -> Self {
         match plan {
-            QwenHybridInputPartPlan::TextTokens { positions } => Self::Text { positions },
-            QwenHybridInputPartPlan::Projected {
+            QwenInputPartPlan::TextTokens { positions } => Self::Text { positions },
+            QwenInputPartPlan::Projected {
                 modality,
                 positions,
             } => Self::Projected {
                 modality,
                 positions,
             },
-            QwenHybridInputPartPlan::Media { shape, .. } => Self::Media { shape },
+            QwenInputPartPlan::Media { shape, .. } => Self::Media { shape },
         }
     }
 }
@@ -403,6 +403,26 @@ pub struct AdmittedCompositeInput<P> {
 }
 
 impl<P> AdmittedCompositeInput<P> {
+    /// Attaches architecture-owned execution context while preserving the admitted
+    /// request identity and neutral accounting. Only architecture constructors may
+    /// replace these private plans.
+    pub(crate) fn map_parts<Q>(
+        self,
+        mut map: impl FnMut(usize, P) -> Q,
+    ) -> AdmittedCompositeInput<Q> {
+        AdmittedCompositeInput {
+            identity: self.identity,
+            parts: self
+                .parts
+                .into_iter()
+                .enumerate()
+                .map(|(index, part)| map(index, part))
+                .collect(),
+            decoder_positions: self.decoder_positions,
+            active_modalities: self.active_modalities,
+        }
+    }
+
     /// Identity recomputed from the exact tensor handles admitted by the architecture.
     pub const fn identity(&self) -> &PreparedInputIdentity {
         &self.identity
@@ -430,7 +450,7 @@ impl<P> AdmittedCompositeInput<P> {
     }
 }
 
-trait CompositePartPlan {
+pub(crate) trait CompositePartPlan {
     fn decoder_positions(&self) -> u64;
 }
 
@@ -443,7 +463,7 @@ impl CompositePartPlan for QwenVlInputPartPlan {
     }
 }
 
-impl CompositePartPlan for QwenHybridInputPartPlan {
+impl CompositePartPlan for QwenInputPartPlan {
     fn decoder_positions(&self) -> u64 {
         match self {
             Self::TextTokens { positions } | Self::Projected { positions, .. } => *positions,
@@ -479,7 +499,7 @@ impl CompositePartPlan for MuseGlimmerInputPartPlan {
     }
 }
 
-fn admit_composite_input<Tensor, P>(
+pub(crate) fn admit_composite_input<Tensor, P>(
     input: &PreparedModelInput<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
     mut admit_part: impl FnMut(&PreparedInputPart<Tensor>) -> Result<P, CapabilityError>,
@@ -554,7 +574,7 @@ pub fn admit_qwen_hybrid_input<Tensor>(
     args: &ParsedHybridConfig,
     input: &PreparedModelInput<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<AdmittedCompositeInput<QwenHybridInputPartPlan>, CapabilityError> {
+) -> Result<AdmittedCompositeInput<QwenInputPartPlan>, CapabilityError> {
     admit_composite_input(input, inspector, |part| {
         qwen_hybrid_input_part(args, part, inspector)
     })
@@ -1060,25 +1080,24 @@ pub fn qwen_vl_input_part<Tensor>(
     }
 }
 
-fn qwen_hybrid_input_part_with_policy<Tensor>(
-    text: &HybridConfig,
+pub(crate) fn qwen_input_part_with_policy<Tensor>(
+    model_type: &str,
+    hidden_size: i32,
     vision: Option<&VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+) -> Result<QwenInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
     let descriptor = &inspected.descriptor;
     let modality = descriptor.modality();
     let payload = descriptor.payload_kind();
     let shape = u64_shape(descriptor.payload())?;
     match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => {
-            Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: batch_one_sequence(&shape, 2, "text token IDs", &text.model_type)?,
-            })
-        }
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(QwenInputPartPlan::TextTokens {
+            positions: batch_one_sequence(&shape, 2, "text token IDs", model_type)?,
+        }),
         (
             modality @ (InputModality::Text | InputModality::Image | InputModality::Video),
             InputPayloadKind::Embeddings,
@@ -1087,19 +1106,19 @@ fn qwen_hybrid_input_part_with_policy<Tensor>(
                 &shape,
                 3,
                 &format!("{} embeddings", modality.as_str()),
-                &text.model_type,
+                model_type,
             )?;
-            let hidden = positive(text.hidden_size, "Qwen hybrid hidden size")?;
+            let hidden = positive(hidden_size, "Qwen hidden size")?;
             if shape[2] != hidden {
                 return Err(unsupported(
-                    &text.model_type,
+                    model_type,
                     format!(
                         "prepared {} embeddings must have hidden width {hidden}, got {shape:?}",
                         modality.as_str()
                     ),
                 ));
             }
-            Ok(QwenHybridInputPartPlan::Projected {
+            Ok(QwenInputPartPlan::Projected {
                 modality,
                 positions,
             })
@@ -1110,14 +1129,14 @@ fn qwen_hybrid_input_part_with_policy<Tensor>(
                 image_token_id,
                 video_token_id,
                 &inspected,
-                &text.model_type,
+                model_type,
             )?;
-            Ok(QwenHybridInputPartPlan::Media { ingress, shape })
+            Ok(QwenInputPartPlan::Media { ingress, shape })
         }
         (modality, payload) => Err(unsupported(
-            &text.model_type,
+            model_type,
             format!(
-                "Qwen hybrid does not support a {} {} payload",
+                "Qwen does not support a {} {} payload",
                 modality.as_str(),
                 payload_name(payload)
             ),
@@ -1131,9 +1150,10 @@ pub fn qwen_hybrid_input_part<Tensor>(
     args: &ParsedHybridConfig,
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<QwenHybridInputPartPlan, CapabilityError> {
-    qwen_hybrid_input_part_with_policy(
-        &args.text,
+) -> Result<QwenInputPartPlan, CapabilityError> {
+    qwen_input_part_with_policy(
+        &args.text.model_type,
+        args.text.hidden_size,
         args.vision.as_ref(),
         args.image_token_id,
         args.video_token_id,
@@ -1147,18 +1167,16 @@ pub fn qwen_hybrid_text_input_part<Tensor>(
     args: &HybridConfig,
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
-) -> Result<QwenHybridInputPartPlan, CapabilityError> {
+) -> Result<QwenInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
     let descriptor = &inspected.descriptor;
     let modality = descriptor.modality();
     let payload = descriptor.payload_kind();
     let shape = u64_shape(descriptor.payload())?;
     match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => {
-            Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
-            })
-        }
+        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(QwenInputPartPlan::TextTokens {
+            positions: batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
+        }),
         (modality, payload) => Err(unsupported(
             &args.model_type,
             format!(
@@ -2270,13 +2288,9 @@ mod tests {
     input_part_adapter!(
         qwen_hybrid_input_part,
         ParsedHybridConfig,
-        QwenHybridInputPartPlan
+        QwenInputPartPlan
     );
-    input_part_adapter!(
-        qwen_hybrid_text_input_part,
-        HybridConfig,
-        QwenHybridInputPartPlan
-    );
+    input_part_adapter!(qwen_hybrid_text_input_part, HybridConfig, QwenInputPartPlan);
     input_part_adapter!(
         gemma4_input_part,
         crate::gemma4::FamilyConfig,
@@ -2453,7 +2467,7 @@ mod tests {
             };
             assert_eq!(
                 qwen_hybrid_input_part(&args, &projected).unwrap(),
-                QwenHybridInputPartPlan::Projected {
+                QwenInputPartPlan::Projected {
                     modality,
                     positions: 4,
                 }
@@ -2522,12 +2536,12 @@ mod tests {
         assert_eq!(
             admitted.parts(),
             [
-                QwenHybridInputPartPlan::TextTokens { positions: 3 },
-                QwenHybridInputPartPlan::Projected {
+                QwenInputPartPlan::TextTokens { positions: 3 },
+                QwenInputPartPlan::Projected {
                     modality: InputModality::Image,
                     positions: 4,
                 },
-                QwenHybridInputPartPlan::Projected {
+                QwenInputPartPlan::Projected {
                     modality: InputModality::Video,
                     positions: 2,
                 },

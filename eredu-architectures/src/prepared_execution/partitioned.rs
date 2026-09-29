@@ -87,15 +87,16 @@ where
 }
 
 /// Routed partitioned construction with architecture-owned operator/state selection.
-pub struct PartitionedRoutedRoute<'a, B: NeuralBackend, S, PS, G, T, P = WithoutPrediction> {
+pub struct PartitionedRoutedRoute<'a, B: NeuralBackend, S, PS, SS, G, T, U, P = WithoutPrediction> {
     context: &'a <B::Tensor as Tensor>::Context,
     source_context: &'a <B::Tensor as Tensor>::Context,
     gated: G,
     pooling: T,
+    streams: U,
     prediction: P,
-    states: PhantomData<fn() -> (S, PS)>,
+    states: PhantomData<fn() -> (S, PS, SS)>,
 }
-impl<'a, B: NeuralBackend, S, PS, G, T> PartitionedRoutedRoute<'a, B, S, PS, G, T> {
+impl<'a, B: NeuralBackend, S, PS, SS, G, T, U> PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U> {
     /// Binds factories for mixed-state grouped execution and pooling execution.
     ///
     /// The first visitor implements both gated-product and ReLU-squared contracts.
@@ -104,58 +105,71 @@ impl<'a, B: NeuralBackend, S, PS, G, T> PartitionedRoutedRoute<'a, B, S, PS, G, 
         source_context: &'a <B::Tensor as Tensor>::Context,
         gated: G,
         pooling: T,
+        streams: U,
     ) -> Self {
         Self {
             context,
             source_context,
             gated,
             pooling,
+            streams,
             prediction: WithoutPrediction,
             states: PhantomData,
         }
     }
 }
 
-impl<'a, B: NeuralBackend, S, PS, G, T, P> PartitionedRoutedRoute<'a, B, S, PS, G, T, P> {
+impl<'a, B: NeuralBackend, S, PS, SS, G, T, U, P>
+    PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U, P>
+{
     /// Adds native extension materialization and a typed prediction visitor factory.
     pub fn with_prediction<M, F, V>(
         self,
         materialize: F,
         visitor: V,
-    ) -> PartitionedRoutedRoute<'a, B, S, PS, G, T, PredictionMechanisms<M, (S, PS), F, V>> {
+    ) -> PartitionedRoutedRoute<'a, B, S, PS, SS, G, T, U, PredictionMechanisms<M, (S, PS), F, V>>
+    {
         PartitionedRoutedRoute {
             context: self.context,
             source_context: self.source_context,
             gated: self.gated,
             pooling: self.pooling,
+            streams: self.streams,
             prediction: PredictionMechanisms::new(materialize, visitor),
             states: PhantomData,
         }
     }
 }
-impl<B: NeuralBackend, S, PS, G, T, P> sealed::Sealed
-    for PartitionedRoutedRoute<'_, B, S, PS, G, T, P>
+impl<B: NeuralBackend, S, PS, SS, G, T, U, P> sealed::Sealed
+    for PartitionedRoutedRoute<'_, B, S, PS, SS, G, T, U, P>
 {
 }
 
-impl<B, S, PS, GF, TF, G, T, P, C, E, F>
+impl<B, S, PS, SS, GF, TF, UF, G, T, U, P, C, E, F>
     PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, E, F>
-    for PartitionedRoutedRoute<'_, B, S, PS, GF, TF, P>
+    for PartitionedRoutedRoute<'_, B, S, PS, SS, GF, TF, UF, P>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::HyperNeuralBackend,
+        + eredu_nn::HyperNeuralBackend
+        + 'static,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: LayerRuntimeState<B>,
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    SS: LayerRuntimeState<B>,
+    SS::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>,
     GF: FnOnce(PreparedPartitionResources<C>) -> G,
     TF: FnOnce(PreparedPartitionResources<C>) -> T,
+    UF: FnOnce(PreparedPartitionResources<C>) -> U,
     G: RoutedPartitionedProductionVisitor<B, S, Output = E, Error = F>,
     T: RoutedPartitionedProductionVisitor<B, PS, Output = E, Error = F>,
+    U: RoutedPartitionedProductionVisitor<B, SS, Output = E, Error = F>,
     P: PredictionConstruction<B, SelectedRoutedPartitionedExecution, C, E, F>,
 {
     fn construct(
@@ -171,6 +185,22 @@ where
             );
         }
         let resources = branch.partition_resources()?;
+        if let Some(retained) = branch.retained_construction.take() {
+            return match retained {
+                RetainedArchitectureConstruction::Qwen4Partition(prepared) => {
+                    let visitor = (self.streams)(resources);
+                    if let Some(binding) = branch.retained_prediction.take() {
+                        prepared.visit_prediction::<B, SS, U>(self.context, visitor, binding)
+                    } else {
+                        prepared.visit::<B, SS, U>(self.context, visitor)
+                    }
+                    .map_err(partitioned_error)
+                }
+                _ => Err(PreparedExecutionError::Architecture(
+                    "partitioned route received nonpartitioned construction authority".into(),
+                )),
+            };
+        }
         dispatch_routed_partitioned_production(
             &branch.inspection,
             branch.selected,
@@ -254,10 +284,15 @@ impl<B: NeuralBackend, S, V, P> sealed::Sealed for PartitionedCompositeRoute<'_,
 impl<B, S, VF, V, P, C, E, F> PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, E, F>
     for PartitionedCompositeRoute<'_, B, S, VF, P>
 where
-    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend
+        + 'static,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     VF: FnOnce(PreparedPartitionResources<C>) -> V,
     V: AuthoritativeCompositePartitionVisitor<B, S, Output = E, Error = F>,
@@ -267,6 +302,35 @@ where
         self,
         mut branch: PreparedConstructionBranch<SelectedCompositePartitionedExecution, C>,
     ) -> Result<E, PreparedExecutionError<F>> {
+        if let Some(retained) = branch.retained_construction.take() {
+            if branch.prediction.is_some() {
+                return Err(PreparedExecutionError::UnavailablePrediction);
+            }
+            // Row providers and bound integer controls retain their own source
+            // authority. The module visitor receives only its declared recipes,
+            // as on the ordinary routed and replicated composite paths.
+            branch.target = crate::replicated_text::restrict_store_handoff(
+                branch.selected.base().execution().requirements(),
+                branch.target,
+                crate::replicated_text::StoreHandoffScope::Primary,
+            )
+            .map_err(PreparedExecutionError::Architecture)?;
+            let resources = branch.partition_resources()?;
+            return match retained {
+                RetainedArchitectureConstruction::Qwen4ConditionalPartition(prepared) => {
+                    let visitor = (self.visitor)(resources);
+                    if let Some(binding) = branch.retained_prediction.take() {
+                        prepared.visit_prediction::<B, S, V>(self.context, visitor, binding)
+                    } else {
+                        prepared.visit::<B, S, V>(self.context, visitor)
+                    }
+                    .map_err(composite_partitioned_error)
+                }
+                _ => Err(PreparedExecutionError::Architecture(
+                    "composite partition route received incompatible construction authority".into(),
+                )),
+            };
+        }
         if let Some(prediction) = branch.prediction.take() {
             return self.prediction.construct(
                 prediction,

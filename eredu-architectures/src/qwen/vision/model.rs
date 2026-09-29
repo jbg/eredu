@@ -34,6 +34,26 @@ pub struct VisionState<T> {
     deepstack: Vec<T>,
 }
 
+/// Semantic roots retained between shared vision execution units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionStateTensorRole {
+    /// Rotary cosine products.
+    RotaryCosine,
+    /// Rotary sine products.
+    RotarySine,
+    /// Captured features in retained capture order, not merger-bank identity.
+    DeepStack(usize),
+}
+
+/// Semantic roots returned by the shared vision tower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionOutputTensorRole {
+    /// Final decoder-width embeddings.
+    Embeddings,
+    /// Captured features in retained capture order, not merger-bank identity.
+    DeepStack(usize),
+}
+
 impl<T> VisionState<T> {
     /// Full-attention contiguous segment lengths.
     pub fn full_chunks(&self) -> &[i32] {
@@ -53,9 +73,22 @@ impl<T> VisionState<T> {
     }
     /// Backend tensors that must remain live while streamable blocks execute.
     pub fn retained_values(&self) -> impl Iterator<Item = &T> {
-        std::iter::once(&self.cosine)
-            .chain(std::iter::once(&self.sine))
-            .chain(self.deepstack.iter())
+        self.storage_values().map(|(_, value)| value)
+    }
+    /// Named borrowed roots; combine with request/output roots before surveying
+    /// to observe aliases across categories in the same index namespace.
+    pub fn storage_values(&self) -> impl Iterator<Item = (VisionStateTensorRole, &T)> {
+        [
+            (VisionStateTensorRole::RotaryCosine, &self.cosine),
+            (VisionStateTensorRole::RotarySine, &self.sine),
+        ]
+        .into_iter()
+        .chain(
+            self.deepstack
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (VisionStateTensorRole::DeepStack(index), value)),
+        )
     }
     /// Replaces the backend tensors transported between component owners.
     pub fn replace_retained_values(&mut self, values: Vec<T>) -> Result<(), Error> {
@@ -83,8 +116,20 @@ impl<T> VisionState<T> {
 pub struct VisionOutput<T> {
     /// Final `[1, media_tokens, text_hidden]` embeddings.
     pub embeddings: T,
-    /// DeepStack features in merger-bank order.
+    /// DeepStack features in retained capture order.
     pub deepstack_features: Vec<T>,
+}
+
+impl<T> VisionOutput<T> {
+    /// Named output roots, borrowed without evaluating or cloning tensors.
+    pub fn storage_values(&self) -> impl Iterator<Item = (VisionOutputTensorRole, &T)> {
+        std::iter::once((VisionOutputTensorRole::Embeddings, &self.embeddings)).chain(
+            self.deepstack_features
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (VisionOutputTensorRole::DeepStack(index), value)),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Parameterized)]
@@ -95,6 +140,7 @@ pub(super) struct LayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
+    const EPSILON: f32 = 1e-6;
     fn new(
         prefix: &str,
         width: i32,
@@ -121,7 +167,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
             input,
             Some(self.weight.as_ref()),
             Some(self.bias.as_ref()),
-            1e-6,
+            Self::EPSILON,
             context,
         )
     }
@@ -252,97 +298,47 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             scale: (head_dim as f32).sqrt().recip(),
         })
     }
-    fn forward(
+    fn forward_impl(
         &mut self,
         hidden: &B::Tensor,
         chunks: &[i32],
         cos: &B::Tensor,
         sin: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let sequence = hidden.dim(0);
-        let qkv = self
-            .qkv
-            .forward(hidden, context)?
-            .reshape(&[sequence, 3, self.heads, self.head_dim], context)?;
-        let select = |n| {
-            qkv.index(
-                &[
-                    Index::Full,
-                    Index::Range(n, n + 1),
-                    Index::Full,
-                    Index::Full,
-                ],
-                context,
-            )?
-            .squeeze_axes(&[1], context)
-        };
-        let query = apply_rotary(&select(0)?, cos, sin, context)?;
-        let key = apply_rotary(&select(1)?, cos, sin, context)?;
-        let value = select(2)?;
-        let attended = B::segmented_attention(
-            SegmentedAttentionInput {
-                queries: &query,
-                keys: &key,
-                values: &value,
-                segment_lengths: chunks,
-                scale: self.scale,
-            },
-            context,
-        )?;
-        self.forward_output(&attended, None, context)
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        chunks: &[i32],
-        cos: &B::Tensor,
-        sin: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let sequence = hidden.dim(0);
-        let qkv = self
-            .qkv
-            .forward(hidden, context)?
-            .reshape(&[sequence, 3, self.heads, self.head_dim], context)?;
-        let select = |n| {
-            qkv.index(
-                &[
-                    Index::Full,
-                    Index::Range(n, n + 1),
-                    Index::Full,
-                    Index::Full,
-                ],
-                context,
-            )?
-            .squeeze_axes(&[1], context)
-        };
-        let query = apply_rotary(&select(0)?, cos, sin, context)?;
-        let key = apply_rotary(&select(1)?, cos, sin, context)?;
-        let value = select(2)?;
-        let attended = B::segmented_attention(
-            SegmentedAttentionInput {
-                queries: &query,
-                keys: &key,
-                values: &value,
-                segment_lengths: chunks,
-                scale: self.scale,
-            },
-            context,
-        )?;
-        self.forward_output(&attended, Some(parallel), context)
-    }
-
-    fn forward_output(
-        &mut self,
-        attended: &B::Tensor,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let sequence = attended.dim(0);
+        let sequence = hidden.dim(0);
+
+        let qkv = self
+            .qkv
+            .forward(hidden, context)?
+            .reshape(&[sequence, 3, self.heads, self.head_dim], context)?;
+        let select = |n| {
+            qkv.index(
+                &[
+                    Index::Full,
+                    Index::Range(n, n + 1),
+                    Index::Full,
+                    Index::Full,
+                ],
+                context,
+            )?
+            .squeeze_axes(&[1], context)
+        };
+        let query = apply_rotary(&select(0)?, cos, sin, context)?;
+        let key = apply_rotary(&select(1)?, cos, sin, context)?;
+        let value = select(2)?;
+        let attention = SegmentedAttentionInput {
+            queries: &query,
+            keys: &key,
+            values: &value,
+            segment_lengths: chunks,
+            scale: self.scale,
+        };
+
+        let attended = B::segmented_attention(attention, context)?;
         let attended = attended.reshape(&[sequence, self.heads * self.head_dim], context)?;
+
         match parallel {
             Some(parallel) => {
                 B::row_parallel_linear(&mut self.output, &attended, parallel, context)
@@ -423,7 +419,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
             activation: config.hidden_act.clone(),
         })
     }
-    /// Applies exact attention/MLP residual equations over validated segments.
+    /// Executes the shared attention/MLP residual equations.
     pub fn forward(
         &mut self,
         hidden: &B::Tensor,
@@ -432,27 +428,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         sin: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let normed = self.norm1.forward(hidden, context)?;
-        let hidden = hidden.add(
-            &self.attention.forward(&normed, chunks, cos, sin, context)?,
-            context,
-        )?;
-        let normed = self.norm2.forward(&hidden, context)?;
-        let projected = self.fc1.forward(&normed, context)?;
-        let activated = match self.activation.as_str() {
-            "silu" => B::silu(projected, context)?,
-            "gelu" => B::Tensor::gelu(&projected, context)?,
-            "gelu_pytorch_tanh" => B::gelu_approximate(projected, context)?,
-            other => {
-                return Err(Error::backend(format!(
-                    "unsupported vision activation {other:?}"
-                )))
-            }
-        };
-        hidden.add(&self.fc2.forward(&activated, context)?, context)
+        self.forward_impl(hidden, chunks, cos, sin, None, context)
     }
 
-    /// Applies the same block with local heads/channels and two exact row reductions.
+    /// Executes the shared block with local heads/channels and row reductions.
     pub fn forward_parallel(
         &mut self,
         hidden: &B::Tensor,
@@ -462,14 +441,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_impl(hidden, chunks, cos, sin, Some(parallel), context)
+    }
+
+    fn forward_impl(
+        &mut self,
+        hidden: &B::Tensor,
+        chunks: &[i32],
+        cos: &B::Tensor,
+        sin: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
         let normed = self.norm1.forward(hidden, context)?;
         let hidden = hidden.add(
             &self
                 .attention
-                .forward_parallel(&normed, chunks, cos, sin, parallel, context)?,
+                .forward_impl(&normed, chunks, cos, sin, parallel, context)?,
             context,
         )?;
         let normed = self.norm2.forward(&hidden, context)?;
+
         let projected = self.fc1.forward(&normed, context)?;
         let activated = match self.activation.as_str() {
             "silu" => B::silu(projected, context)?,
@@ -481,10 +473,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
                 )))
             }
         };
-        hidden.add(
-            &B::row_parallel_linear(&mut self.fc2, &activated, parallel, context)?,
-            context,
-        )
+
+        let projected = match parallel {
+            Some(parallel) => B::row_parallel_linear(&mut self.fc2, &activated, parallel, context)?,
+            None => self.fc2.forward(&activated, context)?,
+        };
+        hidden.add(&projected, context)
     }
 }
 
@@ -545,9 +539,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
             approximate,
         })
     }
-    fn forward(
+    fn forward_impl(
         &mut self,
         hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         if hidden.dim(0) % self.unit != 0 {
@@ -569,35 +564,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         } else {
             B::Tensor::gelu(&hidden, context)?
         };
-        self.fc2.forward(&hidden, context)
-    }
 
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if hidden.dim(0) % self.unit != 0 {
-            return Err(Error::backend(
-                "vision merge geometry does not divide sequence",
-            ));
+        match parallel {
+            Some(parallel) => B::row_parallel_linear(&mut self.fc2, &hidden, parallel, context),
+            None => self.fc2.forward(&hidden, context),
         }
-        let hidden = if self.postshuffle {
-            self.norm
-                .forward(&hidden.reshape(&[-1, self.width], context)?, context)?
-        } else {
-            self.norm
-                .forward(hidden, context)?
-                .reshape(&[-1, self.width], context)?
-        };
-        let hidden = self.fc1.forward(&hidden, context)?;
-        let hidden = if self.approximate {
-            B::gelu_approximate(hidden, context)?
-        } else {
-            B::Tensor::gelu(&hidden, context)?
-        };
-        B::row_parallel_linear(&mut self.fc2, &hidden, parallel, context)
     }
 }
 
@@ -720,13 +691,40 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             )?,
         };
         hidden = hidden.add(&positions, context)?;
-        let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
+        let state = self.prepare_state(input.grid, context)?;
+        let unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let indexes = B::Tensor::from_i32_slice(
+            &state.permutation,
+            &[state.permutation.len() as i32],
+            context,
+        )?;
+        let sequence = hidden.dim(0);
+        hidden = hidden
+            .reshape(&[-1, unit, hidden.dim(1)], context)?
+            .take_axis(&indexes, 0, context)?
+            .reshape(&[sequence, -1], context)?;
+        Ok((hidden, state))
+    }
+
+    /// Builds rotary products and attention geometry without reading any model
+    /// parameters. Receiving pipeline owners pair this with the upstream activation.
+    pub fn prepare_state(
+        &self,
+        grid: &[(i32, i32, i32)],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<VisionState<B::Tensor>, Error> {
+        validate_patch_grid(grid, self.config.spatial_merge_size, None).map_err(Error::backend)?;
+        let full_chunks = attention_chunk_lengths(grid).map_err(Error::backend)?;
+        let sequence = full_chunks
+            .iter()
+            .try_fold(0_i32, |total, length| total.checked_add(*length))
+            .ok_or_else(|| Error::backend("vision continuation sequence exceeds i32"))?;
         let unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
         let (permutation, window_chunks) = match self.config.mode {
-            VisionMode::DeepStack => ((0..hidden.dim(0) / unit).collect(), full_chunks.clone()),
+            VisionMode::DeepStack => ((0..sequence / unit).collect(), full_chunks.clone()),
             VisionMode::WindowScheduled => {
                 let p = window_partition(
-                    input.grid,
+                    grid,
                     self.config.spatial_merge_size,
                     self.config.window_size,
                     self.config.patch_size,
@@ -737,26 +735,21 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         };
         let indexes =
             B::Tensor::from_i32_slice(&permutation, &[permutation.len() as i32], context)?;
-        let sequence = hidden.dim(0);
         let reorder = |value: B::Tensor| {
             value
                 .reshape(&[-1, unit, value.dim(1)], context)?
                 .take_axis(&indexes, 0, context)?
                 .reshape(&[sequence, -1], context)
         };
-        hidden = reorder(hidden)?;
-        let (cosine, sine) = rotary_embeddings::<B::Tensor>(input.grid, &self.config, context)?;
-        Ok((
-            hidden,
-            VisionState {
-                full_chunks,
-                window_chunks,
-                permutation,
-                cosine: reorder(cosine)?,
-                sine: reorder(sine)?,
-                deepstack: Vec::new(),
-            },
-        ))
+        let (cosine, sine) = rotary_embeddings::<B::Tensor>(grid, &self.config, context)?;
+        Ok(VisionState {
+            full_chunks,
+            window_chunks,
+            permutation,
+            cosine: reorder(cosine)?,
+            sine: reorder(sine)?,
+            deepstack: Vec::new(),
+        })
     }
 
     /// Executes one scheduled block and captures selected DeepStack output.
@@ -768,30 +761,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &mut VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let policy = *self
-            .config
-            .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("vision schedule has no block {layer}")))?;
-        let hidden = block.forward(
-            hidden,
-            state.chunks(policy.attention),
-            &state.cosine,
-            &state.sine,
-            context,
-        )?;
-        if let Some(index) = policy.deepstack_merger {
-            let feature = self
-                .deepstack_mergers
-                .get_mut(index as usize)
-                .ok_or_else(|| Error::backend("missing DeepStack merger"))?
-                .forward(&hidden, context)?
-                .expand_dims(0, context)?;
-            state.deepstack.push(feature);
-        }
-        Ok(hidden)
+        self.forward_block_impl(block, layer, hidden, state, None, context)
     }
 
-    /// Executes one rank-local block with architecture-owned segmented attention state.
+    /// Executes one scheduled rank-local block and captures selected DeepStack output.
     pub fn forward_block_parallel(
         &mut self,
         block: &mut VisionBlock<B>,
@@ -801,11 +774,23 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_block_impl(block, layer, hidden, state, Some(parallel), context)
+    }
+
+    fn forward_block_impl(
+        &mut self,
+        block: &mut VisionBlock<B>,
+        layer: usize,
+        hidden: &B::Tensor,
+        state: &mut VisionState<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
         let policy = *self
             .config
             .layer_policy(layer)
             .ok_or_else(|| Error::backend(format!("vision schedule has no block {layer}")))?;
-        let hidden = block.forward_parallel(
+        let hidden = block.forward_impl(
             hidden,
             state.chunks(policy.attention),
             &state.cosine,
@@ -814,11 +799,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             context,
         )?;
         if let Some(index) = policy.deepstack_merger {
-            let feature = self
+            let merger = self
                 .deepstack_mergers
                 .get_mut(index as usize)
-                .ok_or_else(|| Error::backend("missing DeepStack merger"))?
-                .forward_parallel(&hidden, parallel, context)?
+                .ok_or_else(|| Error::backend("missing DeepStack merger"))?;
+            let feature = merger
+                .forward_impl(&hidden, parallel, context)?
                 .expand_dims(0, context)?;
             state.deepstack.push(feature);
         }
@@ -832,17 +818,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &mut VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionOutput<B::Tensor>, Error> {
-        let merged = self.merger.forward(hidden, context)?;
-        let inverse = inverse_permutation(&state.permutation).map_err(Error::backend)?;
-        let inverse = B::Tensor::from_i32_slice(&inverse, &[inverse.len() as i32], context)?;
-        Ok(VisionOutput {
-            embeddings: merged
-                .take_axis(&inverse, 0, context)?
-                .expand_dims(0, context)?,
-            deepstack_features: std::mem::take(&mut state.deepstack),
-        })
+        self.finish_impl(hidden, state, None, context)
     }
-
     /// Completes a rank-local tower and reduces the final merger exactly once.
     pub fn finish_parallel(
         &mut self,
@@ -851,13 +828,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionOutput<B::Tensor>, Error> {
-        let merged = self.merger.forward_parallel(hidden, parallel, context)?;
+        self.finish_impl(hidden, state, Some(parallel), context)
+    }
+
+    fn finish_impl(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut VisionState<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<VisionOutput<B::Tensor>, Error> {
+        let merged = self.merger.forward_impl(hidden, parallel, context)?;
         let inverse = inverse_permutation(&state.permutation).map_err(Error::backend)?;
         let inverse = B::Tensor::from_i32_slice(&inverse, &[inverse.len() as i32], context)?;
+        let embeddings = merged
+            .take_axis(&inverse, 0, context)?
+            .expand_dims(0, context)?;
         Ok(VisionOutput {
-            embeddings: merged
-                .take_axis(&inverse, 0, context)?
-                .expand_dims(0, context)?,
+            embeddings,
             deepstack_features: std::mem::take(&mut state.deepstack),
         })
     }
@@ -1009,16 +997,25 @@ fn rotary_embeddings<T: Tensor>(
     config: &VisionConfig,
     context: &T::Context,
 ) -> Result<(T, T), Error> {
+    let spec = config.rotary_spec()?;
+    let patches =
+        validate_patch_grid(grid, config.spatial_merge_size, None).map_err(Error::backend)?;
+    let rows = i32::try_from(patches).map_err(Error::backend)?;
     let positions = patch_positions(grid, PatchTraversal::MergeMajor(config.spatial_merge_size))
         .map_err(Error::backend)?
         .into_iter()
         .flat_map(|[_, y, x]| [y, x])
         .collect::<Vec<_>>();
-    let ids = T::from_i32_slice(&positions, &[positions.len() as i32 / 2, 2], context)?;
-    let dimensions = (config.hidden_size / config.num_heads) / 2;
-    multi_axis_rotary_embeddings(
-        &ids,
-        &MultiAxisRotarySpec {
+    let ids = T::from_i32_slice(&positions, &[rows, 2], context)?;
+    multi_axis_rotary_embeddings(&ids, &spec, context)
+}
+
+impl VisionConfig {
+    /// Exact spatial rotary policy shared by execution and resource descriptions.
+    pub fn rotary_spec(&self) -> Result<MultiAxisRotarySpec, Error> {
+        self.validate().map_err(Error::backend)?;
+        let dimensions = (self.hidden_size / self.num_heads) / 2;
+        let spec = MultiAxisRotarySpec {
             axes: vec![
                 RotaryAxisSpec {
                     dimensions,
@@ -1032,9 +1029,14 @@ fn rotary_embeddings<T: Tensor>(
             base: 10_000.0,
             minimum_position: 0,
             layout: MultiAxisRotaryLayout::SplitHalves,
-        },
-        context,
-    )
+        };
+        if spec.dimensions()? != self.hidden_size / self.num_heads {
+            return Err(Error::backend(
+                "vision rotary axes do not cover the head width",
+            ));
+        }
+        Ok(spec)
+    }
 }
 
 fn apply_rotary<T: Tensor>(

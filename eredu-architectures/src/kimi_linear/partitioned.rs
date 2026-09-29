@@ -7,7 +7,7 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -749,7 +749,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -789,7 +789,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -841,7 +841,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -883,7 +883,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -1098,8 +1098,44 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
-    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
-        (input.tokens, input.mask)
+    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        Ok((input.tokens.dim(0), input.tokens.dim(1)))
+    }
+
+    fn begin_text_partition<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        expected: &eredu_runtime::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = (input.tokens, input.mask);
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+            observer,
+        )
     }
 
     fn partition_output_width(&self) -> i32 {
@@ -1110,7 +1146,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<(usize, usize), Self::Error> {
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
         let policy = self.args.layer_schedule.get(unit).ok_or_else(|| {
             Error::backend(format!("Kimi has no collective order for unit {unit}"))
         })?;
@@ -1122,6 +1158,11 @@ where
         // KDA/MLA each reduce their row-parallel output before feed-forward.
         // A sparse unit then reduces both its routed result and its shared
         // expert projection; a dense unit has only the ordinary FFN reduction.
-        Ok(if routed { (1, 2) } else { (1, 1) })
+        Ok(
+            crate::partitioned_execution::RoutedTensorReductions::hidden(
+                1,
+                if routed { 2 } else { 1 },
+            ),
+        )
     }
 }

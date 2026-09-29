@@ -39,8 +39,23 @@ impl IQuantTensor {
     }
 
     /// Canonically dequantize native GGML blocks for differential testing and
-    /// generic execution backends. Model loading does not call this method.
+    /// generic execution backends and explicitly selected F32 source views.
     pub fn dequantize_f32(&self) -> Result<Vec<f32>> {
+        if let Ok(decoder) = crate::BlockDecoder::new(self.ggml_type, self.endian) {
+            let count = decoder.output_len(self.data.len())?;
+            let shape_count = self.shape.iter().try_fold(1u64, |n, &d| {
+                n.checked_mul(d).ok_or(Error::Overflow("decoded shape"))
+            })?;
+            if shape_count != count as u64 {
+                return Err(Error::tensor(
+                    "<blocks>",
+                    "encoded length differs from logical shape",
+                ));
+            }
+            let mut output = vec![0.; count];
+            decoder.decode_into(&self.data, &mut output)?;
+            return Ok(output);
+        }
         if self.ggml_type.is_iq() {
             return crate::iquant::decode_f32(self.ggml_type, &self.data, self.endian);
         }

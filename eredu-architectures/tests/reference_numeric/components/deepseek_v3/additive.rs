@@ -1,7 +1,7 @@
 use super::*;
 use eredu_runtime::{
-    ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, TensorParallelParameterProvider,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -11,7 +11,7 @@ enum ProviderMode {
     PostBias,
 }
 struct Provider(ProviderMode);
-impl RoutedExpertProvider<NumericBackend> for Provider {
+impl ParameterProvider<NumericBackend> for Provider {
     type Error = Error;
     fn forward_grouped(
         &mut self,
@@ -19,7 +19,7 @@ impl RoutedExpertProvider<NumericBackend> for Provider {
         request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        <ResidentExpertProvider as RoutedExpertProvider<NumericBackend>>::forward_grouped(
+        <ResidentExpertProvider as ParameterProvider<NumericBackend>>::forward_grouped(
             &mut ResidentExpertProvider,
             bank,
             request,
@@ -32,7 +32,7 @@ impl RoutedExpertProvider<NumericBackend> for Provider {
         request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        <ResidentExpertProvider as RoutedExpertProvider<NumericBackend>>::forward_linear_routed(
+        <ResidentExpertProvider as ParameterProvider<NumericBackend>>::forward_linear_routed(
             &mut ResidentExpertProvider,
             bank,
             request,
@@ -45,7 +45,7 @@ impl RoutedExpertProvider<NumericBackend> for Provider {
         request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        <ResidentExpertProvider as RoutedExpertProvider<NumericBackend>>::forward_relu2_routed(
+        <ResidentExpertProvider as ParameterProvider<NumericBackend>>::forward_relu2_routed(
             &mut ResidentExpertProvider,
             bank,
             request,
@@ -53,7 +53,7 @@ impl RoutedExpertProvider<NumericBackend> for Provider {
         )
     }
 }
-impl TensorParallelRoutedExpertProvider<NumericBackend> for Provider {
+impl TensorParallelParameterProvider<NumericBackend> for Provider {
     fn forward_grouped_tensor_parallel(
         &mut self,
         bank: &mut <NumericBackend as eredu_nn::GroupedNeuralBackend>::GatedProductGroups,
@@ -85,7 +85,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for Provider {
         partitions: usize,
         context: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Error> {
-        <ResidentExpertProvider as TensorParallelRoutedExpertProvider<NumericBackend>>::forward_relu2_routed_tensor_parallel(&mut ResidentExpertProvider, bank, request, partitions, context)
+        <ResidentExpertProvider as TensorParallelParameterProvider<NumericBackend>>::forward_relu2_routed_tensor_parallel(&mut ResidentExpertProvider, bank, request, partitions, context)
     }
 }
 

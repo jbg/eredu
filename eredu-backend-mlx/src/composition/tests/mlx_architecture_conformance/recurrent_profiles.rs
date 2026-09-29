@@ -18,7 +18,7 @@ fn neutral_kimi_linear_forward_executes_on_mlx() {
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
-        MlxHybridState::device(eredu_architectures::kimi_linear::state_layout(&args).unwrap())
+        MlxHybridState::device(eredu_architectures::kimi_linear::state_layout(&args).unwrap(), &[])
             .unwrap();
     let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
     execute_target_group!(
@@ -51,7 +51,7 @@ fn neutral_lfm2_forward_executes_on_mlx() {
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
-        MlxHybridState::device(eredu_architectures::lfm2::state_layout(&args).unwrap()).unwrap();
+        MlxHybridState::device(eredu_architectures::lfm2::state_layout(&args).unwrap(), &[]).unwrap();
     let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
     execute_target_group!(
         Architecture,
@@ -86,7 +86,7 @@ fn neutral_nemotron_h_forward_executes_on_mlx() {
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
-        MlxHybridState::device(eredu_architectures::nemotron_h::state_layout(&args).unwrap())
+        MlxHybridState::device(eredu_architectures::nemotron_h::state_layout(&args).unwrap(), &[])
             .unwrap();
     let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
     execute_target_group!(

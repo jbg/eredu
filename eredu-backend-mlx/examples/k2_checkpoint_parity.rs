@@ -19,7 +19,7 @@ use eredu_nn::{
     GroupedRelu2Operator, LinearOperator, NeuralBackend, NormalizationOperator, ParameterMetadata,
     ParameterVisitorMut, Parameterized,
 };
-use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
+use eredu_runtime::{ExpertPass, ParameterProvider, RoutedExpertRequest};
 use safemlx::{Array, Device, DeviceType, Dtype, Stream};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -66,7 +66,7 @@ impl Capture {
         Ok(())
     }
 }
-impl RoutedExpertProvider<MlxNeuralBackend> for Capture {
+impl ParameterProvider<MlxNeuralBackend> for Capture {
     type Error = eredu_nn::Error;
     fn forward_grouped(
         &mut self,
@@ -314,6 +314,7 @@ fn main() -> anyhow::Result<()> {
             hidden = block.forward_routed(
                 layer,
                 decoder::AttentionInput {
+                    selected_positions: None,
                     hidden: &hidden,
                     mask: Some(&mask),
                     cache: Some(cache),

@@ -326,6 +326,9 @@ pub struct ExecutionPlan {
     pub(crate) expert_cache: Option<ExpertCachePlan>,
     /// Speculative decoding configuration.
     pub(crate) drafting: DraftingPlan,
+    /// Optional artifact supplying the selected embedded prediction parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prediction_source: Option<std::path::PathBuf>,
     /// Capabilities which the selected device must provide.
     pub(crate) required_device_capabilities: DeviceCapabilities,
     /// Capabilities which the exact prepared session must provide.
@@ -352,6 +355,7 @@ impl ExecutionPlan {
             max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
             expert_cache: None,
             drafting: DraftingPlan::Disabled,
+            prediction_source: None,
             required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
             prompt_cache_persistence: false,
@@ -435,6 +439,19 @@ impl ExecutionPlan {
     pub const fn drafting(&self) -> &DraftingPlan {
         &self.drafting
     }
+    /// Explicit artifact supplying embedded prediction parameters, when separate
+    /// from the target checkpoint. Architecture preparation validates the pairing.
+    pub fn prediction_source(&self) -> Option<&std::path::Path> {
+        self.prediction_source.as_deref()
+    }
+
+    /// Supplies an artifact for the selected embedded prediction extension.
+    /// This does not enable drafting or select an external assistant.
+    pub fn with_prediction_source(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.prediction_source = Some(path.into());
+        self
+    }
+
     /// Required device capabilities.
     pub const fn required_device_capabilities(&self) -> &DeviceCapabilities {
         &self.required_device_capabilities
@@ -627,6 +644,23 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ExecutionPlan>(encoded).unwrap(),
             explicit
+        );
+    }
+
+    #[test]
+    fn embedded_prediction_source_round_trips_without_changing_drafting_intent() {
+        let base = ExecutionPlan::fully_resident(DevicePlan::new("foreign", "cpu:0").unwrap());
+        assert!(serde_json::to_value(&base)
+            .unwrap()
+            .get("prediction_source")
+            .is_none());
+        let plan = base.with_prediction_source("prediction/safetensors");
+        assert_eq!(plan.drafting(), &DraftingPlan::Disabled);
+        let encoded = serde_json::to_value(&plan).unwrap();
+        assert_eq!(encoded["prediction_source"], "prediction/safetensors");
+        assert_eq!(
+            serde_json::from_value::<ExecutionPlan>(encoded).unwrap(),
+            plan
         );
     }
 

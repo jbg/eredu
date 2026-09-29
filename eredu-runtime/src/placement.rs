@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::{
-    recipe::RecipeError,
-    store::{CheckpointSource, StoreError, TensorSelection},
+    recipe::{RecipeCatalog, RecipeError},
+    store::{StoreError, TensorSelection},
 };
 
 use crate::{
@@ -515,9 +515,9 @@ pub enum PlacementPlanError {
 }
 
 /// Applies all architecture-selected logical placements to parameter recipes.
-pub fn place_weight_bindings(
+pub fn place_weight_bindings<C: RecipeCatalog + ?Sized>(
     bindings: Vec<WeightBinding>,
-    source: &dyn CheckpointSource,
+    source: &C,
     layout: &LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, BindingPlacementError> {
     apply_binding_placements(bindings, source, layout, false)
@@ -527,21 +527,20 @@ pub fn place_weight_bindings(
 ///
 /// The bank catalog has already selected semantic axis zero, so the ordinary
 /// logical lowering skips only that consumed member axis.
-pub fn place_addressable_member_bindings(
+pub fn place_addressable_member_bindings<C: RecipeCatalog + ?Sized>(
     bindings: Vec<WeightBinding>,
-    source: &dyn CheckpointSource,
+    source: &C,
     layout: &LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, BindingPlacementError> {
     apply_binding_placements(bindings, source, layout, true)
 }
 
-fn apply_binding_placements(
+fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
     bindings: Vec<WeightBinding>,
-    source: &dyn CheckpointSource,
+    source: &C,
     layout: &LocalModelLayout,
     skip_member_axis: bool,
 ) -> Result<Vec<WeightBinding>, BindingPlacementError> {
-    let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
         if binding.is_alias() {
@@ -564,7 +563,10 @@ fn apply_binding_placements(
 
         if !skip_member_axis
             && binding.recipe().is_none()
-            && !source_keys.contains(binding.checkpoint_key())
+            && matches!(
+                source.tensor_metadata(binding.checkpoint_key()),
+                Err(StoreError::UnknownTensor { .. })
+            )
         {
             if !tensor.additional_placements().is_empty() {
                 return Err(BindingPlacementError::CompoundPlacementRequiresRecipe {

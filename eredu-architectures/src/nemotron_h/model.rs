@@ -8,7 +8,7 @@ use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput, OwnedParameterGroupSpec,
     ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
+    ParameterProvider, PartitionedLayeredArchitecture, RoutedLayeredArchitecture,
     RuntimeStateComponents, StateLayout,
 };
 
@@ -47,7 +47,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         LayeredModel::forward_unit_with_provider(
@@ -73,7 +73,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -103,7 +103,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         LayeredModel::forward_unit_parallel_with_provider(
@@ -307,7 +307,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.norm)?;
+        visitor.visit("norm", &self.static_modules.boundary.norm)?;
         if let Some(head) = &self.static_modules.lm_head {
             visitor.visit("output", head)?;
         }
@@ -319,7 +319,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
         if let Some(head) = &mut self.static_modules.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -872,7 +872,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
         match &mut self.static_modules.lm_head {
             Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
             None => self.static_modules.embeddings.as_linear(&hidden, context),
@@ -886,7 +886,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
         match &mut self.static_modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -971,7 +971,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.unit_path_inner(group, index)?;
@@ -1016,7 +1016,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let path = self.unit_path_inner(group, index)?;
@@ -1055,7 +1055,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.unit_path_inner(group, index)?;
@@ -1340,7 +1340,7 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match forward.mode {
             ForwardMode::Target => {
-                let hidden = self.static_modules.norm.forward(hidden, context)?;
+                let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
                 match &mut self.static_modules.lm_head {
                     Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
                     None => self.static_modules.embeddings.as_linear(&hidden, context),
@@ -1520,7 +1520,7 @@ where
             ));
         }
         let hidden = match forward.mode {
-            ForwardMode::Target => self.static_modules.norm.forward(hidden, context)?,
+            ForwardMode::Target => self.static_modules.boundary.norm.forward(hidden, context)?,
             ForwardMode::Draft(_) => hidden.clone(),
         };
         match &mut self.static_modules.lm_head {

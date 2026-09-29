@@ -46,6 +46,7 @@ impl Drop for MlxCommunicationCompletion {
 struct FailureAgreementResolution {
     output: Array,
     member_count: i32,
+    descriptor: bool,
     resolved: Rc<Cell<Option<bool>>>,
 }
 
@@ -106,6 +107,19 @@ impl MlxCommunicationFlag {
 }
 
 impl MlxFailureAgreement {
+    /// One status word and two exact i32 bit-pattern halves per u64 field.
+    pub(crate) const DESCRIPTOR_WORDS: usize = 17;
+
+    pub(crate) fn descriptor_words(success: bool, descriptor: [u64; 8]) -> [i32; 17] {
+        let mut words = [0; Self::DESCRIPTOR_WORDS];
+        words[0] = i32::from(success);
+        for (index, value) in descriptor.into_iter().enumerate() {
+            words[1 + index * 2] = value as u32 as i32;
+            words[2 + index * 2] = (value >> 32) as u32 as i32;
+        }
+        words
+    }
+
     pub(crate) fn resolve(self) -> Result<bool, safemlx::error::Exception> {
         self.resolved.get().ok_or_else(|| {
             safemlx::error::Exception::custom(
@@ -321,11 +335,13 @@ impl MlxCommunicationCompletion {
         mut self,
         output: Array,
         member_count: i32,
+        descriptor: bool,
     ) -> (MlxFailureAgreement, Self) {
         let resolved = Rc::new(Cell::new(None));
         self.agreement = Some(FailureAgreementResolution {
             output,
             member_count,
+            descriptor,
             resolved: Rc::clone(&resolved),
         });
         (MlxFailureAgreement { resolved }, self)
@@ -370,12 +386,27 @@ impl MlxCommunicationCompletion {
                     "failure-agreement result is not an i32 status count: {error}"
                 ))
             })?;
-            let agreed = match counts {
-                [successes] => *successes == agreement.member_count,
-                _ => {
+            let agreed = if agreement.descriptor {
+                let count = agreement.member_count as usize;
+                if counts.len() != count * MlxFailureAgreement::DESCRIPTOR_WORDS || count == 0 {
                     return Err(safemlx::error::Exception::custom(
-                        "failure-agreement result is not one scalar status count",
+                        "failure-agreement descriptor result has invalid member geometry",
                     ));
+                }
+                counts
+                    .chunks_exact(MlxFailureAgreement::DESCRIPTOR_WORDS)
+                    .all(|frame| {
+                        frame[0] == 1
+                            && frame[1..] == counts[1..MlxFailureAgreement::DESCRIPTOR_WORDS]
+                    })
+            } else {
+                match counts {
+                    [successes] => *successes == agreement.member_count,
+                    _ => {
+                        return Err(safemlx::error::Exception::custom(
+                            "failure-agreement result is not one scalar status count",
+                        ));
+                    }
                 }
             };
             agreement.resolved.set(Some(agreed));

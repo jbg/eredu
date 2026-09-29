@@ -152,7 +152,6 @@ impl MlxDistributedSession {
     }
 
     /// Returns the communicator for an active opaque group identity.
-    #[cfg(test)]
     pub(crate) fn selected_group(&self, id: CollectiveGroupId) -> Option<&Group> {
         self.communicators.group(id)
     }
@@ -863,6 +862,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDis
         let operation = eredu_runtime::CommunicationOperation::FailureAgreement;
         let submission = crate::backend::nn::shared::MlxNeuralBackend::agree_success(
             success,
+            None,
             group,
             &self.stream,
         )

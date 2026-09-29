@@ -494,7 +494,7 @@ impl BankRecorder {
         ));
     }
 }
-impl RoutedExpertProvider<NumericBackend> for BankRecorder {
+impl ParameterProvider<NumericBackend> for BankRecorder {
     type Error = Error;
     fn forward_grouped(
         &mut self,
@@ -656,7 +656,7 @@ fn k2_tensor_parallel_keeps_complete_value_projections_and_local_kv_state() {
         );
         let mut groups = decoder::static_parallel_parameter_groups::<NumericBackend>(
             &architecture.static_modules().embeddings,
-            &architecture.static_modules().norm,
+            &architecture.static_modules().boundary.norm,
             architecture.static_modules().lm_head.as_ref(),
             "model",
         )
@@ -898,7 +898,7 @@ struct LinearBankMechanism {
     resident: Vec<ParameterBankKey>,
     report: Arc<std::sync::Mutex<NumericBankReport>>,
 }
-impl AddressableGroupedBank<NumericBackend> for LinearBankMechanism {
+impl eredu_runtime::ParameterBank<NumericBackend> for LinearBankMechanism {
     type Acquisition = Vec<usize>;
     type Report = NumericBankReport;
     type Error = Error;
@@ -930,6 +930,21 @@ impl AddressableGroupedBank<NumericBackend> for LinearBankMechanism {
             .map(|(key, _)| key.member())
             .collect())
     }
+    fn complete(
+        &mut self,
+        _: Self::Acquisition,
+        _: &NumericTensor,
+        _: &NumericContext,
+    ) -> Result<(), Error> {
+        self.report.lock().unwrap().completions += 1;
+        Ok(())
+    }
+    fn report(&self) -> Result<Self::Report, Error> {
+        Ok(*self.report.lock().unwrap())
+    }
+}
+
+impl AddressableGroupedBank<NumericBackend> for LinearBankMechanism {
     fn gated_product_groups(
         &mut self,
         _: &Self::Acquisition,
@@ -955,18 +970,6 @@ impl AddressableGroupedBank<NumericBackend> for LinearBankMechanism {
         _: &NumericContext,
     ) -> Result<grouped_linear::NumericLinearGroups, Error> {
         self.source.selected(spec, ids)
-    }
-    fn complete(
-        &mut self,
-        _: Self::Acquisition,
-        _: &NumericTensor,
-        _: &NumericContext,
-    ) -> Result<(), Error> {
-        self.report.lock().unwrap().completions += 1;
-        Ok(())
-    }
-    fn report(&self) -> Result<Self::Report, Error> {
-        Ok(*self.report.lock().unwrap())
     }
 }
 
@@ -1039,7 +1042,7 @@ fn bounded_value_bank_chunks_prefill_union_and_reacquires_with_complete_projecti
         family::ExpertBank::AttentionValue.id(),
         Box::new(provider)
             as Box<
-                dyn RoutedExpertProvider<
+                dyn ParameterProvider<
                     NumericBackend,
                     Error = eredu_architectures::routed_text::RoutedTextExecutionError,
                 >,
@@ -1112,7 +1115,11 @@ fn k2_mova_collective_waves_keep_bank_order_ownership_and_value_output_width() {
                 banks[&family::ExpertBank::AttentionValue.id()].global_group_count(),
                 3
             );
-            let mut blocks = vec![vec![RoutedExpertUnitWave::ordinary(0, 8, (1, 1))]];
+            let mut blocks = vec![vec![RoutedExpertUnitWave::ordinary(
+                0,
+                8,
+                eredu_architectures::partitioned_execution::RoutedTensorReductions::hidden(1, 1),
+            )]];
             for layer in 1..3 {
                 blocks.push(
                     args.routed_bank_order(layer)
@@ -1124,7 +1131,7 @@ fn k2_mova_collective_waves_keep_bank_order_ownership_and_value_output_width() {
                                 &owner,
                                 &banks[&bank],
                                 2,
-                                args.routed_bank_tensor_reductions(layer, bank).unwrap(),
+                                { let (before, after) = args.routed_bank_tensor_reductions(layer, bank).unwrap(); eredu_architectures::partitioned_execution::RoutedTensorReductions::hidden(before, after) },
                             )
                             .unwrap()
                         })

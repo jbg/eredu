@@ -10,8 +10,8 @@ use eredu_nn::{NeuralBackend, Parameterized, Tensor};
 use crate::{
     observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
     ExecutionScheduleError, ExecutionUnitLayout, ExpertPass, NoAuxiliaryBoundary,
-    ObservedExpertProvider, RoutedExpertProvider, RoutedObservationPoints, RuntimeState,
-    StateLayout, SubmissionBackend,
+    ObservedExpertProvider, ParameterProvider, RoutedObservationPoints, RuntimeState, StateLayout,
+    SubmissionBackend,
 };
 
 /// Statically dispatched visitor over one immutable pinned parameter module.
@@ -1428,7 +1428,7 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display;
 
     /// Executes one unit with architecture-owned pass classification.
@@ -1445,7 +1445,7 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let pass = self.expert_pass_for_unit(group, index, hidden, forward);
@@ -1471,7 +1471,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
         Self::Error: std::fmt::Display,
@@ -1513,7 +1513,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
         Self::Error: std::fmt::Display,
@@ -1558,7 +1558,7 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: crate::TensorParallelRoutedExpertProvider<B>,
+        P: crate::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display;
 
     /// Preserves provider routing observations while allowing genuine component hooks.
@@ -1578,7 +1578,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: crate::TensorParallelRoutedExpertProvider<B>,
+        P: crate::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
         Self::Error: std::fmt::Display,
@@ -1622,7 +1622,7 @@ where
         observer: Option<&mut O>,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: crate::TensorParallelRoutedExpertProvider<B>,
+        P: crate::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
         Self::Error: std::fmt::Display,
@@ -2523,7 +2523,7 @@ where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
-        Provider: RoutedExpertProvider<B>,
+        Provider: ParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -2548,7 +2548,7 @@ where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
-        Provider: RoutedExpertProvider<B>,
+        Provider: ParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -2580,7 +2580,7 @@ where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
-        Provider: RoutedExpertProvider<B>,
+        Provider: ParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -2605,7 +2605,7 @@ where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
-        Provider: RoutedExpertProvider<B>,
+        Provider: ParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -3341,7 +3341,7 @@ where
         B: eredu_nn::GroupedNeuralBackend,
         A: ParallelRoutedLayeredArchitecture<B, S>,
         A::Error: std::fmt::Display,
-        Provider: crate::TensorParallelRoutedExpertProvider<B>,
+        Provider: crate::TensorParallelParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {

@@ -122,6 +122,7 @@ fn operation_consensus(
     let agree_any = |local: bool| {
         let submission = <crate::backend::nn::shared::MlxNeuralBackend as FailureAgreementBackend>::agree_success(
             !local,
+            None,
             group,
             stream,
         )

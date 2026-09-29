@@ -8,8 +8,8 @@ use eredu_nn::{
     TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
+    TensorParallelParameterProvider,
 };
 
 use crate::{
@@ -354,7 +354,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjec
     ) -> Result<B::Tensor, Error> {
         let routes = self.router.select(input, context)?;
         let mut provider = ResidentExpertProvider;
-        RoutedExpertProvider::<B>::forward_grouped(
+        ParameterProvider::<B>::forward_grouped(
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
@@ -381,7 +381,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     ) -> Result<B::Tensor, Error> {
         let routes = self.router.select(input, context)?;
         let mut provider = ResidentExpertProvider;
-        let output = TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
+        let output = TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
@@ -447,7 +447,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -490,7 +490,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -599,7 +599,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if let Self::Dense(mlp) = self {
@@ -631,7 +631,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         FeedForward::forward_with_provider(self, layer, pass, input, context, provider)
@@ -653,7 +653,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if let Self::Dense(mlp) = self {
@@ -691,7 +691,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         FeedForward::forward_with_provider_parallel(

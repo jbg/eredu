@@ -9,6 +9,46 @@ struct AttentionVisitor<'a> {
     events: Rc<RefCell<Vec<&'static str>>>,
 }
 
+#[test]
+fn combined_stream_profile_keeps_its_exact_visitor_conversion() {
+    use eredu_architectures::replicated_text::ReplicatedTextProfileDispatcher;
+    let context = NumericContext::default();
+    let tokens = NumericTensor::token_ids(&[1, 3, 2]);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let conversion_events = Rc::clone(&events);
+    let ordinary_events = Rc::clone(&events);
+    let adapter = SharedReplicatedTextVisitor::<NumericReplicatedStateProfiles, _>::new(
+        NumericReplicatedVisitor {
+            context: &context,
+            tokens: &tokens,
+            construction_started: false,
+        },
+    )
+    .with_attention_stream_conversion(move |original| {
+        conversion_events
+            .borrow_mut()
+            .push("combined_stream_conversion");
+        AttentionVisitor {
+            original,
+            events: conversion_events,
+        }
+    })
+    .with_attention_conversion(move |original| {
+        ordinary_events.borrow_mut().push("ordinary_conversion");
+        AttentionVisitor {
+            original,
+            events: ordinary_events,
+        }
+    });
+    let mut visitor =
+        ReplicatedTextProfileDispatcher::<NumericBackend>::into_attention_stream_visitor(adapter);
+    visitor.construction_started();
+    assert_eq!(
+        &*events.borrow(),
+        &["combined_stream_conversion", "construction_started"]
+    );
+}
+
 impl
     ReplicatedTextArchitectureVisitor<
         NumericBackend,

@@ -909,7 +909,7 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     let requirements = selected.requirements().clone();
-    validate_store_handoff(&requirements, store.as_ref())
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     visitor.construction_started();
     let prepared = prepare_architecture_handoff::<B, S, A>(
@@ -985,7 +985,7 @@ where
     let eligible = ordinary_eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     match eligible {
         EligibleConfig::Gemma2(args) => {
@@ -1191,11 +1191,54 @@ fn validate_plan_identity(
     Ok(())
 }
 
+/// Source authority being validated; restricted primary views must not acquire auxiliaries.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StoreHandoffScope {
+    Primary,
+    Complete,
+}
+
+/// Projects an already admitted artifact onto the exact selected parameter role.
+/// Other roles retain their own source leases; native binding must not gain their
+/// catalog authority merely because they share an underlying checkpoint file.
+pub(crate) fn restrict_store_handoff(
+    requirements: &ReplicatedTextRequirements,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    scope: StoreHandoffScope,
+) -> Result<eredu_checkpoint::store::SharedCheckpointSource, String> {
+    validate_store_handoff(requirements, store.as_ref(), scope)?;
+    let keys = requirements
+        .parameters()
+        .iter()
+        .chain(
+            requirements
+                .auxiliary_parameters()
+                .iter()
+                .filter(|_| scope == StoreHandoffScope::Complete),
+        )
+        .flat_map(|parameter| parameter.sources().iter().cloned())
+        .collect::<BTreeSet<_>>();
+    Ok(Arc::new(
+        eredu_checkpoint::store::RestrictedCheckpointSource::including(
+            store,
+            "declared-execution-parameters",
+            keys,
+        )
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
 pub(crate) fn validate_store_handoff(
     requirements: &ReplicatedTextRequirements,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
+    scope: StoreHandoffScope,
 ) -> Result<(), String> {
-    for parameter in requirements.parameters() {
+    for parameter in requirements.parameters().iter().chain(
+        requirements
+            .auxiliary_parameters()
+            .iter()
+            .filter(|_| scope == StoreHandoffScope::Complete),
+    ) {
         let derived = matches!(
             parameter.presence(),
             ReplicatedTextParameterPresence::Derived { .. }
@@ -1266,10 +1309,11 @@ pub(crate) fn validate_store_handoff(
         }
     }
     for (target, recipe) in requirements.derived_recipes() {
-        if requirements
-            .auxiliary_parameters()
-            .iter()
-            .any(|parameter| parameter.name() == target)
+        if scope == StoreHandoffScope::Primary
+            && requirements
+                .auxiliary_parameters()
+                .iter()
+                .any(|parameter| parameter.name() == target)
         {
             continue;
         }
@@ -1724,7 +1768,7 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     match eligible {
         EligibleConfig::Lfm2(args) => {
@@ -2007,7 +2051,7 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     macro_rules! visit_family {
         ($family:ty, $args:expr, $capability:path, $select:path, $identity:path) => {{
@@ -2122,6 +2166,22 @@ where
     type ComponentState: LayerRuntimeState<B>;
     /// State representation used by key/value attention with fixed components.
     type AttentionComponentState: LayerRuntimeState<B>;
+    /// State exposing the combined attention, fixed and named-stream contract.
+    type AttentionStreamState: LayerRuntimeState<
+        B,
+        LayerState: AttentionCache<B::Tensor>
+                        + eredu_runtime::RuntimeStateComponents<B>
+                        + eredu_runtime::RuntimeAppendStreams<B>,
+    >;
+    /// Visitor preserving the concrete combined-state access bounds.
+    type AttentionStreamVisitor: ReplicatedTextArchitectureVisitor<
+        B,
+        Self::AttentionStreamState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
+    /// Consumes this adapter into its attention-with-streams visitor.
+    fn into_attention_stream_visitor(self) -> Self::AttentionStreamVisitor;
     /// State representation used by compressed attention.
     type CompressedState: LayerRuntimeState<B>;
     /// State representation used by compressed attention with fixed components.
@@ -2368,7 +2428,7 @@ where
     let eligible = eligible_config(plan)?;
     validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     let args = match eligible {
         EligibleConfig::QwenHybrid(args) => {
@@ -2931,6 +2991,7 @@ impl EligibleConfig<'_> {
         let mut ordinary = false;
         let mut compressed = false;
         let mut fixed = false;
+        let mut streams = false;
         for role in roles {
             match role {
                 eredu_core::cache::StateComponentRole::AttentionKeys
@@ -2938,7 +2999,15 @@ impl EligibleConfig<'_> {
                 eredu_core::cache::StateComponentRole::CompressedLatent
                 | eredu_core::cache::StateComponentRole::RotaryKeys => compressed = true,
                 eredu_core::cache::StateComponentRole::Fixed(_) => fixed = true,
+                eredu_core::cache::StateComponentRole::AppendStream { .. } => streams = true,
             }
+        }
+        if streams {
+            assert!(
+                ordinary && !compressed,
+                "append streams require ordinary attention in this profile"
+            );
+            return ReplicatedTextStateAccess::AttentionWithStreams;
         }
         match (ordinary, compressed, fixed) {
             (false, false, false) => ReplicatedTextStateAccess::Stateless,
@@ -5009,7 +5078,7 @@ fn finalize_materialization_parameters_with_recipes(
     ))
 }
 
-fn recipe_stored_dtype(
+pub(crate) fn recipe_stored_dtype(
     dtype: &eredu_checkpoint::recipe::RecipeDtype,
 ) -> Result<StoredDtype, ReplicatedTextRequirementsError> {
     use eredu_checkpoint::recipe::RecipeDtype;
@@ -5052,6 +5121,7 @@ fn safetensors_eligible_config(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        SafetensorsModelConfig::Qwen4Exp(_, _) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
         SafetensorsModelConfig::Gemma2(args) => Ok(EligibleConfig::Gemma2(args)),
@@ -5117,6 +5187,7 @@ fn gguf_eligible_config(
     architecture: &crate::configuration::GgufArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        GgufModelConfig::Qwen4Exp(_) => Err(ReplicatedTextIneligibility::Routed),
         GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
         GgufModelConfig::K2Horizon(args) if args.is_moe() => {
             Err(ReplicatedTextIneligibility::Routed)
@@ -5319,7 +5390,7 @@ fn qwen_next_fused_targets(
     Ok(Some(targets))
 }
 
-fn exact_physical_source(
+pub(crate) fn exact_physical_source(
     catalog: &dyn eredu_checkpoint::store::CheckpointSource,
     key: &str,
 ) -> Result<ReplicatedTextPhysicalSource, ReplicatedTextRequirementsError> {
@@ -6164,7 +6235,9 @@ fn finish_parameters(
     Ok(parameters)
 }
 
-fn stored_dtype(dtype: &TensorDtype) -> Result<StoredDtype, ReplicatedTextRequirementsError> {
+pub(crate) fn stored_dtype(
+    dtype: &TensorDtype,
+) -> Result<StoredDtype, ReplicatedTextRequirementsError> {
     Ok(match dtype {
         TensorDtype::Bool => StoredDtype::Bool,
         TensorDtype::F32 => StoredDtype::F32,
@@ -6234,6 +6307,7 @@ pub struct CompositeTextRequirements {
     processor: eredu_runtime::ProcessorExecutionRequirements,
     execution: ReplicatedTextRequirements,
     routed: Option<crate::RoutedTextRequirements>,
+    partition_boundaries: crate::composite_partitioned::CompositePartitionBoundaries,
     inspection: ArtifactInspection<ArtifactArchitecturePlan>,
 }
 
@@ -6251,6 +6325,7 @@ impl PartialEq for CompositeTextRequirements {
             && self.processor == other.processor
             && self.execution == other.execution
             && self.routed == other.routed
+            && self.partition_boundaries == other.partition_boundaries
             && self.inspection.format() == other.inspection.format()
             && self.inspection.tensors() == other.inspection.tensors()
             && self.inspection.safetensors_shards() == other.inspection.safetensors_shards()
@@ -6258,6 +6333,48 @@ impl PartialEq for CompositeTextRequirements {
 }
 
 impl CompositeTextRequirements {
+    /// Combines already-authored routed execution and input requirements without
+    /// reconstructing family configuration or checkpoint recipes.
+    pub(crate) fn from_routed(
+        inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+        architecture_identity: String,
+        routed: crate::RoutedTextRequirements,
+        processor: eredu_runtime::ProcessorExecutionRequirements,
+        input_modalities: InputModalities,
+        partition_boundaries: crate::composite_partitioned::CompositePartitionBoundaries,
+    ) -> Result<Self, String> {
+        let execution = routed.text().clone();
+        partition_boundaries.validate(execution.execution_graph(), execution.execution_units())?;
+        Ok(Self {
+            architecture_identity,
+            execution_graph: execution.execution_graph().clone(),
+            execution_units: execution.execution_units().clone(),
+            group_transports: execution.group_transports().to_vec(),
+            state_layout: execution.state_layout().clone(),
+            input_modalities,
+            decoder: CompositeTextDecoderStrategy::Routed,
+            raw_processor: inspection.architecture_plan().has_processor(),
+            media_projector: inspection
+                .architecture_plan()
+                .gguf_media_projector()
+                .is_some(),
+            processor,
+            execution,
+            routed: Some(routed),
+            partition_boundaries,
+            inspection: inspection
+                .clone()
+                .map_architecture_plan(ArtifactArchitecturePlan::without_validation),
+        })
+    }
+
+    /// Exact retained non-decoder continuation and cross-group wire contracts.
+    pub fn partition_boundaries(
+        &self,
+    ) -> &crate::composite_partitioned::CompositePartitionBoundaries {
+        &self.partition_boundaries
+    }
+
     pub(crate) fn with_state_layout(
         mut self,
         layout: eredu_runtime::StateLayout,
@@ -6511,12 +6628,31 @@ pub struct PreparedCompositeTextArchitecture<A, C> {
     effective_model_type: String,
 }
 
+/// Source-independent requirements retained by a prepared routed composite.
+/// Artifact inspection remains with cold admission and typed dispatch, rather
+/// than being captured by a constructed session or its processor policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedCompositeRequirements {
+    execution: crate::RoutedTextRequirements,
+    processor: eredu_runtime::ProcessorExecutionRequirements,
+}
+impl RoutedCompositeRequirements {
+    /// Exact target/encoder parameters, grouped banks, row lookups and state.
+    pub const fn execution(&self) -> &crate::RoutedTextRequirements {
+        &self.execution
+    }
+    /// Exact raw, prepared and projected input mechanism requirements.
+    pub const fn processor(&self) -> &eredu_runtime::ProcessorExecutionRequirements {
+        &self.processor
+    }
+}
+
 /// Checked composite architecture whose target decoder uses grouped providers.
 pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
     routed: crate::PreparedRoutedTextArchitecture<
         crate::composite_execution::PreparedCompositeArchitecture<A>,
     >,
-    requirements: CompositeTextRequirements,
+    requirements: RoutedCompositeRequirements,
     processor: eredu_runtime::SelectedProcessorExecution,
     admission: C,
     capability_estimate: crate::capability::CapabilityEstimate,
@@ -6524,8 +6660,48 @@ pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
 }
 
 impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
+    /// Pairs already checked modules with their exact retained composite policy.
+    /// The selected authority is supplied explicitly so every bank, row provider,
+    /// state and materialization choice must agree before a visitor receives it.
+    pub(crate) fn from_routed_declared(
+        routed: crate::PreparedRoutedTextArchitecture<
+            crate::composite_execution::PreparedCompositeArchitecture<A>,
+        >,
+        requirements: crate::RoutedTextRequirements,
+        selected: &crate::SelectedRoutedTextRealization,
+        processor: eredu_runtime::SelectedProcessorExecution,
+        processor_requirements: eredu_runtime::ProcessorExecutionRequirements,
+        admission: C,
+    ) -> Result<Self, String> {
+        crate::routed_text::validate_selected_routed_handoff(&requirements, selected)
+            .map_err(|error| error.to_string())?;
+        if processor.requirements() != &processor_requirements {
+            return Err("selected composite processor differs from exact requirements".into());
+        }
+        if routed.text().selected() != selected.text()
+            || routed.bank_residency() != selected.bank_residency()
+            || routed.banks() != selected.banks()
+            || routed.row_lookups().map(|rows| rows.plan()) != selected.row_lookups()
+        {
+            return Err("prepared composite modules differ from selected execution".into());
+        }
+        let capability_estimate = routed.text().capability_estimate().clone();
+        let effective_model_type = routed.text().effective_model_type().to_owned();
+        Ok(Self {
+            routed,
+            requirements: RoutedCompositeRequirements {
+                execution: requirements,
+                processor: processor_requirements,
+            },
+            processor,
+            admission,
+            capability_estimate,
+            effective_model_type,
+        })
+    }
+
     /// Exact architecture, artifact, processor, and grouped-bank requirements.
-    pub const fn requirements(&self) -> &CompositeTextRequirements {
+    pub const fn requirements(&self) -> &RoutedCompositeRequirements {
         &self.requirements
     }
 
@@ -6631,6 +6807,34 @@ where
 
     /// Records that validated dispatch is about to construct architecture modules.
     fn construction_started(&mut self);
+
+    /// Binds a routed composite target and its independently prepared predictor.
+    /// Native adaptation retains processor policy and uses the shared speculative driver.
+    fn visit_prediction<A, W>(
+        self,
+        _prepared: PreparedRoutedCompositeTextArchitecture<
+            A,
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+        >,
+        _prediction: W,
+        _target_source: eredu_checkpoint::store::SharedCheckpointSource,
+        _provider_source: eredu_checkpoint::store::SharedCheckpointSource,
+        _binding: crate::prepared_execution::PredictionBinding,
+    ) -> Result<Self::Output, crate::prepared_execution::PreparedExecutionError<Self::Error>>
+    where
+        B: eredu_nn::BlockwiseAttentionBackend + eredu_nn::HyperNeuralBackend,
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        W: crate::prediction_extension::PreparedRoutedPrediction<
+            B,
+            crate::composite_execution::PreparedCompositeArchitecture<A>,
+        >,
+    {
+        Err(crate::prepared_execution::PreparedExecutionError::UnavailablePrediction)
+    }
 
     /// Binds one statically known composite architecture to generic mechanisms.
     fn visit<A>(
@@ -7104,8 +7308,15 @@ pub(crate) fn composite_config(
             GgufMediaProjectorConfig::MuseGlimmer(args) => CompositeConfig::Muse(args),
             GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(args),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
+            GgufMediaProjectorConfig::Qwen4Exp(_) => {
+                return Err(ReplicatedTextRequirementsError::InvalidArtifact(
+                    "Flash-Next composite requires its selected routed architecture declaration"
+                        .into(),
+                ));
+            }
             GgufMediaProjectorConfig::Qwen3VlPending(_)
-            | GgufMediaProjectorConfig::Qwen35Pending(_) => {
+            | GgufMediaProjectorConfig::Qwen35Pending(_)
+            | GgufMediaProjectorConfig::Qwen4ExpPending { .. } => {
                 return Err(ReplicatedTextRequirementsError::InvalidArtifact(
                     "composite GGUF media token identities are unresolved".into(),
                 ));
@@ -7588,7 +7799,7 @@ fn derive_composite_text_requirements(
         .state_layout()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let processor = composite_processor_requirements(inspection.architecture_plan(), &config)?;
-    let mut execution = replicated_text_requirements_for_structure(
+    let execution = replicated_text_requirements_for_structure(
         inspection,
         config.requirement_config(),
         Some((
@@ -7599,10 +7810,25 @@ fn derive_composite_text_requirements(
         )),
     )?;
     let routed = composite_routed_requirements(inspection, &config, execution.clone())?;
-    if let Some(routed) = &routed {
-        execution = routed.text().clone();
+    let partition_boundaries =
+        crate::composite_partitioned::composite_partition_boundaries(&config)
+            .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+    if let Some(routed) = routed {
+        return CompositeTextRequirements::from_routed(
+            inspection,
+            config.architecture_identity(),
+            routed,
+            processor,
+            config.input_modalities(),
+            partition_boundaries,
+        )
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture);
     }
+    partition_boundaries
+        .validate(&execution_graph, &execution_units)
+        .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     Ok(CompositeTextRequirements {
+        partition_boundaries,
         architecture_identity: config.architecture_identity(),
         execution_graph,
         execution_units,
@@ -7621,7 +7847,7 @@ fn derive_composite_text_requirements(
             .is_some(),
         processor,
         execution,
-        routed,
+        routed: None,
         inspection: inspection
             .clone()
             .map_architecture_plan(ArtifactArchitecturePlan::without_validation),
@@ -7765,21 +7991,22 @@ where
     let routed = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
         architecture,
         source_architecture,
-        routed_requirements,
-        selected,
+        routed_requirements.clone(),
+        selected.clone(),
+        None,
         capability_estimate.clone(),
         effective_model_type.clone(),
         prompt_cache_architecture_identity,
         context,
     )?;
-    Ok(PreparedRoutedCompositeTextArchitecture {
+    PreparedRoutedCompositeTextArchitecture::from_routed_declared(
         routed,
-        requirements,
+        routed_requirements,
+        &selected,
         processor,
+        requirements.processor_execution().clone(),
         admission,
-        capability_estimate,
-        effective_model_type,
-    })
+    )
 }
 
 /// Constructs and visits one selected replicated composite architecture.
@@ -7798,8 +8025,12 @@ where
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S>,
 {
-    validate_store_handoff(requirements.execution(), store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    validate_store_handoff(
+        requirements.execution(),
+        store.as_ref(),
+        StoreHandoffScope::Primary,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
     let retained = requirements.inspection.clone();
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
@@ -8114,8 +8345,12 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: CompositePredictionTargetVisitor<B, S, M>,
 {
-    validate_store_handoff(requirements.execution(), store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    validate_store_handoff(
+        requirements.execution(),
+        store.as_ref(),
+        StoreHandoffScope::Primary,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
     let retained = requirements.inspection.clone();
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?

@@ -85,6 +85,19 @@ impl KeyValueCache for MlxKeyValueLayerState {
             Self::Paged(cache) => cache.paged_relative_attention(input, stream),
         }
     }
+    fn paged_indexed_attention(
+        &mut self,
+        input: &eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless invocation cannot execute selected-position attention",
+            )),
+            Self::Device(cache) => cache.paged_indexed_attention(input, stream),
+            Self::Paged(cache) => cache.paged_indexed_attention(input, stream),
+        }
+    }
     fn offset(&self) -> i32 {
         match self {
             Self::Stateless => 0,

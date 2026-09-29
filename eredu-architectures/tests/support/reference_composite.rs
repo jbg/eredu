@@ -421,16 +421,17 @@ where
 {
     type Input = ReferencePreparedInput;
 
-    fn with_prefill<R>(
+    fn with_prefill_chunks(
         &mut self,
         input: Self::Input,
+        maximum_chunk_tokens: usize,
         _: &(),
-        operation: impl for<'a> FnOnce(
+        mut operation: impl for<'a> FnMut(
             A::Input<'a>,
             ReferenceTensor,
             Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
-        ) -> Result<R, Error>,
-    ) -> Result<R, Error> {
+        ) -> Result<A::ForwardContext, Error>,
+    ) -> Result<(), Error> {
         let tokens = input
             .input
             .parts()
@@ -440,11 +441,17 @@ where
                 _ => None,
             })
             .ok_or_else(|| Error::backend("reference prediction input is not text tokens"))?;
+        if maximum_chunk_tokens == 0 || tokens.dim(1) as usize > maximum_chunk_tokens {
+            return Err(Error::backend(
+                "reference composite prediction retains a complete pass",
+            ));
+        }
         operation(
             A::text_input(&tokens, None),
             tokens.clone(),
             Some(&input.identity),
         )
+        .map(|_| ())
     }
 
     fn with_decode<R>(
@@ -1933,8 +1940,13 @@ impl
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let mut session = prepared
-            .construct_resident_session(ReferenceReplicatedMechanisms, &())
+        let (mut session, _) = prepared
+            .construct_resident_session(
+                ReferenceReplicatedMechanisms,
+                None::<eredu_runtime::NoRowLookups>,
+                &[],
+                &(),
+            )
             .map_err(|error| error.to_string())?;
         let mut strategy =
             eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<

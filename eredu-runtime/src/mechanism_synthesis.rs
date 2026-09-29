@@ -239,31 +239,7 @@ pub fn synthesize_replicated_text_capabilities(
         }
     }
 
-    let floating_dtype = requirements
-        .floating_state_source()
-        .and_then(|source| support.floating_state_dtype(source))
-        .filter(|dtype| dtype.is_floating());
-    let mut state =
-        synthesize_state_components(requirements.state_layout(), facts.state, |component| {
-            let Some(dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype) else {
-                return (None, None);
-            };
-            let device = support
-                .supports_state_component(component, dtype, StateComponentPlacement::Device)
-                .then_some(StateComponentPlacement::Device);
-            let paged = match component.residency() {
-                StateResidencyClass::SealablePaged => support
-                    .supports_state_component(component, dtype, StateComponentPlacement::Paged)
-                    .then_some(StateComponentPlacement::Paged),
-                StateResidencyClass::AlwaysDeviceMutable
-                | StateResidencyClass::LayerScopedOffloadable => device,
-            };
-            (device, paged)
-        });
-
-    if let (Some(source), Some(dtype)) = (requirements.floating_state_source(), floating_dtype) {
-        state = state.with_floating_state_dtype(source.clone(), dtype);
-    }
+    let state = state_capabilities(&requirements.state_requirements(), facts.state, support);
     let capabilities = BackendMechanismCapabilities::new(
         facts.operators,
         weight_lowerings,
@@ -280,6 +256,48 @@ pub fn synthesize_replicated_text_capabilities(
         Some(storage) => capabilities.with_addressable_storage(storage),
         None => capabilities,
     }
+}
+
+/// Enumerates one independent state role using existing backend support predicates.
+/// This performs no immutable-weight queries and introduces no native resources.
+pub fn synthesize_state_capabilities(
+    requirements: &crate::StateRealizationRequirements,
+    policy: &CacheResidencyPolicy,
+    support: &impl ReplicatedTextMechanismSupport,
+) -> StateMechanismCapabilities {
+    state_capabilities(requirements, support.facts(policy).state, support)
+}
+
+fn state_capabilities(
+    requirements: &crate::StateRealizationRequirements,
+    lifecycle: StateLifecycleCapabilities,
+    support: &impl ReplicatedTextMechanismSupport,
+) -> StateMechanismCapabilities {
+    let floating_dtype = requirements
+        .floating_source()
+        .and_then(|source| support.floating_state_dtype(source))
+        .filter(|dtype| dtype.is_floating());
+    let mut state = synthesize_state_components(requirements.layout(), lifecycle, |component| {
+        let Some(dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype) else {
+            return (None, None);
+        };
+        let device = support
+            .supports_state_component(component, dtype, StateComponentPlacement::Device)
+            .then_some(StateComponentPlacement::Device);
+        let paged = match component.residency() {
+            StateResidencyClass::SealablePaged => support
+                .supports_state_component(component, dtype, StateComponentPlacement::Paged)
+                .then_some(StateComponentPlacement::Paged),
+            StateResidencyClass::AlwaysDeviceMutable
+            | StateResidencyClass::LayerScopedOffloadable => device,
+        };
+        (device, paged)
+    });
+
+    if let (Some(source), Some(dtype)) = (requirements.floating_source(), floating_dtype) {
+        state = state.with_floating_state_dtype(source.clone(), dtype);
+    }
+    state
 }
 
 /// Shared collection traversal; native providers answer only one component at a time.

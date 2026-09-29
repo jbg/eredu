@@ -283,3 +283,5 @@ include!("unit_and_worker.rs");
 include!("fixtures.rs");
 include!("suites.rs");
 include!("process.rs");
+
+mod qwen4_exp;

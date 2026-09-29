@@ -20,5 +20,6 @@ workspace = true
 [dependencies]
 eredu-core.workspace = true
 thiserror.workspace = true
-image = { version = "0.25", default-features = false, optional = true }
+# The resize-buffer bound in image.rs tracks this exact implementation.
+image = { version = "=0.25.10", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }

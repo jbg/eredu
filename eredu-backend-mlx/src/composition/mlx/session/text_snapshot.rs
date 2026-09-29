@@ -85,6 +85,16 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         }
         match pending? {
             PendingTextInput::Decode(token) if token.value.size() == 1 => Some(predictions),
+            PendingTextInput::Prefill(prompt) if prompt.prefill_cursor().is_some() => {
+                let cursor = prompt.prefill_cursor()?;
+                u64::try_from(
+                    cursor
+                        .token_count()
+                        .checked_sub(cursor.next_range().start)?,
+                )
+                .ok()?
+                .checked_add(predictions - 1)
+            }
             PendingTextInput::Prefill(prompt) => with_text_prompt_array(prompt, |array| {
                 u64::try_from(array.shape()[1])
                     .ok()?
@@ -206,16 +216,35 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                 array_storage(&token.value)
             }
             Some(PendingTextInput::Decode(_)) => None,
-            Some(PendingTextInput::Prefill(prompt)) => with_text_prompt_array(prompt, |array| {
-                array_storage(array)?
-                    .checked_add(u64::try_from(std::mem::size_of::<MlxModelInput>()).ok()?)?
-                    .checked_add(u64::try_from(std::mem::size_of::<input::InputPart>()).ok()?)?
-                    .checked_add(match prompt.cache_identity() {
-                        Some(identity) => identity.logical_metadata_bytes()?,
-                        None => 0,
+            Some(PendingTextInput::Prefill(prompt)) if prompt.prefill_cursor().is_some() => {
+                let cursor = prompt.prefill_cursor().expect("retained cursor");
+                u64::try_from(cursor.retained_bytes()?)
+                    .ok()
+                    .and_then(|bytes| {
+                        bytes.checked_add(std::mem::size_of::<MlxModelInput>() as u64)
                     })
-            })
-            .flatten(),
+                    .and_then(|bytes| {
+                        bytes.checked_add(match prompt.cache_identity() {
+                            Some(identity) => identity.logical_metadata_bytes()?,
+                            None => 0,
+                        })
+                    })
+            }
+            Some(PendingTextInput::Prefill(prompt)) => prompt.with_borrowed(|input| {
+                let mut bytes = u64::try_from(std::mem::size_of::<MlxModelInput>()).ok()?;
+                for part in input.parts {
+                    bytes = bytes
+                        .checked_add(std::mem::size_of::<input::InputPart>() as u64)?
+                        .checked_add(array_storage(part.payload().value())?)?;
+                    for array in part.metadata().values() {
+                        bytes = bytes.checked_add(array_storage(array)?)?;
+                    }
+                }
+                bytes.checked_add(match prompt.cache_identity() {
+                    Some(identity) => identity.logical_metadata_bytes()?,
+                    None => 0,
+                })
+            }),
         };
         Ok(bytes.map(|bytes| SnapshotEstimate {
             retained_bytes: bytes,
@@ -237,7 +266,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         .is_none()
         {
             return Err(Error::ArchitectureModel(
-                "snapshots require a single-sequence ordinary token-ID input".into(),
+                "pending input cannot be represented by the snapshot contract".into(),
             ));
         }
         let stream = runtime.backend().stream().clone();
@@ -251,6 +280,33 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                             stream: stream.clone(),
                             owner: std::rc::Rc::clone(&token.owner),
                         }))
+                    }
+                    Some(PendingTextInput::Prefill(prompt))
+                        if prompt.prefill_cursor().is_some() =>
+                    {
+                        // The cursor owns immutable prepared tensors and a separate
+                        // mutable continuation position. Native state is snapshotted
+                        // by the existing session contract, not by this input clone.
+                        Some(PendingTextInput::Prefill(prompt.clone()))
+                    }
+                    Some(PendingTextInput::Prefill(prompt))
+                        if with_text_prompt_array(prompt, |_| ()).is_none() =>
+                    {
+                        // Prepared inputs expose immutable tensor handles. Evaluate
+                        // their roots before sharing storage with a snapshot so no
+                        // pending native request work outlives this operation guard.
+                        prompt.with_borrowed(|input| {
+                            let roots = input
+                                .parts
+                                .iter()
+                                .flat_map(|part| {
+                                    std::iter::once(part.payload().value())
+                                        .chain(part.metadata().values())
+                                })
+                                .collect::<Vec<_>>();
+                            safemlx::transforms::eval(roots)
+                        })?;
+                        Some(PendingTextInput::Prefill(prompt.clone()))
                     }
                     Some(PendingTextInput::Prefill(prompt)) => {
                         let tokens =

@@ -290,22 +290,16 @@ replace the existing completion and state-recovery checks. See
 A new model family declares its genuine hooks and ordinary selector policy in
 `eredu-architectures`; these drivers do not require a new action implementation for
 that family. Discovery still needs family-specific validation and truthful support
-declarations. This refactor does not expand the established model/session coverage
-listed above, and it does not add a production backend.
+declarations.
 
-The lower-level Rust interfaces changed: the coarse
-`InterventionBackend::apply_intervention` method was replaced by native primitives;
-intervention preflight and `CaptureSession::enable_interventions` now take backend
-estimates. Backend implementers must update those call sites. `RoutingMechanism`
-and the shared session/observer helpers provide the replacement execution path.
-Serialized plans/records and the application facade workflow are unchanged.
+Native intervention primitives implement edits. Intervention preflight and
+`CaptureSession::enable_interventions` consume backend estimates. `RoutingMechanism`
+and shared session/observer helpers own the execution path.
 
-The intervention schema is version 1. Capture/trace records gain optional additive
-intervention fields, defaulting to absent/empty when older JSON is read and omitted
-on ordinary runs. Existing observation paths, capture positions and generation
+The intervention schema is version 1. Capture/trace records contain optional intervention fields. Missing fields default
+to absent/empty; ordinary runs omit them. Existing observation paths, capture positions and generation
 entry points retain their meanings.
-The candidate `source` field is additive and defaults to `original` when reading
-older records. Rust applications constructing candidate structs must provide it.
+The candidate `source` field defaults to `original` when absent. Rust applications constructing candidate structs must provide it.
 
 Behavioral verification includes portable admission, ordered mutation, budgets,
 session binding, consumer cancellation/unwinding and failure records; loaded MLX

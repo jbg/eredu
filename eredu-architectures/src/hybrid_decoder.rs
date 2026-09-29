@@ -3,10 +3,11 @@
 use eredu_nn::{EmbeddingOperator, Error, LinearOperator, NeuralBackend, Tensor};
 
 use crate::decoder::{
-    SequentialGroup, SequentialPredictionGroups, StaticModuleSpec, StaticModules,
-    TARGET_EXECUTION_GROUP,
+    DecoderBoundary, NormalizedBoundary, SequentialGroup, SequentialPredictionGroups,
+    StaticModules, TARGET_EXECUTION_GROUP,
 };
 
+#[derive(Clone)]
 enum HybridExecutionGroups {
     Target(SequentialGroup),
     TargetAndPrediction(SequentialPredictionGroups),
@@ -15,14 +16,16 @@ enum HybridExecutionGroups {
 /// Pinned decoder modules with architecture-owned shared execution parameters.
 #[derive(Debug, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct HybridStaticModules<B: NeuralBackend, E> {
+pub struct HybridStaticModules<B: NeuralBackend, E, D: DecoderBoundary<B> = NormalizedBoundary<B>> {
     /// Shared token embedding, normalization, and vocabulary projection.
-    pub base: StaticModules<B>,
+    pub base: StaticModules<B, D>,
     /// Architecture-owned pinned modules shared by execution units.
     pub extension: E,
 }
 
-impl<B: NeuralBackend, E: Clone> Clone for HybridStaticModules<B, E> {
+impl<B: NeuralBackend, E: Clone, D: DecoderBoundary<B> + Clone> Clone
+    for HybridStaticModules<B, E, D>
+{
     fn clone(&self) -> Self {
         Self {
             base: self.base.clone(),
@@ -34,22 +37,30 @@ impl<B: NeuralBackend, E: Clone> Clone for HybridStaticModules<B, E> {
 /// Common hybrid execution shell with an optional architecture-owned extension.
 /// Family modules retain their operator policies and block equations; this shell
 /// owns embedding/finalization and the stable target/prediction group lifecycle.
-pub struct HybridDecoder<B: NeuralBackend, E = ()> {
-    static_modules: HybridStaticModules<B, E>,
+pub struct HybridDecoder<B: NeuralBackend, E = (), D: DecoderBoundary<B> = NormalizedBoundary<B>> {
+    static_modules: HybridStaticModules<B, E, D>,
     groups: HybridExecutionGroups,
 }
 
-impl<B: NeuralBackend> HybridDecoder<B> {
-    /// Builds pinned modules and one validated heterogeneous target group.
+impl<B: NeuralBackend, E: Clone, D: DecoderBoundary<B> + Clone> Clone for HybridDecoder<B, E, D> {
+    fn clone(&self) -> Self {
+        Self {
+            static_modules: self.static_modules.clone(),
+            groups: self.groups.clone(),
+        }
+    }
+}
+
+impl<B: NeuralBackend, D: DecoderBoundary<B>> HybridDecoder<B, (), D> {
+    /// Owns prepared pinned modules and one validated heterogeneous target group.
     pub fn new(
-        static_spec: StaticModuleSpec,
+        static_modules: StaticModules<B, D>,
         parameter_root: &'static str,
         units: usize,
-        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
             static_modules: HybridStaticModules {
-                base: StaticModules::from_spec(static_spec, context)?,
+                base: static_modules,
                 extension: (),
             },
             groups: HybridExecutionGroups::Target(SequentialGroup::new(
@@ -60,20 +71,19 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         })
     }
 
-    /// Builds pinned modules plus target and equally sized appended prediction groups.
+    /// Owns pinned modules plus target and equally sized appended prediction groups.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_prediction_groups(
-        static_spec: StaticModuleSpec,
+        static_modules: StaticModules<B, D>,
         target_parameter_root: &'static str,
         target_units: usize,
         prediction_parameter_root: &'static str,
         prediction_groups: usize,
         prediction_units: usize,
-        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
             static_modules: HybridStaticModules {
-                base: StaticModules::from_spec(static_spec, context)?,
+                base: static_modules,
                 extension: (),
             },
             groups: HybridExecutionGroups::TargetAndPrediction(
@@ -89,7 +99,7 @@ impl<B: NeuralBackend> HybridDecoder<B> {
     }
 
     /// Attaches one pinned extension without reconstructing the decoder modules.
-    pub fn with_static_extension<E>(self, extension: E) -> HybridDecoder<B, E> {
+    pub fn with_static_extension<E>(self, extension: E) -> HybridDecoder<B, E, D> {
         HybridDecoder {
             static_modules: HybridStaticModules {
                 base: self.static_modules.base,
@@ -100,34 +110,34 @@ impl<B: NeuralBackend> HybridDecoder<B> {
     }
 }
 
-impl<B: NeuralBackend, E> HybridDecoder<B, E> {
+impl<B: NeuralBackend, E, D: DecoderBoundary<B>> HybridDecoder<B, E, D> {
     /// Borrows all pinned modules, including the architecture extension.
-    pub const fn extended_static_modules(&self) -> &HybridStaticModules<B, E> {
+    pub const fn extended_static_modules(&self) -> &HybridStaticModules<B, E, D> {
         &self.static_modules
     }
 
     /// Mutably borrows all pinned modules.
-    pub fn extended_static_modules_mut(&mut self) -> &mut HybridStaticModules<B, E> {
+    pub fn extended_static_modules_mut(&mut self) -> &mut HybridStaticModules<B, E, D> {
         &mut self.static_modules
     }
 
     /// Consumes the execution shell and returns all pinned modules.
-    pub fn into_extended_static_modules(self) -> HybridStaticModules<B, E> {
+    pub fn into_extended_static_modules(self) -> HybridStaticModules<B, E, D> {
         self.static_modules
     }
 
     /// Borrows the shared embedding, final normalization, and output head.
-    pub const fn static_modules(&self) -> &StaticModules<B> {
+    pub const fn static_modules(&self) -> &StaticModules<B, D> {
         &self.static_modules.base
     }
 
     /// Mutably borrows the shared embedding, final normalization, and output head.
-    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
+    pub fn static_modules_mut(&mut self) -> &mut StaticModules<B, D> {
         &mut self.static_modules.base
     }
 
     /// Consumes the graph shell and returns its pinned modules.
-    pub fn into_static_modules(self) -> StaticModules<B> {
+    pub fn into_static_modules(self) -> StaticModules<B, D> {
         self.static_modules.base
     }
 
@@ -188,7 +198,7 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
         }
     }
 
-    /// Applies final normalization and the tied or separate vocabulary projection.
+    /// Applies the architecture's residual readout and tied or separate vocabulary projection.
     pub fn finish_logits(
         &mut self,
         hidden: &B::Tensor,
@@ -202,7 +212,7 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
     }
 
     /// Projects only the final position of an unobserved causal-text pass.
-    pub(crate) fn finish_text_logits(
+    pub fn finish_text_logits(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -213,7 +223,8 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
         )
     }
 
-    pub(crate) fn finish_logits_instrumented(
+    /// Applies the selected readout while preserving semantic observation boundaries.
+    pub fn finish_logits_instrumented(
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
@@ -222,6 +233,25 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
         self.static_modules
             .base
             .finish_instrumented(hidden, context, instrumentation)
+    }
+
+    /// Applies the same readout with the selected vocabulary collective.
+    pub fn finish_logits_parallel_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        self.static_modules.base.finish_parallel_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 
     /// Projects an already normalized hidden state through the shared vocabulary head.

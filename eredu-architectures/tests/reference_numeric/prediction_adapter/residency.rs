@@ -105,7 +105,11 @@ fn prediction_rank_resources_count_tensor_shards_and_pipeline_expert_replicas() 
                     .embeddings
                     .visit_parameters(&mut replicated_embedding);
             }
-            assert_eq!(complete.parameter_bytes - ordinary.parameter_bytes, module_bytes.iter().sum::<u64>() + replicated_embedding.0, "{tp}/{pp}/{ep} rank {rank}: every rank owns its full tensor-sharded prediction schedule");
+            assert_eq!(
+                complete.parameter_bytes - ordinary.parameter_bytes,
+                module_bytes.iter().sum::<u64>() + replicated_embedding.0,
+                "{tp}/{pp}/{ep} rank {rank}: every rank owns its full tensor-sharded prediction schedule"
+            );
             assert_eq!(
                 complete.pinned_bytes - ordinary.pinned_bytes,
                 replicated_embedding.0

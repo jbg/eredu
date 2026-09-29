@@ -55,9 +55,7 @@ impl MlxParameterBankTelemetry for eredu_runtime::DirectReplicatedTextExecution 
 }
 
 impl MlxParameterBankTelemetry
-    for eredu_runtime::RoutedReplicatedTextExecution<
-        eredu_runtime::RoutedBankProviders<eredu_architectures::routed_text::PlannedResidentBank>,
-    >
+    for eredu_runtime::RoutedBankProviders<eredu_architectures::routed_text::PlannedResidentBank>
 {
     fn parameter_bank_report(
         &self,
@@ -89,14 +87,11 @@ pub(super) type MlxAddressableBanks = eredu_runtime::RoutedBankProviders<
         crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
     >,
 >;
-impl MlxParameterBankTelemetry
-    for eredu_runtime::RoutedReplicatedTextExecution<MlxAddressableBanks>
-{
+impl MlxParameterBankTelemetry for MlxAddressableBanks {
     fn parameter_banks(
         &self,
     ) -> std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank> {
-        self.provider()
-            .banks()
+        self.banks()
             .iter()
             .map(|(id, provider)| (*id, provider.bank_storage().clone()))
             .collect()
@@ -108,7 +103,6 @@ impl MlxParameterBankTelemetry
         Error,
     > {
         let banks = self
-            .provider()
             .banks()
             .iter()
             .map(|(id, provider)| {
@@ -123,6 +117,54 @@ impl MlxParameterBankTelemetry
                 banks,
             ),
         ))
+    }
+}
+
+impl<P: MlxParameterBankTelemetry> MlxParameterBankTelemetry
+    for eredu_runtime::RoutedReplicatedTextExecution<P>
+{
+    fn parameter_banks(
+        &self,
+    ) -> std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank> {
+        self.provider().parameter_banks()
+    }
+    fn parameter_bank_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
+        Error,
+    > {
+        self.provider().parameter_bank_report()
+    }
+}
+impl<P: MlxParameterBankTelemetry> MlxParameterBankTelemetry
+    for eredu_runtime::ParameterProviders<
+        P,
+        Option<crate::backend::runtime::residency::parameter_bank::MlxRowLookups>,
+    >
+{
+    fn parameter_banks(
+        &self,
+    ) -> std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank> {
+        self.grouped.parameter_banks()
+    }
+    fn parameter_bank_report(
+        &self,
+    ) -> Result<
+        Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
+        Error,
+    > {
+        let grouped = self.grouped.parameter_bank_report()?;
+        let rows = self
+            .rows
+            .as_ref()
+            .map(|rows| rows.pool_report())
+            .transpose()?
+            .flatten();
+        Ok(match rows {
+            Some(rows) => Some(grouped.unwrap_or_else(|| crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport::new(Default::default())).with_rows(rows)),
+            None => grouped,
+        })
     }
 }
 
@@ -473,6 +515,20 @@ pub(crate) struct MlxPredictionMaterializationContext<'a> {
     weights_stream: &'a Stream,
 }
 
+impl<'a> MlxPredictionMaterializationContext<'a> {
+    pub(super) fn new(
+        store: SharedCheckpointSource,
+        stream: &'a Stream,
+        weights_stream: &'a Stream,
+    ) -> Self {
+        Self {
+            store,
+            stream,
+            weights_stream,
+        }
+    }
+}
+
 impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<MlxNeuralBackend>
     for MlxEmbeddedPredictionMaterializer
 {
@@ -554,7 +610,7 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
         _context: &mut Self::Context<'_>,
         layout: eredu_runtime::StateLayout,
     ) -> Result<Self::ModelState, Self::Error> {
-        Ok(MlxHybridState::device(layout)?)
+        Ok(MlxHybridState::device(layout, &[])?)
     }
 
     fn sequential_state() -> Self::SequentialState {
@@ -821,6 +877,15 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
     ) -> Result<MlxTensor, Error>;
 }
 
+/// Owned request progress; clones share completed immutable tensors and copy the cursor.
+pub(crate) trait ErasedPrefillCursor {
+    fn clone_box(&self) -> Box<dyn ErasedPrefillCursor>;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn next_range(&self) -> std::ops::Range<usize>;
+    fn token_count(&self) -> usize;
+    fn retained_bytes(&self) -> Result<usize, Error>;
+}
+
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
     fn projects_final_prefill_position(&self) -> bool {
@@ -831,6 +896,31 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     }
     fn supports_chunked_prefill(&self) -> bool {
         false
+    }
+
+    fn supports_retained_prefill(&self) -> bool {
+        false
+    }
+
+    fn start_prefill_cursor(
+        &mut self,
+        _input: Result<input::ModelInput<'_>, Error>,
+        _max_tokens: usize,
+        _capture_geometry: Option<eredu_core::capture::CaptureRequestShape>,
+        _stream: &Stream,
+    ) -> Result<Option<Box<dyn ErasedPrefillCursor>>, Error> {
+        Ok(None)
+    }
+
+    fn advance_prefill_cursor(
+        &mut self,
+        _cursor: &mut dyn ErasedPrefillCursor,
+        _stream: &Stream,
+        _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        Err(Error::ArchitectureModel(
+            "executable has no retained prefill request".into(),
+        ))
     }
 
     fn prepared_input_plans(

@@ -227,6 +227,19 @@ pub enum StateStorageDtype {
 }
 
 impl StateStorageDtype {
+    /// Exact neutral tensor scalar representation used by typed state bindings.
+    pub const fn element_type(self) -> eredu_nn::TensorElementType {
+        use eredu_nn::TensorElementType as Element;
+        match self {
+            Self::F16 => Element::F16,
+            Self::Bf16 => Element::Bf16,
+            Self::F32 => Element::F32,
+            Self::F64 => Element::F64,
+            Self::Complex64 => Element::Complex64,
+            Self::I32 => Element::I32,
+            Self::U32 => Element::U32,
+        }
+    }
     /// Exact bytes occupied by one native state element.
     pub const fn bytes(self) -> std::num::NonZeroU8 {
         let bytes = match self {
@@ -447,7 +460,7 @@ impl ParameterTransformTarget {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ParameterTransformConstraint {
-    /// This parameter is not an executable affine projection weight.
+    /// This parameter does not permit a load-time projection transformation.
     None,
     /// The declared axis is the input/packing axis of a linear parameter.
     Linear {
@@ -1070,8 +1083,11 @@ impl ReplicatedTextParameterRequirement {
         };
         let packed_axis = packed_axis
             .or_else(|| {
-                (self.role == ReplicatedTextParameterRole::Embedding
-                    && executable != LinearFormat::Dense)
+                (matches!(
+                    self.role,
+                    ReplicatedTextParameterRole::Embedding
+                        | ReplicatedTextParameterRole::LinearWeight
+                ) && executable != LinearFormat::Dense)
                     .then(|| self.logical_shape.len().checked_sub(1))
                     .flatten()
             })
@@ -1148,6 +1164,8 @@ pub enum ReplicatedTextStateAccess {
     Fixed,
     /// Key/value attention plus architecture-declared fixed components.
     AttentionWithFixed,
+    /// Ordinary attention, lane-local append streams and optional fixed components.
+    AttentionWithStreams,
     /// Compressed-latent attention state without fixed components.
     CompressedAttention,
     /// Compressed-latent attention plus architecture-declared fixed components.
@@ -1184,6 +1202,7 @@ pub struct ReplicatedTextRequirements {
     group_transports: Vec<ArchitectureGroupTransport>,
     /// Complete architecture-owned mutable-state geometry.
     state_layout: StateLayout,
+    append_streams: Vec<crate::AppendStreamBinding>,
     /// Static state-access semantics used by architecture traversal.
     state_access: ReplicatedTextStateAccess,
     /// Canonical logical parameter requirements.
@@ -1198,6 +1217,32 @@ pub struct ReplicatedTextRequirements {
 }
 
 impl ReplicatedTextRequirements {
+    /// Projects this target's exact state contract for shared cold admission.
+    pub fn state_requirements(&self) -> StateRealizationRequirements {
+        StateRealizationRequirements {
+            layout: self.state_layout.clone(),
+            access: self.state_access,
+            floating_source: self.floating_state_source.clone(),
+            append_streams: self.append_streams.clone(),
+        }
+    }
+
+    /// Retains complete finite stream bounds before mechanism selection.
+    pub fn with_append_streams(
+        mut self,
+        bindings: Vec<crate::AppendStreamBinding>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        crate::AppendStreamBinding::validate_layout(&self.state_layout, &bindings)
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        self.append_streams = bindings;
+        Ok(self)
+    }
+
+    /// Exact architecture-owned stream identities, lanes and finite allowances.
+    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+        &self.append_streams
+    }
+
     /// Retains the ordinary reusable module topology alongside selected parameters.
     pub fn with_execution_topology(
         mut self,
@@ -1240,6 +1285,10 @@ impl ReplicatedTextRequirements {
             ));
         }
         validate_state_access_profile(&layout, self.state_access)?;
+        if !self.append_streams.is_empty() {
+            crate::AppendStreamBinding::validate_layout(&layout, &self.append_streams)
+                .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        }
         self.state_layout = layout;
         Ok(self)
     }
@@ -1320,6 +1369,7 @@ impl ReplicatedTextRequirements {
             execution_units,
             group_transports,
             state_layout,
+            append_streams: Vec::new(),
             state_access,
             parameters,
             auxiliary_parameters: Vec::new(),
@@ -1517,6 +1567,12 @@ impl ReplicatedTextRequirements {
         self
     }
 
+    /// Includes optional neural mechanisms used by separately invoked auxiliaries.
+    pub fn with_additional_operators(mut self, operators: NeuralOperatorCapabilities) -> Self {
+        self.operators = self.operators.union(operators);
+        self
+    }
+
     /// Returns required optional neural-operation semantics.
     pub const fn operators(&self) -> NeuralOperatorCapabilities {
         self.operators
@@ -1602,7 +1658,16 @@ fn validate_state_access_profile(
     let has_ordinary = roles.iter().copied().any(ordinary);
     let has_compressed = roles.iter().copied().any(compressed);
     let has_fixed = roles.iter().copied().any(fixed);
+    let append = |role| matches!(role, StateComponentRole::AppendStream { .. });
     let coherent = match access {
+        ReplicatedTextStateAccess::AttentionWithStreams => {
+            has_ordinary
+                && roles.iter().copied().any(append)
+                && roles
+                    .iter()
+                    .copied()
+                    .all(|role| ordinary(role) || fixed(role) || append(role))
+        }
         ReplicatedTextStateAccess::Stateless => roles.is_empty(),
         ReplicatedTextStateAccess::KeyValue => roles.iter().copied().all(ordinary) && has_ordinary,
         ReplicatedTextStateAccess::Fixed => roles.iter().copied().all(fixed) && has_fixed,
@@ -3253,6 +3318,164 @@ impl SelectedStateComponentRealization {
     }
 }
 
+/// Exact architecture-authored state contract, independent of immutable weights.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StateRealizationRequirements {
+    layout: StateLayout,
+    access: ReplicatedTextStateAccess,
+    floating_source: Option<TensorDtype>,
+    append_streams: Vec<crate::AppendStreamBinding>,
+}
+impl StateRealizationRequirements {
+    /// Validates access semantics and finite stream geometry before cold selection.
+    pub fn new(
+        layout: StateLayout,
+        access: ReplicatedTextStateAccess,
+        floating_source: Option<TensorDtype>,
+        append_streams: Vec<crate::AppendStreamBinding>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        validate_state_access_profile(&layout, access)?;
+        crate::AppendStreamBinding::validate_layout(&layout, &append_streams)
+            .map_err(|e| ReplicatedTextContractError::invalid(e.to_string()))?;
+        Ok(Self {
+            layout,
+            access,
+            floating_source,
+            append_streams,
+        })
+    }
+    /// Complete logical geometry in this state's own layer address space.
+    pub fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+    /// Architecture traversal contract used by typed state construction.
+    pub fn access(&self) -> ReplicatedTextStateAccess {
+        self.access
+    }
+    /// Exact source dtype for backend floating-state capability queries.
+    pub fn floating_source(&self) -> Option<&TensorDtype> {
+        self.floating_source.as_ref()
+    }
+    /// Required streams, lanes and finite allowances.
+    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+        &self.append_streams
+    }
+}
+
+/// Selects mutable state without weight mechanisms, payload reads or native allocation.
+/// Target and auxiliary roles call this with separate exact component capabilities.
+pub fn select_state_realization(
+    requirements: &StateRealizationRequirements,
+    request: &ReplicatedTextSelectionRequest,
+    capabilities: &StateMechanismCapabilities,
+) -> Result<SelectedStateRealization, ReplicatedTextSelectionError> {
+    let mut issues = Vec::new();
+    let floating_dtype = match capabilities.floating_state_dtype() {
+        Some((source, dtype))
+            if Some(source) == requirements.floating_source.as_ref() && dtype.is_floating() =>
+        {
+            Some(dtype)
+        }
+        Some(_) => {
+            issues.push("floating-state dtype support differs from the selected source".into());
+            None
+        }
+        None => None,
+    };
+    let mut state_components = Vec::new();
+    for layer in 0..requirements.layout.len() {
+        for component in requirements
+            .layout
+            .components(layer)
+            .expect("state layout exposes every validated layer")
+        {
+            let Some(storage_dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype)
+            else {
+                issues.push(format!(
+                    "state component {} at layer {layer} has no selected floating storage dtype",
+                    component.role().stable_name()
+                ));
+                continue;
+            };
+            let matches = capabilities
+                .components
+                .iter()
+                .filter(|mechanism| mechanism.layer == layer && mechanism.component == *component)
+                .collect::<Vec<_>>();
+            let role = component.role().stable_name();
+            match matches.as_slice() {
+                [mechanism] => match mechanism.placement(&request.state) {
+                    Some(placement) if placement_is_compatible(component, &request.state, placement) => {
+                        state_components.push(SelectedStateComponentRealization {
+                            layer,
+                            component: component.clone(),
+                            storage_dtype,
+                            placement,
+                        });
+                    }
+                    Some(placement) => issues.push(format!(
+                        "state component {role} at layer {layer} has incompatible {placement:?} placement for {:?} and {:?} residency",
+                        request.state,
+                        component.residency()
+                    )),
+                    None => issues.push(format!(
+                        "state component {role} at layer {layer} for {:?}",
+                        request.state
+                    )),
+                },
+                [] => issues.push(format!(
+                    "state component {role} at layer {layer} with shape {:?} and dtype {:?}",
+                    component.shape(),
+                    component.dtype()
+                )),
+                _ => issues.push(format!(
+                    "unique state component mechanism {role} at layer {layer}"
+                )),
+            }
+        }
+    }
+    for (supported, name) in [
+        (capabilities.checkpoint, "state checkpoint"),
+        (capabilities.rollback, "state rollback"),
+        (capabilities.reset, "state reset"),
+    ] {
+        if !supported {
+            issues.push(name.into());
+        }
+    }
+    if request.prompt_cache && !capabilities.prompt_cache {
+        issues.push("state prompt-cache persistence".into());
+    }
+    if (request.session.output_observation() || request.session.activation_inspection())
+        && !capabilities.observation_retention
+    {
+        issues.push("state observation retention".into());
+    }
+    if !issues.is_empty() {
+        return Err(ReplicatedTextSelectionError { issues });
+    }
+    let selected = SelectedStateRealization {
+        floating_dtype,
+        layout: requirements.layout.clone(),
+        access: requirements.access,
+        policy: request.state.clone(),
+        components: state_components,
+        append_streams: requirements.append_streams.clone(),
+        checkpoint: true,
+        rollback: true,
+        reset: true,
+        prompt_cache: request.prompt_cache,
+        observation_retention: request.session.output_observation()
+            || request.session.activation_inspection(),
+    };
+    crate::AppendStreamBinding::validate_selected(&selected, selected.append_streams()).map_err(
+        |error| ReplicatedTextSelectionError {
+            issues: vec![format!("append-stream binding: {error}")],
+        },
+    )?;
+    Ok(selected)
+}
+
 /// Authoritative mutable-state realization selected before allocation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedStateRealization {
@@ -3261,6 +3484,7 @@ pub struct SelectedStateRealization {
     access: ReplicatedTextStateAccess,
     policy: CacheResidencyPolicy,
     components: Vec<SelectedStateComponentRealization>,
+    append_streams: Vec<crate::AppendStreamBinding>,
     checkpoint: bool,
     rollback: bool,
     reset: bool,
@@ -3269,6 +3493,72 @@ pub struct SelectedStateRealization {
 }
 
 impl SelectedStateRealization {
+    /// Complete retained stream bindings; native construction cannot replace them.
+    pub fn append_streams(&self) -> &[crate::AppendStreamBinding] {
+        &self.append_streams
+    }
+
+    /// Aggregate local allowances, preserving the selected number of sequence lanes.
+    pub fn append_stream_allowances(&self) -> crate::AppendStreamAllowances {
+        crate::AppendStreamBinding::allowances(&self.append_streams)
+            .expect("selected append stream allowances were checked before construction")
+    }
+
+    fn partition_streams(
+        &self,
+        partition: &crate::PartitionState,
+    ) -> Result<Vec<crate::AppendStreamBinding>, ReplicatedTextContractError> {
+        let range = partition.global_layers();
+        let bindings = self
+            .append_streams
+            .iter()
+            .filter(|binding| range.contains(&binding.layer))
+            .cloned()
+            .map(|mut binding| {
+                let global_policy = self
+                    .layout
+                    .layer(binding.layer)
+                    .and_then(|layer| {
+                        layer
+                            .append_streams()
+                            .iter()
+                            .find(|policy| policy.slot() == binding.spec.slot)
+                    })
+                    .expect("selected stream belongs to a declared policy");
+                binding.layer -= range.start;
+                let policy = partition
+                    .layout()
+                    .layer(binding.layer)
+                    .and_then(|layer| {
+                        layer
+                            .append_streams()
+                            .iter()
+                            .find(|policy| policy.slot() == binding.spec.slot)
+                    })
+                    .ok_or_else(|| {
+                        ReplicatedTextContractError::invalid(
+                            "partition lost a selected append stream",
+                        )
+                    })?;
+                if policy.record_tokens() != global_policy.record_tokens() {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "partition changed a selected append stream record cadence",
+                    ));
+                }
+                if policy.width() > binding.spec.width {
+                    return Err(ReplicatedTextContractError::invalid(
+                        "partition widened a selected append stream",
+                    ));
+                }
+                binding.spec.width = policy.width();
+                Ok(binding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::AppendStreamBinding::validate_layout(partition.layout(), &bindings)
+            .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+        Ok(bindings)
+    }
+
     /// Native representation selected from the architecture's floating-state source.
     pub const fn floating_dtype(&self) -> Option<StateStorageDtype> {
         self.floating_dtype
@@ -3327,6 +3617,7 @@ impl SelectedStateRealization {
             access: self.access,
             policy: self.policy.clone(),
             components,
+            append_streams: self.partition_streams(partition)?,
             checkpoint: self.checkpoint,
             rollback: self.rollback,
             reset: self.reset,
@@ -3409,6 +3700,7 @@ impl SelectedStateRealization {
             access: self.access,
             policy: self.policy.clone(),
             components,
+            append_streams: self.partition_streams(partition)?,
             checkpoint: self.checkpoint,
             rollback: self.rollback,
             reset: self.reset,
@@ -3499,7 +3791,8 @@ impl SelectedReplicatedTextRealization {
         self.parameter_conversion_retention
     }
     /// Ordinary prefix support from retained architecture and backend facts.
-    /// Outer preparation must still apply prediction, composite and partition restrictions.
+    /// Outer preparation must still apply prediction and capture restrictions;
+    /// partitioned requests also require exact request-step agreement.
     pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
         if !self.requirements.supports_chunked_prefill() {
             Err("selected architecture does not implement chunked prefill")
@@ -3621,87 +3914,13 @@ pub fn select_replicated_text_realization(
     {
         issues.push(format!("weight residency {residency_mechanism:?}"));
     }
-    let floating_dtype = match capabilities.state.floating_state_dtype() {
-        Some((source, dtype))
-            if Some(source) == requirements.floating_state_source() && dtype.is_floating() =>
-        {
-            Some(dtype)
-        }
-        Some(_) => {
-            issues.push("floating-state dtype support differs from the selected source".into());
-            None
-        }
-        None => None,
-    };
-    let mut state_components = Vec::new();
-    for layer in 0..requirements.state_layout.len() {
-        for component in requirements
-            .state_layout
-            .components(layer)
-            .expect("state layout exposes every validated layer")
-        {
-            let Some(storage_dtype) = StateStorageDtype::resolve(component.dtype(), floating_dtype)
-            else {
-                issues.push(format!(
-                    "state component {} at layer {layer} has no selected floating storage dtype",
-                    component.role().stable_name()
-                ));
-                continue;
-            };
-            let matches = capabilities
-                .state
-                .components
-                .iter()
-                .filter(|mechanism| mechanism.layer == layer && mechanism.component == *component)
-                .collect::<Vec<_>>();
-            let role = component.role().stable_name();
-            match matches.as_slice() {
-                [mechanism] => match mechanism.placement(&request.state) {
-                    Some(placement) if placement_is_compatible(component, &request.state, placement) => {
-                        state_components.push(SelectedStateComponentRealization {
-                            layer,
-                            component: component.clone(),
-                            storage_dtype,
-                            placement,
-                        });
-                    }
-                    Some(placement) => issues.push(format!(
-                        "state component {role} at layer {layer} has incompatible {placement:?} placement for {:?} and {:?} residency",
-                        request.state,
-                        component.residency()
-                    )),
-                    None => issues.push(format!(
-                        "state component {role} at layer {layer} for {:?}",
-                        request.state
-                    )),
-                },
-                [] => issues.push(format!(
-                    "state component {role} at layer {layer} with shape {:?} and dtype {:?}",
-                    component.shape(),
-                    component.dtype()
-                )),
-                _ => issues.push(format!(
-                    "unique state component mechanism {role} at layer {layer}"
-                )),
-            }
-        }
-    }
-    for (supported, name) in [
-        (capabilities.state.checkpoint, "state checkpoint"),
-        (capabilities.state.rollback, "state rollback"),
-        (capabilities.state.reset, "state reset"),
-    ] {
-        if !supported {
-            issues.push(name.into());
-        }
-    }
-    if request.prompt_cache && !capabilities.state.prompt_cache {
-        issues.push("state prompt-cache persistence".into());
-    }
-    if (request.session.output_observation() || request.session.activation_inspection())
-        && !capabilities.state.observation_retention
-    {
-        issues.push("state observation retention".into());
+    let state = select_state_realization(
+        &requirements.state_requirements(),
+        request,
+        &capabilities.state,
+    );
+    if let Err(error) = &state {
+        issues.extend(error.issues().iter().cloned());
     }
     for (required, supported, name) in [
         (
@@ -3827,19 +4046,7 @@ pub fn select_replicated_text_realization(
             .topology
             .unwrap_or_else(|| ParallelTopology::new(1, 1, 1, 1).expect("replicated topology")),
         residency: request.residency,
-        state: SelectedStateRealization {
-            floating_dtype,
-            layout: requirements.state_layout.clone(),
-            access: requirements.state_access,
-            policy: request.state.clone(),
-            components: state_components,
-            checkpoint: true,
-            rollback: true,
-            reset: true,
-            prompt_cache: request.prompt_cache,
-            observation_retention: request.session.output_observation()
-                || request.session.activation_inspection(),
-        },
+        state: state.expect("state admission issues were returned before construction"),
         parameters,
         materialization_tasks: Vec::new(),
         auxiliary_parameters,
@@ -3926,6 +4133,66 @@ mod tests {
             2,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn native_required_projection_infers_packed_axis_without_enabling_transforms() {
+        let encoding = SourceTensorEncoding::Gguf {
+            ggml_type: eredu_gguf::GgmlType::Q8_0,
+            endian: eredu_gguf::Endian::Little,
+        };
+        let format = LinearFormat::GgufIQuant {
+            ggml_type: eredu_gguf::GgmlType::Q8_0,
+            endian: eredu_gguf::Endian::Little,
+        };
+        for shape in [vec![64, 32], vec![3, 64, 32], vec![64, 31]] {
+            let source = ReplicatedTextPhysicalSource::new(
+                "projection.weight",
+                "projection.weight",
+                "/checkpoint/model.gguf",
+                "projection.weight",
+                encoding.clone(),
+                2176,
+            )
+            .unwrap();
+            let requirement = ReplicatedTextParameterRequirement::new(
+                "projection.weight",
+                vec!["projection.weight".into()],
+                vec![source],
+                vec![],
+                Some(encoding.clone()),
+                Some(shape.clone()),
+                shape.clone(),
+                format,
+                ReplicatedTextParameterRole::LinearWeight,
+                ReplicatedTextParameterOwner::StaticRole("projection".into()),
+                ReplicatedTextParameterPresence::Required,
+                ParameterTransformConstraint::None,
+            )
+            .unwrap();
+            let descriptor = requirement.lowering_descriptor(format).unwrap();
+            assert_eq!(descriptor.packed_axis(), Some(shape.len() - 1));
+            assert_eq!(descriptor.physical_shape(), shape);
+            assert_eq!(descriptor.logical_shape(), shape);
+            assert_eq!(
+                descriptor.has_valid_direct_geometry(),
+                shape.last() == Some(&32)
+            );
+            assert_eq!(
+                requirement
+                    .lowering_descriptor(LinearFormat::Dense)
+                    .unwrap()
+                    .packed_axis(),
+                None
+            );
+            assert!(requirement
+                .transform_target(QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4
+                })
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]
@@ -4296,7 +4563,8 @@ mod tests {
                             eredu_core::cache::StateComponentRole::AttentionKeys
                             | eredu_core::cache::StateComponentRole::AttentionValues
                             | eredu_core::cache::StateComponentRole::CompressedLatent
-                            | eredu_core::cache::StateComponentRole::RotaryKeys => {
+                            | eredu_core::cache::StateComponentRole::RotaryKeys
+                            | eredu_core::cache::StateComponentRole::AppendStream { .. } => {
                                 StateComponentPlacement::Paged
                             }
                             eredu_core::cache::StateComponentRole::Fixed(_) => {
@@ -5159,11 +5427,12 @@ mod tests {
         requirements.state_layout = StateLayout::new(
             LayerSchedule::new(
                 1,
-                vec![LayerCachePolicy::key_value_with_fixed_state(
+                vec![LayerCachePolicy::key_value_with_state(
                     AttentionPolicy::Full,
                     1,
                     8,
                     vec![fixed],
+                    Vec::new(),
                 )
                 .unwrap()],
             )
@@ -5263,6 +5532,152 @@ mod tests {
     }
 
     #[test]
+    fn combined_stream_profile_selects_exact_integer_storage_and_requires_complete_bindings() {
+        use crate::{AppendStreamBinding, AppendStreamLimits, AppendStreamSpec};
+        use eredu_core::cache::AppendStreamPolicy;
+        use eredu_nn::TensorElementType;
+        let layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value_with_state(
+                    AttentionPolicy::Full,
+                    1,
+                    8,
+                    vec![],
+                    vec![AppendStreamPolicy::new(5, 2, StateTensorDtype::Int32, 4).unwrap()],
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            validate_state_access_profile(&layout, ReplicatedTextStateAccess::KeyValue).is_err()
+        );
+        assert!(validate_state_access_profile(
+            &layout,
+            ReplicatedTextStateAccess::AttentionWithFixed
+        )
+        .is_err());
+        let mut requirements = requirements();
+        requirements.state_layout = layout.clone();
+        requirements.state_access = ReplicatedTextStateAccess::AttentionWithStreams;
+        validate_state_access_profile(&layout, requirements.state_access).unwrap();
+        let mut mechanisms = capabilities();
+        mechanisms.state.components = layout
+            .components(0)
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|component| {
+                StateComponentMechanism::new(
+                    0,
+                    component,
+                    Some(StateComponentPlacement::Device),
+                    Some(StateComponentPlacement::Paged),
+                )
+            })
+            .collect();
+        let binding = AppendStreamBinding {
+            layer: 0,
+            lanes: 2,
+            spec: AppendStreamSpec {
+                slot: 5,
+                width: 2,
+                element: TensorElementType::I32,
+            },
+            limits: AppendStreamLimits {
+                entries: 32,
+                page_entries: 4,
+                read_entries: 3,
+            },
+            payload_bytes: 256,
+            scratch_bytes: 112,
+            catalog_bytes: 65536,
+        };
+        assert!(
+            select_replicated_text_realization(
+                &requirements,
+                &request(LayerWeightResidency::FullyResident),
+                &mechanisms,
+            )
+            .is_err(),
+            "missing bindings must reject before construction"
+        );
+        requirements = requirements
+            .with_append_streams(vec![binding.clone()])
+            .unwrap();
+        let selected = select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &mechanisms,
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .state()
+                .components()
+                .last()
+                .unwrap()
+                .storage_dtype(),
+            StateStorageDtype::I32
+        );
+        assert_eq!(
+            selected.state().components().last().unwrap().placement(),
+            StateComponentPlacement::Paged
+        );
+        AppendStreamBinding::validate_selected(selected.state(), std::slice::from_ref(&binding))
+            .unwrap();
+        use crate::execution_resources::PreparedStateResource;
+        let states = [
+            PreparedStateResource {
+                owner: "target",
+                state: selected.state(),
+            },
+            PreparedStateResource {
+                owner: "prediction",
+                state: selected.state(),
+            },
+        ];
+        let allowances = PreparedStateResource::append_stream_allowances(&states).unwrap();
+        assert_eq!(
+            allowances.payload_bytes, 0,
+            "paged payload is charged to its selected pool"
+        );
+        assert_eq!(allowances.scratch_bytes, 4 * 112);
+        assert_eq!(allowances.catalog_bytes, 4 * 65536);
+        let mut large = selected.state().clone();
+        large.append_streams[0].catalog_bytes = u64::MAX / 2;
+        AppendStreamBinding::validate_selected(&large, large.append_streams()).unwrap();
+        assert!(
+            PreparedStateResource::append_stream_allowances(&[
+                PreparedStateResource {
+                    owner: "target",
+                    state: &large
+                },
+                PreparedStateResource {
+                    owner: "prediction",
+                    state: &large
+                },
+            ])
+            .is_err(),
+            "individually valid allowances can overflow their joint total"
+        );
+
+        assert!(AppendStreamBinding::validate_selected(selected.state(), &[]).is_err());
+        let mut wrong = binding;
+        wrong.spec.element = TensorElementType::F32;
+        assert!(AppendStreamBinding::validate_selected(selected.state(), &[wrong]).is_err());
+        mechanisms.state.components.pop();
+        assert!(select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &mechanisms
+        )
+        .is_err());
+    }
+
+    #[test]
     fn requirements_reject_state_layout_and_access_profile_mismatch() {
         let fixed = StateTensorPolicy::new(
             StateTensorRole::Recurrent,
@@ -5277,11 +5692,12 @@ mod tests {
         let layout = StateLayout::new(
             LayerSchedule::new(
                 1,
-                vec![LayerCachePolicy::key_value_with_fixed_state(
+                vec![LayerCachePolicy::key_value_with_state(
                     AttentionPolicy::Full,
                     1,
                     8,
                     vec![fixed],
+                    Vec::new(),
                 )
                 .unwrap()],
             )
@@ -5405,3 +5821,7 @@ mod tests {
             .any(|issue| { issue.contains("GatedProductTensorParallelPartial") }));
     }
 }
+
+#[cfg(test)]
+#[path = "replicated_text/stream_tests.rs"]
+mod stream_tests;

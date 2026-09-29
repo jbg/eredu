@@ -60,7 +60,7 @@ fn resources_use_binding_sharing_and_keep_replicas_and_companions_distinct() {
         slot("output.scales", Some("scales"), "output"),
     ];
     let description =
-        describe_prepared_resources(&selected, Some(selected.state()), &slots, &[], &query())
+        describe_prepared_resources(&selected, &[PreparedStateResource { owner: "target", state: selected.state() }], &slots, &[], &query())
             .unwrap();
     let parameters = description
         .allocations
@@ -80,12 +80,12 @@ fn resources_use_binding_sharing_and_keep_replicas_and_companions_distinct() {
     );
     assert!(parameters.iter().all(|a| matches!(&a.size, ResourceSize::Fixed { extent } if extent.payload == ResourceByteBounds::exact(64) && extent.capacity.upper_bytes.is_none())));
     let again =
-        describe_prepared_resources(&selected, Some(selected.state()), &slots, &[], &query())
+        describe_prepared_resources(&selected, &[PreparedStateResource { owner: "target", state: selected.state() }], &slots, &[], &query())
             .unwrap();
     assert_eq!(description, again);
     let mut other = query();
     other.scope.key = "independent-copy".into();
-    let other = describe_prepared_resources(&selected, Some(selected.state()), &slots, &[], &other)
+    let other = describe_prepared_resources(&selected, &[PreparedStateResource { owner: "target", state: selected.state() }], &slots, &[], &other)
         .unwrap();
     assert_ne!(
         description.allocations[0].identity,
@@ -105,7 +105,7 @@ fn resources_do_not_infer_backing_from_logical_ties_or_aggregate_banks() {
         tied,
         bank,
     ];
-    let description = describe_prepared_resources(&selected, None, &slots, &[], &query()).unwrap();
+    let description = describe_prepared_resources(&selected, &[], &slots, &[], &query()).unwrap();
     assert_eq!(description.allocations.len(), 1);
     let ResourceCoverage::Partial { reasons } = &description.coverage else {
         panic!("incomplete mechanism facts cannot imply coverage")
@@ -127,7 +127,7 @@ fn conflicting_backing_geometry_invalid_pool_and_overflow_are_rejected() {
     let first = slot("a", Some("shared"), "embedding");
     let mut second = slot("b", Some("shared"), "output");
     second.materialized.byte_len = 128;
-    assert!(describe_prepared_resources(&selected, None, &[first, second], &[], &query()).is_err());
+    assert!(describe_prepared_resources(&selected, &[], &[first, second], &[], &query()).is_err());
     let mut q = query();
     q.prefix_positions = u64::MAX;
     assert!(selected.describe_prepared_resources(&q).is_err());
@@ -277,7 +277,7 @@ fn prediction_resources_preserve_physical_parameter_owners_state_offsets_and_fea
     // Same local backing key in separate materialization batches is not sharing.
     let mut description = describe_prepared_resources(
         &selected,
-        None,
+        &[],
         &[target.clone(), prediction.clone()],
         &[],
         &query(),
@@ -377,7 +377,7 @@ fn feature_binding_rejects_bad_shapes_conflicts_and_duplicate_input_without_muta
     let topology = prediction_topology();
     let mut description = describe_prepared_resources(
         &selected,
-        None,
+        &[],
         &[slot("target", Some("target"), "embedding")],
         &[],
         &query(),
@@ -536,4 +536,33 @@ fn prediction_sliding_state_keeps_window_minimum_and_full_prefix_upper_end() {
         );
         assert_eq!(current.capacity.lower_bytes, 16);
     }
+}
+
+#[test]
+fn named_state_owners_preserve_replicas_without_duplicating_parameters() {
+    let selected = selection();
+    let states = [
+        PreparedStateResource { owner: "target", state: selected.state() },
+        PreparedStateResource { owner: "prediction", state: selected.state() },
+    ];
+    let slots = [slot("embedding.weight", Some("shared"), "embedding")];
+    let report = describe_prepared_resources(&selected, &states, &slots, &[], &query()).unwrap();
+    assert_eq!(report.allocations.len(), 5);
+    let parameters: Vec<_> = report.allocations.iter().filter(|a| a.uses[0].role == ResourceRole::Parameters).collect();
+    assert_eq!(parameters.len(), 1);
+    for role in ["target", "prediction"] {
+        let members: Vec<_> = report.allocations.iter().filter(|a| a.identity.key.starts_with(&format!("state/{role}/"))).collect();
+        assert_eq!(members.len(), 2);
+        for member in members {
+            let ResourceSize::ContextDependent { current, horizon_peak } = &member.size else { panic!() };
+            assert_eq!(current.payload.lower_bytes, 80);
+            assert_eq!(horizon_peak.payload.upper_bytes, Some(128));
+            assert!(horizon_peak.capacity.upper_bytes.is_none());
+        }
+    }
+    let duplicate = [states[0], states[0]];
+    assert!(describe_prepared_resources(&selected, &duplicate, &[], &[], &query()).is_err());
+    assert!(PreparedStateResource::append_stream_allowances(&duplicate).is_err());
+    let blank = [PreparedStateResource { owner: " ", state: selected.state() }];
+    assert!(describe_prepared_resources(&selected, &blank, &[], &[], &query()).is_err());
 }

@@ -3,7 +3,7 @@
 The dense, MoE and MoVA implementations are integrated with SafeTensors/GGUF
 loading, bounded expert residency, partitioned execution, tokenization and shared
 generation/control drivers. Portable and native conformance passes as described
-below. The released dense and MoVA SafeTensors BF16 comparisons now match the
+below. The released dense and MoVA SafeTensors BF16 comparisons match the
 pinned publisher implementation exactly for prefill and four cached decode steps.
 Their official BF16 GGUFs, short natural-text prompts, and complete tool-call
 prompts also pass the unchanged numerical criteria, with bit-exact CPU and Metal logits.
@@ -58,7 +58,7 @@ and four cached decode steps to the independent oracle and verifies reset.
 The fixture serializes the oracle's packed matrices into individual experts,
 including the same selection-only router biases.
 
-Native CPU Ring validation now passes 14 resident/ordinary-weight distributed
+Native CPU Ring validation passes 14 resident/ordinary-weight distributed
 cases for dense K2 and MoVA: TP2, PP2, TP2/PP2, host-layerwise TP2,
 disk-streamed PP2, and MoVA EP2, TP2/EP2, PP2/EP2 and TP2/PP2/EP2.
 Eight further MoVA cases use independently addressable banks, including host
@@ -67,7 +67,7 @@ logits, distributed prompt-cache restore and continued decoding, and verify
 rank-local ownership of both unequal expert banks within a shared 1,152-byte
 cache. Local loopback sockets require running the native test outside the sandbox.
 
-The scalar partition adapter now uses the shared bounded runtime constructor;
+The scalar partition adapter uses the shared bounded runtime constructor;
 its evidence verifies one loaded block at a time for host/disk execution.
 Collective-wave tests additionally check different bank cardinalities and value
 output widths, bank order within a block, and cuts around the dense prefix.
@@ -82,23 +82,15 @@ seven-token state, and verifies host demotion and promotion. Both expert banks
 share one residency budget. Per-bank identities and counters
 remain distinct, aggregate occupancy stays within that budget, and a generic
 native regression forces cross-bank eviction/reacquisition with exact companion
-recovery. Rollback testing found and fixed a shared paged-cache defect: restoring
-a saved partial tail previously also left a sealed copy of that same token range.
-The architecture conformance rerun after the shared-pool/exchange changes passes
-154 numerical and 46 structural tests. Seventeen native bank-residency tests and
-sixteen neutral expert-exchange tests also pass. The full AGENTS.md portable
-build matrix and portable facade/backend conformance rerun also passes.
-The final rerun includes 533 architecture unit tests, 312 runtime unit tests,
-64 neutral session conformance tests, 623 native unit tests, and the 34 native
-distributed cases.
+recovery. Prompt-cache rollback preserves one copy of each token range, including a
+partially filled tail.
 Commands, toolchain versions, exit codes and log hashes are recorded in
 [`k2_horizon_checks.json`](../eredu-backend-mlx/validation/k2_horizon_checks.json).
 
 Nonzero FP8 execution compares both banks and explicitly excluded parameters
 against the pinned publisher model with independently expanded F32 weights and
-E4M3 activation quantization hooks. A weight-only oracle omitted the declared
-dynamic activation quantization; the corrected CPU fallback and independent
-oracle now agree with the GPU equation. The fixture records the exact input
+E4M3 activation quantization hooks. The CPU fallback and independent oracle include the declared dynamic
+activation quantization and agree with the GPU equation. The fixture records the exact input
 artifact hash, publisher hash and per-projection quantization policy in
 `validation/k2_fp8_reference.json`. Resident, host-layerwise and
 disk-streamed runs pass prefill and four cached steps. The independently
@@ -107,9 +99,9 @@ Nonzero Q4_0, MXFP4 and IQ4_NL GGUF fixtures likewise pass all five steps
 against explicit block-arithmetic expansion under those residency modes with
 a 16,384-byte expert cache. All nine quantized TP2/PP2/EP2 cases and all
 three FP8 TP2/PP2/EP2 cases also pass under resident/host/disk ordinary weights.
-These tests found and fixed missing packed companion recipes, logical-width
-retention for derived native byte blocks, contiguous IQ4_NL byte-offset mapping,
-and fused FP8 scale partitioning in block-row coordinates. A neutral bounded-read
+Recipe coverage includes packed companions, logical-width retention for derived
+native byte blocks, contiguous IQ4_NL byte-offset mapping and fused FP8 scales in
+block-row coordinates. A neutral bounded-read
 regression also covers Q8_0, whose byte-block size exceeds its logical block width.
 
 All four released artifacts are downloaded and hash-verified. Their SafeTensors
@@ -142,8 +134,7 @@ for prefill and all four cached decode steps: relative L2 zero, cosine one,
 top-ten overlap ten and matching argmax. The full MoVA capture also matches every
 layer output and routing record.
 
-The tolerance failures came from shared numerical mechanisms. CPU matrix
-products now accumulate complete FP32 dots and preserve row-projection strides
+CPU matrix products accumulate complete FP32 dots and preserve row-projection strides
 when selecting a bank member. Dropping the selected bank axis uses a squeeze;
 reshaping a transposed view can copy it and change the reduction order. Grouped
 normalization uses a cascade sum, division by the group width and the reference
@@ -152,32 +143,25 @@ while preserving complete key rows. Explicit rotary products retain the inverse
 frequencies instead of reconstructing their denominators.
 
 FP32 softmax and sigmoid retain the pinned exponential polynomial and arithmetic
-order. The previous symmetric sigmoid formula differed by one FP32 ULP in some
-scores. In the six-token natural prompt, that rounded one layer-20 routing
-coefficient differently and later changed a greedy choice. The corrected trace
-matches that layer's scores, coefficients, expert IDs and output exactly.
-
-Exact router cutoff ties use a value-only descending partition. In the original
-MoVA layer-10 trace, experts 52 and 83 had equal selection scores; choosing the
-other expert changed the feed-forward output despite exact normalization.
+order. Exact router cutoff ties use a value-only descending partition.
 Independent PyTorch fixtures exercise dense and selected row projections,
 adversarial cancellation, grouped normalization, default and YaRN rotary
 products, masked softmax, bounded attention, sigmoid coefficients, and tied
 top-k selection. Their generators, tensor hashes and dependency versions are
 retained under `eredu-backend-mlx/validation`.
 
-The final released matrix passes all sixteen runs: eight each on CPU and Metal.
+The released matrix passes all sixteen runs: eight each on CPU and Metal.
 Each device covers both SafeTensors checkpoints, both official BF16 GGUFs, both
 natural-text prompts and both complete tool prompts. Every compared logit is
 bit-exact. Metal uses generic BF16 row projections and batched products with
 complete FP32 accumulation, cascade normalization and the same FP32
 softmax/sigmoid arithmetic. Exact ties spanning a router cutoff use the
 value-only CPU partition of routing scores; expert parameters remain on device.
-The 86 native neural operator tests also pass, including independent attention
-fixtures with short, masked and long rows.
+Native neural operator fixtures cover independent attention with short, masked
+and long rows.
 
-The host has one physical GPU. Native multi-GPU, CUDA and NCCL distributed runs
-were unavailable; the neutral numerical matrix and native multi-process CPU
+The host has one physical GPU. The validation matrix contains no native multi-GPU, CUDA or NCCL distributed
+measurements; the neutral numerical matrix and native multi-process CPU
 Ring matrix cover the supported partition semantics.
 
 The acceptance policy remains relative L2 ≤ 2%, cosine ≥ 0.999, top-ten overlap
@@ -232,7 +216,7 @@ behaviors, not interchangeable tokenizer configurations.
 
 The Python/Jinja fixtures cover high/medium/low effort, assistant reasoning
 history, tool results, JSON/XML/typed-XML calls and all three tool-presentation
-formats. Shared rendering now matches Transformers' whitespace settings and
+formats. Shared rendering matches Transformers' whitespace settings and
 Python dictionary construction from iterable pairs. IFM parsing and constraints
 use declarative envelopes, recognize rendered behavior without architecture
 names, preserve literal argument newlines, validate type annotations, and pass
@@ -246,7 +230,7 @@ Fixtures and reference versions/hashes are in
 `7420149d96e3aeeb3be0ee050d9b9d0371fedce7fef002caf999247c6a41cf61`.
 The parser's partial type annotations participate in snapshot storage accounting.
 
-Both pinned publisher checkpoints also produced a complete XML call to
+Both pinned publisher checkpoints produce a complete XML call to
 `get_weather` with `{"city":"Paris"}` from the same tool request. Exact rendered
 prompts, generated token IDs and reference hashes are recorded in
 `eredu-text/tests/fixtures/k2_horizon/tool-generation.json`. On both CPU and Metal, the dense
@@ -286,35 +270,31 @@ cargo test -p eredu --no-default-features --lib ifm_ --offline
 
 ## Controlled execution
 
-Native MoVA control tests now pass for resident and independently addressable
+Native MoVA control tests pass for resident and independently addressable
 banks with device and paged KV state. They capture a prefix, advance four steps,
 restore and fork it, intervene on value routing and feed-forward routing
 independently, and compare the restored continuation exactly. Restoring state
 preserves cumulative bank requests. Paged copies use independent namespaces in
-one shared finite pool, and snapshot estimates include sealed blocks. The test
-found and fixed copying of strided paged tails; separate full/sliding cache
+one shared finite pool, and snapshot estimates include sealed blocks. Strided paged tails have independent copies; full/sliding cache
 conformance compares interleaved branches with a scalar attention oracle.
 
 Distributed state-copy preparation uses the retained bounded failure-agreement
 mechanism before publishing a copy or exchanging branches. Native dense/MoVA
 and quantized GGUF branch schedules compare four continued decode steps,
 mid-continuation snapshots and reuse of immutable snapshots after descendants
-advance. The expanded FP8 branch schedule requires more host capacity than its
-ordinary run: a 32 KiB host limit produced coordinated copy failure, and the
-branch matrix reserves finite 1 MiB host and 128 KiB device tiers. The 34
+advance. The FP8 branch matrix reserves finite 1 MiB host and 128 KiB device tiers.
+A 32 KiB host allowance is insufficient for the copied state and yields a
+coordinated copy failure. The 34
 distributed ordinary/bounded/quantized/FP8 cases all pass their branch schedules.
 Neutral tests verify remote copy/exchange failure fences retries and leave
 installed state unchanged. Commit epochs stay monotonic across branch exchange,
-manual rollback and prompt-cache restore. All 64 neutral backend-independence
-tests pass.
+manual rollback and prompt-cache restore.
 
 Three public-facade CPU tests cover dense K2 and MoVA: controlled/uninterrupted
 sampling with resident, host-layerwise and disk-streamed weights; restoration and
 forking during partial Unicode output after deleting the loaded artifacts; and
 bounded captures with an unchanged and a modified continuation. These pass
-through the existing public generation and control drivers. The rebuilt full
-facade suite passes all fifteen tests, including existing family and assistant
-regressions and the K2 speculative matrix below.
+through the existing public generation and control drivers.
 
 The public distributed facade matrix also passes six cases: dense TP2/PP2 and
 MoVA TP2/PP2/EP2 with resident, host-layerwise and disk-streamed ordinary weights.
@@ -322,8 +302,8 @@ MoVA uses independently acquired banks. Each case compares greedy and seeded
 sampled uninterrupted/control runs, restores a snapshot, exchanges a fork and
 verifies that copying continues to consume the cumulative budget. The test lives
 above the facade in `eredu-cli`; production backends do not depend on the facade.
-Distributed facade cases cover continuation and state control. Bounded activation
-capture remains subject to the current shared single-rank capture capability.
+Distributed facade cases cover continuation and state control. Activation capture
+availability follows loaded discovery.
 
 ```sh
 cargo test -p eredu-backend-mlx --no-default-features --lib k2_mova_native_control --offline
@@ -351,7 +331,7 @@ reuse them. It does not claim to bound opaque driver bookkeeping, allocator
 caches or request-sized attention activations. Missing native estimates remain
 unknown instead of being reported as zero.
 
-K2 checkpoints publish no embedded prediction head. They can now pair with an
+K2 checkpoints publish no embedded prediction head. They can pair with an
 ordinary tokenizer-compatible decoder through the existing external drafting
 plan. Architecture preparation retains the exact ordinary sources, lowering,
 placement and tokenizer proof. The runtime's independent-draft transaction uses

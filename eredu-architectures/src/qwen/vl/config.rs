@@ -354,7 +354,7 @@ pub fn state_layout_with_key_value_heads(
                 .get(layer)
                 .ok_or_else(|| invalid(format!("missing attention layer {layer}")))?;
             if layer == 0 {
-                LayerCachePolicy::key_value_with_fixed_state(
+                LayerCachePolicy::key_value_with_state(
                     attention,
                     key_value_heads[layer],
                     args.text.head_dim,
@@ -365,6 +365,7 @@ pub fn state_layout_with_key_value_heads(
                         MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(|error| invalid(error.to_string()))?],
+                    Vec::new(),
                 )
             } else {
                 LayerCachePolicy::key_value(attention, key_value_heads[layer], args.text.head_dim)

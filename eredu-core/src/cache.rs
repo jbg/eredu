@@ -7,15 +7,16 @@ mod policy;
 mod prompt;
 
 pub use policy::{
-    CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
-    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateComponentPolicy,
-    StateComponentRole, StateElementBounds, StateResidencyClass, StateTensorDimension,
-    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
+    AppendStreamPolicy, CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation,
+    CacheStreamId, CacheTier, LayerCachePolicy, MutableStateResidency, PoolingStateComponent,
+    StateComponentPolicy, StateComponentRole, StateElementBounds, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+    StateTensorPresence, StateTensorRole,
 };
 pub use prompt::{
     derive_prompt_cache_architecture_fingerprint, prompt_cache_token_fingerprint,
     validate_prompt_cache_model_identity, PromptCacheBlock, PromptCacheDescriptor,
     PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheStateSegment, PromptCacheStateTensor, PromptCacheTopology,
-    PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheStateSegment, PromptCacheStateTensor, PromptCacheStreamFrontier,
+    PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
 };

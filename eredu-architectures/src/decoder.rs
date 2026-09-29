@@ -38,15 +38,15 @@ pub(crate) fn final_hidden_position<T: Tensor>(
     hidden: &T,
     context: &T::Context,
 ) -> Result<T, Error> {
+    if hidden.shape().len() < 3 || hidden.dim(1) <= 0 {
+        return Err(Error::backend(
+            "decoder readout requires nonempty batch/sequence/features",
+        ));
+    }
     let sequence = hidden.dim(1);
-    hidden.index(
-        &[
-            Index::Full,
-            Index::Range(sequence - 1, sequence),
-            Index::Full,
-        ],
-        context,
-    )
+    let mut indices = vec![Index::Full; hidden.shape().len()];
+    indices[1] = Index::Range(sequence - 1, sequence);
+    hidden.index(&indices, context)
 }
 
 /// Optional component instrumentation at the values actually consumed downstream.
@@ -56,7 +56,10 @@ pub struct ComponentInstrumentation<'a, T> {
     unit_path: &'a str,
 }
 
+/// Typed residual ingress and readout transformations.
+pub mod boundary;
 pub mod unary;
+pub use boundary::{DecoderBoundary, NormalizedBoundary};
 
 impl<T: Clone> ComponentInstrumentation<'_, T> {
     /// Ordinary execution, without additional tensor work.
@@ -1265,7 +1268,10 @@ fn validate_schedule<C: Config>(config: &C) -> Result<(), Error> {
 pub struct AttentionInput<'a, T, C> {
     /// Hidden states shaped `[batch, sequence, hidden]`.
     pub hidden: &'a T,
-    /// Optional additive or boolean attention mask.
+    /// Optional absolute selected K/V positions, shaped `[batch,sequence,slots]`.
+    /// `-1` marks unused slots; architectures own causal eligibility.
+    pub selected_positions: Option<&'a T>,
+    /// Optional additive or boolean attention mask (selected-slot shape when indexed).
     pub mask: Option<&'a T>,
     /// Optional mutable layer cache.
     pub cache: Option<&'a mut C>,
@@ -1813,8 +1819,15 @@ impl<B: NeuralBackend> Attention<B> {
         allow_sliding_prefill: bool,
         rotary_position: Option<RotaryPosition<'_, B::Tensor>>,
         external_value: Option<B::Tensor>,
+        selected_positions: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        if selected_positions.is_some() && (self.softcap.is_some() || self.sliding_window.is_some())
+        {
+            return Err(Error::backend(
+                "indexed selection requires uncapped full-history attention",
+            ));
+        }
         let ProjectedAttention {
             queries,
             keys,
@@ -1851,6 +1864,36 @@ impl<B: NeuralBackend> Attention<B> {
             None => (keys, values),
         };
         let sinks = self.sinks.as_ref().map(Parameter::as_ref);
+        if let Some(positions) = selected_positions {
+            let request = eredu_nn::IndexedAttentionInput {
+                queries: &queries,
+                keys: &keys,
+                values: &values,
+                key_position_offset: offset + sequence - keys.dim(2),
+                selected_positions: positions,
+                validity: None,
+                mask,
+                local: None,
+                scale: self.scale,
+                arithmetic: self.arithmetic,
+                sinks,
+            };
+            let attended = if let Some(cache) = cache {
+                cache.indexed_attention::<B>(request, context)?
+            } else {
+                B::indexed_attention(request, context)?
+            };
+            let attended = attended
+                .transpose_axes(&[0, 2, 1, 3], context)?
+                .reshape(&[batch, sequence, -1], context)?;
+            return match output_gate {
+                Some(gate) => attended.multiply(
+                    &self.output_gate_activation.apply::<B>(gate, context)?,
+                    context,
+                ),
+                None => Ok(attended),
+            };
+        }
         if let Some(window) = self.sliding_window.filter(|_| {
             allow_sliding_prefill
                 && sequence > 1
@@ -1931,6 +1974,7 @@ impl<B: NeuralBackend> Attention<B> {
             input.allow_sliding_prefill,
             input.rotary_position,
             None,
+            input.selected_positions,
             context,
         )?;
         let attended = instrumentation.apply("attention.channels", attended)?;
@@ -1958,6 +2002,7 @@ impl<B: NeuralBackend> Attention<B> {
             input.allow_sliding_prefill,
             input.rotary_position,
             value,
+            input.selected_positions,
             context,
         )?;
         self.output.forward(&attended, context)
@@ -1989,6 +2034,7 @@ impl<B: NeuralBackend> Attention<B> {
             input.allow_sliding_prefill,
             input.rotary_position,
             value,
+            input.selected_positions,
             context,
         )?;
         B::row_parallel_linear(&mut self.output, &attended, parallel, context)
@@ -2440,6 +2486,7 @@ where
         let normalized = instrumentation.apply("attention.input", normalized)?;
         let value = values(&mut self.mlp, &normalized, state, context, instrumentation)?;
         let attention_input = AttentionInput {
+            selected_positions: input.selected_positions,
             hidden: &normalized,
             mask: input.mask,
             cache: input.cache,
@@ -2453,6 +2500,7 @@ where
             attention_input.allow_sliding_prefill,
             attention_input.rotary_position,
             value,
+            attention_input.selected_positions,
             context,
         )?;
         let attended = instrumentation.apply("attention.channels", attended)?;
@@ -2634,7 +2682,7 @@ where
         B: GroupedNeuralBackend,
         C: AttentionCache<B::Tensor>,
         F: RoutedProjectionOperator<B>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
@@ -2668,7 +2716,7 @@ where
         B: GroupedNeuralBackend,
         C: AttentionCache<B::Tensor>,
         F: RoutedProjectionOperator<B>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
@@ -2717,7 +2765,7 @@ where
         B: GroupedNeuralBackend,
         C: AttentionCache<B::Tensor>,
         F: TensorParallelRoutedProjectionOperator<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
@@ -2753,7 +2801,7 @@ where
         B: GroupedNeuralBackend,
         C: AttentionCache<B::Tensor>,
         F: TensorParallelRoutedProjectionOperator<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_projections(
@@ -3450,20 +3498,20 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend>(
 /// Pinned modules shared by resident and bounded-residency execution.
 #[derive(Debug, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct StaticModules<B: NeuralBackend> {
+pub struct StaticModules<B: NeuralBackend, D: DecoderBoundary<B> = NormalizedBoundary<B>> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
-    /// Final RMSNorm.
-    pub norm: B::Normalization,
+    /// Architecture-owned input expansion and residual readout.
+    pub boundary: D,
     /// Optional untied vocabulary projection.
     pub lm_head: Option<B::Linear>,
 }
 
-impl<B: NeuralBackend> Clone for StaticModules<B> {
+impl<B: NeuralBackend, D: DecoderBoundary<B> + Clone> Clone for StaticModules<B, D> {
     fn clone(&self) -> Self {
         Self {
             embeddings: self.embeddings.clone(),
-            norm: self.norm.clone(),
+            boundary: self.boundary.clone(),
             lm_head: self.lm_head.clone(),
         }
     }
@@ -3498,6 +3546,59 @@ pub struct StaticModuleSpec {
 }
 
 impl StaticModuleSpec {
+    fn construction_specs(
+        &self,
+    ) -> Result<
+        (
+            EmbeddingSpec,
+            Option<LinearSpec>,
+            NormalizationConstructionSpec,
+        ),
+        Error,
+    > {
+        let embedding = EmbeddingSpec {
+            vocabulary: self.vocabulary,
+            dimensions: self.hidden_size,
+            weight: ParameterSpec::trainable(&self.embedding_weight).map_err(Error::backend)?,
+            format: crate::linear_format::standard_linear_format(
+                &self.embedding_weight,
+                self.embedding_quantization.into(),
+            )?,
+        };
+        let head = (!self.tied_head)
+            .then(|| -> Result<_, Error> {
+                Ok(LinearSpec {
+                    input: self.hidden_size,
+                    output: self.vocabulary,
+                    weight: ParameterSpec::trainable(&self.head_weight).map_err(Error::backend)?,
+                    bias: None,
+                    format: crate::linear_format::standard_linear_format(
+                        &self.head_weight,
+                        self.head_format,
+                    )?,
+                })
+            })
+            .transpose()?;
+        validate_vocabulary_specs(&embedding, head.as_ref())?;
+        let weight =
+            ParameterSpec::trainable(&self.normalization_weight).map_err(Error::backend)?;
+        let normalization = NormalizationConstructionSpec {
+            groups: self.normalization_groups,
+            dimensions: self.hidden_size,
+            epsilon: self.normalization_epsilon,
+            scale: if self.normalization_offset == 0.0 {
+                eredu_nn::NormalizationScale::Learned(weight)
+            } else {
+                eredu_nn::NormalizationScale::LearnedOffset {
+                    weight,
+                    offset: self.normalization_offset,
+                }
+            },
+        };
+        normalization.validate()?;
+        Ok((embedding, head, normalization))
+    }
+
     /// Shared ordinary static-module specification before backend binding.
     pub(crate) fn from_config<C: Config>(config: &C) -> Self {
         let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
@@ -3541,7 +3642,20 @@ impl StaticModuleSpec {
     }
 }
 
-impl<B: eredu_nn::DistributedNeuralBackend> StaticModules<B> {
+impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
+    /// Looks up rank-local vocabulary rows, reduces them, then expands the residual.
+    pub fn embed_parallel(
+        &mut self,
+        tokens: &B::Tensor,
+        policy: EmbeddingLookupPolicy,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let embeddings =
+            B::vocabulary_parallel_lookup(&mut self.embeddings, tokens, policy, parallel, context)?;
+        self.expand_embeddings(&embeddings, context)
+    }
+
     /// Projects an already normalized value through its actual tied or untied
     /// head, retaining the vocabulary collective and projection-input boundary.
     pub(crate) fn project_instrumented(
@@ -3586,12 +3700,12 @@ impl<B: eredu_nn::DistributedNeuralBackend> StaticModules<B> {
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let hidden = instrumentation.normalize_readout(hidden, &mut self.norm, context)?;
+        let hidden = self.boundary.collapse(hidden, context, instrumentation)?;
         self.project_instrumented(&hidden, Some(parallel), context, instrumentation)
     }
 }
 
-impl<B: NeuralBackend> StaticModules<B> {
+impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
     /// Applies the actual residual, normalization and affine readout boundaries.
     pub(crate) fn finish_instrumented(
         &mut self,
@@ -3599,7 +3713,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let hidden = instrumentation.normalize_readout(hidden, &mut self.norm, context)?;
+        let hidden = self.boundary.collapse(hidden, context, instrumentation)?;
         let logits = match &mut self.lm_head {
             Some(head) => {
                 instrumentation.project::<B>("projection_input", head, &hidden, None, context)
@@ -3615,64 +3729,115 @@ impl<B: NeuralBackend> StaticModules<B> {
         Ok(logits)
     }
 
+    /// Embeds token IDs and applies the architecture's residual expansion.
+    pub fn embed(
+        &mut self,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let embeddings = self.embeddings.forward(tokens, context)?;
+        self.expand_embeddings(&embeddings, context)
+    }
+
+    /// Expands already prepared embeddings after any media replacement.
+    pub fn expand_embeddings(
+        &self,
+        embeddings: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.boundary.expand(embeddings, context)
+    }
+
+    /// Builds vocabulary parameters around an architecture-owned residual boundary.
+    /// No ordinary normalization is allocated for a different readout algorithm.
+    pub fn from_boundary(
+        embedding: EmbeddingSpec,
+        head: Option<LinearSpec>,
+        boundary: D,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        validate_vocabulary_specs(&embedding, head.as_ref())?;
+        if embedding.dimensions != boundary.embedding_width() {
+            return Err(Error::backend(
+                "decoder boundary width differs from its vocabulary parameters",
+            ));
+        }
+        Ok(Self {
+            embeddings: B::embedding(embedding, context)?,
+            boundary,
+            lm_head: head.map(|spec| B::linear(spec, context)).transpose()?,
+        })
+    }
+
+    /// Builds the same boundary with explicitly selected vocabulary ownership.
+    pub fn from_parallel_boundary(
+        embedding: EmbeddingSpec,
+        head: Option<LinearSpec>,
+        boundary: D,
+        embedding_range: VocabularyParallelRange,
+        output_range: Option<VocabularyParallelRange>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error>
+    where
+        B: eredu_nn::DistributedNeuralBackend,
+    {
+        validate_vocabulary_specs(&embedding, head.as_ref())?;
+        if embedding.dimensions != boundary.embedding_width() {
+            return Err(Error::backend(
+                "decoder boundary width differs from its vocabulary parameters",
+            ));
+        }
+        embedding_range.validate_global_rows(embedding.vocabulary)?;
+        if head.is_some() != output_range.is_some() {
+            return Err(Error::backend(
+                "vocabulary ownership must match the tied or separate head",
+            ));
+        }
+        if let (Some(head), Some(range)) = (&head, &output_range) {
+            range.validate_global_rows(head.output)?;
+        }
+        Ok(Self {
+            embeddings: B::vocabulary_parallel_embedding(embedding, embedding_range, context)?,
+            boundary,
+            lm_head: head
+                .zip(output_range)
+                .map(|(spec, range)| B::vocabulary_parallel_linear(spec, range, context))
+                .transpose()?,
+        })
+    }
+}
+
+fn validate_vocabulary_specs(
+    embedding: &EmbeddingSpec,
+    head: Option<&LinearSpec>,
+) -> Result<(), Error> {
+    if embedding.vocabulary <= 0
+        || embedding.dimensions <= 0
+        || head.is_some_and(|head| {
+            head.input != embedding.dimensions || head.output != embedding.vocabulary
+        })
+    {
+        return Err(Error::backend(
+            "decoder embedding and vocabulary projection geometry disagree",
+        ));
+    }
+    embedding.format.validate_for_weight(&embedding.weight)?;
+    if let Some(head) = head {
+        head.format.validate_for_weight(&head.weight)?;
+    }
+    Ok(())
+}
+
+impl<B: NeuralBackend> StaticModules<B> {
     /// Builds unloaded pinned modules from architecture-owned parameter
     /// identities and physical formats.
     pub fn from_spec(
         spec: StaticModuleSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embeddings = B::embedding(
-            EmbeddingSpec {
-                vocabulary: spec.vocabulary,
-                dimensions: spec.hidden_size,
-                weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &spec.embedding_weight,
-                    spec.embedding_quantization.into(),
-                )?,
-            },
-            context,
-        )?;
-        let normalization_weight =
-            ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
-        let norm = B::normalization(
-            eredu_nn::NormalizationConstructionSpec {
-                groups: spec.normalization_groups,
-                dimensions: spec.hidden_size,
-                epsilon: spec.normalization_epsilon,
-                scale: if spec.normalization_offset == 0.0 {
-                    eredu_nn::NormalizationScale::Learned(normalization_weight)
-                } else {
-                    eredu_nn::NormalizationScale::LearnedOffset {
-                        weight: normalization_weight,
-                        offset: spec.normalization_offset,
-                    }
-                },
-            },
-            context,
-        )?;
-        let lm_head = if spec.tied_head {
-            None
-        } else {
-            Some(B::linear(
-                LinearSpec {
-                    input: spec.hidden_size,
-                    output: spec.vocabulary,
-                    weight: ParameterSpec::trainable(&spec.head_weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &spec.head_weight,
-                        spec.head_format,
-                    )?,
-                },
-                context,
-            )?)
-        };
-        Ok(Self {
-            embeddings,
-            norm,
-            lm_head,
-        })
+        let (embedding, head, normalization) = spec.construction_specs()?;
+        let boundary = NormalizedBoundary::new(normalization, context)?;
+        Self::from_boundary(embedding, head, boundary, context)
     }
 
     /// Builds the same pinned modules with planner-derived vocabulary ownership.
@@ -3685,74 +3850,16 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        embedding_range.validate_global_rows(spec.vocabulary)?;
-        let embeddings = B::vocabulary_parallel_embedding(
-            EmbeddingSpec {
-                vocabulary: spec.vocabulary,
-                dimensions: spec.hidden_size,
-                weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &spec.embedding_weight,
-                    spec.embedding_quantization.into(),
-                )?,
-            },
+        let (embedding, head, normalization) = spec.construction_specs()?;
+        let boundary = NormalizedBoundary::new(normalization, context)?;
+        Self::from_parallel_boundary(
+            embedding,
+            head,
+            boundary,
             embedding_range,
+            output_range,
             context,
-        )?;
-        let normalization_weight =
-            ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
-        let norm = B::normalization(
-            eredu_nn::NormalizationConstructionSpec {
-                groups: spec.normalization_groups,
-                dimensions: spec.hidden_size,
-                epsilon: spec.normalization_epsilon,
-                scale: if spec.normalization_offset == 0.0 {
-                    eredu_nn::NormalizationScale::Learned(normalization_weight)
-                } else {
-                    eredu_nn::NormalizationScale::LearnedOffset {
-                        weight: normalization_weight,
-                        offset: spec.normalization_offset,
-                    }
-                },
-            },
-            context,
-        )?;
-        let lm_head = match (spec.tied_head, output_range) {
-            (true, None) => None,
-            (true, Some(_)) => {
-                return Err(Error::backend(
-                    "tied decoder output must not declare separate vocabulary ownership",
-                ));
-            }
-            (false, None) => {
-                return Err(Error::backend(
-                    "untied decoder output is missing vocabulary ownership",
-                ));
-            }
-            (false, Some(range)) => {
-                range.validate_global_rows(spec.vocabulary)?;
-                Some(B::vocabulary_parallel_linear(
-                    LinearSpec {
-                        input: spec.hidden_size,
-                        output: spec.vocabulary,
-                        weight: ParameterSpec::trainable(&spec.head_weight)
-                            .map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            &spec.head_weight,
-                            spec.head_format,
-                        )?,
-                    },
-                    range,
-                    context,
-                )?)
-            }
-        };
-        Ok(Self {
-            embeddings,
-            norm,
-            lm_head,
-        })
+        )
     }
 
     /// Builds unloaded pinned modules for a decoder family.
@@ -4067,7 +4174,7 @@ pub trait RoutedProjectionOperator<B: GroupedNeuralBackend>: DecoderProjectionOp
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         Ok(None)
@@ -4083,7 +4190,7 @@ pub trait RoutedProjectionOperator<B: GroupedNeuralBackend>: DecoderProjectionOp
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display;
     /// Preserves actual provider observations while allowing scalar component instrumentation.
     #[allow(clippy::too_many_arguments)]
@@ -4098,7 +4205,7 @@ pub trait RoutedProjectionOperator<B: GroupedNeuralBackend>: DecoderProjectionOp
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<Option<B::Tensor>, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (points, instrumentation.observer()) {
@@ -4125,7 +4232,7 @@ pub trait RoutedProjectionOperator<B: GroupedNeuralBackend>: DecoderProjectionOp
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (points, instrumentation.observer()) {
@@ -4156,7 +4263,7 @@ pub trait TensorParallelRoutedProjectionOperator<B: GroupedNeuralBackend>:
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display;
     /// Preserves actual provider observations while allowing scalar component instrumentation.
     #[allow(clippy::too_many_arguments)]
@@ -4172,7 +4279,7 @@ pub trait TensorParallelRoutedProjectionOperator<B: GroupedNeuralBackend>:
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (points, instrumentation.observer()) {
@@ -4981,6 +5088,7 @@ where
             .map_err(Error::backend)?;
         unit.forward(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5015,6 +5123,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_observed(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5144,6 +5253,7 @@ where
             .map_err(Error::backend)?;
         unit.forward_tensor_parallel(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5180,6 +5290,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_tensor_parallel_observed(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5270,7 +5381,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::RoutedExpertProvider<B>,
+        R: eredu_runtime::ParameterProvider<B>,
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -5286,6 +5397,7 @@ where
         unit.forward_routed_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5313,7 +5425,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::RoutedExpertProvider<B>,
+        R: eredu_runtime::ParameterProvider<B>,
         R::Error: std::fmt::Display,
     {
         if group != 0 || !self.geometry.owned_units.contains(&index) {
@@ -5325,6 +5437,7 @@ where
         unit.forward_routed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5371,7 +5484,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        R: eredu_runtime::TensorParallelParameterProvider<B>,
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -5387,6 +5500,7 @@ where
         unit.forward_routed_parallel_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5416,7 +5530,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        R: eredu_runtime::TensorParallelParameterProvider<B>,
         R::Error: std::fmt::Display,
     {
         if group != 0 || !self.geometry.owned_units.contains(&index) {
@@ -5428,6 +5542,7 @@ where
         unit.forward_routed_parallel(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -5631,8 +5746,44 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
-        (input.tokens, input.mask)
+    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        Ok((input.tokens.dim(0), input.tokens.dim(1)))
+    }
+
+    fn begin_text_partition<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        expected: &eredu_runtime::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = (input.tokens, input.mask);
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+            observer,
+        )
     }
 
     fn partition_output_width(&self) -> i32 {
@@ -5647,8 +5798,12 @@ where
         &self,
         unit: usize,
         bank: eredu_runtime::RoutedBankId,
-    ) -> Result<(usize, usize), Error> {
-        self.args.routed_bank_tensor_reductions(unit, bank)
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Error> {
+        self.args
+            .routed_bank_tensor_reductions(unit, bank)
+            .map(|(before, after)| {
+                crate::partitioned_execution::RoutedTensorReductions::hidden(before, after)
+            })
     }
 }
 
@@ -5819,7 +5974,7 @@ where
     {
         let hidden = match input {
             LayeredPartitionInput::Tokens(tokens) => {
-                let hidden = self.static_modules.embeddings.forward(tokens, context)?;
+                let hidden = self.static_modules.embed(tokens, context)?;
                 scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
@@ -5963,6 +6118,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6001,6 +6157,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_with_feed_forward(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6036,6 +6193,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_tensor_parallel(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6076,6 +6234,7 @@ where
         let cache = state.layer(index).map_err(Error::backend)?;
         block.forward_tensor_parallel_with_feed_forward(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6141,8 +6300,11 @@ where
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let hidden =
-            instrumentation.normalize_readout(hidden, &mut self.static_modules.norm, context)?;
+        let hidden = instrumentation.normalize_readout(
+            hidden,
+            &mut self.static_modules.boundary.norm,
+            context,
+        )?;
         let logits = match &mut self.static_modules.lm_head {
             Some(head) => instrumentation.project_vocabulary::<B>(
                 "projection_input",
@@ -6182,7 +6344,7 @@ where
         let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
         let static_groups = static_parallel_parameter_groups::<B>(
             &self.static_modules.embeddings,
-            &self.static_modules.norm,
+            &self.static_modules.boundary.norm,
             self.static_modules.lm_head.as_ref(),
             self.args.parameter_root(),
         )
@@ -6256,7 +6418,7 @@ where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.norm)?;
+        visitor.visit("norm", &self.static_modules.boundary.norm)?;
         if let Some(head) = &self.static_modules.lm_head {
             visitor.visit("output", head)?;
         }
@@ -6268,7 +6430,7 @@ where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
         if let Some(head) = &mut self.static_modules.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -6444,6 +6606,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_observed(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6617,6 +6780,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_tensor_parallel_observed(
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6870,7 +7034,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::RoutedExpertProvider<B>,
+        R: eredu_runtime::ParameterProvider<B>,
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -6881,6 +7045,7 @@ where
         unit.forward_routed_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6911,13 +7076,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::RoutedExpertProvider<B>,
+        R: eredu_runtime::ParameterProvider<B>,
         R::Error: std::fmt::Display,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -6966,7 +7132,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        R: eredu_runtime::TensorParallelParameterProvider<B>,
         R::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -6977,6 +7143,7 @@ where
         unit.forward_routed_parallel_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),
@@ -7009,13 +7176,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        R: eredu_runtime::TensorParallelParameterProvider<B>,
         R::Error: std::fmt::Display,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
         unit.forward_routed_parallel(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(cache),

@@ -231,6 +231,7 @@ fn unsupported_owner_binding_fails_preflight_before_any_payload_read() {
     let sources = ResidencySources {
         primary: store.clone(),
         units: BTreeMap::new(),
+        row_ranges:Vec::new(),
     };
     let result = preflight_residency_owner_bindings(&sources, &control);
     assert!(matches!(result, Err(ResidencyError::BindingPreflight(_))));

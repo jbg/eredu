@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn completed_prefill_chunks_are_snapshotable_without_advancing_prediction() {
+    let mut lifecycle = GenerationLifecycle::default();
+    assert!(lifecycle.complete_prefill().is_err());
+    for _ in 0..2 {
+        lifecycle.begin_prediction().unwrap();
+        lifecycle.complete_prefill().unwrap();
+        assert_eq!(lifecycle.status(), GenerationStatus::Paused);
+        assert_eq!(lifecycle.next_prediction(), 0);
+        assert_eq!(lifecycle.finish_reason(), None);
+        lifecycle.checkpoint().unwrap();
+    }
+    lifecycle.begin_prediction().unwrap();
+    lifecycle.complete_prediction(None).unwrap();
+    lifecycle.begin_prediction().unwrap();
+    assert!(lifecycle.complete_prefill().is_err());
+}
+
+#[test]
 fn cancellation_after_running_admission_does_not_invent_a_prediction() {
     let mut lifecycle = GenerationLifecycle::default();
     assert!(lifecycle.cancel_without_prediction().is_err());

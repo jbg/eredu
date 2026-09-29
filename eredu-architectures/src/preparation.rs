@@ -162,7 +162,7 @@ pub const fn gguf_composite_artifact_plan(
             };
             (modalities, Some(modalities), Required)
         }
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => (
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen4Exp => (
             InputModalities::TEXT,
             Some(InputModalities {
                 text: true,
@@ -386,7 +386,8 @@ pub fn prepared_safetensors_floating_state_dtype_source(
         | SafetensorsModelConfig::Llama(_)
         | SafetensorsModelConfig::Nanbeige(_)
         | SafetensorsModelConfig::Lfm2(_)
-        | SafetensorsModelConfig::QwenHybrid(_) => "model.embed_tokens.weight".into(),
+        | SafetensorsModelConfig::QwenHybrid(_)
+        | SafetensorsModelConfig::Qwen4Exp(_, _) => "model.embed_tokens.weight".into(),
     };
     resolve_floating_state_dtype_source(architecture.checkpoint(), &parameter, tensors)
 }
@@ -413,7 +414,8 @@ pub fn prepared_gguf_floating_state_dtype_source(
         | GgufModelConfig::MuseGlimmer(_)
         | GgufModelConfig::NemotronH(_)
         | GgufModelConfig::Qwen(_)
-        | GgufModelConfig::QwenHybrid(_) => "token_embd.weight",
+        | GgufModelConfig::QwenHybrid(_)
+        | GgufModelConfig::Qwen4Exp(_) => "token_embd.weight",
     };
     resolve_gguf_floating_state_dtype_source(architecture.checkpoint(), parameter, tensors)
 }
@@ -537,6 +539,20 @@ pub fn prepared_safetensors_capabilities(
             }
             SafetensorsModelConfig::K2Horizon(args) => routed_text(args.is_moe()),
             SafetensorsModelConfig::Qwen(args) => routed_text(args.is_moe()),
+            SafetensorsModelConfig::Qwen4Exp(config, _) => (
+                routed_parallel(true),
+                true,
+                InputModalities {
+                    text: true,
+                    image: config.vision.is_some(),
+                    audio: false,
+                    video: config.vision.is_some(),
+                },
+                config
+                    .prediction
+                    .as_ref()
+                    .map_or(0, |prediction| prediction.layers.len()),
+            ),
             SafetensorsModelConfig::QwenHybrid(args) => {
                 let routed = args.text.is_moe();
                 let multimodal = args.vision.is_some();
@@ -620,6 +636,7 @@ pub fn prepared_gguf_capabilities(
         GgufModelConfig::K2Horizon(args) => args.is_moe(),
         GgufModelConfig::Qwen(args) => args.is_moe(),
         GgufModelConfig::QwenHybrid(args) => args.text.is_moe(),
+        GgufModelConfig::Qwen4Exp(_) => true,
         GgufModelConfig::Gemma2(_) | GgufModelConfig::Llama(_) | GgufModelConfig::Nanbeige(_) => {
             false
         }

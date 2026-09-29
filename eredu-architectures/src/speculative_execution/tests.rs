@@ -335,16 +335,16 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         Ok(())
     }
 
-    fn prefill_target<'a>(
+    fn prefill_with_prediction<'a>(
         &mut self,
         input: Self::Input,
         cache: &mut Self::TargetCache,
         _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<Tensor, TestError>>,
-    ) -> Result<EmbeddedPredictionOutput<Tensor>, TestError> {
+        observers: &mut EmbeddedPredictionObservers<Tensor, i32, TestError>,
+    ) -> Result<(EmbeddedPredictionOutput<Tensor>, usize), TestError> {
         let tokens = Tensor(input.into_iter().map(|token| token as i32).collect());
-        with_speculative_activation(
-            observer,
+        let mut output = with_speculative_activation(
+            observers.internal(),
             SpeculativeActivationPhase::TargetPrefill,
             tokens.0.len(),
             |observer| {
@@ -359,7 +359,31 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
                 }
                 Ok(output)
             },
-        )
+        )?;
+        output.capture = observers.target_capture(output.capture())?;
+        let sequence = validate_prediction_output::<Mechanisms>(&output, None)?;
+        if sequence == 0 {
+            return Err(Mechanisms::empty_prediction_input());
+        }
+        let tokens = output.tokens();
+        if sequence <= 1 {
+            cache.prediction.clone_from(&tokens.0);
+        } else {
+            with_speculative_activation(
+                observers.internal(),
+                SpeculativeActivationPhase::PredictionPrefill,
+                sequence - 1,
+                |observer| {
+                    cache.prediction.clone_from(&tokens.0);
+                    if let Some(observer) = observer {
+                        observer
+                            .observe("fixture.prediction.seed", &Tensor(tokens.0[1..].to_vec()))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok((output, sequence))
     }
 
     fn verify_target<'a>(
@@ -382,32 +406,6 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
             }
             Ok(output)
         })
-    }
-
-    fn seed_prediction_cache<'a>(
-        &mut self,
-        _: &EmbeddedPredictionOutput<Tensor>,
-        tokens: &Tensor,
-        cache: &mut Self::TargetCache,
-        _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<Tensor, TestError>>,
-    ) -> Result<(), TestError> {
-        if tokens.0.len() <= 1 {
-            cache.prediction.clone_from(&tokens.0);
-            return Ok(());
-        }
-        with_speculative_activation(
-            observer,
-            SpeculativeActivationPhase::PredictionPrefill,
-            tokens.0.len() - 1,
-            |observer| {
-                cache.prediction.clone_from(&tokens.0);
-                if let Some(observer) = observer {
-                    observer.observe("fixture.prediction.seed", &Tensor(tokens.0[1..].to_vec()))?;
-                }
-                Ok(())
-            },
-        )
     }
 
     fn prediction_cache(&self, cache: &Self::TargetCache) -> Self::PredictionCache {
@@ -575,7 +573,7 @@ fn sequential_partial_commit_replays_target_and_commits_prediction_state() {
     let (_, replayed_tokens) = commit.into_parts();
     assert_eq!(replayed_tokens, 2);
     assert_eq!(cache.target, vec![9, 1, 2, 2, 3]);
-    assert_eq!(cache.prediction, vec![1, 2, 2, 3, 3]);
+    assert_eq!(cache.prediction, vec![1, 2, 2, 3]);
 }
 
 #[test]
@@ -727,7 +725,7 @@ fn settled_embedded_observation_keeps_installed_and_seed_owners_distinct() {
             embedded.prediction.peak_state_bytes,
             Some((3 + additional) * 4)
         );
-        assert_eq!(embedded.retained_feature_bytes, Some(4));
+        assert_eq!(embedded.retained_feature_bytes, Some(8));
         assert_eq!(observation.seed_bytes, Some(8));
         assert_eq!(cache, before);
         assert_eq!(seed.capture, Tensor(vec![19]));

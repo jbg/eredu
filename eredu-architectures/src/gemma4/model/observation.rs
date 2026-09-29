@@ -102,7 +102,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -159,7 +159,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {

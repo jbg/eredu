@@ -127,13 +127,10 @@ pub fn static_recipes<C: RecipeCatalog + ?Sized>(
     }
     BTreeMap::from([(
         "model.visual.patch_embed.proj.weight".into(),
-        DerivedWeightRecipe::Stack {
-            axis: 2,
-            inputs: vec![
-                DerivedWeightRecipe::source(first, TensorSelection::Full),
-                DerivedWeightRecipe::source(second, TensorSelection::Full),
-            ],
-        },
+        crate::qwen::vision::temporal_patch_recipe([
+            DerivedWeightRecipe::source(first, TensorSelection::Full),
+            DerivedWeightRecipe::source(second, TensorSelection::Full),
+        ]),
     )])
 }
 

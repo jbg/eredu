@@ -52,20 +52,24 @@ pub enum GgufSpecialTokenKind {
     Inkling,
 }
 
+/// Complete Qwen protocol identities resolved by the facade tokenizer policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QwenMediaTokenIds {
+    /// Image tensor placeholder.
+    pub image_token_id: u32,
+    /// Video tensor placeholder.
+    pub video_token_id: u32,
+    /// Opening vision framing token.
+    pub vision_start_token_id: u32,
+    /// Closing vision framing token.
+    pub vision_end_token_id: u32,
+}
+
 /// Typed token IDs resolved from strings only after tokenizer reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufSpecialTokenIds {
-    /// Qwen tokenizer protocol IDs.
-    Qwen {
-        /// Image tensor placeholder.
-        image_token_id: u32,
-        /// Video tensor placeholder.
-        video_token_id: u32,
-        /// Opening vision framing token.
-        vision_start_token_id: u32,
-        /// Closing vision framing token.
-        vision_end_token_id: u32,
-    },
+    /// Complete Qwen tokenizer protocol IDs.
+    Qwen(QwenMediaTokenIds),
     /// Inkling tokenizer protocol IDs.
     Inkling {
         /// Opening image-content token.
@@ -226,14 +230,21 @@ pub struct QwenProcessorPlan {
 }
 
 impl QwenProcessorPlan {
+    /// Token-only preparation when no visual processor artifact was supplied.
+    pub fn tokens_only() -> Self {
+        Self {
+            image: None,
+            video: None,
+            framing: None,
+        }
+    }
+
     /// Parses Hugging Face model and optional visual processor JSON.
     pub fn from_hf_json(
         model: &[u8],
         image: Option<&[u8]>,
         video: Option<&[u8]>,
     ) -> Result<Option<Self>, ProcessorPlanError> {
-        let image = image.map(parse_qwen_visual).transpose()?;
-        let video = video.map(parse_qwen_visual).transpose()?;
         if image.is_none() && video.is_none() {
             return Ok(None);
         }
@@ -249,18 +260,56 @@ impl QwenProcessorPlan {
             .vision_end_token_id
             .or_else(|| text.and_then(|config| config.vision_end_token_id))
             .ok_or_else(|| invalid("Qwen processor requires vision_end_token_id in config.json"))?;
-        Ok(Some(Self {
-            image,
-            video,
-            framing: Some(MediaFraming {
+        Self::from_visual_json(
+            MediaFraming {
                 start_token_id,
                 end_token_id,
-            }),
+            },
+            image,
+            video,
+        )
+    }
+
+    /// Retains visual processor JSON with already resolved model framing identities.
+    pub fn from_visual_json(
+        framing: MediaFraming,
+        image: Option<&[u8]>,
+        video: Option<&[u8]>,
+    ) -> Result<Option<Self>, ProcessorPlanError> {
+        let image = image.map(parse_qwen_visual).transpose()?;
+        let video = video.map(parse_qwen_visual).transpose()?;
+        Ok((image.is_some() || video.is_some()).then_some(Self {
+            image,
+            video,
+            framing: Some(framing),
         }))
     }
 
+    /// Checks every retained processor against the tower's declared packing geometry.
+    pub fn validate_patches(&self, expected: QwenPatchPlan) -> Result<(), ProcessorPlanError> {
+        for source in self.image.iter().chain(self.video.iter()) {
+            if source.patch_size != expected.patch_size
+                || source.temporal_patch_size != expected.temporal_patch_size
+                || source.merge_size != expected.merge_size
+            {
+                return Err(invalid(
+                    "Qwen processor patch geometry differs from vision tower",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw modalities for which this retained artifact contains preprocessing policy.
+    pub fn raw_modalities(&self) -> impl Iterator<Item = eredu_core::InputModality> + '_ {
+        self.image
+            .iter()
+            .map(|_| eredu_core::InputModality::Image)
+            .chain(self.video.iter().map(|_| eredu_core::InputModality::Video))
+    }
+
     /// Derives Qwen preprocessing geometry from the admitted GGUF projector.
-    fn from_gguf_metadata(
+    pub(crate) fn from_gguf_metadata(
         projector: &BTreeMap<String, MetadataValue>,
     ) -> Result<Self, ProcessorPlanError> {
         let patch_size = required_btree_usize(projector, "clip.vision.patch_size")?;
@@ -312,8 +361,13 @@ impl QwenProcessorPlan {
         })
     }
 
-    fn bind_framing(&mut self, framing: MediaFraming) {
+    pub(crate) fn bind_framing(&mut self, framing: MediaFraming) {
         self.framing = Some(framing);
+    }
+
+    /// Exact tokenizer framing retained by the admitted media policy.
+    pub const fn framing(&self) -> Option<MediaFraming> {
+        self.framing
     }
 
     const fn has_framing(&self) -> bool {
@@ -348,6 +402,20 @@ impl QwenProcessorPlan {
             transform: qwen_transform(source, height, width),
             patches: qwen_patches(source),
         })
+    }
+
+    /// Bounds temporary sampling indices before building a video plan.
+    pub fn video_frame_capacity_bound(
+        &self,
+        total_frames: usize,
+    ) -> Result<usize, ProcessorPlanError> {
+        let source = self
+            .video
+            .as_ref()
+            .ok_or_else(|| invalid("no video processor config"))?;
+        total_frames
+            .checked_add(source.temporal_patch_size)
+            .ok_or_else(|| invalid("video planning extent overflow"))
     }
 
     /// Derives sampling, framing, RGB transform, and patch geometry for a video.
@@ -637,10 +705,11 @@ impl ArtifactArchitecturePlan {
                 .map(MuseProcessorPlan::from_hf_json)
                 .transpose()?
                 .map(NormalizedProcessorPlan::Muse),
-            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe | ModelKind::Qwen35 => {
-                QwenProcessorPlan::from_hf_json(model, image, video)?
-                    .map(NormalizedProcessorPlan::Qwen)
-            }
+            ModelKind::Qwen3Vl
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+            | ModelKind::Qwen4Exp => QwenProcessorPlan::from_hf_json(model, image, video)?
+                .map(NormalizedProcessorPlan::Qwen),
             _ => None,
         };
         self.validation = Default::default();
@@ -683,7 +752,8 @@ impl ArtifactArchitecturePlan {
             GgufArchitecture::Qwen3Vl
             | GgufArchitecture::Qwen3VlMoe
             | GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe => projector
+            | GgufArchitecture::Qwen35Moe
+            | GgufArchitecture::Qwen4Exp => projector
                 .map(QwenProcessorPlan::from_gguf_metadata)
                 .transpose()?
                 .map(NormalizedProcessorPlan::Qwen),
@@ -819,27 +889,20 @@ impl ArtifactArchitecturePlan {
     ) -> Result<(), ProcessorPlanError> {
         self.validation = Default::default();
         match ids {
-            GgufSpecialTokenIds::Qwen {
-                image_token_id,
-                video_token_id,
-                vision_start_token_id,
-                vision_end_token_id,
-            } => {
+            GgufSpecialTokenIds::Qwen(tokens) => {
                 if !matches!(&self.processor, Some(NormalizedProcessorPlan::Qwen(_))) {
                     return Err(invalid("Qwen GGUF special tokens require a processor plan"));
                 }
                 let projector = self.media_projector.as_mut().ok_or_else(|| {
                     invalid("Qwen GGUF special tokens require an admitted media projector")
                 })?;
-                projector
-                    .bind_qwen_token_ids(image_token_id, video_token_id)
-                    .map_err(invalid)?;
+                projector.bind_qwen_media_tokens(tokens).map_err(invalid)?;
                 let Some(NormalizedProcessorPlan::Qwen(plan)) = self.processor.as_mut() else {
                     unreachable!("Qwen processor presence checked before projector mutation")
                 };
                 plan.bind_framing(MediaFraming {
-                    start_token_id: vision_start_token_id,
-                    end_token_id: vision_end_token_id,
+                    start_token_id: tokens.vision_start_token_id,
+                    end_token_id: tokens.vision_end_token_id,
                 });
             }
             GgufSpecialTokenIds::Inkling {

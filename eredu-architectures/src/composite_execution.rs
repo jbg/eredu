@@ -5,7 +5,7 @@ use eredu_core::AttentionPolicy;
 use eredu_nn::{GroupedNeuralBackend, NeuralBackend, Tensor};
 use eredu_runtime::{
     ArchitectureParameters, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    ParallelLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParallelLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, StaticParameterVisitor, StaticParameterVisitorMut,
 };
 
@@ -182,15 +182,108 @@ pub(crate) fn prepared_token_parts<T: Tensor, P>(
         .collect()
 }
 
+/// One indivisible prepared composite invocation. Architectures that have no
+/// chunk continuation contract retain their existing whole-request semantics.
+/// Clones share the immutable prepared tensors and admission rather than copying
+/// payloads; observation and state-copy budgets remain with the session.
+#[derive(Clone)]
+pub struct SingleCompositePrefillRequest<T, P> {
+    input: std::sync::Arc<(
+        eredu_runtime::PreparedModelInput<T>,
+        AdmittedCompositeInput<P>,
+    )>,
+    tokens: usize,
+}
+
+impl<T, P> SingleCompositePrefillRequest<T, P> {
+    /// Couples owned prepared tensors to their exact admission.
+    pub fn new(
+        prepared: eredu_runtime::PreparedModelInput<T>,
+        admitted: AdmittedCompositeInput<P>,
+    ) -> Result<Self, eredu_nn::Error> {
+        PreparedCompositeInput::new(&prepared, &admitted).map_err(eredu_nn::Error::backend)?;
+        let tokens =
+            usize::try_from(admitted.decoder_positions()).map_err(eredu_nn::Error::backend)?;
+        Ok(Self {
+            input: std::sync::Arc::new((prepared, admitted)),
+            tokens,
+        })
+    }
+}
+
+impl<A, B, S> eredu_runtime::prefill::ChunkedPrefillRequest<PreparedCompositeArchitecture<A>, B, S>
+    for SingleCompositePrefillRequest<B::Tensor, A::InputPartPlan>
+where
+    B: NeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    A: CompositeArchitecture<B, S>,
+    A::Error: From<eredu_nn::Error>,
+{
+    type Continuation = ();
+    fn token_count(&self) -> usize {
+        self.tokens
+    }
+    fn maximum_chunk_tokens(&self) -> usize {
+        self.tokens
+    }
+    fn with_chunk<R>(
+        &self,
+        range: std::ops::Range<usize>,
+        _continuation: Option<&Self::Continuation>,
+        operation: impl for<'a> FnOnce(PreparedCompositeInput<'a, B::Tensor, A::InputPartPlan>) -> R,
+    ) -> Result<R, A::Error> {
+        if range != (0..self.tokens) {
+            return Err(eredu_nn::Error::backend(
+                "composite request has no partial invocation contract",
+            )
+            .into());
+        }
+        let paired = PreparedCompositeInput::new(&self.input.0, &self.input.1)
+            .map_err(eredu_nn::Error::backend)?;
+        Ok(operation(paired))
+    }
+    fn request_values(&self) -> Vec<&B::Tensor> {
+        self.input
+            .0
+            .storage_values()
+            .map(|(_, value)| value)
+            .collect()
+    }
+    fn continuation(&self, _completed: &A::ForwardContext) {}
+    fn retained_values<'a>(&self, _continuation: &'a ()) -> Vec<&'a B::Tensor> {
+        Vec::new()
+    }
+}
+
 /// Architecture-owned interpretation of admitted prepared input.
-pub trait CompositeArchitecture<B, S>: LayeredArchitecture<B, S>
+pub trait CompositeArchitecture<B, S>: LayeredArchitecture<B, S> + Sized + 'static
 where
     B: NeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
 {
     /// One architecture-specific plan for each ordered input part, with a neutral
     /// accounting projection of the same admitted geometry.
-    type InputPartPlan: Clone + Into<crate::media_plan::PreparedInputPartPlan>;
+    type InputPartPlan: Clone + Into<crate::media_plan::PreparedInputPartPlan> + 'static;
+    /// Owns request preparation and immutable encoder continuation while the
+    /// ordinary runtime session owns traversal, commitment and observation.
+    type PrefillRequest: Clone
+        + eredu_runtime::prefill::ChunkedPrefillRequest<PreparedCompositeArchitecture<Self>, B, S>;
+
+    /// Maximum target invocation for an admitted request, when the architecture
+    /// has a bounded continuation contract. `None` retains one invocation.
+    fn prefill_chunk_limit(
+        _admitted: &AdmittedCompositeInput<Self::InputPartPlan>,
+    ) -> Result<Option<usize>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Creates the architecture-selected request cursor input from exact admitted
+    /// tensors. Families with shared encoders prepare their request products once.
+    fn prepare_prefill_request(
+        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        admitted: AdmittedCompositeInput<Self::InputPartPlan>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::PrefillRequest, Self::Error>;
     /// Minimal normalized configuration retained for repeated input admission.
     type AdmissionConfig: Clone;
 
@@ -334,15 +427,21 @@ where
 
     /// Exact TP reductions surrounding one routed decoder unit.
     ///
-    /// The returned `(before, after)` order is carried unchanged into inactive
+    /// The returned typed before/after order is carried unchanged into inactive
     /// pipeline waves. It must describe the concrete family equation rather
     /// than a generic transformer default.
     fn routed_tensor_reductions(
         &self,
         _unit: usize,
         _routed: bool,
-    ) -> Result<(usize, usize), Self::Error> {
-        Ok((1, 1))
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
+        Ok(crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1))
+    }
+
+    /// Whether primary token embedding and final vocabulary use TP collectives.
+    /// Replicated vocabulary equations omit those otherwise implicit idle waves.
+    fn routed_tensor_vocabulary_sharded(&self) -> bool {
+        true
     }
 
     /// Physical vocabulary width gathered by the routed TP output equation.
@@ -445,21 +544,32 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+}
 
-    /// Builds architecture-native ingress through the selected tensor-parallel
-    /// embedding boundary, then enters the same graph lifecycle.
+/// Composite ingress whose static operations honor the declared tensor partition.
+/// Ordinary composite admission does not imply distributed execution support.
+pub trait ParallelCompositeArchitecture<B, S>:
+    CompositeArchitecture<B, S> + ParallelLayeredArchitecture<B, S>
+where
+    B: NeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+{
+    /// Enters the same graph lifecycle through the selected parallel ingress.
     fn begin_composite_forward_parallel<'a>(
         &mut self,
         input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend;
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
 }
 
 /// Additive input adapter over the same architecture modules and graph lifecycle.
+///
+/// Composite partition entry supplies `first_state_ordinal` as the global origin
+/// of the already-local state view. Architecture adapters retain that origin for
+/// ownership and unit mapping, and translate it before entering a nested decoder
+/// that expects local state ordinals. Runtime state storage itself starts at zero.
 pub struct PreparedCompositeArchitecture<A> {
     inner: A,
 }
@@ -788,7 +898,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.inner.forward_unit_with_provider(
@@ -810,7 +920,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -824,7 +934,7 @@ impl<A, B, S> ParallelLayeredArchitecture<B, S> for PreparedCompositeArchitectur
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
-    A: CompositeArchitecture<B, S> + ParallelLayeredArchitecture<B, S> + 'static,
+    A: ParallelCompositeArchitecture<B, S> + 'static,
     A::InputPartPlan: 'static,
 {
     fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -945,7 +1055,7 @@ impl<A, B, S> PartitionedLayeredArchitecture<B, S> for PreparedCompositeArchitec
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
-    A: CompositeArchitecture<B, S> + PartitionedLayeredArchitecture<B, S> + 'static,
+    A: ParallelCompositeArchitecture<B, S> + PartitionedLayeredArchitecture<B, S> + 'static,
     A::InputPartPlan: 'static,
 {
     type Boundary = A::Boundary;

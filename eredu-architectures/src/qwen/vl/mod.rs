@@ -28,7 +28,8 @@ pub use parallel::{
     PartitionLocalFoundation, PartitionLocalGeometry,
 };
 pub use positions::{
-    mrope_embeddings, mrope_values, multimodal_position_ids, position_ids_tensor, PositionPart,
+    mrope_embeddings, mrope_spec, mrope_values, multimodal_position_ids, position_ids_tensor,
+    PositionPart,
 };
 
 /// Derives complete expert ownership and rank-local text-bank geometry from Qwen3-VL.

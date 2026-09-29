@@ -1132,6 +1132,24 @@ fn expand_linear_format_member(
                         .collect::<Result<Vec<_>, ParallelPlanError>>()?,
                     chunk_size: bytes(chunk_size)?,
                 },
+                MemberSharding::Segmented { axis, segments } if axis == column_axis => {
+                    MemberSharding::Segmented {
+                        axis,
+                        segments: segments
+                            .into_iter()
+                            .map(|segment| Ok(bytes(segment.start)?..bytes(segment.end)?))
+                            .collect::<Result<Vec<_>, ParallelPlanError>>()?,
+                    }
+                }
+                MemberSharding::PartitionedSegments { axis, segments } if axis == column_axis => {
+                    MemberSharding::PartitionedSegments {
+                        axis,
+                        segments: segments
+                            .into_iter()
+                            .map(|segment| Ok(bytes(segment.start)?..bytes(segment.end)?))
+                            .collect::<Result<Vec<_>, ParallelPlanError>>()?,
+                    }
+                }
                 other => other,
             };
             Ok(vec![ParameterMemberSpec::new(name, packed, sharding)])
@@ -1774,6 +1792,42 @@ mod tests {
             assert_eq!(groups[0].members()[0].global_shape(), [4, width / 32 * 34]);
             assert_eq!(groups[0].members()[0].sharding(), &expected);
             assert_eq!(partition_chunk_range(306, 136, 2..3).unwrap(), 272..306);
+        }
+    }
+
+    #[test]
+    fn gguf_fused_segments_use_byte_coordinates() {
+        for partitioned in [false, true] {
+            let sharding = |segments| {
+                if partitioned {
+                    MemberSharding::PartitionedSegments { axis: 1, segments }
+                } else {
+                    MemberSharding::Segmented { axis: 1, segments }
+                }
+            };
+            let member =
+                ParameterMemberSpec::new("fused", [4, 512], sharding(vec![0..256, 256..512]));
+            let group = if partitioned {
+                ParameterGroupSpec::partitioned("fused", ParameterRole::Segmented, 4, [member])
+            } else {
+                ParameterGroupSpec::new("fused", ParameterRole::Segmented, [member])
+            }
+            .unwrap();
+            let expanded = expand_linear_format_parameter_groups(vec![group], |_| {
+                Ok(Some(
+                    LinearFormatSpec::unscaled(LinearFormat::GgufIQuant {
+                        ggml_type: eredu_gguf::GgmlType::Q8_0,
+                        endian: eredu_gguf::Endian::Little,
+                    })
+                    .unwrap(),
+                ))
+            })
+            .unwrap();
+            assert_eq!(expanded[0].members()[0].global_shape(), [4, 544]);
+            assert_eq!(
+                expanded[0].members()[0].sharding(),
+                &sharding(vec![0..272, 272..544])
+            );
         }
     }
 

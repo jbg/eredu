@@ -1139,6 +1139,7 @@ where
     fn agree_success(
         &self,
         local_success: bool,
+        descriptor: Option<[u64; 8]>,
         group: CollectiveGroupId,
         phase: DistributedExecutionPhase,
         executor: &B::Executor,
@@ -1148,7 +1149,7 @@ where
     {
         let (_, native) = self.group(group, CommunicationOperation::FailureAgreement)?;
         let output = self.wait(
-            B::agree_success(local_success, native, executor).map_err(|error| {
+            B::agree_success(local_success, descriptor, native, executor).map_err(|error| {
                 self.submission_error(error, CommunicationOperation::FailureAgreement, phase, None)
             })?,
             CommunicationOperation::FailureAgreement,
@@ -1211,25 +1212,26 @@ where
             });
         }
         let native = self.groups[index].resource.borrow();
-        let submission = B::agree_success(local_success, native, executor).map_err(|error| {
-            self.authority.mark_poisoned(CommunicationPoison {
-                operation: CommunicationOperation::FailureAgreement,
-                phase,
-                route: None,
-                cancellation: self
-                    .manifest
-                    .completion_policy()
-                    .expect("partition communication requires bounded completion")
-                    .cancellation(),
-            });
-            PartitionExecutionError::CommunicationSubmissionFailed {
-                operation: CommunicationOperation::FailureAgreement,
-                phase,
-                route: None,
-                error: error.to_string(),
-                source: Some(eredu_core::BackendFailure::from_error(error)),
-            }
-        })?;
+        let submission =
+            B::agree_success(local_success, None, native, executor).map_err(|error| {
+                self.authority.mark_poisoned(CommunicationPoison {
+                    operation: CommunicationOperation::FailureAgreement,
+                    phase,
+                    route: None,
+                    cancellation: self
+                        .manifest
+                        .completion_policy()
+                        .expect("partition communication requires bounded completion")
+                        .cancellation(),
+                });
+                PartitionExecutionError::CommunicationSubmissionFailed {
+                    operation: CommunicationOperation::FailureAgreement,
+                    phase,
+                    route: None,
+                    error: error.to_string(),
+                    source: Some(eredu_core::BackendFailure::from_error(error)),
+                }
+            })?;
         let output = self.authority.wait_after_prior_failure(
             submission,
             CommunicationOperation::FailureAgreement,
@@ -1354,6 +1356,14 @@ where
 pub enum DistributedExecutionPhase {
     /// Every rank prepared its input before observation admission or mutable execution.
     InputPreparation,
+    /// Request preparation and exact prefill branch agree before model execution.
+    PrefillPreparation,
+    /// Request cursor extent and selected chunk size agree before creating a cursor.
+    PrefillStart,
+    /// Cursor identity, committed position and next extent agree before execution.
+    PrefillStep,
+    /// Every rank selected the chunk output before completing the transaction.
+    PrefillOutputSelection,
     /// Checks whether every rank omits a transactional observer.
     ObservationParticipation,
     /// Checks whether every rank supplies a transactional observer.
@@ -2029,6 +2039,22 @@ where
     /// canonical shared-session phase.
     const PHASE_FAILURE_AGREEMENT: bool = false;
 
+    /// Whether small exact control descriptors participate in the bounded agreement.
+    const DESCRIPTOR_AGREEMENT: bool = false;
+
+    /// Requires every rank to submit the same exact descriptor and successful status.
+    fn agree_descriptor(
+        &mut self,
+        _communication: &PartitionCommunication<B, G, R, I>,
+        _group: CollectiveGroupId,
+        _phase: DistributedExecutionPhase,
+        local_success: bool,
+        _descriptor: [u64; 8],
+        _executor: &B::Executor,
+    ) -> Result<bool, PartitionExecutionError> {
+        Ok(local_success)
+    }
+
     /// Returns the conjunction of every member's local phase status.
     ///
     /// Barrier-only policies intentionally retain the local status here; they
@@ -2113,6 +2139,19 @@ where
 {
     const ENABLED: bool = true;
     const PHASE_FAILURE_AGREEMENT: bool = true;
+    const DESCRIPTOR_AGREEMENT: bool = true;
+
+    fn agree_descriptor(
+        &mut self,
+        communication: &PartitionCommunication<B, G, R, I>,
+        group: CollectiveGroupId,
+        phase: DistributedExecutionPhase,
+        local_success: bool,
+        descriptor: [u64; 8],
+        executor: &B::Executor,
+    ) -> Result<bool, PartitionExecutionError> {
+        communication.agree_success(local_success, Some(descriptor), group, phase, executor)
+    }
 
     fn agree_phase(
         &mut self,
@@ -2122,7 +2161,7 @@ where
         local_success: bool,
         executor: &B::Executor,
     ) -> Result<bool, PartitionExecutionError> {
-        communication.agree_success(local_success, group, phase, executor)
+        communication.agree_success(local_success, None, group, phase, executor)
     }
 
     fn agree_phase_after_prior_failure(
@@ -2143,8 +2182,13 @@ where
         epoch: DistributedCommitEpoch,
         executor: &B::Executor,
     ) -> DistributedCommitOutcome {
-        match communication.agree_success(true, group, DistributedExecutionPhase::Commit, executor)
-        {
+        match communication.agree_success(
+            true,
+            None,
+            group,
+            DistributedExecutionPhase::Commit,
+            executor,
+        ) {
             Ok(true) => DistributedCommitOutcome::Committed(epoch),
             Ok(false) => DistributedCommitOutcome::Aborted(epoch),
             Err(error) => indeterminate_commit(epoch, &error),
@@ -2573,6 +2617,33 @@ where
 {
     const PARTITIONED_SESSION: bool = true;
     const DISTRIBUTED_PHASE_AGREEMENT: bool = V::PHASE_FAILURE_AGREEMENT;
+    const DISTRIBUTED_DESCRIPTOR_AGREEMENT: bool = V::DESCRIPTOR_AGREEMENT;
+
+    fn agree_distributed_descriptor(
+        runtime: &mut Self::Runtime,
+        phase: DistributedExecutionPhase,
+        local_success: bool,
+        descriptor: [u64; 8],
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, Resident::Error, std::convert::Infallible>>
+    {
+        let Some(group) = runtime.plan.commit_barrier else {
+            return Err(ReplicatedTextSessionError::Contract(
+                "distributed prefill requires a selected agreement group".into(),
+            ));
+        };
+        runtime
+            .commit_agreement
+            .agree_descriptor(
+                &runtime.communication,
+                group,
+                phase,
+                local_success,
+                descriptor,
+                runtime.communication_executor.borrow(),
+            )
+            .map_err(ReplicatedTextSessionError::Partition)
+    }
 
     type Runtime = PartitionedTextRuntime<A, B, S, Bounded, E, G, R, I, T, U, V>;
 
@@ -3652,6 +3723,7 @@ fn resolved_tagged_boundary_roles<T>(
                 },
                 crate::BoundaryTensorDtype::Uint32 => TensorDtype::U32,
                 crate::BoundaryTensorDtype::Int32 => TensorDtype::I32,
+                crate::BoundaryTensorDtype::Float32 => TensorDtype::F32,
             };
             let shape = spec
                 .shape()
@@ -3700,6 +3772,7 @@ where
         },
         crate::BoundaryTensorDtype::Uint32 => TensorDtype::U32,
         crate::BoundaryTensorDtype::Int32 => TensorDtype::I32,
+        crate::BoundaryTensorDtype::Float32 => TensorDtype::F32,
     };
     let actual = inspector.dtype(value);
     if actual != expected_dtype {

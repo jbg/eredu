@@ -293,7 +293,17 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
     )
     .expect("static MLX point-to-point capability is valid");
     CommunicationCapabilities::new([
-        collective_requirement(CommunicationOperation::AllReduceSum),
+        // Ring, MPI and NCCL preserve I32 sum reductions; row-provider status
+        // agreement uses this exact integer operation before compact data exchange.
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::AllReduceSum,
+            mlx_collective_dtypes()
+                .into_iter()
+                .chain([TensorDtype::I32]),
+            tensor_limits,
+            true,
+        )
+        .expect("static MLX sum-reduction capability is valid"),
         CommunicationOperationRequirement::tensors(
             CommunicationOperation::AllGatherEven,
             mlx_even_gather_dtypes(),

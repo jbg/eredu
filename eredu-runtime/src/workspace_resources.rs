@@ -73,6 +73,7 @@ fn projection(p: &ProjectionTopology, rows: u64, scalar: TensorElementType) -> M
         element: scalar,
         weight_element: None,
         bias: p.bias,
+        bias_element: None,
     }
 }
 
@@ -489,13 +490,17 @@ pub fn describe_text_workspace(
                 }
             }
             TokenMixerTopology::GatedConvolution {
-                channels, kernel, ..
+                channels,
+                kernel,
+                dilation,
+                ..
             } => {
                 let invocation = MechanismInvocation::Convolution {
                     batch: request.batch_size,
                     tokens: query,
                     channels: *channels,
                     kernel: *kernel,
+                    dilation: *dilation,
                     element: scalar,
                 };
                 let payload = output_bytes(&invocation)?;
@@ -513,6 +518,7 @@ pub fn describe_text_workspace(
                     query,
                     *channels,
                     *kernel,
+                    *dilation,
                     upper_scalar,
                 )?;
                 let scratch = product(&[
@@ -817,12 +823,13 @@ fn convolution_intermediates(
     queries: u64,
     channels: u64,
     kernel: u64,
+    dilation: u64,
     scalar: u64,
 ) -> Result<u64, CapabilityError> {
-    if kernel == 0 {
-        return Err(invalid("convolution kernel must be positive"));
+    if kernel == 0 || dilation == 0 {
+        return Err(invalid("convolution kernel and dilation must be positive"));
     }
-    let padded = add(queries, kernel - 1)?;
+    let padded = add(queries, mul(kernel - 1, dilation)?)?;
     let rows = add(
         add(mul(queries, 2)?, mul(padded, 2)?)?,
         add(mul(queries, kernel)?, kernel)?,
@@ -1032,10 +1039,13 @@ fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityE
             TokenMixerTopology::GatedConvolution {
                 channels,
                 kernel,
+                dilation,
                 projections,
             } => {
-                if *channels == 0 || *kernel == 0 {
-                    return Err(invalid("convolution channels and kernel must be positive"));
+                if *channels == 0 || *kernel == 0 || *dilation == 0 {
+                    return Err(invalid(
+                        "convolution channels, kernel and dilation must be positive",
+                    ));
                 }
                 check_projections(projections, topology.hidden_size, topology.hidden_size)?;
             }
@@ -1083,4 +1093,21 @@ fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityE
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod convolution_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn dilation_charges_retained_padding_without_expanding_kernel_taps() {
+        // Two batches, five tokens, three channels, four taps and f32 storage.
+        // Dilation three retains nine history tokens rather than three. Both
+        // padded input owners grow, while the four-tap kernel is unchanged.
+        assert_eq!(convolution_intermediates(2, 5, 3, 4, 1, 4).unwrap(), 1200);
+        assert_eq!(convolution_intermediates(2, 5, 3, 4, 3, 4).unwrap(), 1488);
+        assert_eq!(convolution_intermediates(2, 5, 3, 1, 7, 4).unwrap(), 624);
+        assert!(convolution_intermediates(2, 5, 3, 4, 0, 4).is_err());
+        assert!(convolution_intermediates(2, 5, 3, u64::MAX, 2, 4).is_err());
+    }
 }

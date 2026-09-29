@@ -67,7 +67,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -96,6 +96,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let output = block.forward_routed_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),
@@ -136,7 +137,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -165,6 +166,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         let output = block.forward_routed_parallel_observed(
             index,
             AttentionInput {
+                selected_positions: None,
                 hidden,
                 mask: forward.mask.as_ref(),
                 cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),

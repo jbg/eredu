@@ -79,7 +79,7 @@ pub fn static_parameter_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNe
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     static_parallel_parameter_groups::<B>(
         &modules.embeddings,
-        &modules.norm,
+        &modules.boundary.norm,
         modules.lm_head.as_ref(),
         &args.parameter_root,
     )

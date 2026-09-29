@@ -10,7 +10,7 @@ use eredu_runtime::{
 use super::PreparedExecutionError;
 use crate::{
     partitioned_execution::PreparedRoutedPartitionedArchitecture,
-    routed_text::EmptyPartitionRoutedExpertProvider,
+    routed_text::EmptyPartitionParameterProvider,
 };
 
 /// Native bank mechanisms bound to exact rank-local member byte geometry.
@@ -44,7 +44,7 @@ impl<Bank, Movement, Retained> PartitionBankMechanisms<Bank, Movement, Retained>
 /// Providers whose equations and placement were selected before backend binding.
 pub type PartitionBankProviders<B> = eredu_runtime::RoutedBankProviders<
     Box<
-        dyn eredu_runtime::TensorParallelRoutedExpertProvider<
+        dyn eredu_runtime::TensorParallelParameterProvider<
             B,
             Error = crate::routed_text::RoutedTextExecutionError,
         >,
@@ -124,6 +124,17 @@ impl PreparedPartitionBanks {
         }
     }
 
+    pub(crate) fn extend_banks(
+        &mut self,
+        banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
+    ) -> Result<(), String> {
+        if banks.keys().any(|id| self.banks.contains_key(id)) {
+            return Err("prediction and target parameter banks overlap".into());
+        }
+        self.banks.extend(banks);
+        Ok(())
+    }
+
     /// The selected immutable-weight cache policy.
     pub const fn residency(&self) -> ParameterBankResidency {
         self.residency
@@ -192,14 +203,13 @@ where
     >,
 {
     use crate::routed_text::{PartitionUnitProvider, PlannedAddressableBank, PlannedResidentBank};
-    let exchange = selection.expert_exchange;
     let options = match selection.residency() {
         ParameterBankResidency::WithLayer => None,
         ParameterBankResidency::IndependentCache(options) => Some(options),
         _ => {
             return Err(PreparedExecutionError::Architecture(
                 "selected partition bank residency has no construction mechanism".into(),
-            ))
+            ));
         }
     };
     let mut mechanisms =
@@ -211,15 +221,16 @@ where
     let mut retained = BTreeMap::new();
     let mut providers = BTreeMap::new();
     for (id, bank) in selection.banks() {
+        let exchange = selection.expert_exchange && bank.plan().expert_parallel_size() > 1;
         let provider: Box<
-            dyn eredu_runtime::TensorParallelRoutedExpertProvider<
+            dyn eredu_runtime::TensorParallelParameterProvider<
                 B,
                 Error = crate::routed_text::RoutedTextExecutionError,
             >,
         > = if bank.plan().local_global_group_indices().is_empty()
             || (options.is_some() && bank.addressable_members().is_empty())
         {
-            Box::new(EmptyPartitionRoutedExpertProvider)
+            Box::new(EmptyPartitionParameterProvider)
         } else if let Some(options) = options {
             let mechanism = mechanisms.remove(id).ok_or_else(|| {
                 PreparedExecutionError::Architecture(format!(

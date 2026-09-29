@@ -7,7 +7,7 @@ use eredu_nn::{
 use eredu_runtime::capture::partition::{
     PartitionCaptureReceiptLimits, PartitionCaptureReceiptPlan, PartitionRoutedCaptureProducer,
 };
-use eredu_runtime::{RoutedExpertProvider, RoutedUnitBatch, RoutedUnitObserver};
+use eredu_runtime::{ParameterProvider, RoutedUnitBatch, RoutedUnitObserver};
 mod live;
 
 fn input(peer: usize, token: usize, channel: usize) -> f32 {
@@ -256,7 +256,7 @@ fn verify(device: DeviceType) {
                 )
                 .unwrap();
                 bank.bind_local_parameters(bindings).unwrap();
-                let baseline = RoutedExpertProvider::<MlxNeuralBackend>::forward_grouped(
+                let baseline = ParameterProvider::<MlxNeuralBackend>::forward_grouped(
                     &mut provider,
                     &mut bank,
                     request!(None),
@@ -273,7 +273,7 @@ fn verify(device: DeviceType) {
                             &mut observer,
                             owned.coordinates.units(),
                             |observer| {
-                                RoutedExpertProvider::<MlxNeuralBackend>::forward_grouped(
+                                ParameterProvider::<MlxNeuralBackend>::forward_grouped(
                                     &mut provider,
                                     &mut bank,
                                     request!(observer),
@@ -293,7 +293,7 @@ fn verify(device: DeviceType) {
                 )
                 .unwrap();
                 bank.bind_local_parameters(bindings).unwrap();
-                let baseline = RoutedExpertProvider::<MlxNeuralBackend>::forward_relu2_routed(
+                let baseline = ParameterProvider::<MlxNeuralBackend>::forward_relu2_routed(
                     &mut provider,
                     &mut bank,
                     request!(None),
@@ -310,7 +310,7 @@ fn verify(device: DeviceType) {
                             &mut observer,
                             owned.coordinates.units(),
                             |observer| {
-                                RoutedExpertProvider::<MlxNeuralBackend>::forward_relu2_routed(
+                                ParameterProvider::<MlxNeuralBackend>::forward_relu2_routed(
                                     &mut provider,
                                     &mut bank,
                                     request!(observer),

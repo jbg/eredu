@@ -333,10 +333,40 @@ impl<P: Probe> Drop for SessionOperation<'_, P> {
 ///
 /// Arrays are cloned handles, not copied tensor storage. Owning the handles
 /// makes submission independent of the caller's temporary `ModelInput` view.
-#[derive(Debug, Clone)]
 pub struct MlxModelInput {
     parts: Vec<input::InputPart>,
     cache_identity: Option<eredu_runtime::PreparedInputCacheIdentity>,
+    prefill_cursor: Option<Box<dyn crate::composition::mlx::replicated_text::ErasedPrefillCursor>>,
+}
+
+impl Clone for MlxModelInput {
+    fn clone(&self) -> Self {
+        Self {
+            parts: self.parts.clone(),
+            cache_identity: self.cache_identity.clone(),
+            prefill_cursor: self
+                .prefill_cursor
+                .as_ref()
+                .map(|cursor| cursor.clone_box()),
+        }
+    }
+}
+
+impl std::fmt::Debug for MlxModelInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MlxModelInput")
+            .field("parts", &self.parts)
+            .field("cache_identity", &self.cache_identity)
+            .field(
+                "prefill_range",
+                &self
+                    .prefill_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.next_range()),
+            )
+            .finish()
+    }
 }
 
 impl From<input::ModelInput<'_>> for MlxModelInput {
@@ -344,11 +374,17 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
         Self {
             parts: input.parts.to_vec(),
             cache_identity: input.cache_identity().cloned(),
+            prefill_cursor: None,
         }
     }
 }
 
 impl MlxModelInput {
+    pub(super) fn prefill_cursor(
+        &self,
+    ) -> Option<&dyn crate::composition::mlx::replicated_text::ErasedPrefillCursor> {
+        self.prefill_cursor.as_deref()
+    }
     fn chunkable_text_tokens(&self) -> Option<&Array> {
         let [part] = self.parts.as_slice() else {
             return None;
@@ -1299,6 +1335,17 @@ impl MlxModelSession {
         let mut operation = self.begin_submission(backend)?;
         let token_validation_scope = TokenValidationScope::begin()?;
         let output = match input {
+            Ok(mut input) if input.prefill_cursor.is_some() => {
+                operation.model().erased_mut().advance_prefill_cursor(
+                    input.prefill_cursor.as_mut().unwrap().as_mut(),
+                    backend.stream(),
+                    &mut ArrayObserverAdapter {
+                        inner: observer,
+                        routed_path: None,
+                        routed_invocation_active: false,
+                    },
+                )
+            }
             Ok(input) => input.with_borrowed(|input| {
                 operation.model().erased_mut().prefill_result_with_observer(
                     Ok(input),
@@ -1371,6 +1418,39 @@ impl MlxModelSession {
             recovery,
         ))
     }
+
+    fn submit_prefill_cursor_with_observer(
+        &mut self,
+        backend: &MlxBackend<'_>,
+        cursor: &mut dyn crate::composition::mlx::replicated_text::ErasedPrefillCursor,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
+    ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
+        let mut operation = self.begin_submission(backend)?;
+        let validation = TokenValidationScope::begin()?;
+        let output = operation
+            .model()
+            .erased_mut()
+            .advance_prefill_cursor(
+                cursor,
+                backend.stream(),
+                &mut ArrayObserverAdapter {
+                    inner: observer,
+                    routed_path: None,
+                    routed_invocation_active: false,
+                },
+            )
+            .and_then(|output| {
+                observer.finish()?;
+                Ok(output)
+            });
+        let (output, owner, recovery) = operation.finish_execution(output)?;
+        Ok(model_array_submission(
+            output,
+            validation.finish(),
+            owner,
+            recovery,
+        ))
+    }
 }
 
 impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
@@ -1388,6 +1468,21 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession {
         backend: &MlxBackend<'a>,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, Error> {
+        if input.prefill_cursor.is_some() {
+            let public_output = self.payload.model.erased().partition_public_output();
+            let submission = self.submit_prefill_result_with_observer(
+                backend,
+                Ok(input),
+                None,
+                &mut eredu_runtime::NoopObserver,
+            )?;
+            return Ok(Submission {
+                output: MlxModelOutput::new(
+                    public_output.then(|| MlxTensor::from_array(submission.output)),
+                ),
+                completion: submission.completion,
+            });
+        }
         let mut operation = self.begin_submission(backend)?;
         let token_validation_scope = TokenValidationScope::begin()?;
         let output =
@@ -1784,8 +1879,85 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         max_tokens: std::num::NonZeroUsize,
         state: &mut Self::TextGenerationState,
     ) -> Result<bool, Error> {
-        // These contracts currently describe one complete forward operation.
-        // Keep their established observation, media, and agreement semantics.
+        if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .supports_retained_prefill()
+        {
+            runtime
+                .session()
+                .validate_parameter_epoch(&mut state.sampling.parameter_epoch)?;
+            if prompt.prefill_cursor.is_none() {
+                let geometry = state
+                    .capture
+                    .as_ref()
+                    .map(|capture| capture.plan().request());
+                let (backend, session) = runtime.parts_mut();
+                session.validate_backend(backend)?;
+                let cursor = session.with_model_operation(|model| {
+                    let validation = TokenValidationScope::begin()?;
+                    let cursor = prompt.with_borrowed(|input| {
+                        model.erased_mut().start_prefill_cursor(
+                            Ok(input),
+                            max_tokens.get(),
+                            geometry,
+                            backend.stream(),
+                        )
+                    })?;
+                    let validation = validation.finish();
+                    safemlx::transforms::eval(validation.arrays())?;
+                    validation.validate_completed()?;
+                    Ok(cursor)
+                })?;
+                if let Some(cursor) = cursor {
+                    prompt.parts.clear();
+                    prompt.prefill_cursor = Some(cursor);
+                }
+            }
+            if let Some(cursor) = prompt.prefill_cursor.as_mut() {
+                let range = cursor.next_range();
+                if range.end == cursor.token_count() {
+                    return Ok(false);
+                }
+                let stream = runtime.backend().stream().clone();
+                let (backend, session) = runtime.parts_mut();
+                let submission = if let Some(capture) = &mut state.capture {
+                    capture
+                        .set_prefill_span(eredu_core::capture::CapturePrefillSpan {
+                            start: range.start as u64,
+                            end: range.end as u64,
+                            total: cursor.token_count() as u64,
+                        })
+                        .map_err(Error::before_model_mutation)?;
+                    partition_capture::with_observer(
+                        session,
+                        capture,
+                        &stream,
+                        None,
+                        0,
+                        |session, observer| {
+                            session.submit_prefill_cursor_with_observer(
+                                backend,
+                                cursor.as_mut(),
+                                &mut eredu_runtime::BorrowedActivationObserver(observer),
+                            )
+                        },
+                    )?
+                } else {
+                    session.submit_prefill_cursor_with_observer(
+                        backend,
+                        cursor.as_mut(),
+                        &mut eredu_runtime::NoopObserver,
+                    )?
+                };
+                submission.completion.wait()?;
+                return Ok(true);
+            }
+        }
+        // Adapters without a retained request can split only plain text and
+        // keep capture in their existing complete-forward path.
         if state.capture.is_some() || Self::text_prefill_chunking_support(runtime).is_err() {
             return Ok(false);
         }
@@ -1811,6 +1983,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 Ok(MlxModelInput {
                     parts: vec![input::token_ids_part(&tokens)?],
                     cache_identity: None,
+                    prefill_cursor: None,
                 })
             };
             Ok((make(prefix)?, make(suffix)?))
@@ -1826,7 +1999,15 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
     }
 
     fn text_prefill_chunking_support(runtime: &ModelRuntime<Self>) -> Result<(), &'static str> {
-        if runtime.session().distributed().is_some() {
+        if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .supports_retained_prefill()
+        {
+            Ok(())
+        } else if runtime.session().distributed().is_some() {
             Err("distributed execution retains a complete prefill pass")
         } else if !runtime
             .session()
@@ -1855,6 +2036,20 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         let prepared = prepared.map(|()| prompt);
         if let Some(capture) = &mut state.capture {
             let capture_geometry = Some(capture.plan().request());
+            if let Ok(prompt) = &prepared {
+                if let Some(cursor) = prompt.prefill_cursor() {
+                    let range = cursor.next_range();
+                    if range.start != 0 || range.end != cursor.token_count() {
+                        capture
+                            .set_prefill_span(eredu_core::capture::CapturePrefillSpan {
+                                start: range.start as u64,
+                                end: range.end as u64,
+                                total: cursor.token_count() as u64,
+                            })
+                            .map_err(Error::before_model_mutation)?;
+                    }
+                }
+            }
             let (backend, session) = runtime.parts_mut();
             let public_output = session.payload.model.erased().partition_public_output();
             let submission = partition_capture::with_observer(

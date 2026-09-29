@@ -51,7 +51,16 @@ impl SelectedReplicatedTextRealization {
         &self,
         query: &PreparedResourceQuery,
     ) -> Result<ResourceDescription, ResourceDescriptionError> {
-        describe_prepared_resources(self, Some(self.state()), &[], &[], query)
+        describe_prepared_resources(
+            self,
+            &[PreparedStateResource {
+                owner: "target",
+                state: self.state(),
+            }],
+            &[],
+            &[],
+            query,
+        )
     }
 }
 
@@ -65,17 +74,77 @@ impl PreparedReplicatedTextContract {
     }
 }
 
+/// One independently retained local state owner. Parameter sharing does not imply
+/// state sharing. Distinct replicas or prediction lanes require distinct owners.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedStateResource<'a> {
+    /// Stable execution-role identity, unique within the resource query.
+    pub owner: &'a str,
+    /// Exact selected local geometry, dtype, placement and append-stream bindings.
+    pub state: &'a SelectedStateRealization,
+}
+
+impl PreparedStateResource<'_> {
+    /// Sums independently retained stream allowances across local state owners.
+    /// These are configured limits, not physical allocations. Paged payload is
+    /// covered by its selected pool, not by the resident payload allowance.
+    pub fn append_stream_allowances(
+        states: &[Self],
+    ) -> Result<crate::AppendStreamAllowances, ResourceDescriptionError> {
+        let mut owners = BTreeSet::new();
+        let mut total = crate::AppendStreamAllowances::default();
+        for binding in states {
+            if binding.owner.trim().is_empty() || !owners.insert(binding.owner) {
+                return Err(invalid("selected state owner is empty or duplicated"));
+            }
+            let part = binding.state.append_stream_allowances();
+            let mut resident_payload = 0u64;
+            for stream in binding.state.append_streams() {
+                let component = binding
+                    .state
+                    .components()
+                    .iter()
+                    .find(|component| {
+                        component.layer() == stream.layer
+                            && component.component().role()
+                                == (StateComponentRole::AppendStream {
+                                    slot: stream.spec.slot,
+                                })
+                    })
+                    .ok_or_else(|| invalid("selected stream has no component placement"))?;
+                if component.placement() == StateComponentPlacement::Device {
+                    resident_payload = stream
+                        .payload_bytes
+                        .checked_mul(u64::from(stream.lanes))
+                        .and_then(|bytes| resident_payload.checked_add(bytes))
+                        .ok_or_else(|| invalid("resident stream allowance overflowed"))?;
+                }
+            }
+            for (sum, bytes) in [
+                (&mut total.payload_bytes, resident_payload),
+                (&mut total.scratch_bytes, part.scratch_bytes),
+                (&mut total.catalog_bytes, part.catalog_bytes),
+            ] {
+                *sum = sum
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("combined stream allowance overflowed"))?;
+            }
+        }
+        Ok(total)
+    }
+}
+
 /// Derives storage descriptions from the exact prepared module/binding pair.
 ///
-/// `state` is the selected **local** state realization, or `None` for a stateless
-/// rank. `slots` and `declarations` are those retained by ordinary preparation,
+/// `states` names each selected **local** state realization; stateless ranks use
+/// an empty slice. `slots` and `declarations` are those retained by ordinary preparation,
 /// including its rank-local physical geometry; they must not be reconstructed
 /// from source names. Only slots with canonical materialization backing facts
 /// become allocations. Bank catalogs aggregating members remain explicit gaps.
 /// This function is also used by `ReplicatedTextSession::describe_prepared_resources`.
 pub fn describe_prepared_resources(
     selected: &SelectedReplicatedTextRealization,
-    state: Option<&SelectedStateRealization>,
+    states: &[PreparedStateResource<'_>],
     slots: &[PreparedParameterSlot],
     declarations: &[ParameterMetadata],
     query: &PreparedResourceQuery,
@@ -131,9 +200,10 @@ pub fn describe_prepared_resources(
         &mut description.allocations,
         &mut missing,
     )?;
-    if let Some(state) = state {
+    PreparedStateResource::append_stream_allowances(states)?;
+    for binding in states {
         state_resources(
-            state,
+            binding,
             query,
             end,
             &mut description.allocations,
@@ -277,16 +347,26 @@ fn parameter_resources(
 }
 
 fn state_resources(
-    state: &SelectedStateRealization,
+    binding: &PreparedStateResource<'_>,
     query: &PreparedResourceQuery,
     end: u64,
     allocations: &mut Vec<ResourceAllocation>,
     missing: &mut BTreeSet<String>,
 ) -> Result<(), ResourceDescriptionError> {
+    let state = binding.state;
+    for stream in state.append_streams() {
+        missing.insert(format!("state/{} stream/{}/{}: {} lanes with per-lane payload {}, scratch {}, catalog {} byte allowances; backing capacity, host/device placement and completion overlap are not described", binding.owner, stream.layer, stream.spec.slot, stream.lanes, stream.payload_bytes, stream.scratch_bytes, stream.catalog_bytes));
+        if query.batch_size > u64::from(stream.lanes) {
+            return Err(invalid(
+                "resource query exceeds selected append-stream lanes",
+            ));
+        }
+    }
     for selected in state.components() {
         let component = selected.component();
         let key = format!(
-            "state/{}/{}",
+            "state/{}/{}/{}",
+            binding.owner,
             selected.layer(),
             component.role().stable_name()
         );
@@ -319,7 +399,10 @@ fn state_resources(
         let width = u64::from(selected.storage_dtype().bytes().get());
         let mut current = byte_bounds(current, width)?;
         let mut peak = byte_bounds(peak, width)?;
-        if !matches!(component.role(), StateComponentRole::Fixed(_)) {
+        if !matches!(
+            component.role(),
+            StateComponentRole::Fixed(_) | StateComponentRole::AppendStream { .. }
+        ) {
             if let Some(window) = state
                 .layout()
                 .layer(selected.layer())
@@ -361,7 +444,8 @@ fn state_resources(
                 owner: id(
                     query,
                     format!(
-                        "segment/{}/layer/{}/{}",
+                        "state/{}/segment/{}/layer/{}/{}",
+                        binding.owner,
                         segment.id().as_str(),
                         selected.layer(),
                         component.role().stable_name()

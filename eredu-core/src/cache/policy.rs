@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::AttentionPolicy;
 
+mod append;
 mod geometry;
+pub use append::AppendStreamPolicy;
 pub use geometry::StateElementBounds;
 
 /// Representation stored atomically in one cache block.
@@ -17,6 +19,36 @@ pub enum CacheRepresentation {
     KeyValue,
     /// Compressed latent state and rotary keys.
     CompressedLatentRotary,
+    /// Named append-only records for one sequence lane.
+    AppendStream {
+        /// Architecture-declared stream slot.
+        slot: u32,
+        /// Independent sequence lane within the batch.
+        lane: u32,
+    },
+}
+
+/// One independently advancing stream within a rank-local cache manager.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CacheStreamId {
+    /// Architecture-global owning layer.
+    pub global_layer: usize,
+    /// Attention or auxiliary stream identity.
+    pub representation: CacheRepresentation,
+}
+impl CacheStreamId {
+    /// Declares a stream without selecting its storage mechanism.
+    pub const fn new(global_layer: usize, representation: CacheRepresentation) -> Self {
+        Self {
+            global_layer,
+            representation,
+        }
+    }
+}
+impl From<&CacheBlockId> for CacheStreamId {
+    fn from(block: &CacheBlockId) -> Self {
+        Self::new(block.global_layer, block.representation)
+    }
 }
 
 /// Optional rank identity included in a stable cache block identifier.
@@ -67,11 +99,11 @@ pub struct CacheBlockId {
     pub session_id: u64,
     /// Architecture-global decoder layer index.
     pub global_layer: usize,
-    /// Stored attention representation.
+    /// Stored attention or named append-stream representation.
     pub representation: CacheRepresentation,
-    /// Inclusive absolute token position.
+    /// Inclusive absolute token position or append-stream record ordinal.
     pub start: i64,
-    /// Exclusive absolute token position.
+    /// Exclusive absolute token position or append-stream record ordinal.
     pub end: i64,
     /// Rank-local ownership identity.
     pub rank: Option<CacheRankIdentity>,
@@ -127,8 +159,8 @@ pub enum LayerCachePolicy {
         /// Ordered tensors required to resume this layer.
         tensors: Vec<StateTensorPolicy>,
     },
-    /// Ordinary attention plus fixed-size state.
-    KeyValueWithFixedState {
+    /// Ordinary attention plus fixed tensors and named append streams.
+    KeyValueWithState {
         /// Exact full or sliding attention range.
         attention: AttentionPolicy,
         /// Rank-local key/value head count.
@@ -137,9 +169,11 @@ pub enum LayerCachePolicy {
         head_dim: NonZeroU32,
         /// Ordered additional tensors.
         tensors: Vec<StateTensorPolicy>,
+        /// Named append-only streams, with independent per-lane frontiers.
+        streams: Vec<AppendStreamPolicy>,
     },
-    /// Key-only attention plus fixed-size state.
-    KeyOnlyWithFixedState {
+    /// Key-only attention plus fixed tensors and named append streams.
+    KeyOnlyWithState {
         /// Exact full or sliding attention range.
         attention: AttentionPolicy,
         /// Rank-local key head count.
@@ -148,6 +182,8 @@ pub enum LayerCachePolicy {
         head_dim: NonZeroU32,
         /// Ordered additional tensors.
         tensors: Vec<StateTensorPolicy>,
+        /// Named append-only streams, with independent per-lane frontiers.
+        streams: Vec<AppendStreamPolicy>,
     },
 }
 
@@ -155,6 +191,16 @@ pub enum LayerCachePolicy {
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateTensorRole {
+    /// Architecture-declared bounded mutable buffer with explicit shape and dtype.
+    Auxiliary {
+        /// Stable buffer identity within the owning layer.
+        slot: u32,
+    },
+    /// Exact bounded integer context, distinct from floating convolution history.
+    IntegerHistory {
+        /// Stable architecture-declared history slot.
+        slot: u32,
+    },
     /// Bounded causal-convolution history.
     Convolution {
         /// Stable slot within the layer's convolution states.
@@ -305,18 +351,28 @@ pub enum StateComponentRole {
     RotaryKeys,
     /// One fixed-size or pooling tensor.
     Fixed(StateTensorRole),
+    /// Lane-local append records with a prefix-dependent upper bound.
+    AppendStream {
+        /// Architecture-declared stream slot.
+        slot: u32,
+    },
 }
 
 impl StateComponentRole {
     /// Returns a stable checkpoint/runtime component name.
     pub fn stable_name(self) -> String {
         match self {
+            Self::AppendStream { slot } => format!("state.append.{slot}"),
             Self::AttentionKeys => "attention.keys".into(),
             Self::AttentionValues => "attention.values".into(),
             Self::CompressedLatent => "attention.compressed_latent".into(),
             Self::RotaryKeys => "attention.rotary_keys".into(),
+            Self::Fixed(StateTensorRole::Auxiliary { slot }) => format!("state.auxiliary.{slot}"),
             Self::Fixed(StateTensorRole::Convolution { slot }) => {
                 format!("state.convolution.{slot}")
+            }
+            Self::Fixed(StateTensorRole::IntegerHistory { slot }) => {
+                format!("state.integer_history.{slot}")
             }
             Self::Fixed(StateTensorRole::Recurrent) => "state.recurrent".into(),
             Self::Fixed(StateTensorRole::PrefixEmbedding) => "state.prefix_embedding".into(),
@@ -385,8 +441,8 @@ impl LayerCachePolicy {
             Self::KeyValue { .. }
             | Self::KeyOnly { .. }
             | Self::CompressedLatentRotary { .. }
-            | Self::KeyValueWithFixedState { .. }
-            | Self::KeyOnlyWithFixedState { .. } => Some(StateResidencyClass::SealablePaged),
+            | Self::KeyValueWithState { .. }
+            | Self::KeyOnlyWithState { .. } => Some(StateResidencyClass::SealablePaged),
         }
     }
 
@@ -443,34 +499,38 @@ impl LayerCachePolicy {
     }
 
     /// Constructs validated key/value plus fixed-state geometry.
-    pub fn key_value_with_fixed_state(
+    pub fn key_value_with_state(
         attention: AttentionPolicy,
         num_key_value_heads: i32,
         head_dim: i32,
         tensors: Vec<StateTensorPolicy>,
+        streams: Vec<AppendStreamPolicy>,
     ) -> Result<Self, CachePolicyError> {
-        let policy = Self::KeyValueWithFixedState {
+        let policy = Self::KeyValueWithState {
             attention,
             num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
             head_dim: positive_u32(head_dim, "key/value head dimension")?,
             tensors,
+            streams,
         };
         policy.validate()?;
         Ok(policy)
     }
 
     /// Constructs validated key-only plus fixed-state geometry.
-    pub fn key_only_with_fixed_state(
+    pub fn key_only_with_state(
         attention: AttentionPolicy,
         num_key_heads: i32,
         head_dim: i32,
         tensors: Vec<StateTensorPolicy>,
+        streams: Vec<AppendStreamPolicy>,
     ) -> Result<Self, CachePolicyError> {
-        let policy = Self::KeyOnlyWithFixedState {
+        let policy = Self::KeyOnlyWithState {
             attention,
             num_key_heads: positive_u32(num_key_heads, "key head count")?,
             head_dim: positive_u32(head_dim, "key head dimension")?,
             tensors,
+            streams,
         };
         policy.validate()?;
         Ok(policy)
@@ -483,8 +543,8 @@ impl LayerCachePolicy {
             Self::KeyValue { attention, .. }
             | Self::KeyOnly { attention, .. }
             | Self::CompressedLatentRotary { attention, .. }
-            | Self::KeyValueWithFixedState { attention, .. }
-            | Self::KeyOnlyWithFixedState { attention, .. } => Some(*attention),
+            | Self::KeyValueWithState { attention, .. }
+            | Self::KeyOnlyWithState { attention, .. } => Some(*attention),
         }
     }
 
@@ -492,8 +552,18 @@ impl LayerCachePolicy {
     pub fn fixed_state(&self) -> &[StateTensorPolicy] {
         match self {
             Self::FixedState { tensors }
-            | Self::KeyValueWithFixedState { tensors, .. }
-            | Self::KeyOnlyWithFixedState { tensors, .. } => tensors,
+            | Self::KeyValueWithState { tensors, .. }
+            | Self::KeyOnlyWithState { tensors, .. } => tensors,
+            _ => &[],
+        }
+    }
+
+    /// Returns the ordered architecture-declared append streams.
+    pub fn append_streams(&self) -> &[AppendStreamPolicy] {
+        match self {
+            Self::KeyValueWithState { streams, .. } | Self::KeyOnlyWithState { streams, .. } => {
+                streams
+            }
             _ => &[],
         }
     }
@@ -511,7 +581,7 @@ impl LayerCachePolicy {
                 head_dim,
                 ..
             }
-            | Self::KeyValueWithFixedState {
+            | Self::KeyValueWithState {
                 num_key_value_heads,
                 head_dim,
                 ..
@@ -540,7 +610,7 @@ impl LayerCachePolicy {
                 head_dim,
                 ..
             }
-            | Self::KeyOnlyWithFixedState {
+            | Self::KeyOnlyWithState {
                 num_key_heads,
                 head_dim,
                 ..
@@ -590,6 +660,11 @@ impl LayerCachePolicy {
                     presence: tensor.presence,
                 }),
         );
+        components.extend(
+            self.append_streams()
+                .iter()
+                .map(AppendStreamPolicy::component),
+        );
         components
     }
 
@@ -616,7 +691,7 @@ impl LayerCachePolicy {
                 head_dim,
                 ..
             }
-            | Self::KeyValueWithFixedState {
+            | Self::KeyValueWithState {
                 num_key_value_heads,
                 head_dim,
                 ..
@@ -629,7 +704,7 @@ impl LayerCachePolicy {
                 head_dim,
                 ..
             }
-            | Self::KeyOnlyWithFixedState {
+            | Self::KeyOnlyWithState {
                 num_key_heads,
                 head_dim,
                 ..
@@ -648,16 +723,26 @@ impl LayerCachePolicy {
         }
         let tensors = self.fixed_state();
         if tensors.is_empty()
+            && self.append_streams().is_empty()
             && matches!(
                 self,
                 Self::FixedState { .. }
-                    | Self::KeyValueWithFixedState { .. }
-                    | Self::KeyOnlyWithFixedState { .. }
+                    | Self::KeyValueWithState { .. }
+                    | Self::KeyOnlyWithState { .. }
             )
         {
             return Err(CachePolicyError::Invalid(
                 "fixed-state cache policy must contain at least one tensor".into(),
             ));
+        }
+        let mut slots = BTreeSet::new();
+        for stream in self.append_streams() {
+            stream.validate()?;
+            if !slots.insert(stream.slot()) {
+                return Err(CachePolicyError::Invalid(
+                    "duplicate append-stream slot".into(),
+                ));
+            }
         }
         validate_state_tensor_policies(tensors)
     }
@@ -764,7 +849,14 @@ impl StateTensorPolicy {
 
     /// Tests a stable serialized dtype name against this policy.
     pub fn accepts_dtype_name(&self, dtype: &str) -> bool {
-        match self.dtype {
+        self.dtype.accepts_dtype_name(dtype)
+    }
+}
+
+impl StateTensorDtype {
+    /// Tests an exact serialized scalar name against this portable dtype contract.
+    pub fn accepts_dtype_name(self, dtype: &str) -> bool {
+        match self {
             StateTensorDtype::Floating => {
                 matches!(dtype, "Float16" | "Bfloat16" | "Float32" | "Float64")
             }
@@ -804,9 +896,22 @@ fn validate_state_tensor_policies(tensors: &[StateTensorPolicy]) -> Result<(), C
                 tensor.role
             )));
         }
+        if matches!(tensor.role, StateTensorRole::IntegerHistory { .. })
+            && (tensor.dtype != StateTensorDtype::Int32
+                || !matches!(
+                    tensor.shape.as_slice(),
+                    [StateTensorDimension::Batch, StateTensorDimension::Fixed(_)]
+                ))
+        {
+            return Err(CachePolicyError::Invalid(
+                "integer history requires bounded batch-by-capacity Int32 storage".into(),
+            ));
+        }
         let expected = match tensor.role {
             StateTensorRole::Recurrent => StateResidencyClass::LayerScopedOffloadable,
-            StateTensorRole::Convolution { .. }
+            StateTensorRole::Auxiliary { .. }
+            | StateTensorRole::IntegerHistory { .. }
+            | StateTensorRole::Convolution { .. }
             | StateTensorRole::PrefixEmbedding
             | StateTensorRole::PositionDelta => StateResidencyClass::AlwaysDeviceMutable,
             StateTensorRole::Pooling {
@@ -849,11 +954,12 @@ mod tests {
             MutableStateResidency::LayerScopedOffloadable,
         )
         .unwrap();
-        let layer = LayerCachePolicy::key_value_with_fixed_state(
+        let layer = LayerCachePolicy::key_value_with_state(
             AttentionPolicy::sliding(128).unwrap(),
             8,
             64,
             vec![recurrent.clone()],
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(

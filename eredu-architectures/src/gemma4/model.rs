@@ -13,8 +13,8 @@ use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
     ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelPlanError, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
+    ParallelPlanError, ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
+    PartitionedLayeredArchitecture, RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
@@ -688,6 +688,37 @@ where
     })
 }
 
+impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let prepared = prepare_composite_ingress::<B>(input, context)?;
+        let decoder_parts = prepared.decoder_parts();
+        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+            self,
+            ModelInput {
+                parts: &decoder_parts,
+                vision: prepared.vision_input(),
+                audio: prepared.audio_input(),
+                per_layer_tokens: None,
+                mask: None,
+            },
+            state,
+            parallel,
+            context,
+        )
+    }
+}
+
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
@@ -695,6 +726,16 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     type InputPartPlan = Gemma4InputPartPlan;
+    type PrefillRequest =
+        crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
+
+    fn prepare_prefill_request(
+        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::PrefillRequest, Self::Error> {
+        crate::composite_execution::SingleCompositePrefillRequest::new(prepared, admitted)
+    }
     type AdmissionConfig = FamilyConfig;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
@@ -899,7 +940,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<(usize, usize), Self::Error> {
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
         self.args
             .text
             .layer_policy(unit)
@@ -907,11 +948,12 @@ where
         let per_layer = usize::from(self.args.text.hidden_size_per_layer_input > 0);
         // Attention and the always-present dense branch reduce before routing;
         // the routed write and optional per-layer write reduce afterward.
-        Ok(if routed {
-            (2, 1 + per_layer)
-        } else {
-            (1, 1 + per_layer)
-        })
+        Ok(
+            crate::partitioned_execution::RoutedTensorReductions::hidden(
+                if routed { 2 } else { 1 },
+                1 + per_layer,
+            ),
+        )
     }
 
     fn accept_partition_boundary(
@@ -1026,33 +1068,6 @@ where
             context,
         )
     }
-
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
-    {
-        let prepared = prepare_composite_ingress::<B>(input, context)?;
-        let decoder_parts = prepared.decoder_parts();
-        <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-            self,
-            ModelInput {
-                parts: &decoder_parts,
-                vision: prepared.vision_input(),
-                audio: prepared.audio_input(),
-                per_layer_tokens: None,
-                mask: None,
-            },
-            state,
-            parallel,
-            context,
-        )
-    }
 }
 
 enum PreparedPart<T> {
@@ -1099,7 +1114,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -1121,7 +1136,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
@@ -1162,7 +1177,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -1185,7 +1200,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
@@ -1274,7 +1289,7 @@ impl TextBoundarySchema {
                         head_dim,
                         ..
                     }
-                    | LayerCachePolicy::KeyValueWithFixedState {
+                    | LayerCachePolicy::KeyValueWithState {
                         num_key_value_heads,
                         head_dim,
                         ..
@@ -1284,7 +1299,7 @@ impl TextBoundarySchema {
                         head_dim,
                         ..
                     }
-                    | LayerCachePolicy::KeyOnlyWithFixedState {
+                    | LayerCachePolicy::KeyOnlyWithState {
                         num_key_heads,
                         head_dim,
                         ..
@@ -2568,7 +2583,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let (generated_mask, per_layer_input) =
@@ -2631,7 +2646,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let (generated_mask, per_layer_input) =

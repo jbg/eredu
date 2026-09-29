@@ -45,18 +45,6 @@ pub use prompt_cache::{
 mod persistence;
 pub(super) use persistence::*;
 
-fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let digest = digest.as_ref();
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for &byte in digest {
-        encoded.push(HEX[usize::from(byte >> 4)] as char);
-        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    encoded
-}
-
 #[cfg(test)]
 fn cpu_stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))

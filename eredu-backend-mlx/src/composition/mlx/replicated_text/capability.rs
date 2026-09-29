@@ -35,10 +35,10 @@ impl ReplicatedTextMechanismSupport for MlxReplicatedTextSupport {
         .with_grouped_operations(GROUPED_OPERATION_CAPABILITIES)
         .with_indexed_movement(true)
         .with_addressable_storage(
-            eredu_runtime::AddressableStorageCapabilities::new(true, true, true, u64::MAX)
-                .with_tiers(eredu_runtime::AddressableStorageTiers::new(
-                    true, true, true,
-                )),
+            eredu_runtime::RowLookupMechanismSupport::storage(
+                &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
+            )
+            .expect("native addressable storage is implemented"),
         )
         .with_prompt_cache(true)
         .with_exact_completion(true)
@@ -99,4 +99,11 @@ pub(crate) fn capabilities(
     request: &ReplicatedTextSelectionRequest,
 ) -> BackendMechanismCapabilities {
     synthesize_replicated_text_capabilities(requirements, request, &MlxReplicatedTextSupport)
+}
+
+pub(crate) fn state_capabilities(
+    requirements: &eredu_runtime::StateRealizationRequirements,
+    policy: &CacheResidencyPolicy,
+) -> eredu_runtime::StateMechanismCapabilities {
+    eredu_runtime::synthesize_state_capabilities(requirements, policy, &MlxReplicatedTextSupport)
 }

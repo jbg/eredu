@@ -27,29 +27,29 @@ explicitly excludes GGUF sources.
 
 ## Released checkpoint
 
-Validation on 2026-09-12 used the existing Hugging Face cache outside the source
+The validation artifact resides in the Hugging Face cache outside the source
 tree, pinned to revision `87e768fbfa03994095f3d14527c80c5ae70c5758` of
 [mlx-community/Qwen3.5-0.8B-8bit](https://huggingface.co/mlx-community/Qwen3.5-0.8B-8bit/tree/87e768fbfa03994095f3d14527c80c5ae70c5758).
-The `model.safetensors` SHA-256 matched the publisher's LFS metadata:
+The `model.safetensors` SHA-256 matches the publisher's LFS metadata:
 `9a887c5731520e33bbd324378ecb7b560c1f750af16a6dc28229d500304e656c`.
 The offline fixture in `eredu-architectures/tests/fixtures/configs/` records the
 published configuration and all 847 tensor names, shapes and dtypes; it contains
 no weight payloads.
 
-Native Metal ordinary and semantic generation produced the same 32 greedy
+Native Metal ordinary and semantic generation produces the same 32 greedy
 tokens. Independently loading the same checkpoint with MLX-LM and replaying the
-exact 39-token prompt matched all 32 generated tokens, including cached decode.
-The reference used `mlx-lm==0.31.3`, `mlx==0.32.2`, and
+exact 39-token prompt matches all 32 generated tokens, including cached decode.
+The reference uses `mlx-lm==0.31.3`, `mlx==0.32.2`, and
 `transformers==5.17.0`. The comparison requires exact token equality, without a
 numeric tolerance. It does not assert full-logit equality for this released
 BF16/8-bit model.
 
-The native CLI also completed 16 greedy tokens for `What is 2 + 2?` with
+The recorded native CLI result contains 16 greedy tokens for `What is 2 + 2?` with
 thinking disabled in resident, host-layerwise (one device layer), and
 disk-streamed (1 GiB device budget, zero host cache/lookahead) modes. All three
-outputs matched exactly, beginning `The answer is **4**.`. These runs retained
-the CLI's default draft-token setting, verifying that stale MTP configuration
-does not enable an absent draft.
+outputs match exactly, beginning `The answer is **4**.`. These runs use
+the CLI's default draft-token setting. MTP admission depends on the artifact
+tensor catalog rather than configuration alone.
 
 Reproduce on macOS with Metal access:
 
@@ -76,13 +76,10 @@ Add `--layerwise-host` for the host-windowed run, or
 `--dense-disk-stream --device-budget-bytes 1073741824 --host-budget-bytes 0
 --dense-host-lookahead 0 --dense-background-queue 0` for the disk-streamed run.
 
-`chat_probe` writes successful ordinary and semantic reports, then exits with
-the existing composite-executable controlled-session rejection:
-`complete native state copying is unavailable for this executable`.
-This checkpoint-layout change does not implement composite native state
-copying. Controlled/snapshot/fork validation for this released model therefore
-remains unavailable; ordinary generation and the reference comparison above
-succeed. Released image/video and native distributed execution were not run.
+The released measurements cover ordinary text generation and exact-token
+comparison. They contain no controlled snapshot/fork, image/video or native
+distributed measurements for this artifact. Loaded capability discovery reports
+the executable's available state-copy and control mechanisms.
 
 ## Regression coverage
 
@@ -96,13 +93,9 @@ Admission tests check the full released catalog, reject partial MTP and missing
 companions, and preserve the official schema. Native recipe tests verify
 F16/BF16/F32 dtype, values and materialized byte counts.
 
-The complete architecture library and numerical suites passed: 537 library
-tests (one ignored) and 156 numerical tests. These include existing official
-SafeTensors, GGUF, and parallel-execution coverage. The portable facade suites
-passed 72 tests (one ignored); CLI tests passed 54 tests (one ignored). A fresh
-released official upstream or GGUF
-checkpoint comparison was not performed in this change; compatibility is
-covered by preserved format selection and the regression fixtures.
+Official upstream and GGUF compatibility have format-selection and numerical
+fixture coverage; this report contains no separate released-checkpoint comparison
+for those formats.
 
 ```sh
 export CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu"

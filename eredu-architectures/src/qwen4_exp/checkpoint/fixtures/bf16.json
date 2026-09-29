@@ -1,0 +1,3442 @@
+{
+  "repository": "Qwen/Qwen3.8-Flash-Next",
+  "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+  "index_sha256": "99e815241ef03325536b0aaa4441deea45174c17fae31e10f0bb456410c590de",
+  "tensor_count": 1658,
+  "headers": [
+    {
+      "file": "model-00001-of-00131.safetensors",
+      "sha256": "bd0ba6edc3cffdcfb05456a7e1c3973ac7380a6c43fc47ddfd220a91a283fea5",
+      "bytes": 39296
+    },
+    {
+      "file": "model-00002-of-00131.safetensors",
+      "sha256": "d482a7b5ad9050e1ec1541aa95e6ce3e836d943641748dbb0836f0c5232e3f9d",
+      "bytes": 160
+    },
+    {
+      "file": "model-00003-of-00131.safetensors",
+      "sha256": "931bf5e2754636596a8f1032d56ff6db6d113d94f78c3a9a890bb2d9ab9b6eec",
+      "bytes": 3248
+    },
+    {
+      "file": "model-00004-of-00131.safetensors",
+      "sha256": "d72251836707907ba8c78398898cb7086efa594c113ef7dd2c79e97e116a185e",
+      "bytes": 160
+    },
+    {
+      "file": "model-00005-of-00131.safetensors",
+      "sha256": "70b7de92054cd2d61a0c9da6756c818c533059b945063a13182ec8940060d856",
+      "bytes": 2392
+    },
+    {
+      "file": "model-00006-of-00131.safetensors",
+      "sha256": "f7c1a3d36a421faba2ee89fe0f90c1bbad9766409dd50120eec4143e7e147d67",
+      "bytes": 664
+    },
+    {
+      "file": "model-00007-of-00131.safetensors",
+      "sha256": "fa51b723f10176cdffda771aeb75cf1a15706710becdc879338819a5a46efdf3",
+      "bytes": 664
+    },
+    {
+      "file": "model-00008-of-00131.safetensors",
+      "sha256": "6a6833a2c6e49373d9646202469524dfe2bcf5aa3c315dde8781b92a1100b48a",
+      "bytes": 664
+    },
+    {
+      "file": "model-00009-of-00131.safetensors",
+      "sha256": "63e5c199c20c2feda1fb436c3f50b40f23037c325246f87704b764132a4c656d",
+      "bytes": 664
+    },
+    {
+      "file": "model-00010-of-00131.safetensors",
+      "sha256": "27296710e4bf04d72ded2c90ccee4e92bbbe6d10a538640dcdfad2d883e6dcc5",
+      "bytes": 664
+    },
+    {
+      "file": "model-00011-of-00131.safetensors",
+      "sha256": "a0cff186fbc6e6eddaffac7c79fa8f561acb8bb427e3325c4edbeea4661d738a",
+      "bytes": 664
+    },
+    {
+      "file": "model-00012-of-00131.safetensors",
+      "sha256": "fe5f9950f00fb55d2630ad2a7db01edaaf95c9cfa0df4d4874a84929ec8ae63d",
+      "bytes": 664
+    },
+    {
+      "file": "model-00013-of-00131.safetensors",
+      "sha256": "77ae21889f86cb5c3791eb4df0d900800ede044150c0c39692f4a53d85720d2e",
+      "bytes": 664
+    },
+    {
+      "file": "model-00014-of-00131.safetensors",
+      "sha256": "999009ba0f12570d248d305f916168e1d4f8c43a7cfa6a6a25062165864b1b6d",
+      "bytes": 664
+    },
+    {
+      "file": "model-00015-of-00131.safetensors",
+      "sha256": "903f14cdac0f238b184adeff022e8c8aa8d24207cd3f4ff94b2f89b8f70fa613",
+      "bytes": 664
+    },
+    {
+      "file": "model-00016-of-00131.safetensors",
+      "sha256": "a4ed558b907ce965b77831349d44d1f46df04c2ef2722d2f76ad99f26424f226",
+      "bytes": 664
+    },
+    {
+      "file": "model-00017-of-00131.safetensors",
+      "sha256": "69482021012051e4a8ca0625bdff57a5749fb4b851021cab39f83388313d7bc6",
+      "bytes": 664
+    },
+    {
+      "file": "model-00018-of-00131.safetensors",
+      "sha256": "b9d36fc763f54e1f23b8cc21d0380550438ce7ca7f64e1bbda7b5fa19bab65e3",
+      "bytes": 664
+    },
+    {
+      "file": "model-00019-of-00131.safetensors",
+      "sha256": "e85c37fab3448265556344a2d930ed88e88d29e13705b6bc086c8fbf27451d25",
+      "bytes": 664
+    },
+    {
+      "file": "model-00020-of-00131.safetensors",
+      "sha256": "bf4b68fc75e62c41954fa6ae71b30dc3f0be549cbe5d97a70059c98c4922ef5a",
+      "bytes": 664
+    },
+    {
+      "file": "model-00021-of-00131.safetensors",
+      "sha256": "e29479a6fbfc5a42e62cb36c86c2e5bbb5abb33ecd74bca3270fce44f27fb453",
+      "bytes": 664
+    },
+    {
+      "file": "model-00022-of-00131.safetensors",
+      "sha256": "a495e2f05d16e8eb9004ae2141fd7c13216384104b79c2541a776a99def4398e",
+      "bytes": 664
+    },
+    {
+      "file": "model-00023-of-00131.safetensors",
+      "sha256": "e21273c5f485c93ede1bd8f926b818d558de39214d3d773ba4d1cc63112431ad",
+      "bytes": 664
+    },
+    {
+      "file": "model-00024-of-00131.safetensors",
+      "sha256": "f3321fdd0ccf343bf1307bf0f686a8953dfa64954b4404ffa6612152ae9c9b63",
+      "bytes": 664
+    },
+    {
+      "file": "model-00025-of-00131.safetensors",
+      "sha256": "557976cd8b20976b5c499058d4b28c9f76a5de8d1250fa3ac794374e8dfccb02",
+      "bytes": 664
+    },
+    {
+      "file": "model-00026-of-00131.safetensors",
+      "sha256": "b23ca35669868f9a74eb101249f8d8b243ab64095d6780a5af9f54b90f3d2e74",
+      "bytes": 664
+    },
+    {
+      "file": "model-00027-of-00131.safetensors",
+      "sha256": "fc6f7c46622c352a7e72c2315b8b487de7b34ee321b3d638948755e257db2981",
+      "bytes": 664
+    },
+    {
+      "file": "model-00028-of-00131.safetensors",
+      "sha256": "e62ecfcf9109a7048bf6c3d00fad2efc2f9eb0e2d4ed477e216bba9be78ddbdf",
+      "bytes": 664
+    },
+    {
+      "file": "model-00029-of-00131.safetensors",
+      "sha256": "28e7efb8be166a57f67d8db7bea7d5785b663ac1d4abc98e32827bb81e796ce4",
+      "bytes": 664
+    },
+    {
+      "file": "model-00030-of-00131.safetensors",
+      "sha256": "ba395fc22826b79b90301a616a2849f948ea13da686bebd0ab4061a9fa392bea",
+      "bytes": 664
+    },
+    {
+      "file": "model-00031-of-00131.safetensors",
+      "sha256": "82a0b52141a9202f0744055861bc813a7d2478843dc656a8afbba167f61c0d6d",
+      "bytes": 672
+    },
+    {
+      "file": "model-00032-of-00131.safetensors",
+      "sha256": "8a6fcf7a8542a0f924195faef66d889e8333022c5fc07adfa8c1ffb4b73214fa",
+      "bytes": 672
+    },
+    {
+      "file": "model-00033-of-00131.safetensors",
+      "sha256": "21437504ec382bdb7b49ee712de07f6e7af19aedc1cd43f077fc109081ba22c8",
+      "bytes": 672
+    },
+    {
+      "file": "model-00034-of-00131.safetensors",
+      "sha256": "658a4b98069ca620f87866fad881769003c10f163ff113faf7914670bea25a1c",
+      "bytes": 672
+    },
+    {
+      "file": "model-00035-of-00131.safetensors",
+      "sha256": "e39a33bef6c65297b3915cbc2f11a2ebbe6556ebbc4ba8bb356b471e3f7f6ee8",
+      "bytes": 672
+    },
+    {
+      "file": "model-00036-of-00131.safetensors",
+      "sha256": "48208b9be7bca58566d45eace04cbb29a934966146b8f9998ec89c638149dbeb",
+      "bytes": 672
+    },
+    {
+      "file": "model-00037-of-00131.safetensors",
+      "sha256": "a9805b59c4761af5e4c546dafc9370d7f5260035c0eb9ae4a2cf67427795babe",
+      "bytes": 2768
+    },
+    {
+      "file": "model-00038-of-00131.safetensors",
+      "sha256": "caac9bbb5beb5c1dcc683d989295f3d811e1ca49649c88a224d5602b5b573278",
+      "bytes": 168
+    },
+    {
+      "file": "model-00039-of-00131.safetensors",
+      "sha256": "5efd71a30cbd4f77997579eb31cc48ab0b18b0ca03305a7cd097f916174e6fb1",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00040-of-00131.safetensors",
+      "sha256": "963072318e0f609c58370c4b984ca9f5b41529f0e709ad539060dbff82a6b256",
+      "bytes": 168
+    },
+    {
+      "file": "model-00041-of-00131.safetensors",
+      "sha256": "d855949e6e1db053cdf7619d26df72cc54202867807ae4fe68dd768e5748a627",
+      "bytes": 4616
+    },
+    {
+      "file": "model-00042-of-00131.safetensors",
+      "sha256": "b6ff0e00c9557219fe7bff3b9cccfa7e88aac2900aa8d9a883986691407757b2",
+      "bytes": 168
+    },
+    {
+      "file": "model-00043-of-00131.safetensors",
+      "sha256": "a2aa6f79e2b71d3b9c647a2531abe0ed10841af9202ddea6e71f6bc6a533b647",
+      "bytes": 3400
+    },
+    {
+      "file": "model-00044-of-00131.safetensors",
+      "sha256": "512bc1a07319c203fe3440509747f3e9663164fbf6ddb5540c08ea27c4492c22",
+      "bytes": 168
+    },
+    {
+      "file": "model-00045-of-00131.safetensors",
+      "sha256": "bc18969ba36ce3b6d394f4e2e4d8832b1362cd23c831a650661e13ec53c3889c",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00046-of-00131.safetensors",
+      "sha256": "6321cacf8086fe976098ba67b6fb19d590d8d05c664a7dd334ed21be7ef1836b",
+      "bytes": 168
+    },
+    {
+      "file": "model-00047-of-00131.safetensors",
+      "sha256": "4646bb11b2d6a602a825144e030bbd8249450e816c7cacfa0054e948c14c1f9a",
+      "bytes": 2216
+    },
+    {
+      "file": "model-00048-of-00131.safetensors",
+      "sha256": "3faecdce4022552e45a75c34d0e6721883a3c46385b183561ef79e5f177563d2",
+      "bytes": 168
+    },
+    {
+      "file": "model-00049-of-00131.safetensors",
+      "sha256": "f20c34d823588bf81067e654ab564bdbf9c969f089838446f01998e3303ee10e",
+      "bytes": 4600
+    },
+    {
+      "file": "model-00050-of-00131.safetensors",
+      "sha256": "42e88922ab7576b6a2fa57a761eb6112ac2ff692f92872225eac50293b488639",
+      "bytes": 168
+    },
+    {
+      "file": "model-00051-of-00131.safetensors",
+      "sha256": "11e675dabaae4df3b7d48b963df0152fbd2357bb307720b743e481c6c12cc486",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00052-of-00131.safetensors",
+      "sha256": "1e8fae33616969f5edf030bb66f76fc2b7e26613fdf33b55e58b5c03ab30d736",
+      "bytes": 168
+    },
+    {
+      "file": "model-00053-of-00131.safetensors",
+      "sha256": "29d09ff707a54b14eda7566d900ee3deafec0b31cc24238ae620a916829f3558",
+      "bytes": 3408
+    },
+    {
+      "file": "model-00054-of-00131.safetensors",
+      "sha256": "4d71ccdd7912227310c2dea5539eb3ecb0f59ff9fea24e1efce67b00829bec47",
+      "bytes": 168
+    },
+    {
+      "file": "model-00055-of-00131.safetensors",
+      "sha256": "84f2d37930f4628245f5b791a0b6c2c47edef95abf272d1773720b53eada7e96",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00056-of-00131.safetensors",
+      "sha256": "70515f6ab8f1de2981d73722d26d5d96bf0444c842389ebd3347a4d0887ac12a",
+      "bytes": 168
+    },
+    {
+      "file": "model-00057-of-00131.safetensors",
+      "sha256": "926a43b4672e2db4bc3f45107d372fe6a86782e04650045b14e94a8efca87d44",
+      "bytes": 4608
+    },
+    {
+      "file": "model-00058-of-00131.safetensors",
+      "sha256": "6acb9a84ea35a159005aa173fd47ff09772c6aeb1af35b130eb88dd5f1919f3b",
+      "bytes": 160
+    },
+    {
+      "file": "model-00059-of-00131.safetensors",
+      "sha256": "14cfc3018b2c8c4ebbd7b930b2deaa30ae8297d1eb83380514ef3b162b8a95c8",
+      "bytes": 2184
+    },
+    {
+      "file": "model-00060-of-00131.safetensors",
+      "sha256": "362c32d36fc32dfab249cb83f0800e2efcdeebc17838557a71a4edcd3b21744a",
+      "bytes": 1168
+    },
+    {
+      "file": "model-00061-of-00131.safetensors",
+      "sha256": "fc5adb7a589a2066a96966a65a54dba5fcda466a84ab258450e9a47c598e1433",
+      "bytes": 168
+    },
+    {
+      "file": "model-00062-of-00131.safetensors",
+      "sha256": "1208eff9ea4496ca1521686d163a460d7c873e8c9260baf4cbd175cbd6b02bd4",
+      "bytes": 3384
+    },
+    {
+      "file": "model-00063-of-00131.safetensors",
+      "sha256": "ca6a1c3bf18de0dd9ca3e87297d35d35fc4a317b624c534fa32392d3be866011",
+      "bytes": 168
+    },
+    {
+      "file": "model-00064-of-00131.safetensors",
+      "sha256": "80a62860e6cbba1973420194c96ea7b7aa48ec44249fbf5390a81aa237f32d04",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00065-of-00131.safetensors",
+      "sha256": "8e185715200c883e59544ef8ba973d391849197d855876a822650e1c074093ec",
+      "bytes": 168
+    },
+    {
+      "file": "model-00066-of-00131.safetensors",
+      "sha256": "88296ad899cc28800ff9ad7ee6fefe6331e6d8fdbb50e72ebf7cc682696e859e",
+      "bytes": 2184
+    },
+    {
+      "file": "model-00067-of-00131.safetensors",
+      "sha256": "8701660d41505cd19a6e88153703ca2ed30f488612903dbe0828209543a15aed",
+      "bytes": 168
+    },
+    {
+      "file": "model-00068-of-00131.safetensors",
+      "sha256": "7fdd19b6b2e2716e458da55b0da613e0915b691640b52c6bf4e99c29adb2792a",
+      "bytes": 4480
+    },
+    {
+      "file": "model-00069-of-00131.safetensors",
+      "sha256": "b09d2c4023d920db48857d9164d621ec752f083f9189212ce9b9a27fb389ba3c",
+      "bytes": 168
+    },
+    {
+      "file": "model-00070-of-00131.safetensors",
+      "sha256": "e990b7fce77d88c10bf42c42551e4f6441a078140a3a1c63a9934b26f26d3fbe",
+      "bytes": 3384
+    },
+    {
+      "file": "model-00071-of-00131.safetensors",
+      "sha256": "61db7e6900ded22a923e13a6063d47241343187889e824c69b289a7e83f58d67",
+      "bytes": 168
+    },
+    {
+      "file": "model-00072-of-00131.safetensors",
+      "sha256": "1842cfbfc03a29fd970a7f6269c4b7ad4d5fa1b634218360d8c94ea6f2cfa390",
+      "bytes": 3512
+    },
+    {
+      "file": "model-00073-of-00131.safetensors",
+      "sha256": "4243cbefea3ca5b1812904b8c2ee65d6cd40650db6e2b0babe62eb6acbc27a62",
+      "bytes": 168
+    },
+    {
+      "file": "model-00074-of-00131.safetensors",
+      "sha256": "b22b9e52a31b5862f795f7757a6a4e9ec2925a7afc3c562a3f0965ddc32004d3",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00075-of-00131.safetensors",
+      "sha256": "7f3edaf330c3c086518c720f30f54cd6f839fe006dae0d8b2cdcbe5f1f5f2dbe",
+      "bytes": 168
+    },
+    {
+      "file": "model-00076-of-00131.safetensors",
+      "sha256": "7f4c07549987f05ebd538b41a7b5c19ece4e3f2ccfa52ff4f1abc21282cb77ba",
+      "bytes": 4608
+    },
+    {
+      "file": "model-00077-of-00131.safetensors",
+      "sha256": "5e6cb0347152a7a46785e2406a5ade1d947f33bc8663bc1e0159a25cf238120f",
+      "bytes": 168
+    },
+    {
+      "file": "model-00078-of-00131.safetensors",
+      "sha256": "e475b72cc843b72bce71e3a8ebf3a6caf150ea9aaa2e6961ef1d097504fb92be",
+      "bytes": 3408
+    },
+    {
+      "file": "model-00079-of-00131.safetensors",
+      "sha256": "048affca9667613fe53ca34bd039f6946fcc76efffc6bc78768d76e5f262a4bb",
+      "bytes": 168
+    },
+    {
+      "file": "model-00080-of-00131.safetensors",
+      "sha256": "abd684fe9e7e41a4ca6199dac8cb8d46d046f89d12379ac0ed67d89279dc431f",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00081-of-00131.safetensors",
+      "sha256": "348778160fc9e8d64b4d7ed2933ebf019a385b7f4783a5bdc3731b6d484ff447",
+      "bytes": 160
+    },
+    {
+      "file": "model-00082-of-00131.safetensors",
+      "sha256": "ce840d1d64f034886f1774712a1f0c16d89560f5ac8f5194624b9c9f5249eb95",
+      "bytes": 4584
+    },
+    {
+      "file": "model-00083-of-00131.safetensors",
+      "sha256": "d050d72f7a46076e8aaa0a47aac114d813b522c23f64cf69d6d23edb95a83611",
+      "bytes": 168
+    },
+    {
+      "file": "model-00084-of-00131.safetensors",
+      "sha256": "84b9f66ae3761e00e21f91605db4cbc4f4fbf98625ffcf19620b0029a88ef001",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00085-of-00131.safetensors",
+      "sha256": "800390558fc0586716fefe07b866f1f444ff9bc12c934bb00cb7ecfa18afd9fa",
+      "bytes": 168
+    },
+    {
+      "file": "model-00086-of-00131.safetensors",
+      "sha256": "c20e56ccd18653a47d1205982383aa9ecdbaa8945a20e3ce96cbd27a022d4f4a",
+      "bytes": 4624
+    },
+    {
+      "file": "model-00087-of-00131.safetensors",
+      "sha256": "16e7cd905bfd7de2bc7d1752ada9a9572cb8b225f244e4ee4aed0f7cccb02cfe",
+      "bytes": 168
+    },
+    {
+      "file": "model-00088-of-00131.safetensors",
+      "sha256": "da685ca44e484735b3928b400fe22e9cd76521ffb29eb86c128d9c1b7e1183a3",
+      "bytes": 3408
+    },
+    {
+      "file": "model-00089-of-00131.safetensors",
+      "sha256": "f734e82be397acb54ffa26f22e7116ca9070889870c11b9e1d647861ff6f15b5",
+      "bytes": 168
+    },
+    {
+      "file": "model-00090-of-00131.safetensors",
+      "sha256": "fb40f428c3f7b98d686c011c743cff77f3cbdca7a673ae3415a8996a6cf67ef4",
+      "bytes": 3400
+    },
+    {
+      "file": "model-00091-of-00131.safetensors",
+      "sha256": "d794ae45f531f8124eeabc94e39a90052fd4cad2c6ef5fffcaac26d8a1f1e14a",
+      "bytes": 168
+    },
+    {
+      "file": "model-00092-of-00131.safetensors",
+      "sha256": "b60edd1f263689bae0247bb2e2061c8729d70646c5249a8de9a002866a66fe3c",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00093-of-00131.safetensors",
+      "sha256": "619aea0d36926b4655773206fcf98647e361c3544d3717c8f7fff28688d65ee1",
+      "bytes": 168
+    },
+    {
+      "file": "model-00094-of-00131.safetensors",
+      "sha256": "f1ddb98d7ae341ce6de1f443e52516f8f931d7698152e8a0b4266eeaf2c9e21e",
+      "bytes": 4600
+    },
+    {
+      "file": "model-00095-of-00131.safetensors",
+      "sha256": "2d783bb6f62e90dcb4d91ea3ed085f83db9a96c23199ca7d083704ceb2735ce2",
+      "bytes": 168
+    },
+    {
+      "file": "model-00096-of-00131.safetensors",
+      "sha256": "edb16af93fc3b212a6d375d3430ea75b11e9c85e00b7f8bfab010f4d10a5bce8",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00097-of-00131.safetensors",
+      "sha256": "f8f4a77a0eb404ab5ac90c32b87eaba8edb6d1e6bd925544c67f221982e5e947",
+      "bytes": 168
+    },
+    {
+      "file": "model-00098-of-00131.safetensors",
+      "sha256": "d4d186a3ce4aa803591d9f7bf80740f7ff144bf1fbb57f96e4c59a20f74561a7",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00099-of-00131.safetensors",
+      "sha256": "7dbbea83c06de6f5c1fe9ed966ed14b13f975dd2ca82ac3fd70dc06f882009aa",
+      "bytes": 168
+    },
+    {
+      "file": "model-00100-of-00131.safetensors",
+      "sha256": "fd4f3e7139eb8d242880f321aaba9fc0fb672a7a1dbd1eec233fefe313dc7e07",
+      "bytes": 2200
+    },
+    {
+      "file": "model-00101-of-00131.safetensors",
+      "sha256": "184a25ab2a50ea09a629a717c7f34d59bb5076d0d8099eb2d725c675c6d78612",
+      "bytes": 168
+    },
+    {
+      "file": "model-00102-of-00131.safetensors",
+      "sha256": "d17ca4abcdcd91fcbf2e4419da42e5308ea56cb2bf0bb6ec0c4c9320b01c2cde",
+      "bytes": 4576
+    },
+    {
+      "file": "model-00103-of-00131.safetensors",
+      "sha256": "ef5ada2b78445e7bb6ef21b2e844c1e52a94573a20cc3a20d1fb4cf58d6f7a21",
+      "bytes": 160
+    },
+    {
+      "file": "model-00104-of-00131.safetensors",
+      "sha256": "ee765ddce35c6e58810386cadb1d9167b8f3f57fb1eccb433cbe4227d768c8b3",
+      "bytes": 3256
+    },
+    {
+      "file": "model-00105-of-00131.safetensors",
+      "sha256": "fe037747f6a6dac836efcc8d7853ebd9fadadc45a266a77543206488c4d238b5",
+      "bytes": 168
+    },
+    {
+      "file": "model-00106-of-00131.safetensors",
+      "sha256": "b02ba8bb298ccbf9fd2a5e4edad12fc5349d1a3c3a7f6bf6158fad44c8b228c3",
+      "bytes": 3384
+    },
+    {
+      "file": "model-00107-of-00131.safetensors",
+      "sha256": "1b09b806d59ca8eaac244f185de7391216ee358ce36c549b2e2e365605fdf3bb",
+      "bytes": 168
+    },
+    {
+      "file": "model-00108-of-00131.safetensors",
+      "sha256": "da76a60f39492e59a8a1becd2f0ebccdcbbf6b8717f5ee01def167691eac0ec3",
+      "bytes": 3608
+    },
+    {
+      "file": "model-00109-of-00131.safetensors",
+      "sha256": "3903ea9ae427e771834dd5610d2e618cbb23f37179c92aa7397d6c611abbc311",
+      "bytes": 168
+    },
+    {
+      "file": "model-00110-of-00131.safetensors",
+      "sha256": "ab9edd36254d3bc70819befd3e70ec2441c4307c64df9a6bacb86eed64df0983",
+      "bytes": 2072
+    },
+    {
+      "file": "model-00111-of-00131.safetensors",
+      "sha256": "d2ef0892f7090edceeb9ddf90bc97f7d203c91ea8573adb731c7c13fb86ba97c",
+      "bytes": 168
+    },
+    {
+      "file": "model-00112-of-00131.safetensors",
+      "sha256": "dbb225350437a0bee2e51f69c47bcf3df8f76ca3878a988af92bc56d8ad46e76",
+      "bytes": 4592
+    },
+    {
+      "file": "model-00113-of-00131.safetensors",
+      "sha256": "875ed3858b02814a91e38f43471452f29876c6abb4162eff2bab9a77c72055c0",
+      "bytes": 168
+    },
+    {
+      "file": "model-00114-of-00131.safetensors",
+      "sha256": "e93c1a2ccc03a12cdd1d74023702208feea9d8328c43e9de773a4125458253e3",
+      "bytes": 3376
+    },
+    {
+      "file": "model-00115-of-00131.safetensors",
+      "sha256": "089a1d806adbe22a0e3cc7e82ef57db1476176bd22cba6d70b869d08b5f07f15",
+      "bytes": 168
+    },
+    {
+      "file": "model-00116-of-00131.safetensors",
+      "sha256": "2b8ce455e3808d9189b537418d4cdaf3808caa8ea832694e9ab175ac0d21b391",
+      "bytes": 3264
+    },
+    {
+      "file": "model-00117-of-00131.safetensors",
+      "sha256": "2e8dc0fc1c88db2eb0672a2b35d84c9f73c795008dae01c4344b2c534f80118d",
+      "bytes": 168
+    },
+    {
+      "file": "model-00118-of-00131.safetensors",
+      "sha256": "064e88ac8a3e88bfe5c7b8e753c13851e94e61cbddcfedeed97b7952aaef928c",
+      "bytes": 2176
+    },
+    {
+      "file": "model-00119-of-00131.safetensors",
+      "sha256": "5a9b7781b9001a3029d89420cbc9e0f913102be39d4bad647d4152dd6718285b",
+      "bytes": 168
+    },
+    {
+      "file": "model-00120-of-00131.safetensors",
+      "sha256": "603c7d6eb958abd92e1a270d6bef6f33391438ac1409de320de2f79c666b737d",
+      "bytes": 4568
+    },
+    {
+      "file": "model-00121-of-00131.safetensors",
+      "sha256": "581d2af6a4f1e922da5b320221b8e713ee4de72f1c779cee89f50fba47a31f70",
+      "bytes": 160
+    },
+    {
+      "file": "model-00122-of-00131.safetensors",
+      "sha256": "0df2a6c31d4d75eb88c35ecdded527a47c802d39184f0ee8894b87dae0063f35",
+      "bytes": 3248
+    },
+    {
+      "file": "model-00123-of-00131.safetensors",
+      "sha256": "23b1c91e7f2bf42ea35d2a5a751ad2be25afd39301eb4abcc9e531e73f485458",
+      "bytes": 160
+    },
+    {
+      "file": "model-00124-of-00131.safetensors",
+      "sha256": "cc242c190f53c8a0509351c6ab506235fdb499dd98c87cce876b7693b4660bf2",
+      "bytes": 2160
+    },
+    {
+      "file": "model-00125-of-00131.safetensors",
+      "sha256": "fd19395dcc76aa8b731ff479a6a3aa846c268bf49a0d9280643f712c628f915c",
+      "bytes": 160
+    },
+    {
+      "file": "model-00126-of-00131.safetensors",
+      "sha256": "f32b30685f6cf1889df0cddb80a909706e7a27b6b9d603ab7efd8b2093947888",
+      "bytes": 4448
+    },
+    {
+      "file": "model-00127-of-00131.safetensors",
+      "sha256": "557479b68b9dc8e0079591393f93fc5ae68b7aa46215d55d5e5c7abcbe2f72ce",
+      "bytes": 160
+    },
+    {
+      "file": "model-00128-of-00131.safetensors",
+      "sha256": "114c7f8b64c7aa69734ebddd1487008f35cbbe6a82d2c626ad0da88e132ea743",
+      "bytes": 3248
+    },
+    {
+      "file": "model-00129-of-00131.safetensors",
+      "sha256": "a9480bd06ee703a9f8dc02942a44191e136ef348f0fe820897e5fca2bb2389cb",
+      "bytes": 160
+    },
+    {
+      "file": "model-00130-of-00131.safetensors",
+      "sha256": "3f68ed90e4b36cbbdfcbb6c598a5a72e1d5d95dab5013765f5bf5da17d7ef9e1",
+      "bytes": 1568
+    },
+    {
+      "file": "model-00131-of-00131.safetensors",
+      "sha256": "2a4725f92e5ba69f0cf0e9f6bd06004eda193c8ae184c05ac6d5bef7ea6905e9",
+      "bytes": 120
+    }
+  ],
+  "tensors": [
+    {
+      "name": "lm_head.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        248320,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.embed_tokens.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        248320,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.hyper_connection_mixer.hc_norm.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.attn_hyper_connection.block_inject_weight.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4,
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.attn_hyper_connection.hc_norm.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.attn_hyper_connection.input_mix_weight_down.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.attn_hyper_connection.input_mix_weight_up.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.A_log",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        48
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.conv1d.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        1,
+        4
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.dt_bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        48
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.in_proj_a.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        48,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.in_proj_b.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        48,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.in_proj_qkv.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.in_proj_z.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        6144,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.norm.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.linear_attn.out_proj.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          4,
+          5,
+          6,
+          8,
+          9,
+          10,
+          12,
+          13,
+          14,
+          16,
+          17,
+          18,
+          20,
+          21,
+          22,
+          24,
+          25,
+          26,
+          28,
+          29,
+          30,
+          32,
+          33,
+          34,
+          36,
+          37,
+          38,
+          40,
+          41,
+          42,
+          44,
+          45,
+          46
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        6144
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.experts.down_proj",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560,
+        640
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.experts.gate_up_proj",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1280,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.gate.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.shared_expert.down_proj.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        640
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.shared_expert.gate_proj.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.shared_expert.up_proj.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp.shared_expert_gate.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp_hyper_connection.block_inject_weight.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4,
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp_hyper_connection.hc_norm.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp_hyper_connection.input_mix_weight_down.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.mlp_hyper_connection.input_mix_weight_up.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.conv1d.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        1,
+        4
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.key_proj.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.norm_conv.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.norm_key.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.norm_query.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.ple_embedding.layer_multipliers",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "I64",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.ple_embedding.ngram_embedding.shard_{1}.weight",
+      "axes": [
+        [
+          1
+        ],
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76,
+          77,
+          78,
+          79,
+          80,
+          81,
+          82,
+          83,
+          84,
+          85,
+          86,
+          87,
+          88,
+          89,
+          90,
+          91,
+          92,
+          93,
+          94,
+          95,
+          96,
+          97,
+          98,
+          99,
+          100,
+          101,
+          102,
+          103,
+          104,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          112,
+          113,
+          114,
+          115,
+          116,
+          117,
+          118,
+          119,
+          120,
+          121,
+          122,
+          123,
+          124,
+          125,
+          126,
+          127
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2500012,
+        160
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.ple_embedding.ngram_heads_offsets",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "I64",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.ple_embedding.ngram_heads_vocab_sizes",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "I64",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.ple.value_proj.weight",
+      "axes": [
+        [
+          1
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.indexer.index_qk_proj.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.indexer.k_layernorm.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.indexer.q_layernorm.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.k_norm.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        256
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.k_proj.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.o_proj.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        6144
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.q_norm.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        256
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.q_proj.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        12288,
+        2560
+      ]
+    },
+    {
+      "name": "model.language_model.layers.{0}.self_attn.v_proj.weight",
+      "axes": [
+        [
+          3,
+          7,
+          11,
+          15,
+          19,
+          23,
+          27,
+          31,
+          35,
+          39,
+          43,
+          47
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.attn.proj.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.attn.proj.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152,
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.attn.qkv.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        3456
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.attn.qkv.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        3456,
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.mlp.linear_fc1.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4304
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.mlp.linear_fc1.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4304,
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.mlp.linear_fc2.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.mlp.linear_fc2.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152,
+        4304
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.norm1.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.norm1.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.norm2.bias",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.blocks.{0}.norm2.weight",
+      "axes": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.merger.linear_fc1.bias",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        4608
+      ]
+    },
+    {
+      "name": "model.visual.merger.linear_fc1.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        4608,
+        4608
+      ]
+    },
+    {
+      "name": "model.visual.merger.linear_fc2.bias",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2560
+      ]
+    },
+    {
+      "name": "model.visual.merger.linear_fc2.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        4608
+      ]
+    },
+    {
+      "name": "model.visual.merger.norm.bias",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.merger.norm.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.patch_embed.proj.bias",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        1152
+      ]
+    },
+    {
+      "name": "model.visual.patch_embed.proj.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        1152,
+        3,
+        2,
+        16,
+        16
+      ]
+    },
+    {
+      "name": "model.visual.pos_embed.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2304,
+        1152
+      ]
+    },
+    {
+      "name": "mtp.fc_embedding.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.fc_hidden.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.hyper_connection_mixer.hc_norm.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.attn_hyper_connection.block_inject_weight.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4,
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.attn_hyper_connection.hc_norm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.attn_hyper_connection.input_mix_weight_down.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.attn_hyper_connection.input_mix_weight_up.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.experts.down_proj",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560,
+        640
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.experts.gate_up_proj",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        1280,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.gate.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.shared_expert.down_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        640
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.shared_expert.gate_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.shared_expert.up_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp.shared_expert_gate.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        1,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp_hyper_connection.block_inject_weight.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        4,
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp_hyper_connection.hc_norm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp_hyper_connection.input_mix_weight_down.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        320,
+        10240
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.mlp_hyper_connection.input_mix_weight_up.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        10240,
+        320
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.indexer.index_qk_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        640,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.indexer.k_layernorm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.indexer.q_layernorm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        128
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.k_norm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        256
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.k_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.o_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        2560,
+        6144
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.q_norm.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        256
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.q_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        12288,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.layers.{0}.self_attn.v_proj.weight",
+      "axes": [
+        [
+          0
+        ]
+      ],
+      "dtype": "BF16",
+      "shape": [
+        512,
+        2560
+      ]
+    },
+    {
+      "name": "mtp.pre_fc_norm_embedding.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        2560
+      ]
+    },
+    {
+      "name": "mtp.pre_fc_norm_hidden.weight",
+      "axes": [],
+      "dtype": "BF16",
+      "shape": [
+        10240
+      ]
+    }
+  ],
+  "constants": [
+    {
+      "tensor": "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+      "dtype": "I64",
+      "shape": [
+        3
+      ],
+      "bytes": "89d70eeb8e15000035ff30024a120000a73bebf652070000",
+      "sha256": "37349930c3c77bf4927b2afb6b50f30c404f42f00f5790bda96e7d9589c26477"
+    },
+    {
+      "tensor": "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets",
+      "dtype": "I64",
+      "shape": [
+        16
+      ],
+      "bytes": "0000000000000000032d3101000000001a5a6202000000003b879303000000006ab4c40400000000a5e1f50500000000e40e270700000000293c5808000000007669890900000000c796ba0a0000000024c4eb0b000000008ff11c0d00000000221f4e0e00000000bb4c7f0f000000005a7ab01000000000fba7e11100000000",
+      "sha256": "af1566f7a3be2f4a9ee8e2384aa161b8d45cfcbd92376827662a028679b7d8eb"
+    },
+    {
+      "tensor": "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes",
+      "dtype": "I64",
+      "shape": [
+        16
+      ],
+      "bytes": "032d310100000000172d310100000000212d3101000000002f2d3101000000003b2d3101000000003f2d310100000000452d3101000000004d2d310100000000512d3101000000005d2d3101000000006b2d310100000000932d310100000000992d3101000000009f2d310100000000a12d310100000000ab2d310100000000",
+      "sha256": "81879b658d9974287ceecc77463e5fdd183cb4cd66692b061ea6af24ef414d39"
+    }
+  ]
+}

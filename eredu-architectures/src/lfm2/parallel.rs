@@ -1066,7 +1066,7 @@ pub fn static_parallel_parameter_groups<
         module_parameter_group::<B::Tensor, _>(
             "model.embedding_norm",
             ParameterRole::Replicated,
-            &modules.norm,
+            &modules.boundary.norm,
             |_, _| Ok(MemberSharding::Replicated),
         )?,
     ];

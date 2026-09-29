@@ -11,6 +11,7 @@ mod evidence;
 pub mod execution_control;
 pub mod intervention;
 mod parity;
+pub mod qwen4_exp;
 mod realtime;
 
 pub use checkpoint::{

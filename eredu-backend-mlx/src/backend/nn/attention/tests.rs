@@ -289,26 +289,32 @@ fn sliding_prefill_matches_independent_scalar_softmax_reference() {
 }
 
 #[test]
-#[ignore = "requires MLX runtime execution"]
 fn indexed_attention_shares_softmax_with_sink() {
     let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = ctx.stream();
-    let queries = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
-    let local = Array::from_slice(&[1.0f32], &[1, 1, 1]);
-    let pooled = Array::from_slice(&[2.0f32, 3.0], &[1, 2, 1]);
-    let indices = Array::from_slice(&[1i32], &[1, 1, 1]);
-    let sinks = Array::from_slice(&[0.0f32], &[1]);
+    let queries = crate::MlxTensor::from_array(Array::from_slice(&[1.0f32], &[1, 1, 1, 1]));
+    let local = crate::MlxTensor::from_array(Array::from_slice(&[1.0f32], &[1, 1, 1, 1]));
+    let pooled = crate::MlxTensor::from_array(Array::from_slice(&[2.0f32, 3.0], &[1, 1, 2, 1]));
+    let indices = crate::MlxTensor::from_array(Array::from_slice(&[1i32], &[1, 1, 1]));
+    let sinks = crate::MlxTensor::from_array(Array::from_slice(&[0.0f32], &[1]));
     let output = indexed_sparse_attention(
-        &queries,
-        &local,
-        &local,
-        &pooled,
-        &pooled,
-        &indices,
-        1.0,
-        None,
-        None,
-        Some(&sinks),
+        &eredu_nn::IndexedAttentionInput {
+            queries: &queries,
+            keys: &pooled,
+            values: &pooled,
+            key_position_offset: 0,
+            selected_positions: &indices,
+            validity: None,
+            mask: None,
+            local: Some(eredu_nn::LocalAttentionInput {
+                keys: &local,
+                values: &local,
+                mask: None,
+            }),
+            scale: 1.0,
+            arithmetic: eredu_nn::AttentionArithmetic::Fused,
+            sinks: Some(&sinks),
+        },
         stream,
     )
     .unwrap();
@@ -316,6 +322,114 @@ fn indexed_attention_shares_softmax_with_sink() {
     let denominator = 1.0f32.exp() + 3.0f32.exp() + 1.0;
     let expected = (1.0f32.exp() + 3.0 * 3.0f32.exp()) / denominator;
     assert!((output.as_slice::<f32>()[0] - expected).abs() < 1e-5);
+}
+
+#[test]
+fn indexed_attention_batch_origin_masks_and_bf16_rounding_match_scalar_reference() {
+    indexed_attention_rounding_reference(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution outside the sandbox"]
+fn indexed_attention_batch_origin_masks_and_bf16_rounding_match_scalar_reference_metal() {
+    indexed_attention_rounding_reference(DeviceType::Gpu);
+}
+
+fn indexed_attention_rounding_reference(device: DeviceType) {
+    use crate::MlxTensor;
+    use eredu_nn::{AttentionArithmetic, IndexedAttentionInput};
+    use safemlx::Dtype;
+    let context = ExecutionContext::new(Device::new(device, 0));
+    let stream = context.stream();
+    let q = [0.5f32, 1.25, -0.75, 2.0];
+    let k = [1.0f32, 2.0, -1.0, -2.0, 0.5, 1.5];
+    let v = [
+        2.0f32, 4.0, 8.0, 16.0, -2.0, -4.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0,
+    ];
+    for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+        let round = |x: f32| {
+            if dtype == Dtype::Bfloat16 {
+                half::bf16::from_f32(x).to_f32()
+            } else {
+                x
+            }
+        };
+        let tensor = |data: &[f32], shape: &[i32]| {
+            MlxTensor::from_array(
+                Array::from_slice(data, shape)
+                    .as_dtype(dtype, stream)
+                    .unwrap(),
+            )
+        };
+        let queries = tensor(&q, &[2, 2, 1, 1]);
+        let keys = tensor(&k, &[2, 1, 3, 1]);
+        let values = tensor(&v, &[2, 1, 3, 2]);
+        let positions =
+            MlxTensor::from_array(Array::from_slice(&[12u32, 10, 11, 10, 12, 11], &[2, 1, 3]));
+        for boolean in [false, true] {
+            let mask = MlxTensor::from_array(if boolean {
+                Array::from_slice(&[true, false, true], &[1, 3])
+            } else {
+                Array::from_slice(&[0.25f32, f32::NEG_INFINITY, -0.375], &[1, 3])
+            });
+            let output = indexed_sparse_attention(
+                &IndexedAttentionInput {
+                    queries: &queries,
+                    keys: &keys,
+                    values: &values,
+                    key_position_offset: 10,
+                    selected_positions: &positions,
+                    validity: None,
+                    mask: Some(&mask),
+                    local: None,
+                    scale: 0.7,
+                    arithmetic: AttentionArithmetic::InputScores,
+                    sinks: None,
+                },
+                stream,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Float32, stream)
+            .unwrap();
+            let data = output.evaluated().unwrap();
+            for b in 0..2 {
+                for h in 0..2 {
+                    let selected = if b == 0 { [2, 1] } else { [0, 1] };
+                    let scores = selected
+                        .into_iter()
+                        .enumerate()
+                        .map(|(slot, p)| {
+                            let score = round(round(q[b * 2 + h] * k[b * 3 + p]) * 0.7);
+                            round(score + if boolean { 0.0 } else { [0.25, -0.375][slot] })
+                        })
+                        .collect::<Vec<_>>();
+                    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let denominator = scores
+                        .iter()
+                        .map(|score| (score - maximum).exp())
+                        .sum::<f32>();
+                    for d in 0..2 {
+                        let expected = round(
+                            selected
+                                .into_iter()
+                                .zip(&scores)
+                                .map(|(p, score)| {
+                                    round((score - maximum).exp() / denominator)
+                                        * v[(b * 3 + p) * 2 + d]
+                                })
+                                .sum::<f32>(),
+                        );
+                        let actual = data.as_slice::<f32>()[(b * 2 + h) * 2 + d];
+                        if dtype == Dtype::Bfloat16 {
+                            assert_eq!(actual, expected);
+                        } else {
+                            assert!((actual - expected).abs() < 1e-5);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -842,4 +956,83 @@ fn published_input_score_allowance_covers_f16_and_f32_prefill_and_decode() {
             eprintln!("input-score allowance: dtype={dtype:?}, queries={queries}, keys={keys}, peak={peak}, bound={bound}");
         }
     }
+}
+
+#[test]
+fn explicit_rotary_preserves_tail_and_pair_order_for_all_embedding_ranks() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let values: Vec<_> = (0..72).map(|i| ((i * 7 % 29) as f32 - 14.) / 16.).collect();
+    let input = Array::from_slice(&values, &[2, 2, 3, 6]);
+    for traditional in [false, true] {
+        for rank in [2, 3, 4] {
+            for full in [false, true] {
+                let batch = if rank == 2 { 1 } else { 2 };
+                let width = if full { 4 } else { 2 };
+                let mut cosine = vec![];
+                let mut sine = vec![];
+                for lane in 0..batch {
+                    for token in 0..3 {
+                        for component in 0..width {
+                            let frequency = if full {
+                                if traditional {
+                                    component / 2
+                                } else {
+                                    component % 2
+                                }
+                            } else {
+                                component
+                            };
+                            let angle = (lane * 3 + token + frequency + 1) as f32 / 7.;
+                            cosine.push(angle.cos());
+                            sine.push(angle.sin());
+                        }
+                    }
+                }
+                let shape = match rank {
+                    2 => vec![3, width],
+                    3 => vec![batch, 3, width],
+                    _ => vec![batch, 1, 3, width],
+                };
+                let cos = Array::from_slice(&cosine, &shape);
+                let sin = Array::from_slice(&sine, &shape);
+                let result =
+                    super::apply_rotary_embeddings(&input, &cos, &sin, 4, traditional, stream)
+                        .unwrap()
+                        .evaluated()
+                        .unwrap()
+                        .try_to_vec::<f32>()
+                        .unwrap();
+                let mut expected = values.clone();
+                for lane in 0..2 {
+                    for head in 0..2 {
+                        for token in 0..3 {
+                            for frequency in 0..2 {
+                                let offset = ((lane * 2 + head) * 3 + token) * 6;
+                                let embedding_lane = if rank == 2 { 0 } else { lane };
+                                let angle =
+                                    (embedding_lane * 3 + token + frequency + 1) as f32 / 7.;
+                                let (a, b) = if traditional {
+                                    (frequency * 2, frequency * 2 + 1)
+                                } else {
+                                    (frequency, frequency + 2)
+                                };
+                                expected[offset + a] = values[offset + a] * angle.cos()
+                                    - values[offset + b] * angle.sin();
+                                expected[offset + b] = values[offset + b] * angle.cos()
+                                    + values[offset + a] * angle.sin();
+                            }
+                        }
+                    }
+                }
+                for (actual, expected) in result.into_iter().zip(expected) {
+                    assert!((actual - expected).abs() <= 1e-6, "{actual} != {expected}");
+                }
+            }
+        }
+    }
+    let malformed = Array::from_slice(&[1f32; 8], &[2, 2, 2]);
+    assert!(
+        super::apply_rotary_embeddings(&input, &malformed, &malformed, 4, false, stream).is_err()
+    );
 }

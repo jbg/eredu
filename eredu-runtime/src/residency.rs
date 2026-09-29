@@ -2,6 +2,8 @@
 
 /// Shared execution-scoped admission for optional parameter conversions.
 pub mod conversion_retention;
+mod rows;
+pub use rows::RowResidencyRange;
 
 use std::{
     borrow::Cow,
@@ -148,6 +150,8 @@ pub struct ResidencyReport {
     materialization: Option<WeightMaterializationReport>,
     device_parameter_conversion_bytes: u64,
     device_parameter_conversions: Option<Vec<ResidentParameterConversion>>,
+    host_storage_resources: Option<eredu_core::resources::ResourceDescription>,
+    detached_resources: Option<crate::detached_resources::DetachedResourceInventory>,
     projection_storage: BTreeMap<String, crate::projection_memory::ProjectionStorageFacts>,
     f32_rms_normalization_gains: std::collections::BTreeSet<String>,
 }
@@ -171,9 +175,47 @@ impl ResidencyReport {
             materialization: None,
             device_parameter_conversion_bytes: 0,
             device_parameter_conversions: None,
+            host_storage_resources: None,
+            detached_resources: None,
             projection_storage: BTreeMap::new(),
             f32_rms_normalization_gains: Default::default(),
         }
+    }
+
+    /// Detached-work observation in its declared producer scope, which may span
+    /// several managers. Missing data is not evidence of reclaimed storage.
+    pub fn detached_resources(
+        &self,
+    ) -> Option<&crate::detached_resources::DetachedResourceInventory> {
+        self.detached_resources.as_ref()
+    }
+
+    /// Retains an already validated, bounded detached-work observation without
+    /// changing residency credits, completion state or the offload ledger.
+    pub fn with_detached_resources(
+        mut self,
+        resources: crate::detached_resources::DetachedResourceInventory,
+    ) -> Self {
+        self.detached_resources = Some(resources);
+        self
+    }
+
+    /// Point-in-time native host allocations retained by the residency cache.
+    /// Missing observations are not zero storage. This does not include detached
+    /// transfers, device arrays, source-store caches or materialization scratch.
+    pub fn host_storage_resources(&self) -> Option<&eredu_core::resources::ResourceDescription> {
+        self.host_storage_resources.as_ref()
+    }
+
+    /// Attaches native allocation identities and capacities without changing the
+    /// logical offload ledger. The supplied scope and coverage must remain explicit.
+    pub fn with_host_storage_resources(
+        mut self,
+        resources: eredu_core::resources::ResourceDescription,
+    ) -> Result<Self, eredu_core::resources::ResourceDescriptionError> {
+        resources.validate()?;
+        self.host_storage_resources = Some(resources);
+        Ok(self)
     }
 
     /// Storage coverage established by current permanent native parameter bindings.
@@ -677,6 +719,7 @@ pub struct ResidencyController {
     conversion_retention: Option<conversion_retention::ConversionRetentionBudget>,
     ledger: ResidencyLedger,
     units: BTreeMap<OffloadUnitId, OffloadUnit>,
+    row_ranges: Vec<RowResidencyRange>,
     alias_owners: BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>,
 }
 
@@ -1029,6 +1072,26 @@ impl ResidencyController {
         plan: OffloadPlan,
         units: impl IntoIterator<Item = OffloadUnit>,
     ) -> Result<Self, ResidencyControllerError> {
+        Self::new_with_row_ranges(catalog_for_unit, plan, units, Vec::new())
+    }
+
+    /// Combines explicit units with compact row namespaces over retained sources.
+    pub fn new_with_row_ranges<'a, C: RecipeCatalog + ?Sized + 'a>(
+        catalog_for_unit: impl Fn(&OffloadUnitId) -> &'a C,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        mut row_ranges: Vec<RowResidencyRange>,
+    ) -> Result<Self, ResidencyControllerError> {
+        row_ranges.sort_by(|a, b| {
+            (a.range().prefix(), a.range().start()).cmp(&(b.range().prefix(), b.range().start()))
+        });
+        if row_ranges
+            .iter()
+            .map(RowResidencyRange::range)
+            .ne(plan.ranges().iter())
+        {
+            return Err(ResidencyControllerError::RangeCatalogMismatch);
+        }
         let mut definitions = BTreeMap::new();
         for unit in units {
             let id = unit.id().clone();
@@ -1097,6 +1160,7 @@ impl ResidencyController {
             conversion_retention: None,
             ledger: ResidencyLedger::new(plan),
             units: definitions,
+            row_ranges,
             alias_owners,
         })
     }
@@ -1104,6 +1168,55 @@ impl ResidencyController {
     /// Returns the validated declaration for one planned unit.
     pub fn unit(&self, id: &OffloadUnitId) -> Option<&OffloadUnit> {
         self.units.get(id)
+    }
+
+    /// Prepares only demanded declarations before a native acquisition. Failed
+    /// planning publishes none of the new bindings and performs no payload I/O.
+    pub fn prepare_units(&mut self, ids: &[OffloadUnitId]) -> Result<(), ResidencyControllerError> {
+        let mut prepared = BTreeMap::new();
+        for id in ids {
+            if self.units.contains_key(id) || prepared.contains_key(id) {
+                continue;
+            }
+            let range = self
+                .row_ranges
+                .iter()
+                .find(|range| range.range().member(id).is_some())
+                .ok_or_else(|| ResidencyControllerError::MissingUnitDefinition {
+                    id: id.clone(),
+                })?;
+            let unit =
+                range
+                    .unit(id)?
+                    .ok_or_else(|| ResidencyControllerError::MissingUnitDefinition {
+                        id: id.clone(),
+                    })?;
+            prepared.insert(id.clone(), unit);
+        }
+        self.units.extend(prepared);
+        Ok(())
+    }
+
+    /// Releases transient row declarations once neither tier has a live copy.
+    /// Explicit model units keep their original immutable catalog entries.
+    pub fn retire_unit_if_unused(
+        &mut self,
+        id: &OffloadUnitId,
+    ) -> Result<bool, ResidencyLedgerError> {
+        if !self
+            .row_ranges
+            .iter()
+            .any(|range| range.range().member(id).is_some())
+        {
+            return Ok(false);
+        }
+        if !self.ledger.has_allocation(id, MemoryTier::Host)?
+            && !self.ledger.has_allocation(id, MemoryTier::Device)?
+        {
+            self.units.remove(id);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Returns declarations in stable unit-identifier order.
@@ -1404,6 +1517,18 @@ fn validate_global_binding_aliases(
 /// Failure while validating a residency control plane.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyControllerError {
+    /// Compact declarations differ from the admitted offload plan.
+    #[error("row residency catalog differs from admitted compact ranges")]
+    RangeCatalogMismatch,
+    /// Matrix extent or encoded per-row bytes differ from the declared range.
+    #[error("row residency geometry differs for {prefix}")]
+    RowRangeGeometry {
+        /// Invalid namespace.
+        prefix: OffloadUnitId,
+    },
+    /// Bounded row planning failed before native materialization.
+    #[error(transparent)]
+    RowRead(#[from] eredu_checkpoint::rows::RowReadError),
     /// A binding alias graph was invalid.
     #[error(transparent)]
     Declaration(#[from] ResidencyDeclarationError),
@@ -2085,6 +2210,21 @@ mod tests {
             allocations: vec![allocation("shared", "target", 16, "pool")],
         };
         baseline.validate().unwrap();
+        assert!(report.host_storage_resources().is_none());
+        let host_report = report
+            .clone()
+            .with_host_storage_resources(baseline.clone())
+            .unwrap();
+        assert_eq!(host_report.host_storage_resources(), Some(&baseline));
+        assert_eq!(host_report.offload(), report.offload());
+        let mut malformed_host = baseline.clone();
+        malformed_host
+            .allocations
+            .push(malformed_host.allocations[0].clone());
+        assert!(report
+            .clone()
+            .with_host_storage_resources(malformed_host)
+            .is_err());
         let observed = report
             .clone()
             .with_device_parameter_conversions(vec![conversion(allocation(

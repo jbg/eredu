@@ -49,7 +49,7 @@ use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
     LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, ModelStateIdentity,
     OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParameterGroupOwner, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -113,7 +113,7 @@ where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.embeddings)?;
-        visitor.visit("norm", &self.static_modules.norm)?;
+        visitor.visit("norm", &self.static_modules.boundary.norm)?;
         if let Some(head) = &self.static_modules.lm_head {
             visitor.visit("output", head)?;
         }
@@ -125,7 +125,7 @@ where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.boundary.norm)?;
         if let Some(head) = &mut self.static_modules.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -450,7 +450,7 @@ where
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
         match &mut self.static_modules.lm_head {
             Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
             None => self.static_modules.embeddings.as_linear(&hidden, context),
@@ -468,7 +468,7 @@ where
                 "Kimi model was not built with local geometry",
             ));
         }
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
         match &mut self.static_modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -1126,7 +1126,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.group.unit_path(group, index)?;
@@ -1157,7 +1157,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -1215,7 +1215,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.group.unit_path(group, index)?;
@@ -1256,7 +1256,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {

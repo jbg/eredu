@@ -6,8 +6,7 @@ use eredu_nn::{
     Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ParameterProvider, ResidentExpertProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
 use crate::{
@@ -378,7 +377,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -388,7 +387,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
             }
             Self::Routed(routed) => {
                 let routes = routed.router.select(input, context)?;
-                RoutedExpertProvider::<B>::forward_grouped(
+                ParameterProvider::<B>::forward_grouped(
                     provider,
                     &mut routed.experts,
                     RoutedExpertRequest {
@@ -417,7 +416,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -446,7 +445,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -480,7 +479,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -490,22 +489,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
             }
             Self::Routed(routed) => {
                 let routes = routed.router.select(input, context)?;
-                let output =
-                    TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(
-                        provider,
-                        &mut routed.experts,
-                        RoutedExpertRequest {
-                            unit_observer: None,
-                            bank: eredu_runtime::RoutedBankId::new(0),
-                            layer: routed.layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        B::parallel_size(parallel),
-                        context,
-                    )
-                    .map_err(Error::backend_source)?;
+                let output = TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
+                    provider,
+                    &mut routed.experts,
+                    RoutedExpertRequest {
+                        unit_observer: None,
+                        bank: eredu_runtime::RoutedBankId::new(0),
+                        layer: routed.layer,
+                        input,
+                        routes: &routes,
+                        pass,
+                    },
+                    B::parallel_size(parallel),
+                    context,
+                )
+                .map_err(Error::backend_source)?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }
@@ -540,7 +538,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjec
             Self::Routed(routed) => {
                 let routes = routed.router.select(input, context)?;
                 let mut provider = ResidentExpertProvider;
-                RoutedExpertProvider::<B>::forward_grouped(
+                ParameterProvider::<B>::forward_grouped(
                     &mut provider,
                     &mut routed.experts,
                     RoutedExpertRequest {

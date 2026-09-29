@@ -16,6 +16,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[path = "persistence/retained.rs"]
+mod retained;
+pub use retained::RetainedCacheShard;
+
 static NEXT_LIVE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REVERSIBLE_CACHE_PUBLICATION_ID: AtomicU64 = AtomicU64::new(1);
 static LIVE_CACHE_PROCESS_NAMESPACE: OnceLock<String> = OnceLock::new();
@@ -131,8 +135,11 @@ impl LiveCacheBlockPublication {
         });
         let publication_id = NEXT_LIVE_CACHE_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
         let representation = match id.representation {
-            CacheRepresentation::KeyValue => "kv",
-            CacheRepresentation::CompressedLatentRotary => "mla",
+            CacheRepresentation::KeyValue => "kv".to_owned(),
+            CacheRepresentation::CompressedLatentRotary => "mla".to_owned(),
+            CacheRepresentation::AppendStream { slot, lane } => {
+                format!("stream-{slot}-lane-{lane}")
+            }
         };
         let rank_component =
             |rank: Option<usize>| rank.map_or_else(|| "x".to_string(), |rank| rank.to_string());
@@ -804,6 +811,16 @@ fn validate_block_shard(
     block: &PromptCacheBlock,
 ) -> Result<(), PromptCachePersistenceError> {
     let (metadata, file_len, data_start) = read_shard_metadata(path)?;
+    validate_block_metadata(path, block, &metadata, file_len, data_start)
+}
+
+fn validate_block_metadata(
+    path: &Path,
+    block: &PromptCacheBlock,
+    metadata: &safetensors::tensor::Metadata,
+    file_len: u64,
+    data_start: u64,
+) -> Result<(), PromptCachePersistenceError> {
     let entries = metadata.tensors();
     if entries.len() != 2 {
         return Err(malformed(
@@ -849,7 +866,7 @@ fn validate_block_shard(
             ),
         ));
     }
-    validate_file_boundary(path, &metadata, file_len, data_start)
+    validate_file_boundary(path, metadata, file_len, data_start)
 }
 
 fn validate_state_shard(
@@ -915,6 +932,13 @@ fn read_shard_metadata(
         path: path.to_path_buf(),
         source,
     })?;
+    read_shard_metadata_from_file(path, &mut file)
+}
+
+fn read_shard_metadata_from_file(
+    path: &Path,
+    file: &mut File,
+) -> Result<(safetensors::tensor::Metadata, u64, u64), PromptCachePersistenceError> {
     let file_len = file
         .metadata()
         .map_err(|source| PromptCachePersistenceError::Io {
@@ -1172,6 +1196,7 @@ mod tests {
                 logical_bytes: 32,
                 payload_sha256: hash,
             }],
+            stream_frontiers: Vec::new(),
             state_tensors: vec![],
         }
     }

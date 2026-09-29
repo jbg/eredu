@@ -8,6 +8,11 @@ mod components;
 mod families;
 mod routed_components;
 
+pub(crate) const OPAQUE_PREDICTION_DESCRIPTION: &str =
+    "Embedded prediction is represented as an opaque component";
+pub(crate) const UNENUMERATED_PREDICTION_CAPTURES: &str =
+    "Embedded prediction capture paths are not enumerated";
+
 impl ArtifactArchitecturePlan {
     /// Describes admitted family semantics and implemented observation points.
     /// This only reads the retained plan; it never opens weights or creates a device.
@@ -40,8 +45,8 @@ impl ArtifactArchitecturePlan {
 
     fn discovery_builder(&self) -> Builder {
         let mut graph = Builder::new();
-        if let Some(projector) = self.gguf_media_projector() {
-            families::gguf_composite(&mut graph, projector.model());
+        if let (Some(projector), Some(primary)) = (self.gguf_media_projector(), self.gguf_plan()) {
+            families::gguf_composite(&mut graph, projector.model(), primary.model());
             return graph;
         }
         if let Some(plan) = self.safetensors_architecture() {
@@ -85,30 +90,23 @@ fn axes(width: usize) -> Vec<TensorAxis> {
     ]
 }
 
-struct Builder {
-    descriptor: ArchitectureDescriptor,
-    interventions: Vec<eredu_core::intervention::InterventionPoint>,
-}
-
-impl Builder {
-    fn routing_control(
-        &mut self,
-        node: &str,
-        path: &str,
-        spec: eredu_nn::TopKGroupSelectionSpec,
-        shared_experts: u32,
-        learned_coefficient_scale: bool,
-    ) {
-        use eredu_core::intervention::*;
-        use eredu_nn::GroupScoring as S;
-        let scoring = match spec.scoring() {
-            S::Softmax => RoutingScoring::Softmax,
-            S::SelectedSoftmax => RoutingScoring::SelectedSoftmax,
-            S::Sigmoid => RoutingScoring::Sigmoid,
-            S::SqrtSoftplus => RoutingScoring::SqrtSoftplus,
-            _ => return,
-        };
-        self.interventions.push(InterventionPoint {
+pub(crate) fn routing_intervention_point(
+    node: &str,
+    path: &str,
+    spec: eredu_nn::TopKGroupSelectionSpec,
+    shared_experts: u32,
+    learned_coefficient_scale: bool,
+) -> Option<eredu_core::intervention::InterventionPoint> {
+    use eredu_core::intervention::*;
+    use eredu_nn::GroupScoring as S;
+    let scoring = match spec.scoring() {
+        S::Softmax => RoutingScoring::Softmax,
+        S::SelectedSoftmax => RoutingScoring::SelectedSoftmax,
+        S::Sigmoid => RoutingScoring::Sigmoid,
+        S::SqrtSoftplus => RoutingScoring::SqrtSoftplus,
+        _ => return None,
+    };
+    Some(InterventionPoint {
             path: path.into(), node_id: node.into(), stage: InterventionStage::RoutingBeforeDispatch,
             axes: vec![TensorAxis { name: "token".into(), dimension: SymbolicDimension::TokenRows }, TensorAxis { name: "selected_expert".into(), dimension: SymbolicDimension::Known(spec.top_k() as usize) }],
             dtypes: vec![], operations: vec![InterventionKind::ExcludeExperts, InterventionKind::ZeroExpertContribution, InterventionKind::BiasRoutingScores, InterventionKind::ForceExperts],
@@ -125,7 +123,28 @@ impl Builder {
                 coefficient_scale: spec.coefficient_scale(), groups: spec.selection_partitions() as u32,
                 selected_groups: spec.selected_groups() as u32, learned_coefficient_scale, shared_experts,
             }),
-        });
+        })
+}
+
+struct Builder {
+    descriptor: ArchitectureDescriptor,
+    interventions: Vec<eredu_core::intervention::InterventionPoint>,
+}
+
+impl Builder {
+    fn routing_control(
+        &mut self,
+        node: &str,
+        path: &str,
+        spec: eredu_nn::TopKGroupSelectionSpec,
+        shared_experts: u32,
+        learned_coefficient_scale: bool,
+    ) {
+        if let Some(point) =
+            routing_intervention_point(node, path, spec, shared_experts, learned_coefficient_scale)
+        {
+            self.interventions.push(point);
+        }
     }
 
     fn new() -> Self {

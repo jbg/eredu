@@ -281,11 +281,12 @@ fn text_state_policy(
             .map_err(|error| StateError::InvalidResidency(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    LayerCachePolicy::key_value_with_fixed_state(
+    LayerCachePolicy::key_value_with_state(
         policy.attention,
         text.key_value_heads(local),
         text.attention_head_dim(local),
         tensors,
+        Vec::new(),
     )
     .map_err(|error| StateError::InvalidResidency(error.to_string()))
 }

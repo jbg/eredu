@@ -6,10 +6,7 @@ use crate::rotary::RopeValue;
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
-    cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
-    },
+    cache::{derive_prompt_cache_architecture_fingerprint, LayerCachePolicy},
 };
 use eredu_gguf::MetadataValue;
 use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
@@ -1138,12 +1135,6 @@ pub fn state_layout_with_geometry(
             target_layers + mtp_layers,
         )));
     }
-    let history = config
-        .linear_conv_kernel_dim
-        .checked_sub(1)
-        .ok_or_else(|| invalid("linear convolution history underflowed"))?;
-    let fixed =
-        |value| StateTensorDimension::fixed(value).map_err(|error| invalid(error.to_string()));
     let mut policies = config
         .layer_schedule
         .iter()
@@ -1162,44 +1153,16 @@ pub fn state_layout_with_geometry(
                     key_heads,
                     value_heads,
                 },
-            ) => {
-                let key_width = key_heads
-                    .checked_mul(config.linear_key_head_dim)
-                    .ok_or_else(|| invalid("rank-local linear key width overflowed"))?;
-                let value_width = value_heads
-                    .checked_mul(config.linear_value_head_dim)
-                    .ok_or_else(|| invalid("rank-local linear value width overflowed"))?;
-                let convolution_width = key_width
-                    .checked_mul(2)
-                    .and_then(|width| width.checked_add(value_width))
-                    .ok_or_else(|| invalid("rank-local convolution width overflowed"))?;
-                LayerCachePolicy::fixed_only(vec![
-                    StateTensorPolicy::new(
-                        StateTensorRole::Convolution { slot: 0 },
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(history)?,
-                            fixed(convolution_width)?,
-                        ],
-                        StateTensorDtype::Floating,
-                        MutableStateResidency::AlwaysDeviceMutable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?,
-                    StateTensorPolicy::new(
-                        StateTensorRole::Recurrent,
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(value_heads)?,
-                            fixed(config.linear_key_head_dim)?,
-                            fixed(config.linear_value_head_dim)?,
-                        ],
-                        StateTensorDtype::Float32,
-                        MutableStateResidency::LayerScopedOffloadable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?,
-                ])
-                .map_err(|error| invalid(error.to_string()))
+            ) => crate::gated_delta::GatedDeltaStateGeometry {
+                key_heads,
+                value_heads,
+                key_dim: config.linear_key_head_dim,
+                value_dim: config.linear_value_head_dim,
+                kernel: config.linear_conv_kernel_dim,
+                dilation: 1,
             }
+            .state_policy()
+            .map_err(|error| invalid(error.to_string())),
             (policy, geometry) => Err(invalid(format!(
                 "hybrid state geometry {geometry:?} does not match layer {layer} policy {policy:?}"
             ))),

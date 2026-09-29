@@ -206,6 +206,44 @@ impl
     type Output = Box<dyn ErasedReplicatedTextExecutable>;
     type Error = Error;
 
+    fn visit_prediction<A, G, P>(
+        self,
+        prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
+            MlxNeuralBackend,
+            A,
+            G,
+            <A as eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::Boundary,
+        >,
+        prediction: P,
+        target_source: Arc<dyn CheckpointSource>,
+        provider_source: Arc<dyn CheckpointSource>,
+        binding: eredu_architectures::prepared_execution::PredictionBinding,
+    ) -> Result<
+        Self::Output,
+        eredu_architectures::partitioned_execution::DenseDecoderPartitionedDispatchError<
+            Self::Error,
+        >,
+    >
+    where
+        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::StaticModules: Clone,
+        G: 'static,
+        P: eredu_architectures::prediction_extension::PreparedRoutedPrediction<MlxNeuralBackend, A>,
+    {
+        bind_retained_partitioned_routed_prediction(
+            prepared, prediction, target_source, provider_source, binding,
+            self.distributed, self.additional_claimed_sources, self.stream, self.weights_stream,
+        ).map_err(eredu_architectures::partitioned_execution::DenseDecoderPartitionedDispatchError::Visitor)
+    }
+
     fn visit<A, G>(
         self,
         prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<

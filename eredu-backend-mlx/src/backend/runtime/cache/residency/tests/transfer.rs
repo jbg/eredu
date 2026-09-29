@@ -606,7 +606,7 @@ fn host_demotion_uses_typed_buffers_and_promotion_rebuilds_device_arrays() {
             assert_eq!(keys.evaluated().unwrap().as_slice::<f32>(), &[0.0, 0.0]);
             assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[1.0, 1.0]);
         }
-        CacheBlockArrays::CompressedLatentRotary { .. } => unreachable!(),
+        CacheBlockArrays::CompressedLatentRotary { .. } | CacheBlockArrays::AppendStream { .. } => unreachable!(),
     }
     {
         let state = manager.lock().unwrap();

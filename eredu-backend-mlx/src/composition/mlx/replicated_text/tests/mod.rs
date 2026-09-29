@@ -2,7 +2,10 @@ use super::*;
 
 mod admission_failures;
 mod execution;
+mod qwen4_exp;
+mod qwen4_exp_media;
 mod routing_interventions;
+mod selected_streams;
 mod selection_and_lowering;
 mod state_and_controls;
 

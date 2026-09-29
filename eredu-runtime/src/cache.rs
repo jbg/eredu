@@ -24,9 +24,9 @@ pub use persistence::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     prompt_cache_rank_path, resolve_prompt_cache_root, safe_prompt_cache_shard_path,
     validate_prompt_cache_manifest, LiveCacheBlockPublication, LiveCachePublicationError,
-    PromptCachePersistenceError, PromptCachePublication, ReversiblePromptCachePublication,
-    MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    PromptCachePersistenceError, PromptCachePublication, RetainedCacheShard,
+    ReversiblePromptCachePublication, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };
 pub use policy::{
     CacheResidencyConfigurationError, CacheResidencyPolicy, LiveCacheDiskPolicy, PagedCacheOptions,

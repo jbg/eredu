@@ -289,12 +289,12 @@ fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
         .unwrap(),
         LayerSchedule::new(
             1,
-            vec![LayerCachePolicy::key_value_with_fixed_state(
+            vec![LayerCachePolicy::key_value_with_state(
                 AttentionPolicy::Full,
                 1,
                 1,
                 vec![convolution.clone()],
-            )
+             Vec::new())
             .unwrap()],
         )
         .unwrap(),
@@ -324,7 +324,7 @@ fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
 }
 
 #[test]
-fn v4_fixed_state_validation_rejects_missing_reordered_kind_and_geometry() {
+fn fixed_state_validation_rejects_missing_kind_and_geometry() {
     let directory = tempfile::tempdir().unwrap();
     let base = write_fixed_state_fixture(directory.path());
     inspect_prompt_cache(directory.path()).unwrap();
@@ -345,7 +345,7 @@ fn v4_fixed_state_validation_rejects_missing_reordered_kind_and_geometry() {
 
     let mut unexpected = base.clone();
     unexpected.state_tensors[0].role = StateTensorRole::Recurrent;
-    assert!(write(&unexpected).contains("does not match its policy"));
+    assert!(write(&unexpected).contains("undeclared owner or role"));
 
     let mut geometry = base.clone();
     geometry.state_tensors[0].shape = vec![1, 2, 4];
@@ -439,25 +439,25 @@ fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
     fs::write(&shard, &bytes).unwrap();
 
     // Header-only inspection remains valid because metadata and length did
-    // not change. The buffered payload gate must still reject the shard.
+    // not change. The retained payload gate must still reject the shard.
     inspect_prompt_cache(directory.path()).unwrap();
     let location = DiskLocation {
         path: shard.clone(),
         first_name: "keys".into(),
         second_name: "values".into(),
         persistent: true,
-        buffered: Some(buffer_prompt_cache_shard(&shard).unwrap()),
+        source: Some(Arc::new(eredu_runtime::RetainedCacheShard::open_block(&shard, &manifest.blocks[0]).unwrap())),
+        logical_bytes: manifest.blocks[0].logical_bytes,
         payload_sha256: Some(manifest.blocks[0].payload_sha256.clone()),
-        payload_verification: Arc::new(OnceLock::new()),
     };
-    let error = verify_disk_payload(&location).unwrap_err();
+    let error = load_host_cache_block_direct(&location, CacheRepresentation::KeyValue).unwrap_err();
     assert!(error.to_string().contains("payload SHA-256 mismatch"));
 }
 
 #[test]
-fn imported_prompt_shards_are_buffered_and_retained() {
+fn imported_prompt_shards_retain_handles_without_payload_buffers() {
     let directory = tempfile::tempdir().unwrap();
-    write_prompt_fixture(directory.path(), "buffered");
+    write_prompt_fixture(directory.path(), "retained");
     let options = PagedCacheOptions::new(1, 64, 64, 1).unwrap();
     let (manager, _) = open_prompt_cache(
         directory.path(),
@@ -468,13 +468,13 @@ fn imported_prompt_shards_are_buffered_and_retained() {
     )
     .unwrap();
     let state = manager.lock().unwrap();
-    assert_eq!(state.telemetry.report.imported_buffered_shards, 1);
+    assert_eq!(state.telemetry.report.imported_retained_shards, 1);
     assert!(state.blocks.values().all(|record| record
         .disk()
-        .and_then(|location| location.buffered.as_ref())
+        .and_then(|location| location.source.as_ref())
         .is_some()));
     for record in state.blocks.values() {
-        verify_disk_payload(record.disk().unwrap()).unwrap();
+        load_host_cache_block_direct(record.disk().unwrap(), record.physical.id().representation).unwrap();
     }
 }
 

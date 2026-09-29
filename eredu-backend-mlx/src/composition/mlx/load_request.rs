@@ -117,7 +117,9 @@ fn normalized_request_error(error: NormalizedLoadRequestError) -> Error {
     match error {
         NormalizedLoadRequestError::Quantization(message) => Error::Quantization(message),
         NormalizedLoadRequestError::ZeroEmbeddedDraftCapacity
-        | NormalizedLoadRequestError::UnsupportedDraftingPlan => Error::AutomaticPlanning(message),
+        | NormalizedLoadRequestError::UnsupportedDraftingPlan
+        | NormalizedLoadRequestError::PredictionSourceRequiresEmbeddedDrafting
+        | NormalizedLoadRequestError::EmptyPredictionSource => Error::AutomaticPlanning(message),
         _ => Error::Parallel(message),
     }
 }

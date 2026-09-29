@@ -25,6 +25,8 @@ use crate::{
     SelectedPreparation,
 };
 
+pub(crate) mod prediction;
+
 // Internal projection of the total execution selection onto source admission.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MediaProjectorSourcePolicy {
@@ -103,6 +105,7 @@ pub struct PreparedModelSourceGraph {
     extension: Option<SharedCheckpointSource>,
     resolutions: PreparedSourceResolutions,
     source_metadata: BTreeMap<String, TensorMetadata>,
+    retained_construction: Option<crate::prepared_execution::RetainedArchitectureConstruction>,
 }
 
 /// Retained discovery declarations; content hashing happens only on discovery demand.
@@ -127,7 +130,7 @@ pub struct PreparedModelDiscovery {
 struct PreparedPredictionDiscovery {
     resources: Result<eredu_runtime::prediction_resources::EmbeddedPredictionTopology, String>,
     placement: crate::prediction_extension::PredictionPlacementSlot,
-    descriptor: eredu_core::ArchitectureDescriptor,
+    descriptor: Result<eredu_core::ArchitectureDescriptor, String>,
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
 }
 
@@ -372,7 +375,14 @@ impl PreparedModelDiscovery {
             )
         })?;
         target
-            .with_prediction(&prediction.descriptor, placement, execution)
+            .with_prediction(
+                prediction
+                    .descriptor
+                    .as_ref()
+                    .map_err(|reason| eredu_core::capture::CaptureError::Invalid(reason.clone()))?,
+                placement,
+                execution,
+            )
             .map(Some)
     }
 
@@ -516,12 +526,16 @@ impl PreparedModelDiscovery {
         let prediction = self.prediction.as_ref().ok_or_else(|| {
             CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
         })?;
+        let descriptor = prediction
+            .descriptor
+            .as_ref()
+            .map_err(|reason| CaptureError::Invalid(reason.clone()))?;
         let mut captures = self.capture()?;
-        captures.catalog = prediction.descriptor.observations.clone();
+        captures.catalog = descriptor.observations.clone();
         let mut bindings = std::collections::BTreeMap::new();
         for point in &mut captures.catalog.points {
             let scope = crate::speculative_execution::speculative_capture_scope(
-                &prediction.descriptor,
+                descriptor,
                 &point.node_id,
             )?;
             execution.validate_scope(scope)?;
@@ -565,7 +579,7 @@ impl PreparedModelDiscovery {
         captures.support.capture = self.support.capture.clone();
         // Keep the semantic declaration; only this report discharges its
         // prediction requirement for the scoped execution.
-        captures.catalog = prediction.descriptor.observations.clone();
+        captures.catalog = descriptor.observations.clone();
         let mut interventions = eredu_runtime::inspection::intervention_support(
             prediction.intervention_points.clone(),
             &captures,
@@ -573,7 +587,7 @@ impl PreparedModelDiscovery {
         );
         for point in &interventions.points {
             let scope = crate::speculative_execution::speculative_capture_scope(
-                &prediction.descriptor,
+                descriptor,
                 &point.node_id,
             )?;
             bindings.insert(point.node_id.clone(), scope);
@@ -661,7 +675,7 @@ impl PreparedModelSources {
             support,
             observation_context,
             intervention_points: self.architecture().intervention_points(),
-            prediction: self.prediction_extension().map(|_| {
+            prediction: self.selected().prediction_realization().map(|_| {
                 let complete = self.inspection.architecture_plan();
                 PreparedPredictionDiscovery {
                     resources: self
@@ -673,7 +687,23 @@ impl PreparedModelSources {
                                 .ok_or_else(|| "selected prediction topology is missing".to_owned())
                         }),
                     placement: Arc::clone(&self.graph.prediction_placement),
-                    descriptor: complete.architecture_descriptor(),
+                    descriptor: match self.selected().qwen4_construction() {
+                        Some(construction) => construction
+                            .prediction_discovery()
+                            .map_err(|error| error.to_string())
+                            .and_then(|declaration| {
+                                declaration.ok_or_else(|| {
+                                    "selected prediction declaration is absent".to_owned()
+                                })
+                            })
+                            .and_then(|(prediction, _)| {
+                                crate::qwen4_exp::prepared::join_prediction_descriptor(
+                                    self.architecture().architecture_descriptor(),
+                                    prediction,
+                                )
+                            }),
+                        None => Ok(complete.architecture_descriptor()),
+                    },
                     intervention_points: complete.intervention_points(),
                 }
             }),
@@ -774,6 +804,13 @@ impl PreparedModelSources {
 }
 
 impl PreparedModelSourceGraph {
+    /// Moves exact bound construction authority into total typed dispatch.
+    pub(crate) fn take_retained_construction(
+        &mut self,
+    ) -> Option<crate::prepared_execution::RetainedArchitectureConstruction> {
+        self.retained_construction.take()
+    }
+
     /// Deferred identity of the complete admitted physical source graph.
     pub const fn source_identity(&self) -> &DeferredArtifactIdentity {
         &self.source_identity
@@ -931,7 +968,14 @@ pub fn prepare_model_sources(
         .inspection()
         .clone()
         .map_architecture_plan(|_| architecture.clone());
-    let expected_execution_identity =
+    let expected_execution_identity = if let Some(retained) = selected.qwen4_construction() {
+        retained
+            .selected()
+            .text()
+            .requirements()
+            .architecture_identity()
+            .to_owned()
+    } else {
         match crate::replicated_text::replicated_text_execution_class(&execution_inspection)
             .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?
         {
@@ -944,44 +988,67 @@ pub fn prepare_model_sources(
             crate::replicated_text::ReplicatedTextExecutionClass::Composite(requirements) => {
                 requirements.execution().architecture_identity().to_owned()
             }
-        };
+        }
+    };
     if execution_identity != expected_execution_identity {
         return Err(PreparedModelSourcesError::InvalidSelection(format!(
             "selected execution identity {execution_identity:?} does not match inspected artifact identity {expected_execution_identity:?}"
         )));
     }
-    let source_identity = source_graph_identity(plan.inspection(), &execution_identity)?;
+    let source_identity = source_graph_identity(
+        plan.inspection(),
+        &execution_identity,
+        selected
+            .qwen4_construction()
+            .and_then(|construction| construction.prediction_source()),
+    )?;
 
-    let graph = match plan.into_artifact() {
-        ModelArtifact::SafeTensors {
-            tensors, shards, ..
-        } => prepare_safetensors_sources(
+    let graph = if let Some(retained) = selected.qwen4_construction() {
+        if prediction_extension.is_some() {
+            return Err(PreparedModelSourcesError::InvalidSelection(
+                "target-only retained construction cannot consume prediction source roles".into(),
+            ));
+        }
+        prepare_retained_qwen4_sources(
             source_identity,
             execution_identity,
             architecture,
-            prediction_extension,
-            tensors,
-            shards,
+            plan.into_artifact(),
+            retained.clone(),
             max_cached_sources,
-        ),
-        ModelArtifact::Gguf { validated, .. } => {
-            if prediction_extension.is_some() {
-                return Err(PreparedModelSourcesError::InvalidSelection(
-                    "GGUF artifacts do not admit embedded prediction source projections".into(),
-                ));
-            }
-            prepare_gguf_sources(
+        )
+    } else {
+        match plan.into_artifact() {
+            ModelArtifact::SafeTensors {
+                tensors, shards, ..
+            } => prepare_safetensors_sources(
                 source_identity,
                 execution_identity,
                 architecture,
-                validated,
+                prediction_extension,
+                tensors,
+                shards,
                 max_cached_sources,
-                media_projector,
-            )
+            ),
+            ModelArtifact::Gguf { validated, .. } => {
+                if prediction_extension.is_some() {
+                    return Err(PreparedModelSourcesError::InvalidSelection(
+                        "GGUF artifacts do not admit embedded prediction source projections".into(),
+                    ));
+                }
+                prepare_gguf_sources(
+                    source_identity,
+                    execution_identity,
+                    architecture,
+                    validated,
+                    max_cached_sources,
+                    media_projector,
+                )
+            }
+            _ => Err(PreparedModelSourcesError::InvalidSelection(
+                "unsupported artifact format for prepared model sources".into(),
+            )),
         }
-        _ => Err(PreparedModelSourcesError::InvalidSelection(
-            "unsupported artifact format for prepared model sources".into(),
-        )),
     }?;
     Ok(PreparedModelSources {
         selected,
@@ -990,9 +1057,396 @@ pub fn prepare_model_sources(
     })
 }
 
+/// Realizes the exact cold header contract once; no family rediscovery or recipe
+/// reconstruction is allowed after request-specific selection.
+fn prepare_retained_qwen4_sources(
+    source_identity: DeferredArtifactIdentity,
+    execution_identity: String,
+    architecture: ArtifactArchitecturePlan,
+    artifact: ModelArtifact,
+    retained: crate::selected_execution::SelectedQwen4Construction,
+    max_cached_sources: usize,
+) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
+    use crate::selected_execution::SelectedQwen4Construction;
+    if matches!(
+        retained,
+        SelectedQwen4Construction::Conditional { .. }
+            | SelectedQwen4Construction::ConditionalPartitioned { .. }
+    ) {
+        return prepare_retained_qwen4_conditional_sources(
+            source_identity,
+            execution_identity,
+            architecture,
+            artifact,
+            retained,
+            max_cached_sources,
+        );
+    }
+    let invalid = || {
+        PreparedModelSourcesError::InvalidSelection(
+            "retained target authority does not match the admitted artifact container".into(),
+        )
+    };
+    let (format, primary, resolution): (_, SharedCheckpointSource, _) = match artifact {
+        ModelArtifact::SafeTensors {
+            tensors, shards, ..
+        } => {
+            let header = retained.safetensors_plan().ok_or_else(invalid)?;
+            let resolution = header.resolution().clone();
+            let source = eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
+                shards,
+                resolution.clone(),
+                max_cached_sources,
+            )?;
+            (ArtifactFormat::SafeTensors, source, resolution)
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            if validated.companions().next().is_some() {
+                return Err(PreparedModelSourcesError::InvalidSelection(
+                    "target-only retained GGUF construction cannot consume companion source roles"
+                        .into(),
+                ));
+            }
+            let header = retained.gguf_plan().ok_or_else(invalid)?.text_plan();
+            let resolution = header.resolution().clone();
+            let source = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                .max_cached_readers(max_cached_sources)?
+                .add_resolved_checkpoint(
+                    header.checkpoint().clone(),
+                    &resolution,
+                    header.mapping(),
+                )?
+                .build()?;
+            (ArtifactFormat::Gguf, Arc::new(source), resolution)
+        }
+        _ => return Err(invalid()),
+    };
+    let prediction = retained
+        .prediction_source()
+        .map(|source| {
+            source
+                .open_source(max_cached_sources)
+                .map(|physical| (physical, source.header_plan().resolution().clone()))
+        })
+        .transpose()?;
+    let complete: SharedCheckpointSource = match &prediction {
+        Some((source, _)) => Arc::new(CompositeCheckpointSource::new([
+            Arc::clone(&primary),
+            Arc::clone(source),
+        ])?),
+        None => Arc::clone(&primary),
+    };
+    let prediction_present = retained
+        .prediction_discovery()
+        .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?
+        .is_some();
+    let extension_keys: BTreeSet<_> = retained
+        .selected()
+        .text()
+        .requirements()
+        .auxiliary_parameters()
+        .iter()
+        .flat_map(|parameter| parameter.sources().iter().cloned())
+        .collect();
+    use crate::prepared_execution::RetainedArchitectureConstruction;
+    let retained_construction = match retained {
+        SelectedQwen4Construction::Partitioned { selected, .. } => {
+            RetainedArchitectureConstruction::Qwen4Partition(Box::new(
+                selected
+                    .bind(
+                        primary.clone(),
+                        prediction.as_ref().map(|(source, _)| source.clone()),
+                    )
+                    .map_err(|error| {
+                        PreparedModelSourcesError::InvalidSelection(error.to_string())
+                    })?,
+            ))
+        }
+        retained => RetainedArchitectureConstruction::Qwen4Exp(Box::new(
+            retained
+                .bind(
+                    primary.clone(),
+                    prediction.as_ref().map(|(source, _)| source.clone()),
+                )
+                .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?,
+        )),
+    };
+    let source_metadata = metadata_snapshot(complete.as_ref())?;
+    let (target, extension, target_resolution) = if let Some((source, _)) = &prediction {
+        (
+            Arc::clone(&primary),
+            Some(Arc::clone(source)),
+            resolution.clone(),
+        )
+    } else if prediction_present {
+        let target_keys: BTreeSet<_> = resolution
+            .source_keys()
+            .difference(&extension_keys)
+            .cloned()
+            .collect();
+        let target_resolution = resolution
+            .project_claimed_sources(format!("{execution_identity}/target"), target_keys.clone())
+            .map_err(PreparedModelSourcesError::InvalidSelection)?;
+        let (target, extension) =
+            projected_prediction_views(&complete, target_keys, extension_keys)?;
+        (target, extension, target_resolution)
+    } else {
+        (Arc::clone(&primary), None, resolution.clone())
+    };
+    let (companions, companion_resolutions) = match prediction {
+        Some((source, resolution)) => {
+            let role = GgufCompanionRole::Named("prediction".into());
+            (
+                BTreeMap::from([(role.clone(), source)]),
+                BTreeMap::from([(role, resolution)]),
+            )
+        }
+        None => (BTreeMap::new(), BTreeMap::new()),
+    };
+    Ok(PreparedModelSourceGraph {
+        prediction_placement: Arc::default(),
+        source_identity,
+        execution_identity,
+        format,
+        architecture,
+        prediction_extension: None,
+        complete,
+        target,
+        primary,
+        companions,
+        extension,
+        resolutions: PreparedSourceResolutions {
+            primary: resolution.clone(),
+            target: target_resolution,
+            companions: companion_resolutions,
+            target_companions: BTreeMap::new(),
+        },
+        source_metadata,
+        retained_construction: Some(retained_construction),
+    })
+}
+
+fn prepare_retained_qwen4_conditional_sources(
+    source_identity: DeferredArtifactIdentity,
+    execution_identity: String,
+    architecture: ArtifactArchitecturePlan,
+    artifact: ModelArtifact,
+    selected: crate::selected_execution::SelectedQwen4Construction,
+    max_cached_sources: usize,
+) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
+    let invalid = |message: &str| PreparedModelSourcesError::InvalidSelection(message.into());
+    let plan = selected
+        .conditional_header_plan()
+        .ok_or_else(|| invalid("conditional construction omitted its retained header"))?;
+    let mut companions = BTreeMap::new();
+    let mut companion_resolutions = BTreeMap::new();
+    let (format, primary, vision, resolution): (
+        _,
+        SharedCheckpointSource,
+        SharedCheckpointSource,
+        _,
+    ) = match artifact {
+        ModelArtifact::SafeTensors {
+            tensors, shards, ..
+        } => {
+            let header = plan.safetensors_target_plan().ok_or_else(|| {
+                invalid("conditional target container differs from selected SafeTensors headers")
+            })?;
+            let resolution = header.resolution().clone();
+            let primary = eredu_core::artifact::open_prepared_safetensors_artifact(
+                &tensors,
+                shards,
+                resolution.clone(),
+                max_cached_sources,
+            )?;
+            (
+                ArtifactFormat::SafeTensors,
+                primary.clone(),
+                primary,
+                resolution,
+            )
+        }
+        ModelArtifact::Gguf { validated, .. } => {
+            if validated.companions().count() != 1
+                || validated
+                    .companions()
+                    .any(|(role, _)| *role != GgufCompanionRole::MediaProjector)
+            {
+                return Err(invalid(
+                    "conditional GGUF requires exactly its admitted media-projector source",
+                ));
+            }
+            let header = plan
+                .gguf_target_plan()
+                .ok_or_else(|| {
+                    invalid("conditional target container differs from selected GGUF headers")
+                })?
+                .text_plan();
+            let vision_header = plan.vision_plan().gguf_source().ok_or_else(|| {
+                invalid("conditional GGUF projector omitted retained source authority")
+            })?;
+            let resolution = header.resolution().clone();
+            let primary: SharedCheckpointSource = Arc::new(
+                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                    .max_cached_readers(max_cached_sources)?
+                    .add_resolved_checkpoint(
+                        header.checkpoint().clone(),
+                        &resolution,
+                        header.mapping(),
+                    )?
+                    .build()?,
+            );
+            let vision: SharedCheckpointSource = Arc::new(
+                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                    .max_cached_readers(max_cached_sources)?
+                    .add_resolved_checkpoint(
+                        vision_header.checkpoint().clone(),
+                        vision_header.resolution(),
+                        vision_header.mapping(),
+                    )?
+                    .build()?,
+            );
+            companions.insert(GgufCompanionRole::MediaProjector, vision.clone());
+            companion_resolutions.insert(
+                GgufCompanionRole::MediaProjector,
+                vision_header.resolution().clone(),
+            );
+            (ArtifactFormat::Gguf, primary, vision, resolution)
+        }
+        _ => return Err(invalid("unsupported conditional source container")),
+    };
+    let target_complete: SharedCheckpointSource = if companions.is_empty() {
+        primary.clone()
+    } else {
+        Arc::new(CompositeCheckpointSource::new(
+            std::iter::once(primary.clone()).chain(companions.values().cloned()),
+        )?)
+    };
+    let prediction = selected
+        .prediction_source()
+        .map(|prediction| {
+            prediction
+                .open_source(max_cached_sources)
+                .map(|source| (source, prediction.header_plan().resolution().clone()))
+        })
+        .transpose()?;
+    use crate::prepared_execution::RetainedArchitectureConstruction;
+    use crate::selected_execution::SelectedQwen4Construction;
+    let prediction_keys = selected
+        .prediction_discovery()
+        .map_err(|error| invalid(&error.to_string()))?
+        .map(|_| {
+            selected
+                .selected()
+                .text()
+                .requirements()
+                .auxiliary_parameters()
+                .iter()
+                .flat_map(|parameter| parameter.sources().iter().cloned())
+                .collect::<BTreeSet<_>>()
+        });
+    let (retained_construction, embedded_prediction_keys) = match selected {
+        SelectedQwen4Construction::Conditional { selected, .. } => {
+            let bound = selected
+                .bind(
+                    primary.clone(),
+                    vision,
+                    prediction.as_ref().map(|(source, _)| source.clone()),
+                )
+                .map_err(|error| invalid(&error.to_string()))?;
+            let keys = bound.prediction_state().map(|_| {
+                bound
+                    .realization()
+                    .text()
+                    .requirements()
+                    .auxiliary_parameters()
+                    .iter()
+                    .flat_map(|parameter| parameter.sources().iter().cloned())
+                    .collect::<BTreeSet<_>>()
+            });
+            (
+                RetainedArchitectureConstruction::Qwen4Conditional(Box::new(bound)),
+                keys,
+            )
+        }
+        SelectedQwen4Construction::ConditionalPartitioned { selected, .. } => {
+            let bound = selected
+                .bind(
+                    primary.clone(),
+                    vision,
+                    prediction.as_ref().map(|(source, _)| source.clone()),
+                )
+                .map_err(|error| invalid(&error.to_string()))?;
+            (
+                RetainedArchitectureConstruction::Qwen4ConditionalPartition(Box::new(bound)),
+                prediction_keys,
+            )
+        }
+        _ => {
+            return Err(invalid(
+                "conditional source construction requires retained composite authority",
+            ))
+        }
+    };
+    let complete: SharedCheckpointSource = match &prediction {
+        Some((source, _)) => Arc::new(CompositeCheckpointSource::new([
+            target_complete.clone(),
+            source.clone(),
+        ])?),
+        None => target_complete.clone(),
+    };
+    let (target, extension, target_resolution) = if let Some((source, _)) = &prediction {
+        (target_complete, Some(source.clone()), resolution.clone())
+    } else if let Some(extension_keys) = embedded_prediction_keys {
+        let target_keys: BTreeSet<_> = resolution
+            .source_keys()
+            .difference(&extension_keys)
+            .cloned()
+            .collect();
+        let target_resolution = resolution
+            .project_claimed_sources(format!("{execution_identity}/target"), target_keys.clone())
+            .map_err(PreparedModelSourcesError::InvalidSelection)?;
+        let (target, extension) =
+            projected_prediction_views(&complete, target_keys, extension_keys)?;
+        (target, extension, target_resolution)
+    } else {
+        (target_complete, None, resolution.clone())
+    };
+    let target_companions = companion_resolutions.clone();
+    if let Some((source, resolution)) = prediction {
+        let role = GgufCompanionRole::Named("prediction".into());
+        companions.insert(role.clone(), source);
+        companion_resolutions.insert(role, resolution);
+    }
+    let source_metadata = metadata_snapshot(complete.as_ref())?;
+    Ok(PreparedModelSourceGraph {
+        source_identity,
+        execution_identity,
+        format,
+        architecture,
+        prediction_extension: None,
+        prediction_placement: Arc::default(),
+        primary,
+        companions,
+        target,
+        complete,
+        extension,
+        resolutions: PreparedSourceResolutions {
+            primary: resolution.clone(),
+            target: target_resolution,
+            companions: companion_resolutions.clone(),
+            target_companions,
+        },
+        source_metadata,
+        retained_construction: Some(retained_construction),
+    })
+}
+
 fn source_graph_identity(
     inspection: &eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
     execution_identity: &str,
+    prediction: Option<&prediction::InspectedPredictionSource>,
 ) -> Result<DeferredArtifactIdentity, ArtifactError> {
     match inspection.format() {
         ArtifactFormat::SafeTensors => DeferredArtifactIdentity::safetensors(
@@ -1030,6 +1484,9 @@ fn source_graph_identity(
                         shard.path(),
                     )
                 }));
+            }
+            if let Some(prediction) = prediction {
+                files.extend(prediction.files());
             }
             DeferredArtifactIdentity::filesystem(execution_identity, files)
         }
@@ -1107,6 +1564,7 @@ fn prepare_safetensors_sources(
             target_companions: BTreeMap::new(),
         },
         source_metadata,
+        retained_construction: None,
     })
 }
 
@@ -1216,6 +1674,7 @@ fn prepare_gguf_sources(
             target_companions: target_companion_resolutions,
         },
         source_metadata,
+        retained_construction: None,
     })
 }
 

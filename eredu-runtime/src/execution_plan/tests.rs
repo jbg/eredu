@@ -304,3 +304,27 @@ fn conversion_retention_plan_is_optional_serializable_and_model_scoped() {
         None
     );
 }
+
+#[test]
+fn embedded_prediction_source_is_preserved_by_execution_plan_normalization() {
+    let plan = plan()
+        .with_drafting(DraftingPlan::Embedded {
+            max_draft_tokens: 3,
+            lookahead: false,
+            adaptive_lookahead: false,
+        })
+        .with_prediction_source("prediction/checkpoint");
+    let request = normalize(&plan).unwrap();
+    assert_eq!(request.prediction_source(), plan.prediction_source());
+    assert_eq!(request.drafting().embedded_capacity().unwrap().get(), 3);
+    assert_ne!(
+        request,
+        request.clone().with_prediction_source("another/checkpoint")
+    );
+    assert!(matches!(
+        normalize(&plan.with_drafting(DraftingPlan::Disabled)),
+        Err(ExecutionPlanLoadError::Request(
+            NormalizedLoadRequestError::PredictionSourceRequiresEmbeddedDrafting
+        ))
+    ));
+}

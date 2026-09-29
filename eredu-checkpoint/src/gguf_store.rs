@@ -1,5 +1,7 @@
 //! Backend-neutral logical GGUF storage and portable encoded leases.
 
+use crate::store::{AdmittedFile, EncodedReadBatch, EncodedReadTelemetry};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -37,10 +39,194 @@ struct CatalogEntry {
     source_encoding: crate::SourceTensorEncoding,
 }
 
+/// Immutable metadata projection of an admitted logical GGUF catalog.
+///
+/// This is a recipe catalog, not a readable checkpoint source. Construction
+/// uses retained container headers and mappings only; it does not open files,
+/// create materializers, or acquire payload leases.
+#[derive(Debug, Clone)]
+pub struct GgufCatalog {
+    inner: Arc<GgufCatalogInner>,
+}
+
+#[derive(Debug)]
+struct GgufCatalogInner {
+    catalog: BTreeMap<String, CatalogEntry>,
+    unclaimed_keys: BTreeSet<String>,
+    recipes: crate::recipe::RecipeInferenceCache,
+}
+
+impl GgufCatalog {
+    /// Projects an already resolved architecture contract and its admitted
+    /// canonical mapping using exactly the logical layout of a bound store.
+    pub fn from_resolved_checkpoint(
+        checkpoint: &Checkpoint,
+        resolved: &ResolvedCheckpointPlan,
+        tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            inner: Arc::new(project_catalog(checkpoint, resolved, tensor_mapping, 0)?),
+        })
+    }
+
+    /// Returns the exact selected logical tensor keys.
+    pub fn keys(&self) -> Vec<String> {
+        self.inner.catalog.keys().cloned().collect()
+    }
+
+    /// Returns logical metadata and its physical shape and backing shard.
+    pub fn metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.inner
+            .catalog
+            .get(key)
+            .map(|entry| entry.metadata.clone())
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+    }
+
+    /// Returns exact physical identity and encoding without accessing payloads.
+    pub fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<crate::store::TensorSourceProvenance, StoreError> {
+        catalog_provenance(&self.inner.catalog, key)
+    }
+
+    /// Returns logical keys admitted but unclaimed by a non-strict contract.
+    pub fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.inner.unclaimed_keys.iter().cloned().collect()
+    }
+}
+
+impl crate::recipe::RecipeCatalog for GgufCatalog {
+    fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.metadata(key)
+    }
+
+    fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
+        Some(&self.inner.recipes)
+    }
+}
+
+fn catalog_provenance(
+    catalog: &BTreeMap<String, CatalogEntry>,
+    key: &str,
+) -> Result<crate::store::TensorSourceProvenance, StoreError> {
+    let entry = catalog
+        .get(key)
+        .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
+    Ok(crate::store::TensorSourceProvenance {
+        catalog_key: key.to_owned(),
+        physical_tensor: entry.physical_name.clone(),
+        output: entry.original_name.clone(),
+        backing_shard: entry.metadata.backing_shard.clone(),
+        source_encoding: entry.source_encoding.clone(),
+    })
+}
+
+fn project_catalog(
+    checkpoint: &Checkpoint,
+    resolved: &ResolvedCheckpointPlan,
+    tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    checkpoint_index: usize,
+) -> Result<GgufCatalogInner, StoreError> {
+    let mut catalog = BTreeMap::new();
+    let mut unclaimed_keys = BTreeSet::new();
+    let mut names = BTreeMap::new();
+    for mapped in tensor_mapping {
+        let key = (mapped.physical_name.as_str(), mapped.original_name.as_str());
+        if names.insert(key, mapped.layout.name.as_str()).is_some() {
+            return Err(gguf_error(
+                &mapped.layout.name,
+                "admitted GGUF tensor mapping contains a duplicate source output",
+            ));
+        }
+    }
+    for shard in checkpoint.shards() {
+        for tensor in shard.tensors() {
+            let physical_name = &tensor.descriptor().name;
+            let selected = resolved.source_keys().contains(physical_name);
+            let unclaimed = resolved.unclaimed_keys().contains(physical_name);
+            if !selected && !unclaimed {
+                continue;
+            }
+            let descriptor = tensor.descriptor().clone();
+            let physical_shape = descriptor
+                .row_major_shape()
+                .into_iter()
+                .map(|dimension| {
+                    usize::try_from(dimension).map_err(|_| StoreError::Overflow {
+                        context: format!("GGUF physical shape for tensor {physical_name:?}"),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for output in tensor.outputs() {
+                let name = names
+                    .get(&(physical_name.as_str(), output.name.as_str()))
+                    .ok_or_else(|| {
+                        gguf_error(
+                            &output.name,
+                            "admitted GGUF tensor mapping omits a catalog output",
+                        )
+                    })?
+                    .to_string();
+                if unclaimed {
+                    unclaimed_keys.insert(name);
+                    continue;
+                }
+                if catalog.contains_key(&name) {
+                    return Err(gguf_error(
+                        name,
+                        "translated logical tensor collides with an existing output",
+                    ));
+                }
+                let shape = output
+                    .shape
+                    .iter()
+                    .map(|dimension| {
+                        usize::try_from(*dimension).map_err(|_| StoreError::Overflow {
+                            context: format!("GGUF logical shape for tensor {:?}", output.name),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let byte_len = logical_byte_len(&output.name, output.dtype, &shape)?;
+                let logical_last_units_per_block =
+                    logical_units_per_block(&output.name, &descriptor, &shape)?;
+                let metadata = TensorMetadata {
+                    name: name.clone(),
+                    logical_shape: shape,
+                    physical_shape: physical_shape.clone(),
+                    stored_dtype: stored_dtype(output.dtype),
+                    encoded_byte_len: byte_len,
+                    backing_shard: Some(shard.path().to_path_buf()),
+                };
+                catalog.insert(
+                    name,
+                    CatalogEntry {
+                        checkpoint: checkpoint_index,
+                        physical_name: physical_name.clone(),
+                        original_name: output.name.clone(),
+                        metadata,
+                        physical_descriptor: descriptor.clone(),
+                        logical_last_units_per_block,
+                        source_encoding: crate::SourceTensorEncoding::Gguf {
+                            ggml_type: descriptor.ggml_type,
+                            endian: shard.endian(),
+                        },
+                    },
+                );
+            }
+        }
+    }
+    Ok(GgufCatalogInner {
+        catalog,
+        unclaimed_keys,
+        recipes: Default::default(),
+    })
+}
+
 #[derive(Debug, Default)]
 struct StoreStatistics {
-    physical_reads: AtomicU64,
-    physical_read_bytes: AtomicU64,
+    reads: Arc<EncodedReadTelemetry>,
     coalesced_group_hits: AtomicU64,
 }
 
@@ -87,6 +273,7 @@ struct StoreInner {
     readers: Mutex<ReaderCache>,
     max_cached_readers: usize,
     statistics: StoreStatistics,
+    files: BTreeMap<PathBuf, Arc<AdmittedFile>>,
 }
 
 /// Builder for a logical store backed by one or more validated GGUF checkpoints.
@@ -135,93 +322,24 @@ impl GgufWeightStoreBuilder {
         resolved: &ResolvedCheckpointPlan,
         tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
     ) -> Result<Self, StoreError> {
-        let mut names = BTreeMap::new();
-        for mapped in tensor_mapping {
-            let key = (mapped.physical_name.as_str(), mapped.original_name.as_str());
-            if names.insert(key, mapped.layout.name.as_str()).is_some() {
-                return Err(gguf_error(
-                    &mapped.layout.name,
-                    "admitted GGUF tensor mapping contains a duplicate source output",
-                ));
-            }
+        let projection = project_catalog(
+            &checkpoint,
+            resolved,
+            tensor_mapping,
+            self.checkpoints.len(),
+        )?;
+        if let Some(name) = projection
+            .catalog
+            .keys()
+            .find(|name| self.catalog.contains_key(*name))
+        {
+            return Err(gguf_error(
+                name,
+                "translated logical tensor collides with an existing output",
+            ));
         }
-        let checkpoint_index = self.checkpoints.len();
-        for shard in checkpoint.shards() {
-            for tensor in shard.tensors() {
-                let physical_name = &tensor.descriptor().name;
-                let selected = resolved.source_keys().contains(physical_name);
-                let unclaimed = resolved.unclaimed_keys().contains(physical_name);
-                if !selected && !unclaimed {
-                    continue;
-                }
-                let descriptor = tensor.descriptor().clone();
-                let physical_shape = descriptor
-                    .row_major_shape()
-                    .into_iter()
-                    .map(|dimension| {
-                        usize::try_from(dimension).map_err(|_| StoreError::Overflow {
-                            context: format!("GGUF physical shape for tensor {physical_name:?}"),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                for output in tensor.outputs() {
-                    let name = names
-                        .get(&(physical_name.as_str(), output.name.as_str()))
-                        .ok_or_else(|| {
-                            gguf_error(
-                                &output.name,
-                                "admitted GGUF tensor mapping omits a catalog output",
-                            )
-                        })?
-                        .to_string();
-                    if unclaimed {
-                        self.unclaimed_keys.insert(name);
-                        continue;
-                    }
-                    if self.catalog.contains_key(&name) {
-                        return Err(gguf_error(
-                            name,
-                            "translated logical tensor collides with an existing output",
-                        ));
-                    }
-                    let shape = output
-                        .shape
-                        .iter()
-                        .map(|dimension| {
-                            usize::try_from(*dimension).map_err(|_| StoreError::Overflow {
-                                context: format!("GGUF logical shape for tensor {:?}", output.name),
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let byte_len = logical_byte_len(&output.name, output.dtype, &shape)?;
-                    let logical_last_units_per_block =
-                        logical_units_per_block(&output.name, &descriptor, &shape)?;
-                    let metadata = TensorMetadata {
-                        name: name.clone(),
-                        logical_shape: shape,
-                        physical_shape: physical_shape.clone(),
-                        stored_dtype: stored_dtype(output.dtype),
-                        encoded_byte_len: byte_len,
-                        backing_shard: Some(shard.path().to_path_buf()),
-                    };
-                    self.catalog.insert(
-                        name,
-                        CatalogEntry {
-                            checkpoint: checkpoint_index,
-                            physical_name: physical_name.clone(),
-                            original_name: output.name.clone(),
-                            metadata,
-                            physical_descriptor: descriptor.clone(),
-                            logical_last_units_per_block,
-                            source_encoding: crate::SourceTensorEncoding::Gguf {
-                                ggml_type: descriptor.ggml_type,
-                                endian: shard.endian(),
-                            },
-                        },
-                    );
-                }
-            }
-        }
+        self.catalog.extend(projection.catalog);
+        self.unclaimed_keys.extend(projection.unclaimed_keys);
         self.checkpoints.push(checkpoint);
         Ok(self)
     }
@@ -237,9 +355,21 @@ impl GgufWeightStoreBuilder {
             .map(Checkpoint::materializer)
             .collect::<Vec<_>>();
         let count = materializers.len();
+        let files = self
+            .checkpoints
+            .iter()
+            .flat_map(|checkpoint| checkpoint.shards())
+            .map(|shard| {
+                Ok((
+                    shard.path().to_path_buf(),
+                    Arc::new(AdmittedFile::open(shard.path())?),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
         Ok(GgufWeightStore {
             inner: Arc::new(StoreInner {
                 recipes: Default::default(),
+                files,
                 catalog: self.catalog,
                 unclaimed_keys: self.unclaimed_keys,
                 readers: Mutex::new(ReaderCache {
@@ -349,10 +479,12 @@ impl GgufLease {
             )?;
         self.store
             .statistics
+            .reads
             .physical_reads
             .fetch_add(1, Ordering::Relaxed);
         self.store
             .statistics
+            .reads
             .physical_read_bytes
             .fetch_add(self.proof.length_bytes, Ordering::Relaxed);
         Ok(converted)
@@ -461,6 +593,13 @@ impl WeightStore for GgufWeightStore {
             .readers
             .lock()
             .map_err(|_| StoreError::Internal("GGUF reader cache is poisoned".into()))?;
+        let direct_paths = self
+            .inner
+            .statistics
+            .reads
+            .paths
+            .lock()
+            .map_err(|_| StoreError::Internal("GGUF read telemetry poisoned".into()))?;
         Ok(WeightStoreDiagnostics {
             backend: WeightStoreBackend::Gguf,
             cache_hits: readers.hits,
@@ -471,12 +610,18 @@ impl WeightStore for GgufWeightStore {
                 .iter()
                 .filter(|materializer| materializer.open_shard_path().is_some())
                 .count(),
-            touched_shard_paths: readers.touched.iter().cloned().collect(),
-            payload_shard_paths: readers.touched.iter().cloned().collect(),
-            physical_reads: self.inner.statistics.physical_reads.load(Ordering::Relaxed),
+            touched_shard_paths: readers.touched.union(&direct_paths).cloned().collect(),
+            payload_shard_paths: readers.touched.union(&direct_paths).cloned().collect(),
+            physical_reads: self
+                .inner
+                .statistics
+                .reads
+                .physical_reads
+                .load(Ordering::Relaxed),
             physical_read_bytes: self
                 .inner
                 .statistics
+                .reads
                 .physical_read_bytes
                 .load(Ordering::Relaxed),
             coalesced_group_hits: self
@@ -489,6 +634,77 @@ impl WeightStore for GgufWeightStore {
 }
 
 impl CheckpointSource for GgufWeightStore {
+    fn prepare_encoded_read(
+        &self,
+        requests: &[TensorReadRequest],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        let mut batch = EncodedReadBatch::empty(self.inner.statistics.reads.clone());
+        for request in requests {
+            let entry =
+                self.inner
+                    .catalog
+                    .get(&request.key)
+                    .ok_or_else(|| StoreError::UnknownTensor {
+                        key: request.key.clone(),
+                    })?;
+            let metadata = &entry.metadata;
+            // Direct reads retain canonical native blocks. Converted affine/MX
+            // outputs and endian-swapped scalars use their ordinary materializer.
+            let raw = metadata.stored_dtype == StoredDtype::U8
+                || (matches!(
+                    metadata.stored_dtype,
+                    StoredDtype::F32
+                        | StoredDtype::F16
+                        | StoredDtype::BF16
+                        | StoredDtype::I32
+                        | StoredDtype::I64
+                ) && matches!(
+                    entry.source_encoding,
+                    crate::SourceTensorEncoding::Gguf {
+                        endian: eredu_gguf::Endian::Little,
+                        ..
+                    }
+                ));
+            if !raw || metadata.encoded_byte_len != entry.physical_descriptor.byte_len {
+                return Ok(None);
+            }
+            validate_selection(&request.key, &metadata.logical_shape, &request.selection)?;
+            let length = usize::try_from(metadata.encoded_byte_len)
+                .map_err(|_| gguf_error(&request.key, "encoded byte length overflow"))?;
+            let range = match &request.selection {
+                TensorSelection::Full => 0..length,
+                TensorSelection::Range {
+                    axis: 0,
+                    start,
+                    end,
+                } => {
+                    let rows = metadata.logical_shape[0];
+                    if length % rows != 0 {
+                        return Ok(None);
+                    }
+                    start * (length / rows)..end * (length / rows)
+                }
+                _ => return Ok(None),
+            };
+            let path = metadata
+                .backing_shard
+                .as_ref()
+                .ok_or_else(|| gguf_error(&request.key, "missing prepared backing shard"))?;
+            let file = self
+                .inner
+                .files
+                .get(path)
+                .ok_or_else(|| gguf_error(&request.key, "missing admitted file"))?;
+            batch.append_file(
+                metadata.clone(),
+                path.clone(),
+                file.clone(),
+                entry.physical_descriptor.data_offset,
+                vec![range],
+            )?;
+        }
+        Ok(Some(batch))
+    }
     fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
         Some(&self.inner.recipes)
     }
@@ -513,18 +729,7 @@ impl CheckpointSource for GgufWeightStore {
         &self,
         key: &str,
     ) -> Result<crate::store::TensorSourceProvenance, StoreError> {
-        let entry = self
-            .inner
-            .catalog
-            .get(key)
-            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-        Ok(crate::store::TensorSourceProvenance {
-            catalog_key: key.to_owned(),
-            physical_tensor: entry.physical_name.clone(),
-            output: entry.original_name.clone(),
-            backing_shard: entry.metadata.backing_shard.clone(),
-            source_encoding: entry.source_encoding.clone(),
-        })
+        catalog_provenance(&self.inner.catalog, key)
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
@@ -1015,6 +1220,155 @@ mod tests {
     }
 
     #[test]
+    fn header_catalog_matches_bound_layouts_without_a_backing_file() {
+        for (ty, encoded) in [
+            (GgmlType::F32, false),
+            (GgmlType::Q4_0, false),
+            (GgmlType::Q4_0, true),
+            (GgmlType::MxFp4, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("catalog.gguf");
+            let (width, bytes) = ty.block_and_bytes().unwrap();
+            let payload = (0..bytes * 2)
+                .map(|value| (value % 251) as u8)
+                .collect::<Vec<_>>();
+            write_tensor(&path, "physical.weight", &[width, 2], ty, &payload);
+            let mut checkpoint = Checkpoint::open(&path).unwrap();
+            if encoded {
+                checkpoint = checkpoint
+                    .into_tensor_representation(
+                        ["physical.weight".into()],
+                        eredu_gguf::QuantizedTensorRepresentation::Encoded,
+                    )
+                    .unwrap();
+            }
+            let plan = test_plan(&checkpoint);
+            let resolved = resolve_gguf_plan(&checkpoint, &plan).unwrap();
+            let mapping = checkpoint
+                .translated_outputs(|name| format!("canonical.{name}"))
+                .unwrap();
+            let store = GgufWeightStore::builder()
+                .add_resolved_checkpoint(checkpoint.clone(), &resolved, &mapping)
+                .unwrap()
+                .build()
+                .unwrap();
+            // The cold projection must depend only on retained headers. Opening
+            // a readable store here would fail, even without acquiring a lease.
+            std::fs::remove_file(&path).unwrap();
+            let catalog =
+                GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolved, &mapping).unwrap();
+            assert_eq!(catalog.keys(), store.keys());
+            assert!(!catalog.keys().is_empty());
+            for key in catalog.keys() {
+                assert_eq!(
+                    catalog.metadata(&key).unwrap(),
+                    store.metadata(&key).unwrap()
+                );
+                assert_eq!(
+                    catalog.source_provenance(&key).unwrap(),
+                    store.source_provenance(&key).unwrap()
+                );
+                let recipe = DerivedWeightRecipe::source(key, TensorSelection::Full);
+                assert_eq!(
+                    recipe.infer(&catalog).unwrap(),
+                    recipe.infer(&store).unwrap()
+                );
+            }
+            assert_eq!(store.diagnostics().unwrap().physical_reads, 0);
+            assert!(matches!(
+                catalog.metadata("missing"),
+                Err(StoreError::UnknownTensor { .. })
+            ));
+            assert!(matches!(
+                catalog.source_provenance("missing"),
+                Err(StoreError::UnknownTensor { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn header_catalog_preserves_unclaimed_outputs_and_rejects_bad_mappings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.gguf");
+        let payload = 1.5_f32.to_le_bytes();
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &BTreeMap::new(),
+                &[
+                    TensorInput {
+                        name: "claimed",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &payload,
+                    },
+                    TensorInput {
+                        name: "unclaimed",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &payload,
+                    },
+                ],
+            )
+            .unwrap();
+        let checkpoint = Checkpoint::open(&path).unwrap();
+        let plan = GgufCheckpointPlan::new(
+            "unclaimed fixture",
+            vec![GgufTensorConstraint::required(
+                "claimed",
+                vec![1],
+                GgufTypeConstraint::OperationClass(TensorOperation::Dense),
+            )],
+            Vec::new(),
+            CatalogPolicy::non_strict(),
+        )
+        .unwrap();
+        let resolved = resolve_gguf_plan(&checkpoint, &plan).unwrap();
+        let mapping = checkpoint
+            .translated_outputs(|name| format!("logical.{name}"))
+            .unwrap();
+        let catalog =
+            GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolved, &mapping).unwrap();
+        let store = GgufWeightStore::builder()
+            .add_resolved_checkpoint(checkpoint.clone(), &resolved, &mapping)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(catalog.keys(), ["logical.claimed"]);
+        assert_eq!(catalog.unclaimed_checkpoint_keys(), ["logical.unclaimed"]);
+        assert_eq!(
+            catalog.unclaimed_checkpoint_keys(),
+            store.unclaimed_checkpoint_keys()
+        );
+        assert!(matches!(
+            catalog.metadata("logical.unclaimed"),
+            Err(StoreError::UnknownTensor { .. })
+        ));
+
+        let mut duplicate = mapping.clone();
+        duplicate.push(mapping[0].clone());
+        assert!(
+            matches!(GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolved, &duplicate),
+            Err(StoreError::Gguf { message, .. }) if message.contains("duplicate source output"))
+        );
+        assert!(
+            matches!(GgufCatalog::from_resolved_checkpoint(&checkpoint, &resolved, &[]),
+            Err(StoreError::Gguf { message, .. }) if message.contains("mapping omits a catalog output"))
+        );
+
+        let all = resolve_gguf_plan(&checkpoint, &test_plan(&checkpoint)).unwrap();
+        let mut collisions = mapping.clone();
+        for mapped in &mut collisions {
+            mapped.layout.name = "same".into();
+        }
+        assert!(
+            matches!(GgufCatalog::from_resolved_checkpoint(&checkpoint, &all, &collisions),
+            Err(StoreError::Gguf { message, .. }) if message.contains("collides with an existing output"))
+        );
+    }
+
+    #[test]
     fn store_requires_the_admitted_mapping_for_every_catalog_output() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("dense.gguf");
@@ -1275,5 +1629,80 @@ mod tests {
         assert_eq!(selected.weight_shape, [1, 64, 8]);
         assert_eq!(selected.scale_shape, [1, 64, 2]);
         assert_eq!(store.diagnostics().unwrap().physical_reads, 1);
+    }
+    #[test]
+    fn direct_native_rows_share_reads_and_preserve_file_admission() {
+        use crate::store::{CheckpointSource, EncodedReadBatch};
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q2K,
+            GgmlType::Q3K,
+            GgmlType::MxFp4,
+        ] {
+            let (width, row_bytes) = ty.block_and_bytes().unwrap();
+            let row_bytes = row_bytes as usize;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rows.gguf");
+            let raw = (0..4 * row_bytes)
+                .map(|value| value as u8)
+                .collect::<Vec<_>>();
+            write_tensor(&path, "table.weight", &[width, 4], ty, &raw);
+            let checkpoint = Checkpoint::open(&path)
+                .unwrap()
+                .into_tensor_representation(
+                    ["table.weight".into()],
+                    eredu_gguf::QuantizedTensorRepresentation::Encoded,
+                )
+                .unwrap();
+            let plan = test_plan(&checkpoint);
+            let mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
+            let store = GgufWeightStore::builder()
+                .add_checkpoint(checkpoint, &plan, &mapping)
+                .unwrap()
+                .build()
+                .unwrap();
+            let batches = [1, 2].map(|row| {
+                store
+                    .prepare_encoded_read(&[TensorReadRequest {
+                        key: "table.weight".into(),
+                        selection: TensorSelection::Range {
+                            axis: 0,
+                            start: row,
+                            end: row + 1,
+                        },
+                        policy: ReadPolicy::RequireBounded,
+                    }])
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(store.diagnostics().unwrap().physical_read_bytes, 0);
+            let (mut left, mut right) = (vec![0u8; row_bytes], vec![0u8; row_bytes]);
+            EncodedReadBatch::read_many_into(batches.into(), &mut [&mut left, &mut right]).unwrap();
+            assert_eq!(left, raw[row_bytes..2 * row_bytes]);
+            assert_eq!(right, raw[2 * row_bytes..3 * row_bytes]);
+            assert_eq!(
+                store.diagnostics().unwrap().physical_read_bytes,
+                2 * row_bytes as u64
+            );
+            assert_eq!(store.diagnostics().unwrap().physical_reads, 1);
+            let pending = store
+                .prepare_encoded_read(&["table.weight".into()])
+                .unwrap()
+                .unwrap();
+            let mut changed = std::fs::read(&path).unwrap();
+            *changed.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, changed).unwrap();
+            assert!(matches!(
+                pending.read_into(&mut vec![0u8; 4 * row_bytes]),
+                Err(StoreError::AdmittedFileChanged { .. })
+            ));
+            assert_eq!(
+                store.diagnostics().unwrap().physical_read_bytes,
+                2 * row_bytes as u64
+            );
+        }
     }
 }

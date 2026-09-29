@@ -301,7 +301,7 @@ fn background_write_failures_surface_on_the_next_foreground_operation() {
         "injected asynchronous write failure".into(),
     )));
 
-    let error = manager.set_tail_state(0, 0, 0).unwrap_err();
+    let error = manager.set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 0, 0).unwrap_err();
     assert!(error
         .to_string()
         .contains("injected asynchronous write failure"));

@@ -25,29 +25,54 @@ pub fn multimodal_position_ids(
     if parts.is_empty() || merge <= 0 || expected <= 0 {
         return Err("multimodal positions require parts and positive geometry".into());
     }
-    let mut positions = [Vec::new(), Vec::new(), Vec::new()];
-    let mut current = 0i32;
-    for part in parts {
-        match part {
-            PositionPart::Text(length) if *length > 0 => {
-                for position in current..current + *length {
-                    for axis in &mut positions {
-                        axis.push(position);
-                    }
-                }
-                current = current.checked_add(*length).ok_or("position overflow")?;
-            }
+    // Validate the entire extent before allocating or expanding grid coordinates.
+    let count = parts.iter().try_fold(0i32, |count, part| {
+        let length = match part {
+            PositionPart::Text(length) if *length > 0 => *length,
             PositionPart::Media(grid) if !grid.is_empty() => {
-                for &(time, height, width) in *grid {
+                grid.iter().try_fold(0i32, |sum, &(time, height, width)| {
                     if time <= 0
                         || height <= 0
                         || width <= 0
                         || height % merge != 0
                         || width % merge != 0
                     {
-                        return Err("invalid merged media grid".into());
+                        return Err("invalid merged media grid");
                     }
+                    time.checked_mul(height / merge)
+                        .and_then(|v| v.checked_mul(width / merge))
+                        .and_then(|v| sum.checked_add(v))
+                        .ok_or("position extent overflow")
+                })?
+            }
+            _ => return Err("empty or invalid position part"),
+        };
+        count.checked_add(length).ok_or("position extent overflow")
+    })?;
+    if count != expected {
+        return Err(format!(
+            "position metadata describes {count} tokens, expected {expected}"
+        ));
+    }
+    let mut positions = std::array::from_fn(|_| Vec::with_capacity(expected as usize));
+    let mut current = 0i32;
+    for part in parts {
+        match part {
+            PositionPart::Text(length) => {
+                let end = current.checked_add(*length).ok_or("position overflow")?;
+                for position in current..end {
+                    for axis in &mut positions {
+                        axis.push(position);
+                    }
+                }
+                current = end;
+            }
+            PositionPart::Media(grid) => {
+                for &(time, height, width) in *grid {
                     let (height, width) = (height / merge, width / merge);
+                    current
+                        .checked_add(time.max(height).max(width))
+                        .ok_or("position overflow")?;
                     for temporal in 0..time {
                         for y in 0..height {
                             for x in 0..width {
@@ -62,17 +87,16 @@ pub fn multimodal_position_ids(
                         .ok_or("position overflow")?;
                 }
             }
-            _ => return Err("empty or invalid position part".into()),
         }
     }
-    if positions[0].len() != expected as usize {
-        return Err(format!(
-            "position metadata describes {} tokens, expected {expected}",
-            positions[0].len()
-        ));
-    }
     let maximum = positions.iter().flatten().copied().max().unwrap_or(0);
-    Ok((positions, maximum + 1 - expected))
+    Ok((
+        positions,
+        maximum
+            .checked_add(1)
+            .and_then(|v| v.checked_sub(expected))
+            .ok_or("position delta overflow")?,
+    ))
 }
 
 /// Scalar reference for Qwen section-interleaved mRoPE cosine/sine values.
@@ -151,31 +175,63 @@ pub fn mrope_embeddings<T: Tensor>(
     sections: &[i32; 3],
     context: &T::Context,
 ) -> Result<(T, T), Error> {
-    if sections.iter().any(|section| *section <= 0) || sections.iter().sum::<i32>() != head_dim / 2
+    multi_axis_rotary_embeddings(
+        position_ids,
+        &mrope_spec(head_dim, theta, sections)?,
+        context,
+    )
+}
+
+/// Exact section policy shared by request preparation and mechanism reporting.
+pub fn mrope_spec(
+    head_dim: i32,
+    theta: f32,
+    sections: &[i32; 3],
+) -> Result<MultiAxisRotarySpec, Error> {
+    if head_dim <= 0
+        || head_dim % 2 != 0
+        || sections.iter().any(|section| *section <= 0)
+        || sections
+            .iter()
+            .map(|section| i64::from(*section))
+            .sum::<i64>()
+            * 2
+            != i64::from(head_dim)
     {
         return Err(Error::backend("invalid section-interleaved mRoPE geometry"));
     }
-    multi_axis_rotary_embeddings(
-        position_ids,
-        &MultiAxisRotarySpec {
-            axes: sections
-                .iter()
-                .map(|section| RotaryAxisSpec {
-                    dimensions: section * 2,
-                    position_offset: 0,
-                })
-                .collect(),
-            base: theta,
-            minimum_position: 0,
-            layout: MultiAxisRotaryLayout::RoundRobinSections,
-        },
-        context,
-    )
+    let spec = MultiAxisRotarySpec {
+        axes: sections
+            .iter()
+            .map(|section| RotaryAxisSpec {
+                dimensions: section * 2,
+                position_offset: 0,
+            })
+            .collect(),
+        base: theta,
+        minimum_position: 0,
+        layout: MultiAxisRotaryLayout::RoundRobinSections,
+    };
+    spec.dimensions()?;
+    Ok(spec)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grid_extent_is_checked_before_expanding_positions() {
+        assert!(
+            multimodal_position_ids(&[PositionPart::Media(&[(i32::MAX, 4, 4)])], 2, 1).is_err()
+        );
+        assert!(multimodal_position_ids(
+            &[PositionPart::Text(i32::MAX), PositionPart::Text(1)],
+            2,
+            1
+        )
+        .is_err());
+        assert!(multimodal_position_ids(&[PositionPart::Media(&[(1, 4, 4)])], 2, 3).is_err());
+    }
     #[test]
     fn positions_preserve_text_media_order_and_delta() {
         let grid = [(1, 4, 4)];
@@ -213,25 +269,7 @@ mod tests {
         let actual = reference_multi_axis_rotary_embeddings(
             &positions,
             2,
-            &MultiAxisRotarySpec {
-                axes: vec![
-                    RotaryAxisSpec {
-                        dimensions: 4,
-                        position_offset: 0,
-                    },
-                    RotaryAxisSpec {
-                        dimensions: 4,
-                        position_offset: 0,
-                    },
-                    RotaryAxisSpec {
-                        dimensions: 4,
-                        position_offset: 0,
-                    },
-                ],
-                base: 10_000.0,
-                minimum_position: 0,
-                layout: MultiAxisRotaryLayout::RoundRobinSections,
-            },
+            &mrope_spec(12, 10_000.0, &[2, 2, 2]).unwrap(),
         )
         .unwrap();
         assert!(expected
@@ -244,5 +282,16 @@ mod tests {
             .iter()
             .zip(actual.1)
             .all(|(a, b)| (a - b).abs() < 1e-6));
+    }
+    #[test]
+    fn rotary_spec_rejects_odd_overflowing_and_nonfinite_geometry() {
+        for (width, theta, sections) in [
+            (7, 10_000.0, [1, 1, 1]),
+            (6, 10_000.0, [i32::MAX, i32::MAX, i32::MAX]),
+            (6, f32::NAN, [1, 1, 1]),
+            (6, 0.0, [1, 1, 1]),
+        ] {
+            assert!(mrope_spec(width, theta, &sections).is_err());
+        }
     }
 }

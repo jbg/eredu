@@ -68,11 +68,12 @@ fn pooling_stream(stream: u32, ratio: u32, overlapping: bool) -> Vec<StateTensor
 fn materializes_window_and_pooling_streams_from_layer_policy() {
     let mut tensors = pooling_stream(0, 4, true);
     tensors.extend(pooling_stream(1, 6, true));
-    let policy = LayerCachePolicy::key_only_with_fixed_state(
+    let policy = LayerCachePolicy::key_only_with_state(
         AttentionPolicy::sliding(37).unwrap(),
         1,
         8,
         tensors,
+        Vec::new(),
     )
     .unwrap();
 

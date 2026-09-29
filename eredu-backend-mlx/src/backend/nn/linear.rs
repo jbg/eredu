@@ -325,6 +325,22 @@ impl PhysicalLinear {
         &mut self,
         input: &Array,
         stream: &Stream,
+        observer: Option<&mut dyn NativeProjectionInputObserver>,
+    ) -> Result<Array, Exception> {
+        let output = self.project_without_bias(input, stream, observer)?;
+        match self.bias.as_ref() {
+            Some(bias) => output.add(bias, stream),
+            None => Ok(output),
+        }
+    }
+
+    /// Both ordinary and distributed execution use the same selected projection.
+    /// Keeping the bias out of this equation avoids mutating retained parameters
+    /// while invoking fallible, user-controlled input observers.
+    fn project_without_bias(
+        &self,
+        input: &Array,
+        stream: &Stream,
         mut observer: Option<&mut dyn NativeProjectionInputObserver>,
     ) -> Result<Array, Exception> {
         let floating = self.weight.as_ref().dtype().is_float();
@@ -337,7 +353,7 @@ impl PhysicalLinear {
                 observer.observe(input)?;
             }
         }
-        let mut output = if matches!(
+        let output = if matches!(
             self.weight.as_ref().dtype(),
             Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
         ) {
@@ -377,9 +393,6 @@ impl PhysicalLinear {
         } else {
             dense_projection(input, self.weight.as_ref(), stream)?
         };
-        if let Some(bias) = self.bias.as_ref() {
-            output = output.add(bias, stream)?;
-        }
         Ok(output)
     }
 
@@ -401,10 +414,8 @@ impl PhysicalLinear {
         stream: &Stream,
         observer: Option<&mut dyn NativeProjectionInputObserver>,
     ) -> Result<Array, Exception> {
-        let bias = self.bias.value.take();
-        let partial = self.forward_with_input_observer(input, stream, observer);
-        self.bias.value = bias;
-        let output = crate::backend::runtime::distributed::all_sum(&partial?, group, stream)?;
+        let partial = self.project_without_bias(input, stream, observer)?;
+        let output = crate::backend::runtime::distributed::all_sum(&partial, group, stream)?;
         match self.bias.as_ref() {
             Some(bias) => output.add(bias, stream),
             None => Ok(output),
@@ -465,3 +476,6 @@ fn unloaded_embedding_with_dtype(
         )?)),
     }
 }
+
+#[cfg(test)]
+mod tests;

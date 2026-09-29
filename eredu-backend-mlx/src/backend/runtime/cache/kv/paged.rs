@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod append_stream;
+mod selected;
+pub use append_stream::MlxPagedAppendStream;
+
 pub struct PagedLatentAttentionBlock {
     pub start: i64,
     pub end: i64,
@@ -45,6 +49,14 @@ where
         )
     }
 
+    fn paged_indexed_attention(
+        &mut self,
+        input: &eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        T::paged_indexed_attention(self, input, stream)
+    }
+
     fn paged_relative_attention(
         &mut self,
         input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
@@ -81,6 +93,7 @@ where
 pub struct PagedKeyValueCache {
     manager: CacheResidencyManager,
     global_layer: usize,
+    representation: CacheRepresentation,
     rank: Option<CacheRankIdentity>,
     sliding_window: Option<i32>,
     key_only: bool,
@@ -100,6 +113,7 @@ pub struct PagedKeyValueCache {
 pub struct PagedKeyValueTransactionCheckpoint {
     session_id: u64,
     global_layer: usize,
+    representation: CacheRepresentation,
     offset: i64,
     tail_bytes: u64,
     block_ids: Vec<CacheBlockId>,
@@ -282,6 +296,17 @@ impl KeyValueCache for LiveKeyValueCache {
         matches!(self, Self::Paged(_))
     }
 
+    fn paged_indexed_attention(
+        &mut self,
+        input: &eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Resident(_) => Ok(None),
+            Self::Paged(cache) => cache.paged_indexed_attention(input, stream),
+        }
+    }
+
     fn paged_relative_attention(
         &mut self,
         input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
@@ -374,7 +399,7 @@ impl PagedKeyValueCache {
                     self.manager
                         .retain_history(
                             self.global_layer,
-                            CacheRepresentation::KeyValue,
+                            self.representation,
                             start,
                             self.tail_start,
                         )
@@ -400,17 +425,12 @@ impl PagedKeyValueCache {
         }
         let block_ids = self
             .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                i64::MAX,
-                0,
-            )
+            .layer_block_ids(self.global_layer, self.representation, 0, i64::MAX, 0)
             .map_err(cache_residency_exception)?;
         Ok(PagedKeyValueTransactionCheckpoint {
             session_id: self.manager.session_id(),
             global_layer: self.global_layer,
+            representation: self.representation,
             offset: self.offset,
             tail_bytes: self.tail_bytes(),
             block_ids,
@@ -426,6 +446,7 @@ impl PagedKeyValueCache {
     ) -> Result<(), Exception> {
         if checkpoint.session_id != self.manager.session_id()
             || checkpoint.global_layer != self.global_layer
+            || checkpoint.representation != self.representation
         {
             return Err(Exception::custom(
                 "paged transaction checkpoint does not belong to this cache layer",
@@ -433,13 +454,7 @@ impl PagedKeyValueCache {
         }
         let current = self
             .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                i64::MAX,
-                0,
-            )
+            .layer_block_ids(self.global_layer, self.representation, 0, i64::MAX, 0)
             .map_err(cache_residency_exception)?;
         if checkpoint
             .block_ids
@@ -460,10 +475,12 @@ impl PagedKeyValueCache {
                 first_error.get_or_insert_with(|| cache_residency_exception(error));
             }
         }
-        if let Err(error) =
-            self.manager
-                .set_tail_state(self.global_layer, checkpoint.tail_bytes, checkpoint.offset)
-        {
+        if let Err(error) = self.manager.set_tail_state(
+            self.global_layer,
+            self.representation,
+            checkpoint.tail_bytes,
+            checkpoint.offset,
+        ) {
             first_error.get_or_insert_with(|| cache_residency_exception(error));
         }
         match first_error {
@@ -516,12 +533,35 @@ impl PagedKeyValueCache {
         rank: Option<CacheRankIdentity>,
         key_only: bool,
     ) -> Result<Self, Exception> {
+        Self::new_with_representation(
+            manager,
+            global_layer,
+            sliding_window,
+            prefix_tokens,
+            rank,
+            key_only,
+            CacheRepresentation::KeyValue,
+        )
+    }
+
+    fn new_with_representation(
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        sliding_window: Option<i32>,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+        key_only: bool,
+        representation: CacheRepresentation,
+    ) -> Result<Self, Exception> {
         if sliding_window.is_some_and(|window| window <= 0) {
             return Err(Exception::custom(
                 "paged sliding attention window must be positive",
             ));
         }
-        if sliding_window.is_none() && !manager.options().full_attention_enabled() {
+        if sliding_window.is_none()
+            && representation == CacheRepresentation::KeyValue
+            && !manager.options().full_attention_enabled()
+        {
             return Err(Exception::custom(
                 "paged full attention requires explicit blockwise full-attention enablement",
             ));
@@ -532,11 +572,12 @@ impl PagedKeyValueCache {
             ));
         }
         let offset = manager
-            .layer_end(global_layer, CacheRepresentation::KeyValue)
+            .layer_end(global_layer, representation)
             .map_err(cache_residency_exception)?;
         Ok(Self {
             manager,
             global_layer,
+            representation,
             rank,
             sliding_window,
             key_only,
@@ -566,6 +607,7 @@ impl PagedKeyValueCache {
     pub fn has_same_transaction_identity(&self, other: &Self) -> bool {
         self.manager.session_id() == other.manager.session_id()
             && self.global_layer == other.global_layer
+            && self.representation == other.representation
             && self.rank == other.rank
             && self.sliding_window == other.sliding_window
             && self.key_only == other.key_only
@@ -637,7 +679,7 @@ impl PagedKeyValueCache {
                 .map(|array| array.nbytes() as u64)
                 .sum();
             self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, len)
+                .set_tail_state(self.global_layer, self.representation, candidate_bytes, len)
                 .map_err(cache_residency_exception)?;
             self.tail_keys = candidate_keys;
             self.tail_values = candidate_values;
@@ -649,7 +691,7 @@ impl PagedKeyValueCache {
             .manager
             .layer_block_ids(
                 self.global_layer,
-                CacheRepresentation::KeyValue,
+                self.representation,
                 0,
                 self.offset,
                 self.prefix_tokens as i64,
@@ -664,7 +706,12 @@ impl PagedKeyValueCache {
             let retained = i32::try_from(len - id.start)
                 .map_err(|_| Exception::custom("paged cache truncate length overflow"))?;
             let (keys, values) = match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => (
+                CacheBlockArrays::KeyValue { keys, values }
+                | CacheBlockArrays::AppendStream {
+                    records: keys,
+                    reserved: values,
+                    ..
+                } => (
                     keys.try_index_device((.., .., ..retained, ..), stream)?,
                     values.try_index_device((.., .., ..retained, ..), stream)?,
                 ),
@@ -677,14 +724,14 @@ impl PagedKeyValueCache {
             safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
             let keys = keys.contiguous(false, stream)?.deep_clone()?;
             let values = values.contiguous(false, stream)?.deep_clone()?;
-            Some((lease, CacheBlockArrays::KeyValue { keys, values }))
+            Some((lease, self.block_arrays(keys, values)))
         } else {
             None
         };
         self.manager
             .truncate_layer_transaction(
                 self.global_layer,
-                CacheRepresentation::KeyValue,
+                self.representation,
                 len,
                 replacement,
                 self.prefix_tokens as i64,
@@ -728,6 +775,7 @@ impl PagedKeyValueCache {
         self.manager
             .set_tail_state(
                 self.global_layer,
+                self.representation,
                 checkpoint.tail_bytes(),
                 checkpoint.offset,
             )
@@ -742,13 +790,7 @@ impl PagedKeyValueCache {
     /// Clears live state while preserving paging configuration.
     pub fn clear(&mut self) -> Result<(), Exception> {
         self.manager
-            .truncate_layer_transaction(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                None,
-                0,
-            )
+            .truncate_layer_transaction(self.global_layer, self.representation, 0, None, 0)
             .map_err(cache_residency_exception)?;
         self.tail_keys = None;
         self.tail_values = None;
@@ -779,7 +821,10 @@ impl PagedKeyValueCache {
             .take()
             .expect("paged keys and values tails are initialized atomically");
         let end = self.tail_start + keys.dim(-2) as i64;
-        if let Err(error) = self.manager.set_tail_state(self.global_layer, 0, end) {
+        if let Err(error) =
+            self.manager
+                .set_tail_state(self.global_layer, self.representation, 0, end)
+        {
             self.tail_keys = Some(keys);
             self.tail_values = Some(values);
             return Err(cache_residency_exception(error));
@@ -789,21 +834,35 @@ impl PagedKeyValueCache {
             self.tail_start,
             end,
             self.rank,
-            CacheBlockArrays::KeyValue {
-                keys: keys.clone(),
-                values: values.clone(),
-            },
+            self.block_arrays(keys.clone(), values.clone()),
             end <= self.prefix_tokens as i64,
         ) {
             self.tail_keys = Some(keys);
             self.tail_values = Some(values);
             self.manager
-                .set_tail_state(self.global_layer, self.tail_bytes(), end)
+                .set_tail_state(
+                    self.global_layer,
+                    self.representation,
+                    self.tail_bytes(),
+                    end,
+                )
                 .map_err(cache_residency_exception)?;
             return Err(cache_residency_exception(error));
         }
         self.tail_start = end;
         Ok(())
+    }
+
+    fn block_arrays(&self, keys: Array, values: Array) -> CacheBlockArrays {
+        match self.representation {
+            CacheRepresentation::AppendStream { slot, lane } => CacheBlockArrays::AppendStream {
+                slot,
+                lane,
+                records: keys,
+                reserved: values,
+            },
+            _ => CacheBlockArrays::KeyValue { keys, values },
+        }
     }
 
     fn normalize_update_values(
@@ -812,7 +871,12 @@ impl PagedKeyValueCache {
         values: Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        if !self.key_only {
+        if !self.key_only
+            || matches!(
+                self.representation,
+                CacheRepresentation::AppendStream { .. }
+            )
+        {
             return Ok(values);
         }
         if keys.ndim() != 4
@@ -836,7 +900,15 @@ impl PagedKeyValueCache {
                 "paged key/value cache expects rank-4 [batch, heads, sequence, dimension] arrays",
             ));
         }
-        let geometry_matches = if self.key_only {
+        let geometry_matches = if matches!(
+            self.representation,
+            CacheRepresentation::AppendStream { .. }
+        ) {
+            keys.shape()[..2] == [1, 1]
+                && keys.shape()[..3] == values.shape()[..3]
+                && keys.dim(-1) > 0
+                && values.dim(-1) == 0
+        } else if self.key_only {
             keys.shape()[..3] == values.shape()[..3] && values.dim(-1) == 1
         } else {
             keys.shape() == values.shape()
@@ -892,13 +964,7 @@ impl PagedKeyValueCache {
         let previous_offset = self.offset;
         let previous_blocks = self
             .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                i64::MAX,
-                0,
-            )
+            .layer_block_ids(self.global_layer, self.representation, 0, i64::MAX, 0)
             .map_err(cache_residency_exception)?;
         let result = self.append_inner(keys, values, retain_for_attention, stream);
         if let Err(error) = result {
@@ -949,10 +1015,25 @@ impl PagedKeyValueCache {
                 Some(previous) => concatenate_axis(&[previous.clone(), value_part], -2, stream)?,
                 None => value_part,
             };
+            let candidate_keys = if matches!(
+                self.representation,
+                CacheRepresentation::AppendStream { .. }
+            ) {
+                let copy = candidate_keys.contiguous(false, stream)?.deep_clone()?;
+                safemlx::transforms::eval([&copy])?;
+                copy
+            } else {
+                candidate_keys
+            };
             let candidate_bytes = candidate_keys.nbytes() as u64 + candidate_values.nbytes() as u64;
             let candidate_end = candidate_tail_start + candidate_keys.dim(-2) as i64;
             self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, candidate_end)
+                .set_tail_state(
+                    self.global_layer,
+                    self.representation,
+                    candidate_bytes,
+                    candidate_end,
+                )
                 .map_err(cache_residency_exception)?;
             self.tail_start = candidate_tail_start;
             self.tail_keys = Some(candidate_keys);
@@ -975,7 +1056,7 @@ impl PagedKeyValueCache {
             self.manager
                 .discard_before(
                     self.global_layer,
-                    CacheRepresentation::KeyValue,
+                    self.representation,
                     visible_start,
                     self.prefix_tokens as i64,
                 )
@@ -998,13 +1079,7 @@ impl PagedKeyValueCache {
         self.offset = previous_offset;
         let current_blocks = self
             .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                0,
-                i64::MAX,
-                0,
-            )
+            .layer_block_ids(self.global_layer, self.representation, 0, i64::MAX, 0)
             .map_err(cache_residency_exception)?;
         let mut rollback_error = None;
         for id in current_blocks
@@ -1016,10 +1091,12 @@ impl PagedKeyValueCache {
                 rollback_error.get_or_insert_with(|| cache_residency_exception(error));
             }
         }
-        if let Err(error) =
-            self.manager
-                .set_tail_state(self.global_layer, self.tail_bytes(), previous_offset)
-        {
+        if let Err(error) = self.manager.set_tail_state(
+            self.global_layer,
+            self.representation,
+            self.tail_bytes(),
+            previous_offset,
+        ) {
             rollback_error.get_or_insert_with(|| cache_residency_exception(error));
         }
         match rollback_error {
@@ -1036,13 +1113,7 @@ impl PagedKeyValueCache {
     ) -> Result<(Array, Array), Exception> {
         let ids = self
             .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                start,
-                end,
-                0,
-            )
+            .layer_block_ids(self.global_layer, self.representation, start, end, 0)
             .map_err(cache_residency_exception)?;
         let mut key_parts = Vec::new();
         let mut value_parts = Vec::new();
@@ -1057,7 +1128,12 @@ impl PagedKeyValueCache {
             let slice_end = i32::try_from(end.min(id.end) - id.start)
                 .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
             match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => {
+                CacheBlockArrays::KeyValue { keys, values }
+                | CacheBlockArrays::AppendStream {
+                    records: keys,
+                    reserved: values,
+                    ..
+                } => {
                     key_parts
                         .push(keys.try_index_device((.., .., slice_start..slice_end, ..), stream)?);
                     value_parts.push(
@@ -1116,6 +1192,7 @@ impl Default for PagedKeyValueCache {
         Self {
             manager,
             global_layer: 0,
+            representation: CacheRepresentation::KeyValue,
             rank: None,
             sliding_window: Some(1),
             key_only: false,
@@ -1162,6 +1239,14 @@ impl KeyValueCache for PagedKeyValueCache {
         self.scan_attention(
             queries, scale, mask, sinks, softcap, arithmetic, None, stream,
         )
+    }
+
+    fn paged_indexed_attention(
+        &mut self,
+        input: &eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        self.selected_attention(input, stream).map(Some)
     }
 
     fn paged_relative_attention(
@@ -1285,7 +1370,7 @@ impl PagedKeyValueCache {
             .manager
             .layer_block_ids(
                 self.global_layer,
-                CacheRepresentation::KeyValue,
+                self.representation,
                 visible_start,
                 self.offset,
                 self.prefix_tokens as i64,
@@ -1322,7 +1407,12 @@ impl PagedKeyValueCache {
             while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
                 let id = lease.id();
                 let (keys, values) = match lease.arrays() {
-                    CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
+                    CacheBlockArrays::KeyValue { keys, values }
+                    | CacheBlockArrays::AppendStream {
+                        records: keys,
+                        reserved: values,
+                        ..
+                    } => (keys.clone(), values.clone()),
                     _ => {
                         return Err(Exception::custom(
                             "paged key/value cache found an incompatible block representation",

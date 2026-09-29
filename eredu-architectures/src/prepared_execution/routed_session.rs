@@ -30,7 +30,9 @@ pub struct PreparedCompositeSessionFacts<C> {
 }
 
 impl<C> PreparedCompositeSessionFacts<C> {
-    pub(super) fn new(
+    /// Combines constructed session facts with the retained processor selection
+    /// and architecture-owned ingress policy for final native adaptation.
+    pub fn new(
         text: PreparedTextSessionFacts,
         processor: eredu_runtime::SelectedProcessorExecution,
         admission: C,
@@ -63,6 +65,7 @@ pub fn construct_selected_routed_composite_session<
     M,
     Bank,
     Movement,
+    L,
     C,
     MakeBanks,
     R,
@@ -92,11 +95,16 @@ where
     Bank::Error: std::fmt::Display,
     Movement: IndexedMovement<B>,
     Movement::Error: std::fmt::Display,
+    L: eredu_runtime::RowLookupProvider<B>,
     MakeBanks: FnOnce(
         &std::collections::BTreeMap<eredu_runtime::RoutedBankId, SelectedRoutedBank>,
-        eredu_runtime::ParameterBankLoadOptions,
+        eredu_runtime::ParameterBankResidency,
+        Option<&eredu_runtime::SelectedRowLookups>,
     ) -> Result<
-        std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+        (
+            std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+            Option<L>,
+        ),
         E,
     >,
     R: FnOnce(
@@ -105,7 +113,12 @@ where
             PreparedCompositeArchitecture<A>,
             B,
             M,
-            RoutedReplicatedTextExecution<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
+            RoutedReplicatedTextExecution<
+                eredu_runtime::ParameterProviders<
+                    eredu_runtime::RoutedBankProviders<PlannedResidentBank>,
+                    Option<L>,
+                >,
+            >,
         >,
         PreparedCompositeSessionFacts<Admission>,
     ) -> Result<O, E>,
@@ -116,7 +129,10 @@ where
             B,
             M,
             RoutedReplicatedTextExecution<
-                eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+                eredu_runtime::ParameterProviders<
+                    eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+                    Option<L>,
+                >,
             >,
         >,
         PreparedCompositeSessionFacts<Admission>,
@@ -214,7 +230,7 @@ impl PreparedTextSessionFacts {
 /// caller load options. Final callbacks receive already constructed sessions;
 /// the shared native context is moved into only the selected final callback.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn construct_selected_routed_session<B, A, M, Bank, Movement, C, MakeBanks, R, I, O, E>(
+pub fn construct_selected_routed_session<B, A, M, Bank, Movement, L, C, MakeBanks, R, I, O, E>(
     prepared: PreparedRoutedTextArchitecture<A>,
     mechanisms: M,
     context: &<B::Tensor as Tensor>::Context,
@@ -235,11 +251,16 @@ where
     Bank::Error: std::fmt::Display,
     Movement: IndexedMovement<B>,
     Movement::Error: std::fmt::Display,
+    L: eredu_runtime::RowLookupProvider<B>,
     MakeBanks: FnOnce(
         &std::collections::BTreeMap<eredu_runtime::RoutedBankId, SelectedRoutedBank>,
-        eredu_runtime::ParameterBankLoadOptions,
+        eredu_runtime::ParameterBankResidency,
+        Option<&eredu_runtime::SelectedRowLookups>,
     ) -> Result<
-        std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+        (
+            std::collections::BTreeMap<eredu_runtime::RoutedBankId, (Bank, Movement)>,
+            Option<L>,
+        ),
         E,
     >,
     R: FnOnce(
@@ -248,7 +269,12 @@ where
             A,
             B,
             M,
-            RoutedReplicatedTextExecution<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
+            RoutedReplicatedTextExecution<
+                eredu_runtime::ParameterProviders<
+                    eredu_runtime::RoutedBankProviders<PlannedResidentBank>,
+                    Option<L>,
+                >,
+            >,
         >,
         PreparedTextSessionFacts,
     ) -> Result<O, E>,
@@ -259,25 +285,46 @@ where
             B,
             M,
             RoutedReplicatedTextExecution<
-                eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+                eredu_runtime::ParameterProviders<
+                    eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+                    Option<L>,
+                >,
             >,
         >,
         PreparedTextSessionFacts,
     ) -> Result<O, E>,
 {
     let facts = PreparedTextSessionFacts::from_prepared(prepared.text());
-    match prepared.bank_residency() {
+    let residency = prepared.bank_residency();
+    let (banks, rows) = if matches!(residency, ParameterBankResidency::IndependentCache(_))
+        || prepared.row_lookups().is_some()
+    {
+        make_banks(prepared.banks(), residency, prepared.row_lookups())
+            .map_err(PreparedExecutionError::Backend)?
+    } else {
+        (Default::default(), None)
+    };
+    match residency {
         ParameterBankResidency::WithLayer => {
-            let session = prepared
-                .construct_resident_session::<B, M>(mechanisms, context)
+            if !banks.is_empty() {
+                return Err(PreparedExecutionError::Architecture(
+                    "resident grouped weights received addressable banks".into(),
+                ));
+            }
+            let (session, _) = prepared
+                .construct_resident_session::<B, M, L>(mechanisms, rows, &[], context)
                 .map_err(PreparedExecutionError::Architecture)?;
             finish_resident(native, session, facts).map_err(PreparedExecutionError::Backend)
         }
-        ParameterBankResidency::IndependentCache(options) => {
-            let banks =
-                make_banks(prepared.banks(), options).map_err(PreparedExecutionError::Backend)?;
-            let session = prepared
-                .construct_addressable_session::<B, M, Bank, Movement>(mechanisms, banks, context)
+        ParameterBankResidency::IndependentCache(_) => {
+            let (session, _) = prepared
+                .construct_addressable_session::<B, M, Bank, Movement, L>(
+                    mechanisms,
+                    banks,
+                    rows,
+                    &[],
+                    context,
+                )
                 .map_err(PreparedExecutionError::Architecture)?;
             finish_addressable(native, session, facts).map_err(PreparedExecutionError::Backend)
         }

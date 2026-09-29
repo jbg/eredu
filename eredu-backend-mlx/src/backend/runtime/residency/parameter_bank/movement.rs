@@ -139,8 +139,8 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
     }
 }
 
-impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
-    type Acquisition = AcquiredParameterGroups;
+impl eredu_runtime::ParameterBank<MlxNeuralBackend> for AddressableParameterBank {
+    type Acquisition = AcquiredParameters;
     type Report = ParameterBankResidencyReport;
     type Error = Error;
 
@@ -171,6 +171,21 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .map_err(Into::into)
     }
 
+    fn complete(
+        &mut self,
+        acquisition: Self::Acquisition,
+        output: &MlxTensor,
+        _: &Stream,
+    ) -> Result<(), Self::Error> {
+        complete_parameters(acquisition, |_| Ok(output.clone())).map(|_| ())
+    }
+
+    fn report(&self) -> Result<Self::Report, Self::Error> {
+        AddressableParameterBank::report(self).map_err(Into::into)
+    }
+}
+
+impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
     fn gated_product_groups(
         &mut self,
         acquisition: &Self::Acquisition,
@@ -249,25 +264,10 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
         )?;
         Ok(groups)
     }
-
-    fn complete(
-        &mut self,
-        mut acquisition: Self::Acquisition,
-        output: &MlxTensor,
-        _: &Stream,
-    ) -> Result<(), Self::Error> {
-        eval([output.as_array()])?;
-        acquisition.transfer.synchronize()?;
-        Ok(())
-    }
-
-    fn report(&self) -> Result<Self::Report, Self::Error> {
-        AddressableParameterBank::report(self).map_err(Into::into)
-    }
 }
 
-impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank {
-    type Acquisition = AcquiredParameterGroups;
+impl eredu_runtime::ParameterBank<MlxNeuralBackend> for SharedAddressableParameterBank {
+    type Acquisition = AcquiredParameters;
     type Report = ParameterBankResidencyReport;
     type Error = Error;
 
@@ -300,6 +300,26 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
             .acquire(request, stream)
     }
 
+    fn complete(
+        &mut self,
+        acquisition: Self::Acquisition,
+        output: &MlxTensor,
+        stream: &Stream,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+            })?
+            .complete(acquisition, output, stream)
+    }
+
+    fn report(&self) -> Result<Self::Report, Self::Error> {
+        SharedAddressableParameterBank::report(self)
+    }
+}
+
+impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank {
     fn gated_product_groups(
         &mut self,
         acquisition: &Self::Acquisition,
@@ -342,22 +362,28 @@ impl AddressableGroupedBank<MlxNeuralBackend> for SharedAddressableParameterBank
             })?
             .relu2_groups(acquisition, spec, stream)
     }
+}
 
-    fn complete(
-        &mut self,
-        acquisition: Self::Acquisition,
-        output: &MlxTensor,
-        stream: &Stream,
-    ) -> Result<(), Self::Error> {
-        self.inner
-            .lock()
-            .map_err(|_| {
-                Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
-            })?
-            .complete(acquisition, output, stream)
+/// Shared lease lifetime for grouped operators and row decoding, including
+/// operators that submit work while constructing their returned tensor.
+pub(super) fn complete_parameters(
+    acquisition: AcquiredParameters,
+    operation: impl FnOnce(&AcquiredParameters) -> Result<MlxTensor, Error>,
+) -> Result<MlxTensor, Error> {
+    let mut recovery = crate::backend::submission_recovery::Recovery::begin(acquisition)?;
+    let result = operation(recovery.retention());
+    let submitted = result.and_then(|output| {
+        eval([output.as_array()])?;
+        Ok(output)
+    });
+    recovery.seal();
+    let output = submitted?;
+    recovery.retention_mut().transfer.synchronize()?;
+    let status = recovery.finish();
+    if status.failed || status.blocked {
+        return Err(Error::ArchitectureModel(
+            "parameter-bank consumer failed; unresolved leases remain retained".into(),
+        ));
     }
-
-    fn report(&self) -> Result<Self::Report, Self::Error> {
-        SharedAddressableParameterBank::report(self)
-    }
+    Ok(output)
 }

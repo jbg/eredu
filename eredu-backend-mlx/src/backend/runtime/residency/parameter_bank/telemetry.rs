@@ -229,9 +229,27 @@ impl ParameterBankStatistics {
     }
 }
 
+/// Row companion/workspace facts beside the one shared physical cache report.
+pub struct RowLookupPoolReport {
+    pub(super) pool_id: u64,
+    pub(super) residency: ResidencyReport,
+    pub(super) requirements: eredu_runtime::SelectedRowLookupRequirements,
+}
+impl RowLookupPoolReport {
+    /// Whole-pool residency, including any grouped owners sharing this pool.
+    pub fn residency(&self) -> &ResidencyReport {
+        &self.residency
+    }
+    /// Retained scalars and selected serial invocation bounds, separate from cache occupancy.
+    pub const fn requirements(&self) -> eredu_runtime::SelectedRowLookupRequirements {
+        self.requirements
+    }
+}
+
 /// Reports independently identified banks and their total occupancy.
 /// Shared pool peaks are counted once; logical bank counters remain separate.
 pub struct ParameterBanksResidencyReport {
+    rows: Option<RowLookupPoolReport>,
     banks: std::collections::BTreeMap<eredu_runtime::RoutedBankId, ParameterBankResidencyReport>,
     bulk: BankPassStatistics,
     incremental: BankPassStatistics,
@@ -250,7 +268,28 @@ impl ParameterBanksResidencyReport {
             banks,
             bulk,
             incremental,
+            rows: None,
         }
+    }
+    /// Attaches rows without double-counting their shared grouped-weight pool.
+    pub fn with_rows(mut self, rows: RowLookupPoolReport) -> Self {
+        self.rows = Some(rows);
+        self
+    }
+    /// Independent row source, scalar and workspace facts when selected.
+    pub fn rows(&self) -> Option<&RowLookupPoolReport> {
+        self.rows.as_ref()
+    }
+    fn pools(&self) -> BTreeMap<u64, &ResidencyReport> {
+        let mut pools: BTreeMap<_, _> = self
+            .banks
+            .values()
+            .map(|b| (b.pool_id, b.residency()))
+            .collect();
+        if let Some(rows) = &self.rows {
+            pools.insert(rows.pool_id, &rows.residency);
+        }
+        pools
     }
     /// Reports indexed by the selected architecture bank.
     pub fn banks(
@@ -279,63 +318,41 @@ impl ParameterBanksResidencyReport {
             .values()
             .fold(0, |sum, bank| sum.saturating_add(bank.owned_bytes()))
     }
-    /// Sum of `host_resident_entries` across independently retained banks.
+    /// Current shared-pool host entries, counting each physical pool once.
     pub fn host_resident_entries(&self) -> usize {
-        self.banks.values().fold(0, |sum, bank| {
-            sum.saturating_add(bank.host_resident_entries())
+        self.pools().values().fold(0usize, |n, p| {
+            n.saturating_add(p.offload().resident_units().get(MemoryTier::Host))
         })
     }
-    /// Sum of `device_resident_entries` across independently retained banks.
+    /// Current shared-pool device entries, counting each physical pool once.
     pub fn device_resident_entries(&self) -> usize {
-        self.banks.values().fold(0, |sum, bank| {
-            sum.saturating_add(bank.device_resident_entries())
+        self.pools().values().fold(0usize, |n, p| {
+            n.saturating_add(p.offload().resident_units().get(MemoryTier::Device))
         })
     }
-    /// Sum of `host_resident_bytes` across independently retained banks.
+    /// Current shared-pool host bytes, including rows once.
     pub fn host_resident_bytes(&self) -> u64 {
-        self.banks.values().fold(0, |sum, bank| {
-            sum.saturating_add(bank.host_resident_bytes())
+        self.pools().values().fold(0u64, |n, p| {
+            n.saturating_add(p.offload().resident_bytes().get(MemoryTier::Host))
         })
     }
-    /// Sum of `device_resident_bytes` across independently retained banks.
+    /// Current shared-pool device bytes, including rows once.
     pub fn device_resident_bytes(&self) -> u64 {
-        self.banks.values().fold(0, |sum, bank| {
-            sum.saturating_add(bank.device_resident_bytes())
+        self.pools().values().fold(0u64, |n, p| {
+            n.saturating_add(p.offload().resident_bytes().get(MemoryTier::Device))
         })
     }
-    /// Peak shared-pool occupancy, counting each physical pool once.
+    /// Peak shared-pool host occupancy, counting each physical pool once.
     pub fn peak_host_resident_bytes(&self) -> u64 {
-        self.banks
-            .values()
-            .map(|bank| {
-                (
-                    bank.pool_id,
-                    bank.residency()
-                        .offload()
-                        .peak_resident_bytes()
-                        .get(MemoryTier::Host),
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
-            .values()
-            .fold(0, |sum: u64, bytes| sum.saturating_add(*bytes))
+        self.pools().values().fold(0u64, |n, p| {
+            n.saturating_add(p.offload().peak_resident_bytes().get(MemoryTier::Host))
+        })
     }
-    /// Peak shared-pool occupancy, counting each physical pool once.
+    /// Peak shared-pool device occupancy, counting each physical pool once.
     pub fn peak_device_resident_bytes(&self) -> u64 {
-        self.banks
-            .values()
-            .map(|bank| {
-                (
-                    bank.pool_id,
-                    bank.residency()
-                        .offload()
-                        .peak_resident_bytes()
-                        .get(MemoryTier::Device),
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
-            .values()
-            .fold(0, |sum: u64, bytes| sum.saturating_add(*bytes))
+        self.pools().values().fold(0u64, |n, p| {
+            n.saturating_add(p.offload().peak_resident_bytes().get(MemoryTier::Device))
+        })
     }
 }
 impl std::iter::Sum for BankTierStatistics {

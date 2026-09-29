@@ -59,6 +59,19 @@ pub(crate) struct ValidatedSelection {
 /// on a backend name or object address as evidence that its support is unchanged.
 #[derive(Debug)]
 pub(crate) enum MechanismObservation {
+    FloatingStateDtype(
+        eredu_core::checkpoint::TensorDtype,
+        Option<eredu_runtime::StateStorageDtype>,
+    ),
+    RowStorage(Option<eredu_runtime::AddressableStorageCapabilities>),
+    RowWorkspace(
+        eredu_runtime::RowLookupDescriptor,
+        Option<Option<eredu_runtime::RowLookupWorkspace>>,
+    ),
+    RowDecodeMemory(
+        eredu_runtime::RowLookupDescriptor,
+        Option<eredu_nn::mechanism_memory::MechanismMemoryContract>,
+    ),
     InputScoreWorkspace(Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>),
     Observation(eredu_core::ObservationMechanisms),
     Capture(eredu_core::capture::CaptureCapabilities),
@@ -70,6 +83,11 @@ pub(crate) enum MechanismObservation {
         eredu_runtime::BackendMechanismCapabilities,
     ),
     Processor(eredu_runtime::MediaPrimitiveCapabilities),
+    State(
+        eredu_runtime::StateRealizationRequirements,
+        eredu_runtime::CacheResidencyPolicy,
+        eredu_runtime::StateMechanismCapabilities,
+    ),
     Speculative(eredu_runtime::SpeculativeMechanismCapabilities),
     Communication(eredu_runtime::CommunicationCapabilities),
 }
@@ -77,6 +95,20 @@ pub(crate) enum MechanismObservation {
 impl MechanismObservation {
     pub fn matches(&self, provider: &impl crate::PreparationMechanismProvider) -> bool {
         match self {
+            Self::FloatingStateDtype(source, facts) => {
+                *facts == provider.floating_state_dtype(source)
+            }
+            Self::RowStorage(facts) => *facts == provider.row_lookup_storage(),
+            Self::RowWorkspace(descriptor, facts) => facts.as_ref().is_some_and(|facts| {
+                provider
+                    .row_lookup_workspace(descriptor)
+                    .is_ok_and(|current| *facts == current)
+            }),
+            Self::RowDecodeMemory(descriptor, facts) => facts.as_ref().is_some_and(|facts| {
+                provider
+                    .row_lookup_decode_memory(descriptor)
+                    .is_ok_and(|current| *facts == current)
+            }),
             Self::InputScoreWorkspace(facts) => {
                 *facts == provider.input_score_attention_workspace()
             }
@@ -90,6 +122,9 @@ impl MechanismObservation {
                 *facts == provider.replicated_text_capabilities(requirements, request)
             }
             Self::Processor(facts) => *facts == provider.processor_capabilities(),
+            Self::State(requirements, policy, facts) => {
+                *facts == provider.state_capabilities(requirements, policy)
+            }
             Self::Speculative(facts) => *facts == provider.speculative_capabilities(),
             Self::Communication(facts) => *facts == provider.communication_capabilities(),
         }
@@ -104,6 +139,59 @@ pub(crate) struct RecordingMechanisms<'a, P> {
 impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
     for RecordingMechanisms<'_, P>
 {
+    fn floating_state_dtype(
+        &self,
+        source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        let facts = self.provider.floating_state_dtype(source);
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::FloatingStateDtype(
+                source.clone(),
+                facts,
+            ));
+        facts
+    }
+
+    fn row_lookup_storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
+        let facts = self.provider.row_lookup_storage();
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::RowStorage(facts));
+        facts
+    }
+
+    fn row_lookup_workspace(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
+        let facts = self.provider.row_lookup_workspace(descriptor);
+        // Failures carry native causes without semantic equality. Re-evaluate a
+        // failed selection rather than treating equal diagnostic text as a proof.
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::RowWorkspace(
+                descriptor.clone(),
+                facts.as_ref().ok().copied(),
+            ));
+        facts
+    }
+
+    fn row_lookup_decode_memory(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_runtime::RowLookupError>
+    {
+        let facts = self.provider.row_lookup_decode_memory(descriptor);
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::RowDecodeMemory(
+                descriptor.clone(),
+                facts.as_ref().ok().cloned(),
+            ));
+        facts
+    }
+
     fn input_score_attention_workspace(
         &self,
     ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
@@ -167,6 +255,22 @@ impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
         facts
     }
 
+    fn state_capabilities(
+        &self,
+        requirements: &eredu_runtime::StateRealizationRequirements,
+        policy: &eredu_runtime::CacheResidencyPolicy,
+    ) -> eredu_runtime::StateMechanismCapabilities {
+        let facts = self.provider.state_capabilities(requirements, policy);
+        self.observations
+            .borrow_mut()
+            .push(MechanismObservation::State(
+                requirements.clone(),
+                policy.clone(),
+                facts.clone(),
+            ));
+        facts
+    }
+
     fn processor_capabilities(&self) -> eredu_runtime::MediaPrimitiveCapabilities {
         let facts = self.provider.processor_capabilities();
         self.observations
@@ -191,3 +295,6 @@ impl<P: crate::PreparationMechanismProvider> crate::PreparationMechanismProvider
         facts
     }
 }
+
+#[cfg(test)]
+mod row_tests;

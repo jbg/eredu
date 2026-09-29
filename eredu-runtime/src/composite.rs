@@ -181,6 +181,16 @@ impl ProcessorSelectionRequest {
         }
     }
 
+    /// Adds architecture-required modalities without changing representation policy.
+    /// Existing projected requirements remain scoped to the caller's original modalities.
+    pub fn with_additional_modalities(
+        mut self,
+        modalities: impl IntoIterator<Item = InputModality>,
+    ) -> Self {
+        self.modalities.extend(modalities);
+        self
+    }
+
     /// Requires raw decoded-media preparation for requested non-text modalities.
     pub const fn with_raw_media(mut self, required: bool) -> Self {
         self.raw_media = required;
@@ -210,6 +220,7 @@ impl ProcessorSelectionRequest {
     }
 
     /// Requires projected-embedding readiness for only the supplied modalities.
+    /// Selection rejects any supplied modality outside the requested semantic modalities.
     pub fn with_projected_modalities(
         mut self,
         modalities: impl IntoIterator<Item = InputModality>,
@@ -397,6 +408,12 @@ pub fn select_processor_execution(
     capabilities: &MediaPrimitiveCapabilities,
 ) -> Result<SelectedProcessorExecution, ProcessorSelectionError> {
     let mut issues = Vec::new();
+    for modality in request.projected_modalities.difference(&request.modalities) {
+        issues.push(format!(
+            "{} projected embeddings require the modality to be requested",
+            modality.as_str()
+        ));
+    }
     let mut available_raw_media = request.available_raw_media
         && request
             .modalities
@@ -500,6 +517,41 @@ mod tests {
             .unwrap(),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn projected_readiness_cannot_retain_unrequested_modalities() {
+        let capabilities = MediaPrimitiveCapabilities::new(
+            [],
+            [InputModality::Text, InputModality::Image],
+            [InputModality::Text, InputModality::Image],
+            [],
+            1024,
+        );
+        // Even an otherwise supported modality must be requested explicitly before
+        // its representation can occur in the selected readiness proof.
+        for modality in [InputModality::Text, InputModality::Audio] {
+            let request = ProcessorSelectionRequest::new([InputModality::Image])
+                .with_projected_modalities([modality]);
+            let error =
+                select_processor_execution(&requirements(), &request, &capabilities).unwrap_err();
+            assert_eq!(
+                error.issues(),
+                [format!(
+                    "{} projected embeddings require the modality to be requested",
+                    modality.as_str()
+                )]
+            );
+        }
+        let request = ProcessorSelectionRequest::new([InputModality::Text, InputModality::Image])
+            .with_projected_modalities([InputModality::Image]);
+        let selected =
+            select_processor_execution(&requirements(), &request, &capabilities).unwrap();
+        assert_eq!(selected.modalities(), request.modalities());
+        assert_eq!(
+            selected.projected_modalities(),
+            &BTreeSet::from([InputModality::Image])
+        );
     }
 
     #[test]

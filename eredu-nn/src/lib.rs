@@ -14,6 +14,9 @@ use eredu_checkpoint::LinearFormat;
 
 pub use eredu_nn_macros::Parameterized;
 
+mod indexed_attention;
+pub use indexed_attention::{IndexedAttentionInput, LocalAttentionInput};
+
 mod grouped_linear;
 mod grouped_units;
 mod linear_rows;
@@ -25,11 +28,15 @@ pub mod mechanism_memory;
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
 pub mod operation_geometry;
+/// Complete residual stream geometry and portable gated mixing.
+pub mod residual_streams;
 /// Typed pre-dispatch controls for architecture-configured expert selectors.
 pub mod routing_intervention;
 pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec};
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
+/// Side-effect-free, invocation-scoped backing metadata for existing tensors.
+pub mod tensor_storage;
 
 /// Backend operation failure.
 #[derive(Debug, Clone)]
@@ -463,36 +470,6 @@ mod recurrent_encoder_contract_tests {
     }
 }
 
-/// Typed sparse/indexed attention request.
-///
-/// Architecture code owns how positions are selected, causal eligibility,
-/// compression ratios, top-k, and sink policy. A backend may fuse gathering,
-/// shared-softmax attention, and value reduction without exposing an
-/// accelerator-specific indexing API.
-#[derive(Debug, Clone, Copy)]
-pub struct IndexedAttentionInput<'a, T> {
-    /// Queries shaped `[batch, heads, query_tokens, key_dimensions]`.
-    pub queries: &'a T,
-    /// Bounded local keys shaped `[batch, local_tokens, key_dimensions]`.
-    pub local_keys: &'a T,
-    /// Bounded local values shaped `[batch, local_tokens, value_dimensions]`.
-    pub local_values: &'a T,
-    /// Compressed/indexable keys shaped `[batch, pooled_tokens, key_dimensions]`.
-    pub pooled_keys: &'a T,
-    /// Compressed/indexable values shaped `[batch, pooled_tokens, value_dimensions]`.
-    pub pooled_values: &'a T,
-    /// Selected pooled positions shaped `[batch, query_tokens, selected]`.
-    pub selected_positions: &'a T,
-    /// Query/key score multiplier.
-    pub scale: f32,
-    /// Optional mask broadcastable to local scores.
-    pub local_mask: Option<&'a T>,
-    /// Optional mask broadcastable to selected pooled scores.
-    pub pooled_mask: Option<&'a T>,
-    /// Optional learned per-head sink logits.
-    pub sinks: Option<&'a T>,
-}
-
 /// Dense attention over bounded local keys plus complete pooled history.
 #[derive(Debug, Clone, Copy)]
 pub struct PooledAttentionInput<'a, T> {
@@ -595,59 +572,6 @@ impl<T: Tensor> RelativeAttentionInput<'_, T> {
                 "invalid relative attention geometry q={query:?} k={key:?} v={value:?} profiles={profiles:?} window={:?} floor={:?} alpha={}",
                 self.window, self.log_scaling_floor, self.log_scaling_alpha
             )));
-        }
-        Ok(())
-    }
-}
-
-impl<T: Tensor> IndexedAttentionInput<'_, T> {
-    /// Validates semantic ranks and exact non-broadcast geometry without
-    /// materializing any backend values.
-    pub fn validate(&self) -> Result<(), Error> {
-        let query = self.queries.shape();
-        let local_keys = self.local_keys.shape();
-        let local_values = self.local_values.shape();
-        let pooled_keys = self.pooled_keys.shape();
-        let pooled_values = self.pooled_values.shape();
-        let selected = self.selected_positions.shape();
-        if query.len() != 4
-            || local_keys.len() != 3
-            || local_values.len() != 3
-            || pooled_keys.len() != 3
-            || pooled_values.len() != 3
-            || selected.len() != 3
-            || query[0] != local_keys[0]
-            || query[0] != local_values[0]
-            || query[0] != pooled_keys[0]
-            || query[0] != pooled_values[0]
-            || query[0] != selected[0]
-            || query[2] != selected[1]
-            || query[3] != local_keys[2]
-            || query[3] != pooled_keys[2]
-            || local_keys[1] != local_values[1]
-            || pooled_keys[1] != pooled_values[1]
-            || local_values[2] != pooled_values[2]
-            || selected[2] <= 0
-            || pooled_keys[1] <= 0
-        {
-            return Err(Error::backend(format!(
-                "invalid indexed-attention geometry: queries={query:?} local_keys={local_keys:?} local_values={local_values:?} pooled_keys={pooled_keys:?} pooled_values={pooled_values:?} selected={selected:?}"
-            )));
-        }
-        if !self.scale.is_finite() || self.scale <= 0.0 {
-            return Err(Error::backend(format!(
-                "indexed-attention scale must be finite and positive, got {}",
-                self.scale
-            )));
-        }
-        if let Some(sinks) = self.sinks {
-            if sinks.shape() != [query[1]] {
-                return Err(Error::backend(format!(
-                    "indexed-attention sinks require shape [{}], got {:?}",
-                    query[1],
-                    sinks.shape()
-                )));
-            }
         }
         Ok(())
     }
@@ -1451,7 +1375,7 @@ pub enum RotaryArithmetic {
 }
 
 /// Complete backend-neutral rotary-position construction specification.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RotarySpec {
     /// Explicit product rounding policy.
     pub arithmetic: RotaryArithmetic,
@@ -3580,6 +3504,21 @@ pub trait AttentionCache<T: Tensor> {
         request: AttentionRequest<'_, T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+    /// Runs selected-position attention against the retained history. Resident
+    /// caches use the request's source tensors; paged caches must read only
+    /// blocks containing selected positions and retain leases through completion.
+    fn indexed_attention<B: NeuralBackend<Tensor = T>>(
+        &mut self,
+        request: IndexedAttentionInput<'_, T>,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        if self.uses_blockwise_attention() {
+            return Err(Error::backend(
+                "cache lacks selected-position history access",
+            ));
+        }
+        B::indexed_attention(request, context)
+    }
     /// Applies learned relative profiles to the complete visible cache history.
     /// Resident caches use the supplied tensors; blockwise caches must override
     /// this method and scan their retained history, not only the latest append.
@@ -3861,8 +3800,8 @@ impl NeuralOperatorCapabilities {
     pub const GATED_GROUP_RMS_NORM: Self = Self(1 << 4);
     /// L2 normalization.
     pub const L2_NORMALIZE: Self = Self(1 << 5);
-    /// SiLU-gated grouped RMS normalization.
-    pub const SILU_GATED_GROUP_RMS_NORM: Self = Self(1 << 6);
+    /// Float32 grouped RMS normalization with SiLU or sigmoid output gating.
+    pub const OUTPUT_GATED_GROUP_RMS_NORM: Self = Self(1 << 6);
     /// Segmented attention.
     pub const SEGMENTED_ATTENTION: Self = Self(1 << 7);
     /// Gated-delta recurrent scan.
@@ -3929,8 +3868,16 @@ impl NeuralOperatorCapabilities {
     pub const MASKED_OUTPUT_PROJECTION: Self = Self(1 << 38);
     /// Tanh-capped attention scores across contiguous, sliding and paged execution.
     pub const ATTENTION_SOFTCAP: Self = Self(1 << 39);
+    /// Elementwise absolute value.
+    pub const ABS: Self = Self(1 << 40);
+    /// Elementwise sign, with zero mapped to zero.
+    pub const SIGN: Self = Self(1 << 41);
+    /// Elementwise square root.
+    pub const SQRT: Self = Self(1 << 42);
+    /// Explicit floating-point casts with declared arithmetic boundaries.
+    pub const CAST_FLOAT: Self = Self(1 << 43);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 40) - 1);
+    pub const ALL: Self = Self((1 << 44) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3962,8 +3909,8 @@ impl NeuralOperatorCapabilities {
             ),
             (NeuralOperatorCapabilities::L2_NORMALIZE, "l2_normalize"),
             (
-                NeuralOperatorCapabilities::SILU_GATED_GROUP_RMS_NORM,
-                "silu_gated_group_rms_norm",
+                NeuralOperatorCapabilities::OUTPUT_GATED_GROUP_RMS_NORM,
+                "output_gated_group_rms_norm",
             ),
             (
                 NeuralOperatorCapabilities::SEGMENTED_ATTENTION,
@@ -4018,6 +3965,10 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::FULL_F32, "full_f32"),
             (NeuralOperatorCapabilities::FULL_I32, "full_i32"),
             (NeuralOperatorCapabilities::TANH, "tanh"),
+            (NeuralOperatorCapabilities::ABS, "abs"),
+            (NeuralOperatorCapabilities::SIGN, "sign"),
+            (NeuralOperatorCapabilities::SQRT, "sqrt"),
+            (NeuralOperatorCapabilities::CAST_FLOAT, "cast_float"),
             (NeuralOperatorCapabilities::CLIP, "clip"),
             (NeuralOperatorCapabilities::SOFTMAX_AXIS, "softmax_axis"),
             (NeuralOperatorCapabilities::BROADCAST_TO, "broadcast_to"),
@@ -4066,6 +4017,10 @@ mod neural_operator_capability_tests {
             (C::FULL_F32, "full_f32"),
             (C::FULL_I32, "full_i32"),
             (C::TANH, "tanh"),
+            (C::ABS, "abs"),
+            (C::SIGN, "sign"),
+            (C::SQRT, "sqrt"),
+            (C::CAST_FLOAT, "cast_float"),
             (C::CLIP, "clip"),
             (C::SOFTMAX_AXIS, "softmax_axis"),
             (C::BROADCAST_TO, "broadcast_to"),
@@ -4099,6 +4054,37 @@ pub trait NeuralBackend: Sized + 'static {
     fn mechanism_memory(
         invocation: &mechanism_memory::MechanismInvocation,
     ) -> Result<mechanism_memory::MechanismMemoryContract, Error> {
+        mechanism_memory::MechanismMemoryContract::unknown(invocation)
+    }
+
+    /// Refines one invocation using an already selected execution context. This
+    /// warm inspection may query context metadata but must not allocate tensors,
+    /// submit/evaluate work, or change execution state. Cold selection uses
+    /// `mechanism_memory` instead. Missing native facts remain explicit.
+    fn mechanism_memory_in_context(
+        invocation: &mechanism_memory::MechanismInvocation,
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<mechanism_memory::MechanismMemoryContract, Error> {
+        Self::mechanism_memory(invocation)
+    }
+
+    /// Describes one segment of this backend's segmented-attention primitive.
+    /// Ordinary attention facts cannot be assumed to describe an overridden or
+    /// reference segmented implementation. Segment slicing/concatenation is
+    /// described separately by the caller. Only Attention invocations are valid.
+    fn segmented_attention_memory(
+        invocation: &mechanism_memory::MechanismInvocation,
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<mechanism_memory::MechanismMemoryContract, Error> {
+        if !matches!(invocation, mechanism_memory::MechanismInvocation::Attention {
+            batch: 1, query_heads, kv_heads, queries, keys,
+            arithmetic: AttentionArithmetic::Fused, softcap: false, sinks: false, ..
+        } if query_heads == kv_heads && queries == keys)
+        {
+            return Err(Error::backend(
+                "segmented attention memory requires unmasked equal-length self-attention geometry",
+            ));
+        }
         mechanism_memory::MechanismMemoryContract::unknown(invocation)
     }
 
@@ -4228,20 +4214,27 @@ pub trait NeuralBackend: Sized + 'static {
         ))
     }
     /// Applies grouped RMS normalization to `input`, multiplies by a learned
-    /// scale, and then modulates the result by `silu(gate)`.
+    /// scale, and then modulates the result by the selected gate activation.
+    /// Normalization and gate activation use FP32. The explicit arithmetic policy
+    /// selects intermediate rounding; the final product returns to the input dtype.
+    /// Weight has one entry per final-axis feature.
     /// Input and gate shapes must match; positive groups must divide the final
     /// feature axis, and epsilon must be finite and strictly positive.
-    fn silu_gated_group_rms_norm(
+    fn output_gated_group_rms_norm(
         input: &Self::Tensor,
         gate: &Self::Tensor,
         weight: &Self::Tensor,
         groups: i32,
         epsilon: f32,
+        activation: eredu_nn::OutputGateActivation,
+        arithmetic: OutputGatedNormArithmetic,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
-        let _ = (input, gate, weight, groups, epsilon, context);
+        let _ = (
+            input, gate, weight, groups, epsilon, activation, arithmetic, context,
+        );
         Err(Error::backend(
-            "SiLU-gated grouped RMS normalization is not implemented by this backend",
+            "output-gated grouped RMS normalization is not implemented by this backend",
         ))
     }
     /// Repeats a validated head axis using backend-native reshape and
@@ -4310,9 +4303,9 @@ pub trait NeuralBackend: Sized + 'static {
             "selective state-space scan is not implemented by this backend",
         ))
     }
-    /// Runs sparse attention over bounded local state and caller-selected
-    /// compressed positions, optionally sharing softmax normalization with
-    /// learned attention sinks.
+    /// Runs grouped-query attention over caller-selected source positions,
+    /// optionally sharing softmax with a bounded local source and learned sinks.
+    /// All-invalid rows without a sink produce zero output.
     fn indexed_attention(
         input: IndexedAttentionInput<'_, Self::Tensor>,
         context: &<Self::Tensor as Tensor>::Context,
@@ -4491,6 +4484,7 @@ pub trait NeuralBackend: Sized + 'static {
         window: Option<i32>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+
     /// Applies a row-parallel projection and its collective reduction.
     fn row_parallel_linear(
         linear: &mut Self::Linear,
@@ -4524,6 +4518,9 @@ pub trait NeuralBackend: Sized + 'static {
 /// Every operation here is required, so an admitted distributed architecture cannot
 /// encounter an inherited forward-time “unsupported” implementation.
 pub trait DistributedNeuralBackend: NeuralBackend {
+    /// Actual member rank in this collective context, using the group's retained order.
+    fn parallel_rank(parallel: &Self::ParallelContext) -> usize;
+
     /// Builds one rank-local vocabulary embedding under validated ownership.
     fn vocabulary_parallel_embedding(
         spec: EmbeddingSpec,
@@ -4939,6 +4936,36 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Logical tensor shape maintained without materializing tensor values.
     fn shape(&self) -> &[i32];
 
+    /// Side-effect-free physical scalar facts, when supplied by the backend.
+    /// Exact integer state readers reject unknown or floating representations.
+    fn element_type(&self) -> Option<TensorElementType> {
+        None
+    }
+
+    /// Inspects existing tensor backing metadata without allocation of tensors,
+    /// evaluation, synchronization, or state changes. Host metadata may use
+    /// space proportional to `values.len()`. Backing identities are meaningful
+    /// only within the returned survey; no tensor or storage lease is retained.
+    /// The default reports unavailable facts for every supplied value.
+    fn inspect_storage(values: &[&Self]) -> Result<tensor_storage::TensorStorageSurvey, Error> {
+        Ok(tensor_storage::TensorStorageSurvey::unavailable(
+            values.len(),
+        ))
+    }
+
+    /// Explicitly casts a floating tensor to F16, BF16, F32 or F64. Integer
+    /// input/output is rejected; exact identity buffers use integer mechanisms.
+    fn cast_float(
+        &self,
+        element: TensorElementType,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (element, context);
+        Err(Error::backend(
+            "floating cast is not implemented by this tensor backend",
+        ))
+    }
+
     /// Returns one logical dimension.
     fn dim(&self, axis: usize) -> i32 {
         self.shape()[axis]
@@ -5014,12 +5041,34 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn subtract(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise multiplication.
     fn multiply(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
-    /// Elementwise multiplication by a floating-point scalar.
+    /// Elementwise multiplication by a floating-point scalar, rounding the result
+    /// to the input type for floating inputs.
     fn multiply_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise division.
     fn divide(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise square.
     fn square(&self, context: &Self::Context) -> Result<Self, Error>;
+    /// Elementwise absolute value, preserving the input floating type.
+    fn abs(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "absolute value is not implemented by this tensor backend",
+        ))
+    }
+    /// Elementwise sign (-1, 0, 1); both signed zeros map to zero.
+    fn sign(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "sign is not implemented by this tensor backend",
+        ))
+    }
+    /// Elementwise square root, preserving the input floating type.
+    fn sqrt(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "square root is not implemented by this tensor backend",
+        ))
+    }
     /// Elementwise hyperbolic tangent.
     fn tanh(&self, context: &Self::Context) -> Result<Self, Error> {
         let _ = context;
@@ -5027,7 +5076,7 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "tanh is not implemented by this tensor backend",
         ))
     }
-    /// Elementwise maximum with a scalar.
+    /// Elementwise maximum with a scalar, preserving a floating input type.
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise maximum with one signed integer while preserving an
     /// integral input representation.
@@ -5240,6 +5289,7 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         bias: Option<&Self>,
         context: &Self::Context,
     ) -> Result<Self, Error>;
+
     /// Layer normalization.
     fn layer_norm(
         input: &Self,
@@ -5263,7 +5313,9 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         offset: i32,
         context: &Self::Context,
     ) -> Result<Self, Error>;
-    /// Builds cosine and sine tensors for explicit multi-axis positions.
+    /// Builds F32 cosine and sine tensors for explicit multi-axis positions.
+    /// Outputs preserve the position shape prefix and replace the axis count
+    /// with the validated specification's total rotary width.
     fn multi_axis_rotary_embeddings(
         position_ids: &Self,
         spec: &multimodal::MultiAxisRotarySpec,
@@ -5430,9 +5482,33 @@ pub enum ConvolutionActivation {
     Silu,
 }
 
+/// Activation applied after learned grouped RMS normalization.
+///
+/// Normalization, scaling and gating use float32 arithmetic before converting
+/// the result back to the input dtype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputGateActivation {
+    /// Multiply by `gate * sigmoid(gate)`.
+    Silu,
+    /// Multiply by `sigmoid(gate)`.
+    Sigmoid,
+}
+
+/// Explicit arithmetic boundaries for learned, output-gated RMS normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputGatedNormArithmetic {
+    /// Keep the normalized value and learned-scale product in FP32 until gating.
+    Float32,
+    /// Cast the normalized value to the input dtype before learned scaling.
+    /// Scaling uses ordinary input/weight promotion, then gating promotes to FP32.
+    RoundedNormalization,
+}
+
 /// Geometry and parameter identity for a causal depthwise convolution.
 #[derive(Debug, Clone)]
 pub struct CausalDepthwiseConvolutionSpec {
+    /// Spacing between consecutive kernel taps in token positions.
+    pub dilation: i32,
     /// Number of independent channels.
     pub channels: i32,
     /// Causal kernel width, including the current token.
@@ -5460,7 +5536,22 @@ impl CausalDepthwiseConvolutionSpec {
                 self.kernel_size
             )));
         }
+        self.history_len()?;
         Ok(())
+    }
+
+    /// Exact retained input history, checked before allocating parameters.
+    pub fn history_len(&self) -> Result<i32, Error> {
+        if self.kernel_size <= 0 || self.dilation <= 0 {
+            return Err(Error::backend(
+                "convolution kernel and dilation must be positive",
+            ));
+        }
+        (self.kernel_size - 1)
+            .checked_mul(self.dilation)
+            // A tensor holding the history must also fit at least one input token.
+            .filter(|length| *length < i32::MAX)
+            .ok_or_else(|| Error::backend("causal convolution receptive field exceeds i32"))
     }
 }
 
@@ -5469,7 +5560,7 @@ impl CausalDepthwiseConvolutionSpec {
 pub struct CausalDepthwiseConvolutionOutput<T> {
     /// Activated convolution output shaped like the input.
     pub output: T,
-    /// Last `kernel_size - 1` inputs, or `None` for a width-one kernel.
+    /// Last `(kernel_size - 1) * dilation` inputs, or `None` for a width-one kernel.
     pub history: Option<T>,
 }
 
@@ -5487,7 +5578,9 @@ pub struct CausalDepthwiseConvolution<B: NeuralBackend> {
     #[parameter(skip)]
     channels: i32,
     #[parameter(skip)]
-    kernel_size: i32,
+    history_len: i32,
+    #[parameter(skip)]
+    dilation: i32,
     #[parameter(skip)]
     activation: ConvolutionActivation,
 }
@@ -5499,6 +5592,7 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         spec.validate()?;
+        let history_len = spec.history_len()?;
         Ok(Self {
             weight: Parameter::unloaded(
                 spec.weight,
@@ -5510,14 +5604,15 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
                 .map(|bias| Parameter::unloaded(bias, &[spec.channels], context))
                 .transpose()?,
             channels: spec.channels,
-            kernel_size: spec.kernel_size,
+            history_len,
+            dilation: spec.dilation,
             activation: spec.activation,
         })
     }
 
     /// Returns the exact retained causal-history length.
     pub const fn history_len(&self) -> i32 {
-        self.kernel_size - 1
+        self.history_len
     }
 
     /// Applies the convolution and returns the replacement bounded history.
@@ -5535,6 +5630,9 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
             )));
         }
         let history_len = self.history_len();
+        let padded_len = shape[1]
+            .checked_add(history_len)
+            .ok_or_else(|| Error::backend("causal convolution padded length exceeds i32"))?;
         let padded = if history_len == 0 {
             if history.is_some() {
                 return Err(Error::backend(
@@ -5560,8 +5658,15 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
             )?
         };
         let execution_weight = self.weight.as_ref().swap_axes(1, 2, context)?;
-        let mut output =
-            B::Tensor::conv1d(&padded, &execution_weight, 1, 0, 1, self.channels, context)?;
+        let mut output = B::Tensor::conv1d(
+            &padded,
+            &execution_weight,
+            1,
+            0,
+            self.dilation,
+            self.channels,
+            context,
+        )?;
         if output.shape() != shape {
             return Err(Error::backend(format!(
                 "causal depthwise convolution backend returned shape {:?}, expected {shape:?}",
@@ -5582,11 +5687,7 @@ impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
             .then(|| {
                 padded
                     .index(
-                        &[
-                            Index::Full,
-                            Index::Range(shape[1], shape[1] + history_len),
-                            Index::Full,
-                        ],
+                        &[Index::Full, Index::Range(shape[1], padded_len), Index::Full],
                         context,
                     )?
                     .compact(context)

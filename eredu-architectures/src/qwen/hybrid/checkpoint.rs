@@ -122,13 +122,10 @@ pub fn static_recipes(
     if store.source_metadata(patch0).is_ok() && store.source_metadata(patch1).is_ok() {
         recipes.insert(
             "model.visual.patch_embed.proj.weight".into(),
-            DerivedWeightRecipe::Stack {
-                axis: 2,
-                inputs: vec![
-                    DerivedWeightRecipe::source(patch0, TensorSelection::Full),
-                    DerivedWeightRecipe::source(patch1, TensorSelection::Full),
-                ],
-            },
+            crate::qwen::vision::temporal_patch_recipe([
+                DerivedWeightRecipe::source(patch0, TensorSelection::Full),
+                DerivedWeightRecipe::source(patch1, TensorSelection::Full),
+            ]),
         );
     }
     if store
@@ -192,11 +189,12 @@ pub fn unit_recipes(
     } else {
         format!("mtp.layers.{}.mlp.experts", flat - target_layers)
     };
-    for (binding, recipe) in expert_bank_recipes(
+    for (binding, recipe) in crate::shared_routed::checkpoint::gated_expert_recipes(
         store,
         &root,
         0..config.num_experts as usize,
         TensorSelection::Full,
+        aliases,
     )? {
         let target = format!("{root}.{binding}");
         if recipe != DerivedWeightRecipe::source(&target, TensorSelection::Full) {
@@ -268,7 +266,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     } else {
         format!("mtp.layers.{}.mlp.experts", layer - target)
     };
-    expert_bank_recipes(
+    crate::shared_routed::checkpoint::gated_expert_recipes(
         catalog,
         &root,
         expert..expert + 1,
@@ -277,156 +275,8 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             start: expert,
             end: expert + 1,
         },
+        aliases,
     )
-}
-
-// Keep physical aliases and FP8 companions identical for full-bank preparation
-// and independently resident experts. Recipes retain the selected physical keys.
-fn expert_bank_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    root: &str,
-    experts: std::ops::Range<usize>,
-    selection: TensorSelection,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    let source = |name: &str| {
-        std::iter::once(name.to_owned())
-            .chain(aliases(name))
-            .find(|name| catalog.tensor_metadata(name).is_ok())
-    };
-    let packed = source(&format!("{root}.gate_up_proj")).is_some();
-    let split_banks = ["gate_proj", "up_proj", "down_proj"]
-        .into_iter()
-        .all(|name| source(&format!("{root}.{name}")).is_some());
-    let mut recipes = BTreeMap::new();
-    if packed {
-        for (target_name, required) in [
-            ("gate_up_proj", true),
-            ("gate_up_proj_scale_inv", false),
-            ("gate_up_proj_scales", false),
-            ("gate_up_proj_biases", false),
-            ("down_proj", true),
-            ("down_proj_scale_inv", false),
-            ("down_proj_scales", false),
-            ("down_proj_biases", false),
-        ] {
-            let name = format!("{root}.{target_name}");
-            let Some(source) = source(&name) else {
-                if required {
-                    return Err(format!("missing packed Qwen hybrid expert tensor {name}"));
-                }
-                continue;
-            };
-            recipes.insert(
-                target_name.replace("_scale_inv", "_scales"),
-                DerivedWeightRecipe::source(source, selection.clone()),
-            );
-        }
-    } else if split_banks {
-        recipes.insert(
-            "gate_up_proj".into(),
-            DerivedWeightRecipe::Concatenate {
-                axis: 1,
-                inputs: ["gate_proj", "up_proj"]
-                    .into_iter()
-                    .map(|name| {
-                        DerivedWeightRecipe::source(
-                            source(&format!("{root}.{name}")).expect("split bank exists"),
-                            selection.clone(),
-                        )
-                    })
-                    .collect(),
-            },
-        );
-        recipes.insert(
-            "down_proj".into(),
-            DerivedWeightRecipe::source(
-                source(&format!("{root}.down_proj")).expect("split bank exists"),
-                selection.clone(),
-            ),
-        );
-        for suffix in ["scales", "biases", "scale_inv"] {
-            let gate = source(&format!("{root}.gate_proj_{suffix}"));
-            let up = source(&format!("{root}.up_proj_{suffix}"));
-            let target_suffix = if suffix == "scale_inv" {
-                "scales"
-            } else {
-                suffix
-            };
-            if let (Some(gate), Some(up)) = (gate, up) {
-                recipes.insert(
-                    format!("gate_up_proj_{target_suffix}"),
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(gate, selection.clone()),
-                            DerivedWeightRecipe::source(up, selection.clone()),
-                        ],
-                    },
-                );
-            }
-            if let Some(down) = source(&format!("{root}.down_proj_{suffix}")) {
-                recipes.insert(
-                    format!("down_proj_{target_suffix}"),
-                    DerivedWeightRecipe::source(down, selection.clone()),
-                );
-            }
-        }
-    } else {
-        for (suffix, target_suffix) in [("weight", ""), ("weight_scale_inv", "_scales")] {
-            let mut gate_up_inputs = Vec::new();
-            let mut down_inputs = Vec::new();
-            for expert in experts.clone() {
-                let projection = |names: &[&str]| {
-                    names.iter().find_map(|name| {
-                        source(&format!("{root}.{expert}.{name}.{suffix}"))
-                            .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full))
-                    })
-                };
-                match (
-                    projection(&["gate_proj", "w1"]),
-                    projection(&["up_proj", "w3"]),
-                    projection(&["down_proj", "w2"]),
-                ) {
-                    (Some(gate), Some(up), Some(down)) => {
-                        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
-                            axis: 0,
-                            inputs: vec![gate, up],
-                        });
-                        down_inputs.push(down);
-                    }
-                    (None, None, None) if suffix != "weight" => {}
-                    _ => {
-                        return Err(format!(
-                            "missing split Qwen hybrid expert {expert} {suffix} tensor under {root}"
-                        ));
-                    }
-                }
-            }
-            if gate_up_inputs.is_empty() {
-                continue;
-            }
-            if gate_up_inputs.len() != experts.len() {
-                return Err(format!(
-                    "incomplete Qwen hybrid expert {suffix} bank under {root}"
-                ));
-            }
-            recipes.insert(
-                format!("gate_up_proj{target_suffix}"),
-                DerivedWeightRecipe::Stack {
-                    axis: 0,
-                    inputs: gate_up_inputs,
-                },
-            );
-            recipes.insert(
-                format!("down_proj{target_suffix}"),
-                DerivedWeightRecipe::Stack {
-                    axis: 0,
-                    inputs: down_inputs,
-                },
-            );
-        }
-    }
-    Ok(recipes)
 }
 
 /// Builds the complete architecture-owned schedule for independently resident experts.
@@ -568,13 +418,14 @@ fn add_gguf_unit_transforms(
             let source = if config.variant == HybridVariant::Qwen3Next {
                 source
             } else {
-                qwen35_value_head_recipe(
-                    "linear_attn.in_proj_qkv.weight",
+                crate::gated_delta::checkpoint::grouped_value_heads(
                     source,
                     &metadata.logical_shape,
-                    config,
+                    0,
+                    2 * config.linear_num_key_heads as usize * config.linear_key_head_dim as usize,
+                    config.linear_num_key_heads as usize,
+                    config.linear_num_value_heads as usize,
                 )?
-                .unwrap_or_else(|| DerivedWeightRecipe::source(&conv, TensorSelection::Full))
             };
             recipes.insert(
                 conv.clone(),
@@ -604,101 +455,25 @@ fn add_gguf_unit_transforms(
         let base = recipes
             .remove(&name)
             .unwrap_or_else(|| DerivedWeightRecipe::source(name.clone(), TensorSelection::Full));
-        if let Some(recipe) =
-            qwen35_value_head_recipe(suffix, base, &metadata.logical_shape, config)?
-        {
-            recipes.insert(name, recipe);
-        }
+        let axis = usize::from(suffix == "linear_attn.out_proj.weight");
+        let prefix = if suffix == "linear_attn.in_proj_qkv.weight" {
+            2 * config.linear_num_key_heads as usize * config.linear_key_head_dim as usize
+        } else {
+            0
+        };
+        recipes.insert(
+            name,
+            crate::gated_delta::checkpoint::grouped_value_heads(
+                base,
+                &metadata.logical_shape,
+                axis,
+                prefix,
+                config.linear_num_key_heads as usize,
+                config.linear_num_value_heads as usize,
+            )?,
+        );
     }
     Ok(())
-}
-
-fn qwen35_value_head_recipe(
-    suffix: &str,
-    recipe: DerivedWeightRecipe,
-    shape: &[usize],
-    config: &HybridConfig,
-) -> Result<Option<DerivedWeightRecipe>, String> {
-    let num_k = usize::try_from(config.linear_num_key_heads)
-        .map_err(|_| "invalid Qwen3.5 key-head count".to_string())?;
-    let num_v = usize::try_from(config.linear_num_value_heads)
-        .map_err(|_| "invalid Qwen3.5 value-head count".to_string())?;
-    if num_k == 0 || num_v == 0 || num_v % num_k != 0 {
-        return Err("invalid Qwen3.5 value-head grouping".into());
-    }
-    let repeats = num_v / num_k;
-    let reorder =
-        |input: DerivedWeightRecipe, axis: usize, head_width: usize, original: Vec<usize>| {
-            let mut expanded = original.clone();
-            expanded.splice(axis..=axis, [repeats, num_k, head_width]);
-            let mut axes = (0..expanded.len()).collect::<Vec<_>>();
-            axes.swap(axis, axis + 1);
-            DerivedWeightRecipe::Reshape {
-                input: Box::new(DerivedWeightRecipe::Transpose {
-                    input: Box::new(DerivedWeightRecipe::Reshape {
-                        input: Box::new(input),
-                        shape: expanded,
-                    }),
-                    axes,
-                }),
-                shape: original,
-            }
-        };
-    if suffix.ends_with("in_proj_qkv.weight") {
-        if shape.len() != 2 {
-            return Ok(None);
-        }
-        let prefix = 2usize
-            .checked_mul(num_k)
-            .and_then(|value| value.checked_mul(config.linear_key_head_dim as usize))
-            .ok_or_else(|| "Qwen3.5 value-tail width overflow".to_string())?;
-        if prefix >= shape[0] || !(shape[0] - prefix).is_multiple_of(num_v) {
-            return Ok(None);
-        }
-        let leading = DerivedWeightRecipe::Select {
-            input: Box::new(recipe.clone()),
-            selection: TensorSelection::Range {
-                axis: 0,
-                start: 0,
-                end: prefix,
-            },
-        };
-        let tail = DerivedWeightRecipe::Select {
-            input: Box::new(recipe),
-            selection: TensorSelection::Range {
-                axis: 0,
-                start: prefix,
-                end: shape[0],
-            },
-        };
-        return Ok(Some(DerivedWeightRecipe::Concatenate {
-            axis: 0,
-            inputs: vec![
-                leading,
-                reorder(
-                    tail,
-                    0,
-                    (shape[0] - prefix) / num_v,
-                    vec![shape[0] - prefix, shape[1]],
-                ),
-            ],
-        }));
-    }
-    let axis = if suffix.ends_with("out_proj.weight") {
-        1
-    } else {
-        0
-    };
-    if axis >= shape.len() || !shape[axis].is_multiple_of(num_v) {
-        return Ok(None);
-    }
-    let admitted = suffix.ends_with("in_proj_z.weight")
-        || suffix.ends_with("in_proj_a.weight")
-        || suffix.ends_with("in_proj_b.weight")
-        || suffix.ends_with("dt_bias")
-        || suffix.ends_with("A_log")
-        || suffix.ends_with("out_proj.weight");
-    Ok(admitted.then(|| reorder(recipe, axis, shape[axis] / num_v, shape.to_vec())))
 }
 
 use super::{

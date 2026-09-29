@@ -8,7 +8,7 @@ use eredu_nn::{
     RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
 use crate::decoder::ComponentInstrumentation;
@@ -478,7 +478,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
@@ -514,7 +514,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
@@ -616,7 +616,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -645,7 +645,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -777,7 +777,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_provider_observed(
@@ -805,7 +805,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_inner(
@@ -894,7 +894,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_parallel_with_provider_observed(
@@ -924,7 +924,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_inner(

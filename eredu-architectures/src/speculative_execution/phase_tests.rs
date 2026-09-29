@@ -125,7 +125,7 @@ fn shared_driver_attributes_actual_phases_and_preserves_causal_values() {
         .into_parts();
     assert_eq!(replayed, 2);
     assert_eq!(cache.target, [9, 1, 2, 3, 3, 4]);
-    assert_eq!(cache.prediction, [1, 2, 3, 3, 4, 4]);
+    assert_eq!(cache.prediction, [1, 2, 3, 3, 4]);
     let trace = trace.lock().unwrap();
     assert_eq!(
         trace.phases,
@@ -135,12 +135,13 @@ fn shared_driver_attributes_actual_phases_and_preserves_causal_values() {
             (Phase::Proposal { depth: 0 }, 1),
             (Phase::Proposal { depth: 1 }, 1),
             (Phase::Verification, 3),
-            (Phase::PredictionReplay, 1),
+            (Phase::PredictionReplay, 1), // committed target anchor
+            (Phase::PredictionReplay, 1), // accepted suffix
             (Phase::TargetReplay, 2),
         ]
     );
-    assert_eq!(trace.finishes, [true; 7]);
-    assert_eq!(trace.remaining, 7);
+    assert_eq!(trace.finishes, [true; 8]);
+    assert_eq!(trace.remaining, 6);
     assert_eq!(
         trace.observations[2].2,
         Tensor(vec![3]),
@@ -223,7 +224,7 @@ fn replay_delivery_failures_restore_preverification_state_and_keep_tentative_evi
             if phase == Phase::PredictionReplay {
                 13
             } else {
-                11
+                10
             }
         );
     }

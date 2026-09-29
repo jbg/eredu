@@ -7,7 +7,10 @@ fn relative_attention_rejects_invalid_geometry_before_backend_work() {
     let make = |shape: &[i32]| NumericTensor {
         shape: shape.to_vec(),
         data: Vec::new(),
-        dtype: eredu_core::checkpoint::TensorDtype::F32,
+        scalars: Box::new(NumericTensorScalars {
+            exact_i32: None,
+            dtype: eredu_core::checkpoint::TensorDtype::F32,
+        }),
     };
     let mut q = make(&[1, 4, 3, 8]);
     let mut k = make(&[1, 2, 3, 8]);

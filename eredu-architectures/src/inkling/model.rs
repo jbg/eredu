@@ -13,8 +13,8 @@ use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, ModelStateIdentity, OwnedParameterGroupSpec,
     ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
-    PartitionState, PartitionedLayeredArchitecture, RoutedExpertProvider,
-    RoutedLayeredArchitecture, StateLayout,
+    ParameterProvider, PartitionState, PartitionedLayeredArchitecture, RoutedLayeredArchitecture,
+    StateLayout,
 };
 
 use super::{
@@ -348,6 +348,27 @@ pub fn prepare_input<T: Tensor>(
     })
 }
 
+impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+{
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        prepare_input(input, context)?.with_model_input(|input| {
+            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+                self, input, state, parallel, context,
+            )
+        })
+    }
+}
+
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
@@ -355,6 +376,16 @@ where
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
     type InputPartPlan = InklingInputPartPlan;
+    type PrefillRequest =
+        crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
+
+    fn prepare_prefill_request(
+        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::PrefillRequest, Self::Error> {
+        crate::composite_execution::SingleCompositePrefillRequest::new(prepared, admitted)
+    }
     type AdmissionConfig = ModelArgs;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
@@ -477,23 +508,6 @@ where
             <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
         })
     }
-
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
-    {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                self, input, state, parallel, context,
-            )
-        })
-    }
 }
 
 /// Typed text-decoder input for one pipeline partition.
@@ -557,7 +571,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let output = match (group, unit) {
@@ -588,7 +602,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -656,7 +670,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let output = match (group, unit) {
@@ -688,7 +702,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -1367,7 +1381,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         unit.forward_parallel_with_provider(
@@ -1644,7 +1658,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         unit.forward_with_provider(

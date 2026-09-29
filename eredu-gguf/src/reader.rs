@@ -594,6 +594,7 @@ pub struct Limits {
     pub max_tensor_count: u64,
     pub max_rank: u32,
     pub max_string_bytes: u64,
+    /// Maximum encoded payload bytes per read; header-only descriptors may be larger.
     pub max_allocation_bytes: u64,
     pub max_metadata_depth: u32,
 }
@@ -769,7 +770,6 @@ impl<R: Read + Seek> Reader<R> {
             let byte_len = (elements / block)
                 .checked_mul(bytes)
                 .ok_or(Error::Overflow("tensor byte length"))?;
-            check_limit("tensor allocation", byte_len, limits.max_allocation_bytes)?;
             let data_offset = data_start
                 .checked_add(relative_offset)
                 .ok_or(Error::Overflow("tensor offset"))?;
@@ -836,6 +836,10 @@ impl<R: Read + Seek> Reader<R> {
         self.metadata
     }
 
+    pub(crate) fn check_payload_allocation(&self, bytes: u64) -> Result<()> {
+        check_limit("tensor allocation", bytes, self.limits.max_allocation_bytes)
+    }
+
     pub fn read_raw(&mut self, tensor: &TensorDescriptor) -> Result<Vec<u8>> {
         check_limit(
             "tensor allocation",
@@ -867,6 +871,13 @@ impl<R: Read + Seek> Reader<R> {
 
     /// Execute a validated metadata-only physical selection plan.
     pub fn read_tensor_plan(&mut self, plan: &TensorSelectionPlan) -> Result<ConvertedTensor> {
+        let raw = self.read_raw_plan(plan)?;
+        crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
+    }
+
+    /// Reads only the spans of a validated selection, preserving its block bytes.
+    /// The same allocation limit applies as for converted selected tensors.
+    pub fn read_raw_plan(&mut self, plan: &TensorSelectionPlan) -> Result<Vec<u8>> {
         check_limit(
             "tensor allocation",
             plan.encoded_byte_len(),
@@ -896,7 +907,7 @@ impl<R: Read + Seek> Reader<R> {
                     source,
                 })?;
         }
-        crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
+        Ok(raw)
     }
 
     /// Execute a validated block-aligned contiguous-span plan.

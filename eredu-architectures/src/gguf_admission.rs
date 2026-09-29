@@ -28,6 +28,7 @@ fn canonical_tensor_mapping(
     model: &GgufModelConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
+        GgufModelConfig::Qwen4Exp(plan) => return Ok(plan.text_plan().mapping().to_vec()),
         GgufModelConfig::DeepSeekV3(_) => {
             checkpoint.translated_outputs(crate::deepseek::translate_v3_gguf_weight_name)
         }
@@ -133,6 +134,16 @@ fn resolve_family(
         }
     }
     match architecture {
+        GgufArchitecture::Qwen4Exp => {
+            let header = crate::qwen4_exp::prepared::GgufTargetPlan::prepare(checkpoint)
+                .map_err(|error| error.to_string())?;
+            let plan = header.text_plan().checkpoint_plan().clone();
+            Ok((
+                GgufModelConfig::Qwen4Exp(std::sync::Arc::new(header)),
+                plan,
+                Some(CheckpointValidation::Exact),
+            ))
+        }
         GgufArchitecture::DeepSeek2 => {
             let args = crate::deepseek::parse_v3_gguf(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;

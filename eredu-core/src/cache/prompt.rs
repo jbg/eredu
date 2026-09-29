@@ -17,10 +17,9 @@ use super::{
 
 /// Current reusable prompt-cache schema version.
 ///
-/// Version 9 rejects states produced before source-precision-preserving affine
-/// materialization. Earlier metadata cannot distinguish that numerical policy
-/// from the former unloaded-placeholder precision.
-pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 9;
+/// Version 10 records independent named-stream frontiers and combined state
+/// declarations. Earlier schemas cannot describe or validate those components.
+pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 10;
 
 /// One named contiguous state range in a portable prompt-cache identity.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -807,6 +806,21 @@ pub struct PromptCacheManifest {
     pub blocks: Vec<PromptCacheBlock>,
     /// Ordered fixed-size state tensors.
     pub state_tensors: Vec<PromptCacheStateTensor>,
+    /// Exact frontier for every declared stream and batch lane, including empty lanes.
+    pub stream_frontiers: Vec<PromptCacheStreamFrontier>,
+}
+
+/// Exact lane-local extent of an architecture-declared append stream.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PromptCacheStreamFrontier {
+    /// Architecture-global owning layer.
+    pub global_layer: usize,
+    /// Declared stream slot.
+    pub slot: u32,
+    /// Independent batch lane.
+    pub lane: u32,
+    /// Complete retained records, independent of padding in other lanes.
+    pub records: usize,
 }
 
 /// One independently validated fixed-size state tensor catalog entry.
@@ -981,7 +995,12 @@ impl PromptCacheManifest {
                     block.global_layer, block.start, block.end
                 )));
             }
-            let order = (block.global_layer, block.start, block.end);
+            let order = (
+                block.global_layer,
+                block.representation,
+                block.start,
+                block.end,
+            );
             if previous.is_some_and(|value| value >= order) {
                 return Err(PromptCacheError::Malformed(format!(
                     "prompt-cache blocks are reordered or duplicated at layer {} range {}..{}",
@@ -990,8 +1009,35 @@ impl PromptCacheManifest {
             }
             previous = Some(order);
             let policy = self.layer_layout.get(layer_index).expect("bounded");
-            let (representation, first_shape, second_shape) =
-                block_geometry(policy, self.batch_size, block.end - block.start)?;
+            let (representation, first_shape, second_shape) = match block.representation {
+                CacheRepresentation::AppendStream { slot, lane } => {
+                    let declaration = policy
+                        .append_streams()
+                        .iter()
+                        .find(|stream| stream.slot() == slot)
+                        .ok_or_else(|| {
+                            PromptCacheError::Malformed("undeclared append-stream slot".into())
+                        })?;
+                    if lane as usize >= self.batch_size
+                        || block.end as usize > declaration.maximum_records(layer_tokens)
+                        || !declaration.dtype().accepts_dtype_name(&block.first_dtype)
+                    {
+                        return Err(PromptCacheError::Malformed(
+                            "append-stream lane, frontier or dtype differs from its declaration"
+                                .into(),
+                        ));
+                    }
+                    let count = i32::try_from(block.end - block.start).map_err(|_| {
+                        PromptCacheError::Malformed("append block exceeds i32".into())
+                    })?;
+                    (
+                        block.representation,
+                        vec![1, 1, count, declaration.width()],
+                        vec![1, 1, count, 0],
+                    )
+                }
+                _ => block_geometry(policy, self.batch_size, block.end - block.start)?,
+            };
             if block.representation != representation
                 || block.first_shape != first_shape
                 || block.second_shape != second_shape
@@ -1034,7 +1080,7 @@ impl PromptCacheManifest {
                 "fixed-state tensors contain duplicate owner/role entries".into(),
             ));
         }
-        let mut expected = Vec::new();
+        let mut expected = BTreeMap::new();
         for (index, layer) in self.layer_layout.iter().enumerate() {
             let owner = StateTensorOwner::Layer(self.global_layer_start + index);
             let tokens =
@@ -1045,7 +1091,7 @@ impl PromptCacheManifest {
                 if (tokens != 0 && policy.is_required_for(tokens))
                     || actual.contains(&(owner, policy.role))
                 {
-                    expected.push((owner, policy, tokens));
+                    expected.insert((owner, policy.role), (policy, tokens));
                 }
             }
         }
@@ -1056,10 +1102,13 @@ impl PromptCacheManifest {
                 expected.len()
             )));
         }
-        for (entry, (owner, policy, tokens)) in self.state_tensors.iter().zip(expected) {
-            if entry.owner != owner
-                || entry.role != policy.role
-                || entry.shape != policy.resolved_shape(self.batch_size, tokens)?
+        for entry in &self.state_tensors {
+            let Some((policy, tokens)) = expected.get(&(entry.owner, entry.role)) else {
+                return Err(PromptCacheError::Malformed(
+                    "fixed-state tensor has an undeclared owner or role".into(),
+                ));
+            };
+            if entry.shape != policy.resolved_shape(self.batch_size, *tokens)?
                 || !policy.accepts_dtype_name(&entry.dtype)
                 || entry.logical_bytes == 0
                 || !is_sha256_hex(&entry.payload_sha256)
@@ -1072,7 +1121,7 @@ impl PromptCacheManifest {
                     entry.owner,
                     entry.shape,
                     entry.dtype,
-                    policy.resolved_shape(self.batch_size, tokens)?,
+                    policy.resolved_shape(self.batch_size, *tokens)?,
                 )));
             }
         }
@@ -1082,7 +1131,12 @@ impl PromptCacheManifest {
     fn validate_coverage(&self) -> Result<(), PromptCacheError> {
         let mut by_layer: BTreeMap<usize, Vec<&PromptCacheBlock>> = BTreeMap::new();
         for block in &self.blocks {
-            by_layer.entry(block.global_layer).or_default().push(block);
+            if !matches!(
+                block.representation,
+                CacheRepresentation::AppendStream { .. }
+            ) {
+                by_layer.entry(block.global_layer).or_default().push(block);
+            }
         }
         for (index, policy) in self.layer_layout.iter().enumerate() {
             let layer = self.global_layer_start + index;
@@ -1130,6 +1184,88 @@ impl PromptCacheManifest {
                 )));
             }
         }
+        self.validate_stream_coverage()?;
+        Ok(())
+    }
+    fn validate_stream_coverage(&self) -> Result<(), PromptCacheError> {
+        let expected = self
+            .layer_layout
+            .iter()
+            .try_fold(0usize, |total, policy| {
+                policy
+                    .append_streams()
+                    .len()
+                    .checked_mul(self.batch_size)
+                    .and_then(|n| total.checked_add(n))
+            })
+            .ok_or_else(|| {
+                PromptCacheError::Malformed("append-stream frontier count overflow".into())
+            })?;
+        if expected != self.stream_frontiers.len() {
+            return Err(PromptCacheError::Malformed(
+                "missing or unexpected append-stream frontiers".into(),
+            ));
+        }
+        let mut blocks = BTreeMap::<(usize, u32, u32), Vec<&PromptCacheBlock>>::new();
+        for block in &self.blocks {
+            if let CacheRepresentation::AppendStream { slot, lane } = block.representation {
+                blocks
+                    .entry((block.global_layer, slot, lane))
+                    .or_default()
+                    .push(block);
+            }
+        }
+        let mut previous = None;
+        for frontier in &self.stream_frontiers {
+            let key = (frontier.global_layer, frontier.slot, frontier.lane);
+            let index = frontier
+                .global_layer
+                .checked_sub(self.global_layer_start)
+                .filter(|i| *i < self.layer_layout.len())
+                .ok_or_else(|| {
+                    PromptCacheError::Malformed("append-stream frontier has invalid owner".into())
+                })?;
+            let policy = self.layer_layout.get(index).expect("checked");
+            let declaration = policy
+                .append_streams()
+                .iter()
+                .find(|stream| stream.slot() == frontier.slot)
+                .ok_or_else(|| {
+                    PromptCacheError::Malformed("append-stream frontier has undeclared slot".into())
+                })?;
+            let tokens =
+                layer_prefix_tokens(self.total_prefix_tokens, self.layer_prefix_offsets[index])?;
+            if previous.is_some_and(|old| old >= key)
+                || frontier.lane as usize >= self.batch_size
+                || frontier.records > declaration.maximum_records(tokens)
+            {
+                return Err(PromptCacheError::Malformed(
+                    "append-stream frontiers are duplicated, reordered or out of bounds".into(),
+                ));
+            }
+            previous = Some(key);
+            let mut end = 0;
+            let mut dtype: Option<&str> = None;
+            for block in blocks.remove(&key).unwrap_or_default() {
+                if block.start != end || dtype.is_some_and(|dtype| dtype != block.first_dtype) {
+                    return Err(PromptCacheError::Malformed(
+                        "append-stream blocks have a gap, overlap or changed dtype".into(),
+                    ));
+                }
+                end = block.end;
+                dtype = Some(&block.first_dtype);
+            }
+            if usize::try_from(end).ok() != Some(frontier.records) {
+                return Err(PromptCacheError::Malformed(
+                    "append-stream blocks do not reach their declared frontier".into(),
+                ));
+            }
+        }
+        if !blocks.is_empty() {
+            return Err(PromptCacheError::Malformed(
+                "append-stream blocks have no declared frontier".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1152,7 +1288,7 @@ fn block_geometry(
             head_dim,
             ..
         }
-        | LayerCachePolicy::KeyValueWithFixedState {
+        | LayerCachePolicy::KeyValueWithState {
             num_key_value_heads,
             head_dim,
             ..
@@ -1170,7 +1306,7 @@ fn block_geometry(
             head_dim,
             ..
         }
-        | LayerCachePolicy::KeyOnlyWithFixedState {
+        | LayerCachePolicy::KeyOnlyWithState {
             num_key_heads,
             head_dim,
             ..
@@ -1229,6 +1365,7 @@ fn layer_prefix_tokens(total: usize, offset: i32) -> Result<usize, PromptCacheEr
 fn array_names(representation: CacheRepresentation) -> (&'static str, &'static str) {
     match representation {
         CacheRepresentation::KeyValue => ("keys", "values"),
+        CacheRepresentation::AppendStream { .. } => ("records", "reserved"),
         CacheRepresentation::CompressedLatentRotary => ("latent", "rotary_key"),
     }
 }
@@ -1365,7 +1502,114 @@ mod tests {
                 logical_bytes: 64,
                 payload_sha256: "0".repeat(64),
             }],
+            stream_frontiers: Vec::new(),
             state_tensors: vec![],
+        }
+    }
+
+    fn combined_manifest() -> PromptCacheManifest {
+        let mut value = manifest();
+        value.batch_size = 2;
+        value.total_prefix_tokens = 8;
+        value.blocks[0].end = 8;
+        value.blocks[0].first_shape = vec![2, 2, 8, 4];
+        value.blocks[0].second_shape = vec![2, 2, 8, 4];
+        value.layer_layout = LayerSchedule::new(
+            1,
+            vec![LayerCachePolicy::key_value_with_state(
+                AttentionPolicy::Full,
+                2,
+                4,
+                vec![],
+                vec![super::super::AppendStreamPolicy::new(
+                    5,
+                    2,
+                    super::super::StateTensorDtype::Int32,
+                    2,
+                )
+                .unwrap()],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        value.stream_frontiers = vec![
+            PromptCacheStreamFrontier {
+                global_layer: 0,
+                slot: 5,
+                lane: 0,
+                records: 3,
+            },
+            PromptCacheStreamFrontier {
+                global_layer: 0,
+                slot: 5,
+                lane: 1,
+                records: 0,
+            },
+        ];
+        for (start, end) in [(0, 2), (2, 3)] {
+            value.blocks.push(PromptCacheBlock {
+                global_layer: 0,
+                representation: CacheRepresentation::AppendStream { slot: 5, lane: 0 },
+                start,
+                end,
+                rank: None,
+                shard: format!("stream-{start}.safetensors"),
+                first_array: "records".into(),
+                second_array: "reserved".into(),
+                first_shape: vec![1, 1, (end - start) as i32, 2],
+                second_shape: vec![1, 1, (end - start) as i32, 0],
+                first_dtype: "Int32".into(),
+                second_dtype: "Int32".into(),
+                logical_bytes: ((end - start) * 8) as u64,
+                payload_sha256: "0".repeat(64),
+            });
+        }
+        value
+    }
+
+    #[test]
+    fn named_stream_frontiers_allow_padding_and_reject_incomplete_or_malformed_history() {
+        let original = combined_manifest();
+        original.validate().unwrap();
+        let restored: PromptCacheManifest =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert_eq!(original, restored);
+        for mutate in [
+            (|v: &mut PromptCacheManifest| {
+                v.stream_frontiers.pop();
+            }) as fn(&mut PromptCacheManifest),
+            |v| {
+                v.stream_frontiers[1].lane = 0;
+            },
+            |v| {
+                v.stream_frontiers[0].records = 5;
+            },
+            |v| {
+                v.stream_frontiers[0].records = 2;
+            },
+            |v| {
+                v.blocks[2].start = 1;
+            },
+            |v| {
+                v.blocks.pop();
+            },
+            |v| {
+                v.blocks[1].representation = CacheRepresentation::AppendStream { slot: 9, lane: 0 };
+            },
+            |v| {
+                v.blocks[1].first_dtype = "Float32".into();
+                v.blocks[1].second_dtype = "Float32".into();
+            },
+            |v| {
+                v.blocks[1].second_shape[3] = 1;
+            },
+        ] {
+            let mut invalid = original.clone();
+            mutate(&mut invalid);
+            assert!(matches!(
+                invalid.validate(),
+                Err(PromptCacheError::Malformed(_))
+            ));
         }
     }
 
@@ -1440,6 +1684,58 @@ mod tests {
             fingerprint,
             "sha256:9ee0b30ea8687d04eb4b65db3a58ccfff0a72bdd502805e9fdd6edb223ca5949"
         );
+    }
+
+    #[test]
+    fn fixed_tensor_identity_is_independent_of_manifest_order() {
+        use crate::cache::{
+            MutableStateResidency, StateTensorDimension as Dim, StateTensorDtype, StateTensorPolicy,
+        };
+        let policies = vec![
+            StateTensorPolicy::new(
+                StateTensorRole::IntegerHistory { slot: 7 },
+                vec![Dim::Batch, Dim::fixed(5).unwrap()],
+                StateTensorDtype::Int32,
+                MutableStateResidency::AlwaysDeviceMutable,
+            )
+            .unwrap(),
+            StateTensorPolicy::new(
+                StateTensorRole::Auxiliary { slot: 10 },
+                vec![Dim::Batch, Dim::fixed(2).unwrap(), Dim::fixed(2).unwrap()],
+                StateTensorDtype::Float32,
+                MutableStateResidency::AlwaysDeviceMutable,
+            )
+            .unwrap(),
+        ];
+        let mut value = manifest();
+        value.blocks.clear();
+        value.state_tensors = policies
+            .iter()
+            .enumerate()
+            .map(|(index, policy)| PromptCacheStateTensor {
+                owner: StateTensorOwner::Layer(0),
+                role: policy.role,
+                shard: format!("state/{index}.safetensors"),
+                array: "state".into(),
+                shape: policy.resolved_shape(1, 2).unwrap(),
+                dtype: if index == 0 { "Int32" } else { "Float32" }.into(),
+                logical_bytes: if index == 0 { 20 } else { 16 },
+                payload_sha256: "0".repeat(64),
+            })
+            .collect();
+        value.layer_layout =
+            LayerSchedule::new(1, vec![LayerCachePolicy::fixed_only(policies).unwrap()]).unwrap();
+        value.validate().unwrap();
+        value.state_tensors.reverse();
+        value.validate().unwrap();
+        let mut invalid = value.clone();
+        invalid.state_tensors[0].role = StateTensorRole::Auxiliary { slot: 11 };
+        assert!(invalid.validate().is_err());
+        let mut invalid = value.clone();
+        invalid.state_tensors[0].role = invalid.state_tensors[1].role;
+        assert!(invalid.validate().is_err());
+        value.state_tensors[0].shape = vec![1, 5];
+        assert!(value.validate().is_err());
     }
 
     #[test]

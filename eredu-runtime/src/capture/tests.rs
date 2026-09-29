@@ -5,6 +5,7 @@ use std::{cell::Cell, convert::Infallible};
 mod checkpoints;
 mod generated;
 mod partition;
+mod prefill;
 mod projection;
 mod routed;
 

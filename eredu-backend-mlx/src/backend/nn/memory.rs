@@ -1,6 +1,6 @@
 //! Allocation-free descriptions of reusable MLX mechanisms.
 //!
-//! Kernel-private workspace and allocator capacity are deliberately unknown.
+//! Kernel-private workspace and unproven allocation capacities remain unknown.
 //! Named tensors below are individual payload facts, not simultaneous peaks.
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{mechanism_memory::*, Error, TensorElementType};
@@ -8,7 +8,7 @@ use eredu_nn::{mechanism_memory::*, Error, TensorElementType};
 /// Describes the selected ordinary MLX invocation without a device or stream.
 /// Cache-specific allocation reuse is refined by the cache instance hook.
 pub fn describe(invocation: &MechanismInvocation) -> Result<MechanismMemoryContract, Error> {
-    describe_selected(invocation, None, None)
+    describe_selected(invocation, None, false)
 }
 
 /// Refines native path facts using the already-selected device kind, without
@@ -18,63 +18,31 @@ pub fn describe_for_device(
     invocation: &MechanismInvocation,
     device: safemlx::DeviceType,
 ) -> Result<MechanismMemoryContract, Error> {
-    describe_selected(invocation, Some(device), None)
+    describe_selected(invocation, Some(device), false)
 }
 
-/// Describe an ordinary projection against its actual bound weight, without
-/// evaluating it. Unknown/lazy layouts retain the same conservative contract.
-/// Exact partial payload and a layout-dependent activation-copy envelope replace
-/// the generic promotion allowance only when the shared selector is covered.
-pub fn describe_bound_projection(
+/// The ordinary segmented primitive always submits unmasked native SDPA.
+/// This describes one segment, excluding preparation and final concatenation.
+pub(crate) fn describe_unmasked_segment(
     invocation: &MechanismInvocation,
-    weight: &safemlx::Array,
-    stream: &safemlx::Stream,
+    device: safemlx::DeviceType,
 ) -> Result<MechanismMemoryContract, Error> {
-    let device = stream
-        .get_device()
-        .and_then(|d| d.get_type())
-        .map_err(Error::backend)?;
-    let mut workspace = None;
-    if let MechanismInvocation::Projection {
-        rows,
-        input,
-        output,
-        format: LinearFormat::Dense,
-        element: TensorElementType::F32,
-        weight_element: Some(element),
-        ..
-    } = invocation
+    if !matches!(invocation, MechanismInvocation::Attention {
+        batch: 1, query_heads, kv_heads, queries, keys,
+        arithmetic: eredu_nn::AttentionArithmetic::Fused, softcap: false, sinks: false, ..
+    } if query_heads == kv_heads && queries == keys)
     {
-        let expected = match element {
-            TensorElementType::F16 => Some(safemlx::Dtype::Float16),
-            TensorElementType::Bf16 => Some(safemlx::Dtype::Bfloat16),
-            _ => None,
-        };
-        if expected == Some(weight.dtype()) {
-            if let Some(facts) =
-                super::mixed_projection::storage_facts(weight, stream).map_err(Error::backend)?
-            {
-                if let Some(range) = facts.for_invocation(
-                    *input,
-                    *output,
-                    &eredu_core::checkpoint::TensorDtype::F32,
-                    *rows,
-                ) {
-                    workspace = Some((
-                        bytes(&[*rows, range.partial_bytes_per_row], 1)?,
-                        bytes(&[*rows, facts.activation_copy_bytes_per_row], 1)?,
-                    ));
-                }
-            }
-        }
+        return Err(Error::backend(
+            "segmented attention memory requires unmasked equal-length self-attention geometry",
+        ));
     }
-    describe_selected(invocation, Some(device), workspace)
+    describe_selected(invocation, Some(device), true)
 }
 
 fn describe_selected(
     invocation: &MechanismInvocation,
     device: Option<safemlx::DeviceType>,
-    projection_workspace: Option<(u64, u64)>,
+    unmasked_attention: bool,
 ) -> Result<MechanismMemoryContract, Error> {
     use MechanismInvocation::*;
     let mut result = MechanismMemoryContract {
@@ -82,6 +50,7 @@ fn describe_selected(
         storage: Vec::new(),
         missing: Vec::new(),
     };
+    let mut projection_pre_bias_element = None;
     // Native lowering can promote the portable nominal result representation.
     if let Some(output) = result
         .values
@@ -110,6 +79,17 @@ fn describe_selected(
                 ..
             } => output.element = TensorElementType::F32,
             _ => {}
+        }
+        if let Projection {
+            bias: true,
+            bias_element,
+            ..
+        } = invocation
+        {
+            projection_pre_bias_element = Some(output.element);
+            if let Some(bias) = bias_element {
+                output.element = promoted_element(output.element, *bias);
+            }
         }
     }
     // Output shapes do not prove alias-free storage for cache updates or causal
@@ -148,6 +128,11 @@ fn describe_selected(
             storage.backing = MechanismBacking::Unknown;
             storage.detail = "logical result can alias input/state or an implementation temporary; backing requires owner facts".into();
         }
+        if unmasked_attention {
+            storage.backing = MechanismBacking::Unknown;
+            storage.capacity = MechanismBytes::unknown(0);
+            storage.detail = "selected segment output payload; native layout, output views and assembled-result backing are not established by this report".into();
+        }
         if matches!(
             invocation,
             Projection {
@@ -161,6 +146,9 @@ fn describe_selected(
                     format: LinearFormat::Dense,
                     weight_element: None,
                     ..
+                } | Projection {
+                    format: LinearFormat::Affine(_) | LinearFormat::MxFp4,
+                    ..
                 } | ExpertDispatch { .. }
                     | Convolution { .. }
             ) && value.kind == LogicalValueKind::Output
@@ -173,6 +161,16 @@ fn describe_selected(
         result.storage.push(storage);
     }
     match *invocation {
+        LayerNormalization { .. } => {
+            return super::layer_norm_memory::describe(invocation, device);
+        }
+        MultiAxisRotary {
+            ref position_shape,
+            position_element,
+            ref spec,
+        } => {
+            describe_multi_axis_rotary(&mut result, position_shape, position_element, spec)?;
+        }
         Projection {
             rows,
             input,
@@ -181,11 +179,11 @@ fn describe_selected(
             element,
             weight_element,
             bias,
+            bias_element,
         } => {
             match format {
                 LinearFormat::Dense => {
-                    if projection_workspace.is_none()
-                        && element == TensorElementType::F32
+                    if element == TensorElementType::F32
                         && matches!(
                             weight_element,
                             Some(TensorElementType::Bf16 | TensorElementType::F16)
@@ -209,6 +207,7 @@ fn describe_selected(
                 }
                 LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
                     result.missing.push("native packed matmul's internal activation conversions/workspace are opaque; packed parameters are borrowed".into());
+                    result.missing.push("packed matmul result promotion from scale and quantization-bias representations is not established; logical output representation remains conditional".into());
                 }
                 LinearFormat::GgufIQuant { .. } => match device {
                     Some(device) if super::native_quantization::uses_metal_device(device) => {
@@ -282,32 +281,37 @@ fn describe_selected(
                 }
             }
             if bias {
-                let scalar = result
-                    .values
-                    .iter()
-                    .find(|value| value.name == "output")
-                    .expect("projection output")
-                    .element;
+                let scalar = projection_pre_bias_element.unwrap_or_else(|| {
+                    result
+                        .values
+                        .iter()
+                        .find(|value| value.name == "output")
+                        .expect("projection output")
+                        .element
+                });
                 result.storage.push(allocation(
                     "pre_bias_output",
                     bytes(&[rows, output], element_bytes(scalar))?,
                     MechanismStorageRole::Scratch,
                     StorageRetention::Evaluation,
                 ));
-                if weight_element.is_none()
+                if format == LinearFormat::Dense && weight_element.is_none()
+                    || matches!(format, LinearFormat::Affine(_) | LinearFormat::MxFp4)
                     || matches!(format, LinearFormat::GgufIQuant { .. }) && device.is_none()
                 {
                     let pre_bias = result.storage.last_mut().expect("pre-bias output");
                     pre_bias.payload = MechanismBytes::unknown(0);
                     pre_bias.capacity = MechanismBytes::unknown(0);
                 }
-                result.missing.push("ordinary bias dtype can further promote the final output; inspect its bound parameter metadata".into());
-                if let Some(output) = result
-                    .storage
-                    .iter_mut()
-                    .find(|storage| storage.name == "output")
-                {
-                    output.payload.upper = None;
+                if bias_element.is_none() {
+                    result.missing.push("ordinary bias dtype can further promote the final output; inspect its bound parameter metadata".into());
+                    if let Some(output) = result
+                        .storage
+                        .iter_mut()
+                        .find(|storage| storage.name == "output")
+                    {
+                        output.payload.upper = None;
+                    }
                 }
             }
         }
@@ -325,7 +329,83 @@ fn describe_selected(
             sinks,
         } => {
             let path = super::attention::memory_path(queries, keys, arithmetic, softcap);
-            if path != super::attention::AttentionMemoryPath::Fused {
+            if path == super::attention::AttentionMemoryPath::Fused {
+                if device == Some(safemlx::DeviceType::Cpu) {
+                    // MLX fast.cpp's CPU SDPA fallback is ordinary full-score
+                    // attention, not the tiled InputScores implementation below.
+                    // Precise softmax accumulates internally in F32 but returns
+                    // the input dtype. Native kernel workspace remains unknown.
+                    let scalar = element_bytes(element);
+                    let scores = bytes(&[batch, query_heads, queries, keys], scalar)?;
+                    for (name, payload) in [
+                        (
+                            "sdpa_scaled_queries",
+                            bytes(&[batch, query_heads, queries, key_width], scalar)?,
+                        ),
+                        ("sdpa_full_scores", scores),
+                    ] {
+                        let mut storage = allocation(
+                            name,
+                            payload,
+                            MechanismStorageRole::Scratch,
+                            StorageRetention::Evaluation,
+                        );
+                        if unmasked_attention && name == "sdpa_scaled_queries" {
+                            storage.backing = MechanismBacking::Unknown;
+                            storage.capacity = MechanismBytes::unknown(0);
+                            storage.detail = "CPU SDPA scales queries in the promoted input representation; elementwise lowering may donate or reuse input backing".into();
+                        }
+                        result.storage.push(storage);
+                    }
+                    // Mask presence is not part of MechanismInvocation. The
+                    // backend receives an optional caller-owned array mask;
+                    // allow its where/add result without inventing a mask copy.
+                    if !unmasked_attention {
+                        let mut masked = allocation(
+                            "sdpa_masked_scores",
+                            scores,
+                            MechanismStorageRole::Scratch,
+                            StorageRetention::Evaluation,
+                        );
+                        masked.payload.lower = 0;
+                        masked.capacity = MechanismBytes::unknown(0);
+                        masked.detail = "CPU SDPA optional array-mask where/add result; mask presence is not described by this invocation".into();
+                        result.storage.push(masked);
+                    }
+                    let columns = keys
+                        .checked_add(u64::from(sinks))
+                        .ok_or_else(|| Error::backend("attention sink column overflowed"))?;
+                    let probability_bytes = bytes(&[batch, query_heads, queries, columns], scalar)?;
+                    if sinks {
+                        result.storage.push(allocation(
+                            "sdpa_sink_scores",
+                            probability_bytes,
+                            MechanismStorageRole::Scratch,
+                            StorageRetention::Evaluation,
+                        ));
+                    }
+                    let mut probabilities = allocation(
+                        "sdpa_probabilities",
+                        probability_bytes,
+                        MechanismStorageRole::Scratch,
+                        StorageRetention::Evaluation,
+                    );
+                    probabilities.backing = MechanismBacking::Unknown;
+                    probabilities.detail = if unmasked_attention {
+                        "CPU SDPA precise softmax returns promoted-dtype full probabilities; native donation may reuse score storage"
+                    } else {
+                        "CPU SDPA precise softmax returns input-dtype full probabilities; native donation may reuse score storage, and removing the sink column is a view"
+                    }.into();
+                    result.storage.push(probabilities);
+                    result.missing.push(if unmasked_attention {
+                        "CPU SDPA fallback uses unmasked full score matrices; native buffer donation, layout and lazy graph overlap remain unresolved"
+                    } else {
+                        "CPU SDPA fallback uses full score matrices; mask presence, native buffer donation and lazy graph overlap require bound invocation/lifetime facts"
+                    }.into());
+                } else {
+                    result.missing.push("native SDPA fused/fallback selection and scratch depend on device, layout and kernel geometry; full CPU score facts cannot be assumed".into());
+                }
+            } else {
                 let score_bytes = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
                     element_bytes(element)
                 } else {
@@ -382,15 +462,107 @@ fn describe_selected(
                 result.missing.push(format!("selected {path:?}: lazy graph retention follows tile evaluation policy; tile count and overlap require lifetime composition"));
             }
         }
+        IndexedAttention {
+            batch,
+            query_heads,
+            kv_heads,
+            queries,
+            selected,
+            local,
+            key_width,
+            value_width,
+            element,
+            arithmetic,
+            sinks,
+        } => {
+            let slots = selected
+                .checked_add(local)
+                .ok_or_else(|| Error::backend("selected attention extent overflowed"))?;
+            // Only one batch/query's selection and score graph is live. The
+            // concatenation of completed outputs is separately returned.
+            for (name, width) in [
+                ("selected_keys", key_width),
+                ("selected_values", value_width),
+            ] {
+                let mut storage = allocation(
+                    name,
+                    bytes(&[kv_heads, selected, width], element_bytes(element))?,
+                    MechanismStorageRole::Scratch,
+                    StorageRetention::Evaluation,
+                );
+                storage.payload = MechanismBytes {
+                    lower: 0,
+                    upper: Some(bytes(&[kv_heads, selected, width, 8], 4)?),
+                };
+                storage.capacity = MechanismBytes::unknown(0);
+                storage.detail = "bounded unique page copies, concatenation, slot remapping, invalid-slot clearing and dtype casts for one query; actual duplicates/invalids may reduce the payload".into();
+                result.storage.push(storage);
+            }
+            let mut host = allocation(
+                "selected_host_positions",
+                bytes(&[selected], 32)?,
+                MechanismStorageRole::Scratch,
+                StorageRetention::NativeCompletion,
+            );
+            host.placement = MechanismPlacement::Host;
+            host.detail = "one query's host positions, validity, deduplication and slot remapping; no history-sized catalog vector".into();
+            result.storage.push(host);
+            result.storage.push(allocation(
+                "selected_score_mask",
+                bytes(&[query_heads, slots, 4], 4)?,
+                MechanismStorageRole::Scratch,
+                StorageRetention::Evaluation,
+            ));
+            result.storage.push(allocation(
+                "completed_output_rows",
+                bytes(
+                    &[batch, query_heads, queries, value_width],
+                    element_bytes(element),
+                )?,
+                MechanismStorageRole::Scratch,
+                StorageRetention::Evaluation,
+            ));
+            if slots > 0 {
+                let nested = describe_selected(
+                    &Attention {
+                        batch: 1,
+                        query_heads,
+                        kv_heads,
+                        queries: 1,
+                        keys: slots,
+                        key_width,
+                        value_width,
+                        element,
+                        arithmetic,
+                        softcap: false,
+                        sinks,
+                    },
+                    device,
+                    false,
+                )?;
+                for mut storage in nested.storage {
+                    storage.name = format!("selected_query_{}", storage.name);
+                    storage.role = MechanismStorageRole::Scratch;
+                    storage.retention = StorageRetention::Evaluation;
+                    result.storage.push(storage);
+                }
+                result.missing.extend(nested.missing);
+            }
+            result.missing.push("source cache pages, transfer buffers and metadata capacity remain owned by cache residency; native allocator capacity and fused-kernel private workspace are not exposed".into());
+        }
         Convolution {
             batch,
             tokens,
             channels,
             kernel,
+            dilation,
             element,
         } => {
+            let history_len = (kernel - 1)
+                .checked_mul(dilation)
+                .ok_or_else(|| Error::backend("convolution history length overflowed"))?;
             let padded = tokens
-                .checked_add(kernel - 1)
+                .checked_add(history_len)
                 .ok_or_else(|| Error::backend("convolution history concatenation overflowed"))?;
             let mut history = allocation(
                 "history_and_input",
@@ -545,29 +717,6 @@ fn describe_selected(
             result.missing.push("sampling random state, filtered logits, reductions and sorting workspace depend on native lowering and owned sampler state".into());
         }
     }
-    if let Some((partials, activation_copy)) = projection_workspace {
-        result.storage.push(allocation(
-            "split_k_partials",
-            partials,
-            MechanismStorageRole::Scratch,
-            StorageRetention::NativeCompletion,
-        ));
-        let mut copy = allocation(
-            "activation_layout_copy",
-            activation_copy,
-            MechanismStorageRole::Scratch,
-            StorageRetention::NativeCompletion,
-        );
-        copy.payload = MechanismBytes {
-            lower: 0,
-            upper: Some(activation_copy),
-        };
-        copy.capacity = MechanismBytes::unknown(0);
-        copy.detail = "native activation layout is resolved at evaluation; logical copy upper payload, no full-weight promotion".into();
-        result.storage.push(copy);
-        result.missing.push("allocator rounding/capacity and GPU-private registers/threadgroup scratch are not exposed; native partial payload is exact".into());
-        return Ok(result);
-    }
     result.storage.push(MechanismStorage {
         name: "native_workspace".into(),
         role: MechanismStorageRole::Scratch,
@@ -584,6 +733,139 @@ fn describe_selected(
     );
     result.validate()?;
     Ok(result)
+}
+
+// Mirrors generic Tensor::multi_axis_rotary_embeddings graph construction. These
+// records describe individual logical payloads; none asserts simultaneous liveness.
+fn describe_multi_axis_rotary(
+    result: &mut MechanismMemoryContract,
+    position_shape: &[u64],
+    position_element: TensorElementType,
+    spec: &eredu_nn::multimodal::MultiAxisRotarySpec,
+) -> Result<(), Error> {
+    use eredu_nn::multimodal::MultiAxisRotaryLayout;
+    let rows = bytes(&position_shape[..position_shape.len() - 1], 1)?;
+    if rows > i32::MAX as u64 || position_shape.iter().any(|d| *d > i32::MAX as u64) {
+        return Err(Error::backend("MLX rotary position geometry exceeds i32"));
+    }
+    let dimensions = spec.dimensions()? as u64;
+    let mut record = |name: String, extent: u64, placement, aliases: bool, detail: &str| {
+        let mut storage = allocation(
+            &name,
+            extent,
+            MechanismStorageRole::Scratch,
+            StorageRetention::Evaluation,
+        );
+        storage.placement = placement;
+        // Graph views/casts/concatenations can alias or fuse; logical byte extents
+        // do not prove a separately allocated native buffer or minimum capacity.
+        storage.backing = if aliases {
+            MechanismBacking::Unknown
+        } else {
+            MechanismBacking::Invocation
+        };
+        storage.capacity = MechanismBytes::unknown(0);
+        storage.detail = detail.into();
+        if placement == MechanismPlacement::Host {
+            storage.retention = StorageRetention::Unknown;
+        }
+        result.storage.push(storage);
+    };
+    for (index, axis) in spec.axes.iter().enumerate() {
+        let half = axis.dimensions as u64 / 2;
+        for name in [
+            "host_inverse_frequencies",
+            "host_inverse_tensor",
+            "inverse_frequencies",
+        ] {
+            let host = name.starts_with("host_");
+            record(format!("axis_{index}_{name}"), bytes(&[half], 4)?,
+                if host { MechanismPlacement::Host } else { MechanismPlacement::Execution },
+                true, "F32 inverse frequency Vec, source tensor or copied tensor from native rotary construction; host copying and lifetime are not exposed");
+        }
+        // I32 IDs match the constructor's I32 offset and minimum scalars exactly.
+        // Other ID representations need MLX promotion facts, kept unknown below.
+        if position_element == TensorElementType::I32 {
+            for name in [
+                "selected_positions",
+                "offset_positions",
+                "clamped_positions",
+            ] {
+                record(format!("axis_{index}_{name}"), bytes(&[rows], 4)?,
+                    MechanismPlacement::Execution, true,
+                    "I32 per-axis position slice, offset sum or clamped result; views and lazy fusion lack independent backing identity");
+            }
+        }
+        record(
+            format!("axis_{index}_float_positions"),
+            bytes(&[rows], 4)?,
+            MechanismPlacement::Execution,
+            true,
+            "F32 position cast and expanded view; aliasing depends on source representation",
+        );
+        record(format!("axis_{index}_angles"), bytes(&[rows, half], 4)?,
+            MechanismPlacement::Execution, true, "F32 position/inverse-frequency product, including the unused axis graph built for round-robin layout");
+        if spec.layout == MultiAxisRotaryLayout::IndependentAxes {
+            record(
+                format!("axis_{index}_expanded_angles"),
+                bytes(&[rows, half, 2], 4)?,
+                MechanismPlacement::Execution,
+                true,
+                "F32 doubled axis angle concatenation",
+            );
+        }
+    }
+    match spec.layout {
+        MultiAxisRotaryLayout::IndependentAxes => {}
+        MultiAxisRotaryLayout::SplitHalves => {
+            record(
+                "half_angles".into(),
+                bytes(&[rows, dimensions / 2], 4)?,
+                MechanismPlacement::Execution,
+                true,
+                "F32 concatenation of axis angles before repeating the half",
+            );
+        }
+        MultiAxisRotaryLayout::RoundRobinSections => {
+            for name in [
+                "round_robin_host_inverse_frequencies",
+                "round_robin_host_inverse_tensor",
+                "round_robin_inverse_frequencies",
+            ] {
+                record(name.into(), bytes(&[dimensions / 2], 4)?,
+                    if name.contains("host_") { MechanismPlacement::Host } else { MechanismPlacement::Execution },
+                    true, "F32 global inverse frequency Vec, source tensor or copied tensor for round-robin layout");
+            }
+            if position_element == TensorElementType::I32 {
+                record(
+                    "round_robin_selected_positions".into(),
+                    bytes(&[rows, dimensions / 2], 4)?,
+                    MechanismPlacement::Execution,
+                    true,
+                    "I32 concatenation of per-frequency selected, offset and clamped positions",
+                );
+            }
+            for name in ["round_robin_float_positions", "half_angles"] {
+                record(
+                    name.into(),
+                    bytes(&[rows, dimensions / 2], 4)?,
+                    MechanismPlacement::Execution,
+                    true,
+                    "F32 round-robin selected-position cast or inverse-frequency product",
+                );
+            }
+        }
+    }
+    record("angles".into(), bytes(&[rows, dimensions], 4)?,
+        MechanismPlacement::Execution, true, "F32 assembled angle tensor consumed by cosine and sine; concatenation may reuse a single input");
+    if position_element != TensorElementType::I32 {
+        result.missing.push("rotary position slicing, offset and clamp representation depends on MLX promotion with I32 scalars for non-I32 position inputs".into());
+    }
+    if spec.layout == MultiAxisRotaryLayout::RoundRobinSections {
+        result.missing.push(format!("round-robin constructs {} per-frequency selected position views, offset sums and clamp results before concatenation; their backing, scalar constructors and retirement are undescribed", dimensions / 2));
+    }
+    result.missing.push("rotary scalar constructors, graph metadata, host Vec capacities, source tensor copying, view backing, fusion and intermediate retirement are not exposed; payloads cannot be summed as a live peak".into());
+    Ok(())
 }
 
 pub(crate) fn allocation(
@@ -613,7 +895,10 @@ pub(crate) fn bytes(shape: &[u64], scalar: u64) -> Result<u64, Error> {
         .ok_or_else(|| Error::backend("MLX mechanism byte geometry overflowed"))
 }
 
-fn promoted_element(left: TensorElementType, right: TensorElementType) -> TensorElementType {
+pub(crate) fn promoted_element(
+    left: TensorElementType,
+    right: TensorElementType,
+) -> TensorElementType {
     use TensorElementType::*;
     match (left, right) {
         (F64, _) | (_, F64) => F64,
@@ -647,6 +932,43 @@ pub(crate) fn element_type(dtype: safemlx::Dtype) -> Option<TensorElementType> {
 #[cfg(test)]
 mod contract_validation_tests {
     use super::*;
+
+    #[test]
+    fn indexed_workspace_is_per_query_and_output_scales_with_prefill() {
+        let request = |queries| MechanismInvocation::IndexedAttention {
+            batch: 2,
+            query_heads: 4,
+            kv_heads: 2,
+            queries,
+            selected: 7,
+            local: 3,
+            key_width: 8,
+            value_width: 6,
+            element: TensorElementType::Bf16,
+            arithmetic: eredu_nn::AttentionArithmetic::InputScores,
+            sinks: true,
+        };
+        let one = describe(&request(1)).unwrap();
+        let many = describe(&request(128)).unwrap();
+        one.validate().unwrap();
+        many.validate().unwrap();
+        for storage in &one.storage {
+            let other = many
+                .storage
+                .iter()
+                .find(|other| other.name == storage.name)
+                .unwrap();
+            if storage.name == "output" || storage.name == "completed_output_rows" {
+                assert_eq!(other.payload.lower, storage.payload.lower * 128);
+            } else {
+                assert_eq!(
+                    storage.payload, other.payload,
+                    "{} should not retain per-query scratch",
+                    storage.name
+                );
+            }
+        }
+    }
     #[test]
     fn mechanism_attention_sink_extent_overflow_is_rejected() {
         let request = MechanismInvocation::Attention {

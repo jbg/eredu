@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use eredu_nn::{AttentionCache, BlockwiseAttentionBackend, CompressedAttentionCache};
-use eredu_runtime::{LayerRuntimeState, RuntimeStateComponents};
+use eredu_runtime::{LayerRuntimeState, RuntimeAppendStreams, RuntimeStateComponents};
 
 use super::{ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher};
 
@@ -27,6 +27,7 @@ use super::{ReplicatedTextArchitectureVisitor, ReplicatedTextProfileDispatcher};
 ///     type AttentionState = S;
 ///     type ComponentState = S;
 ///     type AttentionComponentState = S;
+///     type AttentionStreamState = S;
 ///     type CompressedState = S;
 ///     type CompressedComponentState = S;
 /// }
@@ -42,6 +43,11 @@ pub trait ReplicatedTextStateProfiles<B: BlockwiseAttentionBackend> {
     type AttentionComponentState: LayerRuntimeState<
         B,
         LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    >;
+    /// State exposing ordinary attention, fixed components and named append streams.
+    type AttentionStreamState: LayerRuntimeState<
+        B,
+        LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
     >;
     /// State exposing compressed attention access.
     type CompressedState: LayerRuntimeState<B, LayerState: CompressedAttentionCache<B::Tensor>>;
@@ -101,6 +107,7 @@ pub struct SharedReplicatedTextVisitor<
     AF = IdentityReplicatedTextVisitor,
     C = IdentityReplicatedTextVisitor,
     CF = IdentityReplicatedTextVisitor,
+    AS = IdentityReplicatedTextVisitor,
 > {
     visitor: V,
     profiles: PhantomData<fn() -> P>,
@@ -110,6 +117,7 @@ pub struct SharedReplicatedTextVisitor<
     attention_component: AF,
     compressed: C,
     compressed_component: CF,
+    attention_stream: AS,
 }
 
 impl<P, V> SharedReplicatedTextVisitor<P, V> {
@@ -124,16 +132,35 @@ impl<P, V> SharedReplicatedTextVisitor<P, V> {
             attention_component: IdentityReplicatedTextVisitor,
             compressed: IdentityReplicatedTextVisitor,
             compressed_component: IdentityReplicatedTextVisitor,
+            attention_stream: IdentityReplicatedTextVisitor,
         }
     }
 }
 
-impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, CF> {
+impl<P, V, S, A, F, AF, C, CF, AS> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, CF, AS> {
+    /// Replaces only the attention-with-streams visitor conversion.
+    pub fn with_attention_stream_conversion<N>(
+        self,
+        conversion: N,
+    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, CF, N> {
+        SharedReplicatedTextVisitor {
+            visitor: self.visitor,
+            profiles: self.profiles,
+            stateless: self.stateless,
+            attention: self.attention,
+            component: self.component,
+            attention_component: self.attention_component,
+            compressed: self.compressed,
+            compressed_component: self.compressed_component,
+            attention_stream: conversion,
+        }
+    }
+
     /// Replaces only the stateless visitor conversion.
     pub fn with_stateless_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, N, A, F, AF, C, CF> {
+    ) -> SharedReplicatedTextVisitor<P, V, N, A, F, AF, C, CF, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -143,6 +170,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: self.attention_component,
             compressed: self.compressed,
             compressed_component: self.compressed_component,
+            attention_stream: self.attention_stream,
         }
     }
 
@@ -150,7 +178,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
     pub fn with_attention_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, S, N, F, AF, C, CF> {
+    ) -> SharedReplicatedTextVisitor<P, V, S, N, F, AF, C, CF, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -160,6 +188,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: self.attention_component,
             compressed: self.compressed,
             compressed_component: self.compressed_component,
+            attention_stream: self.attention_stream,
         }
     }
 
@@ -167,7 +196,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
     pub fn with_component_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, S, A, N, AF, C, CF> {
+    ) -> SharedReplicatedTextVisitor<P, V, S, A, N, AF, C, CF, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -177,6 +206,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: self.attention_component,
             compressed: self.compressed,
             compressed_component: self.compressed_component,
+            attention_stream: self.attention_stream,
         }
     }
 
@@ -184,7 +214,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
     pub fn with_attention_component_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, N, C, CF> {
+    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, N, C, CF, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -194,6 +224,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: conversion,
             compressed: self.compressed,
             compressed_component: self.compressed_component,
+            attention_stream: self.attention_stream,
         }
     }
 
@@ -201,7 +232,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
     pub fn with_compressed_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, AF, N, CF> {
+    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, AF, N, CF, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -211,6 +242,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: self.attention_component,
             compressed: conversion,
             compressed_component: self.compressed_component,
+            attention_stream: self.attention_stream,
         }
     }
 
@@ -218,7 +250,7 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
     pub fn with_compressed_component_conversion<N>(
         self,
         conversion: N,
-    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, N> {
+    ) -> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, N, AS> {
         SharedReplicatedTextVisitor {
             visitor: self.visitor,
             profiles: self.profiles,
@@ -228,12 +260,13 @@ impl<P, V, S, A, F, AF, C, CF> SharedReplicatedTextVisitor<P, V, S, A, F, AF, C,
             attention_component: self.attention_component,
             compressed: self.compressed,
             compressed_component: conversion,
+            attention_stream: self.attention_stream,
         }
     }
 }
 
-impl<B, P, V, O, E, S, A, F, AF, C, CF> ReplicatedTextProfileDispatcher<B>
-    for SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, CF>
+impl<B, P, V, O, E, S, A, F, AF, C, CF, AS> ReplicatedTextProfileDispatcher<B>
+    for SharedReplicatedTextVisitor<P, V, S, A, F, AF, C, CF, AS>
 where
     B: BlockwiseAttentionBackend,
     P: ReplicatedTextStateProfiles<B>,
@@ -243,6 +276,9 @@ where
     AF: ReplicatedTextVisitorConversion<V>,
     C: ReplicatedTextVisitorConversion<V>,
     CF: ReplicatedTextVisitorConversion<V>,
+    AS: ReplicatedTextVisitorConversion<V>,
+    AS::Visitor:
+        ReplicatedTextArchitectureVisitor<B, P::AttentionStreamState, Output = O, Error = E>,
     S::Visitor: ReplicatedTextArchitectureVisitor<B, P::StatelessState, Output = O, Error = E>,
     A::Visitor: ReplicatedTextArchitectureVisitor<B, P::AttentionState, Output = O, Error = E>,
     F::Visitor: ReplicatedTextArchitectureVisitor<B, P::ComponentState, Output = O, Error = E>,
@@ -258,12 +294,14 @@ where
     type AttentionState = P::AttentionState;
     type ComponentState = P::ComponentState;
     type AttentionComponentState = P::AttentionComponentState;
+    type AttentionStreamState = P::AttentionStreamState;
     type CompressedState = P::CompressedState;
     type CompressedComponentState = P::CompressedComponentState;
     type StatelessVisitor = S::Visitor;
     type AttentionVisitor = A::Visitor;
     type ComponentVisitor = F::Visitor;
     type AttentionComponentVisitor = AF::Visitor;
+    type AttentionStreamVisitor = AS::Visitor;
     type CompressedVisitor = C::Visitor;
     type CompressedComponentVisitor = CF::Visitor;
 
@@ -277,6 +315,10 @@ where
 
     fn into_component_visitor(self) -> Self::ComponentVisitor {
         self.component.convert(self.visitor)
+    }
+
+    fn into_attention_stream_visitor(self) -> Self::AttentionStreamVisitor {
+        self.attention_stream.convert(self.visitor)
     }
 
     fn into_attention_component_visitor(self) -> Self::AttentionComponentVisitor {

@@ -7,7 +7,7 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -763,7 +763,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -804,7 +804,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -852,7 +852,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -895,7 +895,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -1087,8 +1087,44 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
-        (input.tokens, input.mask)
+    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        Ok((input.tokens.dim(0), input.tokens.dim(1)))
+    }
+
+    fn begin_text_partition<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        expected: &eredu_runtime::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = (input.tokens, input.mask);
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+            observer,
+        )
     }
 
     fn partition_output_width(&self) -> i32 {

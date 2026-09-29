@@ -70,9 +70,9 @@ fn isolated_compressed_snapshots_copy_strided_state_and_isolate_paged_catalogs()
                     .unwrap(),
             )
             .unwrap();
-            MlxHybridState::paged(layout, manager, None).unwrap()
+            MlxHybridState::paged(layout, manager, None, &[]).unwrap()
         } else {
-            MlxHybridState::device(layout).unwrap()
+            MlxHybridState::device(layout, &[]).unwrap()
         };
         let input = |tokens, width, seed| {
             Array::from_slice(
@@ -258,7 +258,7 @@ fn isolated_native_hybrid_snapshots_copy_strided_recurrent_and_convolution_stora
         .collect();
     let policy = LayerCachePolicy::fixed_only(tensors).unwrap();
     let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
-    let mut parent = MlxHybridState::device(layout).unwrap();
+    let mut parent = MlxHybridState::device(layout, &[]).unwrap();
     for (index, role) in roles.iter().enumerate() {
         let array = Array::from_slice(&[1. + index as f32, 2., 3., 4.], &[2, 2])
             .transpose(&stream)

@@ -24,7 +24,9 @@ mod routed_partition;
 mod routed_session;
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
-pub use ordinary::{CompositeRoute, KeyValueRoute, ReplicatedRoute, RoutedRoute};
+pub use ordinary::{
+    CompositeRoute, KeyValueRoute, ReplicatedRoute, RetainedArchitectureConstruction, RoutedRoute,
+};
 pub use partition_facts::PreparedPartitionSessionFacts;
 pub use partitioned::{PartitionedCompositeRoute, PartitionedDenseRoute, PartitionedRoutedRoute};
 pub use prediction::{
@@ -205,6 +207,8 @@ pub struct PreparedConstructionBranch<S, C> {
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
+    retained_prediction: Option<PredictionBinding>,
+    retained_construction: Option<RetainedArchitectureConstruction>,
 }
 
 impl<S, C> PreparedConstructionBranch<S, C> {
@@ -392,7 +396,77 @@ where
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
 {
-    let (selected, inspection, graph) = sources.into_parts();
+    let (selected, inspection, mut graph) = sources.into_parts();
+    let retained_construction = graph.take_retained_construction();
+    let topology = selected.execution().parallel_topology().unwrap_or(
+        ParallelTopology::new(1, 1, 1, 1)
+            .and_then(|topology| ParallelRankTopology::new(topology, 0))
+            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
+    );
+    let retained_prediction = match (&retained_construction, selected.prediction_realization()) {
+        (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), Some(realization))
+            if target.prediction_state().is_some() && graph.extension().is_some() =>
+        {
+            Some(PredictionBinding::new(
+                realization.clone(),
+                target.capability_estimate().clone(),
+                Arc::clone(&graph.prediction_placement),
+                topology,
+            ))
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4Exp(target)), None)
+            if target.prediction_state().is_some() =>
+        {
+            return Err(PreparedExecutionError::PredictionSourceMismatch);
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4Conditional(target)), Some(realization))
+            if target.prediction_state().is_some() && graph.extension().is_some() =>
+        {
+            Some(PredictionBinding::new(
+                realization.clone(),
+                target.capability_estimate().clone(),
+                Arc::clone(&graph.prediction_placement),
+                topology,
+            ))
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4Conditional(target)), None)
+            if target.prediction_state().is_some() =>
+        {
+            return Err(PreparedExecutionError::PredictionSourceMismatch);
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), Some(realization))
+            if target.prediction_state().is_some() && graph.extension().is_some() =>
+        {
+            Some(PredictionBinding::new(
+                realization.clone(),
+                target.capability_estimate().clone(),
+                Arc::clone(&graph.prediction_placement),
+                topology,
+            ))
+        }
+        (
+            Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)),
+            Some(realization),
+        ) if target.prediction_state().is_some() && graph.extension().is_some() => {
+            Some(PredictionBinding::new(
+                realization.clone(),
+                target.capability_estimate().clone(),
+                Arc::clone(&graph.prediction_placement),
+                topology,
+            ))
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4Partition(target)), None)
+            if target.prediction_state().is_some() =>
+        {
+            return Err(PreparedExecutionError::PredictionSourceMismatch)
+        }
+        (Some(RetainedArchitectureConstruction::Qwen4ConditionalPartition(target)), None)
+            if target.prediction_state().is_some() =>
+        {
+            return Err(PreparedExecutionError::PredictionSourceMismatch)
+        }
+        _ => None,
+    };
     match (selected.communication_manifest(), communication.as_ref()) {
         (Some(manifest), Some(communication)) => assembler
             .validate_communication(manifest, communication)
@@ -403,11 +477,6 @@ where
     }
     let state_residency = selected.text_realization().state().policy().clone();
     let capabilities = selected.session_capabilities();
-    let topology = selected.execution().parallel_topology().unwrap_or(
-        ParallelTopology::new(1, 1, 1, 1)
-            .and_then(|topology| ParallelRankTopology::new(topology, 0))
-            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
-    );
     let prediction = match (
         selected.prediction_extension(),
         graph.prediction_extension(),
@@ -433,16 +502,33 @@ where
             })
         }
         (None, None, None, None) => None,
+        (None, None, Some(_), Some(_)) if retained_prediction.is_some() => None,
         _ => return Err(PreparedExecutionError::PredictionSourceMismatch),
     };
     let processor = match selected.execution().processor() {
-        Some(processor) if processor.raw_media() => Some(
-            PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
+        Some(processor) if processor.raw_media() => Some(match selected.qwen4_construction() {
+            Some(crate::selected_execution::SelectedQwen4Construction::Conditional {
+                selected: conditional,
+                ..
+            }) => {
+                let budget = conditional.header_plan().processor_budget();
+                conditional.processor().prepared_processor(budget)
+            }
+            Some(
+                crate::selected_execution::SelectedQwen4Construction::ConditionalPartitioned {
+                    selected: conditional,
+                    ..
+                },
+            ) => {
+                let budget = conditional.header_plan().processor_budget();
+                conditional.processor().prepared_processor(budget)
+            }
+            _ => PreparedProcessor::from_artifact(graph.architecture()).ok_or_else(|| {
                 PreparedExecutionError::Architecture(
                     "selected raw-media execution has no retained architecture processor".into(),
                 )
             })?,
-        ),
+        }),
         _ => None,
     };
     let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
@@ -465,6 +551,8 @@ where
     let floating_state_bytes = floating_state_dtype.bytes();
     let retained_communication = communication.clone();
     let context = BranchContext {
+        retained_construction,
+        retained_prediction,
         inspection,
         target: Arc::clone(graph.target()),
         extension_sources: graph
@@ -508,6 +596,8 @@ struct BranchContext<C> {
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
+    retained_prediction: Option<PredictionBinding>,
+    retained_construction: Option<RetainedArchitectureConstruction>,
 }
 impl<C> BranchContext<C> {
     fn branch<S>(self, selected: S) -> PreparedConstructionBranch<S, C> {
@@ -518,6 +608,8 @@ impl<C> BranchContext<C> {
             communication: self.communication,
             extension_sources: self.extension_sources,
             prediction: self.prediction,
+            retained_prediction: self.retained_prediction,
+            retained_construction: self.retained_construction,
         }
     }
 }

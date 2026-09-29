@@ -22,6 +22,7 @@ pub struct CaptureCheckpoint {
     prediction: u64,
     phase: CapturePhase,
     has_step: bool,
+    prefill_progress: Option<CapturePrefillSpan>,
     usage: CaptureUsage,
 }
 
@@ -59,6 +60,7 @@ pub struct PreparedCaptureRestore<'a> {
     prediction: u64,
     phase: CapturePhase,
     has_step: bool,
+    prefill_progress: Option<CapturePrefillSpan>,
 }
 
 impl PreparedCaptureRestore<'_> {
@@ -67,6 +69,7 @@ impl PreparedCaptureRestore<'_> {
         self.run.prediction = self.prediction;
         self.run.phase = self.phase;
         self.run.has_step = self.has_step;
+        self.run.prefill_progress = self.prefill_progress;
         self.run.capture_seconds = 0.0;
         self.run.transaction = None;
         self.run.invocation = None;
@@ -132,6 +135,7 @@ impl CaptureSession {
             prediction: self.prediction,
             phase: self.phase,
             has_step: self.has_step,
+            prefill_progress: self.prefill_progress,
             usage: self.ledger.total(),
         })
     }
@@ -182,6 +186,7 @@ impl CaptureSession {
             prediction: checkpoint.prediction,
             phase: checkpoint.phase,
             has_step: checkpoint.has_step,
+            prefill_progress: checkpoint.prefill_progress,
         })
     }
 
@@ -251,7 +256,12 @@ impl CaptureCheckpoint {
     /// Absolute next prediction; zero means prompt prefill has not executed.
     pub fn next_prediction(&self) -> u64 {
         // begin_step requires prediction < max_predictions, hence this cannot overflow.
-        if self.has_step {
+        if self
+            .prefill_progress
+            .is_some_and(|span| span.end < span.total)
+        {
+            0
+        } else if self.has_step {
             self.prediction + 1
         } else {
             0
@@ -375,6 +385,7 @@ impl CaptureCheckpoint {
         child.prediction = self.prediction;
         child.phase = self.phase;
         child.has_step = self.has_step;
+        child.prefill_progress = self.prefill_progress;
         Ok(child)
     }
 }

@@ -120,6 +120,16 @@ impl GenerationLifecycle {
         Ok(())
     }
 
+    /// Completes a prompt prefix after native completion and record delivery,
+    /// retaining prediction zero until the final chunk samples its first token.
+    pub fn complete_prefill(&mut self) -> Result<(), ExecutionControlError> {
+        if self.status() != GenerationStatus::Running || self.boundary.prediction != 0 {
+            return Err(self.invalid(GenerationStatus::Paused));
+        }
+        self.boundary.status = GenerationStatus::Paused;
+        Ok(())
+    }
+
     /// Pauses an already quiescent session without advancing a prediction or RNG.
     pub fn pause(&mut self) -> Result<(), ExecutionControlError> {
         if !matches!(

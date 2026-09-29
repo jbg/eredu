@@ -5,3 +5,6 @@ pub(crate) mod kv;
 pub mod residency;
 /// Runtime-policy-selected key/value state realization.
 pub mod state;
+
+/// Named bounded append-stream storage and transactional checkpoint.
+pub use kv::MlxPagedAppendStream;

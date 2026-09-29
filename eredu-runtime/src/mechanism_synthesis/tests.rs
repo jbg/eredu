@@ -413,8 +413,14 @@ fn exact_state_components_retain_dtype_shape_and_semantic_placement() {
     .unwrap();
     let requirements = requirements(
         Vec::new(),
-        LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 2, 8, vec![fixed])
-            .unwrap(),
+        LayerCachePolicy::key_value_with_state(
+            AttentionPolicy::Full,
+            2,
+            8,
+            vec![fixed],
+            Vec::new(),
+        )
+        .unwrap(),
         ReplicatedTextStateAccess::AttentionWithFixed,
     );
     let paged = CacheResidencyPolicy::Paged(
@@ -429,6 +435,13 @@ fn exact_state_components_retain_dtype_shape_and_semantic_placement() {
         ..Support::default()
     };
     let report = synthesize_replicated_text_capabilities(&requirements, &request, &support);
+    let expected_queries = support.state_queries.borrow().clone();
+    support.state_queries.borrow_mut().clear();
+    let standalone =
+        synthesize_state_capabilities(&requirements.state_requirements(), &paged, &support);
+    assert_eq!(&standalone, report.state());
+    assert_eq!(*support.state_queries.borrow(), expected_queries);
+    assert!(support.queries.borrow().is_empty());
     let declared = requirements.state_layout().components(0).unwrap();
     assert_eq!(
         report
@@ -626,7 +639,8 @@ fn half_precision_activations_preserve_fixed_float_and_integer_state_dtypes() {
     .collect();
     let requirements = requirements(
         Vec::new(),
-        LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 2, 8, fixed).unwrap(),
+        LayerCachePolicy::key_value_with_state(AttentionPolicy::Full, 2, 8, fixed, Vec::new())
+            .unwrap(),
         ReplicatedTextStateAccess::AttentionWithFixed,
     )
     .with_floating_state_source(TensorDtype::F16);

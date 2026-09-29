@@ -63,6 +63,24 @@ pub struct PreparedInputPart<Tensor> {
     extents: Vec<InputExtent>,
 }
 
+/// Logical role of a tensor retained by an ordered prepared input.
+/// Roles identify request handles, not distinct allocations or physical owners.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PreparedInputTensorRole {
+    /// Primary payload for an input part.
+    Payload {
+        /// Zero-based position in the ordered prepared request.
+        part: usize,
+    },
+    /// Typed metadata retained alongside one part's payload.
+    Metadata {
+        /// Zero-based position in the ordered prepared request.
+        part: usize,
+        /// Stable metadata key within this part.
+        key: InputMetadataKey,
+    },
+}
+
 impl<Tensor> PreparedInputPart<Tensor> {
     /// Creates a part with compatible payload and unique, compatible metadata.
     pub fn new(
@@ -294,14 +312,28 @@ impl<Tensor> PreparedModelInput<Tensor> {
         self.parts.is_empty()
     }
 
+    /// Borrows every retained payload and metadata tensor with its request role.
+    /// Parts follow request order, each payload precedes its metadata, and
+    /// metadata follows stable key order. This traversal allocates no catalog,
+    /// clones no tensor, and establishes no physical ownership or completion.
+    pub fn storage_values(&self) -> impl Iterator<Item = (PreparedInputTensorRole, &Tensor)> {
+        self.parts.iter().enumerate().flat_map(|(index, part)| {
+            std::iter::once((
+                PreparedInputTensorRole::Payload { part: index },
+                part.payload.value(),
+            ))
+            .chain(part.metadata.iter().map(move |(&key, value)| {
+                (
+                    PreparedInputTensorRole::Metadata { part: index, key },
+                    value,
+                )
+            }))
+        })
+    }
+
     /// Borrows payloads and metadata tensors in deterministic wire order.
     pub fn wire_values(&self) -> Vec<&Tensor> {
-        let mut values = Vec::new();
-        for part in &self.parts {
-            values.push(part.payload.value());
-            values.extend(part.metadata.values());
-        }
-        values
+        self.storage_values().map(|(_, value)| value).collect()
     }
 
     /// Reconstructs and validates input received in deterministic wire order.
@@ -390,6 +422,71 @@ mod tests {
 
     fn describe(value: &FakeTensor) -> Result<InputTensorIdentity, PreparedInputError> {
         InputTensorIdentity::new(value.dtype.clone(), value.shape.clone())
+    }
+
+    #[test]
+    fn storage_roles_borrow_every_payload_and_metadata_in_wire_order() {
+        let input = PreparedModelInput::new(
+            vec![
+                PreparedInputPart::new(
+                    InputModality::Text,
+                    PreparedInputPayload::TokenIds(fake(TensorDtype::U32, &[1, 2], 1)),
+                    [],
+                )
+                .unwrap(),
+                PreparedInputPart::new(
+                    InputModality::Image,
+                    PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[4, 12], 2)),
+                    [
+                        (
+                            InputMetadataKey::PatchPositions,
+                            fake(TensorDtype::I32, &[4, 3], 4),
+                        ),
+                        (
+                            InputMetadataKey::PatchGrid,
+                            fake(TensorDtype::I32, &[1, 3], 3),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            ],
+            describe,
+        )
+        .unwrap();
+        let expected = [
+            (PreparedInputTensorRole::Payload { part: 0 }, 1),
+            (PreparedInputTensorRole::Payload { part: 1 }, 2),
+            (
+                PreparedInputTensorRole::Metadata {
+                    part: 1,
+                    key: InputMetadataKey::PatchGrid,
+                },
+                3,
+            ),
+            (
+                PreparedInputTensorRole::Metadata {
+                    part: 1,
+                    key: InputMetadataKey::PatchPositions,
+                },
+                4,
+            ),
+        ];
+        let actual = input
+            .storage_values()
+            .map(|(role, value)| (role, value.marker))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let wire = input.wire_values();
+        for ((_, value), wire_value) in input.storage_values().zip(&wire) {
+            assert!(std::ptr::eq(value, *wire_value));
+        }
+        assert!(std::ptr::eq(wire[1], input.parts()[1].payload().value()));
+        assert!(std::ptr::eq(
+            wire[2],
+            input.parts()[1]
+                .metadata_value(InputMetadataKey::PatchGrid)
+                .unwrap()
+        ));
     }
 
     #[test]

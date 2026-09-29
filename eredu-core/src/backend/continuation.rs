@@ -207,6 +207,27 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         }
     }
 
+    /// Completes at most one nonfinal prefill chunk without sampling or querying
+    /// the constraint controller. True leaves an independently snapshotable
+    /// pending prompt after draining its completed captures; false performs no
+    /// prefix work. Call `take_completed_step` after progress or failure.
+    pub fn advance_prefill<C: TokenFilterController>(
+        &mut self,
+        state: &mut TextGenerationContinuation<B, C>,
+    ) -> Result<bool, TextContinuationError<B::Error, C::Error>> {
+        self.validate(state)?;
+        state.require_quiescent()?;
+        state.failed = true;
+        state.records_drained = false;
+        let advanced = state
+            .inner
+            .advance_prefill(self.runtime)
+            .map_err(ControlledTextGenerationError::Backend)?;
+        state.failed = false;
+        state.records_drained = !advanced;
+        Ok(advanced)
+    }
+
     /// Settles exact native completion and moves out the single bounded record
     /// batch. It remains available after failure for attributed error evidence;
     /// draining never turns a failed continuation into a resumable one.

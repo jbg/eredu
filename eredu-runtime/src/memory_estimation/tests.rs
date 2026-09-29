@@ -1224,6 +1224,7 @@ fn generic_target_rejects_zero_kernels_and_inconsistent_projection_contracts() {
     assert!(estimate_generation_memory(&r).is_err());
     let mut topology = generic_topology();
     topology.layers[0].mixer = TokenMixerTopology::GatedConvolution {
+        dilation: 1,
         channels: 32,
         kernel: 0,
         projections: vec![],

@@ -50,6 +50,15 @@ fn affine(input: &NumericTensor, weight: &NumericTensor) -> NumericTensor {
 
 #[test]
 fn qwen_recurrent_channels_reconstruct_declared_recurrence_and_cached_masks() {
+    recurrent_channels(eredu_nn::OutputGateActivation::Silu);
+}
+
+#[test]
+fn sigmoid_recurrent_channels_match_independent_equations_and_cached_masks() {
+    recurrent_channels(eredu_nn::OutputGateActivation::Sigmoid);
+}
+
+fn recurrent_channels(gate_activation: eredu_nn::OutputGateActivation) {
     for mut config in heterogeneous_replicated_configs().into_iter().filter(|c| {
         matches!(
             c["model_type"].as_str(),
@@ -110,8 +119,13 @@ fn qwen_recurrent_channels_reconstruct_declared_recurrence_and_cached_masks() {
             let (key_width, channels) = (kh * kd, vh * vd);
             assert_eq!(group.count, channels);
             let context = NumericContext::default();
+            let mut spec = qwen::hybrid::recurrent_spec(&args, 0).unwrap();
+            spec.output_gate = gate_activation;
             let mut layer =
-                qwen::hybrid::LinearAttention::<NumericBackend>::new(&args, 0, &context).unwrap();
+                eredu_architectures::gated_delta::GatedDeltaMixer::<NumericBackend>::new(
+                    spec, &context,
+                )
+                .unwrap();
             layer.visit_parameters_mut(&mut Initialize);
             let mut parameters = Parameters::default();
             layer.visit_parameters(&mut parameters);
@@ -255,7 +269,12 @@ fn qwen_recurrent_channels_reconstruct_declared_recurrence_and_cached_masks() {
                             .sqrt();
                         expected_channels.extend((0..vd).map(|v| {
                             let z = gate.data[t * channels + h * vd + v] as f64;
-                            (y[v] / rms * gain.data[v] as f64 * z / (1.0 + (-z).exp())) as f32
+                            let numerator = match gate_activation {
+                                eredu_nn::OutputGateActivation::Silu => z,
+                                eredu_nn::OutputGateActivation::Sigmoid => 1.0,
+                            };
+                            (y[v] / rms * gain.data[v] as f64 * numerator / (1.0 + (-z).exp()))
+                                as f32
                         }));
                     }
                 }
@@ -330,5 +349,29 @@ fn qwen_recurrent_channels_reconstruct_declared_recurrence_and_cached_masks() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn recurrent_spec_rejects_mismatched_geometry_and_normalization() {
+    let config = heterogeneous_replicated_configs()
+        .into_iter()
+        .find(|c| c["model_type"] == "qwen3_next")
+        .unwrap();
+    let args = qwen::hybrid::model_args_from_config_value(&config)
+        .unwrap()
+        .text;
+    let spec = qwen::hybrid::recurrent_spec(&args, 0).unwrap();
+    for mutate in [
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.key_heads = 0,
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.key_head_dim = i32::MAX,
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.input_gate.output += 1,
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.convolution.channels += 1,
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.output_epsilon = f32::NAN,
+        |s: &mut eredu_architectures::gated_delta::GatedDeltaMixerSpec| s.l2_epsilon = 0.0,
+    ] {
+        let mut invalid = spec.clone();
+        mutate(&mut invalid);
+        assert!(invalid.validate().is_err());
     }
 }

@@ -740,17 +740,24 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
                                 .as_ref()
                                 .map(|mask| B::gather_pooled_mask(mask, positions, context))
                                 .transpose()?;
+                            let local_heads = local.expand_dims(1, context)?;
+                            let pooled_heads = pooled.expand_dims(1, context)?;
                             B::indexed_attention(
                                 IndexedAttentionInput {
                                     queries: &query,
-                                    local_keys: &local,
-                                    local_values: &local,
-                                    pooled_keys: &pooled,
-                                    pooled_values: &pooled,
+                                    keys: &pooled_heads,
+                                    values: &pooled_heads,
+                                    key_position_offset: 0,
                                     selected_positions: positions,
+                                    validity: None,
+                                    mask: selected_pool_mask.as_ref(),
+                                    local: Some(eredu_nn::LocalAttentionInput {
+                                        keys: &local_heads,
+                                        values: &local_heads,
+                                        mask: Some(local_mask),
+                                    }),
                                     scale: self.scale,
-                                    local_mask: Some(local_mask),
-                                    pooled_mask: selected_pool_mask.as_ref(),
+                                    arithmetic: eredu_nn::AttentionArithmetic::Fused,
                                     sinks: Some(self.sinks.as_ref()),
                                 },
                                 context,

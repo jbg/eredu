@@ -1,6 +1,6 @@
 //! Selection remains in the architecture-configured selector. These adapters
 //! only connect portable control/evidence hooks before provider execution.
-use super::RoutedExpertProvider;
+use super::ParameterProvider;
 use eredu_nn::{Error, GroupSelection, GroupSelectionOperator, GroupedNeuralBackend, Tensor};
 
 fn token_rows<T: Tensor>(input: &T) -> Result<u64, Error> {
@@ -28,7 +28,7 @@ pub fn select_routes_with_provider<B, P>(
 ) -> Result<GroupSelection<B::Tensor>, Error>
 where
     B: GroupedNeuralBackend,
-    P: RoutedExpertProvider<B>,
+    P: ParameterProvider<B>,
     P::Error: std::fmt::Display,
 {
     let Some(control) = provider

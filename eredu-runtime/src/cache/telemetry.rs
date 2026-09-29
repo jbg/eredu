@@ -19,6 +19,14 @@ pub struct CacheLayerResidencyStats {
     pub key_value_blocks: u64,
     /// Sealed compressed-latent/rotary blocks.
     pub compressed_latent_blocks: u64,
+    /// Immutable auxiliary stream blocks.
+    pub append_stream_blocks: u64,
+    /// Cumulative immutable pages acquired by bounded append-stream reads.
+    pub append_stream_read_blocks: u64,
+    /// Cumulative source bytes acquired by bounded append-stream reads.
+    pub append_stream_read_bytes: u64,
+    /// Peak admitted compact read/tail-copy scratch observed in use.
+    pub append_stream_scratch_peak_bytes: u64,
     /// Blocks cataloged on the execution device.
     pub device_blocks: u64,
     /// Blocks cataloged in host memory.
@@ -73,6 +81,11 @@ pub struct CacheLayerResidencyStats {
     pub decode_full_attention_blocks: u64,
     /// Logical bytes scanned by full attention during decode.
     pub decode_full_attention_bytes: u64,
+    /// Pages and mutable tails read by selected-position attention.
+    pub selected_attention_blocks: u64,
+    /// Logical page payloads and compact tail rows read by selected attention.
+    pub selected_attention_bytes: u64,
+
     /// Peak logical scratch bytes used by this layer's attention.
     pub attention_scratch_peak_bytes: u64,
 }
@@ -83,6 +96,12 @@ impl CacheLayerResidencyStats {
         self.logical_cached_tokens += other.logical_cached_tokens;
         self.key_value_blocks += other.key_value_blocks;
         self.compressed_latent_blocks += other.compressed_latent_blocks;
+        self.append_stream_blocks += other.append_stream_blocks;
+        self.append_stream_read_blocks += other.append_stream_read_blocks;
+        self.append_stream_read_bytes += other.append_stream_read_bytes;
+        self.append_stream_scratch_peak_bytes = self
+            .append_stream_scratch_peak_bytes
+            .max(other.append_stream_scratch_peak_bytes);
         self.device_blocks += other.device_blocks;
         self.host_blocks += other.host_blocks;
         self.disk_blocks += other.disk_blocks;
@@ -110,6 +129,8 @@ impl CacheLayerResidencyStats {
         self.prefill_full_attention_bytes += other.prefill_full_attention_bytes;
         self.decode_full_attention_blocks += other.decode_full_attention_blocks;
         self.decode_full_attention_bytes += other.decode_full_attention_bytes;
+        self.selected_attention_blocks += other.selected_attention_blocks;
+        self.selected_attention_bytes += other.selected_attention_bytes;
         self.attention_scratch_peak_bytes = self
             .attention_scratch_peak_bytes
             .max(other.attention_scratch_peak_bytes);
@@ -134,6 +155,14 @@ pub struct CacheResidencyReport {
     pub key_value_blocks: u64,
     /// Sealed compressed-latent/rotary blocks.
     pub compressed_latent_blocks: u64,
+    /// Immutable auxiliary stream blocks.
+    pub append_stream_blocks: u64,
+    /// Cumulative immutable pages acquired by bounded append-stream reads.
+    pub append_stream_read_blocks: u64,
+    /// Cumulative source bytes acquired by bounded append-stream reads.
+    pub append_stream_read_bytes: u64,
+    /// Peak admitted compact read/tail-copy scratch observed in use.
+    pub append_stream_scratch_peak_bytes: u64,
     /// Blocks cataloged on the execution device.
     pub device_blocks: u64,
     /// Blocks cataloged in host memory.
@@ -220,6 +249,11 @@ pub struct CacheResidencyReport {
     pub decode_full_attention_blocks: u64,
     /// Logical bytes scanned by full attention during decode.
     pub decode_full_attention_bytes: u64,
+    /// Pages and mutable tails read by selected-position attention.
+    pub selected_attention_blocks: u64,
+    /// Logical page payloads and compact tail rows read by selected attention.
+    pub selected_attention_bytes: u64,
+
     /// Peak logical scratch bytes used by attention.
     pub attention_scratch_peak_bytes: u64,
     /// Successful prompt-cache saves.
@@ -228,8 +262,8 @@ pub struct CacheResidencyReport {
     pub prompt_cache_loads: u64,
     /// Logical bytes written or cataloged for prompt caches.
     pub prompt_cache_bytes: u64,
-    /// Imported persistent shard count.
-    pub imported_buffered_shards: u64,
+    /// Imported persistent shard handles; payload bytes are loaded only on demand.
+    pub imported_retained_shards: u64,
     /// Optional peak process resident-set size.
     pub process_rss_bytes: Option<u64>,
     /// Optional cumulative minor page faults.
@@ -366,6 +400,13 @@ fn apply_activity(activity: &CacheLayerResidencyStats, stats: &mut CacheLayerRes
     stats.prefill_full_attention_bytes += activity.prefill_full_attention_bytes;
     stats.decode_full_attention_blocks += activity.decode_full_attention_blocks;
     stats.decode_full_attention_bytes += activity.decode_full_attention_bytes;
+    stats.append_stream_read_blocks += activity.append_stream_read_blocks;
+    stats.append_stream_read_bytes += activity.append_stream_read_bytes;
+    stats.append_stream_scratch_peak_bytes = stats
+        .append_stream_scratch_peak_bytes
+        .max(activity.append_stream_scratch_peak_bytes);
+    stats.selected_attention_blocks += activity.selected_attention_blocks;
+    stats.selected_attention_bytes += activity.selected_attention_bytes;
     stats.attention_scratch_peak_bytes = stats
         .attention_scratch_peak_bytes
         .max(activity.attention_scratch_peak_bytes);

@@ -19,8 +19,24 @@ use crate::{
 pub struct PredictionBinding {
     selected: eredu_runtime::SelectedSpeculativeRealization,
     capability: CapabilityEstimate,
+    pub(crate) placement: Option<(
+        crate::prediction_extension::PredictionPlacementSlot,
+        ParallelRankTopology,
+    )>,
 }
 impl PredictionBinding {
+    pub(crate) fn new(
+        selected: eredu_runtime::SelectedSpeculativeRealization,
+        capability: CapabilityEstimate,
+        placement: crate::prediction_extension::PredictionPlacementSlot,
+        topology: ParallelRankTopology,
+    ) -> Self {
+        Self {
+            selected,
+            capability,
+            placement: Some((placement, topology)),
+        }
+    }
     /// Selected speculative contract paired with this materialized extension.
     pub const fn selected(&self) -> &eredu_runtime::SelectedSpeculativeRealization {
         &self.selected
@@ -118,6 +134,7 @@ where
         PredictionBinding {
             selected: prediction.realization,
             capability: prediction.capability,
+            placement: None,
         },
     ))
 }

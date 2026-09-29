@@ -89,6 +89,8 @@ pub enum TokenMixerTopology {
         channels: u64,
         /// Causal kernel width.
         kernel: u64,
+        /// Spacing between consecutive kernel taps in token positions.
+        dilation: u64,
         /// Input and output projections in invocation order.
         projections: Vec<ProjectionTopology>,
     },

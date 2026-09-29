@@ -277,7 +277,7 @@ impl eredu_runtime::ActivationObserver<NumericTensor, Error> for Capture {
     }
 }
 
-fn invoke_gated<P: TensorParallelRoutedExpertProvider<NumericBackend>>(
+fn invoke_gated<P: TensorParallelParameterProvider<NumericBackend>>(
     provider: &mut P,
     bank: &mut NumericExpertBank,
     input: &NumericTensor,
@@ -307,7 +307,7 @@ where
     };
     if tp {
         let result =
-            TensorParallelRoutedExpertProvider::<NumericBackend>::forward_grouped_tensor_parallel(
+            TensorParallelParameterProvider::<NumericBackend>::forward_grouped_tensor_parallel(
                 &mut boxed, bank, request, 1, context,
             )
             .unwrap_or_else(|e| panic!("{e}"));
@@ -323,11 +323,11 @@ where
             }
         }
     } else {
-        RoutedExpertProvider::<NumericBackend>::forward_grouped(&mut boxed, bank, request, context)
+        ParameterProvider::<NumericBackend>::forward_grouped(&mut boxed, bank, request, context)
             .unwrap_or_else(|e| panic!("{e}"))
     }
 }
-fn invoke_relu<P: TensorParallelRoutedExpertProvider<NumericBackend>>(
+fn invoke_relu<P: TensorParallelParameterProvider<NumericBackend>>(
     provider: &mut P,
     bank: &mut NumericRelu2Groups,
     input: &NumericTensor,
@@ -356,7 +356,7 @@ where
         unit_observer: None,
     };
     if tp {
-        let result=TensorParallelRoutedExpertProvider::<NumericBackend>::forward_relu2_routed_tensor_parallel(&mut boxed,bank,request,1,context).unwrap_or_else(|e|panic!("{e}"));
+        let result=TensorParallelParameterProvider::<NumericBackend>::forward_relu2_routed_tensor_parallel(&mut boxed,bank,request,1,context).unwrap_or_else(|e|panic!("{e}"));
         match result {
             RoutedExpertTensorParallelOutput::Complete(v) => v,
             RoutedExpertTensorParallelOutput::Partial(p) => {
@@ -369,14 +369,14 @@ where
             }
         }
     } else {
-        RoutedExpertProvider::<NumericBackend>::forward_relu2_routed(
+        ParameterProvider::<NumericBackend>::forward_relu2_routed(
             &mut boxed, bank, request, context,
         )
         .unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
-pub(super) fn verify_gated<P: TensorParallelRoutedExpertProvider<NumericBackend>>(
+pub(super) fn verify_gated<P: TensorParallelParameterProvider<NumericBackend>>(
     provider: &mut P,
     bank: &mut NumericExpertBank,
     input: &NumericTensor,
@@ -440,7 +440,7 @@ pub(super) fn verify_gated<P: TensorParallelRoutedExpertProvider<NumericBackend>
         }
     }
 }
-pub(super) fn verify_relu<P: TensorParallelRoutedExpertProvider<NumericBackend>>(
+pub(super) fn verify_relu<P: TensorParallelParameterProvider<NumericBackend>>(
     provider: &mut P,
     bank: &mut NumericRelu2Groups,
     input: &NumericTensor,
@@ -831,7 +831,7 @@ impl eredu_runtime::ActivationObserver<NumericTensor, Error> for Failing {
         Ok(Some(self))
     }
 }
-pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
+pub(super) fn verify_failure<P: ParameterProvider<NumericBackend>>(
     provider: &mut P,
     bank: &mut NumericExpertBank,
     input: &NumericTensor,
@@ -848,7 +848,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
         &mut observer,
         eredu_runtime::RoutedObservationPoints::new(id, "bank", bank.spec.group_count()),
     );
-    let error = RoutedExpertProvider::<NumericBackend>::forward_grouped(
+    let error = ParameterProvider::<NumericBackend>::forward_grouped(
         &mut observed,
         bank,
         RoutedExpertRequest {
@@ -881,7 +881,7 @@ pub(super) fn verify_failure<P: RoutedExpertProvider<NumericBackend>>(
         eredu_runtime::RoutedObservationPoints::new(id, "bank", bank.spec.group_count()),
     )
     .execute_neural(|observed| {
-        RoutedExpertProvider::<NumericBackend>::forward_grouped(
+        ParameterProvider::<NumericBackend>::forward_grouped(
             observed,
             bank,
             RoutedExpertRequest {

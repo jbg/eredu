@@ -588,6 +588,7 @@ where
     let mixed = match mixer {
         TokenMixer::Attention(attention) => attention.forward_instrumented(
             AttentionInput {
+                selected_positions: None,
                 hidden: &normalized,
                 mask,
                 cache: Some(&mut *state),
@@ -686,6 +687,7 @@ pub(crate) fn short_convolution_spec(
         input_projection: linear("in_proj", args.hidden_size, 3 * channels)?,
         output_projection: linear("out_proj", channels, args.hidden_size)?,
         convolution: CausalDepthwiseConvolutionSpec {
+            dilation: 1,
             channels,
             kernel_size: args.conv_l_cache,
             weight: parameter(format!("{prefix}.conv.weight"))?,
@@ -772,6 +774,7 @@ pub(crate) fn execution_topology(
                     TokenMixerTopology::GatedConvolution {
                         channels: positive(spec.channels)?,
                         kernel: positive(spec.convolution.kernel_size)?,
+                        dilation: positive(spec.convolution.dilation)?,
                         projections: [&spec.input_projection, &spec.output_projection]
                             .into_iter()
                             .map(ProjectionTopology::from_spec)

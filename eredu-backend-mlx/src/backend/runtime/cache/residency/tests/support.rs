@@ -1,11 +1,11 @@
 // Residency, persistence, and resource-lifetime tests.
 
 use super::{
-    buffer_prompt_cache_shard, cpu_stream, hash_prompt_cache_shard_payload,
-    host_cache_capacity_upper_bound, inspect_prompt_cache, open_prompt_cache, verify_disk_payload,
+    cpu_stream, hash_prompt_cache_shard_payload,
+    host_cache_capacity_upper_bound, inspect_prompt_cache, open_prompt_cache, load_host_cache_block_direct,
     CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind,
     CacheLayerResidencyStats, CacheManagerState, CachePoolError, CachePoolResource,
-    CacheRankIdentity, CacheRepresentation, CacheResidencyError, CacheResidencyManager,
+    CacheRankIdentity, CacheRepresentation, CacheStreamId, CacheResidencyError, CacheResidencyManager,
     CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask,
     DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
     HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
@@ -33,7 +33,7 @@ use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, OnceLock},
+    sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
@@ -55,9 +55,9 @@ fn missing_location(root: &Path, name: &str) -> DiskLocation {
         first_name: "keys".into(),
         second_name: "values".into(),
         persistent: false,
-        buffered: None,
+        source: None,
+        logical_bytes: 8,
         payload_sha256: None,
-        payload_verification: Arc::new(OnceLock::new()),
     }
 }
 
@@ -258,6 +258,7 @@ fn write_prompt_fixture(root: &Path, namespace: &str) -> PromptCacheManifest {
             payload_sha256: hash_prompt_cache_shard_payload(&generation.join("block.safetensors"))
                 .unwrap(),
         }],
+        stream_frontiers: Vec::new(),
         state_tensors: Vec::new(),
     };
     fs::write(
@@ -315,6 +316,7 @@ fn write_fixed_state_fixture(root: &Path) -> PromptCacheManifest {
         distributed_commit: None,
         application_namespace: None,
         blocks: Vec::new(),
+        stream_frontiers: Vec::new(),
         state_tensors: vec![PromptCacheStateTensor {
             owner: StateTensorOwner::Layer(0),
             role: StateTensorRole::Convolution { slot: 0 },
@@ -404,8 +406,8 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
         .seal_block(0, 0, 1, None, backend_key_value_block(&stream), false)
         .unwrap();
     let competing = CacheResidencyManager::new(options()).unwrap();
-    competing.set_tail_state(0, 8, 1).unwrap();
-    let aggregate_error = competing.set_tail_state(0, 12, 1).unwrap_err();
+    competing.set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 8, 1).unwrap();
+    let aggregate_error = competing.set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 12, 1).unwrap_err();
     assert!(matches!(
         aggregate_error,
         CacheResidencyError::Pool(CachePoolError::BudgetExceeded {

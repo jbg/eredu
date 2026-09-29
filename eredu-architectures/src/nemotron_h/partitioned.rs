@@ -7,7 +7,7 @@ use eredu_nn::{
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
     LayeredForwardState, LayeredPartitionInput, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -940,7 +940,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -971,7 +971,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -1019,7 +1019,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -1052,7 +1052,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if group != 0 {
@@ -1280,11 +1280,50 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
-        match input {
+    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+        let tokens = match input {
+            EmbeddedInput::Target { tokens, .. } | EmbeddedInput::Draft { tokens, .. } => tokens,
+        };
+        Ok((tokens.dim(0), tokens.dim(1)))
+    }
+
+    fn begin_text_partition<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        expected: &eredu_runtime::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = match input {
             EmbeddedInput::Target { tokens, mask } => (tokens, mask),
             EmbeddedInput::Draft { tokens, .. } => (tokens, None),
-        }
+        };
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+            observer,
+        )
     }
 
     fn partition_output_width(&self) -> i32 {
@@ -1295,7 +1334,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<(usize, usize), Self::Error> {
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
         let policy = self.args.layer_schedule.get(unit).ok_or_else(|| {
             Error::backend(format!(
                 "Nemotron-H has no collective order for unit {unit}"
@@ -1306,6 +1345,11 @@ where
                 "Nemotron-H routed collective selection drifted at unit {unit}"
             )));
         }
-        Ok(if routed { (0, 2) } else { (0, 1) })
+        Ok(
+            crate::partitioned_execution::RoutedTensorReductions::hidden(
+                0,
+                if routed { 2 } else { 1 },
+            ),
+        )
     }
 }

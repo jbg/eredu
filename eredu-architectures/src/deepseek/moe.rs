@@ -7,9 +7,9 @@ use eredu_nn::{
     Parameterized, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
-    RoutedExpertProvider, RoutedExpertRequest, RoutingObservation,
-    TensorParallelRoutedExpertProvider,
+    observe_and_intervene, ActivationObserver, ExpertPass, ParameterProvider,
+    ResidentExpertProvider, RoutedExpertRequest, RoutingObservation,
+    TensorParallelParameterProvider,
 };
 
 use crate::linear_format::standard_expert_projection;
@@ -176,7 +176,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         self.forward_with_provider(input, source, ExpertPass::Decode, &mut provider, context)
     }
 
-    pub fn forward_with_provider<P: RoutedExpertProvider<B>>(
+    pub fn forward_with_provider<P: ParameterProvider<B>>(
         &mut self,
         input: &B::Tensor,
         source: RouteSource<'_, B::Tensor>,
@@ -210,7 +210,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         mut reduce: F,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -284,7 +284,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         reduce: F,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
@@ -329,7 +329,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             observer,
             reduce,
             |experts, request| {
-                <ResidentExpertProvider as RoutedExpertProvider<B>>::forward_grouped(
+                <ResidentExpertProvider as ParameterProvider<B>>::forward_grouped(
                     &mut ResidentExpertProvider,
                     experts,
                     request,
@@ -421,7 +421,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {

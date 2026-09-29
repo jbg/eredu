@@ -1687,17 +1687,11 @@ extern "C" {
 }
 extern "C" {
     #[doc = " Return whether this completion event carries timestamp markers."]
-    pub fn mlx_event_has_timing(
-        has_timing: *mut bool,
-        event: mlx_event,
-    ) -> ::std::os::raw::c_int;
+    pub fn mlx_event_has_timing(has_timing: *mut bool, event: mlx_event) -> ::std::os::raw::c_int;
 }
 extern "C" {
     #[doc = " Resolve elapsed execution-timeline seconds, blocking until completion."]
-    pub fn mlx_event_elapsed(
-        seconds: *mut f64,
-        event: mlx_event,
-    ) -> ::std::os::raw::c_int;
+    pub fn mlx_event_elapsed(seconds: *mut f64, event: mlx_event) -> ::std::os::raw::c_int;
 }
 extern "C" {
     #[doc = " Query elapsed execution-timeline seconds without blocking."]
@@ -2612,6 +2606,7 @@ extern "C" {
 }
 extern "C" {
     pub fn mlx_get_active_memory(res: *mut usize) -> ::std::os::raw::c_int;
+
 }
 extern "C" {
     pub fn mlx_get_cache_memory(res: *mut usize) -> ::std::os::raw::c_int;
@@ -4931,6 +4926,12 @@ extern "C" {
 
 unsafe extern "C" {
     pub fn _mlx_array_is_available(res: *mut bool, arr: mlx_array) -> ::std::os::raw::c_int;
+    pub fn _mlx_array_storage_metadata(
+        identity: *mut usize,
+        allocator_owned: *mut bool,
+        allocator_capacity: *mut usize,
+        arr: mlx_array,
+    ) -> ::std::os::raw::c_int;
 }
 
 extern "C" {
@@ -4944,7 +4945,12 @@ extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_mixed_storage_gemm_workspace(supported: *mut bool, partial_bytes: *mut u64,
-        rows: ::std::os::raw::c_int, outputs: ::std::os::raw::c_int,
-        width: ::std::os::raw::c_int, stream: mlx_stream) -> ::std::os::raw::c_int;
+    pub fn mlx_mixed_storage_gemm_workspace(
+        supported: *mut bool,
+        partial_bytes: *mut u64,
+        rows: ::std::os::raw::c_int,
+        outputs: ::std::os::raw::c_int,
+        width: ::std::os::raw::c_int,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
 }

@@ -3,6 +3,7 @@
 mod checkpoint;
 mod config;
 pub mod hybrid;
+pub mod ingress;
 mod moe;
 mod parallel;
 pub mod vision;

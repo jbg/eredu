@@ -154,11 +154,12 @@ pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, StateError> {
             // Sharing the K/V projection does not share its cache payload:
             // learned key normalization and RoPE differ from value normalization.
             if layer == 0 {
-                LayerCachePolicy::key_value_with_fixed_state(
+                LayerCachePolicy::key_value_with_state(
                     policy.attention,
                     kv_heads,
                     head_dim,
                     vec![prefix.clone()],
+                    Vec::new(),
                 )
             } else {
                 LayerCachePolicy::key_value(policy.attention, kv_heads, head_dim)
@@ -213,7 +214,7 @@ mod tests {
         let layout = state_layout(&args()).unwrap();
         assert!(matches!(
             layout.layer(0),
-            Some(LayerCachePolicy::KeyValueWithFixedState { .. })
+            Some(LayerCachePolicy::KeyValueWithState { .. })
         ));
         assert!(matches!(
             layout.layer(1),

@@ -36,6 +36,8 @@ pub struct PreparedModelInput {
     cache_identity: Option<PreparedInputCacheIdentity>,
 }
 
+mod transfer;
+
 impl PreparedModelInput {
     fn new(parts: Vec<InputPart>) -> Result<Self, Error> {
         let inner = RuntimePreparedModelInput::new(parts, |array| {
@@ -117,6 +119,52 @@ impl PreparedModelInput {
         let mut arrays = Vec::new();
         arrays.extend(self.inner.wire_values().into_iter().cloned());
         arrays
+    }
+
+    /// Describes the selected serial host-staged copy without submitting native work.
+    /// Destination payload/count and the peak physical staging capacity are independent.
+    /// Source backing, destination allocator capacity and evaluation scratch remain outside
+    /// this per-copy report; a logical view may retain a larger source allocation.
+    pub fn transfer_resources(
+        &self,
+    ) -> Result<eredu_runtime::input_transfer::InputTransferResources, Error> {
+        use eredu_runtime::input_transfer::{InputTransferError, InputTransferResources};
+        Ok(InputTransferResources::from_identity_with_staging(
+            self.identity(),
+            |tensor| {
+                // The neutral preflight has already checked all dense wire extents.
+                let bytes =
+                    eredu_runtime::input_transfer::InputTransferResources::tensor_payload_bytes(
+                        tensor,
+                    )?;
+                let bytes = usize::try_from(bytes).map_err(|_| InputTransferError::Overflow)?;
+                safemlx::host_transfer_capacity_upper_bound(
+                    bytes,
+                    safemlx::HostTransferPolicy::Transfer,
+                )
+                .map(|bytes| bytes as u64)
+                .map_err(|error| InputTransferError::StagingUnavailable {
+                    detail: error.to_string(),
+                })
+            },
+        )?)
+    }
+
+    /// Copies every payload and metadata tensor through completion-owned host staging.
+    /// The entire request is admitted before cloning roots or allocating staging.
+    /// Each staging buffer is retired after download and upload completion, so its
+    /// physical peak is the largest single buffer rather than the sum of wire bytes.
+    /// Source and all destination arrays remain retained through final completion.
+    /// Exact structural and semantic cache identities survive the value-preserving copy.
+    /// These bounds exclude source/destination allocator capacity and graph scratch.
+    pub fn transfer_to_stream(
+        &self,
+        stream: &safemlx::Stream,
+        budget: eredu_runtime::input_transfer::InputTransferBudget,
+    ) -> Result<(Self, eredu_runtime::input_transfer::InputTransferResources), Error> {
+        let resources = self.transfer_resources()?;
+        budget.admit(resources)?;
+        transfer::copy(self, stream, resources)
     }
 
     /// Rebuilds owned prepared ingress from a validated identity and wire arrays.
@@ -336,6 +384,78 @@ mod prepared_input_identity_tests {
         assert_ne!(baseline, descriptor(ModelInput::new(&video_part)));
         assert_ne!(baseline, descriptor(ModelInput::new(&shaped_part)));
         assert_ne!(baseline, descriptor(ModelInput::new(&metadata_part)));
+    }
+
+    #[test]
+    fn explicit_input_transfer_preserves_values_identity_and_cache_under_exact_limits() {
+        use eredu_runtime::input_transfer::{InputTransferBudget, InputTransferError};
+        let stream =
+            safemlx::Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let tokens = Array::from_slice(&[16_777_217_u32, u32::MAX], &[1, 2]);
+        let pixels = Array::from_slice(&[0.5_f32, -1.25, 2.0, 17.0], &[2, 2]);
+        let grid = Array::from_slice(&[1_i32, 1, 2], &[1, 3]);
+        let parts = [
+            input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap(),
+            input_part(
+                InputModality::Image,
+                InputPayload::Tensor(pixels),
+                [(InputMetadataKey::PatchGrid, grid)],
+                [],
+            )
+            .unwrap(),
+        ];
+        let mut source = PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap();
+        source.cache_identity = Some(source.inner.cache_identity("transfer-fixture").unwrap());
+        let identity = source.identity().clone();
+        let cache_identity = source.cache_identity.clone();
+        let expected = source.transfer_resources().unwrap();
+        assert_eq!(expected.tensor_count, 3);
+        assert_eq!(expected.payload_bytes, 36);
+        assert!(expected.staging_capacity_bytes >= 16);
+        let exact = expected.into_budget();
+        for denied in [
+            InputTransferBudget {
+                tensor_count: 2,
+                ..exact
+            },
+            InputTransferBudget {
+                payload_bytes: 35,
+                ..exact
+            },
+            InputTransferBudget {
+                staging_capacity_bytes: exact.staging_capacity_bytes - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                source.transfer_to_stream(&stream, denied),
+                Err(crate::backend::error::Error::InputTransfer(
+                    InputTransferError::Exhausted { .. }
+                ))
+            ));
+        }
+        let (copied, report) = source.transfer_to_stream(&stream, exact).unwrap();
+        assert_eq!(report.tensor_count, 3);
+        assert_eq!(report.payload_bytes, 36);
+        assert_eq!(copied.identity(), &identity);
+        assert_eq!(copied.cache_identity, cache_identity);
+        drop(source);
+        drop(parts);
+        let arrays = copied.wire_arrays();
+        assert_eq!(
+            arrays[0].evaluated().unwrap().as_slice::<u32>(),
+            &[16_777_217, u32::MAX]
+        );
+        assert_eq!(
+            arrays[1].evaluated().unwrap().as_slice::<f32>(),
+            &[0.5, -1.25, 2.0, 17.0]
+        );
+        assert_eq!(arrays[2].evaluated().unwrap().as_slice::<i32>(), &[1, 1, 2]);
+        // Repeated explicit transfers remain within the same per-call staging
+        // and logical destination ceilings and retain the original semantic request identity.
+        let (again, second_report) = copied.transfer_to_stream(&stream, exact).unwrap();
+        assert_eq!(second_report, report);
+        assert_eq!(again.cache_identity, cache_identity);
     }
 
     #[test]

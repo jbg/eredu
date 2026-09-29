@@ -211,7 +211,10 @@ where
             })
             .transpose()
             .map_err(|error| PreparationSelectionError::PredictionProjection(error.into()))?
-            .map_or(0, |capacity| capacity.get());
+            .map_or(
+                capabilities.embedded_draft_layers().unwrap_or(0),
+                |capacity| capacity.get(),
+            );
         Ok((capabilities, capacity))
     });
     let (capabilities, embedded_capacity) = match capabilities {
@@ -235,7 +238,22 @@ where
             let mut report = eredu_core::assemble_portable_model_inspection(
                 &inspection,
                 preparation.admission(),
-                capabilities.input_modalities(),
+                if preparation.qwen4_construction().is_some() {
+                    match preparation.execution().processor() {
+                        Some(processor) => {
+                            let modalities = processor.modalities();
+                            eredu_core::InputModalities {
+                                text: modalities.contains(&eredu_core::InputModality::Text),
+                                image: modalities.contains(&eredu_core::InputModality::Image),
+                                audio: modalities.contains(&eredu_core::InputModality::Audio),
+                                video: modalities.contains(&eredu_core::InputModality::Video),
+                            }
+                        }
+                        None => eredu_core::InputModalities::TEXT,
+                    }
+                } else {
+                    capabilities.input_modalities()
+                },
                 capabilities.embedded_draft_layers(),
                 safetensors_processor(&inspection, media),
             );
@@ -260,15 +278,19 @@ where
                         "rank-local conversion workspace is not projected for this architecture",
                     )
                 } else {
-                    let workspace = crate::replicated_text::inspection_recipe_source(&inspection)
-                        .map_err(|error| error.to_string())
-                        .and_then(|source| {
-                            preparation.execution().parameter_materialization_workspace(
-                                source.as_ref(),
-                                None,
-                                mechanisms,
-                            )
-                        });
+                    let workspace = if let Some(target) = preparation.qwen4_construction() {
+                        target.parameter_materialization_workspace(mechanisms)
+                    } else {
+                        crate::replicated_text::inspection_recipe_source(&inspection)
+                            .map_err(|error| error.to_string())
+                            .and_then(|source| {
+                                preparation.execution().parameter_materialization_workspace(
+                                    source.as_ref(),
+                                    None,
+                                    mechanisms,
+                                )
+                            })
+                    };
                     match workspace {
                         Ok(value) => eredu_core::Observed::Available {
                             value,

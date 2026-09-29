@@ -32,6 +32,10 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedReplicatedText<
         eredu_runtime::RoutedBankId,
         crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
     >,
+    partition_row_pool: Option<(
+        crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+        eredu_runtime::SelectedRowLookupRequirements,
+    )>,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
@@ -119,6 +123,7 @@ where
             prediction: NoSelectedPrediction,
             embedded_prediction_observers: MlxEmbeddedPredictionObservers::default(),
             parameter_banks: std::collections::BTreeMap::new(),
+            partition_row_pool: None,
             #[cfg(test)]
             selected_residency,
             stream: stream.clone(),
@@ -127,6 +132,17 @@ where
             partition_sampling_rank,
             partition_public_output,
         }
+    }
+
+    pub(super) fn with_partition_row_pool(
+        mut self,
+        pool: Option<(
+            crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+            eredu_runtime::SelectedRowLookupRequirements,
+        )>,
+    ) -> Self {
+        self.partition_row_pool = pool;
+        self
     }
 
     pub(super) fn with_parameter_banks(
@@ -188,6 +204,7 @@ where
             prediction,
             embedded_prediction_observers: self.embedded_prediction_observers,
             parameter_banks: self.parameter_banks,
+            partition_row_pool: self.partition_row_pool,
             prepared_parameters: self.prepared_parameters,
             parameter_tasks: self.parameter_tasks,
             prepared_bank_parameters: self.prepared_bank_parameters,
@@ -790,12 +807,25 @@ where
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
-        if self.parameter_banks.is_empty() {
-            self.session.execution_strategy().parameter_bank_report()
+        use crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport;
+        let report = self.session.execution_strategy().parameter_bank_report()?;
+        let report = if report.is_some() || self.parameter_banks.is_empty() {
+            report
         } else {
-            self.parameter_banks.iter().map(|(id, bank)| bank.report().map(|report| (*id, report)))
-                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
-                .map(|reports| Some(crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport::new(reports)))
+            Some(ParameterBanksResidencyReport::new(
+                self.parameter_banks
+                    .iter()
+                    .map(|(id, bank)| bank.report().map(|report| (*id, report)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+            ))
+        };
+        match &self.partition_row_pool {
+            Some((pool, requirements)) => Ok(Some(
+                report
+                    .unwrap_or_else(|| ParameterBanksResidencyReport::new(Default::default()))
+                    .with_rows(pool.row_report(*requirements)?),
+            )),
+            None => Ok(report),
         }
     }
 

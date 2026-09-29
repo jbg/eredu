@@ -52,12 +52,22 @@ pub struct LogicalTensorLayout {
     pub dtype: LogicalDtype,
 }
 
+/// Explicit quantized source representation, selected without reading payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizedTensorRepresentation {
+    /// Preserve physical block bytes in one U8 output.
+    Encoded,
+    /// Decode selected blocks to one F32 output before architecture transforms.
+    DecodedF32,
+}
+
 /// One physical GGUF tensor and the logical tensors its conversion produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogTensor {
     descriptor: TensorDescriptor,
     outputs: Vec<LogicalTensorLayout>,
     affine: Option<(u8, u32)>,
+    representation: Option<QuantizedTensorRepresentation>,
 }
 
 impl CatalogTensor {
@@ -76,7 +86,58 @@ impl CatalogTensor {
 
     /// Whether this physical tensor expands into packed MXFP4 weights and scales.
     pub fn is_mxfp4(&self) -> bool {
-        self.descriptor.ggml_type == crate::GgmlType::MxFp4
+        self.representation.is_none() && self.descriptor.ggml_type == crate::GgmlType::MxFp4
+    }
+
+    /// Whether materialization preserves physical blocks in one U8 output.
+    pub fn is_encoded(&self) -> bool {
+        self.representation == Some(QuantizedTensorRepresentation::Encoded)
+    }
+
+    /// Whether selected materialization decodes physical blocks into F32.
+    pub fn is_decoded_f32(&self) -> bool {
+        self.representation == Some(QuantizedTensorRepresentation::DecodedF32)
+    }
+
+    fn read<R: Read + Seek>(
+        &self,
+        reader: &mut Reader<R>,
+        plan: Option<&TensorSelectionPlan>,
+    ) -> Result<ConvertedTensor> {
+        if self.representation.is_none() {
+            return match plan {
+                Some(plan) => reader.read_tensor_plan(plan),
+                None => reader.read_tensor(&self.descriptor),
+            };
+        }
+        let descriptor = plan.map_or(&self.descriptor, TensorSelectionPlan::selected_descriptor);
+        if self.is_decoded_f32() {
+            let bytes = descriptor
+                .element_count()?
+                .checked_mul(4)
+                .ok_or(Error::Overflow("decoded tensor allocation"))?;
+            reader.check_payload_allocation(bytes)?;
+        }
+        let data = match plan {
+            Some(plan) => reader.read_raw_plan(plan)?,
+            None => reader.read_raw(descriptor)?,
+        };
+        let encoded = crate::IQuantTensor {
+            shape: descriptor.row_major_shape(),
+            ggml_type: descriptor.ggml_type,
+            endian: reader.endian(),
+            data,
+        };
+        if self.is_decoded_f32() {
+            let values = encoded.dequantize_f32()?;
+            Ok(ConvertedTensor::Dense(crate::DenseTensor {
+                shape: encoded.shape,
+                dtype: DenseDtype::F32,
+                data: values.into_iter().flat_map(f32::to_ne_bytes).collect(),
+            }))
+        } else {
+            Ok(ConvertedTensor::IQuant(encoded))
+        }
     }
 }
 
@@ -304,6 +365,55 @@ pub struct TranslatedTensorLayout {
 }
 
 impl Checkpoint {
+    /// Selects an explicit representation for named quantized tensors.
+    /// This header-only projection replaces converted companions with one output
+    /// under the physical name. Other tensors keep their selected layouts.
+    /// Materializers, iterators and bounded selections all retain this decision.
+    pub fn into_tensor_representation(
+        mut self,
+        names: impl IntoIterator<Item = String>,
+        representation: QuantizedTensorRepresentation,
+    ) -> Result<Self> {
+        let mut remaining: std::collections::BTreeSet<_> = names.into_iter().collect();
+        for tensor in self.shards.iter_mut().flat_map(|shard| &mut shard.tensors) {
+            if !remaining.remove(&tensor.descriptor.name) {
+                continue;
+            }
+            if tensor.descriptor.ggml_type.block_and_bytes()?.0 <= 1 {
+                return Err(Error::tensor(
+                    &tensor.descriptor.name,
+                    "explicit quantized representation requires a quantized tensor",
+                ));
+            }
+            tensor.outputs = vec![LogicalTensorLayout {
+                name: tensor.descriptor.name.clone(),
+                shape: match representation {
+                    QuantizedTensorRepresentation::Encoded => iquant_packed_shape(
+                        &tensor.descriptor.row_major_shape(),
+                        tensor.descriptor.ggml_type,
+                    )?,
+                    QuantizedTensorRepresentation::DecodedF32 => {
+                        tensor.descriptor.row_major_shape()
+                    }
+                },
+                dtype: match representation {
+                    QuantizedTensorRepresentation::Encoded => LogicalDtype::U8,
+                    QuantizedTensorRepresentation::DecodedF32 => LogicalDtype::F32,
+                },
+            }];
+            tensor.affine = None;
+            tensor.representation = Some(representation);
+        }
+        if let Some(name) = remaining.first() {
+            return Err(Error::tensor(
+                name,
+                "selected tensor is not present in checkpoint",
+            ));
+        }
+        validate_logical_names(self.tensors())?;
+        Ok(self)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_limits(path, Limits::default())
     }
@@ -687,12 +797,15 @@ impl TensorMaterializer {
     pub fn converted_tensor(&mut self, name: &str) -> Result<ConvertedCheckpointTensor> {
         let (location, descriptor, _) = self.location_and_reader(name)?;
         let output_names = self.catalog_output_names(location);
-        let converted = self
-            .reader
-            .as_mut()
-            .expect("requested shard reader opened above")
-            .1
-            .read_tensor(&descriptor)
+        let converted = self.checkpoint.shards[location.shard_index].tensors[location.tensor_index]
+            .read(
+                &mut self
+                    .reader
+                    .as_mut()
+                    .expect("requested shard reader opened above")
+                    .1,
+                None,
+            )
             .map_err(|source| Error::Shard {
                 path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),
@@ -715,12 +828,15 @@ impl TensorMaterializer {
         let (location, mut descriptor, _) = self.location_and_reader(name)?;
         let output_names = self.catalog_output_names(location);
         let plan = TensorSelectionPlan::new(&descriptor, selection.clone())?;
-        let converted = self
-            .reader
-            .as_mut()
-            .expect("requested shard reader opened above")
-            .1
-            .read_tensor_plan(&plan)
+        let converted = self.checkpoint.shards[location.shard_index].tensors[location.tensor_index]
+            .read(
+                &mut self
+                    .reader
+                    .as_mut()
+                    .expect("requested shard reader opened above")
+                    .1,
+                Some(&plan),
+            )
             .map_err(|source| Error::Shard {
                 path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),
@@ -829,11 +945,8 @@ impl Iterator for ConvertedTensorIter<'_> {
                 .map(|output| output.name.clone())
                 .collect();
             self.tensor_index += 1;
-            let converted = self
-                .reader
-                .as_mut()
-                .expect("reader opened above")
-                .read_tensor(&descriptor)
+            let converted = catalog_tensor
+                .read(self.reader.as_mut().expect("reader opened above"), None)
                 .map_err(|source| Error::Shard {
                     path: shard.path.clone(),
                     source: Box::new(source),
@@ -890,6 +1003,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
                 dtype: LogicalDtype::U8,
             }],
             affine: None,
+            representation: Some(QuantizedTensorRepresentation::Encoded),
         });
     }
     if let ConversionKind::Dense(dtype) = kind {
@@ -901,6 +1015,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
                 dtype: dtype.into(),
             }],
             affine: None,
+            representation: None,
         });
     }
     if let ConversionKind::MxFp4 = kind {
@@ -923,6 +1038,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
                 },
             ],
             affine: None,
+            representation: None,
         });
     }
 
@@ -957,6 +1073,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
         descriptor: descriptor.clone(),
         outputs,
         affine: Some((bits, group_size)),
+        representation: None,
     })
 }
 

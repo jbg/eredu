@@ -35,10 +35,7 @@ impl CaptureSession {
                 bounds.validate(shape, self.prediction)?;
                 Ok(shape)
             }
-            (None, None) => self
-                .plan
-                .request()
-                .invocation_shape(self.phase, self.prediction),
+            (None, None) => self.plan.geometry_at(self.phase, self.prediction, None),
             _ => Err(CaptureError::Invalid(
                 "capture invocation geometry is not active".into(),
             )),

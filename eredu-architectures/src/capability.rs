@@ -377,7 +377,7 @@ fn neutral_deepseek_v4_spec(args: &crate::deepseek::V4Args) -> Result<Spec, Capa
     for (layer, policy) in layout.layers().iter().enumerate() {
         let attention = match policy {
             LayerCachePolicy::KeyOnly { attention, .. } => attention,
-            LayerCachePolicy::KeyOnlyWithFixedState {
+            LayerCachePolicy::KeyOnlyWithState {
                 attention, tensors, ..
             } if !tensors.is_empty()
                 && tensors
@@ -1067,6 +1067,130 @@ pub fn qwen_hybrid_text(
         finish(args.model_type.clone(), qwen_hybrid_spec(args, false)?),
         embedded_mtp_draft_source(args.mtp_num_hidden_layers),
     ))
+}
+
+/// Describes the prepared Flash-Next target role using its executable state layout.
+/// Media processors and prediction state require their own prepared roles. Native
+/// allocation overhead and execution workspaces are not persistent-state payload.
+pub fn qwen4_exp_target(
+    spec: &crate::qwen4_exp::target::TargetSpec,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let config = &spec.config;
+    let configured = positive(config.max_positions, "max_position_embeddings")?;
+    let effective = configured.min(positive(spec.limits.history_tokens, "history_tokens")?);
+    let native = match config.attention.rotary.algorithm {
+        eredu_nn::RotaryAlgorithm::Yarn {
+            original_max_positions,
+            ..
+        }
+        | eredu_nn::RotaryAlgorithm::Llama3 {
+            original_max_positions,
+            ..
+        } => positive(original_max_positions, "original_max_position_embeddings")?,
+        _ => configured,
+    };
+    let context = |value| Observed::Available {
+        value,
+        kind: ObservationKind::Exact,
+        source: "validated qwen4_exp configuration and retained execution limits".into(),
+    };
+    let attention = config
+        .layers
+        .iter()
+        .filter(|kind| matches!(kind, crate::qwen4_exp::config::LayerKind::Indexed))
+        .count() as u64;
+    Ok(finish(
+        "qwen4_exp_text".into(),
+        (
+            context(native),
+            context(effective),
+            CacheStateStrategy::HybridRecurrent {
+                full_attention_layers: attention,
+                sliding_attention: Vec::new(),
+                recurrent_layers: config.layers.len() as u64 - attention,
+            },
+            text_modalities(),
+            state_memory_layout(
+                spec.state_layout(),
+                config.hidden_size,
+                1,
+                EstimationCompleteness::PersistentStateOnly,
+            )?,
+        ),
+    ))
+}
+
+/// Joint target and embedded predictor use separately owned persistent state.
+/// Reuses the ordinary state estimate without treating predictor caches as target aliases.
+pub(crate) fn qwen4_exp_prediction(
+    target: &crate::qwen4_exp::target::TargetSpec,
+    prediction: &crate::qwen4_exp::mtp::PredictionSpec,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let mut estimate = qwen4_exp_target(target)?;
+    let prediction_state =
+        prediction
+            .state_layout()
+            .map_err(|error| CapabilityError::InvalidConfiguration {
+                field: "prediction_state_layout",
+                detail: error.to_string(),
+            })?;
+    let layers = estimate
+        .state_layout
+        .layer_layout()
+        .iter()
+        .cloned()
+        .chain(prediction_state.layers().iter().cloned())
+        .collect::<Vec<_>>();
+    let offsets = estimate
+        .state_layout
+        .layer_prefix_offsets()
+        .iter()
+        .copied()
+        .chain(prediction_state.layer_prefix_offsets())
+        .collect();
+    estimate.state_layout = StateMemoryLayout::new(
+        eredu_core::LayerSchedule::new(layers.len(), layers).map_err(|error| {
+            CapabilityError::InvalidConfiguration {
+                field: "prediction_state_layout",
+                detail: error.to_string(),
+            }
+        })?,
+        offsets,
+        estimate.state_layout.hidden_size,
+        estimate.state_layout.allocation_granularity,
+        EstimationCompleteness::PersistentStateOnly,
+    )?;
+    if let CacheStateStrategy::HybridRecurrent {
+        full_attention_layers,
+        recurrent_layers,
+        ..
+    } = &mut estimate.capabilities.state_strategy
+    {
+        for unit in &prediction.units {
+            match &unit.mixer {
+                crate::qwen4_exp::target::MixerSpec::Indexed(_) => *full_attention_layers += 1,
+                crate::qwen4_exp::target::MixerSpec::Recurrent(_) => *recurrent_layers += 1,
+            }
+        }
+    }
+    estimate.draft_source = Some(SpeculativeDraftSource::Embedded);
+    Ok(estimate)
+}
+
+/// Prepared joint image/video and target equations. Host processor dispatch and
+/// complete request workspace admission remain distinct from persistent state sizing.
+pub(crate) fn qwen4_exp_conditional(
+    spec: &crate::qwen4_exp::target::TargetSpec,
+    prediction: Option<&crate::qwen4_exp::mtp::PredictionSpec>,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let mut estimate = match prediction {
+        Some(prediction) => qwen4_exp_prediction(spec, prediction)?,
+        None => qwen4_exp_target(spec)?,
+    };
+    estimate.capabilities.effective_model_type = "qwen4_exp".into();
+    estimate.capabilities.modalities.image = true;
+    estimate.capabilities.modalities.video = true;
+    Ok(estimate)
 }
 
 /// Derives Gemma 2 context and mixed full/sliding KV residency from its schedule.

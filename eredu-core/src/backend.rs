@@ -1394,11 +1394,11 @@ pub struct TextGenerationConfig {
 }
 
 /// Bounds the number of prompt tokens processed together when the selected
-/// backend and request support incremental prefill. Media, instrumentation, or
-/// specialized execution may retain a complete pass to preserve their contracts.
+/// backend and request support incremental prefill. Architecture-required
+/// invocation limits apply even without a caller-imposed bound.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PrefillChunkPolicy {
-    /// Process the prompt in one pass.
+    /// Add no caller-imposed chunk limit; architecture invocation limits remain.
     Unchunked,
     /// Process at most this many tokens in each eligible prefill pass.
     Bounded(std::num::NonZeroUsize),
@@ -1915,13 +1915,15 @@ pub trait TextGenerationBackend: BackendProvider {
     }
 
     /// Consumes and completes one nonfinal prompt prefix without sampling.
-    /// Returns true only after replacing `prompt` with the remaining suffix.
-    /// Returning false leaves the prompt intact for the final ordinary prefill.
+    /// Returns true after replacing `prompt` with its remaining suffix or
+    /// advancing its retained prepared-input cursor by exactly one chunk.
+    /// Returning false performs no model work and retains final prefill input.
     ///
     /// Implementations must preserve cache positions and settle native work
     /// before returning true, so transient graphs do not accumulate across
-    /// chunks. Inputs with incompatible media or observation semantics retain
-    /// the full pass. The default backend does not split opaque prompts.
+    /// chunks. Captures describe this physical chunk and are drained before the
+    /// next prefix by shared facade drivers. Inputs without a supported partial
+    /// invocation contract retain the full pass.
     fn prefill_text_prefix(
         _runtime: &mut ModelRuntime<Self>,
         _prompt: &mut Self::Prompt,
@@ -2267,6 +2269,16 @@ where
         self.inner.resolve_completions_before_decode()?;
         Ok(B::take_text_capture(&mut self.inner.backend_state))
     }
+
+    /// Completes one nonfinal prefill chunk without sampling or constraint
+    /// advancement. Drain captures before advancing another chunk or token.
+    pub fn advance_prefill(
+        &mut self,
+    ) -> Result<bool, ControlledTextGenerationError<B::Error, C::Error>> {
+        self.inner
+            .advance_prefill(self.runtime)
+            .map_err(ControlledTextGenerationError::Backend)
+    }
 }
 
 impl<B, C> TextGenerationMachine<B, C>
@@ -2369,6 +2381,34 @@ where
         }))
     }
 
+    /// Completes one nonfinal prefix, preserving the remaining prompt and all
+    /// sampling/controller state. Backends return only after native completion.
+    fn advance_prefill(&mut self, runtime: &mut ModelRuntime<B>) -> Result<bool, B::Error> {
+        let max_tokens = match self.prefill {
+            PrefillChunkPolicy::Unchunked => std::num::NonZeroUsize::MAX,
+            PrefillChunkPolicy::Bounded(max_tokens) => max_tokens,
+        };
+        if self.remaining_tokens == Some(0)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
+        {
+            return Ok(false);
+        }
+        let Some(step) = self.step.take() else {
+            return Ok(false);
+        };
+        let PendingTextInput::Prefill(mut prompt) = step else {
+            self.step = Some(step);
+            return Ok(false);
+        };
+        let advanced =
+            B::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
+        self.step = Some(PendingTextInput::Prefill(prompt));
+        Ok(advanced)
+    }
+
     fn next_output(
         &mut self,
         runtime: &mut ModelRuntime<B>,
@@ -2382,6 +2422,21 @@ where
             self.step = None;
             return None;
         }
+        loop {
+            match self.advance_prefill(runtime) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
+            }
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
+            {
+                self.step = None;
+                return None;
+            }
+        }
         let step = self.step.take()?;
         if matches!(step, PendingTextInput::Decode(_)) {
             if let Err(error) = self.resolve_completions_before_decode() {
@@ -2393,30 +2448,7 @@ where
             Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
         };
         let submission = match step {
-            PendingTextInput::Prefill(mut prompt) => {
-                if let PrefillChunkPolicy::Bounded(max_tokens) = self.prefill {
-                    loop {
-                        if self
-                            .cancellation
-                            .as_ref()
-                            .is_some_and(crate::GenerationCancellationToken::is_cancelled)
-                        {
-                            return None;
-                        }
-                        match B::prefill_text_prefix(
-                            runtime,
-                            &mut prompt,
-                            max_tokens,
-                            &mut self.backend_state,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => break,
-                            Err(error) => {
-                                return Some(Err(ControlledTextGenerationError::Backend(error)))
-                            }
-                        }
-                    }
-                }
+            PendingTextInput::Prefill(prompt) => {
                 B::submit_text_prefill_decision(runtime, prompt, &decision, &mut self.backend_state)
             }
             PendingTextInput::Decode(token) => {
@@ -3277,7 +3309,9 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
     struct FixedController {
+        queries: usize,
         tokens: Vec<u32>,
         committed: usize,
     }
@@ -3286,6 +3320,7 @@ mod tests {
         type Error = Infallible;
 
         fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+            self.queries += 1;
             let mut allowed = vec![false; 64];
             allowed[self.tokens[self.committed] as usize] = true;
             Ok(TokenFilter::allowed(allowed).unwrap())
@@ -3478,6 +3513,7 @@ mod tests {
         )
         .unwrap();
         let controller = FixedController {
+            queries: 0,
             tokens: vec![7, 8],
             committed: 0,
         };
@@ -3508,8 +3544,97 @@ mod tests {
     }
 
     #[test]
+    fn detached_prefill_advances_one_completed_chunk_without_sampling() {
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver
+            .start(
+                vec![1, 2, 3, 4, 5],
+                continuation_config(2).with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
+                    std::num::NonZeroUsize::new(2).unwrap(),
+                )),
+                FixedController {
+                    queries: 0,
+                    tokens: vec![7, 8],
+                    committed: 0,
+                },
+            )
+            .unwrap();
+        assert!(driver.advance_prefill(&mut state).unwrap());
+        assert_eq!(driver.runtime().session().tokens, [1, 2]);
+        assert_eq!(state.controller().queries, 0);
+        assert_eq!(state.remaining_tokens(), Some(2));
+        assert!(matches!(
+            state.require_quiescent(),
+            Err(TextContinuationError::NotQuiescent)
+        ));
+        driver.take_completed_step(&mut state).unwrap();
+        let mut child = {
+            let boundary = driver.quiescent(&mut state).unwrap();
+            let (_, sampler, pending) = boundary.parts();
+            let Some(PendingTextInput::Prefill(pending)) = pending else {
+                panic!("pending prefill")
+            };
+            assert_eq!(pending, &[3, 4, 5]);
+            boundary.fork_host_state(
+                *sampler,
+                FixedController {
+                    queries: 0,
+                    tokens: vec![7, 8],
+                    committed: 0,
+                },
+                Some(PendingTextInput::Prefill(pending.clone())),
+                Some(2),
+            )
+        };
+        // The child shares only execution authority, with its own remaining cursor.
+        assert!(driver.advance_prefill(&mut child).unwrap());
+        driver.take_completed_step(&mut child).unwrap();
+        assert_eq!(driver.runtime().session().tokens, [1, 2, 3, 4]);
+        assert!(state.is_prefill_pending());
+        assert_eq!(child.controller().queries, 0);
+        assert!(!driver.advance_prefill(&mut child).unwrap());
+        assert_eq!(driver.advance(&mut child).unwrap().unwrap().token_id(), 7);
+        driver.take_completed_step(&mut child).unwrap();
+        assert_eq!(child.controller().queries, 1);
+        assert_eq!(child.controller().committed, 1);
+        assert_eq!(child.remaining_tokens(), Some(1));
+        assert_eq!(driver.runtime().session().prefill_lengths, [2, 2, 1]);
+    }
+
+    #[test]
+    fn detached_prefill_cancellation_keeps_sampler_and_pending_input_untouched() {
+        let cancellation = crate::GenerationCancellationToken::new();
+        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver
+            .start(
+                vec![1, 2, 3, 4, 5],
+                continuation_config(2).with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
+                    std::num::NonZeroUsize::new(2).unwrap(),
+                )),
+                FixedController {
+                    queries: 0,
+                    tokens: vec![7, 8],
+                    committed: 0,
+                },
+            )
+            .unwrap();
+        state.set_cancellation_token(cancellation.clone());
+        assert!(driver.advance_prefill(&mut state).unwrap());
+        driver.take_completed_step(&mut state).unwrap();
+        cancellation.cancel();
+        assert!(!driver.advance_prefill(&mut state).unwrap());
+        assert!(driver.advance(&mut state).unwrap().is_none());
+        assert_eq!(state.controller().queries, 0);
+        assert_eq!(state.controller().committed, 0);
+        assert_eq!(driver.runtime().session().tokens, [1, 2]);
+    }
+
+    #[test]
     fn detached_ordinary_continuation_preserves_pending_input_and_commit_order() {
         let controller = || FixedController {
+            queries: 0,
             tokens: vec![7, 8, 9],
             committed: 0,
         };

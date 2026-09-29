@@ -6,8 +6,7 @@ use eredu_nn::{
     TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ParameterProvider, ResidentExpertProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
 use crate::linear_format::standard_expert_projection;
@@ -231,7 +230,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.gate.select(input, context)?;
@@ -266,7 +265,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
     ) -> Result<B::Tensor, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = eredu_runtime::select_routes_with_observer(
@@ -328,7 +327,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
     ) -> Result<B::Tensor, Error>
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = eredu_runtime::select_routes_with_observer(
@@ -394,8 +393,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
     }
 
     // The block's routing seam is a sibling of its always-executed shared branch.
-    // Preserve the existing public routing-path convention and scope the shared
-    // unary driver to the same logical invocation, including appended MTP units.
+    // The shared unary driver uses the public routing path for the same logical
+    // invocation, including appended MTP units.
     fn forward_shared_observed<O>(
         &mut self,
         routing_path: &str,
@@ -435,7 +434,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         provider: &mut P,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.gate.select(input, context)?;

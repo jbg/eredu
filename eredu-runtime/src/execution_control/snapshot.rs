@@ -196,6 +196,13 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     > {
         driver.advance(&mut self.state)
     }
+    /// Completes one nonfinal prompt chunk through the ordinary driver.
+    pub fn advance_prefill(
+        &mut self,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+    ) -> Result<bool, eredu_core::TextContinuationError<B::Error, C::Error>> {
+        driver.advance_prefill(&mut self.state)
+    }
     /// Settles and drains this continuation's bounded record step.
     pub fn take_completed_step(
         &mut self,

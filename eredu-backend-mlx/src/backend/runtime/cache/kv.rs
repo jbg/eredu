@@ -95,6 +95,20 @@ pub trait KeyValueCache {
         Ok(None)
     }
 
+    /// Reads only the explicitly selected absolute history positions.
+    fn paged_indexed_attention(
+        &mut self,
+        _input: &eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        if self.is_paged() {
+            return Err(Exception::custom(
+                "paged cache lacks selected-position history access",
+            ));
+        }
+        Ok(None)
+    }
+
     /// Adds keys and values for an immediate attention operation.
     ///
     /// Paged implementations return only the submitted arrays because the
@@ -127,8 +141,8 @@ pub use compressed::CompressedLatentCache;
 
 mod paged;
 pub use paged::{
-    LiveKeyValueCache, PagedKeyValueCache, PagedKeyValueTransactionCheckpoint,
-    PagedLatentAttentionBlock,
+    LiveKeyValueCache, MlxPagedAppendStream, PagedKeyValueCache,
+    PagedKeyValueTransactionCheckpoint, PagedLatentAttentionBlock,
 };
 
 mod attention;

@@ -11,7 +11,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     AddressableGroupedBank, IndexedMovement, ParameterBankAcquisition, ParameterBankKey,
-    RoutedBankId, RoutedExpertProvider, RoutedExpertRequest,
+    ParameterProvider, RoutedBankId, RoutedExpertRequest,
 };
 
 use crate::{ExpertRealizationPlan, ExpertResidencyCatalog};
@@ -190,9 +190,15 @@ pub struct PreparedRoutedTextArchitecture<A> {
     text: crate::replicated_text::PreparedReplicatedTextArchitecture<A>,
     bank_residency: eredu_runtime::ParameterBankResidency,
     banks: BTreeMap<RoutedBankId, SelectedRoutedBank>,
+    rows: Option<eredu_runtime::SelectedRowLookups>,
 }
 
 impl<A> PreparedRoutedTextArchitecture<A> {
+    /// Exact row mechanisms selected before architecture/session construction.
+    pub fn row_lookups(&self) -> Option<&eredu_runtime::SelectedRowLookups> {
+        self.rows.as_ref()
+    }
+
     /// Shared text architecture and exact prepared sources.
     pub const fn text(&self) -> &crate::replicated_text::PreparedReplicatedTextArchitecture<A> {
         &self.text
@@ -212,8 +218,14 @@ impl<A> PreparedRoutedTextArchitecture<A> {
         crate::replicated_text::PreparedReplicatedTextModules<A>,
         eredu_runtime::ParameterBankResidency,
         BTreeMap<RoutedBankId, SelectedRoutedBank>,
+        Option<eredu_runtime::SelectedRowLookups>,
     ) {
-        (self.text.into_modules(), self.bank_residency, self.banks)
+        (
+            self.text.into_modules(),
+            self.bank_residency,
+            self.banks,
+            self.rows,
+        )
     }
 }
 
@@ -318,8 +330,9 @@ pub(crate) fn project_addressable_members(
     catalog: &ExpertResidencyCatalog,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
 ) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
-    let tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
+    let mut tasks = eredu_runtime::replicated_text_materialization_tasks(selected)
         .map_err(|error| RoutedTextPreparationError::Invalid(error.to_string()))?;
+    tasks.extend_from_slice(selected.auxiliary_materialization_tasks());
     project_addressable_members_with_tasks(catalog, selected, &tasks)
 }
 
@@ -346,7 +359,10 @@ fn project_bank_members_with_tasks(
     tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
     include_replicated: bool,
 ) -> Result<Vec<eredu_runtime::AddressableBankMember>, RoutedTextPreparationError> {
-    let selected_tasks = index_materialization_tasks(selected.materialization_tasks());
+    let mut selected_tasks = index_materialization_tasks(selected.materialization_tasks());
+    selected_tasks.extend(index_materialization_tasks(
+        selected.auxiliary_materialization_tasks(),
+    ));
     let mut exact_tasks = BTreeMap::new();
     for task in tasks {
         if exact_tasks.insert(task.name(), task).is_some() {
@@ -581,6 +597,7 @@ pub(crate) fn validate_selected_routed_handoff(
 ) -> Result<(), RoutedTextPreparationError> {
     if selected.text().requirements() != expected.text()
         || selected.banks.len() != expected.banks.len()
+        || selected.rows != expected.rows
     {
         return Err(RoutedTextPreparationError::Invalid(
             "selected realization differs from admitted routed requirements".into(),
@@ -666,7 +683,11 @@ where
 {
     let expected = routed_text_requirements(inspection).map_err(|error| error.to_string())?;
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )?;
     let args = k2_horizon_args(inspection).ok_or("expected K2 Horizon configuration")?;
     let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
         .then(|| crate::k2_horizon::LayeredModel::<B>::new(args.clone(), context))
@@ -683,6 +704,7 @@ where
         source_architecture,
         expected,
         selected,
+        None,
         capability,
         "k2_horizon".into(),
         identity,
@@ -709,8 +731,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -725,7 +751,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -763,6 +790,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -785,8 +813,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -801,7 +833,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -839,6 +872,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -858,8 +892,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -880,7 +918,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -918,6 +957,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -943,8 +983,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -967,7 +1011,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -1005,6 +1050,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -1027,8 +1073,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1055,7 +1105,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -1093,6 +1144,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -1114,8 +1166,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1138,7 +1194,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -1176,6 +1233,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -1197,8 +1255,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1221,7 +1283,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Gated(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -1259,6 +1322,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -1281,8 +1345,12 @@ where
         RoutedTextRequirementsError::Invalid(detail) => RoutedTextPreparationError::Invalid(detail),
     })?;
     validate_selected_routed_handoff(&expected, &selected)?;
-    crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
-        .map_err(RoutedTextPreparationError::Invalid)?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )
+    .map_err(RoutedTextPreparationError::Invalid)?;
     let args = match (
         inspection.architecture_plan().safetensors_architecture(),
         inspection.architecture_plan().gguf_plan(),
@@ -1305,7 +1373,8 @@ where
         },
         _ => return Err(RoutedTextPreparationError::Ineligible),
     };
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, None).map_err(RoutedTextPreparationError::Invalid)?;
     let SelectedRoutedBank { plan, catalog, .. } = banks[&RoutedBankId::new(0)].clone();
     let RoutedGroupedPlan::Relu2(plan) = plan else {
         return Err(RoutedTextPreparationError::Invalid(
@@ -1342,6 +1411,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -1413,6 +1483,32 @@ where
 
     /// Called immediately before architecture construction begins.
     fn construction_started(&mut self) {}
+
+    /// Binds a retained prediction preparation and its distinct source authorities.
+    /// Family selection and equations stay in the architecture-owned preparation.
+    fn visit_prediction<A, W>(
+        self,
+        _prepared: PreparedRoutedTextArchitecture<A>,
+        _prediction: W,
+        _target_source: eredu_checkpoint::store::SharedCheckpointSource,
+        _provider_source: eredu_checkpoint::store::SharedCheckpointSource,
+        _binding: crate::prepared_execution::PredictionBinding,
+    ) -> Result<Self::Output, RoutedTextDispatchError<Self::Error>>
+    where
+        Self: Sized,
+        B: eredu_nn::BlockwiseAttentionBackend
+            + eredu_nn::DistributedNeuralBackend
+            + eredu_nn::HyperNeuralBackend,
+        A: eredu_runtime::ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::StaticModules: Clone,
+        W: crate::prediction_extension::PreparedRoutedPrediction<B, A>,
+    {
+        Err(RoutedTextDispatchError::Architecture(
+            "retained routed prediction binding is unavailable".into(),
+        ))
+    }
 
     /// Binds one architecture-owned prepared handoff to backend mechanisms.
     fn visit<A>(
@@ -2048,9 +2144,41 @@ impl RoutedBankRequirements {
 pub struct RoutedTextRequirements {
     text: eredu_runtime::ReplicatedTextRequirements,
     banks: BTreeMap<RoutedBankId, RoutedBankRequirements>,
+    rows: Option<eredu_runtime::SelectedRowLookupPlans>,
 }
 
 impl RoutedTextRequirements {
+    /// Exact row mechanisms selected before architecture/session construction.
+    pub fn row_lookups(&self) -> Option<&eredu_runtime::SelectedRowLookupPlans> {
+        self.rows.as_ref()
+    }
+
+    /// Adds independently selected row mechanisms to the cold requirements.
+    /// Descriptors, owners and budgets are validated before text realization selection.
+    pub fn with_row_lookups(
+        mut self,
+        rows: eredu_runtime::SelectedRowLookupPlans,
+    ) -> Result<Self, RoutedTextRequirementsError> {
+        rows.descriptors()
+            .validate_other_banks(self.banks.keys().map(|id| id.value() as usize))
+            .map_err(|e| RoutedTextRequirementsError::Invalid(e.to_string()))?;
+        for entry in rows.descriptors().entries().values() {
+            if entry.spec().unit >= self.text.execution_units().len()
+                || self
+                    .text
+                    .parameters()
+                    .iter()
+                    .any(|p| p.name() == entry.spec().parameter.as_str())
+            {
+                return Err(RoutedTextRequirementsError::Invalid(format!(
+                    "row parameter {} has an invalid owner or duplicates an ordinary parameter",
+                    entry.spec().parameter
+                )));
+            }
+        }
+        self.rows = (!rows.descriptors().entries().is_empty()).then_some(rows);
+        Ok(self)
+    }
     pub(crate) fn with_state_layout(
         mut self,
         layout: eredu_runtime::StateLayout,
@@ -2155,12 +2283,25 @@ pub(crate) fn gated_routed_text_requirements_with_routes(
     RoutedTextRequirements::new(text, [(RoutedBankId::new(0), bank)], recipe_source)
 }
 
+fn bind_row_sources(
+    selected: Option<eredu_runtime::SelectedRowLookupPlans>,
+    sources: Option<eredu_runtime::PreparedRowLookups>,
+) -> Result<Option<eredu_runtime::SelectedRowLookups>, String> {
+    match (selected, sources) {
+        (None, None) => Ok(None),
+        (Some(plan), Some(sources)) => plan.bind(sources).map(Some).map_err(|e| e.to_string()),
+        _ => Err("prepared row source presence differs from selected row mechanisms".into()),
+    }
+}
+
+/// Validates a complete cold routed selection before constructing its shared module handoff.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_routed_architecture_handoff<B, S, A>(
+pub fn prepare_routed_architecture_handoff<B, S, A>(
     architecture: A,
     source_architecture: Option<A>,
     expected: RoutedTextRequirements,
     selected: SelectedRoutedTextRealization,
+    row_sources: Option<eredu_runtime::PreparedRowLookups>,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
     prompt_cache_architecture_identity: String,
@@ -2174,7 +2315,8 @@ where
     A::StaticModules: Clone,
 {
     validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
-    let (text, bank_residency, banks) = selected.into_parts();
+    let (text, bank_residency, banks, rows) = selected.into_parts();
+    let rows = bind_row_sources(rows, row_sources)?;
     let targets = if matches!(
         bank_residency,
         eredu_runtime::ParameterBankResidency::IndependentCache(_)
@@ -2206,6 +2348,7 @@ where
         text: prepared,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -2327,9 +2470,15 @@ pub struct SelectedRoutedTextRealization {
     text: eredu_runtime::SelectedReplicatedTextRealization,
     bank_residency: eredu_runtime::ParameterBankResidency,
     banks: BTreeMap<RoutedBankId, SelectedRoutedBank>,
+    rows: Option<eredu_runtime::SelectedRowLookupPlans>,
 }
 
 impl SelectedRoutedTextRealization {
+    /// Exact row mechanisms selected before architecture/session construction.
+    pub fn row_lookups(&self) -> Option<&eredu_runtime::SelectedRowLookupPlans> {
+        self.rows.as_ref()
+    }
+
     /// Selected shared text-session realization.
     pub const fn text(&self) -> &eredu_runtime::SelectedReplicatedTextRealization {
         &self.text
@@ -2361,8 +2510,9 @@ impl SelectedRoutedTextRealization {
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ParameterBankResidency,
         BTreeMap<RoutedBankId, SelectedRoutedBank>,
+        Option<eredu_runtime::SelectedRowLookupPlans>,
     ) {
-        (self.text, self.bank_residency, self.banks)
+        (self.text, self.bank_residency, self.banks, self.rows)
     }
 }
 
@@ -2384,7 +2534,10 @@ fn maximum_selected_compact_bytes(
     requirements: &RoutedBankRequirements,
     selected: &eredu_runtime::SelectedReplicatedTextRealization,
 ) -> Result<u64, String> {
-    let tasks = index_materialization_tasks(selected.materialization_tasks());
+    let mut tasks = index_materialization_tasks(selected.materialization_tasks());
+    tasks.extend(index_materialization_tasks(
+        selected.auxiliary_materialization_tasks(),
+    ));
     let mut by_unit = BTreeMap::<(String, usize), Vec<u64>>::new();
     for unit in requirements.catalog().units() {
         let (_, selected_bytes) = selected_member_geometry(unit, &tasks)?;
@@ -2439,6 +2592,16 @@ pub fn select_routed_text_realization(
         .err()
         .map(|error| error.issues().to_vec())
         .unwrap_or_default();
+    let rows = requirements.rows.clone();
+    if let (Some(rows), eredu_runtime::ParameterBankResidency::IndependentCache(options)) =
+        (&rows, bank_residency)
+    {
+        if rows.options() != options {
+            issues.push(
+                "row and grouped banks must use the same selected pool and workspace policy".into(),
+            );
+        }
+    }
     if let eredu_runtime::ParameterBankResidency::IndependentCache(options) = bank_residency {
         if !capabilities.indexed_movement() {
             issues.push("indexed selection and movement".into());
@@ -2522,6 +2685,7 @@ pub fn select_routed_text_realization(
         text,
         bank_residency,
         banks,
+        rows,
     })
 }
 
@@ -2562,6 +2726,7 @@ fn select_projection_format(
     let executable = text
         .parameters()
         .iter()
+        .chain(text.auxiliary_parameters())
         .find(|parameter| parameter.name() == weight)
         .map(eredu_runtime::SelectedParameterRealization::executable)
         .ok_or_else(|| format!("grouped projection {weight:?} has no selected realization"))?;
@@ -3054,6 +3219,7 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
     let requirements = text
         .parameters()
         .iter()
+        .chain(text.auxiliary_parameters())
         .map(|parameter| (parameter.name(), parameter))
         .collect::<BTreeMap<_, _>>();
     let mut occurrences = BTreeMap::<&str, usize>::new();
@@ -3421,7 +3587,7 @@ impl PlannedResidentGatedProduct {
     }
 }
 
-impl<B> RoutedExpertProvider<B> for PlannedResidentGatedProduct
+impl<B> ParameterProvider<B> for PlannedResidentGatedProduct
 where
     B: GroupedNeuralBackend,
 {
@@ -3556,7 +3722,7 @@ where
     }
 }
 
-impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for PlannedResidentGatedProduct
+impl<B> eredu_runtime::TensorParallelParameterProvider<B> for PlannedResidentGatedProduct
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
@@ -3695,9 +3861,9 @@ pub struct PlannedResidentRelu2 {
 
 /// Provider installed on a pipeline rank whose exact local routed catalog is empty.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct EmptyPartitionRoutedExpertProvider;
+pub struct EmptyPartitionParameterProvider;
 
-impl<B> RoutedExpertProvider<B> for EmptyPartitionRoutedExpertProvider
+impl<B> ParameterProvider<B> for EmptyPartitionParameterProvider
 where
     B: GroupedNeuralBackend,
 {
@@ -3738,7 +3904,7 @@ where
     }
 }
 
-impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for EmptyPartitionRoutedExpertProvider
+impl<B> eredu_runtime::TensorParallelParameterProvider<B> for EmptyPartitionParameterProvider
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
@@ -3816,7 +3982,7 @@ impl PlannedResidentRelu2 {
     }
 }
 
-impl<B> RoutedExpertProvider<B> for PlannedResidentRelu2
+impl<B> ParameterProvider<B> for PlannedResidentRelu2
 where
     B: GroupedNeuralBackend,
 {
@@ -3888,7 +4054,7 @@ where
     }
 }
 
-impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for PlannedResidentRelu2
+impl<B> eredu_runtime::TensorParallelParameterProvider<B> for PlannedResidentRelu2
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
@@ -4373,12 +4539,12 @@ where
             .iter()
             .map(|(id, bank)| {
                 let provider: Box<
-                    dyn eredu_runtime::TensorParallelRoutedExpertProvider<
+                    dyn eredu_runtime::TensorParallelParameterProvider<
                         B,
                         Error = RoutedTextExecutionError,
                     >,
                 > = if bank.plan().local_global_group_indices().is_empty() {
-                    Box::new(EmptyPartitionRoutedExpertProvider)
+                    Box::new(EmptyPartitionParameterProvider)
                 } else {
                     Box::new(PartitionUnitProvider::new(
                         bank,
@@ -4894,7 +5060,7 @@ where
     }
 }
 
-impl<B, Bank, Movement> RoutedExpertProvider<B>
+impl<B, Bank, Movement> ParameterProvider<B>
     for PlannedAddressableGrouped<GatedProductOperation, B, Bank, Movement>
 where
     B: GroupedNeuralBackend,
@@ -5166,7 +5332,7 @@ where
     }
 }
 
-impl<B, Bank, Movement> eredu_runtime::TensorParallelRoutedExpertProvider<B>
+impl<B, Bank, Movement> eredu_runtime::TensorParallelParameterProvider<B>
     for PlannedAddressableGrouped<GatedProductOperation, B, Bank, Movement>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
@@ -5209,7 +5375,7 @@ where
     }
 }
 
-impl<B, Bank, Movement> eredu_runtime::TensorParallelRoutedExpertProvider<B>
+impl<B, Bank, Movement> eredu_runtime::TensorParallelParameterProvider<B>
     for PlannedAddressableGrouped<Relu2Operation, B, Bank, Movement>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
@@ -5242,7 +5408,7 @@ where
     }
 }
 
-impl<B, Bank, Movement> RoutedExpertProvider<B>
+impl<B, Bank, Movement> ParameterProvider<B>
     for PlannedAddressableGrouped<Relu2Operation, B, Bank, Movement>
 where
     B: GroupedNeuralBackend,
@@ -6453,7 +6619,7 @@ impl<B: GroupedNeuralBackend> RoutedGroupedOperation<B> for LinearOperation {
 pub type PlannedAddressableLinear<B, Bank, Movement> =
     PlannedAddressableGrouped<LinearOperation, B, Bank, Movement>;
 
-impl<B, Bank, Movement> RoutedExpertProvider<B> for PlannedAddressableLinear<B, Bank, Movement>
+impl<B, Bank, Movement> ParameterProvider<B> for PlannedAddressableLinear<B, Bank, Movement>
 where
     B: GroupedNeuralBackend,
     Bank: AddressableGroupedBank<B>,

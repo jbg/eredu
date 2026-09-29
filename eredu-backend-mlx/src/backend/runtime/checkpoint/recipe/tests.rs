@@ -108,6 +108,21 @@ fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
 #[test]
 fn cold_workspace_counts_native_copies_without_reading_payloads() {
     let (_directory, store) = fixture();
+    struct Header(eredu_checkpoint::store::TensorMetadata);
+    impl RecipeCatalog for Header {
+        fn tensor_metadata(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+        {
+            if key == self.0.name {
+                Ok(self.0.clone())
+            } else {
+                Err(eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
+            }
+        }
+    }
+    let header = Header(store.source_metadata("left").unwrap());
     let direct = DerivedWeightRecipe::source("left", TensorSelection::Full);
     let converted = DerivedWeightRecipe::Cast {
         input: Box::new(direct.clone()),
@@ -120,19 +135,10 @@ fn cold_workspace_counts_native_copies_without_reading_payloads() {
             indices: vec![1],
         },
     };
-    #[cfg(not(feature = "cuda"))]
-    assert_eq!(
-        native_recipe_workspace(&direct, store.as_ref()).unwrap(),
-        16
-    );
-    assert_eq!(
-        native_recipe_workspace(&converted, store.as_ref()).unwrap(),
-        64
-    );
-    assert_eq!(
-        native_recipe_workspace(&selected, store.as_ref()).unwrap(),
-        72
-    );
+    // Source copy, retained source value and final contiguous output are bounded.
+    assert_eq!(native_recipe_workspace(&direct, &header).unwrap(), 48);
+    assert_eq!(native_recipe_workspace(&converted, &header).unwrap(), 64);
+    assert_eq!(native_recipe_workspace(&selected, &header).unwrap(), 72);
     assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
 }
 
@@ -972,4 +978,96 @@ fn neg_log_eager_preparation_hands_back_exact_source_lease_until_submission_fini
         Err(WeightRecipeError::NonNegativeNegLogInput)
     ));
     drop(store.acquire_lease(request("other")).unwrap());
+}
+
+#[test]
+fn selected_decoded_gguf_source_binds_as_f32_and_retains_physical_read_bound() {
+    use eredu_checkpoint::{
+        gguf_store::GgufWeightStore,
+        schema::{
+            CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+            TensorOperation,
+        },
+        store::{CheckpointSource, WeightStore},
+    };
+    use eredu_gguf::{Checkpoint, GgmlType, QuantizedTensorRepresentation, TensorInput, Writer};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("view.gguf");
+    let mut bytes = Vec::new();
+    for scale in [0.25, 0.5, 0.75, 1.] {
+        bytes.extend(half::f16::from_f32(scale).to_le_bytes());
+        bytes.extend((0..16).map(|i| i | ((15 - i) << 4)));
+    }
+    Writer::default()
+        .write(
+            std::fs::File::create(&path).unwrap(),
+            &Default::default(),
+            &[TensorInput {
+                name: "matrix.weight",
+                dimensions: &[32, 4],
+                ggml_type: GgmlType::Q4_0,
+                data: &bytes,
+            }],
+        )
+        .unwrap();
+    let checkpoint = Checkpoint::open(&path)
+        .unwrap()
+        .into_tensor_representation(
+            ["matrix.weight".into()],
+            QuantizedTensorRepresentation::DecodedF32,
+        )
+        .unwrap();
+    let mapping = checkpoint.translated_outputs(str::to_owned).unwrap();
+    let plan = GgufCheckpointPlan::new(
+        "scalar view",
+        vec![GgufTensorConstraint::required(
+            "matrix.weight",
+            vec![4, 32],
+            GgufTypeConstraint::OperationClass(TensorOperation::Matrix),
+        )],
+        vec![],
+        CatalogPolicy::strict(),
+    )
+    .unwrap();
+    let store = GgufWeightStore::builder()
+        .add_checkpoint(checkpoint, &plan, &mapping)
+        .unwrap()
+        .build()
+        .unwrap();
+    let recipe = DerivedWeightRecipe::source(
+        "matrix.weight",
+        TensorSelection::Range {
+            axis: 0,
+            start: 1,
+            end: 2,
+        },
+    );
+    // Cold scratch covers raw encoded input and both F32 host vectors during
+    // conversion, as well as the native output lifetime, without payload reads.
+    assert!(native_recipe_workspace(&recipe, &store).unwrap() >= 18 + 2 * 128);
+    assert_eq!(
+        CheckpointSource::source_diagnostics(&store)
+            .unwrap()
+            .physical_reads,
+        0
+    );
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let array = recipe.materialize(&store, &stream).unwrap();
+    assert_eq!(array.shape(), &[1, 32]);
+    let output = array.evaluated().unwrap();
+    let expected: Vec<f32> = (0..32)
+        .map(|i| ((if i < 16 { i } else { 31 - i }) as f32 - 8.) * 0.5)
+        .collect();
+    assert_eq!(output.as_slice::<f32>(), expected);
+    assert_eq!(recipe.infer(&store).unwrap().shape, [1, 32]);
+    assert_eq!(recipe.infer(&store).unwrap().byte_len, 128);
+    let diagnostics = CheckpointSource::source_diagnostics(&store).unwrap();
+    assert_eq!(diagnostics.physical_reads, 1);
+    assert_eq!(diagnostics.physical_read_bytes, 18);
+    assert_eq!(
+        WeightStore::metadata(&store, "matrix.weight")
+            .unwrap()
+            .encoded_byte_len,
+        512
+    );
 }

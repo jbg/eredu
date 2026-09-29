@@ -137,7 +137,15 @@ impl GenerationForecastBackend for MlxBackend<'_> {
         prompt: Option<&Self::Prompt>,
         instrumented: bool,
     ) -> ForecastExecutionContract {
-        let full_pass_reason = if instrumented {
+        let full_pass_reason = if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .supports_retained_prefill()
+        {
+            None
+        } else if instrumented {
             Some("capture or intervention requires one complete prefill invocation".into())
         } else if let Err(reason) = Self::text_prefill_chunking_support(runtime) {
             Some(reason.into())

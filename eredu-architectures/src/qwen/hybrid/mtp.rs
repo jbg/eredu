@@ -4,7 +4,7 @@ use eredu_nn::{
     AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
     NormalizationOperator, NormalizationScale, ParameterSpec, Parameterized, Tensor,
 };
-use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
+use eredu_runtime::{ParameterProvider, ResidentExpertProvider, RuntimeStateComponents};
 
 use crate::decoder::ComponentInstrumentation;
 
@@ -213,7 +213,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_decoder(
@@ -246,7 +246,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -287,7 +287,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_decoder(
@@ -321,7 +321,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {

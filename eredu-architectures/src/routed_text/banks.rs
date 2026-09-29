@@ -247,7 +247,7 @@ where
     }
 }
 
-impl<B> RoutedExpertProvider<B> for PlannedResidentBank
+impl<B> ParameterProvider<B> for PlannedResidentBank
 where
     B: GroupedNeuralBackend,
 {
@@ -260,10 +260,10 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_grouped(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_grouped(p, resident, request, context)
             }
             Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
@@ -278,10 +278,10 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_compact_grouped(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_compact_grouped(p, resident, request, context)
             }
             Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
@@ -296,10 +296,10 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_relu2_routed(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_relu2_routed(p, resident, request, context)
             }
             Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
@@ -314,10 +314,10 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_linear_routed(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_linear_routed(p, resident, request, context)
             }
             Self::Linear {
                 owner_group,
@@ -355,7 +355,7 @@ where
     }
 }
 
-impl<B, Bank, Movement> RoutedExpertProvider<B> for PlannedAddressableBank<B, Bank, Movement>
+impl<B, Bank, Movement> ParameterProvider<B> for PlannedAddressableBank<B, Bank, Movement>
 where
     B: GroupedNeuralBackend,
     Bank: AddressableGroupedBank<B>,
@@ -372,13 +372,13 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_grouped(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_grouped(p, resident, request, context)
             }
             Self::Linear(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_grouped(p, resident, request, context)
             }
         }
     }
@@ -390,13 +390,13 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_compact_grouped(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_compact_grouped(p, resident, request, context)
             }
             Self::Linear(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+                ParameterProvider::<B>::forward_compact_grouped(p, resident, request, context)
             }
         }
     }
@@ -408,13 +408,13 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_relu2_routed(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_relu2_routed(p, resident, request, context)
             }
             Self::Linear(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_relu2_routed(p, resident, request, context)
             }
         }
     }
@@ -426,33 +426,60 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         match self {
             Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_linear_routed(p, resident, request, context)
             }
             Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_linear_routed(p, resident, request, context)
             }
             Self::Linear(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+                ParameterProvider::<B>::forward_linear_routed(p, resident, request, context)
             }
         }
     }
 }
 
 impl<A> PreparedRoutedTextArchitecture<A> {
-    /// Constructs resident execution for every selected bank through the shared session driver.
-    pub fn construct_resident_session<B, M>(
+    fn validate_row_provider<B: eredu_nn::NeuralBackend, L: eredu_runtime::RowLookupProvider<B>>(
+        &self,
+        provider: &Option<L>,
+    ) -> Result<(), String> {
+        match (&self.rows, provider) {
+            (None, None) => Ok(()),
+            (Some(selected), Some(provider)) => {
+                for id in selected.prepared().entries().keys() {
+                    if !provider.has_row_parameter(id) {
+                        return Err(format!("missing selected row provider {id}"));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("row provider presence differs from the cold selection".into()),
+        }
+    }
+    /// Constructs resident execution through the shared session driver, returning
+    /// moved auxiliary banks for prediction or other separately materialized roles.
+    /// All providers are constructed once before splitting their ownership.
+    pub fn construct_resident_session<B, M, L>(
         self,
         mechanisms: M,
+        rows: Option<L>,
+        auxiliary_banks: &[RoutedBankId],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
-        eredu_runtime::ReplicatedTextSession<
-            A,
-            B,
-            M,
-            eredu_runtime::RoutedReplicatedTextExecution<
-                eredu_runtime::RoutedBankProviders<PlannedResidentBank>,
+        (
+            eredu_runtime::ReplicatedTextSession<
+                A,
+                B,
+                M,
+                eredu_runtime::RoutedReplicatedTextExecution<
+                    eredu_runtime::ParameterProviders<
+                        eredu_runtime::RoutedBankProviders<PlannedResidentBank>,
+                        Option<L>,
+                    >,
+                >,
             >,
-        >,
+            Option<eredu_runtime::RoutedBankProviders<PlannedResidentBank>>,
+        ),
         String,
     >
     where
@@ -465,8 +492,10 @@ impl<A> PreparedRoutedTextArchitecture<A> {
         A::Error: std::fmt::Display,
         M::PolicyError: std::fmt::Display,
         M::Error: std::fmt::Display,
+        L: eredu_runtime::RowLookupProvider<B>,
     {
-        let (mut modules, residency, banks) = self.into_parts();
+        self.validate_row_provider::<B, L>(&rows)?;
+        let (mut modules, residency, banks, _) = self.into_parts();
         if residency != eredu_runtime::ParameterBankResidency::WithLayer {
             return Err("selected banks are not resident with their layers".into());
         }
@@ -475,33 +504,52 @@ impl<A> PreparedRoutedTextArchitecture<A> {
             .map(|(id, bank)| PlannedResidentBank::from_selected(bank).map(|p| (id, p)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        let providers =
+        let mut providers =
             eredu_runtime::RoutedBankProviders::new(providers).map_err(|e| e.to_string())?;
+        let auxiliary = providers
+            .split_off(auxiliary_banks)
+            .map_err(|e| e.to_string())?;
         eredu_runtime::construct_replicated_text_session_with_execution(
             modules.take_architecture(),
             modules.take_source_architecture(),
             modules.take_contract(),
             mechanisms,
-            eredu_runtime::RoutedReplicatedTextExecution::new(providers),
+            eredu_runtime::RoutedReplicatedTextExecution::new(eredu_runtime::ParameterProviders {
+                grouped: providers,
+                rows,
+            }),
             context,
         )
+        .map(|session| (session, auxiliary))
         .map_err(|e| e.to_string())
     }
-    /// Constructs addressable execution for every selected bank through the shared session driver.
-    pub fn construct_addressable_session<B, M, Bank, Movement>(
+    /// Constructs addressable execution and returns separately owned auxiliary banks.
+    /// Native banks must cover the complete selected collection and share the admitted
+    /// residency accounting before ownership is split; budgets are not reconstructed.
+    pub fn construct_addressable_session<B, M, Bank, Movement, L>(
         self,
         mechanisms: M,
         native_banks: BTreeMap<RoutedBankId, (Bank, Movement)>,
+        rows: Option<L>,
+        auxiliary_banks: &[RoutedBankId],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<
-        eredu_runtime::ReplicatedTextSession<
-            A,
-            B,
-            M,
-            eredu_runtime::RoutedReplicatedTextExecution<
-                eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>,
+        (
+            eredu_runtime::ReplicatedTextSession<
+                A,
+                B,
+                M,
+                eredu_runtime::RoutedReplicatedTextExecution<
+                    eredu_runtime::ParameterProviders<
+                        eredu_runtime::RoutedBankProviders<
+                            PlannedAddressableBank<B, Bank, Movement>,
+                        >,
+                        Option<L>,
+                    >,
+                >,
             >,
-        >,
+            Option<eredu_runtime::RoutedBankProviders<PlannedAddressableBank<B, Bank, Movement>>>,
+        ),
         String,
     >
     where
@@ -514,12 +562,14 @@ impl<A> PreparedRoutedTextArchitecture<A> {
         A::Error: std::fmt::Display,
         M::PolicyError: std::fmt::Display,
         M::Error: std::fmt::Display,
+        L: eredu_runtime::RowLookupProvider<B>,
         Bank: AddressableGroupedBank<B>,
         Bank::Error: std::fmt::Display,
         Movement: IndexedMovement<B>,
         Movement::Error: std::fmt::Display,
     {
-        let (mut modules, residency, banks) = self.into_parts();
+        self.validate_row_provider::<B, L>(&rows)?;
+        let (mut modules, residency, banks, _) = self.into_parts();
         let eredu_runtime::ParameterBankResidency::IndependentCache(options) = residency else {
             return Err("selected banks are not independently addressable".into());
         };
@@ -536,16 +586,23 @@ impl<A> PreparedRoutedTextArchitecture<A> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        let providers =
+        let mut providers =
             eredu_runtime::RoutedBankProviders::new(providers).map_err(|e| e.to_string())?;
+        let auxiliary = providers
+            .split_off(auxiliary_banks)
+            .map_err(|e| e.to_string())?;
         eredu_runtime::construct_replicated_text_session_with_execution(
             modules.take_architecture(),
             modules.take_source_architecture(),
             modules.take_contract(),
             mechanisms,
-            eredu_runtime::RoutedReplicatedTextExecution::new(providers),
+            eredu_runtime::RoutedReplicatedTextExecution::new(eredu_runtime::ParameterProviders {
+                grouped: providers,
+                rows,
+            }),
             context,
         )
+        .map(|session| (session, auxiliary))
         .map_err(|e| e.to_string())
     }
 }
@@ -651,11 +708,12 @@ impl RoutedTextRequirements {
         Ok(Self {
             text: text.with_grouped_operations(operations),
             banks: admitted,
+            rows: None,
         })
     }
 }
 
-impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for PlannedResidentBank
+impl<B> eredu_runtime::TensorParallelParameterProvider<B> for PlannedResidentBank
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {
@@ -667,9 +725,19 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+            Self::Gated(p) => {
+                eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
+                    p, resident, request, partitions, context,
+                )
+            }
+            Self::Relu2(p) => {
+                eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
+                    p, resident, request, partitions, context,
+                )
+            }
+            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
+                "selected linear bank received a feed-forward partial invocation".into(),
+            )),
         }
     }
     fn forward_compact_grouped_tensor_parallel(
@@ -680,8 +748,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
+            Self::Relu2(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
             Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
         }
     }
@@ -693,14 +761,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
+            Self::Relu2(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
             Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
         }
     }
 }
 
-impl<B, Bank, Movement> eredu_runtime::TensorParallelRoutedExpertProvider<B>
+impl<B, Bank, Movement> eredu_runtime::TensorParallelParameterProvider<B>
     for PlannedAddressableBank<B, Bank, Movement>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
@@ -717,9 +785,19 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Linear(_) => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+            Self::Gated(p) => {
+                eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
+                    p, resident, request, partitions, context,
+                )
+            }
+            Self::Relu2(p) => {
+                eredu_runtime::TensorParallelParameterProvider::<B>::forward_grouped_tensor_parallel(
+                    p, resident, request, partitions, context,
+                )
+            }
+            Self::Linear(_) => Err(RoutedTextExecutionError::Contract(
+                "selected linear bank received a feed-forward partial invocation".into(),
+            )),
         }
     }
     fn forward_compact_grouped_tensor_parallel(
@@ -730,8 +808,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
+            Self::Relu2(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
             Self::Linear(_) => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
         }
     }
@@ -743,8 +821,8 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
+            Self::Gated(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
+            Self::Relu2(p) => eredu_runtime::TensorParallelParameterProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
             Self::Linear(_) => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
         }
     }

@@ -237,11 +237,12 @@ impl
             prepared,
             mechanisms,
             self.stream,
-            |banks, options| {
-                super::routed::selected_addressable_banks(
+            |banks, residency, rows| {
+                super::routed::selected_parameter_providers(
                     banks,
                     Arc::clone(&store),
-                    options,
+                    residency,
+                    rows,
                     self.weights_stream,
                     self.stream,
                 )
@@ -269,6 +270,40 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
     fn construction_started(&mut self) {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::architecture_construction();
+    }
+
+    fn visit_prediction<A, W>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        prediction: W,
+        target_source: Arc<dyn CheckpointSource>,
+        provider_source: Arc<dyn CheckpointSource>,
+        binding: eredu_architectures::prepared_execution::PredictionBinding,
+    ) -> Result<
+        Self::Output,
+        eredu_architectures::prepared_execution::PreparedExecutionError<Self::Error>,
+    >
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
+            MlxNeuralBackend,
+            PreparedCompositeArchitecture<A>,
+        >,
+    {
+        bind_retained_composite_prediction(
+            prepared,
+            prediction,
+            target_source,
+            provider_source,
+            binding,
+            self.stream,
+            self.weights_stream,
+        )
+        .map_err(eredu_architectures::prepared_execution::PreparedExecutionError::Backend)
     }
 
     fn visit<A>(
@@ -310,11 +345,12 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             prepared,
             mechanisms,
             self.stream,
-            |banks, options| {
-                super::routed::selected_addressable_banks(
+            |banks, residency, rows| {
+                super::routed::selected_parameter_providers(
                     banks,
                     Arc::clone(&store),
-                    options,
+                    residency,
+                    rows,
                     self.weights_stream,
                     self.stream,
                 )
@@ -324,5 +360,105 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             finish_routed_composite_session,
         )
         .map_err(super::routed::construction_error)
+    }
+}
+
+/// Materializes the retained prediction source and moves its banks from the
+/// composite target's shared provider into the prediction extension.
+fn bind_retained_composite_prediction<A, W>(
+    prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+    prediction: W,
+    target_source: Arc<dyn CheckpointSource>,
+    provider_source: Arc<dyn CheckpointSource>,
+    binding: eredu_architectures::prepared_execution::PredictionBinding,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::InputPartPlan: 'static,
+    A::StaticModules: Clone,
+    W: eredu_architectures::prediction_extension::PreparedRoutedPrediction<
+        MlxNeuralBackend,
+        PreparedCompositeArchitecture<A>,
+    >,
+{
+    use crate::composition::mlx::replicated_text::prediction::MlxPredictionMaterializationContext;
+    let auxiliary = prediction.banks();
+    let mut context = MlxPredictionMaterializationContext::new(
+        prediction.source().clone(),
+        stream,
+        weights_stream,
+    );
+    let mut extension = prediction
+        .materialize::<MlxEmbeddedPredictionMaterializer>(&mut context, |_, selected| {
+            MlxHybridState::realize(selected, None, 0)
+        })
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let mut mechanisms = MlxReplicatedTextMechanisms::<
+        PreparedCompositeArchitecture<A>,
+        MlxHybridState,
+    >::new(target_source, stream, weights_stream);
+    mechanisms.set_prediction_residency(super::super::super::prediction::parameters::residency::<
+        PreparedCompositeArchitecture<A>,
+        _,
+    >(&mut extension)?);
+    let (prepared, processor, admission) = prepared.into_parts();
+    let facts = eredu_architectures::prepared_execution::PreparedCompositeSessionFacts::new(
+        eredu_architectures::prepared_execution::PreparedTextSessionFacts::from_prepared(
+            prepared.text(),
+        ),
+        processor,
+        admission,
+    );
+    let residency = prepared.bank_residency();
+    let (banks, rows) = super::routed::selected_parameter_providers(
+        prepared.banks(),
+        provider_source,
+        residency,
+        prepared.row_lookups(),
+        weights_stream,
+        stream,
+    )?;
+    macro_rules! finish {
+        ($result:expr) => {{
+            let (session, provider) = $result.map_err(Error::ArchitectureModel)?;
+            let provider = provider.ok_or_else(|| {
+                Error::ArchitectureModel(
+                    "prediction banks were not moved from composite target construction".into(),
+                )
+            })?;
+            let extension =
+                W::with_provider::<MlxEmbeddedPredictionMaterializer, _>(extension, provider);
+            finish_routed_composite_session(
+                (
+                    stream,
+                    PredictionReplicatedFinalizer {
+                        prediction: SelectedPrediction {
+                            extension,
+                            selected: binding.selected().clone(),
+                        },
+                        capability: binding.capability().clone(),
+                    },
+                ),
+                session,
+                facts,
+            )
+        }};
+    }
+    match residency {
+        eredu_runtime::ParameterBankResidency::WithLayer => finish!(prepared
+            .construct_resident_session::<MlxNeuralBackend, _, _>(
+                mechanisms, rows, &auxiliary, stream
+            )),
+        eredu_runtime::ParameterBankResidency::IndependentCache(_) => finish!(prepared
+            .construct_addressable_session::<MlxNeuralBackend, _, _, _, _>(
+            mechanisms, banks, rows, &auxiliary, stream
+        )),
+        _ => Err(Error::ArchitectureModel(
+            "selected prediction bank residency has no binding".into(),
+        )),
     }
 }

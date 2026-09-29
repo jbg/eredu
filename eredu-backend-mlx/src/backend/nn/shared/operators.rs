@@ -317,6 +317,8 @@ pub(super) fn mlx_weightless_rms_norm(
 /// MLX RoPE variant selected from model metadata.
 #[derive(Debug, Clone)]
 pub struct MlxRotary {
+    pub(super) dimensions: i32,
+    pub(super) traditional: bool,
     pub(super) native: RopeVariant,
     pub(super) explicit: Option<rope::ElementwiseRotary>,
 }
@@ -346,6 +348,8 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
                     input.as_array(),
                     cosine.as_array(),
                     sine.as_array(),
+                    self.dimensions,
+                    self.traditional,
                     context,
                 ))
             }

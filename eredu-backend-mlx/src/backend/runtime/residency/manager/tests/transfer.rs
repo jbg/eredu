@@ -104,6 +104,12 @@ fn caller_owned_transfer_publishes_only_after_exact_completion() {
     assert!(ready.is_complete().unwrap());
     drop(ready);
     drop(transfer);
+    // Observation must not perform the ordinary retirement that releases these
+    // application leases. Advance that lifecycle explicitly before asserting release.
+    assert_eq!(state(&manager.report().unwrap(), "a").device_pins(), 2);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        state(&manager.report().unwrap(), "a").device_pins() == 0
+    });
     assert_eq!(state(&manager.report().unwrap(), "a").device_pins(), 0);
 }
 

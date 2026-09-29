@@ -1,6 +1,7 @@
 //! Total backend-neutral selections retained between cold admission and materialization.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use eredu_core::{
     artifact::ArtifactAdmissionToken, CollectiveGroupId, PreparationAdmission, SessionCapabilities,
@@ -19,6 +20,249 @@ use crate::{
     },
     RoutedTextRequirements, SelectedRoutedTextRealization,
 };
+
+/// Source-free request-specific construction retained beside total selection.
+/// It owns only immutable headers and mechanism choices, never its inspection cache.
+#[derive(Clone)]
+pub(crate) enum SelectedQwen4Construction {
+    Partitioned {
+        selected: crate::qwen4_exp::prepared::SelectedTargetPartitionExecution,
+        prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
+    },
+    ConditionalPartitioned {
+        selected: crate::qwen4_exp::prepared::SelectedConditionalPartitionExecution,
+        prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
+    },
+    Safetensors(crate::qwen4_exp::prepared::SelectedSafetensorsTargetExecution),
+    Gguf {
+        selected: crate::qwen4_exp::prepared::SelectedGgufTargetExecution,
+        prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
+    },
+    Conditional {
+        selected: crate::qwen4_exp::prepared::SelectedConditionalHeaderExecution,
+        prediction: Option<Arc<crate::prepared_sources::prediction::InspectedPredictionSource>>,
+    },
+}
+
+impl std::fmt::Debug for SelectedQwen4Construction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedQwen4Construction")
+            .field("selection", self.selected())
+            .finish()
+    }
+}
+
+impl SelectedQwen4Construction {
+    fn projected_parameter_layout(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        rank: eredu_core::ParallelRankTopology,
+    ) -> Result<eredu_runtime::LocalModelLayout, String> {
+        let spec = self.selected_target_spec()?;
+        let conditional = matches!(self, Self::ConditionalPartitioned { .. });
+        let tensor = spec
+            .tensor_partition(rank.tensor_parallel_rank(), rank.tensor_parallel_size())
+            .map_err(|error| error.to_string())?;
+        let mut layout = tensor
+            .projected_layout(parameters, rank)
+            .map_err(|error| error.to_string())?;
+        if conditional {
+            // Vision follows the shared head/merger partition rules. Target physical
+            // ranges above retain GQA replicas, fused recurrent order and companions.
+            let vision = crate::partitioned_execution::local_layout_groups(
+                parameters
+                    .groups()
+                    .iter()
+                    .filter(|group| group.logical_name().starts_with("model.visual.")),
+                rank.tensor_parallel_rank(),
+                rank.tensor_parallel_size(),
+                rank.expert_parallel_rank(),
+                rank.expert_parallel_size(),
+            )?;
+            for (name, tensor) in vision.tensors() {
+                layout.insert(name.to_owned(), tensor.clone());
+            }
+        }
+        if let Some((retained_rank, retained)) = parameters.partition_layout() {
+            if retained_rank.topology() != rank.topology() {
+                return Err("requested projection differs from retained topology".into());
+            }
+            if retained_rank == rank && retained != &layout {
+                return Err(
+                    "projected parameter placement differs from retained construction".into(),
+                );
+            }
+        }
+        Ok(layout)
+    }
+
+    fn selected_target_spec(&self) -> Result<crate::qwen4_exp::target::TargetSpec, String> {
+        match self {
+            Self::Partitioned { selected, .. } => selected
+                .plan()
+                .selected_target_spec(selected.selected().base()),
+            Self::ConditionalPartitioned { selected, .. } => selected.selected_target_spec(),
+            _ => return Err("retained construction is not partitioned".into()),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn unit_observations(
+        &self,
+        descriptor: &eredu_core::ArchitectureDescriptor,
+    ) -> Result<Vec<crate::partitioned_execution::PartitionedUnitObservation>, String> {
+        let spec = self.selected_target_spec()?;
+        crate::qwen4_exp::target::partition_unit_observations(&spec, descriptor)
+    }
+
+    pub(crate) fn selected(&self) -> &SelectedRoutedTextRealization {
+        match self {
+            Self::Partitioned { selected, .. } => selected.selected().base(),
+            Self::ConditionalPartitioned { selected, .. } => match selected.selected().base() {
+                SelectedCompositeTextRealization::Routed { execution, .. } => execution,
+                SelectedCompositeTextRealization::Direct(_) => {
+                    unreachable!("retained routed conditional selection")
+                }
+            },
+            Self::Safetensors(selected) => selected.selected(),
+            Self::Gguf { selected, .. } => selected.selected(),
+            Self::Conditional { selected, .. } => selected.realization(),
+        }
+    }
+
+    pub(crate) fn conditional_header_plan(
+        &self,
+    ) -> Option<&crate::qwen4_exp::prepared::ConditionalHeaderExecutionPlan> {
+        match self {
+            Self::Conditional { selected, .. } => Some(selected.header_plan()),
+            Self::ConditionalPartitioned { selected, .. } => Some(selected.header_plan()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn safetensors_plan(
+        &self,
+    ) -> Option<&crate::qwen4_exp::prepared::SafetensorsTargetPlan> {
+        match self {
+            Self::Safetensors(selected) => Some(selected.header_plan()),
+            Self::Partitioned { selected, .. } => selected.safetensors_plan(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn gguf_plan(&self) -> Option<&crate::qwen4_exp::prepared::GgufTargetPlan> {
+        match self {
+            Self::Gguf { selected, .. } => Some(selected.header_plan()),
+            Self::Partitioned { selected, .. } => selected.gguf_plan(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prediction_source(
+        &self,
+    ) -> Option<&crate::prepared_sources::prediction::InspectedPredictionSource> {
+        match self {
+            Self::Gguf { prediction, .. }
+            | Self::Conditional { prediction, .. }
+            | Self::Partitioned { prediction, .. }
+            | Self::ConditionalPartitioned { prediction, .. } => prediction.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prediction_discovery(
+        &self,
+    ) -> Result<
+        Option<(
+            eredu_core::ArchitectureDescriptor,
+            &eredu_runtime::SelectedStateRealization,
+        )>,
+        crate::qwen4_exp::prepared::PreparationError,
+    > {
+        match self {
+            Self::Partitioned { selected, .. } => selected
+                .prediction_state()
+                .map(|state| {
+                    selected
+                        .prediction_descriptor()
+                        .map(|descriptor| (descriptor, state))
+                })
+                .transpose(),
+            Self::ConditionalPartitioned { selected, .. } => selected
+                .prediction_state()
+                .map(|state| {
+                    selected
+                        .prediction_descriptor()
+                        .map(|descriptor| (descriptor, state))
+                })
+                .transpose(),
+            Self::Safetensors(selected) => selected
+                .prediction_state()
+                .map(|state| {
+                    selected
+                        .prediction_descriptor()
+                        .map(|descriptor| (descriptor, state))
+                })
+                .transpose(),
+            Self::Gguf { selected, .. } => selected
+                .prediction_state()
+                .map(|state| {
+                    selected
+                        .prediction_descriptor()
+                        .map(|descriptor| (descriptor, state))
+                })
+                .transpose(),
+            Self::Conditional { selected, .. } => selected
+                .prediction_state()
+                .map(|state| {
+                    selected
+                        .prediction_descriptor()
+                        .map(|descriptor| (descriptor, state))
+                })
+                .transpose(),
+        }
+    }
+
+    pub(crate) fn bind(
+        self,
+        source: eredu_checkpoint::store::SharedCheckpointSource,
+        prediction: Option<eredu_checkpoint::store::SharedCheckpointSource>,
+    ) -> Result<
+        crate::qwen4_exp::prepared::SelectedTargetExecution,
+        crate::qwen4_exp::prepared::PreparationError,
+    > {
+        match self {
+            Self::Safetensors(selected) => selected.bind(source),
+            Self::Gguf { selected, .. } => selected.bind(source, prediction),
+            Self::Conditional { .. }
+            | Self::Partitioned { .. }
+            | Self::ConditionalPartitioned { .. } => {
+                Err(crate::qwen4_exp::prepared::PreparationError::Contract(
+                    "construction requires its retained partition or composite source roles".into(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn parameter_materialization_workspace(
+        &self,
+        mechanisms: &impl crate::PreparationMechanismProvider,
+    ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
+        match self {
+            Self::Partitioned { selected, .. } => {
+                selected.parameter_materialization_workspace(mechanisms)
+            }
+            Self::ConditionalPartitioned { selected, .. } => {
+                selected.parameter_materialization_workspace(mechanisms)
+            }
+            Self::Safetensors(selected) => selected.parameter_materialization_workspace(mechanisms),
+            Self::Gguf { selected, .. } => selected.parameter_materialization_workspace(mechanisms),
+            Self::Conditional { selected, .. } => {
+                selected.parameter_materialization_workspace(mechanisms)
+            }
+        }
+    }
+}
 
 /// Selected direct partitioned execution, including admitted communication and ownership.
 pub type SelectedDensePartitionedExecution =
@@ -101,11 +345,30 @@ pub trait SelectedExecutionDispatcher: Sized {
 #[derive(Debug, Clone)]
 pub struct SelectedExecution {
     kind: Box<SelectedExecutionKind>,
+    authored_projection: Option<Arc<SelectedQwen4Construction>>,
     pub(crate) input_score_attention_workspace:
         Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism>,
 }
 
 impl SelectedExecution {
+    fn authored_layout(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        global_rank: usize,
+    ) -> Result<Option<eredu_runtime::LocalModelLayout>, String> {
+        let Some(authority) = &self.authored_projection else {
+            return Ok(None);
+        };
+        let topology = self
+            .parallel_topology()
+            .ok_or("projection has no retained topology")?;
+        let rank = eredu_core::ParallelRankTopology::new(topology.topology(), global_rank)
+            .map_err(|error| error.to_string())?;
+        authority
+            .projected_parameter_layout(parameters, rank)
+            .map(Some)
+    }
+
     /// Retained native workspace facts; no device or tensor observation.
     pub fn input_score_attention_workspace(
         &self,
@@ -147,6 +410,9 @@ impl SelectedExecution {
     > {
         use crate::partitioned_execution::selected_parameter_layout_for_rank;
         let tasks = self.text_realization().materialization_tasks();
+        let authored = self
+            .authored_layout(parameters, global_rank)
+            .map_err(eredu_core::parameters::ParameterError::Unsupported)?;
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 selected_parameter_layout_for_rank(
@@ -156,6 +422,7 @@ impl SelectedExecution {
                     parameter,
                     global_rank,
                     index,
+                    authored.as_ref(),
                     reservation,
                 )
                 .map(Some)
@@ -168,6 +435,7 @@ impl SelectedExecution {
                     parameter,
                     global_rank,
                     index,
+                    authored.as_ref(),
                     reservation,
                 )
                 .map(Some)
@@ -180,6 +448,7 @@ impl SelectedExecution {
                     parameter,
                     global_rank,
                     index,
+                    authored.as_ref(),
                     reservation,
                 )
                 .map(Some)
@@ -219,6 +488,16 @@ impl SelectedExecution {
         crate::component_partition::ComponentPartitionError,
     > {
         use crate::partitioned_execution::selected_component_layout_for_rank;
+        let authored = self
+            .authored_layout(parameters, global_rank)
+            .map_err(crate::component_partition::ComponentPartitionError::ParameterLayout)?;
+        let units = self
+            .authored_projection
+            .as_ref()
+            .map(|authority| authority.unit_observations(descriptor))
+            .transpose()
+            .map_err(crate::component_partition::ComponentPartitionError::ParameterLayout)?
+            .unwrap_or_default();
         match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 selected_component_layout_for_rank(
@@ -227,6 +506,8 @@ impl SelectedExecution {
                     parameters,
                     global_rank,
                     self.routed_realization(),
+                    authored.as_ref(),
+                    &units,
                 )
                 .map(Some)
             }
@@ -237,6 +518,8 @@ impl SelectedExecution {
                     parameters,
                     global_rank,
                     self.routed_realization(),
+                    authored.as_ref(),
+                    &units,
                 )
                 .map(Some)
             }
@@ -247,6 +530,8 @@ impl SelectedExecution {
                     parameters,
                     global_rank,
                     self.routed_realization(),
+                    authored.as_ref(),
+                    &units,
                 )
                 .map(Some)
             }
@@ -332,6 +617,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::Replicated(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -339,6 +625,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::Routed(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -346,6 +633,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::Composite(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -353,6 +641,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedDense(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -360,6 +649,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedRouted(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -367,6 +657,7 @@ impl SelectedExecution {
         Self {
             kind: Box::new(SelectedExecutionKind::PartitionedComposite(selected)),
             input_score_attention_workspace: None,
+            authored_projection: None,
         }
     }
 
@@ -500,9 +791,11 @@ impl SelectedExecution {
     }
 
     /// Source-recipe and compact-bank workspace of the retained rank selection.
-    pub fn parameter_materialization_workspace(
+    pub fn parameter_materialization_workspace<
+        C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized,
+    >(
         &self,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        source: &C,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         mechanisms: &impl crate::PreparationMechanismProvider,
     ) -> Result<eredu_core::ParameterMaterializationWorkspace, String> {
@@ -928,6 +1221,7 @@ impl SelectedExecution {
 /// completion object, or backend-private token.
 #[derive(Debug, Clone)]
 pub struct SelectedPreparation {
+    qwen4_construction: Option<Arc<SelectedQwen4Construction>>,
     admission_token: ArtifactAdmissionToken,
     execution: SelectedExecution,
     admission: PreparationAdmission,
@@ -936,6 +1230,56 @@ pub struct SelectedPreparation {
 }
 
 impl SelectedPreparation {
+    pub(crate) fn qwen4_construction(&self) -> Option<&SelectedQwen4Construction> {
+        self.qwen4_construction.as_deref()
+    }
+
+    pub(crate) fn new_qwen4(
+        admission_token: ArtifactAdmissionToken,
+        target: SelectedQwen4Construction,
+        admission: PreparationAdmission,
+        input_score_attention_workspace: Option<
+            eredu_runtime::memory_estimation::InputScoreAttentionMechanism,
+        >,
+    ) -> Self {
+        let mut execution = match &target {
+            SelectedQwen4Construction::Partitioned { selected, .. } => {
+                SelectedExecution::partitioned_routed(selected.selected().clone())
+            }
+            SelectedQwen4Construction::ConditionalPartitioned { selected, .. } => {
+                SelectedExecution::partitioned_composite(selected.selected().clone())
+            }
+            SelectedQwen4Construction::Conditional { selected, .. } => {
+                SelectedExecution::composite(SelectedCompositeTextRealization::Routed {
+                    execution: selected.realization().clone(),
+                    processor: selected.processor().realization().clone(),
+                })
+            }
+            _ => SelectedExecution::routed(target.selected().clone()),
+        };
+        execution.input_score_attention_workspace = input_score_attention_workspace;
+        let target = Arc::new(target);
+        if execution.parallel_topology().is_some() {
+            execution.authored_projection = Some(target.clone());
+        }
+        Self {
+            qwen4_construction: Some(target),
+            admission_token,
+            execution,
+            admission,
+            prediction_extension: None,
+            prediction_realization: None,
+        }
+    }
+
+    pub(crate) fn with_retained_prediction(
+        mut self,
+        realization: SelectedSpeculativeRealization,
+    ) -> Self {
+        self.prediction_realization = Some(realization);
+        self
+    }
+
     /// Reports cold support for ordinary, unobserved plain-text prefix passes.
     /// Prepared media, capture/intervention and external speculation can require
     /// a full pass even when this selected execution supports chunking.
@@ -944,7 +1288,7 @@ impl SelectedPreparation {
             return Err("distributed execution retains a complete prefill pass");
         }
         if self.prediction_realization.is_some() {
-            return Err("selected prediction extension retains a complete prefill pass");
+            return Err("selected prediction extension owns its internal prefill schedule");
         }
         match self.execution.kind.as_ref() {
             SelectedExecutionKind::Replicated(_) | SelectedExecutionKind::Routed(_) => {
@@ -962,6 +1306,7 @@ impl SelectedPreparation {
         prediction_realization: Option<SelectedSpeculativeRealization>,
     ) -> Self {
         Self {
+            qwen4_construction: None,
             admission_token,
             execution,
             admission,

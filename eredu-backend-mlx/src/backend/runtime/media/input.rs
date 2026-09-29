@@ -99,6 +99,20 @@ impl PreparedInputInspector<Array> for MlxInputInspector {
         let evaluated = tensor
             .evaluated()
             .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+        if tensor.dtype() == Dtype::Uint32 {
+            return evaluated
+                .try_as_slice::<u32>()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?
+                .iter()
+                .map(|value| {
+                    i32::try_from(*value).map_err(|_| {
+                        CapabilityError::Observation(format!(
+                            "unsigned input value {value} exceeds signed 32-bit inspection range"
+                        ))
+                    })
+                })
+                .collect();
+        }
         evaluated
             .try_as_slice::<i32>()
             .map(|values| values.to_vec())
@@ -292,6 +306,32 @@ mod tests {
     use super::{input_part, validate, InputPayload, ModelInput};
     use eredu_core::InputModality;
     use safemlx::Array;
+
+    #[test]
+    fn integer_inspection_checks_unsigned_range_without_float_conversion() {
+        use eredu_runtime::PreparedInputInspector;
+        let inspector = super::MlxInputInspector;
+        let input = Array::from_slice(&[0_u32, 16_777_217, i32::MAX as u32], &[3]);
+        assert_eq!(
+            inspector.i32_values(&input).unwrap(),
+            [0, 16_777_217, i32::MAX]
+        );
+        for value in [i32::MAX as u32 + 1, u32::MAX] {
+            let input = Array::from_slice(&[0_u32, value], &[2]);
+            assert!(matches!(
+                inspector.i32_values(&input),
+                Err(eredu_core::CapabilityError::Observation(_))
+            ));
+        }
+        let signed = Array::from_slice(&[i32::MIN, -1, i32::MAX], &[3]);
+        assert_eq!(
+            inspector.i32_values(&signed).unwrap(),
+            [i32::MIN, -1, i32::MAX]
+        );
+        assert!(inspector
+            .i32_values(&Array::from_slice(&[1_f32], &[1]))
+            .is_err());
+    }
 
     #[test]
     fn validates_text_token_part() {

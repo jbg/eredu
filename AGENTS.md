@@ -240,3 +240,12 @@ cargo check -p eredu-backend-mlx --no-default-features
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
 ```
+
+## Documentation
+
+Documentation and code comments describe the repository as it exists, in present tense.
+Explain current contracts, behavior, constraints and validation evidence; omit implementation
+journals, migration narratives, superseded designs and accounts of how behavior used to work.
+Keep implementation plans, continuation notes and remaining-work lists outside the repository.
+Pinned artifact revisions and measured results identify current validation evidence rather than
+serve as a chronological work log.

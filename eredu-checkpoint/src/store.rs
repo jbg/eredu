@@ -102,6 +102,25 @@ pub struct TensorReadRequest {
     pub policy: ReadPolicy,
 }
 
+impl From<&str> for TensorReadRequest {
+    fn from(key: &str) -> Self {
+        Self {
+            key: key.into(),
+            selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        }
+    }
+}
+impl From<String> for TensorReadRequest {
+    fn from(key: String) -> Self {
+        Self {
+            key,
+            selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        }
+    }
+}
+
 /// Proof recorded by a lease about the physical read it performed.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoundedReadProof {
@@ -397,13 +416,13 @@ pub trait CheckpointSource: Send + Sync {
     /// Returns deterministic storage diagnostics.
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
 
-    /// Prepares an ordered, bounded read of complete encoded tensors into
+    /// Prepares ordered, physically bounded selections of encoded tensors into
     /// caller-owned storage. Unsupported sources return `None` without reading
     /// payloads. The returned batch retains exact file admission and metadata;
     /// execution checks each shard once before and after reading its ranges.
     fn prepare_encoded_read(
         &self,
-        _keys: &[String],
+        _keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
         Ok(None)
     }
@@ -662,14 +681,15 @@ impl CheckpointSource for PreparedCheckpointSource {
 
     fn prepare_encoded_read(
         &self,
-        keys: &[String],
+        keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
         // This child's fixed catalog was compared once at construction. Its
         // read contract already binds every batch to that same catalog.
         if self.source.recipe_cache().is_some() {
             return self.source.prepare_encoded_read(keys);
         }
-        for key in keys {
+        for request in keys {
+            let key = &request.key;
             self.expected(key)?;
         }
         let Some(batch) = self.source.prepare_encoded_read(keys)? else {
@@ -789,10 +809,11 @@ impl CheckpointSource for CompositeCheckpointSource {
 
     fn prepare_encoded_read(
         &self,
-        keys: &[String],
+        keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
         let mut owner = None;
-        for key in keys {
+        for request in keys {
+            let key = &request.key;
             let current = *self
                 .owners
                 .get(key)
@@ -826,12 +847,14 @@ impl CheckpointSource for CompositeCheckpointSource {
             .iter()
             .map(|source| source.source_diagnostics())
             .collect::<Result<Vec<_>, _>>()?;
-        let backend = diagnostics[0].backend;
-        if diagnostics.iter().any(|value| value.backend != backend) {
-            return Err(StoreError::Internal(
-                "composite checkpoint sources use different physical backends".into(),
-            ));
-        }
+        let backend = if diagnostics
+            .iter()
+            .any(|value| value.backend != diagnostics[0].backend)
+        {
+            WeightStoreBackend::Composite
+        } else {
+            diagnostics[0].backend
+        };
         let mut touched = diagnostics
             .iter()
             .flat_map(|value| value.touched_shard_paths.iter().cloned())
@@ -971,16 +994,16 @@ impl RestrictedCheckpointSource {
                 "restricted checkpoint source requires a nonempty contract identity".into(),
             ));
         }
-        let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
-        if let Some(key) = allowed.iter().find(|key| !source_keys.contains(*key)) {
-            return Err(StoreError::UnknownTensor { key: key.clone() });
+        // An inclusion view owns only this small allow set. Do not enumerate or
+        // duplicate the complete artifact catalog for every layer/expert view.
+        for key in &allowed {
+            source.source_metadata(key)?;
         }
-        let denied = source_keys.difference(&allowed).cloned().collect();
         Ok(Self {
             source,
             contract,
             recipes: RecipeInferenceCache::default(),
-            denied,
+            denied: BTreeSet::new(),
             allowed: Some(allowed),
         })
     }
@@ -990,9 +1013,18 @@ impl RestrictedCheckpointSource {
         &self.contract
     }
 
-    /// Returns the exact keys denied by this view.
-    pub fn denied_keys(&self) -> &BTreeSet<String> {
-        &self.denied
+    /// Returns the exact keys denied by this view. Inclusion views compute this
+    /// diagnostic projection on demand instead of retaining a catalog-sized copy.
+    pub fn denied_keys(&self) -> BTreeSet<String> {
+        match &self.allowed {
+            Some(allowed) => self
+                .source
+                .source_keys()
+                .into_iter()
+                .filter(|key| !allowed.contains(key))
+                .collect(),
+            None => self.denied.clone(),
+        }
     }
 
     /// Returns the exact allow set when this is an inclusion projection.
@@ -1026,15 +1058,19 @@ impl CheckpointSource for RestrictedCheckpointSource {
 
     fn prepare_encoded_read(
         &self,
-        keys: &[String],
+        keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
-        for key in keys {
+        for request in keys {
+            let key = &request.key;
             self.authorize(key)?;
         }
         self.source.prepare_encoded_read(keys)
     }
 
     fn source_keys(&self) -> Vec<String> {
+        if let Some(allowed) = &self.allowed {
+            return allowed.iter().cloned().collect();
+        }
         self.source
             .source_keys()
             .into_iter()
@@ -1142,9 +1178,10 @@ impl CheckpointSource for ResolvedCheckpointSource {
 
     fn prepare_encoded_read(
         &self,
-        keys: &[String],
+        keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
-        for key in keys {
+        for request in keys {
+            let key = &request.key;
             if !self.source.is_authoritative_materialized_key(key) {
                 self.authorize(key)?;
             }
@@ -1238,6 +1275,8 @@ pub trait WeightStore {
 /// Storage format represented by a diagnostics snapshot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WeightStoreBackend {
+    /// Disjoint retained sources from multiple physical storage formats.
+    Composite,
     /// Buffered SafeTensors payload shards.
     Safetensors,
     /// Seekable GGUF payload shards.
@@ -1422,9 +1461,10 @@ struct CacheState {
 }
 
 #[derive(Debug, Default)]
-struct SafetensorsReadTelemetry {
-    physical_reads: AtomicU64,
-    physical_read_bytes: AtomicU64,
+pub(crate) struct EncodedReadTelemetry {
+    pub(crate) physical_reads: AtomicU64,
+    pub(crate) physical_read_bytes: AtomicU64,
+    pub(crate) paths: Mutex<BTreeSet<PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1657,7 +1697,7 @@ pub struct SafetensorsWeightStore {
     catalog: BTreeMap<String, CatalogEntry>,
     shards: SafetensorsShards,
     cache: Arc<Mutex<CacheState>>,
-    read_telemetry: Arc<SafetensorsReadTelemetry>,
+    read_telemetry: Arc<EncodedReadTelemetry>,
     max_cached_shards: usize,
 }
 
@@ -1720,7 +1760,7 @@ impl SafetensorsWeightStore {
             catalog,
             shards,
             cache: Arc::new(Mutex::new(CacheState::default())),
-            read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
+            read_telemetry: Arc::new(EncodedReadTelemetry::default()),
             max_cached_shards,
         })
     }
@@ -1953,7 +1993,7 @@ impl CheckpointSource for SafetensorsWeightStore {
 
     fn prepare_encoded_read(
         &self,
-        keys: &[String],
+        keys: &[TensorReadRequest],
     ) -> Result<Option<EncodedReadBatch>, StoreError> {
         bulk::prepare(self, keys).map(Some)
     }
@@ -2251,7 +2291,7 @@ fn read_safetensors_ranges(
     admitted_file: &AdmittedFile,
     tensor_payload_start: usize,
     ranges: &[Range<usize>],
-    telemetry: &SafetensorsReadTelemetry,
+    telemetry: &EncodedReadTelemetry,
 ) -> Result<Vec<u8>, StoreError> {
     read_safetensors_ranges_with_hook(
         path,
@@ -2268,7 +2308,7 @@ fn read_safetensors_ranges_with_hook(
     admitted_file: &AdmittedFile,
     tensor_payload_start: usize,
     ranges: &[Range<usize>],
-    telemetry: &SafetensorsReadTelemetry,
+    telemetry: &EncodedReadTelemetry,
     after_read: impl FnOnce(),
 ) -> Result<Vec<u8>, StoreError> {
     let capacity = ranges.iter().try_fold(0usize, |total, range| {
@@ -2298,7 +2338,7 @@ fn read_safetensors_range_pass(
     tensor_payload_start: usize,
     ranges: &[Range<usize>],
     capacity: usize,
-    telemetry: &SafetensorsReadTelemetry,
+    telemetry: &EncodedReadTelemetry,
 ) -> Result<Vec<u8>, StoreError> {
     let mut output = Vec::with_capacity(capacity);
     for range in ranges {
@@ -3382,7 +3422,7 @@ mod tests {
         let admitted = AdmittedFile::open(&path).unwrap();
         let (payload_offset, _) = read_safetensors_metadata(&path, &admitted).unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let telemetry = SafetensorsReadTelemetry::default();
+        let telemetry = EncodedReadTelemetry::default();
         let result = read_safetensors_ranges_with_hook(
             &path,
             &admitted,
@@ -3929,6 +3969,75 @@ mod tests {
                 .unwrap(),
             f32_bytes(&[2.0])
         );
+    }
+
+    #[test]
+    fn inclusion_views_do_not_enumerate_the_whole_catalog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted {
+            store: MemoryWeightStore,
+            enumerations: AtomicUsize,
+            metadata: AtomicUsize,
+        }
+        impl CheckpointSource for Counted {
+            fn source_keys(&self) -> Vec<String> {
+                self.enumerations.fetch_add(1, Ordering::SeqCst);
+                self.store.source_keys()
+            }
+            fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.metadata.fetch_add(1, Ordering::SeqCst);
+                self.store.source_metadata(key)
+            }
+            fn acquire_lease(
+                &self,
+                request: TensorReadRequest,
+            ) -> Result<CheckpointLease, StoreError> {
+                self.store.acquire_lease(request)
+            }
+            fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+                self.store.source_diagnostics()
+            }
+        }
+        let source = Arc::new(Counted {
+            store: MemoryWeightStore::from_safetensors((0..1024).map(|i| {
+                (
+                    format!("parameter.{i}"),
+                    safetensors::Dtype::F32,
+                    vec![1],
+                    (i as f32).to_le_bytes().to_vec(),
+                )
+            }))
+            .unwrap(),
+            enumerations: AtomicUsize::new(0),
+            metadata: AtomicUsize::new(0),
+        });
+        let view = RestrictedCheckpointSource::including(
+            source.clone(),
+            "one owner",
+            BTreeSet::from(["parameter.17".into()]),
+        )
+        .unwrap();
+        assert_eq!(source.metadata.load(Ordering::SeqCst), 1);
+        assert_eq!(view.source_keys(), ["parameter.17"]);
+        assert_eq!(source.enumerations.load(Ordering::SeqCst), 0);
+        assert!(view.source_metadata("parameter.18").is_err());
+        let lease = view
+            .acquire_lease(TensorReadRequest {
+                key: "parameter.17".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        assert_eq!(lease.encoded_bytes().unwrap(), 17f32.to_le_bytes());
+        assert_eq!(source.enumerations.load(Ordering::SeqCst), 0);
+        assert_eq!(view.denied_keys().len(), 1023);
+        assert_eq!(source.enumerations.load(Ordering::SeqCst), 1);
+        assert!(RestrictedCheckpointSource::including(
+            source,
+            "missing",
+            BTreeSet::from(["absent".into()])
+        )
+        .is_err());
     }
 
     #[test]

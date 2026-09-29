@@ -26,11 +26,57 @@ pub struct EncodedReadBatch {
     tensors: Vec<TensorMetadata>,
     shards: BTreeMap<PathBuf, ReadShard>,
     byte_len: usize,
-    telemetry: Arc<SafetensorsReadTelemetry>,
-    cache: Arc<Mutex<CacheState>>,
+    telemetry: Arc<EncodedReadTelemetry>,
+    cache: Option<Arc<Mutex<CacheState>>>,
 }
 
 impl EncodedReadBatch {
+    /// Creates a generic exact-file read plan without a payload-cache entry.
+    pub(crate) fn empty(telemetry: Arc<EncodedReadTelemetry>) -> Self {
+        Self {
+            tensors: Vec::new(),
+            shards: BTreeMap::new(),
+            byte_len: 0,
+            telemetry,
+            cache: None,
+        }
+    }
+    /// Adds exact relative byte spans for one admitted tensor occurrence.
+    pub(crate) fn append_file(
+        &mut self,
+        metadata: TensorMetadata,
+        path: PathBuf,
+        admitted: Arc<AdmittedFile>,
+        offset: u64,
+        ranges: Vec<Range<usize>>,
+    ) -> Result<(), StoreError> {
+        for range in ranges {
+            let invalid = || StoreError::Overflow {
+                context: "encoded read span".into(),
+            };
+            if range.start > range.end || range.end as u64 > metadata.encoded_byte_len {
+                return Err(invalid());
+            }
+            let end = self.byte_len.checked_add(range.len()).ok_or_else(invalid)?;
+            let start = offset.checked_add(range.start as u64).ok_or_else(invalid)?;
+            let file_end = offset.checked_add(range.end as u64).ok_or_else(invalid)?;
+            self.shards
+                .entry(path.clone())
+                .or_insert_with(|| ReadShard {
+                    admitted: admitted.clone(),
+                    spans: Vec::new(),
+                })
+                .spans
+                .push(ReadSpan {
+                    file: start..file_end,
+                    destination: self.byte_len..end,
+                });
+            self.byte_len = end;
+        }
+        self.tensors.push(metadata);
+        Ok(())
+    }
+
     /// Metadata in destination order, including repeated source occurrences.
     pub fn tensors(&self) -> &[TensorMetadata] {
         &self.tensors
@@ -105,7 +151,7 @@ impl EncodedReadBatch {
                             admitted: Arc::clone(&shard.admitted),
                             spans: Vec::new(),
                             telemetry: Arc::clone(&batch.telemetry),
-                            cache: Arc::clone(&batch.cache),
+                            cache: batch.cache.clone(),
                         });
                         index
                     });
@@ -145,11 +191,18 @@ impl EncodedReadBatch {
             let mut file = group.admitted.open_validated(&group.path)?;
             read_destination_spans(&mut file, group.spans, &group.telemetry)
                 .map_err(|error| io_error(&group.path, error))?;
+            if let Some(cache) = &group.cache {
+                cache
+                    .lock()
+                    .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))?
+                    .payloads
+                    .insert(group.path.clone());
+            }
             group
-                .cache
+                .telemetry
+                .paths
                 .lock()
-                .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))?
-                .payloads
+                .map_err(|_| StoreError::Internal("encoded read telemetry is poisoned".into()))?
                 .insert(group.path.clone());
             after_shard();
             group.admitted.validate_file(&group.path, &file)?;
@@ -167,14 +220,14 @@ struct DestinationShard<'a> {
     path: PathBuf,
     admitted: Arc<AdmittedFile>,
     spans: Vec<DestinationSpan<'a>>,
-    telemetry: Arc<SafetensorsReadTelemetry>,
-    cache: Arc<Mutex<CacheState>>,
+    telemetry: Arc<EncodedReadTelemetry>,
+    cache: Option<Arc<Mutex<CacheState>>>,
 }
 
 fn read_destination_spans(
     reader: &mut (impl Read + Seek),
     spans: Vec<DestinationSpan<'_>>,
-    telemetry: &SafetensorsReadTelemetry,
+    telemetry: &EncodedReadTelemetry,
 ) -> io::Result<()> {
     let mut spans = spans.into_iter().peekable();
     let mut position = None;
@@ -209,7 +262,7 @@ fn read_destination_spans(
 fn read_exact_vectored(
     reader: &mut impl Read,
     buffers: &mut [IoSliceMut<'_>],
-    telemetry: &SafetensorsReadTelemetry,
+    telemetry: &EncodedReadTelemetry,
 ) -> io::Result<()> {
     let mut remaining = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
     let mut buffers = buffers;
@@ -243,10 +296,11 @@ pub(super) fn provenance(metadata: &TensorMetadata) -> TensorSourceProvenance {
 
 pub(super) fn prepare(
     store: &SafetensorsWeightStore,
-    keys: &[String],
+    keys: &[TensorReadRequest],
 ) -> Result<EncodedReadBatch, StoreError> {
     let mut groups = BTreeMap::<PathBuf, Vec<(usize, &str)>>::new();
-    for (index, key) in keys.iter().enumerate() {
+    for (index, request) in keys.iter().enumerate() {
+        let key = &request.key;
         let entry = store
             .catalog
             .get(key)
@@ -273,7 +327,24 @@ pub(super) fn prepare(
                 .ok_or_else(|| StoreError::Overflow {
                     context: "bulk tensor offset".into(),
                 })?;
-            entries.push((index, metadata, start, Arc::clone(&admission.file)));
+            let request = &keys[index];
+            let output = validate_selection(key, &info.shape, &request.selection)?;
+            let read = plan_safetensors_reads(
+                key,
+                info.dtype,
+                &info.shape,
+                metadata.encoded_byte_len as usize,
+                &request.selection,
+                &output,
+                ReadPolicy::RequireBounded,
+            )?;
+            entries.push((
+                index,
+                metadata,
+                start,
+                Arc::clone(&admission.file),
+                read.ranges,
+            ));
         }
         // Header admission is independent of the payload-cache window.
     }
@@ -283,45 +354,14 @@ pub(super) fn prepare(
         shards: BTreeMap::new(),
         byte_len: 0,
         telemetry: Arc::clone(&store.read_telemetry),
-        cache: Arc::clone(&store.cache),
+        cache: Some(Arc::clone(&store.cache)),
     };
-    for (_, metadata, start, admitted) in entries {
-        let length =
-            usize::try_from(metadata.encoded_byte_len).map_err(|_| StoreError::Overflow {
-                context: "bulk tensor length".into(),
-            })?;
-        let end = batch
-            .byte_len
-            .checked_add(length)
-            .ok_or_else(|| StoreError::Overflow {
-                context: "bulk output length".into(),
-            })?;
-        let file_start = u64::try_from(start).map_err(|_| StoreError::Overflow {
-            context: "bulk file offset".into(),
-        })?;
-        let file_end = file_start
-            .checked_add(metadata.encoded_byte_len)
-            .ok_or_else(|| StoreError::Overflow {
-                context: "bulk file end".into(),
-            })?;
+    for (_, metadata, start, admitted, ranges) in entries {
         let path = metadata
             .backing_shard
             .clone()
             .expect("SafeTensors source has a shard");
-        batch
-            .shards
-            .entry(path)
-            .or_insert_with(|| ReadShard {
-                admitted,
-                spans: Vec::new(),
-            })
-            .spans
-            .push(ReadSpan {
-                file: file_start..file_end,
-                destination: batch.byte_len..end,
-            });
-        batch.byte_len = end;
-        batch.tensors.push(metadata);
+        batch.append_file(metadata, path, admitted, start as u64, ranges)?;
     }
     for shard in batch.shards.values_mut() {
         shard.spans.sort_unstable_by_key(|span| span.file.start);
@@ -394,7 +434,7 @@ mod tests {
         let mut second = [0; 16];
         let batches = [["b", "c"], ["d", "a"]].map(|keys| {
             source
-                .prepare_encoded_read(&keys.map(String::from))
+                .prepare_encoded_read(&keys.map(TensorReadRequest::from))
                 .unwrap()
                 .unwrap()
         });
@@ -496,7 +536,7 @@ mod tests {
 
     #[test]
     fn short_reads_and_interrupts_preserve_scatter_order_and_report_eof() {
-        let telemetry = SafetensorsReadTelemetry::default();
+        let telemetry = EncodedReadTelemetry::default();
         let mut input = reader((0..10).collect(), 3);
         input.interrupt = true;
         let mut first = [0; 4];
@@ -527,7 +567,7 @@ mod tests {
         let mut input = Scalar(io::Cursor::new(vec![1, 2, 3, 4]));
         let mut first = [0; 2];
         let mut second = [0; 2];
-        let telemetry = SafetensorsReadTelemetry::default();
+        let telemetry = EncodedReadTelemetry::default();
         read_exact_vectored(
             &mut input,
             &mut [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)],
@@ -552,7 +592,7 @@ mod tests {
                 bytes,
             })
             .collect();
-        let telemetry = SafetensorsReadTelemetry::default();
+        let telemetry = EncodedReadTelemetry::default();
         read_destination_spans(&mut input, spans, &telemetry).unwrap();
         assert_eq!(output, vec![7; count]);
         assert_eq!(
@@ -682,7 +722,7 @@ mod tests {
             }
             fn prepare_encoded_read(
                 &self,
-                keys: &[String],
+                keys: &[TensorReadRequest],
             ) -> Result<Option<EncodedReadBatch>, StoreError> {
                 self.0.prepare_encoded_read(keys)
             }

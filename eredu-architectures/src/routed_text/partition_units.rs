@@ -1,6 +1,6 @@
 //! Borrow selected scalar coordinates through every partition bank provider path.
 use super::*;
-use eredu_runtime::{RoutedExpertTensorParallelOutput, TensorParallelRoutedExpertProvider};
+use eredu_runtime::{RoutedExpertTensorParallelOutput, TensorParallelParameterProvider};
 
 pub(crate) struct PartitionUnitProvider<P> {
     inner: P,
@@ -75,12 +75,24 @@ fn with_coordinates<T: Tensor, R>(
     )
 }
 
-impl<B, P> RoutedExpertProvider<B> for PartitionUnitProvider<P>
+impl<B, P> ParameterProvider<B> for PartitionUnitProvider<P>
 where
     B: GroupedNeuralBackend,
-    P: RoutedExpertProvider<B, Error = RoutedTextExecutionError>,
+    P: ParameterProvider<B, Error = RoutedTextExecutionError>,
 {
     type Error = RoutedTextExecutionError;
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.inner.has_row_parameter(parameter)
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &eredu_runtime::RowLookupSpec,
+        rows: &[u64],
+        access: eredu_runtime::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_runtime::RowLookupError> {
+        self.inner.lookup_rows(spec, rows, access, context)
+    }
     fn routing_control(
         &mut self,
         bank: RoutedBankId,
@@ -140,10 +152,10 @@ where
         self.inner.forward_linear_routed(resident, request, context)
     }
 }
-impl<B, P> TensorParallelRoutedExpertProvider<B> for PartitionUnitProvider<P>
+impl<B, P> TensorParallelParameterProvider<B> for PartitionUnitProvider<P>
 where
     B: GroupedNeuralBackend,
-    P: TensorParallelRoutedExpertProvider<B, Error = RoutedTextExecutionError>,
+    P: TensorParallelParameterProvider<B, Error = RoutedTextExecutionError>,
 {
     fn forward_grouped_tensor_parallel(
         &mut self,

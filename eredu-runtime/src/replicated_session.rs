@@ -24,9 +24,9 @@ use crate::{
     plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
     ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
     ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, PreparedInputCacheIdentity,
-    ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
-    ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedExpertProvider,
+    LayerwiseRuntimeError, ParameterGroupOwner, ParameterProvider, PartitionState,
+    PreparedInputCacheIdentity, ReplicatedTextArchitecture, ReplicatedTextMaterializationTask,
+    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterPresence,
     RoutedLayeredArchitecture, RuntimeState, SelectedReplicatedTextRealization,
     SelectedStateRealization, StateError, SubmissionBackend, WeightLoweringKind,
 };
@@ -496,7 +496,7 @@ where
     where
         B: eredu_nn::GroupedNeuralBackend,
         A: RoutedLayeredArchitecture<B, S>,
-        Provider: RoutedExpertProvider<B>,
+        Provider: ParameterProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -567,6 +567,20 @@ where
     const PARTITIONED_SESSION: bool = false;
     /// Whether control phases use a selected bounded all-rank agreement.
     const DISTRIBUTED_PHASE_AGREEMENT: bool = false;
+    /// Whether exact request descriptors agree before distributed prefill.
+    const DISTRIBUTED_DESCRIPTOR_AGREEMENT: bool = false;
+
+    /// Propagates both preparation status and exact request/cursor identity.
+    fn agree_distributed_descriptor(
+        _runtime: &mut Self::Runtime,
+        _phase: crate::DistributedExecutionPhase,
+        local_success: bool,
+        _descriptor: [u64; 8],
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
+    {
+        Ok(local_success)
+    }
 
     /// Concrete execution runtime paired before the shared session lifecycle begins.
     type Runtime;
@@ -900,7 +914,7 @@ where
     A: LayeredArchitecture<B, S> + RoutedLayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
-    Provider: RoutedExpertProvider<B>,
+    Provider: ParameterProvider<B>,
     Provider::Error: std::fmt::Display,
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
@@ -1005,7 +1019,7 @@ where
     A: LayeredArchitecture<B, S> + RoutedLayeredArchitecture<B, S>,
     R: LayerwisePolicy<B, A::Unit>,
     P: LayerwisePolicy<B, A::Unit, Error = R::Error>,
-    Provider: RoutedExpertProvider<B>,
+    Provider: ParameterProvider<B>,
     Provider::Error: std::fmt::Display,
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
@@ -2337,7 +2351,15 @@ where
     > {
         crate::execution_resources::describe_prepared_resources(
             &self.selected,
-            self.selected_state.state(),
+            &self
+                .selected_state
+                .state()
+                .map(|state| crate::execution_resources::PreparedStateResource {
+                    owner: "target",
+                    state,
+                })
+                .into_iter()
+                .collect::<Vec<_>>(),
             self.prepared_parameter_slots(),
             self.parameter_declarations(),
             query,
@@ -2493,29 +2515,33 @@ where
     {
         let input = A::text_input(tokens, mask);
         self.prefill_input_prediction_target(input, context)
+            .map(|(output, capture, _)| (output, capture))
     }
 
-    /// Runs architecture-prepared target prefill and returns its exact additive capture.
+    /// Runs architecture-prepared target prefill and returns logits, its exact
+    /// additive capture, and the forward context used by request continuations.
     pub fn prefill_input_prediction_target<'a>(
         &mut self,
         input: A::Input<'a>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
-        (B::Tensor, B::Tensor),
+        (B::Tensor, B::Tensor, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.prefill_input_prediction_target_observed(input, context, &mut crate::NoopObserver)
     }
 
     /// Runs target prefill with internal hooks and the ordinary observation
-    /// transaction, retaining the exact target capture from that same forward.
+    /// transaction, retaining the exact target capture and context from that
+    /// same forward. Callers that retain continuation tensors must complete them
+    /// before advancing another invocation.
     pub fn prefill_input_prediction_target_observed<'a, O>(
         &mut self,
         input: A::Input<'a>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<
-        (B::Tensor, B::Tensor),
+        (B::Tensor, B::Tensor, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     >
     where
@@ -2533,7 +2559,7 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<
-        (B::Tensor, B::Tensor),
+        (B::Tensor, B::Tensor, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     >
     where
@@ -2607,8 +2633,300 @@ where
         };
         let (output, checkpoint, forward_context) =
             self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
-        self.publish(output, checkpoint, forward_context, context, observer)
-            .map(|output| (output, capture))
+        self.publish_with_context(
+            output,
+            checkpoint,
+            forward_context,
+            context,
+            observer,
+            false,
+            &[],
+        )
+        .map(|(output, forward)| (output, capture, forward))
+    }
+
+    /// Agrees request preparation and the selected prefill branch before any rank
+    /// enters ordinary execution or starts a chunk cursor.
+    pub fn prepare_prefill<V>(
+        &mut self,
+        prepared: Result<V, A::Error>,
+        describe: impl FnOnce(&V) -> crate::prefill::PrefillRequestDescriptor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<V, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        let description = prepared.as_ref().ok().map(describe);
+        let words = description.map_or([0; 5], |value| {
+            [
+                value.tokens as u64,
+                value.chunk_tokens.is_some() as u64,
+                value.chunk_tokens.unwrap_or(0) as u64,
+                0,
+                0,
+            ]
+        });
+        let local = self.ensure_commit_resolved().and_then(|()| {
+            let prepared = prepared.map_err(ReplicatedTextSessionError::Architecture)?;
+            let description = description.expect("successful preparation has a descriptor");
+            if description.tokens == 0 || description.chunk_tokens == Some(0) {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "invalid prefill request extent".into(),
+                ));
+            }
+            Ok(prepared)
+        });
+        self.agree_prefill_preflight(
+            crate::DistributedExecutionPhase::PrefillPreparation,
+            1,
+            words,
+            local,
+            context,
+        )
+    }
+
+    fn agree_prefill_preflight<V>(
+        &mut self,
+        phase: crate::DistributedExecutionPhase,
+        operation: u64,
+        values: [u64; 5],
+        local: Result<V, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<V, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if D::PARTITIONED_SESSION && !D::DISTRIBUTED_DESCRIPTOR_AGREEMENT {
+            return Err(ReplicatedTextSessionError::Contract(
+                "partitioned prefill requires selected exact request agreement".into(),
+            ));
+        }
+        let descriptor = [
+            operation,
+            self.next_commit_epoch.value(),
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            0,
+        ];
+        let agreement = D::agree_distributed_descriptor(
+            &mut self.execution,
+            phase,
+            local.is_ok(),
+            descriptor,
+            context,
+        )
+        .map_err(widen_infallible)
+        .inspect_err(|_| self.control_fence = Some(phase));
+        match (local, agreement) {
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+            (Ok(value), Ok(true)) => Ok(value),
+            (Ok(_), Ok(false)) => Err(ReplicatedTextSessionError::Contract(format!(
+                "distributed prefill preparation or descriptor disagreed at {phase:?}"
+            ))),
+        }
+    }
+
+    /// Reports the retained realization's support for partial prefill invocations.
+    pub fn prefill_chunking_support(&self) -> Result<(), &'static str> {
+        self.selected.prefill_chunking_support()
+    }
+
+    /// Starts an architecture-admitted request without advancing mutable model state.
+    /// Fallible preparation and exact request extents agree on every participant.
+    /// The complete-input cache identity is published only when the final chunk commits.
+    pub fn start_prefill<R>(
+        &mut self,
+        request: Result<R, A::Error>,
+        chunk_tokens: usize,
+        input_identity: Option<PreparedInputCacheIdentity>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        crate::prefill::PrefillCursor<R, R::Continuation>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        A: 'static,
+        R: crate::prefill::ChunkedPrefillRequest<A, B, M::State>,
+    {
+        let tokens = request.as_ref().map_or(0, |request| request.token_count());
+        let maximum = request
+            .as_ref()
+            .map_or(0, |request| request.maximum_chunk_tokens());
+        let local = (|| {
+            self.ensure_commit_resolved()?;
+            self.selected
+                .prefill_chunking_support()
+                .map_err(|error| ReplicatedTextSessionError::Contract(error.into()))?;
+            if !self.selected.exact_completion_available() {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "prefill request continuations require exact completion support".into(),
+                ));
+            }
+            let request = request.map_err(ReplicatedTextSessionError::Architecture)?;
+            if tokens == 0 || chunk_tokens == 0 || chunk_tokens > maximum {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "invalid admitted prefill chunk extent".into(),
+                ));
+            }
+            Ok(request)
+        })();
+        let request = self.agree_prefill_preflight(
+            crate::DistributedExecutionPhase::PrefillStart,
+            2,
+            [tokens as u64, chunk_tokens as u64, maximum as u64, 0, 0],
+            local,
+            context,
+        )?;
+        Ok(crate::prefill::PrefillCursor {
+            request,
+            continuation: None,
+            position: 0,
+            tokens,
+            chunk_tokens,
+            session: self.control_identity.clone(),
+            input_identity,
+        })
+    }
+
+    /// Advances one prefill chunk through the ordinary transaction, completion and
+    /// observation lifecycle. A rolled-back failure leaves the cursor and committed
+    /// prefix unchanged. Restoration errors propagate through the ordinary driver;
+    /// an unchanged cursor alone does not establish successful rollback.
+    pub fn advance_prefill<R, O>(
+        &mut self,
+        cursor: &mut crate::prefill::PrefillCursor<R, R::Continuation>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        crate::prefill::PrefillAdvance<B::Tensor>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        A: 'static,
+        R: crate::prefill::ChunkedPrefillRequest<A, B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let end = cursor
+            .position
+            .saturating_add(cursor.chunk_tokens)
+            .min(cursor.tokens);
+        let local = self.ensure_commit_resolved().and_then(|()| {
+            if !std::sync::Arc::ptr_eq(&cursor.session, &self.control_identity)
+                || cursor.is_complete()
+                || end <= cursor.position
+            {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "prefill cursor belongs to another session or is complete".into(),
+                ));
+            }
+            Ok(())
+        });
+        self.agree_prefill_preflight(
+            crate::DistributedExecutionPhase::PrefillStep,
+            3,
+            [
+                cursor.tokens as u64,
+                cursor.chunk_tokens as u64,
+                cursor.position as u64,
+                end as u64,
+                cursor.continuation.is_some() as u64,
+            ],
+            local,
+            context,
+        )?;
+        let range = cursor.position..end;
+        let (output, continuation) =
+            self.with_observation_transaction(observer, |session, observer| {
+                // Construction may fail before invoking the borrowed-input callback.
+                // Those ranks must still enter the same InputPreparation agreement.
+                let execution = cursor.request.with_chunk(
+                    range.clone(),
+                    cursor.continuation.as_ref(),
+                    |input| {
+                        session.execute_input_result_with_observer(
+                            Ok(input),
+                            ExpertPass::Prefill,
+                            context,
+                            observer,
+                        )
+                    },
+                );
+                let (output, checkpoint, forward) = match execution {
+                    Ok(executed) => executed?,
+                    Err(error) => session.execute_input_result_with_observer(
+                        Err(error),
+                        ExpertPass::Prefill,
+                        context,
+                        observer,
+                    )?,
+                };
+                let output = session
+                    .mechanisms
+                    .index_text_output(output, session.output_selection.sequence_index(), context)
+                    .map_err(ReplicatedTextSessionError::Mechanism);
+                let agreement = D::agree_distributed_phase(
+                    &mut session.execution,
+                    crate::DistributedExecutionPhase::PrefillOutputSelection,
+                    output.is_ok(),
+                    context,
+                )
+                .map_err(widen_infallible);
+                let output = match (output, agreement) {
+                    (Ok(output), Ok(true)) => output,
+                    (Err(error), _) | (_, Err(error)) => {
+                        return session.rollback_failure(checkpoint, error, context);
+                    }
+                    (Ok(_), Ok(false)) => {
+                        return session.rollback_failure(
+                            checkpoint,
+                            ReplicatedTextSessionError::Contract(
+                                "another rank failed to select its prefill chunk output".into(),
+                            ),
+                            context,
+                        );
+                    }
+                };
+                let continuation = cursor.request.continuation(&forward);
+                let retained = cursor.request.retained_values(&continuation);
+                let (output, _) = session.publish_with_context(
+                    output, checkpoint, forward, context, observer, true, &retained,
+                )?;
+                Ok((output, continuation))
+            })?;
+        cursor.continuation = Some(continuation);
+        cursor.position = end;
+        // A committed partial prefix is not the complete prepared input. Publish
+        // its cache identity only with the final successfully completed chunk.
+        self.committed_prompt_input_identity = if cursor.is_complete() {
+            cursor.input_identity.clone()
+        } else {
+            None
+        };
+        Ok(crate::prefill::PrefillAdvance {
+            output,
+            range,
+            complete: cursor.is_complete(),
+        })
+    }
+
+    /// Drives the same controlled advancement until the admitted request completes.
+    /// Earlier chunks remain committed on failure, allowing a caller with a cursor
+    /// to retry through `advance_prefill` instead of re-encoding completed work.
+    pub fn finish_prefill<R, O>(
+        &mut self,
+        cursor: &mut crate::prefill::PrefillCursor<R, R::Continuation>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: 'static,
+        R: crate::prefill::ChunkedPrefillRequest<A, B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        loop {
+            let step = self.advance_prefill(cursor, context, observer)?;
+            if step.complete {
+                return Ok(step.output);
+            }
+        }
     }
 
     /// Runs prompt processing from an architecture-prepared input.
@@ -2980,7 +3298,9 @@ where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.with_observation_transaction(observer, |session, observer| {
-            session.prediction_target_input_inner(input, ExpertPass::Decode, context, observer)
+            session
+                .prediction_target_input_inner(input, ExpertPass::Decode, context, observer)
+                .map(|(output, capture, _)| (output, capture))
         })
     }
 
@@ -4122,14 +4442,45 @@ where
         &mut self,
         output: B::Tensor,
         checkpoint: M::StateCheckpoint,
-        _forward_context: A::ForwardContext,
+        forward_context: A::ForwardContext,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let completion = (self.complete_text_prefill
+        self.publish_with_context(
+            output,
+            checkpoint,
+            forward_context,
+            context,
+            observer,
+            false,
+            &[],
+        )
+        .map(|(output, _)| output)
+    }
+
+    fn publish_with_context<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
+        &mut self,
+        output: B::Tensor,
+        checkpoint: M::StateCheckpoint,
+        forward_context: A::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        require_completion: bool,
+        retained: &[&B::Tensor],
+    ) -> Result<
+        (B::Tensor, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        let completion = (require_completion
+            || self.complete_text_prefill
             || self.selected.exact_completion()
             || observer.transactional())
-        .then(|| self.mechanisms.complete(&output, &self.state, context))
+        .then(|| {
+            for value in retained {
+                self.mechanisms.complete(value, &self.state, context)?;
+            }
+            self.mechanisms.complete(&output, &self.state, context)
+        })
         .transpose();
         let completion_agreed = match D::agree_distributed_phase(
             &mut self.execution,
@@ -4162,7 +4513,7 @@ where
             }
         }
         self.commit_observation_transaction(checkpoint, context, observer)?;
-        Ok(output)
+        Ok((output, forward_context))
     }
 
     fn commit_observation_transaction<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(

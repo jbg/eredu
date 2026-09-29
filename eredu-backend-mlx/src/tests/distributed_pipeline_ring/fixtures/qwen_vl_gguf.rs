@@ -266,12 +266,14 @@ fn component_fixture_inspection(
         inspection
             .architecture_plan_mut()
             .bind_gguf_special_token_ids(
-                eredu_architectures::processor_plan::GgufSpecialTokenIds::Qwen {
-                    image_token_id: token("image_token_id"),
-                    video_token_id: token("video_token_id"),
-                    vision_start_token_id: token("vision_start_token_id"),
-                    vision_end_token_id: token("vision_end_token_id"),
-                },
+                eredu_architectures::processor_plan::GgufSpecialTokenIds::Qwen(
+                    eredu_architectures::processor_plan::QwenMediaTokenIds {
+                        image_token_id: token("image_token_id"),
+                        video_token_id: token("video_token_id"),
+                        vision_start_token_id: token("vision_start_token_id"),
+                        vision_end_token_id: token("vision_end_token_id"),
+                    },
+                ),
             )
             .unwrap();
     }

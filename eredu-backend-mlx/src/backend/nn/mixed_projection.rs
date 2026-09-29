@@ -423,15 +423,12 @@ pub(crate) fn storage_facts(
 #[cfg(all(test, feature = "metal", not(feature = "cuda")))]
 mod storage_tests {
     use super::*;
-    use eredu_nn::{mechanism_memory::MechanismInvocation, TensorElementType};
+    use safemlx::ops::indexing::TryIndexOp;
     use safemlx::{Device, DeviceType, Dtype};
     #[test]
     fn projection_storage_facts_preserve_laziness_and_report_native_partials() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        for (dtype, element) in [
-            (Dtype::Float16, TensorElementType::F16),
-            (Dtype::Bfloat16, TensorElementType::Bf16),
-        ] {
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
             let weight = Array::from_slice(&vec![0.25f32; 129 * 257], &[129, 257])
                 .as_dtype(dtype, &stream)
                 .unwrap();
@@ -445,6 +442,7 @@ mod storage_tests {
             let partial = safemlx::fast::mixed_storage_gemm_workspace(8, 129, 257, &stream)
                 .unwrap()
                 .unwrap();
+            assert!(partial > 0, "fixture must select split-K partial storage");
             assert_eq!(
                 facts
                     .for_invocation(257, 129, &eredu_core::checkpoint::TensorDtype::F32, 8)
@@ -456,34 +454,45 @@ mod storage_tests {
             assert!(facts
                 .for_invocation(257, 129, &eredu_core::checkpoint::TensorDtype::F32, 2001)
                 .is_none());
-            let invocation = MechanismInvocation::Projection {
-                rows: 8,
-                input: 257,
-                output: 129,
-                format: eredu_checkpoint::LinearFormat::Dense,
-                element: TensorElementType::F32,
-                weight_element: Some(element),
-                bias: true,
-            };
-            let contract =
-                super::super::memory::describe_bound_projection(&invocation, &weight, &stream)
-                    .unwrap();
-            assert!(!contract.storage.iter().any(|s| s.name == "promoted_weight"));
-            assert_eq!(
-                contract
-                    .storage
-                    .iter()
-                    .find(|s| s.name == "split_k_partials")
-                    .unwrap()
-                    .payload
-                    .upper,
-                Some(partial)
+            // Explicit range slicing keeps a genuine strided view. Integer
+            // indexing can lower to a gather and would not prove a copy here.
+            // Neither matrix stride is one, forcing General compaction before
+            // both the multi-row Matmul and the one-row CustomKernel path.
+            let source = Array::from_slice(
+                &(0..8 * 257 * 2)
+                    .map(|i| (i % 13) as f32 * 0.125 - 0.75)
+                    .collect::<Vec<_>>(),
+                &[8, 257, 2],
             );
-            assert!(super::super::memory::describe(&invocation)
+            let strided = source
+                .try_index_device((.., .., 0..1), &stream)
                 .unwrap()
-                .storage
-                .iter()
-                .any(|s| s.name == "promoted_weight"));
+                .reshape(&[8, 257], &stream)
+                .unwrap();
+            safemlx::transforms::eval([&strided]).unwrap();
+            assert_eq!(strided.strides(), [514, 2]);
+            for rows in [1, 8] {
+                let input = strided.try_index_device((0..rows, ..), &stream).unwrap();
+                safemlx::transforms::eval([&input]).unwrap();
+                assert_eq!(input.strides()[1], 2);
+                let actual = project(&input, &weight, &stream).unwrap().unwrap();
+                assert!(!actual.is_available().unwrap());
+                let expected = safemlx::ops::matmul(
+                    &input,
+                    weight
+                        .as_dtype(Dtype::Float32, &stream)
+                        .unwrap()
+                        .transpose(&stream)
+                        .unwrap(),
+                    &stream,
+                )
+                .unwrap();
+                let actual = actual.into_evaluated().unwrap();
+                let expected = expected.into_evaluated().unwrap();
+                let values = actual.try_as_slice::<f32>().unwrap();
+                assert!(values.iter().any(|value| *value != 0.0));
+                assert_eq!(values, expected.try_as_slice::<f32>().unwrap());
+            }
             let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
             assert!(storage_facts(&weight, &cpu).unwrap().is_none());
         }

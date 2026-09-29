@@ -226,6 +226,9 @@ pub(crate) fn gguf_tensor_format(
     tensor: &eredu_gguf::CatalogTensor,
     endian: eredu_gguf::Endian,
 ) -> Result<LinearFormat, String> {
+    if tensor.is_decoded_f32() {
+        return Ok(LinearFormat::Dense);
+    }
     if let Some((bits, group)) = tensor.affine() {
         Ok(LinearFormat::Affine(
             eredu_checkpoint::AffineQuantization::new(

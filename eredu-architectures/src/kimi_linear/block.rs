@@ -6,7 +6,7 @@ use eredu_nn::{
     NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
     Parameterized, Tensor,
 };
-use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
+use eredu_runtime::{ParameterProvider, RuntimeStateComponents};
 
 use super::{AttentionKind, FeedForward, KimiDeltaAttention, KimiLatentAttention, ModelArgs};
 
@@ -357,7 +357,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let pass = if hidden.dim(1) > 1 {

@@ -4,9 +4,7 @@ use eredu_nn::routing_intervention::{
     GroupScoreStage, GroupSelectionAction, GroupSelectionControl,
 };
 use eredu_nn::{GroupedNeuralBackend, Parameterized, Tensor};
-use eredu_runtime::{
-    ActivationObserver, RoutedExpertProvider, RoutedExpertRequest, RoutingDecision,
-};
+use eredu_runtime::{ActivationObserver, ParameterProvider, RoutedExpertRequest, RoutingDecision};
 use std::{cell::Cell, rc::Rc};
 
 type B = crate::composition::MlxNeuralBackend;
@@ -32,7 +30,7 @@ struct Probe {
     coefficients: Vec<f32>,
 }
 
-impl RoutedExpertProvider<B> for Probe {
+impl ParameterProvider<B> for Probe {
     type Error = eredu_nn::Error;
     fn forward_grouped(
         &mut self,

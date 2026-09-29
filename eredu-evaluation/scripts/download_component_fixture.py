@@ -60,7 +60,7 @@ def main():
     if len(expected) > 1:
         index = json.loads((checkpoint / 'model.safetensors.index.json').read_text())
         assert set(index['weight_map'].values()) == set(expected)
-    # Preserve the existing single-file provenance consumed by dense references.
+    # Dense references consume a single digest; sharded references consume a digest map.
     verified = digests['model.safetensors'] if isinstance(sha256, str) else digests
     provenance = {'repository': repository, 'revision': revision, 'path': str(checkpoint),
                   'weights_sha256': verified, 'remote_lfs_sha256': sha256}

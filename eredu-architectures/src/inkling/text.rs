@@ -10,7 +10,7 @@ use eredu_nn::{
     RelativeAttentionInput, Tensor,
 };
 use eredu_runtime::{
-    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, RoutedExpertRequest, TensorParallelParameterProvider,
 };
 
 use crate::decoder::ComponentInstrumentation;
@@ -212,6 +212,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let convolution = |field: &str, channels| {
             CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    dilation: 1,
                     channels,
                     kernel_size: args.sconv_kernel_size,
                     weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
@@ -620,7 +621,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = B::joint_group_selection(
@@ -692,7 +693,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = B::joint_group_selection(
@@ -855,7 +856,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -886,7 +887,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
@@ -1004,6 +1005,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         let convolution = |field: &str| {
             CausalDepthwiseConvolution::new(
                 CausalDepthwiseConvolutionSpec {
+                    dilation: 1,
                     channels: args.hidden_size,
                     kernel_size: args.sconv_kernel_size,
                     weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
@@ -1069,7 +1071,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     ) -> Result<B::Tensor, Error>
     where
         C: AuxiliaryConvolutionState<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_provider_instrumented(
@@ -1095,7 +1097,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     ) -> Result<B::Tensor, Error>
     where
         C: AuxiliaryConvolutionState<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let layer = self.layer;
@@ -1155,7 +1157,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     ) -> Result<B::Tensor, Error>
     where
         C: AuxiliaryConvolutionState<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_parallel_with_provider_instrumented(
@@ -1183,7 +1185,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
     ) -> Result<B::Tensor, Error>
     where
         C: AuxiliaryConvolutionState<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let layer = self.layer;

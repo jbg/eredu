@@ -6,9 +6,16 @@ use eredu_core::component::{ComponentResidualWrite, ComponentScalar};
 pub(super) fn gguf_composite(
     g: &mut Builder,
     config: &crate::gguf_companion::GgufMediaProjectorConfig,
+    primary: &GgufModelConfig,
 ) {
     use crate::gguf_companion::GgufMediaProjectorConfig as C;
     match config {
+        C::Qwen4Exp(_) | C::Qwen4ExpPending { .. } => {
+            if let GgufModelConfig::Qwen4Exp(target) = primary {
+                qwen4_exp(g, target.text_plan().config());
+                media(g, "vision");
+            }
+        }
         C::Gemma4(c) => gemma(g, c),
         C::Inkling(c) => inkling(g, c),
         C::MuseGlimmer(c) => muse(g, c),
@@ -590,8 +597,8 @@ fn prediction(g: &mut Builder, previous: &str) {
     g.get_mut("prediction").completeness = DescriptionCompleteness::Partial(vec![
         "Prediction subgraph and its execution-dependent captures are not yet expanded".into(),
     ]);
-    g.partial("Embedded prediction is represented as an opaque component");
-    g.catalog_partial("Embedded prediction capture paths are not enumerated");
+    g.partial(super::OPAQUE_PREDICTION_DESCRIPTION);
+    g.catalog_partial(super::UNENUMERATED_PREDICTION_CAPTURES);
 }
 
 fn media(g: &mut Builder, name: &str) {
@@ -668,6 +675,7 @@ fn merge_capture(g: &mut Builder, assembly: &str) {
 
 pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig) {
     match c {
+        SafetensorsModelConfig::Qwen4Exp(c, _) => qwen4_exp(g, c),
         SafetensorsModelConfig::K2Horizon(c) => k2_horizon(g, c),
         SafetensorsModelConfig::Nanbeige(c) => nanbeige(g, c),
         SafetensorsModelConfig::Lfm2(c) => lfm2(g, c),
@@ -693,6 +701,7 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
 
 pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
     match c {
+        GgufModelConfig::Qwen4Exp(plan) => qwen4_exp(g, plan.text_plan().config()),
         GgufModelConfig::K2Horizon(c) => k2_horizon(g, c),
         GgufModelConfig::Lfm2(c) => lfm2(g, c),
         GgufModelConfig::KimiLinear(c) => kimi(g, c),
@@ -1666,4 +1675,234 @@ fn k2_horizon(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
         crate::k2_horizon::feed_forward_expert_spec(c, layer)
     });
     super::components::k2_horizon::complete(g, c);
+}
+
+// Configuration-only projection: bounds and native state mechanisms belong to
+// retained selection. Do not manufacture a TargetSpec with arbitrary limits here.
+fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
+    use crate::qwen4_exp::config::LayerKind;
+    use ArchitectureEdgeKind as E;
+    use ArchitectureNodeKind as K;
+    let hidden = c.hidden_size as usize;
+    let mut residual_axes = axes(hidden);
+    residual_axes.insert(
+        2,
+        TensorAxis {
+            name: "stream".into(),
+            dimension: SymbolicDimension::Known(c.residual.streams as usize),
+        },
+    );
+    let embedding = g.start("model.embed_tokens", hidden);
+    g.node("tokens", K::Processor, None, None, None);
+    g.get_mut("tokens").label = "Original token IDs retained through media replacement".into();
+    g.edge("tokens", &embedding, E::Data);
+    g.node("residual.expansion", K::Projector, None, None, None);
+    g.get_mut("residual.expansion").label = "Replicate embeddings into residual streams".into();
+    g.get_mut("residual.expansion").output_axes = Some(residual_axes.clone());
+    g.edge(&embedding, "residual.expansion", E::Data);
+    let mut previous = "residual.expansion".to_owned();
+    for (layer, kind) in c.layers.iter().enumerate() {
+        let path = format!("model.layers.{layer}");
+        if c.ngram.layers.contains(&layer) {
+            let id = format!("decoder.layers.{layer}.lexical");
+            g.node(&id, K::Mixer, None, Some(&format!("{path}.ple")), None);
+            g.get_mut(&id).label = format!(
+                "Gated n-gram injection; convolution dilation {}",
+                c.ngram.order
+            );
+            g.get_mut(&id).layer_index = Some(layer);
+            g.get_mut(&id).output_axes = Some(residual_axes.clone());
+            g.get_mut(&id).mixer = Some(MixerAttributes {
+                mechanism: MixerMechanism::ShortConvolution,
+                recurrent: true,
+                convolution_width: Some(c.ngram.kernel as usize),
+            });
+            let table = format!("{id}.table");
+            g.node(
+                &table,
+                K::Embedding,
+                Some(&id),
+                Some(&format!("{path}.ple.ple_embedding.ngram_embedding")),
+                Some(c.ngram.embedding_dim as usize),
+            );
+            g.get_mut(&table).label = "Logical row-addressable n-gram table".into();
+            g.edge("tokens", &table, E::Data);
+            g.edge(&table, &id, E::Data);
+            g.edge(&previous, &id, E::Residual);
+            qwen4_state(
+                g,
+                &id,
+                "Original token history, dilated convolution history and sequence position",
+            );
+            previous = id;
+        }
+        let block = g.block(&previous, layer, &path, hidden);
+        g.get_mut(&block).output_axes = Some(residual_axes.clone());
+        for point in &mut g.descriptor.observations.points {
+            if point.node_id == block {
+                point.axes = Some(residual_axes.clone());
+            }
+        }
+        let mut input = block.clone();
+        for (suffix, parameter) in [
+            ("mixer", "attn_hyper_connection"),
+            ("feed_forward", "mlp_hyper_connection"),
+        ] {
+            let collapse = format!("{block}.{suffix}.collapse");
+            let residual = format!("{block}.{suffix}.residual");
+            let op = format!("{block}.{suffix}");
+            g.node(
+                &collapse,
+                K::Projector,
+                Some(&block),
+                Some(&format!("{path}.{parameter}")),
+                Some(hidden),
+            );
+            g.get_mut(&collapse).label = "Gated multi-stream residual input collapse".into();
+            g.edge(&input, &collapse, E::Data);
+            let recurrent = *kind == LayerKind::Recurrent;
+            let op_path = if suffix == "feed_forward" {
+                format!("{path}.mlp")
+            } else {
+                format!(
+                    "{path}.{}",
+                    if recurrent {
+                        "linear_attn"
+                    } else {
+                        "self_attn"
+                    }
+                )
+            };
+            g.node(
+                &op,
+                if suffix == "feed_forward" {
+                    K::FeedForward
+                } else if recurrent {
+                    K::Mixer
+                } else {
+                    K::Attention
+                },
+                Some(&block),
+                Some(&op_path),
+                Some(hidden),
+            );
+            g.edge(&collapse, &op, E::Data);
+            g.node(
+                &residual,
+                K::ResidualAdd,
+                Some(&block),
+                Some(&format!("{path}.{parameter}")),
+                None,
+            );
+            g.get_mut(&residual).label = "Gated write to every retained residual stream".into();
+            g.get_mut(&residual).output_axes = Some(residual_axes.clone());
+            g.edge(&input, &residual, E::Residual);
+            g.edge(&op, &residual, E::Data);
+            if suffix == "feed_forward" {
+                g.moe(
+                    &op,
+                    &op_path,
+                    moe(
+                        c.experts.count,
+                        c.experts.selected,
+                        1,
+                        c.experts.renormalize,
+                        RoutingScoreTransform::Softmax,
+                    ),
+                    None,
+                    hidden,
+                );
+            } else if recurrent {
+                g.get_mut(&op).label =
+                    "Gated delta recurrent mixer with sigmoid output gate".into();
+                g.get_mut(&op).mixer = Some(MixerAttributes {
+                    mechanism: MixerMechanism::GatedDelta,
+                    recurrent: true,
+                    convolution_width: Some(c.recurrent.kernel as usize),
+                });
+                qwen4_state(g, &op, "Recurrent matrix and causal convolution history");
+            } else {
+                g.get_mut(&op).label = format!(
+                    "QSA-selected original K/V; block ratio {}, selection budget {}",
+                    c.attention.ratio, c.attention.budget
+                );
+                g.get_mut(&op).attention = Some(AttentionAttributes {
+                    head_sharing: Some(if c.attention.heads == c.attention.kv_heads {
+                        HeadSharing::MultiHead
+                    } else if c.attention.kv_heads == 1 {
+                        HeadSharing::MultiQuery
+                    } else {
+                        HeadSharing::GroupedQuery
+                    }),
+                    query_heads: Some(c.attention.heads as usize),
+                    key_value_heads: Some(c.attention.kv_heads as usize),
+                    key_head_dimension: Some(c.attention.head_dim as usize),
+                    value_head_dimension: Some(c.attention.head_dim as usize),
+                    mechanism: Some(AttentionMechanism::Softmax),
+                    causal: Some(true),
+                    recurrent: Some(false),
+                    positional_encoding: Some(PositionalEncoding::Rotary),
+                    ..Default::default()
+                });
+                qwen4_state(g, &op, "Full K/V history, completed index summaries, positions and partial micro-block");
+            }
+            input = residual;
+        }
+        previous = input;
+    }
+    g.node(
+        "output.collapse",
+        K::Projector,
+        None,
+        Some("model.hyper_connection_mixer"),
+        Some(hidden),
+    );
+    g.get_mut("output.collapse").label =
+        "Gated final residual collapse without another RMSNorm".into();
+    g.edge(&previous, "output.collapse", E::Data);
+    g.node(
+        "output",
+        K::OutputHead,
+        None,
+        Some(if c.tied_embeddings {
+            "model.embed_tokens"
+        } else {
+            "lm_head"
+        }),
+        Some(c.vocabulary as usize),
+    );
+    g.edge("output.collapse", "output", E::Data);
+    let mut logits = axes(c.vocabulary as usize);
+    logits[2].name = "vocabulary".into();
+    g.get_mut("output").output_axes = Some(logits.clone());
+    g.observation(
+        "output",
+        MODEL_LOGITS_OBSERVATION_PATH.into(),
+        "Final vocabulary logits",
+        ObservationDtype::Floating,
+        Some(logits),
+        false,
+    );
+    if c.prediction.is_some() {
+        prediction(g, &previous);
+    }
+    if c.vision.is_some() {
+        media(g, "vision");
+    }
+    g.partial("Residual and state ownership are described; component decomposition and prediction internals require retained execution specifications");
+    g.catalog_partial("Configuration discovery declares unit boundaries and logits; internal capture and intervention points require retained execution discovery");
+}
+
+fn qwen4_state(g: &mut Builder, owner: &str, label: &str) {
+    let state = format!("{owner}.state");
+    g.node(
+        &state,
+        ArchitectureNodeKind::Opaque,
+        Some(owner),
+        None,
+        None,
+    );
+    g.get_mut(&state).label = label.into();
+    g.edge(&state, owner, ArchitectureEdgeKind::State);
+    g.edge(owner, &state, ArchitectureEdgeKind::State);
 }

@@ -3,165 +3,15 @@
 use safemlx::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
-    ops::{
-        broadcast_to, concatenate_axis, einsum,
-        indexing::{take_along_axis, NewAxis, TryIndexOp},
-        r#where, softmax_axis,
-    },
+    ops::{broadcast_to, concatenate_axis, indexing::TryIndexOp},
     Array, Dtype, Stream,
 };
 
 use crate::backend::nn::tensor::create_causal_mask;
 
-/// Sparse attention over a bounded local window and indexed compressed tokens.
-///
-/// Queries are `[batch, heads, query, key_dim]`, local and pooled keys/values
-/// are `[batch, tokens, key_or_value_dim]`, and `pooled_indices` is
-/// `[batch, query, selected]`.
-/// A learned sink contributes to the shared softmax denominator with a zero
-/// value. The implementation materializes scores only for the local window and
-/// selected compressed positions, never for the complete source context.
-#[allow(clippy::too_many_arguments)]
-pub fn indexed_sparse_attention(
-    queries: &Array,
-    local_keys: &Array,
-    local_values: &Array,
-    pooled_keys: &Array,
-    pooled_values: &Array,
-    pooled_indices: &Array,
-    scale: f32,
-    local_mask: Option<&Array>,
-    pooled_mask: Option<&Array>,
-    sinks: Option<&Array>,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    if queries.ndim() != 4
-        || local_keys.ndim() != 3
-        || local_values.ndim() != 3
-        || pooled_keys.ndim() != 3
-        || pooled_values.ndim() != 3
-        || pooled_indices.ndim() != 3
-        || queries.dim(0) != local_keys.dim(0)
-        || queries.dim(0) != local_values.dim(0)
-        || queries.dim(0) != pooled_keys.dim(0)
-        || queries.dim(0) != pooled_values.dim(0)
-        || queries.dim(0) != pooled_indices.dim(0)
-        || queries.dim(2) != pooled_indices.dim(1)
-        || queries.dim(3) != local_keys.dim(2)
-        || queries.dim(3) != pooled_keys.dim(2)
-        || local_keys.dim(1) != local_values.dim(1)
-        || pooled_keys.dim(1) != pooled_values.dim(1)
-        || local_values.dim(2) != pooled_values.dim(2)
-    {
-        return Err(Exception::custom(format!(
-            "indexed sparse attention received incompatible shapes q={:?}, local_keys={:?}, local_values={:?}, pooled_keys={:?}, pooled_values={:?}, indices={:?}",
-            queries.shape(),
-            local_keys.shape(),
-            local_values.shape(),
-            pooled_keys.shape(),
-            pooled_values.shape(),
-            pooled_indices.shape()
-        )));
-    }
-    let batch = queries.dim(0);
-    let heads = queries.dim(1);
-    let query_tokens = queries.dim(2);
-    let key_dim = queries.dim(3);
-    let value_dim = local_values.dim(2);
-    let selected = pooled_indices.dim(2);
-    let pooled_tokens = pooled_keys.dim(1);
-    if selected <= 0 || pooled_tokens <= 0 {
-        return Err(Exception::custom(
-            "indexed sparse attention requires at least one pooled token and selected index",
-        ));
-    }
-
-    let expanded_pooled_keys = broadcast_to(
-        &pooled_keys.try_index_device((.., NewAxis, .., ..), stream)?,
-        &[batch, query_tokens, pooled_tokens, key_dim],
-        stream,
-    )?;
-    let expanded_key_indices = broadcast_to(
-        &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
-        &[batch, query_tokens, selected, key_dim],
-        stream,
-    )?;
-    let selected_pooled_keys =
-        take_along_axis(expanded_pooled_keys, &expanded_key_indices, 2, stream)?;
-    let expanded_pooled_values = broadcast_to(
-        &pooled_values.try_index_device((.., NewAxis, .., ..), stream)?,
-        &[batch, query_tokens, pooled_tokens, value_dim],
-        stream,
-    )?;
-    let expanded_value_indices = broadcast_to(
-        &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
-        &[batch, query_tokens, selected, value_dim],
-        stream,
-    )?;
-    let selected_pooled_values =
-        take_along_axis(expanded_pooled_values, &expanded_value_indices, 2, stream)?;
-
-    let scaled_queries = queries.multiply(Array::from_f32(scale), stream)?;
-    let mut local_scores = einsum("bhld,btd->bhlt", [&scaled_queries, local_keys], stream)?;
-    let mut pooled_scores = einsum(
-        "bhld,blkd->bhlk",
-        [&scaled_queries, &selected_pooled_keys],
-        stream,
-    )?;
-    apply_score_mask(&mut local_scores, local_mask, stream)?;
-    apply_score_mask(&mut pooled_scores, pooled_mask, stream)?;
-
-    let mut score_parts = vec![local_scores, pooled_scores];
-    if let Some(sinks) = sinks {
-        if sinks.shape() != [heads] {
-            return Err(Exception::custom(format!(
-                "attention sinks require shape [{heads}], got {:?}",
-                sinks.shape()
-            )));
-        }
-        score_parts.push(broadcast_to(
-            &sinks
-                .as_dtype(score_parts[0].dtype(), stream)?
-                .reshape(&[1, heads, 1, 1], stream)?,
-            &[batch, heads, query_tokens, 1],
-            stream,
-        )?);
-    }
-    let scores = concatenate_axis(&score_parts, -1, stream)?;
-    let weights = softmax_axis(scores, -1, true, stream)?;
-    let local_tokens = local_keys.dim(1);
-    let local_weights = weights.try_index_device((.., .., .., ..local_tokens), stream)?;
-    let pooled_weights =
-        weights.try_index_device((.., .., .., local_tokens..local_tokens + selected), stream)?;
-    let local_context = einsum("bhlt,btv->bhlv", [&local_weights, local_values], stream)?;
-    let pooled_context = einsum(
-        "bhlk,blkv->bhlv",
-        [&pooled_weights, &selected_pooled_values],
-        stream,
-    )?;
-    local_context.add(pooled_context, stream)
-}
-
-fn apply_score_mask(
-    scores: &mut Array,
-    mask: Option<&Array>,
-    stream: &Stream,
-) -> Result<(), Exception> {
-    let Some(mask) = mask else {
-        return Ok(());
-    };
-    *scores = if mask.dtype() == Dtype::Bool {
-        r#where(
-            mask,
-            &*scores,
-            Array::from_f32(scores.dtype().finfo_min()? as f32),
-            stream,
-        )?
-    } else {
-        scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?
-    };
-    Ok(())
-}
+mod indexed;
+pub(crate) use indexed::indexed_attention_with_reader;
+pub use indexed::indexed_sparse_attention;
 
 /// Selected ordinary attention lowering; shared by execution and memory facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,43 +61,107 @@ pub(crate) fn memory_tile_geometry(
     }
 }
 
-/// Applies caller-provided rotary cosine and sine tensors to one head view.
+/// Applies explicit rotary values to a declared prefix of `[batch,heads,tokens,width]`.
+/// Rank-two shared, rank-three batched and rank-four singleton-head values use
+/// the same input-dtype product boundaries as generated elementwise rotary values.
 pub fn apply_rotary_embeddings(
     value: &Array,
     cos: &Array,
     sin: &Array,
+    dimensions: i32,
+    traditional: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let add_batch_axis = |embedding: &Array| -> Result<Array, Exception> {
-        match embedding.shape().len() {
-            2 => embedding.expand_dims(0, stream),
-            3 => Ok(embedding.clone()),
-            rank => Err(Exception::custom(format!(
-                "explicit rotary embeddings must have rank 2 or 3, got {rank}"
-            ))),
+    if value.shape().len() != 4
+        || dimensions <= 0
+        || dimensions % 2 != 0
+        || dimensions > value.dim(-1)
+        || cos.shape() != sin.shape()
+    {
+        return Err(Exception::custom("invalid explicit rotary geometry"));
+    }
+    let half = dimensions / 2;
+    let canonical = |embedding: &Array| -> Result<Array, Exception> {
+        let embedding = match embedding.shape() {
+            [tokens, width]
+                if *tokens == value.dim(2) && (*width == dimensions || *width == half) =>
+            {
+                embedding.reshape(&[1, 1, *tokens, *width], stream)?
+            }
+            [batch, tokens, width]
+                if (*batch == 1 || *batch == value.dim(0))
+                    && *tokens == value.dim(2)
+                    && (*width == dimensions || *width == half) =>
+            {
+                embedding.expand_dims(1, stream)?
+            }
+            [batch, 1, tokens, width]
+                if (*batch == 1 || *batch == value.dim(0))
+                    && *tokens == value.dim(2)
+                    && (*width == dimensions || *width == half) =>
+            {
+                embedding.clone()
+            }
+            _ => {
+                return Err(Exception::custom(
+                    "explicit rotary embedding shape mismatch",
+                ))
+            }
+        }
+        .as_dtype(value.dtype(), stream)?;
+        if embedding.dim(-1) == dimensions {
+            return Ok(embedding);
+        }
+        if traditional {
+            concatenate_axis(
+                &[
+                    embedding.expand_dims(-1, stream)?,
+                    embedding.expand_dims(-1, stream)?,
+                ],
+                -1,
+                stream,
+            )?
+            .reshape(&[embedding.dim(0), 1, value.dim(2), dimensions], stream)
+        } else {
+            concatenate_axis(&[embedding.clone(), embedding], -1, stream)
         }
     };
-    let cos = add_batch_axis(cos)?;
-    let sin = add_batch_axis(sin)?;
-    let cos = cos
-        .as_dtype(value.dtype(), stream)?
-        .try_index_device((.., NewAxis, .., ..), stream)?;
-    let sin = sin
-        .as_dtype(value.dtype(), stream)?
-        .try_index_device((.., NewAxis, .., ..), stream)?;
-    let rotate_half = |x: &Array| -> Result<Array, Exception> {
-        let half = x.dim(-1) / 2;
-        let first = x.try_index_device((.., .., .., ..half), stream)?;
-        let second = x.try_index_device((.., .., .., half..), stream)?;
+    let cos = canonical(cos)?;
+    let sin = canonical(sin)?;
+    let prefix = value.try_index_device((.., .., .., ..dimensions), stream)?;
+    let rotated = if traditional {
+        let pairs = prefix.reshape(&[value.dim(0), value.dim(1), value.dim(2), half, 2], stream)?;
+        let first = pairs.try_index_device((.., .., .., .., 0), stream)?;
+        let second = pairs.try_index_device((.., .., .., .., 1), stream)?;
         concatenate_axis(
-            &[second.multiply(Array::from_f32(-1.0), stream)?, first],
+            &[
+                second.negative(stream)?.expand_dims(-1, stream)?,
+                first.expand_dims(-1, stream)?,
+            ],
+            -1,
+            stream,
+        )?
+        .reshape(prefix.shape(), stream)?
+    } else {
+        let first = prefix.try_index_device((.., .., .., ..half), stream)?;
+        let second = prefix.try_index_device((.., .., .., half..), stream)?;
+        concatenate_axis(&[second.negative(stream)?, first], -1, stream)?
+    };
+    let output = prefix
+        .multiply(&cos, stream)?
+        .add(rotated.multiply(&sin, stream)?, stream)?;
+    if dimensions == value.dim(-1) {
+        Ok(output)
+    } else {
+        concatenate_axis(
+            &[
+                output,
+                value.try_index_device((.., .., .., dimensions..), stream)?,
+            ],
             -1,
             stream,
         )
-    };
-    value
-        .multiply(&cos, stream)?
-        .add(rotate_half(value)?.multiply(&sin, stream)?, stream)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -181,6 +181,7 @@ impl AddressableParameterBank {
         Self::new_shared_with_policy(
             store,
             entries,
+            Vec::new(),
             options.into(),
             ResidencyPolicy::Cacheable,
             MemoryTier::Disk,
@@ -193,17 +194,24 @@ impl AddressableParameterBank {
     }
 
     /// Creates a cache from exact per-binding selected transformation tasks.
-    pub fn new_selected_shared<O>(
+    pub fn new_selected_shared(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         selected: SelectedAddressableEntries,
-        options: O,
+        rows: &eredu_runtime::SelectedRowLookups,
         source_stream: Stream,
         device_stream: Stream,
-    ) -> Result<Self, AddressableParameterBankError>
-    where
-        O: Into<ParameterBankOptions>,
-    {
-        let options = options.into();
+    ) -> Result<Self, AddressableParameterBankError> {
+        rows.validate_binding(rows.options().offload(), &MlxRowLookupSupport)
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(source.into()),
+            })?;
+        let options: ParameterBankOptions = rows.options().into();
+        let rows = rows.prepared();
+        rows.validate_other_banks(selected.entries.iter().map(|entry| entry.identity.bank()))
+            .map_err(|source| AddressableParameterBankError::Transformation {
+                source: Box::new(source.into()),
+            })?;
+        let row_ranges: Vec<_> = rows.ranges().cloned().collect();
         preflight_selected_entry_bindings(store.as_ref(), &selected.entries)?;
         let selected_keys = selected
             .entries
@@ -269,6 +277,25 @@ impl AddressableParameterBank {
                 });
             }
         }
+        // Validate the combined namespace/budget plan before a selected weight
+        // transformation can read payloads. Rows retain their own source recipes.
+        let specs = selected
+            .entries
+            .iter()
+            .map(|entry| {
+                OffloadUnitSpec::new(
+                    entry.identity.unit_id(),
+                    selected.expected_bytes[&entry.identity],
+                    ResidencyPolicy::Cacheable,
+                    MemoryTier::Disk,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        OffloadPlan::with_ranges(
+            options.storage,
+            specs,
+            row_ranges.iter().map(|range| range.range().clone()),
+        )?;
         if selected.transformations.is_empty() {
             let parameter_members = prepared_parameter_members(
                 &selected.entries,
@@ -278,6 +305,7 @@ impl AddressableParameterBank {
             let mut bank = Self::new_shared_with_policy(
                 store,
                 selected.entries,
+                row_ranges,
                 options,
                 ResidencyPolicy::Cacheable,
                 MemoryTier::Disk,
@@ -319,6 +347,7 @@ impl AddressableParameterBank {
         let mut bank = Self::new_shared_with_policy(
             transformed.store,
             transformed.entries,
+            row_ranges,
             options,
             ResidencyPolicy::Cacheable,
             MemoryTier::Disk,
@@ -348,6 +377,7 @@ impl AddressableParameterBank {
         Self::new_shared_with_policy(
             store,
             entries,
+            Vec::new(),
             ParameterBankOptions::default(),
             ResidencyPolicy::Pinned,
             MemoryTier::Device,
@@ -363,6 +393,7 @@ impl AddressableParameterBank {
     pub(super) fn new_shared_with_policy(
         store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
+        row_ranges: Vec<eredu_runtime::RowResidencyRange>,
         options: ParameterBankOptions,
         policy: ResidencyPolicy,
         initial_tier: MemoryTier,
@@ -407,12 +438,23 @@ impl AddressableParameterBank {
             )?);
             definitions.push(entry.unit);
         }
-        if catalog.is_empty() {
+        if catalog.is_empty() && row_ranges.is_empty() {
             return Err(AddressableParameterBankError::EmptyCatalog);
         }
-        let plan = OffloadPlan::new(options.storage, specs)?;
-        let manager =
-            ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
+        let plan = OffloadPlan::with_ranges(
+            options.storage,
+            specs,
+            row_ranges.iter().map(|range| range.range().clone()),
+        )?;
+        let manager = ResidencyManager::new_shared_row_ranges(
+            store,
+            BTreeMap::new(),
+            plan,
+            definitions,
+            row_ranges,
+            source_stream,
+            device_stream,
+        )?;
         manager.initialize()?;
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
@@ -483,7 +525,7 @@ impl AddressableParameterBank {
     #[cfg(test)]
     pub(crate) fn complete_acquisition(
         &self,
-        mut acquisition: AcquiredParameterGroups,
+        mut acquisition: AcquiredParameters,
         output: &Array,
     ) -> Result<(), AddressableParameterBankError> {
         eval([output])?;
@@ -500,7 +542,7 @@ impl AddressableParameterBank {
         selection_shape: &[i32],
         pass: BankAccessClass,
         stream: &Stream,
-    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+    ) -> Result<AcquiredParameters, AddressableParameterBankError> {
         let expected_elements = selection_shape
             .iter()
             .try_fold(1usize, |count, dimension| {
@@ -550,7 +592,7 @@ impl AddressableParameterBank {
         selection_count: u64,
         pass: BankAccessClass,
         stream: &Stream,
-    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+    ) -> Result<AcquiredParameters, AddressableParameterBankError> {
         let bank = compact_ids.first().map(|key| key.bank());
         if compact_ids.iter().any(|key| Some(key.bank()) != bank) {
             return Err(AddressableParameterBankError::MixedBanks);
@@ -649,10 +691,14 @@ impl AddressableParameterBank {
         }
         let mut occupancy = BTreeMap::<usize, (u64, u64)>::new();
         for (id, bytes) in &after.host {
-            occupancy.entry(self.unit_banks[id]).or_default().0 += bytes;
+            if let Some(bank) = self.unit_banks.get(id) {
+                occupancy.entry(*bank).or_default().0 += bytes;
+            }
         }
         for (id, bytes) in &after.device {
-            occupancy.entry(self.unit_banks[id]).or_default().1 += bytes;
+            if let Some(bank) = self.unit_banks.get(id) {
+                occupancy.entry(*bank).or_default().1 += bytes;
+            }
         }
         for (bank, (host, device)) in occupancy {
             let stats = statistics.entry(bank).or_default();
@@ -661,7 +707,7 @@ impl AddressableParameterBank {
         }
         drop(statistics);
 
-        Ok(AcquiredParameterGroups {
+        Ok(AcquiredParameters {
             identities: compact_ids,
             demand: demand.into_values().collect(),
             scratch_bytes,
@@ -676,7 +722,7 @@ impl AddressableParameterBank {
         entries: &[(ParameterBankKey, u64)],
         pass: BankAccessClass,
         stream: &Stream,
-    ) -> Result<AcquiredParameterGroups, AddressableParameterBankError> {
+    ) -> Result<AcquiredParameters, AddressableParameterBankError> {
         if entries.is_empty() {
             return Err(AddressableParameterBankError::EmptyDemand);
         }
@@ -867,7 +913,7 @@ impl ResidentSnapshot {
 }
 
 /// A deterministic compact selection table and the leases protecting its sources.
-pub struct AcquiredParameterGroups {
+pub struct AcquiredParameters {
     pub(super) identities: Vec<ParameterBankKey>,
     pub(super) demand: Vec<u64>,
     pub(super) scratch_bytes: u64,
@@ -875,7 +921,11 @@ pub struct AcquiredParameterGroups {
     pub(super) transfer: ResidentTransfer,
 }
 
-impl AcquiredParameterGroups {
+impl crate::backend::submission_recovery::Retention for AcquiredParameters {
+    fn observe(&self, _: crate::backend::submission_recovery::Status) {}
+}
+
+impl AcquiredParameters {
     /// Returns selected entries in compact-bank order.
     pub fn identities(&self) -> &[ParameterBankKey] {
         &self.identities

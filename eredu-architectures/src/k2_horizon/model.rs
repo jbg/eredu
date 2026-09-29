@@ -10,8 +10,8 @@ use eredu_nn::{
     Parameterized, Tensor,
 };
 use eredu_runtime::{
-    ExpertPass, ResidentExpertProvider, RoutedBankId, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedBankId, RoutedExpertRequest,
+    TensorParallelParameterProvider,
 };
 
 mod observed;
@@ -78,7 +78,7 @@ fn pass<T: Tensor>(input: &T) -> ExpertPass {
 }
 
 impl<B: GroupedNeuralBackend> Projections<B> {
-    fn values<P: RoutedExpertProvider<B>>(
+    fn values<P: ParameterProvider<B>>(
         &mut self,
         input: &B::Tensor,
         pass: ExpertPass,
@@ -97,7 +97,7 @@ impl<B: GroupedNeuralBackend> Projections<B> {
         )
     }
 
-    fn feed_forward<P: RoutedExpertProvider<B>>(
+    fn feed_forward<P: ParameterProvider<B>>(
         &mut self,
         input: &B::Tensor,
         pass: ExpertPass,
@@ -181,7 +181,7 @@ impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
         _points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<Option<B::Tensor>, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {
@@ -203,7 +203,7 @@ impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
         _points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {
@@ -222,7 +222,7 @@ impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {
@@ -241,7 +241,7 @@ impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {
@@ -302,7 +302,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         _points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {
@@ -329,7 +329,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         if layer != self.layer {

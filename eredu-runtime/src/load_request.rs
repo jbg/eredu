@@ -139,9 +139,18 @@ pub enum NormalizedLoadRequestError {
     /// Embedded drafting requires positive capacity.
     #[error("embedded draft capacity must be positive")]
     ZeroEmbeddedDraftCapacity,
+    /// A separate embedded prediction artifact was supplied without selecting embedded drafting.
+    #[error("a separate prediction source requires explicit embedded drafting")]
+    PredictionSourceRequiresEmbeddedDrafting,
+    /// A separate prediction artifact path is empty.
+    #[error("prediction source path must not be empty")]
+    EmptyPredictionSource,
     /// The portable planner supplied a drafting mode this runtime does not understand.
     #[error("unsupported speculative drafting plan")]
     UnsupportedDraftingPlan,
+    /// Portable invocation capacities disagree across independent request fields.
+    #[error(transparent)]
+    BoundedExecution(#[from] crate::BoundedExecutionPolicyError),
     /// The default realtime completion contract could not be constructed.
     #[error("{0}")]
     Completion(String),
@@ -168,6 +177,9 @@ pub struct NormalizedLoadRequest {
     required_session_capabilities: SessionCapabilities,
     prompt_cache_persistence: bool,
     drafting: DraftingLoadRequest,
+    prediction_source: Option<std::path::PathBuf>,
+    media_execution: crate::MediaLoadRequest,
+    bounded_execution: Option<crate::BoundedExecutionPolicy>,
 }
 
 /// A normalized model request whose cross-field invariants were checked once.
@@ -183,6 +195,43 @@ impl<'a> ValidatedModelLoadRequest<'a> {
         self.policy
     }
 
+    /// Projects exact shared text selection from the validated load policy.
+    /// A partitioned base is selected locally; its global topology is bound by
+    /// the partition constructor instead of ordinary replicated selection.
+    pub fn text_selection_request(
+        self,
+        admitted_session: SessionCapabilities,
+        partitioned_base: bool,
+    ) -> crate::ReplicatedTextSelectionRequest {
+        let mut request = crate::ReplicatedTextSelectionRequest::new(
+            self.request.weight_residency().layers(),
+            self.request.state_residency().clone(),
+        )
+        .with_max_cached_shards(
+            NonZeroUsize::new(self.request.max_cached_shards())
+                .expect("validated source reader limit is positive"),
+        )
+        .with_parameter_conversion_retention(self.request.parameter_conversion_retention())
+        .with_session(admitted_session)
+        .with_prompt_cache(
+            self.request.prompt_cache_persistence()
+                || matches!(
+                    self.request.state_residency(),
+                    CacheResidencyPolicy::Paged(_)
+                ),
+        )
+        .with_exact_completion(true);
+        if !partitioned_base {
+            if let Some(topology) = self.policy.topology() {
+                request = request.with_topology(topology);
+            }
+        }
+        if let Some(quantization) = self.policy.quantization() {
+            request = request.with_quantization(quantization);
+        }
+        request
+    }
+
     /// Original normalized request covered by this validation proof.
     pub const fn request(self) -> &'a NormalizedLoadRequest {
         self.request
@@ -190,6 +239,30 @@ impl<'a> ValidatedModelLoadRequest<'a> {
 }
 
 impl NormalizedLoadRequest {
+    /// Selects conditional input readiness and its explicit logical resource ceilings.
+    /// Architecture preparation must admit this intent before binding media sources.
+    pub fn with_media_execution(mut self, request: crate::MediaLoadRequest) -> Self {
+        self.media_execution = request;
+        self
+    }
+
+    /// Returns the exact conditional-input intent retained by cold selection.
+    pub const fn media_execution(&self) -> &crate::MediaLoadRequest {
+        &self.media_execution
+    }
+
+    /// Retains explicit finite invocation and streaming-mechanism controls.
+    /// Architecture preparation decides whether these mechanisms are required.
+    pub const fn with_bounded_execution(mut self, policy: crate::BoundedExecutionPolicy) -> Self {
+        self.bounded_execution = Some(policy);
+        self
+    }
+
+    /// Returns exact finite bounds, if the caller explicitly supplied them.
+    pub const fn bounded_execution(&self) -> Option<crate::BoundedExecutionPolicy> {
+        self.bounded_execution
+    }
+
     /// Requires persisted prompt-prefix import/export independently of state residency.
     pub const fn with_prompt_cache_persistence(mut self, required: bool) -> Self {
         self.prompt_cache_persistence = required;
@@ -306,6 +379,24 @@ impl NormalizedLoadRequest {
     pub const fn with_drafting(mut self, drafting: DraftingLoadRequest) -> Self {
         self.drafting = drafting;
         self
+    }
+
+    /// Supplies the separate artifact for an embedded prediction extension.
+    /// Architecture preparation validates its format and compatibility with the target.
+    pub fn with_prediction_source(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.prediction_source = Some(path.into());
+        self
+    }
+
+    /// Removes the separate prediction artifact when projecting target-only preparation.
+    pub fn without_prediction_source(mut self) -> Self {
+        self.prediction_source = None;
+        self
+    }
+
+    /// Explicit embedded prediction artifact, retained through cold selection.
+    pub fn prediction_source(&self) -> Option<&std::path::Path> {
+        self.prediction_source.as_deref()
     }
 
     /// Applies a portable execution plan's drafting mode before payload selection.
@@ -444,8 +535,25 @@ impl NormalizedLoadRequest {
         if self.max_cached_shards() == 0 {
             return Err(NormalizedLoadRequestError::ZeroCachedShards);
         }
+        if let Some(source) = self.prediction_source() {
+            if source.as_os_str().is_empty() {
+                return Err(NormalizedLoadRequestError::EmptyPredictionSource);
+            }
+            if !matches!(self.drafting, DraftingLoadRequest::Embedded { .. }) {
+                return Err(NormalizedLoadRequestError::PredictionSourceRequiresEmbeddedDrafting);
+            }
+        }
         self.weight_quantization()?;
         self.communication_completion_policy()?;
+        if let (Some(parallel), Some(bounded)) = (self.parallel, self.bounded_execution) {
+            let invocation = bounded.invocation();
+            if parallel.invocation_limits() != (invocation.batch(), invocation.chunk_tokens()) {
+                return Err(crate::BoundedExecutionPolicyError::Conflict(
+                    "parallel and bounded invocation geometry differ",
+                )
+                .into());
+            }
+        }
         Ok(ValidatedModelLoadRequest {
             request: self,
             policy: self.project_preparation_policy(),
@@ -522,6 +630,43 @@ mod tests {
     }
 
     #[test]
+    fn text_selection_preserves_validated_normalized_authority() {
+        let rank =
+            ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap();
+        let parallel = ParallelLoadRequest::new(
+            rank,
+            PipelineWireContract::new(crate::PipelineActivationDtype::Float32),
+            2,
+            128,
+            completion(),
+        )
+        .unwrap();
+        let session = SessionCapabilities::new(true, true, true);
+        let request = NormalizedLoadRequest::with_quantization(QuantizationRequest::MxFp4)
+            .with_parallel_execution(parallel)
+            .unwrap()
+            .with_max_cached_shards(NonZeroUsize::new(3).unwrap())
+            .with_required_session_capabilities(session)
+            .with_prompt_cache_persistence(true);
+        let proof = request.validate_model_preparation().unwrap();
+        let expected = crate::ReplicatedTextSelectionRequest::new(
+            request.weight_residency().layers(),
+            request.state_residency().clone(),
+        )
+        .with_max_cached_shards(NonZeroUsize::new(3).unwrap())
+        .with_session(session)
+        .with_prompt_cache(true)
+        .with_exact_completion(true)
+        .with_quantization(QuantizationRequest::MxFp4)
+        .with_topology(rank.topology());
+        assert_eq!(proof.text_selection_request(session, false), expected);
+        let local = proof.text_selection_request(session, true);
+        assert_eq!(local.topology(), None);
+        assert!(local.prompt_cache());
+        assert_eq!(local.max_cached_shards(), 3);
+    }
+
+    #[test]
     fn invalid_parallel_geometry_fails_at_parallel_construction() {
         let rank =
             ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 0).unwrap();
@@ -584,6 +729,39 @@ mod tests {
             request.with_parallel_execution(parallel),
             Err(NormalizedLoadRequestError::ConflictingCompletionPolicy)
         ));
+    }
+
+    #[test]
+    fn prediction_source_requires_nonempty_path_and_explicit_embedded_drafting() {
+        for drafting in [
+            DraftingLoadRequest::ArchitectureDefault,
+            DraftingLoadRequest::Disabled,
+            DraftingLoadRequest::ExternalTarget,
+        ] {
+            let request = NormalizedLoadRequest::default()
+                .with_drafting(drafting)
+                .with_prediction_source("prediction");
+            assert!(matches!(
+                request.validate_model_preparation(),
+                Err(NormalizedLoadRequestError::PredictionSourceRequiresEmbeddedDrafting)
+            ));
+        }
+        let request = NormalizedLoadRequest::default()
+            .with_drafting(DraftingLoadRequest::embedded(2).unwrap())
+            .with_prediction_source("");
+        assert!(matches!(
+            request.validate_model_preparation(),
+            Err(NormalizedLoadRequestError::EmptyPredictionSource)
+        ));
+        let request = request.with_prediction_source("prediction");
+        assert_eq!(
+            request
+                .validate_model_preparation()
+                .unwrap()
+                .request()
+                .prediction_source(),
+            Some(std::path::Path::new("prediction"))
+        );
     }
 
     #[test]

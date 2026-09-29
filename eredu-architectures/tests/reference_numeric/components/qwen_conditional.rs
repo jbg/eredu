@@ -78,7 +78,12 @@ fn conditional_qwen_prediction_tokens_match_interleaved_target_media() {
             "Qwen prediction preserves text, image, video, and projected segment order",
         );
         assert_eq!(admitted.decoder_positions(), 9);
-        let target = qwen::hybrid::prepare_conditional_input(paired, &context).unwrap();
+        let target = qwen::ingress::prepare_input(
+            paired,
+            qwen::ingress::ProjectedTokenPolicy::Placeholder(0),
+            &context,
+        )
+        .unwrap();
         assert_tensor_exact(
             &actual,
             &target.token_ids(&context).unwrap(),

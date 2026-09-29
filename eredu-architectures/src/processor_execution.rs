@@ -16,8 +16,37 @@ use crate::processor_plan::{
     ArtifactArchitecturePlan, Gemma4AudioPlan, Gemma4ImagePlan, Gemma4ProcessorPlan,
     Gemma4VideoPlan, InklingAudioPlan, InklingImagePlan, InklingProcessorPlan, MusePatchPlan,
     MuseProcessorPlan, MuseVideoPlan, ProcessorPlanError, QwenImagePlan, QwenPatchPlan,
-    QwenProcessorPlan, QwenVideoPlan, RgbTransformPlan,
+    QwenProcessorPlan, RgbTransformPlan,
 };
+
+mod qwen_request;
+use eredu_runtime::processor_resources::{
+    ProcessorRequestBudget, ProcessorRequestResources, ProcessorResourceError,
+};
+
+/// Prepared inputs with optional coarse request preparation limits.
+#[derive(Debug)]
+pub struct BudgetedProcessorInput<T> {
+    input: PreparedModelInput<T>,
+    resources: ProcessorRequestResources,
+}
+impl<T> BudgetedProcessorInput<T> {
+    /// Coarse host and output payload estimates; native allocation and later
+    /// model execution are outside these optional request limits.
+    pub fn resources(&self) -> &ProcessorRequestResources {
+        &self.resources
+    }
+    /// Releases the report and returns the ordinary identity-coupled input.
+    pub fn into_input(self) -> PreparedModelInput<T> {
+        self.input
+    }
+}
+impl<T> std::ops::Deref for BudgetedProcessorInput<T> {
+    type Target = PreparedModelInput<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
 
 /// Fully specified model-independent log-mel operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +113,8 @@ pub trait ProcessorMechanisms: PreparedInputInspector<Self::Tensor> {
     /// Mechanism failure.
     type Error: std::fmt::Display;
 
+    // Constructors must own copied inputs and retain asynchronous resources
+    // through completion, including on failure.
     /// Constructs a native unsigned token tensor.
     fn tensor_u32(&mut self, values: &[u32], shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
 
@@ -170,6 +201,16 @@ impl PreparedInputInspector<HostTensor> for HostProcessorMechanisms {
     fn i32_values(&self, tensor: &HostTensor) -> Result<Vec<i32>, eredu_core::CapabilityError> {
         match tensor {
             HostTensor::I32 { values, .. } => Ok(values.clone()),
+            HostTensor::U32 { values, .. } => values
+                .iter()
+                .map(|value| {
+                    i32::try_from(*value).map_err(|_| {
+                        eredu_core::CapabilityError::Observation(
+                            "processor integer exceeds i32".into(),
+                        )
+                    })
+                })
+                .collect(),
             _ => Err(eredu_core::CapabilityError::Observation(
                 "processor metadata is not an i32 buffer".into(),
             )),
@@ -340,6 +381,58 @@ impl ProcessorOperations for HostProcessorMechanisms {
 #[derive(Debug, Clone)]
 pub struct PreparedProcessor {
     kind: ProcessorKind,
+    authority: Option<Box<ProcessorAuthority>>,
+}
+
+#[derive(Clone)]
+struct ProcessorAuthority {
+    selected: eredu_runtime::SelectedProcessorExecution,
+    admission: crate::qwen4_exp::media::MediaAdmissionConfig,
+    budget: Option<ProcessorRequestBudget>,
+}
+impl std::fmt::Debug for ProcessorAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessorAuthority")
+            .field("selected", &self.selected)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}
+impl ProcessorAuthority {
+    fn validate_request<E: std::fmt::Display, M: std::fmt::Display>(
+        &self,
+        request: &TokenizedMultimodalRequest,
+    ) -> Result<(), ProcessorExecutionError<E, M>> {
+        for segment in request.segments() {
+            let modality = match segment {
+                TokenizedMultimodalSegment::TokenIds(_) => InputModality::Text,
+                TokenizedMultimodalSegment::Media(Media::Image(_)) => InputModality::Image,
+                TokenizedMultimodalSegment::Media(Media::Video(_)) => InputModality::Video,
+                TokenizedMultimodalSegment::Media(Media::Audio(_)) => InputModality::Audio,
+            };
+            if !self.selected.modalities().contains(&modality)
+                || (modality != InputModality::Text && !self.selected.raw_media())
+            {
+                return Err(ProcessorExecutionError::Plan(
+                    "request modality/raw preparation was not selected".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn intersect_processor_budgets(
+    a: ProcessorRequestBudget,
+    b: ProcessorRequestBudget,
+) -> ProcessorRequestBudget {
+    ProcessorRequestBudget {
+        decoded_input_bytes: a.decoded_input_bytes.min(b.decoded_input_bytes),
+        host_buffer_bytes: a.host_buffer_bytes.min(b.host_buffer_bytes),
+        output_tensor_bytes: a.output_tensor_bytes.min(b.output_tensor_bytes),
+        planning_items: a.planning_items.min(b.planning_items),
+        decoder_positions: a.decoder_positions.min(b.decoder_positions),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -350,25 +443,93 @@ enum ProcessorKind {
     Qwen(QwenProcessorPlan),
 }
 
+/// Portable validation of final host products before any native tensor allocation.
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessorInputAdmissionError {
+    /// Geometry, representation or semantic admission failed.
+    #[error(transparent)]
+    Capability(#[from] eredu_core::CapabilityError),
+    /// Architecture-derived resource admission failed, retaining its quantities.
+    #[error(transparent)]
+    Resources(#[from] ProcessorResourceError),
+}
+
+/// Architecture validation on exact host products before any native allocation.
+pub trait ProcessorInputAdmission {
+    /// Checks exact geometry and metadata using a host-only inspector.
+    fn validate<T>(
+        &self,
+        input: &PreparedModelInput<T>,
+        inspector: &impl PreparedInputInspector<T>,
+    ) -> Result<(), ProcessorInputAdmissionError>;
+}
+
 impl PreparedProcessor {
+    pub(crate) fn with_media_authority(
+        mut self,
+        selected: eredu_runtime::SelectedProcessorExecution,
+        admission: crate::qwen4_exp::media::MediaAdmissionConfig,
+        budget: Option<ProcessorRequestBudget>,
+    ) -> Self {
+        self.authority = Some(Box::new(ProcessorAuthority {
+            selected,
+            admission,
+            budget,
+        }));
+        self
+    }
+
+    /// Executes preparation with a retained optional coarse budget and returns its report.
+    /// Use ordinary `prepare` when no processor budget was selected.
+    pub fn prepare_budgeted<M: ProcessorMechanisms, E: std::fmt::Display>(
+        &self,
+        request: &TokenizedMultimodalRequest,
+        mechanisms: &mut M,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<BudgetedProcessorInput<M::Tensor>, ProcessorExecutionError<E, M::Error>> {
+        if self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.budget)
+            .is_none()
+        {
+            return Err(ProcessorResourceError::Unavailable.into());
+        }
+        let (input, resources) =
+            self.prepare_checked(request, mechanisms, encode_text, None, |_| Ok(()))?;
+        Ok(BudgetedProcessorInput {
+            input,
+            resources: resources.expect("retained bounded authority produces a report"),
+        })
+    }
+
+    /// Executes a retained shared Qwen policy supplied by portable family preparation.
+    pub fn from_qwen(plan: QwenProcessorPlan) -> Self {
+        Self {
+            authority: None,
+            kind: ProcessorKind::Qwen(plan),
+        }
+    }
+
     /// Selects architecture-owned processor semantics without backend inspection.
     pub fn from_artifact(plan: &ArtifactArchitecturePlan) -> Option<Self> {
         if let Some(plan) = plan.qwen().cloned() {
-            return Some(Self {
-                kind: ProcessorKind::Qwen(plan),
-            });
+            return Some(Self::from_qwen(plan));
         }
         if let Some(plan) = plan.muse().cloned() {
             return Some(Self {
+                authority: None,
                 kind: ProcessorKind::Muse(plan),
             });
         }
         if let Some(plan) = plan.gemma4().cloned() {
             return Some(Self {
+                authority: None,
                 kind: ProcessorKind::Gemma4(plan),
             });
         }
         plan.inkling().cloned().map(|plan| Self {
+            authority: None,
             kind: ProcessorKind::Inkling(plan),
         })
     }
@@ -384,6 +545,71 @@ impl PreparedProcessor {
         M: ProcessorMechanisms,
         E: std::fmt::Display,
     {
+        self.prepare_checked(request, mechanisms, encode_text, None, |_| Ok(()))
+            .map(|(input, _)| input)
+    }
+
+    /// Checks architecture admission on host products before lowering native tensors.
+    pub fn prepare_with_admission<M, E>(
+        &self,
+        request: &TokenizedMultimodalRequest,
+        mechanisms: &mut M,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+        admission: &impl ProcessorInputAdmission,
+        budget: ProcessorRequestBudget,
+    ) -> Result<BudgetedProcessorInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
+    where
+        M: ProcessorMechanisms,
+        E: std::fmt::Display,
+    {
+        let (input, resources) =
+            self.prepare_checked(request, mechanisms, encode_text, Some(budget), |host| {
+                admission.validate(host, &HostProcessorMechanisms)
+            })?;
+        Ok(BudgetedProcessorInput {
+            input,
+            resources: resources.expect("bounded preparation produces a report"),
+        })
+    }
+
+    fn prepare_checked<M, E>(
+        &self,
+        request: &TokenizedMultimodalRequest,
+        mechanisms: &mut M,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+        budget: Option<ProcessorRequestBudget>,
+        admission: impl FnOnce(
+            &PreparedModelInput<HostTensor>,
+        ) -> Result<(), ProcessorInputAdmissionError>,
+    ) -> Result<
+        (
+            PreparedModelInput<M::Tensor>,
+            Option<ProcessorRequestResources>,
+        ),
+        ProcessorExecutionError<E, M::Error>,
+    >
+    where
+        M: ProcessorMechanisms,
+        E: std::fmt::Display,
+    {
+        let budget = match &self.authority {
+            Some(authority) => {
+                authority.validate_request(request)?;
+                match (authority.budget, budget) {
+                    (Some(selected), Some(request)) => {
+                        Some(intersect_processor_budgets(selected, request))
+                    }
+                    (selected, request) => selected.or(request),
+                }
+            }
+            None => budget,
+        };
+        if budget.is_some() && !matches!(self.kind, ProcessorKind::Qwen(_)) {
+            return Err(ProcessorExecutionError::Resources(
+                ProcessorResourceError::Unavailable,
+            ));
+        }
+        let mut resources = None;
         let mut host_mechanisms = HostProcessorMechanisms;
         let host = match &self.kind {
             ProcessorKind::Gemma4(plan) => {
@@ -394,11 +620,28 @@ impl PreparedProcessor {
                 prepare_muse(plan, request, &mut host_mechanisms, encode_text)
             }
             ProcessorKind::Qwen(plan) => {
-                prepare_qwen(plan, request, &mut host_mechanisms, encode_text)
+                let prepared = qwen_request::Request::plan(plan, request, encode_text, budget)
+                    .map_err(host_execution_error)?;
+                resources = Some(prepared.resources);
+                prepared.execute(&mut host_mechanisms)
             }
         }
         .map_err(host_execution_error)?;
-        lower_host_input(host, mechanisms)
+        if let Some(authority) = &self.authority {
+            authority
+                .admission
+                .validate(&host, &HostProcessorMechanisms)
+                .map_err(input_admission_error)?;
+        }
+        admission(&host).map_err(|error| match error {
+            ProcessorInputAdmissionError::Capability(error) => {
+                ProcessorExecutionError::Admission(error)
+            }
+            ProcessorInputAdmissionError::Resources(error) => {
+                ProcessorExecutionError::Resources(error)
+            }
+        })?;
+        lower_host_input(host, mechanisms).map(|input| (input, resources))
     }
 
     /// Executes processor semantics and exposes every final payload and metadata tensor before
@@ -459,8 +702,33 @@ impl PreparedProcessor {
                 .map_err(ProcessorExecutionError::Prepared)?,
             );
         }
-        PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
-            .map_err(ProcessorExecutionError::Prepared)
+        let observed = PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
+            .map_err(ProcessorExecutionError::Prepared)?;
+        if let Some(authority) = &self.authority {
+            // An observer owns its own allocations. The selected processor only
+            // admits value changes within the original constructor geometry.
+            if observed.identity() != prepared.identity() {
+                return Err(ProcessorExecutionError::Plan(
+                    "processor intervention changed tensor shape or dtype".into(),
+                ));
+            }
+            authority
+                .admission
+                .validate(&observed, mechanisms)
+                .map_err(input_admission_error)?;
+        }
+        Ok(observed)
+    }
+}
+
+fn input_admission_error<E: std::fmt::Display, M: std::fmt::Display>(
+    error: ProcessorInputAdmissionError,
+) -> ProcessorExecutionError<E, M> {
+    match error {
+        ProcessorInputAdmissionError::Capability(error) => {
+            ProcessorExecutionError::Admission(error)
+        }
+        ProcessorInputAdmissionError::Resources(error) => ProcessorExecutionError::Resources(error),
     }
 }
 
@@ -474,6 +742,8 @@ fn host_execution_error<E: std::fmt::Display, M: std::fmt::Display>(
             ProcessorExecutionError::Plan(error.to_string())
         }
         ProcessorExecutionError::Prepared(error) => ProcessorExecutionError::Prepared(error),
+        ProcessorExecutionError::Admission(error) => ProcessorExecutionError::Admission(error),
+        ProcessorExecutionError::Resources(error) => ProcessorExecutionError::Resources(error),
     }
 }
 
@@ -564,6 +834,12 @@ where
     /// Architecture processor policy rejected the request.
     #[error("processor plan rejected input: {0}")]
     Plan(String),
+    /// Architecture rejected final host products before native allocation.
+    #[error(transparent)]
+    Admission(eredu_core::CapabilityError),
+    /// Request buffer budget or arithmetic failed before media execution.
+    #[error(transparent)]
+    Resources(#[from] ProcessorResourceError),
     /// Facade tokenizer callback failed.
     #[error("processor text encoding failed: {0}")]
     Text(E),
@@ -1250,54 +1526,6 @@ where
     ))
 }
 
-fn prepare_qwen<M, E>(
-    plan: &QwenProcessorPlan,
-    request: &TokenizedMultimodalRequest,
-    mechanisms: &mut M,
-    encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-) -> Result<PreparedModelInput<M::Tensor>, ProcessorExecutionError<E, M::Error>>
-where
-    M: ProcessorOperations,
-    E: std::fmt::Display,
-{
-    let mut parts = Vec::new();
-    for segment in request.segments() {
-        match segment {
-            TokenizedMultimodalSegment::TokenIds(ids) => {
-                push_tokens(&mut parts, ids, mechanisms)?;
-            }
-            TokenizedMultimodalSegment::Media(Media::Image(image)) => {
-                let image_plan = plan
-                    .image(image.height() as usize, image.width() as usize)
-                    .map_err(plan_error)?;
-                push_tokens(&mut parts, &[image_plan.framing.start_token_id], mechanisms)?;
-                parts.push(qwen_image(image, &image_plan, mechanisms)?);
-                push_tokens(&mut parts, &[image_plan.framing.end_token_id], mechanisms)?;
-            }
-            TokenizedMultimodalSegment::Media(Media::Video(video)) => {
-                let first = consistent_video_frame(video)?;
-                let video_plan = plan
-                    .video(
-                        video.frames().len(),
-                        first.height() as usize,
-                        first.width() as usize,
-                        video.source_fps(),
-                        video.sampling(),
-                    )
-                    .map_err(plan_error)?;
-                push_qwen_video(&mut parts, video, &video_plan, mechanisms, encode_text)?;
-            }
-            TokenizedMultimodalSegment::Media(Media::Audio(_)) => {
-                return Err(ProcessorExecutionError::Plan(
-                    "Qwen visual processor does not accept audio".into(),
-                ));
-            }
-        }
-    }
-    PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
-        .map_err(ProcessorExecutionError::Prepared)
-}
-
 fn qwen_image<M, E>(
     image: &RgbImage,
     plan: &QwenImagePlan,
@@ -1323,51 +1551,6 @@ where
         [(InputMetadataKey::PatchGrid, metadata)],
     )
     .map_err(ProcessorExecutionError::Prepared)
-}
-
-fn push_qwen_video<M, E>(
-    parts: &mut Vec<PreparedInputPart<M::Tensor>>,
-    video: &eredu_core::Video,
-    plan: &QwenVideoPlan,
-    mechanisms: &mut M,
-    encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
-) -> Result<(), ProcessorExecutionError<E, M::Error>>
-where
-    M: ProcessorOperations,
-    E: std::fmt::Display,
-{
-    for group in &plan.groups {
-        let mut prefix =
-            encode_text(&group.timestamp_text).map_err(ProcessorExecutionError::Text)?;
-        prefix.push(plan.framing.start_token_id);
-        push_tokens(parts, &prefix, mechanisms)?;
-        let frames = group
-            .source_indices
-            .iter()
-            .map(|index| {
-                mechanisms
-                    .normalize_rgb(&video.frames()[*index], plan.transform)
-                    .map_err(mechanism_error)
-            })
-            .collect::<Result<Vec<_>, ProcessorExecutionError<E, M::Error>>>()?;
-        let (values, shape, grid) = pack_qwen(&frames, plan.patches, false)?;
-        let payload = mechanisms
-            .tensor_f32(&values, &shape)
-            .map_err(mechanism_error)?;
-        let metadata = mechanisms
-            .tensor_i32(&grid, &[1, 3])
-            .map_err(mechanism_error)?;
-        parts.push(
-            PreparedInputPart::new(
-                InputModality::Video,
-                PreparedInputPayload::Tensor(payload),
-                [(InputMetadataKey::PatchGrid, metadata)],
-            )
-            .map_err(ProcessorExecutionError::Prepared)?,
-        );
-        push_tokens(parts, &[plan.framing.end_token_id], mechanisms)?;
-    }
-    Ok(())
 }
 
 fn pack_qwen<E, M>(
@@ -1470,6 +1653,7 @@ where
 
 #[cfg(all(test, feature = "image", feature = "audio"))]
 mod tests {
+    mod materialization;
     use std::{cell::Cell, convert::Infallible};
 
     use eredu_core::{
@@ -1587,6 +1771,7 @@ mod tests {
             "min_frames":1,"max_frames":8
         }"#;
         PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Qwen(
                 QwenProcessorPlan::from_hf_json(model, Some(visual), Some(visual))
                     .unwrap()
@@ -1626,6 +1811,7 @@ mod tests {
             "boa_token_id":43,"eoa_token_id":44,"audio_config":{}
         }"#;
         let processor = PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Gemma4(
                 Gemma4ProcessorPlan::from_hf_json(model, None, None)
                     .unwrap()
@@ -1775,6 +1961,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let processor = PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Gemma4(plan),
         };
         let request =
@@ -1815,6 +2002,7 @@ mod tests {
             "boa_token_id":43,"eoa_token_id":44,"audio_config":{}
         }"#;
         let processor = PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Gemma4(
                 Gemma4ProcessorPlan::from_hf_json(model, None, None)
                     .unwrap()
@@ -1851,6 +2039,7 @@ mod tests {
     #[test]
     fn inkling_execution_owns_patch_padding_audio_quantization_and_markers() {
         let processor = PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Inkling(
                 InklingProcessorPlan::from_hf_json(
                     br#"{
@@ -1908,6 +2097,7 @@ mod tests {
         }"#;
         let config = format!("{{\"image_processor\":{visual},\"video_processor\":{visual}}}");
         let processor = PreparedProcessor {
+            authority: None,
             kind: ProcessorKind::Muse(MuseProcessorPlan::from_hf_json(config.as_bytes()).unwrap()),
         };
         let request =

@@ -479,12 +479,13 @@ where
 // A second compile-time boundary: gated-only adapters need not implement the
 // ReLU-squared production-visitor contract to enter the total driver.
 #[allow(dead_code)]
-fn gated_partition_route_does_not_require_relu2_visitor<B, S, PS, GF, TF, G, T, A>(
+fn gated_partition_route_does_not_require_relu2_visitor<B, S, PS, SS, GF, TF, UF, G, T, U, A>(
     sources: PreparedModelSources,
     communication: (),
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     gated: GF,
     pooling: TF,
+    streams: UF,
     assembler: A,
 ) -> Result<A::Output, PreparedExecutionError<A::Error>>
 where
@@ -498,6 +499,17 @@ where
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: eredu_runtime::LayerRuntimeState<B>,
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    SS: eredu_runtime::LayerRuntimeState<B>,
+    SS::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>,
+    UF: FnOnce(PreparedPartitionResources<()>) -> U,
+    U: crate::partitioned_execution::RoutedPartitionedProductionVisitor<
+        B,
+        SS,
+        Output = A::Executable,
+        Error = A::Error,
+    >,
     GF: FnOnce(PreparedPartitionResources<()>) -> G,
     TF: FnOnce(PreparedPartitionResources<()>) -> T,
     G: crate::partitioned_execution::RoutedPartitionedProductionVisitor<
@@ -521,10 +533,75 @@ where
             B,
             S,
             PS,
+            SS,
+            _,
             _,
             _,
         >::new(
-            context, context, gated, pooling
+            context, context, gated, pooling, streams,
+        )),
+        assembler,
+    )
+}
+
+// Append-stream access belongs to its selected profile. Ordinary gated and
+// pooling states remain constructible without implementing RuntimeAppendStreams.
+#[allow(dead_code)]
+fn ordinary_routed_profiles_keep_stream_access_separate<B, S, PS, SS, G, R, T, U, A>(
+    sources: PreparedModelSources,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    gated: G,
+    relu2: R,
+    pooling: T,
+    streams: U,
+    assembler: A,
+) -> Result<A::Output, PreparedExecutionError<A::Error>>
+where
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::CompressedAttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>,
+    PS: eredu_runtime::LayerRuntimeState<B>,
+    PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    SS: eredu_runtime::LayerRuntimeState<B>,
+    SS::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>,
+    G: crate::routed_text::RoutedTextArchitectureVisitor<
+        B,
+        S,
+        Output = A::Executable,
+        Error = A::Error,
+    >,
+    R: crate::routed_text::Relu2RoutedTextArchitectureVisitor<
+        B,
+        S,
+        Output = A::Executable,
+        Error = A::Error,
+    >,
+    T: crate::routed_text::RoutedTextArchitectureVisitor<
+        B,
+        PS,
+        Output = A::Executable,
+        Error = A::Error,
+    >,
+    U: crate::routed_text::RoutedTextArchitectureVisitor<
+        B,
+        SS,
+        Output = A::Executable,
+        Error = A::Error,
+    >,
+    A: PreparedExecutableAssembler<()>,
+{
+    construct_prepared_execution(
+        sources,
+        None,
+        PreparedExecutionRoutes::new().with_routed(RoutedRoute::<B, S, PS, SS, _, _, _, _>::new(
+            context, context, gated, relu2, pooling, streams,
         )),
         assembler,
     )

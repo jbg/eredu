@@ -25,6 +25,16 @@ pub(crate) fn enter() -> RuntimeLockGuard {
     guard
 }
 
+/// Read-only metadata inspection must not run arbitrary housekeeping hooks.
+/// The guard still serializes native access, but acquires no completion or
+/// retirement authority and performs no pending-resource cleanup. It can wait
+/// for the runtime mutex, but neither submits nor waits for device work.
+pub(crate) fn enter_for_metadata() -> RuntimeLockGuard {
+    RuntimeLockGuard {
+        _guard: RUNTIME_LOCK.lock(),
+    }
+}
+
 pub(crate) fn try_enter() -> Option<RuntimeLockGuard> {
     let guard = RUNTIME_LOCK
         .try_lock()

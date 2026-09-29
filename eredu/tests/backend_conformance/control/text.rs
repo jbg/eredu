@@ -40,7 +40,7 @@ fn prepare(
     chat: &PreparedChat,
     settings: PreparedChatGenerationSettings,
     mode: u8,
-) -> PreparedObservedGeneration {
+) -> PreparedObservedGeneration<MockBackend> {
     let mut capture = if mode & 1 == 0 {
         CapturePlan::none()
     } else {

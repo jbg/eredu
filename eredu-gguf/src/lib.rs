@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod block_decode;
 mod catalog;
 mod codebook;
 mod convert;
@@ -20,10 +21,11 @@ mod iquant_tables;
 mod reader;
 mod writer;
 
+pub use block_decode::BlockDecoder;
 pub use catalog::{
     CatalogShard, CatalogTensor, Checkpoint, CheckpointHeader, ConvertedCheckpointTensor,
-    ConvertedTensorIter, LogicalDtype, LogicalTensorLayout, RawCheckpointTensor,
-    TensorMaterializer, TranslatedTensorLayout,
+    ConvertedTensorIter, LogicalDtype, LogicalTensorLayout, QuantizedTensorRepresentation,
+    RawCheckpointTensor, TensorMaterializer, TranslatedTensorLayout,
 };
 pub use codebook::IQuantCodebook;
 pub use convert::{

@@ -550,7 +550,8 @@ fn failure_agreement_worker() {
     let group = communicators.communication_group(group_id).unwrap();
 
     let unanimous =
-        <MlxNeuralBackend as FailureAgreementBackend>::agree_success(true, group, &stream).unwrap();
+        <MlxNeuralBackend as FailureAgreementBackend>::agree_success(true, None, group, &stream)
+            .unwrap();
     assert_eq!(unanimous.completion.retained_arrays(), 2);
     assert_eq!(unanimous.completion.retained_groups(), 1);
     assert_eq!(unanimous.completion.retained_streams(), 1);
@@ -565,9 +566,13 @@ fn failure_agreement_worker() {
             .unwrap()
     );
 
-    let mixed =
-        <MlxNeuralBackend as FailureAgreementBackend>::agree_success(rank == 0, group, &stream)
-            .unwrap();
+    let mixed = <MlxNeuralBackend as FailureAgreementBackend>::agree_success(
+        rank == 0,
+        None,
+        group,
+        &stream,
+    )
+    .unwrap();
     assert_eq!(mixed.completion.retained_arrays(), 2);
     assert_eq!(mixed.completion.retained_groups(), 1);
     assert_eq!(mixed.completion.retained_streams(), 1);

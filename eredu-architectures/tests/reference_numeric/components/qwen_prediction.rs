@@ -539,7 +539,7 @@ fn qwen_target_components_preserve_sharded_masks_shared_gate_and_collective_orde
             let modules = model.static_modules();
             let mut groups = decoder::static_parallel_parameter_groups::<NumericBackend>(
                 &modules.embeddings,
-                &modules.norm,
+                &modules.boundary.norm,
                 modules.lm_head.as_ref(),
                 "model",
             )

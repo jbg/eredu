@@ -101,6 +101,7 @@ fn forward(
     block
         .forward_observed(
             decoder::AttentionInput {
+                selected_positions: None,
                 hidden: input,
                 mask: None,
                 cache: None::<&mut NumericCache>,
@@ -126,6 +127,7 @@ fn component_sums_reconstruct_writes_and_masks_change_only_the_selected_values()
         .clone()
         .forward(
             decoder::AttentionInput {
+                selected_positions: None,
                 hidden: &input,
                 mask: None,
                 cache: None::<&mut NumericCache>,
@@ -838,7 +840,7 @@ fn lfm2_components_preserve_mixed_state_and_reconstruct_residual_writes() {
                 Some("model.embedding_norm.weight")
             );
             let mut final_model = model();
-            let gain = &final_model.static_modules().norm.weight.data;
+            let gain = &final_model.static_modules().boundary.norm.weight.data;
             let expected_normalized: Vec<f32> = residual
                 .data
                 .as_chunks::<4>()
@@ -1603,7 +1605,7 @@ fn qwen_hybrid_components_preserve_mixed_state_and_interleaved_reads() {
                     Some("model.norm.weight")
                 );
                 let mut final_model = model();
-                let gain = &final_model.static_modules().norm.weight.data;
+                let gain = &final_model.static_modules().boundary.norm.weight.data;
                 let expected_normalized: Vec<f32> = residual
                     .data
                     .as_chunks::<8>()
@@ -1721,6 +1723,7 @@ fn tensor_parallel_component_boundaries_match_global_masks_and_recomputed_surviv
                         let output = local
                             .forward_tensor_parallel_observed(
                                 decoder::AttentionInput {
+                                    selected_positions: None,
                                     hidden: &input,
                                     mask: None,
                                     cache: None::<&mut NumericCache>,
@@ -1850,7 +1853,7 @@ fn verify_tensor_parallel_component_decode(tied: bool, readout: usize, traversal
     let architecture = llama::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
     let mut groups = decoder::static_parallel_parameter_groups::<NumericBackend>(
         &architecture.static_modules().embeddings,
-        &architecture.static_modules().norm,
+        &architecture.static_modules().boundary.norm,
         architecture.static_modules().lm_head.as_ref(),
         "model",
     )
@@ -2322,6 +2325,7 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
         block
             .forward_observed(
                 decoder::AttentionInput {
+                    selected_positions: None,
                     hidden: &input,
                     mask: None,
                     cache: None::<&mut NumericCache>,
@@ -2412,7 +2416,7 @@ fn gpt_oss_sink_attention_and_biased_expert_terms_reconstruct_scores() {
             );
             let final_model = model();
             let modules = final_model.static_modules();
-            let gain = &modules.norm.weight.data;
+            let gain = &modules.boundary.norm.weight.data;
             let head = modules.lm_head.as_ref().unwrap();
             let normalized = residual
                 .data

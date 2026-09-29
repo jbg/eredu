@@ -1,5 +1,48 @@
 # Language-model backend architecture
 
+The shared gated-delta mixer and shared/routed feed-forward construction live in
+`eredu-architectures::{gated_delta, shared_routed}`. Construction specs carry exact
+parameter identities, linear formats, local geometry, normalization epsilon,
+gate activation and intermediate-rounding policy. Qwen3-Next/Qwen3.5 construction
+translates its configuration and checkpoint naming once into these specs, including
+rank-local and prediction
+construction. The reusable equations do not inspect family configuration.
+
+`GatedDeltaStateGeometry` owns the exact convolution-history and FP32 recurrent
+matrix policies. Existing Qwen state construction and Flash-Next recurrent specs
+consume it, including rank-local heads, dilation and history-free one-tap kernels.
+Flash-Next's recurrent and feed-forward sublayers compose those shared mechanisms
+with learned gated residual ingress/injection. Parameter identities and retained
+formats stay in the family; complete residual streams survive the sublayer boundary.
+Padding masks recurrent inputs while retaining causal time and original residuals.
+The feed-forward spec preserves FP32 scores, input-dtype routing coefficients,
+ascending expert-ID accumulation, and the sigmoid-gated shared branch. A global
+router may dispatch to a smaller rank-local expert bank through the existing provider.
+
+`eredu-nn::NeuralBackend::output_gated_group_rms_norm` explicitly selects SiLU or
+sigmoid gating after float32 normalization. `OutputGatedNormArithmetic` selects either FP32 intermediates
+or a cast of normalized values to the input dtype before learned scaling. In the
+latter case scaling uses ordinary input/weight promotion; gating uses FP32 and the
+final result returns to the input dtype. Qwen's recurrent families select the
+released rounded-normalization boundary. MLX implements both contracts without
+model-family branches. The shared mixer also normalizes Q/K and forms decay in
+FP32, then casts scan output back to the convolution activation dtype. Its shared
+operator requirement set includes floating casts and feeds cold Qwen admission.
+`CausalDepthwiseConvolutionSpec` carries dilation; retained history is exactly
+`(kernel_size - 1) * dilation`, checked before allocation. Logical state and MLX
+scratch descriptions use this receptive field. Portable convolution topology
+retains dilation so cold workspace estimates also charge its padded history.
+Other recurrent families select dilation one.
+
+`eredu-nn::residual_streams` owns checked stream expansion and flattening plus a
+portable gated residual module assembled from ordinary normalization, projection,
+activation and reduction primitives. DeepSeek expansion consumes the same stream
+geometry. Gated low-rank mixing and Sinkhorn mixing remain separate algorithms;
+sharing their value layout does not change the latter's equations. Architecture
+code continues to own parameter names, learned-offset normalization choices,
+module invocation order, discovery, and pipeline contracts. Family registration
+and prepared construction remain architecture-owned.
+
 Attention arithmetic is a neutral request policy. An architecture can require
 rounding QK products, scaled/masked scores and normalized probabilities to the
 query dtype. Native operators implement those boundaries for contiguous,
@@ -1370,8 +1413,8 @@ producer and fragment limits before runtime admission. Current balanced expert
 construction requires at least one expert per EP rank; placement preserves that
 existing rejection. Loaded capture additionally requires the actual sparse hook
 fact and exact native subgroup support. Runtime still owns reservations, receipts,
-completion and publication; groups needing world participation waves and sparse
-intervention composition remain unfinished.
+completion and publication. Support for world participation waves and sparse
+interventions is conditional on the selected mechanism facts.
 
 DeepSeek V3's layered entry points emit internal hooks while the traversal owns
 the unit input/output observations. The standalone block entry point supplies
@@ -3886,9 +3929,8 @@ units. The ordinary residency ledger accounts for unit materialization separatel
 from cumulative query and overlay work reservations.
 Publication clears incompatible state and invalidates native snapshots; facade
 session identities invalidate outstanding prepared requests. Parameter queries and
-edit records carry the effective execution version. Packed-format verification and
-additional residency/partition mechanisms remain explicit outstanding work in
-the component-analysis support matrix.
+edit records carry the effective execution version. The component-analysis support matrix records packed-format verification and
+residency/partition coverage.
 
 Schema-admitted redundant sources remain distinct from executable parameter
 sources. A tied parameter may retain exact redundant source keys in its neutral
@@ -4060,7 +4102,7 @@ FFN-unit boundaries before their existing row-projection reductions. Normalized
 inputs and reduced residual writes retain their ordinary block equations. These
 operator seams add no collectives; global component coordinates, capture delivery
 and parameter transactions remain responsibilities of the partition driver.
-The new seams alone do not establish public partitioned component support.
+Operator seams alone do not establish public partitioned component support.
 The parallel layered contract has an internal-observation unit entry. The
 ordinary parallel residency traversal supplies its shared observer to that entry,
 retains forward resources for completion, and keeps group/unit boundaries in the
@@ -4073,8 +4115,8 @@ ordinary tied/untied vocabulary gather and output softcap. Neutral vocabulary
 projection input observers delegate input transforms to the backend; MLX uses the
 same deferred FP8 evidence and failure propagation as ordinary projections. An
 absent observer does not construct component paths or request transformed input
-copies. Global coordinate admission, specialized pipeline propagation and
-capture transport remain unfinished integration work.
+copies. Public capture requires selected global coordinate admission, pipeline
+propagation and transport support in addition to the operator hooks.
 
 Direct pipeline and composite unit strategies forward the supplied observer
 to the selected architecture's serial or tensor-parallel internal-unit entry.
@@ -4161,6 +4203,25 @@ called only at a common post-forward boundary. Public distributed capture remain
 unverified until session admission, producer quotas and generation commit use it.
 Per-selection receipts share the immutable global capture plan through `Arc`,
 avoiding copies of all selections for each captured point.
+
+Flash-Next retains its immutable cold family construction with `SelectedExecution` so
+other-rank discovery can project exact physical parameter layouts on demand. The family
+reuses its selected-format tensor selections and expert ownership; fused recurrent ranges,
+K/V replicas and encoded companions keep the same geometry as materialization. Generic
+partition projection accepts that authored layout and still applies shared pipeline
+ownership. It does not infer family geometry from backend tensors or reopen a checkpoint,
+and it does not build an eager catalog for every rank. Prediction provider layouts remain
+separate from the target parameter description. Typed routed prediction construction carries
+its shared discovery slot through the binding and publishes it only after successful state and
+weight assembly. The retained predictor description includes its selected global specification
+and exact local layout; peer queries apply prediction TP selections while preserving PP/EP
+replicas. This uses the existing prediction placement contract for both component capture and
+parameter coordinates, without transferring equations or checkpoint naming into a backend.
+Declared target
+input/output boundaries retain their real execution-group and unit ordinal, including separate
+n-gram injection units. The shared ownership compiler places these replicated four-dimensional
+residual observations on their owning pipeline stage. Layer numbers are not used as execution
+unit indices. Internal prediction observation placement remains a separate integration step.
 
 The retained architecture selection also projects component layouts for any rank
 in its admitted topology. `component_partition_layout_for_rank` reuses admission's
@@ -4930,7 +4991,7 @@ destination; it does not infer scale/bias names or silently load bank-owned copi
 Exact replicated-text affine transforms preserve the admitted floating source precision for
 generated scales and biases, matching independent-bank materialization and neutral
 selected-byte accounting. Unloaded native destination dtypes describe placeholders
-and cannot silently request an F16 cast. Reusable prompt-cache schema 9 rejects
+and cannot silently request an F16 cast. Reusable prompt-cache schema 10 rejects
 incompatible persisted metadata that cannot distinguish these numerical
 policies. Reconstruction uses exact token-ID replay.
 
@@ -4941,8 +5002,8 @@ MLA, routed and shared component hooks. Editing the prediction readout residual
 precedes head normalization and changes both returned hidden state and draft logits.
 The `mtp.{depth}.output` point follows head computation. Low-level
 ordinary/provider/TP traversal forwards these hooks. Prediction scopes are declared
-separately; public speculative admission still requires phase-aware integration.
-Their loaded component capability remains unadvertised until that integration is complete.
+separately; public speculative component admission requires selected phase-aware
+producer hooks and native collector support.
 
 The independently cached mixed V3 component matrix passes all 63 native CPU Ring
 cases across F32 SafeTensors/GGUF and affine loading. Cache telemetry distinguishes
@@ -5190,7 +5251,7 @@ The native error handoff accepts `BackendFailure` with its owned source.
 `safemlx::Exception::from_source` preserves that chain through the existing native
 error domain; it introduces no new unsafe boundary. Diagnostic-only contract
 messages continue to use the existing text adapter. Public distributed internal
-activation admission still requires selected prediction producer layouts and a
+activation admission requires selected prediction producer layouts and a
 bound partition collector/transport; this lifecycle alone does not enable it.
 
 `CaptureBackendProvider` lends one ordinary observer for an entire speculative
@@ -5202,7 +5263,7 @@ Native composition supplies primitives, estimates and source-preserving error
 conversion. Architecture ownership remains in the supplied layout. Routed neural
 callbacks retain typed admission errors and native sources through the same outer
 speculative owner. The provider does not select prediction ownership; public
-partitioned speculative admission still requires the prepared prediction layouts
+partitioned speculative admission requires the prepared prediction layouts
 and their native factory binding.
 
 Prepared prediction modules retain their exact `LocalModelLayout` and global
@@ -7199,10 +7260,9 @@ never evaluates or creates arrays. Native output payload is separately known;
 activation copying remains a zero-to-full-input bound until strides are known.
 Allocator capacity/rounding and GPU-private registers/threadgroup storage are not
 claimed exact. Existing calibrated graph, state, attention and allocator
-allowances remain in the forecast. Backend `describe_bound_projection` exposes
-these same facts as a reusable mechanism contract; unbound/cold descriptions
-retain promotion and unknown native-workspace costs. No portable crate gains a
-native dependency or unsafe-code exception.
+allowances remain in the forecast. Cold mechanism descriptions retain promotion
+and unknown native-workspace costs. No portable crate gains a native dependency
+or unsafe-code exception.
 
 ## Supplied metadata and local payload admission
 
@@ -7261,3 +7321,546 @@ and dense decoder readout helpers select the final hidden position before ordina
 vocabulary projection. Observed, speculative and partitioned full-output entry
 points retain their established contracts. No backend family branch or facade
 scheduling policy is introduced.
+
+### Selected history and addressable parameter banks
+
+`eredu-nn::IndexedAttentionInput` declares grouped K/V heads, absolute selected
+positions, validity, optional selected-score masks, bounded local sources and sinks.
+Architecture equations own selection and causal eligibility. `AttentionCache::indexed_attention`
+routes the request through resident or paged storage. MLX deduplicates positions and
+completes one query's compact gathers before advancing. Paged reads acquire only
+intersecting pages. Sparse attention retains full K/V history; its read counters are
+separate from full-history scans. Failed native page copies retain source leases until
+terminal completion or teardown, using the ordinary cache lifecycle.
+
+`eredu-runtime::ParameterBank` owns operator-independent acquisition, completion
+retention and telemetry. `AddressableGroupedBank` builds grouped operators from those
+acquisitions; `RowLookupBank` decodes independently addressable rows. `ParameterProvider`
+carries both operations through layered, partitioned, observation and prediction drivers.
+`ParameterProviders` composes independently prepared row and grouped mechanisms.
+Source names, formats, geometry and parallel ownership remain architecture declarations.
+
+`PreparedRowSource` retains one restricted recipe over checkpoint shards. It deduplicates
+requested rows, plans bounded selections and restores request order without a
+vocabulary-sized catalog. `OffloadUnitRange` describes uniform source members compactly;
+OffloadPlan schema 2 retains these ranges. The shared residency manager creates demanded
+member definitions and retires them when no allocation, reservation or transfer remains.
+Rows use the same pinning, host/device budgets and completion recovery as grouped weights.
+
+`RowLookupDescriptor` and `RowLookupDescriptors` contain source-free geometry, encoding,
+compact residency ranges, scalar recipe headers and finite request/workspace bounds.
+`SelectedRowLookupPlans` selects generic storage, decoder and workspace facts once.
+Binding compares exact descriptors and yields `SelectedRowLookups` with retained source
+identity. Equal names and shapes do not authorize a replacement source. Native binding
+rechecks mechanism facts but cannot reselect mechanisms or replace sources.
+
+`PreparedRowLookup` pairs the source range with `RowLookupSpec`, an optional
+`PreparedRowScale`, and finite limits. `PreparedRowLookups` checks table identities,
+unit ownership, bank namespaces and range prefixes. Cold admission validates source
+encoding, scalar identity, one-row access and maximum acquisition/planning/output bounds.
+The largest permitted acquisition must fit the device cache. Missing mechanisms,
+incompatible bindings and inadequate budgets produce typed errors before construction.
+
+`MlxRowLookups::bind` consumes the selected parameter pool and retained row declarations.
+It validates decoder availability, scratch, scalar budget and exact source ownership
+before materializing companions. Binding reads no table rows. Native `MlxRowBank` supports
+dense, shared-scalar E4M3 and GGML block rows; shared scalar FP8 uses its declared parameter
+identity rather than expert block-scale equations. Lookup retains exact host integer IDs,
+chunks native acquisitions and keeps source/residency leases through completion.
+
+Selected grouped banks and compact row ranges share an `OffloadPlan` and residency
+manager. Resident grouped execution can use a row-only pool. Pool reports count each
+physical pool once, including row-only pools; grouped member statistics exclude table
+rows. Row scalar allocations are reported separately. Auxiliary prediction providers
+move from the complete selected provider collection into disjoint owners through
+`RoutedBankProviders::split_off`, without cloning storage or creating another budget.
+
+`TensorReadRequest` selects exact checkpoint regions. Bulk reads coalesce adjacent
+physical ranges across separate output allocations, enforce admitted file identities
+and use no payload staging. SafeTensors and byte-preserving GGUF outputs share this
+mechanism; transformed GGUF outputs use bounded conversion. Inclusion views retain
+only their explicit allow set and validate names through metadata lookup. Diagnostic
+denied-key enumeration is computed on demand. Restricted views and leases retain the
+original source authority.
+
+### Attention, append streams and fixed state
+
+`AttentionStreamState` requires ordinary attention, fixed components and
+`RuntimeAppendStreams` together. Shared typed construction visitors enforce these
+contracts. The combined layer layout declares K/V, named append streams and fixed
+tensors; native storage consumes the selected geometry without family dispatch.
+
+Named append streams declare record geometry, scalar policy and processed-token bounds.
+`AppendStreamBinding` adds lanes, record/read/page limits and per-lane allowances.
+`ReplicatedTextRequirements` and `SelectedStateRealization` retain exact bindings;
+selection checks coverage, representation, resident capacity, scratch and page geometry.
+State partitioning rebases owners and can narrow record width under architecture-authored
+TP geometry without changing token cadence or increasing retained limits.
+
+Resident append storage retains immutable chunks. Native paged append storage reuses
+ordinary cache blocks, device/host/disk residency, completion leases and rollback.
+`CacheStreamId` separates layer, representation, slot and sequence lane identities.
+Reads compact only requested ranges and retain source leases through completion.
+Record counts do not inflate attention-token counts; read/byte/scratch counters survive
+rollback. Hybrid state preserves streams, fixed tensors and positions through checkpoint,
+reset, fork, snapshot isolation and persistence.
+
+Prompt-cache schema 10 records every declared slot/lane frontier, including empty lanes.
+Validation checks exact dtype/shape, record bounds and contiguous page coverage separately
+from attention-token coverage. Restore retains shard handles and bounded metadata;
+`RetainedCacheShard` verifies the digest of bytes copied into backend transfer buffers.
+Replacing or unlinking a path cannot redirect an admitted reader. Declared lanes are
+capacity: saving a smaller active batch requires all omitted lanes to be empty.
+
+`StateTensorRole::IntegerHistory` uses checked I32 storage. Token identities never come
+from embeddings or floating proxies. `StateTensorRole::Auxiliary` identifies other
+architecture-declared fixed buffers. `RuntimeStateComponents` validates replacement roles
+and publishes the replacement set atomically; unknown or duplicate roles leave state
+untouched. Prompt manifests match fixed tensors by owner and role rather than serialization
+order. State-only admission uses `StateRealizationRequirements`, `select_state_realization`
+and the same neutral storage/lifecycle capability predicates as ordinary text selection.
+
+### Flash-Next architecture and artifact ownership
+
+`ModelKind::Qwen4Exp` is a distinct portable family. SafeTensors admission accepts
+`qwen4_exp` and `qwen4_exp_text`; GGUF admission accepts `qwen4exp`. Configuration,
+checkpoint schemas, parameter recipes, equations, state geometry, processor policy and
+parallel plans live in `eredu-architectures::qwen4_exp`. MLX binds generic operators,
+state, sources and selected execution contracts. Current supported paths and verification
+coverage are described in the [family validation report](qwen4-exp-validation.md).
+
+`TargetSpec` and `TargetModel` implement the shared architecture, layered and routed
+contracts. Execution alternates decoder blocks with independently owned lexical units.
+Each decoder unit contains a recurrent or indexed mixer and a shared/routed feed-forward
+sublayer. Checkpoint layer numbers and execution ordinals remain distinct, including
+expert/table owners. The target uses `HybridDecoder` vocabulary handling and the shared
+resident, host-layerwise and disk-streamed execution machinery.
+
+`DecoderBoundary<B>` owns embedding expansion and position-independent residual collapse;
+the shared shell owns vocabulary parameters, collectives, execution groups and readout
+instrumentation. `NormalizedBoundary` supplies ordinary normalization. Flash-Next's
+`ResidualBoundary` expands text/media embeddings and applies the released gated collapse.
+Residual observation and prediction capture retain all streams before collapse; normalized
+and projection-input observations consume the actual collapsed value. Final-token
+narrowing preserves every non-sequence axis.
+
+`IndexedSublayerSpec` declares QSA projections, normalization, rotary arithmetic and cache
+geometry. `CachedQsaSelector` validates lane frontiers, stream geometry and rotary
+provenance; complete summaries and original positions append once. Its incomplete visible
+block survives arbitrary chunk boundaries. Selection scores bounded summary tiles and
+passes selected original K/V positions to indexed attention. The indexer and residual
+mixer are replicated independently of ordinary K/V head placement.
+
+`QsaPartialStateSpec` packs the incomplete block into exact I32 controls/positions,
+raw index keys and first-token media cosine/sine components. Packing and restoration
+validate the complete tuple before publication. Summary construction and visible-token
+selection are family equations; full K/V storage remains separate from summaries.
+`QsaExecutionLimits` covers coordinator projections, selected-position output and partial
+packing separately from backend operator workspace and retained state.
+
+`LexicalInjectionSpec` consumes exact hash/table declarations and family parameter
+identities. `LexicalSublayer` adds the n-gram injection to complete residual streams and
+advances declared history/convolution state. Original IDs, visibility and absolute
+prefix position are explicit inputs. Missing IDs or position drift reject before lookup.
+EOS-separated n-gram reset policy belongs to the architecture and is separate from facade
+generation termination. Shared transaction ownership restores state on failure without
+refunding lookup, observation or transport activity.
+
+The BF16/FP8 SafeTensors schema declares exact aliases, exclusions, matrix geometry,
+expert layouts, scale companions, integer controls, shared table scale and vision/MTP
+parameters. `SafetensorsTableSourcePlan` and `SafetensorsTargetPlan` consume metadata-only
+`SafetensorsCatalog`. Binding checks the retained headers, physical source set and layout
+before reading tiny I64 controls or a shared scalar. Table shards form one logical
+row-addressable source; preparation never concatenates or decodes the complete table.
+Static, decoder, lexical, expert, vision and prediction owners have restricted source views.
+
+`NGramEmbeddingSpec` describes header geometry without literal hash constants.
+`BoundTargetSpec` validates an exact per-injection control map before construction.
+`geometry_fingerprint` identifies cold construction; `state_fingerprint` includes exact
+integer controls and selected parameter transforms. Prompt-cache and speculative target
+identity use the bound fingerprint. Equal headers and state shapes alone cannot authorize
+restoring state computed with different controls.
+
+Architecture-owned GGUF recipes map metadata and tensors, undo normalization offsets,
+negative exponential recurrent coefficients, recurrent head permutations and convolution
+squeezing, and join split indexer projections. The shared gated-delta head-layout recipe
+transforms every encoded weight/scale/bias companion. Expert selection precedes decoding
+or concatenation. Equal encodings retain packed storage; differently encoded concatenations
+and permutations crossing physical blocks select bounded F32 views.
+
+`GgufCatalog` is a metadata-only `RecipeCatalog` sharing the canonical output projection
+with readable store construction. `GgufTextPlan` selects representations and mappings;
+`GgufTargetPlan` declares geometry, compact row descriptors, requirements and capabilities.
+Binding compares exact keys, metadata and provenance against an existing retained source.
+GGUF table owners share the prepared store and reader cache with ordinary weights while
+retaining distinct logical bank and unit identities. Exact GGUF integer metadata and
+SafeTensors I64 controls use the same hash validation. GGUF padding matches its retained
+physical row extent; SafeTensors uses the declared alignment and shard geometry.
+
+`eredu-gguf` owns generic representation selection and bounded conversion. Encoded views
+preserve bytes without payload reads during catalog construction; `DecodedF32` views
+report expanded geometry while retaining physical encoding provenance. Per-allocation
+limits apply to payload reads and expanded outputs, not metadata-only table extents.
+Header validation checks arithmetic, blocks, ranges, alignment and overlap.
+`BlockDecoder` writes Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K/Q3K/Q4K/Q5K/Q6K/MXFP4 into caller-owned
+F32 storage without heap scratch. MLX's generic fallback decodes only an admitted compact
+row acquisition and retains its staging/output through completion.
+
+Load-time transforms apply to aligned dense matrices, embeddings and expert input axes.
+Unaligned, already encoded and nonmatrix parameters retain their declared format. Source
+and executable layouts remain separate through bounded loading. Table rows, integer
+controls and convolution kernels are not projection-transform targets. Encoded linear
+weight requirements retain their final packed axis even when further transformations
+are disallowed; capability checks still validate block alignment and exact shapes.
+
+### Retained cold selection and construction
+
+`RoutedTextRequirements` and `SelectedRoutedTextRealization` retain source-free row plans;
+`PreparedRoutedTextArchitecture` owns their bound sources. The shared construction handoff
+validates exact row descriptors without querying mechanisms again. Missing/unexpected
+row sources reject. `PreparationMechanismProvider` supplies generic row storage, decoder
+workspace and memory facts. `RecordingMechanisms` retains queried descriptors/responses;
+changes to storage, support, workspace or retention invalidate cached agreement.
+
+`TargetExecutionPlan` retains the source owner, spec, requirements and capability estimate.
+Selection returns `SelectedTargetExecution`; typed visitors enforce attention, fixed-state
+and append-stream access. The source-free container header plans use the same requirement
+author over `RecipeCatalog`, physical source declarations and static/unit/expert recipes.
+Parameter placement and workspace reporting require metadata catalogs, not readable
+sources. Native estimates include ordinary source copies, intermediates and outputs even
+when a later source permits direct encoded initialization.
+
+`TargetLoadProjection` lowers `NormalizedLoadRequest` once in the architecture layer.
+It validates invocation/history bounds, pages and summary capacity before row queries,
+authors stream bindings and retains the exact selection request. The architecture supplies
+defaults of one lane, up to 512 tokens per invocation, declared history, summary tiles up
+to 256 records and a shared 64 MiB device/zero-host table cache. Explicit generic parameter
+bank controls, page geometry and execution policies remain authoritative. Broad workspace
+headroom does not allocate at the ceiling or promise complete memory accounting.
+
+`SelectedPreparation` retains `SelectedQwen4Construction` target or conditional header
+authority alongside the matching ordinary routed selection. Large immutable plans use
+`Arc`; bound construction is boxed. Selection caches own no inspection/cache back-reference.
+Source construction verifies origin-token/session/policy/route identity, opens retained
+resolutions/mappings once and carries the bound authority through ordinary source graphs
+and typed visitors. Backends receive generic routes and state contracts without family
+configuration or artifact-name dispatch.
+
+`StoreHandoffScope` distinguishes primary parameter authority from complete auxiliary
+provider authority. `restrict_store_handoff` checks provenance, encoding, geometry and
+recipes before retaining the exact declared view. Joint prediction construction retains
+separate target and complete-provider views; auxiliary modules and row providers own their
+sources. Strict unused-parameter validation consumes these views. A table or integer
+buffer does not become an ordinary layer parameter because it shares a checkpoint file.
+
+### Media ingress, processing and chunked control
+
+`VisionPlan` and `GgufVisionPlan` own source-free metadata, recipes, processor policy and
+layer-sized owners; `PreparedVision` retains bound source authority. Shared Qwen vision
+modules provide full attention, bilinearly interpolated learned positions, LayerNorm and
+exact merger GELU. Flash-Next declares no DeepStack captures. Temporal patch recipes are
+shared across Qwen families, with explicit dense promotion and retained encoded companions.
+
+GGUF projector admission does not invent tokenizer IDs. Facade tokenizer resolution binds
+complete `QwenMediaTokenIds`; architecture validation checks vocabulary, uniqueness, target
+aliases and image-reset semantics. `ConditionalHeaderExecutionPlan` joins target/vision
+catalogs and selects weights, state, banks and processor before source access. Integrated
+SafeTensors uses one source; GGUF retains target/projector sources in a joined view.
+An explicit GGUF projector with default media intent selects prepared/projected images and
+video plus supported raw processing. Disabled media rejects a supplied projector.
+
+Core input metadata and wire identity retain `OriginalTokenIds`. Runtime's
+`OriginalTokenIds` and `TokenVisibility` preserve exact host or I32/U32 identities;
+floating proxies and out-of-range IDs reject. Shared `qwen::ingress` owns ordered
+text/media assembly. Flash-Next requires original IDs even for embedding-based input.
+Embedding replacement preserves those IDs and produces checked I32 lexical input.
+Shared rotary preparation checks the complete grid and arithmetic before allocation.
+
+`MediaAdmissionConfig` admits host handles through `PreparedInputInspector` without a
+native tensor or source. `AdmittedMediaInput` retains checked IDs, grids, rotary axes and
+decode delta. Native preparation consumes that proof and the retained request, without
+reconstructing IDs. `MediaPrefillRequest` prepares the request once; `PreparedMediaInput::assemble`
+embeds only the current target span and supports cuts inside raw or projected media.
+Released video framing supplies one frame per media part with processor-owned timestamps.
+Media ingress accepts initial batch-one, unpadded requests with the declared rotary policy.
+
+`ConditionalModel` composes shared vision and target under the ordinary layered/routed
+drivers. The target is canonical group zero and vision group one; graph dependencies run
+vision before target ingress. Text/projected continuation does not acquire encoder blocks.
+Optional pass-through groups do not publish projector observations. Vision-unit, target
+internal and ingress observations use the shared traversal.
+
+`PositionDelta` is an exact I32 fixed component on the first target unit. Initial media
+input commits its signed rotary delta; decode adds it to the causal prefix with checked
+arithmetic. Continuation cannot change it. Reset clears it and fresh text commits zero.
+`qwen4_exp.request.v2` transports the delta, original IDs, visibility, causal prefix,
+complete residual streams and FP32 rotary products. Request validation precedes mutation;
+resumption never recovers IDs from activations.
+
+`InvocationLimits::invocation_tokens` and `TargetLimits::invocation_tokens` bound
+batch-times-chunk work, not the whole prompt. Single-lane media uses `history_tokens` as
+its complete-request ceiling; an explicit processor budget can lower it. Whole-request
+IDs, rotary products, inputs and encoder output remain owned by request/state objects.
+Target assembly and n-gram row requests scale with the chunk. Reused proofs validate
+extent and retained chunk authority; the history ceiling includes later decode tokens.
+
+`ChunkedPrefillRequest` supplies architecture-owned input spans and immutable continuation.
+The shared replicated session owns advancement, output selection, rollback and commitment.
+Retained encoder values complete before cursor publication, including rows unused by the
+first span. Completion publishes whole-input cache identity only on the final chunk.
+A later failure preserves earlier committed chunks. Cursor clones accompany matching
+model-state snapshots and carry no observation, transport or copy budget.
+
+`CompositeArchitecture` declares the typed request and chunk limit. The native prompt owns
+an erased typed cursor. Ordinary and controlled generation use that same cursor; one
+controlled nonfinal prefix step samples no token and consumes no controller decision.
+Snapshots share immutable prepared/encoder roots and copy cursor progress with model state.
+Initial raw-media snapshots complete and share input roots. Absolute capture selections
+project onto each chunk, retaining request spans in records and using the cumulative
+completion/commit ledger. Final-position scores come only from the final chunk.
+
+The facade accepts prepared backend prompts with explicit corresponding original token
+IDs for observed and controlled generation. Nonempty interventions on genuinely partial
+spans produce a typed rejection; single-invocation interventions are supported. Direct
+low-level composite calls using one full-request observer require caller-driven cursor
+advancement for chunked capture. Embedded MTP uses the shared prediction driver and its
+own speculative control boundaries, including streamed media prefill.
+
+`MediaExecutionPolicy` declares required representations and optional coarse
+`ProcessorRequestBudget` limits for decoded input, host buffers, output bytes, planning
+items and decoder positions. Ordinary processing requires no accounting budget. The Qwen
+planner checks supplied limits before expensive transforms; architecture host admission
+checks IDs and complete token geometry before native lowering. Per-call limits cannot
+relax retained ceilings. Backend input roots, including replaced or abandoned roots,
+remain in the existing completion scope.
+
+### Embedded prediction and shared state ownership
+
+`PreparedPredictionSource::safetensors` admits an MTP-only role from a standalone artifact
+or restricted complete checkpoint. It retains exact formats and bounded expert recipes
+without reading target, table, vocabulary or vision payload. `with_prediction_source`
+checks normalized vocabulary, schedule, residual/recurrent/expert/rotary and lexical-reset
+compatibility. An attached role cannot be replaced. These checks establish architecture
+compatibility, not authenticated training lineage; each source retains physical provenance.
+
+Ordinary GGUF loading accepts a matching SafeTensors prediction companion through retained
+`prediction_source` and explicit embedded drafting. GGUF owns embedding/output parameters;
+the companion owns prediction parameters. `CompositeCheckpointSource` reports composite
+backends and exact per-key provenance. Default drafting selects the ordinary target and
+excludes unused prediction parameters from binding. Explicit SafeTensors text/media MTP
+joins source-free requirements and independently selected prediction state before weight reads.
+
+`PredictionSpec`, `PredictionShared` and `PredictionUnit` reuse shared mixer/feed-forward
+construction while declaring independent state, bank identity and rotary policy. Fusion
+normalizes flattened target residual streams before shared per-stream projection. Prediction
+capture retains all residual axes; its gated collapse feeds target vocabulary projection
+without applying the target collapse again. `MaterializedQwen4Prediction` uses ordinary
+completion-aware materialization and injected parameter providers. Output/state roots
+survive failed equations until completion ownership permits release.
+
+`PreparedPredictionExecution` retains target authority, selected prediction weights/state,
+source and bank identities. The generic `PreparedRoutedPrediction` visitor binds modules
+and independent state, registers residency owners, then moves auxiliary providers into the
+executor. Vocabulary storage remains shared with the target. `EmbeddedSpeculativeContract`
+identifies residual capture, target/prediction invocation bounds, proposal depth, placement
+and state. The existing speculative finalizer and scheduler consume these contracts.
+
+Sequential prediction extensions declare a maximum causal prefill span. The shared driver
+streams target chunks, retains the last residual to pair with the next original token and
+seeds the predictor before advancing. The outer speculative checkpoint covers both lanes;
+activation scopes retain actual invocation widths. Composite continuation retains original
+IDs, positions and completed encoder products. Fused predictors use their declared complete
+input contract unless they support sequential pairing.
+
+Commitment restores the pre-proposal prediction checkpoint and replays the committed anchor
+and accepted suffix with actual target captures. Tentative captures and rejected tokens do
+not enter canonical state. The immutable anchor and mutable proposal capture remain distinct.
+Providers and source owners remain outside rewindable lane state. Restore performs no weight
+reads and does not refund lookup, observation, transport or copy activity. Copy admission
+precedes isolation; failed isolation consumes copy allowance while releasing provisional retention.
+
+### Tensor, pipeline and expert placement
+
+`TargetTensorPartition` localizes recurrent heads and component-major Q/K/V convolution
+channels, attention queries with GQA K/V replication, and shared/routed FFN intermediates.
+Neutral range recipes retain exact encoded companion coordinates. Unrepresentable shards
+reject rather than split encoding blocks. Vocabulary, residual mixers, lexical computation,
+routers and indexers are replicated. Bound state identity distinguishes rank and hash controls.
+Parallel execution uses the same equations, observations and lifecycle as ordinary execution.
+
+`PreparedTensorTarget` retains global/local specs, rank plan and restricted static/unit/expert
+sources. Checked `select_bounded` pushdown follows container-authored canonical transforms;
+full bank recipes are partitioned before expert members. Column selection can read a complete
+expert before slicing, so source I/O is not assumed to fall exactly by rank count. Repeated
+reshape selections preserve source order and duplicates. `local_layout` projects exact
+physical selections into `LocalModelLayout`; fused ranges use ordered indices and replicated
+K/V heads retain the appropriate partial ranges on adjacent ranks. Placement applies once.
+
+`TargetPartitionExecutionPlan` retains header authority, tensor geometry, stage-local state,
+row descriptors and communication requirements. Source factories bind exact sources/controls
+through typed visitors. `expert_realization` declares balanced EP ownership using TP-local
+width; routers keep global IDs. `local_expert_layout` composes expert-axis and TP selections.
+Existing provider exchange owns global-to-local translation and the shared equation separately
+reduces its shared TP contribution.
+
+`RoutedTensorReductions` declares inactive pipeline participation. Residual reductions use
+selected wire representation; lexical lookup has an exact I32 status reduction and compact
+`[batch * tokens * ngram_features, row_width]` data payload. Replicated vocabulary omits
+unneeded embedding/readout collectives. `DistributedNeuralBackend::parallel_rank` supplies
+the actual retained member order; construction rejects mismatched rank/size.
+
+`PreparedRowLookups::bind_tensor_parallel` grants table acquisition to one owner and gives
+peers compact declarations. `TensorParallelRowLookup` retains distinct status/data groups.
+EP status includes the full participation group, including inactive pipeline stages; data
+stays in the owning TP group. Every participant checks I32 failure status before row data,
+so rejection cannot leave peers submitting a collective alone. Only the owner materializes
+row decoders/scalars and reports pool occupancy. Stages without lexical units have no rows.
+
+`ParallelCompositeArchitecture` separates parallel ingress from ordinary composite admission.
+`CompositeTextRequirements` retains architecture-authored wire schemas, sequence bounds and
+source-unit continuation geometry. The shared composite executor consumes typed reductions
+and retained row sources. Conditional partitioning composes target TP/PP/EP with shared Qwen
+vision sharding. Receiving vision stages construct geometry/rotary state without accessing
+another stage's patch parameters, then consume transported activation. Encoder edges use
+full-request extent; target edges use decoder chunks. Boundaries retain complete residual
+streams, original IDs, visibility and rotary state.
+
+Distributed chunk cursors agree request/step extents and commit epoch through selected
+failure agreement before execution. Request-construction failures participate before peers
+execute; cursor position/encoder continuation advance only after ordinary completion/commit.
+An optional fixed integer descriptor extends the neutral agreement mechanism; status-only
+calls retain their scalar implementation.
+
+Prediction partitions use the same mixer/feed-forward placement rules, encoded companions
+and independent state. Fusion, residual mixers, indexers and readout remain replicated.
+Prediction units are TP-local and replicated across target PP/EP groups. Every prediction
+participant retains embedding/output through static-role ownership. Supplemental banks use
+TP-local widths and full expert cardinality; each bank's EP plan governs exchange independently
+of target EP ownership. Provider layout is distinct from target module layout, so auxiliary
+coordinates cannot widen target binding authority. Final target residual publication and the
+tensor context feed the existing prediction-extension driver.
+
+### Discovery, capture and parameter coordinates
+
+Flash-Next discovery describes lexical execution units separately from physical decoder
+layers, recurrent/QSA mixers, gated residuals, routed/shared branches, collapse and MTP fusion.
+Logical parameter groups record vocabulary/fusion/readout sharing; mutable recurrent,
+convolution, indexer and token-history owners have separate state nodes. Tables and expert
+banks remain compact nodes. Target-to-prediction edges carry residuals before collapse.
+Generic attention attributes do not fully describe QSA selection and retain explicit partial
+coverage. Logical graphs are not allocator or residency estimates.
+
+`PredictionDiscovery` joins the architecture descriptor and loaded activation discovery in
+one node namespace. Explicit invocation roots establish target/prediction-depth scope;
+sealed hook contracts validate it. Architecture specs supply shapes and mutable/read-only
+status; native facts govern actual collector/editor support. Internal prediction discovery
+retains target node identities and uses exact TP parameter layouts for channel placement.
+Detailed routed feed-forward prediction points are outside this retained catalog.
+
+Observation points include target unit boundaries, recurrent intermediates, attention and
+shared-expert channels, routing events and selected QSA positions. Integer positions remain
+read-only and preserve integer representation. Sparse expert evidence uses actual selected
+rows and route order rather than an expert-dense tensor. Routing policy declares exclusions,
+zero contribution, forced IDs and raw/transformed/ranking bias stages through the shared
+intervention driver. Logit masking uses `LogitsBeforeSampling` and native support facts;
+the canonical target publication is `model.logits`.
+
+`SpeculativeCaptureObserver` and shared capture/intervention ledgers retain loaded authority
+across restore/fork while budgets and invocation identity stay outside mutable snapshots.
+Failed forwards retain bounded aborted evidence. Parameter/component coordinates consume
+architecture-authored physical placement, including shared K/V and encoded chunks. Peer
+queries use retained family authority in `SelectedExecution`; low-level queries without
+that authority reject rather than infer balanced sharding.
+
+Chat and tool behavior uses the shared portable tokenizer, template recognition and facade
+parser/grammar drivers. Released reasoning controls and tagged-parameter syntax are template
+policy. Opaque grammar snapshot rejection is explicit in capabilities; parser forks alone
+do not establish full-session snapshot admission.
+
+### Immutable projection parameters
+
+Ordinary and row-parallel linear execution share a bias-free native projection helper.
+Ordinary execution adds bias after projection; row-parallel execution adds it once after
+the collective. Input observers borrow the retained parameter without temporarily removing
+it. Observer errors and unwinding therefore preserve weight/bias identity for retries.
+Encoding selection and input transforms belong to the shared helper; completion recovery
+and distributed failure agreement retain their independent contracts.
+
+### Resource ranges, storage inspection and completion
+
+Memory reporting distinguishes state payload, selected caches, workspace allowances and
+unknown physical costs. Complete allocation accounting and whole-encoder physical-fit
+proofs are not loading requirements. Context/chunk limits, checkpoint/expert/table residency,
+large transfer/conversion bounds and safe completion ownership govern practical execution.
+
+Named `PreparedStateResource` owners report target and independent prediction state without
+duplicating shared parameter tasks. Estimation uses exact component geometry, dtype, placement,
+segment offsets and active lanes. Append summaries can grow in discrete blocks; rounded
+per-position rates are amortized. Resident stream payload and lane allowances are distinct
+from paged cache occupancy. `TargetResourceReport` retains these facts and selected row
+workspace/cache policy; encoded table source size is not resident memory. Queries describe
+hypothetical horizons, not observed independent predictor frontiers.
+
+Selected rows retain `MechanismMemoryContract` facts for one maximum acquisition. MLX
+reports indices, compaction, conversion intermediates and independently owned output.
+An identity gather supplies owned storage because `copy`/`contiguous` can share backing.
+Scratch ends at completed decode; output belongs to its consumer. Generic GGML fallback
+workspace includes host/native staging and copy. Unknown allocator capacity, source/cache
+backing, private kernels and request composition stay explicit; local allowances are not a
+complete process peak or concurrent aggregate reservation.
+
+Native host-transfer storage carries allocation identities from the residency manager.
+Aliases retain their owner; rematerialized buffers get new identities. Transfer lifetimes
+remain distinct from cache ownership, so host eviction cannot release an in-flight source.
+Read-only residency reporting uses retained metadata without reaping or admission failure
+checks. Failed managers remain observable while new acquisition rejects. Process-local
+identities need rank/session namespaces for cross-process composition; observations omit
+host bookkeeping and do not turn measured capacities into future bounds.
+
+Detached submission reporting uses neutral inventory contracts and pure native retained
+metadata. The calling-thread report limits detached nodes to 64 and allocation records to
+256. Truncation, undescribed nodes, borrowed queues and reentrant/in-progress reaping are
+explicit. Reporting does not poll, evaluate, acquire or retire native work, establish global
+coverage, or authorize refunds. Safe retirement still requires completion evidence or teardown.
+
+`InputTransferResources` derives logical wire counts/payload and selected staging capacity
+bounds before copies. Repeated aliases count once per wire occurrence; serial staging uses
+maximum capacity while destination payloads sum. Native transfer recovery retains sources,
+created destinations and staging through partial failures/unwinding. Successful copies complete
+before publication and preserve structural/semantic cache identity. These are operation
+ceilings rather than process/session memory reservations.
+
+`NeuralBackend::mechanism_memory_in_context` supplies side-effect-free facts for an already
+selected context; cold queries remain context-free. `segmented_attention_memory` describes
+the actual segmented primitive. Shared Qwen vision declares compact invocation geometry,
+projection formats and host setup/output payload. `FlattenedPatchSpec::memory_invocation`
+uses complete channel/temporal/spatial geometry and unbound dense projection semantics.
+Operator invocation counts do not imply simultaneous allocations. Cold ranges do not require
+live callbacks during vision forwarding.
+
+`MechanismInvocation::MultiAxisRotary` carries position shape, representation and the exact
+portable rotary spec. Outputs preserve the prefix with F32 cosine/sine. MLX reports retained
+implementation payloads with explicit unknown capacity, fusion, private scratch and retirement.
+No backend reconstructs family rotary sections or guesses integer promotion. Geometry is
+validated before host coordinate allocation.
+
+`Tensor::inspect_storage` surveys established backing only. Default facts are unavailable;
+MLX uses native wrapper equality and allocator capacity where known without exposing pointers,
+evaluating, copying or initializing streams. Lazy/imported/custom backing stays unknown.
+Records retain no lease and do not prevent donation. A survey's compact indices are local,
+not persistent owner IDs, and external wrappers can overlap.
+
+`TensorStorageSnapshot<Role>` combines caller-authored semantic roles, checked logical extents
+and one backing survey over borrowed roots. Logical records are not deduplicated by role;
+only the survey maps backing. Prepared-input traversal defines wire order; Qwen ingress and
+vision define semantic roles. Media reports include original admitted inputs, prepared
+products and encoder continuation because original pixels can outlive patch concatenation.
+Current activations, target state, parameters, native scratch and host allocations are separate
+owners. Fresh request construction retains the original admission proof without retaining
+redundant chunk products/encoder continuations. Inspection promises neither summed physical
+peak nor admission authority.
+
+Reusable miniature artifacts and comparison fixtures belong to `eredu-evaluation` as development
+dependencies. Production architectures, facade and backends do not depend on evaluation. Native
+conformance uses ordinary selected constructors and erased executables. Numerical, distributed
+and released-artifact verification scope is recorded in the family validation report.

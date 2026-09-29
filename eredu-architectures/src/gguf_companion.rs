@@ -13,6 +13,15 @@ use crate::configuration::{GgufArchitecturePlan, GgufModelConfig};
 /// Typed family geometry retained for one admitted media-projector companion.
 #[derive(Debug, Clone)]
 pub enum GgufMediaProjectorConfig {
+    /// Flash-Next projector with exact tokenizer protocol identities bound.
+    Qwen4Exp(crate::qwen4_exp::prepared::VisionPlan),
+    /// Header-only Flash-Next projector awaiting tokenizer protocol identities.
+    Qwen4ExpPending {
+        /// Exact recipes, geometry and prepared source authority.
+        vision: crate::qwen4_exp::prepared::GgufVisionPlan,
+        /// Exact n-gram reset identity declared by the primary artifact.
+        reset_token_id: Option<u32>,
+    },
     /// Gemma 4 text plus its admitted vision and/or audio projector.
     Gemma4(crate::gemma4::FamilyConfig),
     /// Inkling text plus its admitted vision/audio projector.
@@ -59,12 +68,55 @@ impl GgufMediaProjectorPlan {
         &self.tensor_mapping
     }
 
-    pub(crate) fn bind_qwen_token_ids(
+    pub(crate) fn bind_qwen_media_tokens(
         &mut self,
-        image_token_id: u32,
-        video_token_id: u32,
+        tokens: crate::processor_plan::QwenMediaTokenIds,
     ) -> Result<(), String> {
+        let crate::processor_plan::QwenMediaTokenIds {
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
+        } = tokens;
+        let vocabulary = match &self.model {
+            GgufMediaProjectorConfig::Qwen3VlPending(args) => Some(args.text.vocab_size),
+            GgufMediaProjectorConfig::Qwen35Pending(args) => Some(args.text.vocab_size),
+            _ => None,
+        };
+        if let Some(vocabulary) = vocabulary {
+            let ids = [
+                image_token_id,
+                video_token_id,
+                vision_start_token_id,
+                vision_end_token_id,
+            ];
+            if ids.iter().any(|&id| i64::from(id) >= i64::from(vocabulary))
+                || ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id))
+            {
+                return Err(
+                    "Qwen media protocol IDs must be distinct and fit the structural vocabulary"
+                        .into(),
+                );
+            }
+        }
         let bound = match &self.model {
+            GgufMediaProjectorConfig::Qwen4ExpPending {
+                vision,
+                reset_token_id,
+            } => GgufMediaProjectorConfig::Qwen4Exp(
+                vision
+                    .clone()
+                    .bind_media_tokens(
+                        crate::qwen4_exp::config::MediaTokens {
+                            image: image_token_id,
+                            video: video_token_id,
+                            start: vision_start_token_id,
+                            end: vision_end_token_id,
+                        },
+                        *reset_token_id,
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
             GgufMediaProjectorConfig::Qwen3VlPending(args) => GgufMediaProjectorConfig::Qwen3Vl(
                 args.clone()
                     .with_media_token_ids(image_token_id, video_token_id)
@@ -78,7 +130,9 @@ impl GgufMediaProjectorPlan {
                 )
                 .map_err(|error| error.to_string())?,
             ),
-            GgufMediaProjectorConfig::Qwen3Vl(_) | GgufMediaProjectorConfig::Qwen35(_) => {
+            GgufMediaProjectorConfig::Qwen3Vl(_)
+            | GgufMediaProjectorConfig::Qwen35(_)
+            | GgufMediaProjectorConfig::Qwen4Exp(_) => {
                 return Err("Qwen GGUF media token IDs were already bound".into())
             }
             _ => return Err("non-Qwen GGUF projector received Qwen token IDs".into()),
@@ -115,6 +169,30 @@ pub(crate) fn resolve_media_projector(
     let model_metadata = metadata(primary);
     let projector_metadata = metadata(projector);
     let (model, checkpoint) = match primary_plan.model() {
+        GgufModelConfig::Qwen4Exp(target) => {
+            let vision = crate::qwen4_exp::prepared::GgufVisionPlan::prepare(
+                target.text_plan().config(),
+                projector,
+            )
+            .map_err(|error| error.to_string())?;
+            let reset_token_id = model_metadata
+                .get("qwen4exp.ple.image_token_id")
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| "invalid qwen4exp.ple.image_token_id".to_owned())
+                })
+                .transpose()?;
+            let checkpoint = vision.gguf_source().checkpoint_plan().clone();
+            (
+                GgufMediaProjectorConfig::Qwen4ExpPending {
+                    vision,
+                    reset_token_id,
+                },
+                checkpoint,
+            )
+        }
         GgufModelConfig::Gemma4(family) => {
             let family = crate::gemma4::family_from_gguf_metadata(
                 family.text.clone(),
@@ -208,6 +286,15 @@ fn canonical_projector_mapping(
     model: &GgufMediaProjectorConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
+        GgufMediaProjectorConfig::Qwen4ExpPending { vision, .. } => {
+            return Ok(vision.gguf_source().mapping().to_vec());
+        }
+        GgufMediaProjectorConfig::Qwen4Exp(vision) => {
+            return vision
+                .gguf_source()
+                .map(|source| source.mapping().to_vec())
+                .ok_or_else(|| "GGUF projector lost its exact source declaration".into());
+        }
         GgufMediaProjectorConfig::Gemma4(_) => {
             projector.translated_outputs(crate::gemma4::translate_mmproj_weight_name)
         }
@@ -510,6 +597,49 @@ mod tests {
                 "deepstack_visual_indexes":[0]}
         }))
         .unwrap();
+        let mut pending = GgufMediaProjectorPlan {
+            model: GgufMediaProjectorConfig::Qwen3VlPending(crate::qwen::vl::GgufModelArgs {
+                text: args.text.clone(),
+                vision: args.vision.clone(),
+                mrope_section: args.mrope_section,
+                model_type: args.model_type.clone(),
+            }),
+            checkpoint: crate::qwen::vision::gguf_plan(&args.vision, args.text.hidden_size)
+                .unwrap(),
+            primary_tensor_mapping: vec![],
+            tensor_mapping: vec![],
+        };
+        let ids = crate::processor_plan::QwenMediaTokenIds {
+            image_token_id: 61,
+            video_token_id: 62,
+            vision_start_token_id: 59,
+            vision_end_token_id: 60,
+        };
+        for invalid in [
+            crate::processor_plan::QwenMediaTokenIds {
+                vision_end_token_id: 64,
+                ..ids
+            },
+            crate::processor_plan::QwenMediaTokenIds {
+                vision_start_token_id: 61,
+                ..ids
+            },
+        ] {
+            assert!(pending.bind_qwen_media_tokens(invalid).is_err());
+            assert!(matches!(
+                pending.model(),
+                GgufMediaProjectorConfig::Qwen3VlPending(_)
+            ));
+        }
+        pending.bind_qwen_media_tokens(ids).unwrap();
+        let GgufMediaProjectorConfig::Qwen3Vl(bound) = pending.model() else {
+            panic!("expected bound model")
+        };
+        assert_eq!((bound.image_token_id, bound.video_token_id), (61, 62));
+        assert!(pending
+            .bind_qwen_media_tokens(ids)
+            .unwrap_err()
+            .contains("already bound"));
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("temporal.gguf");
         let first = vec![1_f32.to_le_bytes(); 16 * 3 * 2 * 2].concat();

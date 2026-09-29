@@ -203,7 +203,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         capture: Option<(
             eredu_core::capture::AdmittedCapturePlan,
             Option<eredu_core::intervention::AdmittedInterventionPlan>,
-            &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
+            &'a mut dyn FnMut(
+                super::request::GenerationStepKind,
+                Option<eredu_core::capture::CapturedStep>,
+                f64,
+            ),
             &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
         )>,
         generation_started: std::time::Instant,
@@ -225,7 +229,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         capture: Option<(
             eredu_core::capture::AdmittedCapturePlan,
             Option<eredu_core::intervention::AdmittedInterventionPlan>,
-            &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64),
+            &'a mut dyn FnMut(
+                super::request::GenerationStepKind,
+                Option<eredu_core::capture::CapturedStep>,
+                f64,
+            ),
             &'a dyn Fn() -> Option<eredu_core::capture::CaptureError>,
         )>,
         generation_started: std::time::Instant,
@@ -1035,7 +1043,9 @@ fn bind_gguf_special_token_ids(
     >,
     tokenizer: &ChatTokenizer,
 ) -> Result<(), TextMetadataError> {
-    use eredu_architectures::processor_plan::{GgufSpecialTokenIds, GgufSpecialTokenKind};
+    use eredu_architectures::processor_plan::{
+        GgufSpecialTokenIds, GgufSpecialTokenKind, QwenMediaTokenIds,
+    };
 
     let Some(kind) = inspection
         .architecture_plan()
@@ -1051,12 +1061,12 @@ fn bind_gguf_special_token_ids(
         })
     };
     let ids = match kind {
-        GgufSpecialTokenKind::Qwen => GgufSpecialTokenIds::Qwen {
+        GgufSpecialTokenKind::Qwen => GgufSpecialTokenIds::Qwen(QwenMediaTokenIds {
             image_token_id: required("<|image_pad|>")?,
             video_token_id: required("<|video_pad|>")?,
             vision_start_token_id: required("<|vision_start|>")?,
             vision_end_token_id: required("<|vision_end|>")?,
-        },
+        }),
         GgufSpecialTokenKind::Inkling => GgufSpecialTokenIds::Inkling {
             image_bos_token_id: required("<|content_image|>")?,
             audio_bos_token_id: required("<|content_audio_input|>")?,

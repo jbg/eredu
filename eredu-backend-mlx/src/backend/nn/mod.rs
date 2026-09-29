@@ -10,6 +10,7 @@ pub mod gated_delta;
 pub(crate) mod grouped;
 pub(crate) mod grouping;
 pub(crate) mod hyper_connections;
+pub(crate) mod layer_norm_memory;
 /// Activation functions.
 pub mod layers;
 pub(crate) mod linear;

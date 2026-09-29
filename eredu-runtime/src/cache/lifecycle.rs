@@ -4,14 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use eredu_core::{cache::CacheBlockId, residency::CacheEvictionPolicy};
+use eredu_core::{
+    cache::{CacheBlockId, CacheStreamId},
+    residency::CacheEvictionPolicy,
+};
 
 /// Device-resident mutable state that has not yet become an immutable block.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MutableCacheTail {
     /// Concrete bytes owned by the backend on the execution device.
     pub bytes: u64,
-    /// Exclusive logical token frontier represented by the tail.
+    /// Exclusive logical position or record frontier represented by the tail.
     pub end: i64,
 }
 
@@ -32,7 +35,7 @@ struct BlockLifecycle {
 pub struct CacheBlockLifecycle {
     access_clock: u64,
     blocks: BTreeMap<CacheBlockId, BlockLifecycle>,
-    tails: BTreeMap<usize, MutableCacheTail>,
+    tails: BTreeMap<CacheStreamId, MutableCacheTail>,
 }
 
 impl CacheBlockLifecycle {
@@ -84,9 +87,18 @@ impl CacheBlockLifecycle {
         &mut self,
         removals: &[(CacheBlockId, usize)],
         replacement: Option<(CacheBlockId, bool)>,
-        tail_layer: usize,
+        tail_stream: CacheStreamId,
         tail: MutableCacheTail,
     ) -> Result<(), CacheLifecycleError> {
+        if removals
+            .iter()
+            .any(|(id, _)| CacheStreamId::from(id) != tail_stream)
+            || replacement
+                .as_ref()
+                .is_some_and(|(id, _)| CacheStreamId::from(id) != tail_stream)
+        {
+            return Err(CacheLifecycleError::StreamMismatch);
+        }
         let removal_ids = removals.iter().map(|(id, _)| id).collect::<BTreeSet<_>>();
         if removal_ids.len() != removals.len() {
             return Err(CacheLifecycleError::DuplicateRemoval);
@@ -119,7 +131,7 @@ impl CacheBlockLifecycle {
                 },
             );
         }
-        self.tails.insert(tail_layer, tail);
+        self.tails.insert(tail_stream, tail);
         Ok(())
     }
 
@@ -189,7 +201,7 @@ impl CacheBlockLifecycle {
         &self,
         candidates: impl IntoIterator<Item = CacheBlockId>,
         required: Option<&CacheBlockId>,
-        recent_per_layer: usize,
+        recent_per_stream: usize,
         policy: CacheEvictionPolicy,
     ) -> Result<Option<CacheBlockId>, CacheLifecycleError> {
         let candidates = candidates.into_iter().collect::<BTreeSet<_>>();
@@ -198,7 +210,7 @@ impl CacheBlockLifecycle {
                 return Err(CacheLifecycleError::MissingBlock(id.clone()));
             }
         }
-        let recent = recent_ids(&candidates, recent_per_layer);
+        let recent = recent_ids(&candidates, recent_per_stream);
         Ok(candidates
             .into_iter()
             .filter(|id| {
@@ -221,11 +233,11 @@ impl CacheBlockLifecycle {
             }))
     }
 
-    /// Counts unprotected blocks retained by a per-layer recent window.
+    /// Counts unprotected blocks retained by per-stream recent windows, aggregated by layer.
     pub fn recent_protection_counts(
         &self,
         candidates: impl IntoIterator<Item = CacheBlockId>,
-        recent_per_layer: usize,
+        recent_per_stream: usize,
     ) -> Result<BTreeMap<usize, u64>, CacheLifecycleError> {
         let candidates = candidates
             .into_iter()
@@ -236,36 +248,40 @@ impl CacheBlockLifecycle {
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
         let mut counts = BTreeMap::new();
-        for id in recent_ids(&candidates, recent_per_layer) {
+        for id in recent_ids(&candidates, recent_per_stream) {
             *counts.entry(id.global_layer).or_default() += 1;
         }
         Ok(counts)
     }
 
-    /// Replaces one layer's mutable tail, returning the prior state for rollback.
-    pub fn set_tail(&mut self, layer: usize, tail: MutableCacheTail) -> Option<MutableCacheTail> {
-        self.tails.insert(layer, tail)
+    /// Replaces one stream's mutable tail, returning the prior state for rollback.
+    pub fn set_tail(
+        &mut self,
+        stream: CacheStreamId,
+        tail: MutableCacheTail,
+    ) -> Option<MutableCacheTail> {
+        self.tails.insert(stream, tail)
     }
 
     /// Restores a prior tail after a failed backend admission.
-    pub fn restore_tail(&mut self, layer: usize, tail: Option<MutableCacheTail>) {
+    pub fn restore_tail(&mut self, stream: CacheStreamId, tail: Option<MutableCacheTail>) {
         match tail {
             Some(tail) => {
-                self.tails.insert(layer, tail);
+                self.tails.insert(stream, tail);
             }
             None => {
-                self.tails.remove(&layer);
+                self.tails.remove(&stream);
             }
         }
     }
 
-    /// Returns one layer's mutable tail.
-    pub fn tail(&self, layer: usize) -> Option<MutableCacheTail> {
-        self.tails.get(&layer).copied()
+    /// Returns one stream's mutable tail.
+    pub fn tail(&self, stream: CacheStreamId) -> Option<MutableCacheTail> {
+        self.tails.get(&stream).copied()
     }
 
-    /// Iterates mutable tails in stable layer order.
-    pub fn tails(&self) -> impl Iterator<Item = (usize, MutableCacheTail)> + '_ {
+    /// Iterates mutable tails in stable stream order.
+    pub fn tails(&self) -> impl Iterator<Item = (CacheStreamId, MutableCacheTail)> + '_ {
         self.tails.iter().map(|(layer, tail)| (*layer, *tail))
     }
 
@@ -309,9 +325,12 @@ fn recent_ids(candidates: &BTreeSet<CacheBlockId>, limit: usize) -> BTreeSet<Cac
     if limit == 0 {
         return BTreeSet::new();
     }
-    let mut by_layer = BTreeMap::<usize, Vec<&CacheBlockId>>::new();
+    let mut by_layer = BTreeMap::<CacheStreamId, Vec<&CacheBlockId>>::new();
     for id in candidates {
-        by_layer.entry(id.global_layer).or_default().push(id);
+        by_layer
+            .entry(CacheStreamId::from(id))
+            .or_default()
+            .push(id);
     }
     by_layer
         .into_values()
@@ -334,6 +353,9 @@ pub enum CacheLifecycleError {
     /// A removal list repeated one identity.
     #[error("cache block replacement contains a duplicate removal")]
     DuplicateRemoval,
+    /// A transaction attempted to replace blocks belonging to another stream.
+    #[error("cache block replacement crosses stream identities")]
+    StreamMismatch,
     /// An operation required an unleased block.
     #[error("cache block is leased by active attention: {0:?}")]
     BlockLeased(CacheBlockId),
@@ -362,6 +384,10 @@ pub enum CacheLifecycleError {
 mod tests {
     use super::*;
     use eredu_core::cache::CacheRepresentation;
+
+    fn stream(layer: usize) -> CacheStreamId {
+        CacheStreamId::new(layer, CacheRepresentation::KeyValue)
+    }
 
     fn id(layer: usize, start: i64) -> CacheBlockId {
         CacheBlockId {
@@ -431,14 +457,14 @@ mod tests {
             .replace(
                 &[(first.clone(), 1), (second.clone(), 0)],
                 Some((replacement.clone(), true)),
-                0,
+                stream(0),
                 MutableCacheTail { bytes: 0, end: 1 },
             )
             .unwrap();
         assert_eq!(lifecycle.lease_count(&replacement).unwrap(), 0);
         assert!(lifecycle.is_protected_prefix(&replacement).unwrap());
         assert_eq!(
-            lifecycle.tail(0),
+            lifecycle.tail(stream(0)),
             Some(MutableCacheTail { bytes: 0, end: 1 })
         );
     }
@@ -472,9 +498,58 @@ mod tests {
     fn mutable_tail_rollback_restores_exact_state() {
         let mut lifecycle = CacheBlockLifecycle::new();
         let first = MutableCacheTail { bytes: 8, end: 2 };
-        assert_eq!(lifecycle.set_tail(3, first), None);
-        let prior = lifecycle.set_tail(3, MutableCacheTail { bytes: 16, end: 4 });
-        lifecycle.restore_tail(3, prior);
-        assert_eq!(lifecycle.tail(3), Some(first));
+        assert_eq!(lifecycle.set_tail(stream(3), first), None);
+        let prior = lifecycle.set_tail(stream(3), MutableCacheTail { bytes: 16, end: 4 });
+        lifecycle.restore_tail(stream(3), prior);
+        assert_eq!(lifecycle.tail(stream(3)), Some(first));
+    }
+    #[test]
+    fn auxiliary_lanes_have_independent_tails_and_recent_windows() {
+        let mut lifecycle = CacheBlockLifecycle::new();
+        let mut blocks = Vec::new();
+        for representation in [
+            CacheRepresentation::KeyValue,
+            CacheRepresentation::AppendStream { slot: 0, lane: 0 },
+            CacheRepresentation::AppendStream { slot: 0, lane: 1 },
+            CacheRepresentation::AppendStream { slot: 1, lane: 0 },
+        ] {
+            let stream = CacheStreamId::new(3, representation);
+            lifecycle.set_tail(stream, MutableCacheTail { bytes: 8, end: 3 });
+            for start in [0, 1] {
+                let mut block = id(3, start);
+                block.representation = representation;
+                lifecycle.insert(block.clone(), false).unwrap();
+                blocks.push(block);
+            }
+        }
+        assert_eq!(
+            lifecycle.tails().map(|(_, tail)| tail.bytes).sum::<u64>(),
+            32
+        );
+        let counts = lifecycle
+            .recent_protection_counts(blocks.clone(), 1)
+            .unwrap();
+        assert_eq!(counts.get(&3), Some(&4));
+        let victim = lifecycle
+            .eviction_candidate(blocks, None, 1, CacheEvictionPolicy::LeastRecentlyUsed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(victim.start, 0);
+        let changed = CacheStreamId::new(3, CacheRepresentation::AppendStream { slot: 0, lane: 0 });
+        let previous = lifecycle.set_tail(changed, MutableCacheTail { bytes: 16, end: 5 });
+        lifecycle.restore_tail(changed, previous);
+        assert!(lifecycle
+            .tails()
+            .all(|(_, tail)| tail.bytes == 8 && tail.end == 3));
+        assert_eq!(
+            lifecycle.replace(
+                &[(victim.clone(), 0)],
+                None,
+                changed,
+                MutableCacheTail::default()
+            ),
+            Err(CacheLifecycleError::StreamMismatch)
+        );
+        assert_eq!(lifecycle.lease_count(&victim), Ok(0));
     }
 }

@@ -447,7 +447,7 @@ one capture producer; distinct empty-overlap shards retain their acknowledgments
 The supplied maps still pass runtime receipt coverage checks and must be bound to
 the session's live ledger, run and forward before native work.
 
-The shared runtime now provides transactional observer callbacks for local
+The shared runtime provides transactional observer callbacks for local
 admission, coordinated preparation, delivery after exact completion, and final
 commit/discard notification. Local admission never submits a collective. Uniform
 participation is checked before coordinated callbacks, including on inactive

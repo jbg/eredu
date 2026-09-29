@@ -325,3 +325,14 @@ fn dim(value: i32) -> Result<usize, String> {
         .filter(|v| *v > 0)
         .ok_or_else(|| "vision dimension must be positive".into())
 }
+
+/// Reassembles the published two temporal Conv2D slices as one Conv3D kernel.
+/// Callers retain exact source identity, encoding and dtype in the input recipes.
+pub(crate) fn temporal_patch_recipe(
+    inputs: [eredu_checkpoint::recipe::DerivedWeightRecipe; 2],
+) -> eredu_checkpoint::recipe::DerivedWeightRecipe {
+    eredu_checkpoint::recipe::DerivedWeightRecipe::Stack {
+        axis: 2,
+        inputs: inputs.into(),
+    }
+}

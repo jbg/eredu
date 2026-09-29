@@ -36,6 +36,7 @@ where
     let cache = state.layer(state_ordinal).map_err(Error::backend)?;
     block.forward(
         AttentionInput {
+            selected_positions: None,
             hidden,
             mask,
             cache: Some(cache),
@@ -66,6 +67,7 @@ where
     let cache = state.layer(state_ordinal).map_err(Error::backend)?;
     block.forward_tensor_parallel(
         AttentionInput {
+            selected_positions: None,
             hidden,
             mask,
             cache: Some(cache),

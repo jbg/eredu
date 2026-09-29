@@ -110,7 +110,8 @@ fn member_status_worker() {
             // No world-wave proof is attached. Nonmembers perform no native work.
             for failed in [None, Some(members[0]), Some(*members.last().unwrap())] {
                 let submission =
-                    MlxNeuralBackend::agree_success(failed != Some(rank), &group, &stream).unwrap();
+                    MlxNeuralBackend::agree_success(failed != Some(rank), None, &group, &stream)
+                        .unwrap();
                 assert_eq!(submission.completion.retained_arrays(), 2);
                 assert_eq!(submission.completion.retained_groups(), 1);
                 assert_eq!(submission.completion.retained_streams(), 1);
@@ -125,7 +126,29 @@ fn member_status_worker() {
                     failed.is_none()
                 );
             }
-            assert_eq!(super::super::group::native_collective_submissions(), 3);
+            for case in 0..3 {
+                let mut descriptor = [u64::MAX, 1 << 63, 0, 1, (1 << 53) + 1, 7, 32, 50];
+                if case == 1 && rank == *members.last().unwrap() {
+                    descriptor[0] -= 1;
+                }
+                let success = case != 2 || rank != members[0];
+                let submission =
+                    MlxNeuralBackend::agree_success(success, Some(descriptor), &group, &stream)
+                        .unwrap();
+                assert_eq!(submission.completion.retained_arrays(), 2);
+                assert_eq!(submission.completion.retained_groups(), 1);
+                let BoundedSubmissionOutcome::Completed(output) = submission
+                    .wait_bounded(completion_policy().bounded_wait())
+                    .unwrap()
+                else {
+                    panic!("bounded descriptor agreement deadline");
+                };
+                assert_eq!(
+                    MlxNeuralBackend::resolve_failure_agreement(output).unwrap(),
+                    case == 0 || (case == 1 && members.len() == 1)
+                );
+            }
+            assert_eq!(super::super::group::native_collective_submissions(), 6);
         } else {
             assert_eq!(super::super::group::native_collective_submissions(), 0);
         }

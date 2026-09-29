@@ -42,10 +42,11 @@ fn manager() -> CacheResidencyManager {
     .unwrap()
 }
 
-fn selected_state(
+pub(super) fn selected_state(
     layout: StateLayout,
     access: ReplicatedTextStateAccess,
     policy: CacheResidencyPolicy,
+    streams: Vec<eredu_runtime::AppendStreamBinding>,
 ) -> SelectedStateRealization {
     let graph = ExecutionGraph::new(vec![ExecutionGroupSpec::root("decoder")], "decoder").unwrap();
     let units = ExecutionUnitLayout::new(&graph, [layout.len()]).unwrap();
@@ -68,7 +69,9 @@ fn selected_state(
         Vec::new(),
     )
     .unwrap()
-    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32)
+    .with_append_streams(streams)
+    .unwrap();
     let components = (0..requirements.state_layout().len()).flat_map(|layer| {
         requirements
             .state_layout()
@@ -134,6 +137,7 @@ fn key_value_constructor_uses_selected_component_placement() {
         layout.clone(),
         ReplicatedTextStateAccess::KeyValue,
         CacheResidencyPolicy::Device,
+        vec![],
     );
     let device = MlxKeyValueState::from_selected(&device, None, None).unwrap();
     assert!(matches!(
@@ -146,7 +150,12 @@ fn key_value_constructor_uses_selected_component_placement() {
             .unwrap()
             .with_full_attention(true),
     );
-    let paged = selected_state(layout, ReplicatedTextStateAccess::KeyValue, paged_policy);
+    let paged = selected_state(
+        layout,
+        ReplicatedTextStateAccess::KeyValue,
+        paged_policy,
+        vec![],
+    );
     assert!(MlxKeyValueState::from_selected(&paged, None, None)
         .unwrap_err()
         .to_string()
@@ -164,9 +173,14 @@ fn hybrid_constructor_preserves_paged_attention_and_device_fixed_state() {
         MutableStateResidency::LayerScopedOffloadable,
     )
     .unwrap();
-    let policy =
-        LayerCachePolicy::key_value_with_fixed_state(AttentionPolicy::Full, 1, 8, vec![fixed])
-            .unwrap();
+    let policy = LayerCachePolicy::key_value_with_state(
+        AttentionPolicy::Full,
+        1,
+        8,
+        vec![fixed],
+        Vec::new(),
+    )
+    .unwrap();
     let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
     let paged_policy = CacheResidencyPolicy::Paged(
         PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
@@ -177,6 +191,7 @@ fn hybrid_constructor_preserves_paged_attention_and_device_fixed_state() {
         layout,
         ReplicatedTextStateAccess::AttentionWithFixed,
         paged_policy,
+        vec![],
     );
     assert_eq!(
         selected
@@ -235,6 +250,7 @@ fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
         layout.clone(),
         ReplicatedTextStateAccess::Fixed,
         CacheResidencyPolicy::Paged(paging.clone()),
+        vec![],
     );
     let mut state = MlxHybridState::from_selected(&selected, Some(manager()), None).unwrap();
     let values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -324,8 +340,8 @@ fn hybrid_commit_clones_only_the_architecture_named_segment() {
         ],
     )
     .unwrap();
-    let mut canonical = MlxHybridState::device(layout.clone()).unwrap();
-    let mut draft = MlxHybridState::device(layout).unwrap();
+    let mut canonical = MlxHybridState::device(layout.clone(), &[]).unwrap();
+    let mut draft = MlxHybridState::device(layout, &[]).unwrap();
     canonical.layers[0].fixed_offset = 1;
     canonical.layers[1].fixed_offset = 2;
     canonical.layers[2].fixed_offset = 3;
@@ -359,7 +375,9 @@ fn paged_transaction_discard_restores_shared_manager_frontier() {
         MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
         MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => unreachable!(),
     };
-    manager.set_tail_state(0, 0, 3).unwrap();
+    manager
+        .set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 0, 3)
+        .unwrap();
     assert_eq!(manager.report().unwrap().logical_cached_tokens, 3);
 
     MlxKeyValueState::discard_branch(branch).unwrap();

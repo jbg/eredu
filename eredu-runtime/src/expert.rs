@@ -1,4 +1,4 @@
-//! Runtime ownership boundary for routed expert acquisition and residency.
+//! Runtime ownership boundary for parameter acquisition and operator providers.
 
 use eredu_nn::{
     DistributedNeuralBackend, GroupSelection, GroupedGatedProductOperator, GroupedLinearOperator,
@@ -17,7 +17,7 @@ use crate::{
     WeightLoweringKind,
 };
 pub use agreement::{
-    AgreeingAddressableExpertProvider, AgreeingRoutedExpertProvider, ProviderAgreementRejected,
+    AgreeingAddressableExpertProvider, AgreeingParameterProvider, ProviderAgreementRejected,
 };
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
@@ -1066,56 +1066,15 @@ pub trait AddressableExpertRouteProvider<T> {
     }
 }
 
-/// Exact generic request for an independently addressable bank acquisition.
-#[derive(Debug, Clone, Copy)]
-pub struct ParameterBankAcquisition<'a> {
-    entries: &'a [(ParameterBankKey, u64)],
-    access: ParameterBankAccess,
-}
-
-impl<'a> ParameterBankAcquisition<'a> {
-    /// Creates one deterministic acquisition request in compact-bank order.
-    pub const fn new(entries: &'a [(ParameterBankKey, u64)], access: ParameterBankAccess) -> Self {
-        Self { entries, access }
-    }
-
-    /// Returns generic bank keys and duplicate-preserving demand counts.
-    pub const fn entries(&self) -> &'a [(ParameterBankKey, u64)] {
-        self.entries
-    }
-
-    /// Returns the selected generic storage access class.
-    pub const fn access(&self) -> ParameterBankAccess {
-        self.access
-    }
-}
-
 /// Generic addressable storage and grouped-operator construction mechanisms.
 ///
 /// The mechanism receives already translated bank keys, compact specifications,
 /// and access classes. Architecture identity, routing policy, global identity
 /// mapping, chunking, and text-session behavior remain outside this contract.
-pub trait AddressableGroupedBank<B>
+pub trait AddressableGroupedBank<B>: crate::ParameterBank<B>
 where
     B: GroupedNeuralBackend,
 {
-    /// Live native storage retained across grouped execution.
-    type Acquisition;
-    /// Generic bank telemetry snapshot.
-    type Report;
-    /// Storage, transfer, lowering, or construction failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Returns the selected byte geometry for one admitted bank member.
-    fn member_bytes(&self, key: ParameterBankKey) -> Option<u64>;
-
-    /// Acquires exact generic keys in caller-supplied compact order.
-    fn acquire(
-        &mut self,
-        request: ParameterBankAcquisition<'_>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self::Acquisition, Self::Error>;
-
     /// Constructs one compact gated-product operator from acquired bindings.
     fn gated_product_groups(
         &mut self,
@@ -1124,7 +1083,6 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::GatedProductGroups, Self::Error>;
 
-    /// Constructs one compact ReLU-squared operator from acquired bindings.
     /// Constructs one compact selected-linear bank from acquired bindings.
     fn linear_groups(
         &mut self,
@@ -1140,17 +1098,6 @@ where
         spec: &eredu_nn::GroupedRelu2Spec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Relu2Groups, Self::Error>;
-
-    /// Retains acquired storage until the grouped output is natively complete.
-    fn complete(
-        &mut self,
-        acquisition: Self::Acquisition,
-        output: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(), Self::Error>;
-
-    /// Returns generic key, byte, tier, acquisition, and eviction telemetry.
-    fn report(&self) -> Result<Self::Report, Self::Error>;
 }
 
 /// Mechanism-only lookup of one grouped operator in an addressable parameter bank.
@@ -1302,14 +1249,32 @@ where
 ///
 /// Implementations own identity ordering, acquisition, leases, chunking,
 /// budgets, and residency reports. They keep every lease alive until the
-/// backend-native routed result is safe to return. The backend retains tensor
+/// backend-native result is safe to return. Row lookups use the same unit and
+/// completion paths as grouped operations. The backend retains tensor
 /// storage, transfers, compact-bank construction, and execution kernels.
-pub trait RoutedExpertProvider<B>
+pub trait ParameterProvider<B>
 where
     B: GroupedNeuralBackend,
 {
     /// Provider-specific acquisition or execution failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Whether this prepared provider owns the exact row parameter.
+    fn has_row_parameter(&self, _parameter: &eredu_nn::ParameterId) -> bool {
+        false
+    }
+
+    /// Looks up architecture-supplied integer IDs through the shared unit driver.
+    /// Providers without a declared table fail before any acquisition.
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        _rows: &[u64],
+        _access: crate::ParameterBankAccess,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        Err(crate::RowLookupError::Missing(spec.parameter.clone()))
+    }
 
     /// Optional pre-dispatch control supplied by an instrumented provider adapter.
     fn routing_control(
@@ -1373,7 +1338,7 @@ where
 }
 
 /// Additive provider mechanism for tensor-parallel grouped partials.
-pub trait TensorParallelRoutedExpertProvider<B>: RoutedExpertProvider<B>
+pub trait TensorParallelParameterProvider<B>: ParameterProvider<B>
 where
     B: GroupedNeuralBackend,
 {
@@ -1597,15 +1562,27 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
     }
 }
 
-impl<B, P, O, E> RoutedExpertProvider<B> for ObservedExpertProvider<'_, P, O, E>
+impl<B, P, O, E> ParameterProvider<B> for ObservedExpertProvider<'_, P, O, E>
 where
     B: GroupedNeuralBackend,
-    P: RoutedExpertProvider<B>,
+    P: ParameterProvider<B>,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
     E: std::error::Error + Send + Sync + 'static,
 {
     type Error = ObservedExpertProviderError<P::Error, E>;
 
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.provider.has_row_parameter(parameter)
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        rows: &[u64],
+        access: crate::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        self.provider.lookup_rows(spec, rows, access, context)
+    }
     fn routing_control(
         &mut self,
         bank: RoutedBankId,
@@ -1713,10 +1690,10 @@ where
     }
 }
 
-impl<B, P, O, E> TensorParallelRoutedExpertProvider<B> for ObservedExpertProvider<'_, P, O, E>
+impl<B, P, O, E> TensorParallelParameterProvider<B> for ObservedExpertProvider<'_, P, O, E>
 where
     B: GroupedNeuralBackend,
-    P: TensorParallelRoutedExpertProvider<B>,
+    P: TensorParallelParameterProvider<B>,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -1881,7 +1858,7 @@ where
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResidentExpertProvider;
 
-impl<B> RoutedExpertProvider<B> for ResidentExpertProvider
+impl<B> ParameterProvider<B> for ResidentExpertProvider
 where
     B: GroupedNeuralBackend,
 {
@@ -1947,7 +1924,7 @@ where
     }
 }
 
-impl<B> TensorParallelRoutedExpertProvider<B> for ResidentExpertProvider
+impl<B> TensorParallelParameterProvider<B> for ResidentExpertProvider
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
 {

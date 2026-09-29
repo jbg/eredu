@@ -7,7 +7,6 @@
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
 #include "mlx/memory.h"
-
 extern "C" int mlx_clear_cache(void) {
   try {
     mlx::core::clear_cache();

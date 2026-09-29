@@ -785,13 +785,17 @@ impl DerivedWeightRecipe {
         &self,
         source: &dyn CheckpointSource,
     ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
-        fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
+        fn collect(
+            recipe: &DerivedWeightRecipe,
+            keys: &mut Vec<crate::store::TensorReadRequest>,
+        ) -> bool {
             match recipe {
-                DerivedWeightRecipe::Source {
-                    key,
-                    selection: TensorSelection::Full,
-                } => {
-                    keys.push(key.clone());
+                DerivedWeightRecipe::Source { key, selection } => {
+                    keys.push(crate::store::TensorReadRequest {
+                        key: key.clone(),
+                        selection: selection.clone(),
+                        policy: crate::store::ReadPolicy::RequireBounded,
+                    });
                     true
                 }
                 DerivedWeightRecipe::Concatenate { axis: 0, inputs }
@@ -1716,17 +1720,54 @@ fn map_reinterpret_selection(
         let input_cycle = input_unit
             .checked_mul(input.shape[input_axis] as u64)
             .ok_or(RecipeError::ArithmeticOverflow("selection input cycle"))?;
-        if input_cycle != output_cycle {
+        if !input_cycle.is_multiple_of(output_cycle) || !output_cycle.is_multiple_of(input_unit) {
             continue;
         }
+        let cycle_dimension = usize::try_from(output_cycle / input_unit)
+            .map_err(|_| RecipeError::ArithmeticOverflow("mapped selection cycle"))?;
         if let Some(mapped) = map_selection_units(
             selection,
             input_axis,
-            input.shape[input_axis],
+            cycle_dimension,
             output_unit,
             input_unit,
         )? {
-            return normalize_selection(mapped, &input.shape);
+            if input_cycle == output_cycle {
+                return normalize_selection(mapped, &input.shape);
+            }
+            // Reshaping can split one input axis into several output axes.
+            // Preserve flatten order by repeating the selected inner cycle
+            // across that input axis, including duplicate and reordered indices.
+            let indices: Vec<_> = match mapped {
+                TensorSelection::Range { start, end, .. } => (start..end).collect(),
+                TensorSelection::Indices { indices, .. } => indices,
+                _ => unreachable!("non-full mapped axis selection"),
+            };
+            let cycles = usize::try_from(input_cycle / output_cycle)
+                .map_err(|_| RecipeError::ArithmeticOverflow("mapped selection cycles"))?;
+            let count = cycles
+                .checked_mul(indices.len())
+                .ok_or(RecipeError::ArithmeticOverflow("repeated selection length"))?;
+            let mut repeated = Vec::with_capacity(count);
+            for cycle in 0..cycles {
+                let offset = cycle
+                    .checked_mul(cycle_dimension)
+                    .ok_or(RecipeError::ArithmeticOverflow("repeated selection offset"))?;
+                for index in &indices {
+                    repeated.push(
+                        offset
+                            .checked_add(*index)
+                            .ok_or(RecipeError::ArithmeticOverflow("repeated selection index"))?,
+                    );
+                }
+            }
+            return normalize_selection(
+                TensorSelection::Indices {
+                    axis: input_axis,
+                    indices: repeated,
+                },
+                &input.shape,
+            );
         }
     }
     Err(RecipeError::SelectionPushdownUnsupported {
@@ -2831,6 +2872,213 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn reshaped_axis_cycles_preserve_permuted_vector_and_matrix_values() {
+        fn select(
+            shape: &[usize],
+            values: &[usize],
+            selection: &TensorSelection,
+        ) -> (Vec<usize>, Vec<usize>) {
+            if let TensorSelection::Full = selection {
+                return (shape.to_vec(), values.to_vec());
+            }
+            if let TensorSelection::Contiguous {
+                offset_elements,
+                shape,
+            } = selection
+            {
+                let count: usize = shape.iter().product();
+                return (
+                    shape.clone(),
+                    values[*offset_elements..*offset_elements + count].to_vec(),
+                );
+            }
+            let (axis, indices): (_, Vec<_>) = match selection {
+                TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
+                TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
+                _ => unreachable!(),
+            };
+            let inner: usize = shape[axis + 1..].iter().product();
+            let outer: usize = shape[..axis].iter().product();
+            let mut output = Vec::new();
+            for prefix in 0..outer {
+                for index in &indices {
+                    let start = (prefix * shape[axis] + index) * inner;
+                    output.extend_from_slice(&values[start..start + inner]);
+                }
+            }
+            let mut shape = shape.to_vec();
+            shape[axis] = indices.len();
+            (shape, output)
+        }
+        fn evaluate(
+            recipe: &DerivedWeightRecipe,
+            source_shape: &[usize],
+            reads: &mut usize,
+        ) -> (Vec<usize>, Vec<usize>) {
+            match recipe {
+                DerivedWeightRecipe::Source { selection, .. } => {
+                    let values: Vec<_> = (1..=source_shape.iter().product()).collect();
+                    let result = select(source_shape, &values, selection);
+                    *reads += result.1.len();
+                    result
+                }
+                DerivedWeightRecipe::Reshape { input, shape } => {
+                    let (_, values) = evaluate(input, source_shape, reads);
+                    assert_eq!(shape.iter().product::<usize>(), values.len());
+                    (shape.clone(), values)
+                }
+                DerivedWeightRecipe::Transpose { input, axes } => {
+                    let (shape, values) = evaluate(input, source_shape, reads);
+                    let output_shape: Vec<_> = axes.iter().map(|axis| shape[*axis]).collect();
+                    let output = (0..values.len())
+                        .map(|mut flat| {
+                            let mut coordinates = vec![0; shape.len()];
+                            for axis in (0..axes.len()).rev() {
+                                coordinates[axes[axis]] = flat % output_shape[axis];
+                                flat /= output_shape[axis];
+                            }
+                            let index = coordinates
+                                .iter()
+                                .zip(&shape)
+                                .fold(0, |offset, (coordinate, dim)| offset * dim + coordinate);
+                            values[index]
+                        })
+                        .collect();
+                    (output_shape, output)
+                }
+                DerivedWeightRecipe::Concatenate { axis, inputs } => {
+                    let parts: Vec<_> = inputs
+                        .iter()
+                        .map(|input| evaluate(input, source_shape, reads))
+                        .collect();
+                    let mut shape = parts[0].0.clone();
+                    shape[*axis] = parts.iter().map(|part| part.0[*axis]).sum();
+                    let outer: usize = shape[..*axis].iter().product();
+                    let mut output = Vec::new();
+                    for prefix in 0..outer {
+                        for (shape, values) in &parts {
+                            let width: usize = shape[*axis..].iter().product();
+                            output.extend_from_slice(&values[prefix * width..(prefix + 1) * width]);
+                        }
+                    }
+                    (shape, output)
+                }
+                DerivedWeightRecipe::Select { input, selection } => {
+                    let (shape, values) = evaluate(input, source_shape, reads);
+                    select(&shape, &values, selection)
+                }
+                _ => panic!("unexpected fixture recipe"),
+            }
+        }
+        for width in [1, 2] {
+            let source_shape = if width == 1 { vec![6] } else { vec![6, width] };
+            let catalog = family_catalog(&[("weight", &source_shape, StoredDtype::F32)]);
+            let recipe = DerivedWeightRecipe::Transpose {
+                input: Box::new(DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source("weight", TensorSelection::Full)),
+                    shape: vec![3, 2, width],
+                }),
+                axes: vec![1, 0, 2],
+            };
+            for (selection, rows) in [
+                (
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: 1,
+                        end: 2,
+                    },
+                    vec![1, 3, 5],
+                ),
+                (
+                    TensorSelection::Indices {
+                        axis: 0,
+                        indices: vec![1, 0, 1],
+                    },
+                    vec![1, 3, 5, 0, 2, 4, 1, 3, 5],
+                ),
+            ] {
+                let selected = recipe.select_bounded(&catalog, selection).unwrap();
+                let expected: Vec<_> = rows
+                    .iter()
+                    .flat_map(|row| (row * width + 1)..=(row + 1) * width)
+                    .collect();
+                let mut reads = 0;
+                let (shape, actual) = evaluate(&selected, &source_shape, &mut reads);
+                assert_eq!(shape, [rows.len() / 3, 3, width]);
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    reads,
+                    expected.len(),
+                    "only selected physical values are acquired"
+                );
+            }
+        }
+        let source_shape = [2, 6];
+        let catalog = family_catalog(&[("weight", &source_shape, StoredDtype::F32)]);
+        let recipe = DerivedWeightRecipe::Transpose {
+            input: Box::new(DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::source("weight", TensorSelection::Full)),
+                shape: vec![2, 3, 2],
+            }),
+            axes: vec![0, 2, 1],
+        };
+        for (selection, expected) in [
+            (
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 2,
+                },
+                vec![2, 4, 6, 8, 10, 12],
+            ),
+            (
+                TensorSelection::Indices {
+                    axis: 1,
+                    indices: vec![1, 0, 1],
+                },
+                vec![2, 4, 6, 1, 3, 5, 2, 4, 6, 8, 10, 12, 7, 9, 11, 8, 10, 12],
+            ),
+        ] {
+            let selected = recipe.select_bounded(&catalog, selection).unwrap();
+            let mut reads = 0;
+            let (shape, actual) = evaluate(&selected, &source_shape, &mut reads);
+            assert_eq!(shape, [2, expected.len() / 6, 3]);
+            assert_eq!(actual, expected);
+            assert_eq!(reads, expected.len());
+        }
+    }
+
+    #[test]
+    fn reinterpret_selection_still_rejects_unaligned_cycles_and_scalar_splits() {
+        let catalog = family_catalog(&[
+            ("matrix", &[2, 3], StoredDtype::F32),
+            ("words", &[3], StoredDtype::U32),
+        ]);
+        let reshape = DerivedWeightRecipe::Reshape {
+            input: Box::new(DerivedWeightRecipe::source("matrix", TensorSelection::Full)),
+            shape: vec![3, 2],
+        };
+        let view = DerivedWeightRecipe::View {
+            input: Box::new(DerivedWeightRecipe::source("words", TensorSelection::Full)),
+            dtype: RecipeDtype::U8,
+            shape: vec![3, 4],
+        };
+        for (recipe, axis) in [(reshape, 0), (view, 1)] {
+            assert!(matches!(
+                recipe.select_bounded(
+                    &catalog,
+                    TensorSelection::Range {
+                        axis,
+                        start: 1,
+                        end: 2
+                    }
+                ),
+                Err(RecipeError::SelectionPushdownUnsupported { .. })
+            ));
+        }
     }
 
     fn member(target: &str, source: &str) -> MatrixRecipeMember {

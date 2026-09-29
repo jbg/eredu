@@ -1,6 +1,6 @@
-# Completed-token execution control
+# Execution control
 
-The ordinary text facade supports completed-token stepping, pause/resume, canonical
+The ordinary text facade supports completed-token and prefill-chunk stepping, pause/resume, canonical
 token forcing, temperature changes, explicit reseeding, reusable native snapshots,
 restoration and isolated serial branches. Complete snapshot support requires known
 costs for every state owner. Currently this includes the forbidden-tool constraint
@@ -34,29 +34,34 @@ Ordinary and controlled generation share prompt chunking in the core driver.
 `TextGenerationConfig::with_prefill_chunk_policy` and
 `PreparedChatGenerationSettings::prefill` select `PrefillChunkPolicy::Bounded`
 (512 tokens by default) or `Unchunked`. Each nonfinal chunk completes before the
-next begins, advances the model cache without sampling, and retains the original
-prompt identity. Only the final chunk predicts a token. The shared cancellation
-token is checked between completed chunks; cancellation can therefore leave a
-partial prompt cache, with no committed output. Reset the model before starting
-a different request. Chunk boundaries are internal to the first controlled step,
-so snapshots and pause/resume remain at completed-token boundaries.
+next begins and advances the model cache without sampling. Only the final chunk
+predicts a token. A controlled step can publish `PrefillProgress` and pause at a
+completed nonfinal chunk; it consumes no output token or controller decision.
+Snapshots and branches preserve pending input together with committed model state.
+The uninterrupted driver repeats the same operation until token production.
+Cancellation is checked between completed chunks and can leave a partial prompt
+cache with no committed output. Reset the model before starting a different request.
+`Unchunked` removes the caller-imposed chunk limit but still honors an architecture's
+required invocation limit.
 
-The MLX adapter enables chunking for ordinary replicated plain-text execution
-through the shared decoder architecture (including grouped-query and sliding
-attention) and dense/routed LFM2 and LFM2.5. LFM2 retains convolution history,
-attention caches and absolute positions across passes; convolution-only schedules
-use the same driver. Other architecture drivers retain a complete pass until
-their incremental state semantics have conformance coverage.
 `LoadedModel::prefill_chunking_support()` reports the executable's support or a
-fallback reason. Prepared media/structured inputs, nonempty capture/intervention
-plans, prediction extensions and distributed sessions retain a complete prefill
-pass: their existing coordinates, transaction or publication contracts describe
-one whole prompt. Speculative execution also retains its existing prefill path.
-These are current implementation gaps, not architectural impossibilities. Memory
-estimates for these paths must use the complete prompt. The shared dense and heterogeneous decoder shells project only the last hidden
+fallback reason. MLX plain-text adapters support ordinary replicated shared decoder
+architectures, including grouped-query and sliding attention, and dense/routed LFM2
+and LFM2.5. Their plain-text splitting path retains a complete pass for capture and
+distributed execution. LFM2 retains convolution history, attention caches and absolute
+positions across passes; convolution-only schedules use the same driver.
+
+Composite adapters with retained prefill requests support prepared media and absolute
+capture spans through the shared cursor described under [Flash-Next](#flash-next).
+Adapters without that cursor retain a complete pass for structured input. Nonempty
+intervention plans reject partial prefill spans with a typed error. Speculative
+execution uses its own shared prefill operation and does not expose between-chunk
+control advancement. Memory estimates reflect the actual selected path.
+
+The shared dense and heterogeneous decoder shells project only the last hidden
 position for an unobserved ordinary pass. Observed and speculative full-output
-contracts retain every required row. Nonfinal prefixes currently compute one
-unused vocabulary row; they never sample or commit a token.
+contracts retain every required row. Nonfinal prefixes compute one unused vocabulary
+row; they never sample or commit a token.
 
 Ordinary prefill completes both output and retained mutable state before
 publication, including when ordinary decode is asynchronous. Completing logits
@@ -69,8 +74,8 @@ work already submitted. Chunk size controls work per submission, not a fixed
 wall-clock cancellation deadline or the total attention-cache size.
 
 Chunk size remains caller-selected, with the existing 512-token default and
-`Unchunked` option. No allocator cap, prompt limit or device-size heuristic is
-introduced. See [LFM2 prefill validation](lfm2-prefill-validation.md).
+`Unchunked` option. This policy imposes no allocator cap or device-size heuristic; architecture
+geometry and history limits apply independently. See [LFM2 prefill validation](lfm2-prefill-validation.md).
 
 The focused native regression runs outside the sandbox:
 
@@ -267,7 +272,7 @@ for serial branches while retaining the same executable and completion owner. Th
 native implementation still must prove isolated copies and completion, and the
 facade still must compose all the other generation state listed above.
 
-The MLX state-copy primitive now independently copies device KV arrays and fixed
+The MLX state-copy primitive independently copies device KV arrays and fixed
 recurrent/convolution tensors, materializing strided views contiguously first.
 It preserves sliding windows, backing capacity, absolute offsets and typed layout.
 Its estimates include native logical data, possible contiguous-copy storage and
@@ -299,7 +304,7 @@ states with exact logit agreement. It distinguishes alternative input tokens and
 checks counters for no extra forward execution, state reset, artifact reopening or
 weight materialization during copy/exchange. Separate native storage fixtures cover
 KV sliding windows/capacity and recurrent/convolution arrays.
-`eredu-evaluation::execution_control::continuation_conformance` now runs against
+`eredu-evaluation::execution_control::continuation_conformance` runs against
 host and loaded native dense, LFM2 convolution/attention, and Qwen3.5 MoE
 recurrent/convolution/attention fixtures. It checks reusable initial and decode
 snapshots, sibling interleaving, fresh admissions, controller state and cumulative
@@ -325,8 +330,7 @@ and leaves the cumulative ledger unchanged.
 Drained capture batches expose `CapturedStep.outcome`. An aborted model forward
 can contain valid observations collected before its failure, but cannot provide
 evidence for a committed prediction or create a snapshot boundary. Its reservations
-remain charged after draining and restore. `Untracked` identifies low-level or
-legacy batches without transaction evidence. Completion and state reuse still
+remain charged after draining and restore. `Untracked` identifies low-level batches without transaction evidence. Completion and state reuse still
 follow the existing native ownership protocol, independently of this outcome.
 
 Routed provider success votes belong to execution and run even without capture.
@@ -367,7 +371,7 @@ cancellation propagates to every participant. The session-owned coordinator uses
 bounded native transport and keeps attempt/copy charges monotone across reset,
 restore and branching. It is not part of a restorable model snapshot. See
 [cold text-run preparation](component-validation.md#cold-text-run-preparation) for
-API migration, accounting and current verification scope.
+API contracts, accounting and verification scope.
 
 Native Ring tests across TP, PP and combined TP/PP verify unchanged cached state
 after agreed prompt, sampler and capture-installation rejection, followed by a
@@ -393,7 +397,7 @@ copy attempts still consume copying allowance. Restore uses a provisional retent
 reservation. These are logical bounds, not a physical allocator/private-workspace
 ceiling. Capture and transport budgets remain independent.
 
-The ordinary one-shot driver now delegates to `CommittedGenerationCursor::step`.
+The ordinary one-shot driver delegates to `CommittedGenerationCursor::step`.
 This reuses the existing token source, tokenizer, constraints, EOS precedence and
 semantic pipeline. The pipeline and built-in protocol parsers support exact state
 forks, including buffered bytes, JSON/Python/tool-call state, stop matching, pending
@@ -408,7 +412,7 @@ record draining between advances, and fences failures even after cleanup. This
 low-level mechanism still requires facade composition with native state exchange,
 semantic delivery and lifecycle policy; it alone is not a controllable session.
 
-## Current public stepping workflow
+## Public stepping workflow
 
 Prepare with `prepare_observed_chat` (use `CapturePlan::none()` for ordinary runs)
 or `prepare_intervened_chat`, then call `LoadedModel::start_controlled_chat` with
@@ -453,7 +457,7 @@ partial Unicode and terminal snapshots.
 
 `fork(&snapshot, GenerationBranchOptions, callback)` creates an inactive isolated
 child. `exchange(&mut branch, callback)` moves all native and facade state between
-the active run and that slot; the slot then holds the formerly active run. The
+the active run and that slot; the slot then holds the displaced run. The
 exchange copies no tensors and makes no prediction or RNG draw. Cancellation,
 transport consumption and semantic output follow each logical run. A cancelled
 child may be exchanged out so a healthy parent can continue. Failed or unresolved
@@ -467,7 +471,7 @@ limit; this API does not extend it. The child may itself create snapshots or for
 descendants under the original tree's shared snapshot budget. Same-run restore
 requires the snapshot's logical run; fork permits another run in that same exclusive
 driver tree. A new generation on the same loaded model is a different driver and
-cannot import the old tree's snapshots.
+cannot import another driver's snapshots.
 
 `BranchStarted` is sequence zero of the child stream. It includes parent snapshot
 metadata, inherited capture consumption, future choices and explicit transport
@@ -488,7 +492,7 @@ snapshots and branches use `ControlledGenerationSnapshot<B>` and
 grammar, then restricts the ordinary sampler to that one candidate. It commits
 through the same history, penalty, decoder and termination path. Conflicts fail
 before advancement; `clear_forced_token()` removes a staged choice. A forced token
-record includes `forced: true`; ordinary records retain their previous JSON shape.
+record includes `forced: true`; ordinary records omit this marker.
 At nonzero temperature the decision consumes one ordinary RNG draw. Greedy sampling
 consumes none. Mirostat observes probability one and updates its adaptive state once.
 A pending choice is part of the shared continuation snapshot. Replacing a token
@@ -500,7 +504,7 @@ adaptive counters and penalty history. A stochastic run can become greedy and
 later resume its retained RNG stream. A run created without an RNG needs an explicit
 seed to become stochastic. Mirostat rejects zero temperature. `reseed` resets only
 randomness, never adaptive state or history. Strategy changes and penalty/filter
-overrides are not exposed in this initial policy. `SamplingChanged` records carry
+overrides are not exposed by this policy. `SamplingChanged` records carry
 the request, before/after facts and the first absolute prediction affected.
 Native preparation uses the existing completion/recovery owner and executes no
 model forward. Invalid requests leave the source unchanged; native failures fence
@@ -512,7 +516,7 @@ choices and explicitly reseeded children, preserve the parent, and verify no rep
 Native sampler tests separately verify exact key progression and adaptive updates.
 
 Built-in semantic parsers, stop/UTF-8 buffers, decoder history and the committed
-cursor now have field-audited logical storage estimates. Immutable tokenizer data
+cursor have field-audited logical storage estimates. Immutable tokenizer data
 is shared by `Arc`. Unknown custom parser/decoder costs fail explicitly. These
 estimates count live logical values and owned bytes, excluding allocator capacity
 and node overhead; `semantic_snapshot_bytes()` reports that component only. The
@@ -524,8 +528,7 @@ bound. `Matcher::last_step_stats` reports per-step work, while the lower-level
 [`RegexVec::num_bytes`](https://github.com/guidance-ai/llguidance/blob/v1.8.0/parser/src/earley/regexvec.rs)
 estimates regex tables only. Neither accounts for the full parser state, including
 history buffers and caches, so neither satisfies snapshot admission. The dependency
-uses the compatible `1.8.0` requirement without an exact pin; upgrading it has not
-removed this limitation. Declaring tools with `ToolChoice::None`
+uses the compatible `1.8.0` requirement without an exact pin. Declaring tools with `ToolChoice::None`
 selects the supported forbidden-tool owner on a profile with a tool surface;
 ordinary no-tools requests can still use an active semantic grammar and therefore
 must check support. Adding tools purely to change this capability also changes the
@@ -676,7 +679,7 @@ initialization is reserved from the selected state's complete bound, including
 absent fixed components. Removal retains the active handles for rollback and
 charges its known state/metadata work without reloading parameter sources.
 
-Partition capture now uses the same transactional observer callbacks as ordinary
+Partition capture uses the same transactional observer callbacks as ordinary
 and controlled forwards. Its work handles belong to the actual capture owner and
 monotone forward epoch; restored or foreign handles fail before source access.
 Common pre-forward coordination agrees selected layouts, identities and global
@@ -685,7 +688,7 @@ collectives. Receipt delivery stages global records after exact completion, and
 only the existing final commit publishes them. Restore does not reset producer,
 transport, status, host-assembly or encoded-evidence consumption.
 
-Native communication setup now retains a common instance identity agreed from
+Native communication setup retains a common instance identity agreed from
 the complete manifest/nonce transcript. Runtime capture can bind it to the first
 attempted forward epoch without doing native work during cold configuration.
 Failed admission and restore preserve that run identity; later records retain
@@ -693,7 +696,7 @@ their distinct actual forward epochs. A new capture owner uses the model's later
 epoch, and a new model setup has a fresh instance identity. These descriptive
 labels do not replace move-only submission authority or retained native owners.
 
-Loaded component capture now uses this adapter in ordinary and controlled
+Loaded component capture uses this adapter in ordinary and controlled
 generation. A capture checkpoint includes the retained setup seed; a re-admitted
 child receives a fresh owner and binds its own first forward epoch. Parent replay
 keeps the parent's run identity. Loaded preparation rejects a seed from another
@@ -719,8 +722,8 @@ Cold text-run preparation uses the retained preparation coordinator described
 above. Distributed applications must
 prepare compatible requests and advance every rank through the shared protocol.
 Discovery combines actual hook coverage, retained global ownership and native
-subgroup transport. Remaining specialized drivers and disconnected subgroup
-mechanisms retain explicit implementation gaps.
+subgroup transport. Unsupported specialized drivers and disconnected subgroup
+mechanisms return explicit capability failures.
 Partition capture admits fail-on-limit and skip-on-limit plans, including child
 re-admission. Before source work, every rank compares the successful selection set,
 skipped indices/reasons and all consumed accounting. Disagreement rejects the
@@ -751,35 +754,35 @@ editing on a partition-bound capture owner is rejected: it cannot bypass the
 prepaid operation authority or peer agreement. Missing invocation receipts fail
 the attempt instead of becoming successful zero-valued edits.
 
-Sparse partition capture now has ownership-aware receipt validation and bounded
+Sparse partition capture has ownership-aware receipt validation and bounded
 assembly in the existing exchange protocol. This does not add a second completion
 or inference owner: received host rows remain evidence pending the shared forward's
-completion and commit. The live session now prepays sparse producers, pins each
+completion and commit. The live session prepays sparse producers, pins each
 actual invocation's receive extent, accumulates exact chunks and requires explicit
 provider completion, including zero-row owners. Completed sparse fragments follow
 the same staged delivery and final commit as dense captures. Shared local provider
-callbacks now cover preparation, execution and failure before EP reverse exchange,
+callbacks cover preparation, execution and failure before EP reverse exchange,
 including idle owners, with nested residency adapters reporting one invocation.
 The prepared gated/ReLU² EP tests verify rollback and no reverse exchange after
-an agreed local failure. The shared partition observer now prepares routed source
+an agreed local failure. The shared partition observer prepares routed source
 bounds and uses its prepaid source/final votes through these callbacks, including
 original/effective records, idle owners and nonexporting replicas. Abort and failed
-work preserve cumulative credits and prevent publication. Retained architecture placement now feeds these callbacks through actual prepared
+work preserve cumulative credits and prevent publication. Retained architecture placement feeds these callbacks through actual prepared
 gated and ReLU² executors. The neutral tests cover prefill and two cached decodes,
 idle received owners, all three residencies, TP/EP/PP ownership and source/collector
-failure rollback. Loaded MLX now admits sparse capture through this same observer
+failure rollback. Loaded MLX admits sparse capture through this same observer
 when its exact native invocation group and provider hooks are available. The
 packed-Qwen Ring matrix verifies full/strided original and effective values against
 an ordinary native reference through prefill, two cached decodes, snapshot replay,
 sibling isolation and skipped child capture. Restore preserves cumulative credits
-and fresh branch identity. The shared operation authority now also carries sparse
+and fresh branch identity. The shared operation authority also carries sparse
 edits through the provider scope. Operation-only plans activate these callbacks
 without requiring sparse captures. Re-admitted future child masks start from the
 same prepared boundary, receive fresh identity, preserve parent and sibling state,
 and consume cumulative credits on every replay. Partial chunks or peer failure
-prevent a committed edit outcome. Explicit tensor/expert stage groups now use
+prevent a committed edit outcome. Explicit tensor/expert stage groups use
 bounded native neighbor agreement; inactive pipeline stages do not enter those
-observation callbacks. Disconnected native groups still need coordinated relays.
+observation callbacks. Disconnected native groups lack the coordinated relays required for this protocol.
 
 The released sparse score consumer also runs effective head/gain queries and
 all-layer signed projections before controlled trials. Its combined LFM2-8B-A1B
@@ -791,7 +794,7 @@ start at equivalent prepared boundaries. See the released sparse score results i
 [component-analysis.md](component-validation.md#released-sparse-selected-token-and-token-difference-reconstruction).
 
 
-Mixed dense/routed V3 pipeline component capture now follows the same controlled
+Mixed dense/routed V3 pipeline component capture follows the same controlled
 partition driver. The effective input embedding travels in the typed boundary;
 normalized Q/KV latents retain their invocation ownership, and effective current
 KV values enter the compressed cache. Native two-process Ring tests cover
@@ -799,9 +802,9 @@ resident, host-layerwise and disk-streamed captures/masks with snapshot replay
 and sibling isolation. All-dense V3 additionally passes native TP, PP and combined
 TP/PP in all three residencies, including atomic multi-weight overlays, rejected
 publication rollback and restoration, for F32 SafeTensors/GGUF and SafeTensors
-load-time affine 4-bit/group-32. Corrected token-indexed query rotation is
-shared by controlled and ordinary execution; MLA equation revision 2 rejects older
-V3 cache fingerprints. Mixed V3 TP/PP/EP block instrumentation passes native F32
+load-time affine 4-bit/group-32. Token-indexed query rotation is
+shared by controlled and ordinary execution; MLA equation revision 2 requires a
+matching V3 cache fingerprint. Mixed V3 TP/PP/EP block instrumentation passes native F32
 SafeTensors/GGUF and load-time affine 4-bit/group-32 acceptance in all three
 ordinary residencies. Prediction internals use the shared scoped collector and
 have separate encoded placement matrices; see the
@@ -818,10 +821,10 @@ coverage includes an idle pipeline rank, generated sources, failure/abort, and r
 without refunds. Mixed V3 TP execution hooks pass native F32 SafeTensors/GGUF and
 load-time affine acceptance, including additive-only summary/histogram capture.
 
-V3 prediction component primitives now share fusion/head execution with ordinary
+V3 prediction component primitives share fusion/head execution with ordinary
 inference. Their `prediction.readout.residual` intervention occurs before head
 normalization and affects the returned prediction hidden state and draft logits.
-The older `mtp.{depth}.output` remains after the head and retains that timing.
+`mtp.{depth}.output` occurs after the head.
 Neutral ordinary/provider/TP traversal tests verify selected-depth cache advancement
 and fresh sibling replay. Public phase/frontier admission and delivery are verified
 through `prepare_speculative_activations`, including the native distributed
@@ -833,7 +836,7 @@ TP/PP/EP combinations. Queries, coordinated edits, snapshots, siblings and repla
 use the same selected bank identities. Idle EP owners remain valid participants;
 every routed PP stage must demonstrate actual cache activity.
 
-V3 component discovery now separates prediction depths and their score heads from
+V3 component discovery separates prediction depths and their score heads from
 primary target attribution. Typed prediction operations can accept internal
 observers during extension prefill, proposal and retained-input replay. Their
 caller still owns prediction-lane restoration after failed work; restoring the
@@ -844,7 +847,7 @@ reflects the actual selected hooks; target-only support cannot authorize a separ
 prediction scope.
 
 
-Internal embedded observers now receive explicit target-prefill, prediction-prefill,
+Internal embedded observers receive explicit target-prefill, prediction-prefill,
 proposal-depth, verification and replay phases from the shared strategy. Successful
 invocation completion stages tentative evidence; it does not make a proposal or
 verification row committed output. Physical sequence width is supplied separately
@@ -855,7 +858,7 @@ owner. Public controlled capture admission and delivery compose these hooks with
 cumulative reservations and exact frontier attribution.
 
 
-The capture owner now supports explicitly admitted physical invocation geometry
+The capture owner supports explicitly admitted physical invocation geometry
 independently of prediction coordinates. Snapshots retain immutable bounds and
 schedules; restore clears delivered geometry and requires the next invocation to
 supply its own exact shape. It preserves all spent capture/intervention resources.
@@ -863,14 +866,14 @@ Child re-admission carries bounds and inherited usage into the fresh session. Th
 contracts supply physical geometry to the shared controlled driver, which adds
 speculative request/frontier attribution and public internal-capture delivery.
 
-Speculative internal capture now has scheduler-owned request/prefix origins and
+Speculative internal capture has scheduler-owned request/prefix origins and
 independent physical invocation geometry. Controlled step delivery has a separate
 `activations` array, charged to ordinary trace transport, while `captures` retains
 its sampler-row meaning. Invocation IDs and cumulative capture allowances are not
 rewound by collector restore. Origin scopes are cleared after each operation,
 including failure and unwind; optimistic prefix digests are never substituted for
-a committed frontier. Public admission/installation now uses the separate loaded activation authority.
-The neutral partition observer now accepts the same independently admitted
+a committed frontier. Public admission/installation uses the separate loaded activation authority.
+The neutral partition observer accepts the same independently admitted
 geometry and scope masks. Its receipts bind exact invocation axes and monotone
 forward epochs; failed final commit publishes no payload, and replay does not
 refund geometry, source, edit, receipt or assembly costs. Live multi-rank tests
@@ -904,7 +907,7 @@ branch exchange prepare authority first and commit it only after all native copi
 succeed. Removing edits does not remove the collector or reset its budget. Native
 CPU/Metal acceptance covers adding and removing masks in a child, replaying that
 child, stale-authority rejection and preservation of the parent and another sibling.
-V4 sequential and DSpark now use complete pooling-state copies through the same
+V4 sequential and DSpark use complete pooling-state copies through the same
 driver. Native CPU/Metal tests compare exact sampler captures and seven generated
 tokens after a 255-token prefix, repeated restore and interleaved siblings across
 resident/host/disk weights. Separate V4 component and distributed snapshot matrices
@@ -915,7 +918,7 @@ Continuous observed speculative generation is implemented by advancing this same
 controlled session. The callback receives each `ControlledSpeculativeStep` and may
 cancel with `ControlFlow::Break`; no second inference or sampling engine is used.
 
-Observed prediction prefill, proposal and replay now share the ordinary session's
+Observed prediction prefill, proposal and replay share the ordinary session's
 preparation, checkpoint, completion and commit protocol. Multiple prefill depths
 belong to one invocation. Preparation failures perform no prediction work;
 execution, native completion or delivery failures discard the invocation and
@@ -930,7 +933,7 @@ distributed collectors. Actual family and format coverage is recorded in the
 component-analysis guide.
 
 
-Loaded V3 internal activation plans now use the retained partition collector through
+Loaded V3 internal activation plans use the retained partition collector through
 the same speculative controller. Independent prediction scopes carry their own TP
 columns and non-tensor replicas; target input/output ownership remains unchanged.
 All 21 F32 CPU Ring parallel/residency cases reproduce local phase records and causal
@@ -938,14 +941,14 @@ channel/routed-unit edits over prefill and cached generation. Prepared resident
 providers finish their source/failure protocol before model reductions. Shared
 embedding storage is present on every prediction replica, preventing different
 pipeline ranks from choosing different speculative decisions. This does not change
-snapshot budget semantics. All 21 F32 cases now also verify coordinated target and
+snapshot budget semantics. All 21 F32 cases also verify coordinated target and
 prediction parameter edits, late peer rollback, active-overlay snapshots, repeated
 restore, isolated sibling exchange and restoration after removal. Snapshot copying
 and capture accounting remain cumulative. Additional encoding and family acceptance is recorded in
-`doc/component-analysis.md` and its implementation checklist.
+`doc/component-analysis.md`.
 
 
-Internal speculative activation plans now use schema 2. The admitted scope binds
+Internal speculative activation plans use schema 2. The admitted scope binds
 phase applicability: `PredictionContext` runs only during prediction prefill and
 replay, `FusedProposal` only during fused proposal execution, and sequential
 `Prediction { depth }` only during its own proposal depth or prediction
@@ -1043,7 +1046,8 @@ used by ordinary or controlled startup. `forecast_observed_generation` accepts
 `PreparedObservedGeneration`, verifies its session identity and uses its resolved
 settings and capture/intervention contract. Trace-only preparations retain ordinary
 chunking and final-row projection when the executor supports them. Instrumented
-prefill uses a full pass and all-row logits. Admitted per-step/cumulative capture
+prefill forecasts conservatively use a full pass and all-row logits, including for
+executables that process observed prompts in chunks. Admitted per-step/cumulative capture
 limits bound logical transform storage, intervention execution/evidence, and
 retained host records; immutable intervention payloads are included separately.
 The host envelope allows one record history and one compact JSON trace. MLX uses
@@ -1178,3 +1182,138 @@ are a scoped subset of the forecast's existing parameter/workspace accounting;
 a finite ceiling does not bound temporary casts. If a backend reports outstanding
 reservations without publication/backing attribution, the phase upper bound stays
 unknown even at a zero-token horizon; forecasting does not settle those resources.
+
+## Flash-Next
+
+Qwen3.8-Flash-Next (`qwen4_exp`) uses the shared ordinary and controlled generation
+and speculative drivers. SafeTensors and GGUF targets support resident,
+host-layerwise and disk-streamed weights. Architecture defaults select a 512-token
+target invocation limit and retain the declared context capacity; explicit load
+policies override those defaults. Cumulative history capacity is independent of
+per-invocation chunk size and includes subsequent decode tokens.
+
+### State and request ownership
+
+Flash-Next's typed state combines ordinary K/V, named index-summary and position
+streams, and fixed recurrent, convolution, lexical-history, partial-block and
+position components. Snapshots, restore, fork, reset and paged prompt-cache persistence
+use the shared lifecycle mechanisms. Integer n-gram history remains exact. QSA partial
+blocks retain positions, lengths, raw keys and first-token text/media rotary provenance.
+The bound state identity includes source geometry, integer hash controls and selected
+parameter transforms; same-shaped artifacts with different controls cannot reuse a
+prompt cache. Restoring state never refunds observation, transport, copying or source
+work.
+
+Image/video requests retain explicit original token IDs through embedding replacement
+and pipeline transport. Embedding-only inputs without those IDs fail at admission.
+Media rotary positions and the signed position delta survive prefill chunks and cached
+decode; the delta resides in the target's fixed state. The lexical reset token is
+independent of facade-owned generation termination. Encoder and target units retain
+separate layer-sized residency owners.
+
+### Chunked media prefill and capture
+
+Composite requests use an architecture-owned request type through the shared
+`PrefillCursor`. `start_prefill` validates request and chunk geometry;
+`advance_prefill` performs one ordinary transaction; `finish_prefill` repeats that
+same operation. The complete single-sequence request fits within the selected history
+capacity, while assembly and lexical lookup operate on the current chunk. Oversized
+requests fail before native request construction or encoder execution.
+
+The pending native prompt retains the cursor. A controlled `step` can finish one
+nonfinal chunk and emit `PrefillProgress`. Cursor snapshots share immutable request
+proofs and completed encoder output while copying mutable model state. Restoring a
+completed prefix does not rerun its encoder. Complete-input prompt-cache identity
+publishes only after the final chunk commits; partial progress clears stale complete
+identity. Foreign cursors reject, as do stale cursors whose prefix differs from the
+committed state.
+
+Output and retained encoder projection complete before cursor publication. A failed
+chunk rolls back through the shared driver; completed prefixes stay committed.
+Completion and restoration errors propagate to the caller, and an unchanged cursor
+alone does not establish successful rollback. Partitioned advancement agrees request
+preparation, extent and each step's position before execution. Local preparation
+failures rendezvous with peers through the same agreement protocol.
+
+`prepare_observed_input` accepts a prepared backend prompt and its explicit original
+decoder IDs, including media placeholders. Callers preserve that correspondence. It
+feeds ordinary observed generation and controlled text/chat entry points. Capture
+records retain an absolute `prefill_span`; sequence slices intersect and rebase for
+each physical chunk. Final prediction scores are captured only on the final chunk.
+Restore preserves cumulative capture and copy usage. Low-level token iterators that
+install capture directly drain each `advance_prefill` result before requesting the
+next token.
+
+Nonempty intervention plans receive a typed rejection for partial prefill spans:
+mask and replacement payloads require span projection that this path does not supply.
+Direct low-level composite forwards with a full-request observer reject chunked
+capture; shared generation supplies fresh collectors per cursor advancement.
+
+### Embedded prediction
+
+Default loading runs the target even when MTP weights are present. Explicit embedded
+prediction installs separately selected prediction state and the shared speculative
+executor. Target residual capture preserves every stream before collapse, and the
+target owns shared embedding/output parameters. A GGUF target accepts a matching
+SafeTensors prediction companion through `ExecutionPlan::with_prediction_source(path)`;
+full and prediction-only companions retain source admission and provenance separately
+from the target.
+
+Text and image/video prediction prefill use causal chunks at the selected invocation
+limit. The final residual of a chunk pairs with the first original token of the next
+chunk before seeding the remaining shifted pairs. Whole-request token IDs, rotary
+positions and encoded media remain available to the request cursor. The complete
+prompt is one speculative prefill advancement; failure restores both target and
+prediction state to the initial checkpoint. Ordinary facade `PrefillChunkPolicy`
+does not control this operation, and speculative control has no between-chunk pause.
+Activation scopes identify actual physical target/prediction rows while scheduler
+provenance identifies the complete speculative operation.
+
+### Distributed execution and tools
+
+TP, PP, EP and combined execution use architecture-owned placement and shared
+collectives. Recurrent, K/V, lexical and QSA state follows its declared tensor/stage
+placement. Pipeline boundaries retain complete residual streams, original IDs,
+visibility and rotary products. Table acquisition belongs to one declared tensor
+owner and compact lookup results are shared with peers; failure agreement includes
+expert participants and idle stages. Prediction retains separate local state and
+replicates shared vocabulary parameters across its declared groups.
+
+Distributed parameter and component coordinates use exact bound-rank placement.
+Queries requiring unavailable cross-rank coordinate projection return a typed error;
+local parameter queries and ordinary distributed inference remain supported. Capture
+and intervention availability comes from loaded discovery. The
+[family validation report](qwen4-exp-validation.md) records supported native and
+portable coverage, tolerances and validation limits.
+
+The pinned official chat template supports thinking controls, tagged tool arguments,
+reasoning history and tool-result replay through the shared parser and termination
+policy. Active/automatic tool grammar snapshots return the shared typed unsupported
+capability because complete matcher storage estimates are unavailable. Rejection
+preserves committed progress and output attribution and leaves generation usable.
+
+### Media policy and resource observations
+
+`MediaExecutionPolicy::new(processor)` declares input readiness without mandatory
+encoder/request/native-allocation budgets. Optional coarse host-processing limits
+reject oversized requests before expensive work. Token, history, chunk and geometry
+limits, exact original IDs and completion-safe ownership remain required. A GGUF
+projector can use architecture-default media intent. Cold memory ranges, storage
+diagnostics and dominant weight/table/cache controls describe selected execution;
+completely bounded/accounted inference is not a goal.
+
+Prepared-input stream copies retain source, destination and host staging through
+completion or terminal recovery. The staging ceiling applies per copy operation;
+it neither refunds cumulative control budgets nor caps recovery retained by other
+operations. Cache identity survives transfer. Storage surveys expose known backing
+identities and allocator capacities without evaluating lazy tensors or retaining
+native roots. Media surveys include request proofs, prepared ingress/rotary products
+and a supplied encoder continuation. A survey is metadata, not a session checkpoint
+or proof of completion.
+
+Host parameter-cache and transfer observations preserve backing identity independently
+of cache eviction. Read-only reporting performs no housekeeping, polling, evaluation
+or resource acquisition. Detached native submission reports describe at most 64 nodes
+and 256 allocation records on the calling thread; truncation, borrowed queues, active
+reaping and uncovered owners remain explicit. Empty or partial observations do not
+authorize reclamation or budget refunds. Native completion ownership governs release.

@@ -10,13 +10,7 @@ pub const KIMI_LINEAR: C = C::SIGMOID
     .union(C::GATED_DELTA_SCAN);
 
 /// Qwen3-Next and Qwen3.5 hybrid execution requirements.
-pub const QWEN_HYBRID: C = C::SIGMOID
-    .union(C::SOFTPLUS)
-    .union(C::EXP)
-    .union(C::L2_NORMALIZE)
-    .union(C::SILU_GATED_GROUP_RMS_NORM)
-    .union(C::GATED_DELTA_SCAN)
-    .union(C::BROADCAST_TO);
+pub const QWEN_HYBRID: C = crate::gated_delta::REQUIRED_OPERATORS;
 
 /// Nemotron-H Mamba execution requirements.
 pub const NEMOTRON_H: C = C::GATED_GROUP_RMS_NORM

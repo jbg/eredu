@@ -30,6 +30,16 @@ fn format_keys(keys: &[String]) -> String {
 /// Error type used by MLX model loading and execution.
 #[non_exhaustive]
 pub enum Error {
+    /// Explicit prepared-input transfer exceeded portable logical limits.
+    #[error(transparent)]
+    InputTransfer(#[from] eredu_runtime::input_transfer::InputTransferError),
+    /// Portable row lookup admission or specification failure.
+    #[error(transparent)]
+    RowLookup(#[from] eredu_runtime::RowLookupError),
+    /// Cold row mechanism selection failed before materialization.
+    #[error(transparent)]
+    RowLookupSelection(#[from] eredu_runtime::RowLookupSelectionError),
+
     /// Cold text-run agreement or its selected transport failed.
     #[error("text run preparation failed: {0}")]
     RunPreparation(#[from] eredu_runtime::run_preparation::TextPreparationAgreementError),
@@ -183,6 +193,13 @@ pub enum Error {
     /// Media processor configuration or input error.
     #[error("media processor error: {0}")]
     Processor(String),
+
+    /// Portable host-product admission failed before native preparation.
+    #[error(transparent)]
+    ProcessorAdmission(eredu_core::CapabilityError),
+    /// Portable preprocessing buffer budget rejected the request.
+    #[error(transparent)]
+    ProcessorResources(eredu_runtime::processor_resources::ProcessorResourceError),
 
     /// MLX speculative execution failed.
     #[error("MLX speculative generation failed: {0}")]

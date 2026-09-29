@@ -244,6 +244,7 @@ mod tests {
             layers: vec![TextLayerTopology {
                 input_projections: vec![p.clone()],
                 mixer: TokenMixerTopology::GatedConvolution {
+                    dilation: 1,
                     channels: 128,
                     kernel: 3,
                     projections: vec![],

@@ -119,8 +119,8 @@ fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
             );
         }
     }
-    manager.set_tail_state(0, 40, 5).unwrap();
-    manager.set_tail_state(1, 56, 7).unwrap();
+    manager.set_tail_state(0, CacheRepresentation::KeyValue, 40, 5).unwrap();
+    manager.set_tail_state(1, CacheRepresentation::KeyValue, 56, 7).unwrap();
     let generation_before = manager.lock().unwrap().generation;
 
     manager
@@ -132,11 +132,11 @@ fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
     assert!(state.blocks.contains_key(&block_id(0)));
     assert!(!state.blocks.contains_key(&block_id(1)));
     assert_eq!(
-        state.lifecycle.tail(0),
+        state.lifecycle.tail(eredu_core::cache::CacheStreamId::new(0, CacheRepresentation::KeyValue)),
         Some(MutableCacheTail { bytes: 40, end: 5 })
     );
     assert_eq!(
-        state.lifecycle.tail(1),
+        state.lifecycle.tail(eredu_core::cache::CacheStreamId::new(1, CacheRepresentation::KeyValue)),
         Some(MutableCacheTail { bytes: 0, end: 0 })
     );
 }
@@ -152,8 +152,8 @@ fn process_pool_enforces_aggregate_device_budget_and_releases_membership() {
     let second = CacheResidencyManager::new(options).unwrap();
     let first_layer_handle = first.clone();
 
-    first.set_tail_state(0, 12, 1).unwrap();
-    let error = second.set_tail_state(0, 12, 1).unwrap_err();
+    first.set_tail_state(0, CacheRepresentation::KeyValue, 12, 1).unwrap();
+    let error = second.set_tail_state(0, CacheRepresentation::KeyValue, 12, 1).unwrap_err();
     assert!(matches!(
         error,
         CacheResidencyError::Pool(CachePoolError::BudgetExceeded {
@@ -285,7 +285,7 @@ fn per_layer_residency_report_is_bounded_and_losslessly_aggregated() {
                 0,
             );
             state.lifecycle.set_tail(
-                global_layer,
+                CacheStreamId::new(global_layer, CacheRepresentation::KeyValue),
                 MutableCacheTail {
                     bytes: 2,
                     end: global_layer as i64 + 1,

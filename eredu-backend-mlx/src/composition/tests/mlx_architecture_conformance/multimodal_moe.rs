@@ -24,7 +24,7 @@ fn neutral_qwen3_vl_forward_executes_on_mlx() {
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
-        MlxHybridState::device(eredu_architectures::qwen::vl::state_layout(&args).unwrap())
+        MlxHybridState::device(eredu_architectures::qwen::vl::state_layout(&args).unwrap(), &[])
             .unwrap();
     let text_tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
     let image_tokens = MlxTensor::from_array(Array::from_slice(&[30_u32], &[1, 1]));

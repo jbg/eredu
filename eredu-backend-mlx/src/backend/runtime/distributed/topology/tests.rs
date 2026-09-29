@@ -528,10 +528,16 @@ fn mlx_capabilities_are_operation_specific_and_exclude_encoded_payloads() {
             TensorDtype::I32,
         ))
         .unwrap();
-    assert!(capabilities
+    capabilities
         .validate_manifest(&group_manifest(
             CommunicationOperation::AllReduceSum,
             TensorDtype::I32,
+        ))
+        .unwrap();
+    assert!(capabilities
+        .validate_manifest(&group_manifest(
+            CommunicationOperation::AllReduceSum,
+            TensorDtype::U32,
         ))
         .is_err());
     assert!(capabilities

@@ -93,10 +93,10 @@ pub struct SelectedParameterResources {
 
 /// Peak simultaneously live recipe values, including the produced source tensor.
 /// Native conversion scratch is a separate backend mechanism fact.
-pub fn placed_recipe_peak_bytes(
+pub fn placed_recipe_peak_bytes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
     target: &str,
-    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    source: &C,
     layout: Option<&crate::LocalModelLayout>,
     member_selected: bool,
 ) -> Result<u64, String> {
@@ -107,10 +107,10 @@ pub fn placed_recipe_peak_bytes(
 
 /// Projects an exact selected recipe through the ordinary or member-local
 /// physical placement, using the same bounded source rewrite as materialization.
-pub fn placed_source_recipe(
+pub fn placed_source_recipe<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
     recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
     target: &str,
-    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    source: &C,
     layout: Option<&crate::LocalModelLayout>,
     member_selected: bool,
 ) -> Result<eredu_checkpoint::recipe::DerivedWeightRecipe, String> {

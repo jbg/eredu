@@ -1,8 +1,8 @@
-# Component analysis implementation checklist
+# Component analysis coverage
 
-The LM Inspector infrastructure goal is complete for the applicable autoregressive
-text workflows, including prepared media and embedded prediction. Each outcome
-below has implementation, public integration, behavioral coverage and documentation.
+LM Inspector supports applicable autoregressive text workflows, including prepared
+media and embedded prediction. The coverage below includes public integration,
+behavioral tests and documentation.
 The integration guide records exact loaded capabilities and protocol limitations.
 
 - [x] Reassess Eredu and Inspector integration; read paper §§2–4, §6 and Appendix D.
@@ -53,16 +53,15 @@ The integration guide records exact loaded capabilities and protocol limitations
   fused pure FP8: **84 placements each**, including F32/UE8M0 scale companions,
   actual prediction paging, source decoding, signed arithmetic checks and edits.
   Separate K2 native cases cover F16/BF16 scales and forced eviction.
-- Final Muse published-geometry packed projector: **51 native placements**
+- Muse published-geometry packed projector: **51 native placements**
   (30 ordinary in 1957.01s; 21 independent-bank in 1913.65s), plus **102 neutral
   placements**, including mid-vision cuts and deferred decoder ingress.
-- Refreshed public SmolLM2-135M, LFM2-350M and controlled LFM2-8B-A1B consumers
+- Public SmolLM2-135M, LFM2-350M and controlled LFM2-8B-A1B consumers
   pass independent pinned-reference comparisons, reconstruction, causal masks,
   effective queries, coordinated edits and restoration. Source and derivative
   hashes match provenance. The sparse comparison checks **10,944,290 values**.
 - The [validation record](component-validation.md#current-acceptance-summary)
   preserves exact commands, revisions, geometries, tolerances and detailed results.
-  The guide and checklist's local links and documentation whitespace were checked.
 
 ## Scope and limitations
 

@@ -57,13 +57,13 @@ mod telemetry;
 use telemetry::ParameterBankStatistics;
 pub use telemetry::{
     BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport,
-    ParameterBanksResidencyReport,
+    ParameterBanksResidencyReport, RowLookupPoolReport,
 };
 
 mod acquisition;
 mod parameters;
 pub use acquisition::{
-    AcquiredParameterGroups, AddressableParameterBank, SharedAddressableParameterBank,
+    AcquiredParameters, AddressableParameterBank, SharedAddressableParameterBank,
 };
 pub(crate) use parameters::publish_bank_parameter_replacements;
 
@@ -244,3 +244,8 @@ pub enum AddressableParameterBankError {
 #[cfg(test)]
 #[path = "parameter_bank/tests.rs"]
 mod tests;
+
+mod rows;
+pub use rows::{MlxRowBank, MlxRowLookupSupport, MlxRowLookups};
+#[cfg(test)]
+mod rows_tests;

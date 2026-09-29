@@ -340,7 +340,7 @@ each materialized unit; parameter-work reservations cover retained originals,
 replacements and operation outputs. Completed overlay copies are applied again on
 every affected unit reload. Dense/affine queries and overlays passed on host-layerwise
 and disk-streamed execution, including tied embeddings and repeated invocations.
-Parallel queries and projections now use the same public APIs with collective
+Parallel queries and projections use the same public APIs with collective
 participation by all ranks. Distributed overlays, cached prediction rollback and
 active-overlay controlled capture pass the 24 CPU Ring configurations recorded in
 [parallel validation](component-validation.md#effective-parameter-coordinates-for-parallel-execution).
@@ -362,9 +362,9 @@ A mask on the normalized operator input occurs before its own state update.
 
 ## Execution coverage
 
-The [implementation checklist](component-analysis-checklist.md) records the
+The [coverage checklist](component-analysis-checklist.md) records the
 completed requirement audit. [Validation evidence](component-validation.md) preserves exact commands,
-fixture revisions, numerical tolerances and the history of individual matrices.
+fixture revisions, numerical tolerances and matrix coverage.
 A declaration does not establish support for a loaded execution; use its capture,
 intervention and effective-parameter capability reports before admission.
 
@@ -393,14 +393,14 @@ and text construction returns `ReplicatedTextIneligibility::Realtime`. A realtim
 component-analysis workflow requires the separate frame protocol.
 
 CPU Ring results establish native collective behavior on the tested local CPU
-configuration. Separate distributed GPU suites now cover shared, recurrent,
+configuration. Separate distributed GPU suites cover shared, recurrent,
 quantized, prediction and media paths with local Ring transport; all ranks use
 one physical Metal device. Multiple physical GPUs and hosts remain hardware
 validation gaps. Exact device-specific cases are recorded in the evidence.
 
 ## Numerical conventions for packed parameters
 
-FP8 validation now includes native CPU models with inexact activations, several
+FP8 validation includes native CPU models with inexact activations, several
 feature blocks and a partial final-head input block. Both CPU and GPU block-FP8 projections dynamically quantize their input activations;
 the CPU fallback also dequantizes the weights. Effective weight columns alone
 therefore do not establish an exact additive decomposition using pre-quantization
@@ -457,7 +457,7 @@ check before an experiment.
 helpers perform the research calculations in the example; the library supplies
 portable observations, admitted operations and lifecycle guarantees. After
 creating the pinned reference fixture with the commands in
-[released dense validation](component-validation.md#validation-in-progress), run:
+[released dense validation](component-validation.md#released-dense-validation), run:
 
 ```sh
 cargo run -p eredu --no-default-features --features mlx \

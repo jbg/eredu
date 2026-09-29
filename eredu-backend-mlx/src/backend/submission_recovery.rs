@@ -5,6 +5,8 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use eredu_core::resources::ResourceDescriptionError;
+use eredu_runtime::resource_lifetimes::ResourceLifetimeDescription;
 use safemlx::{error::Exception, SubmissionScope};
 
 #[derive(Clone, Copy, Debug)]
@@ -36,11 +38,27 @@ impl Probe for SubmissionScope {
 
 pub(crate) trait Retention: 'static {
     fn observe(&self, status: Status);
+
+    /// Pure host metadata only: never poll, submit, acquire native locks or
+    /// mutate the pending list. None means missing facts or insufficient output
+    /// allowance; it must not be interpreted as zero retained resources.
+    fn describe_resources(
+        &self,
+        _maximum_allocations: usize,
+    ) -> Result<Option<ResourceLifetimeDescription>, ResourceDescriptionError> {
+        Ok(None)
+    }
 }
 
 impl<T: Retention> Retention for Rc<T> {
     fn observe(&self, status: Status) {
         (**self).observe(status);
+    }
+    fn describe_resources(
+        &self,
+        maximum: usize,
+    ) -> Result<Option<ResourceLifetimeDescription>, ResourceDescriptionError> {
+        (**self).describe_resources(maximum)
     }
 }
 
@@ -58,8 +76,8 @@ pub(crate) fn detached<T>(
 }
 
 /// Preserves caller-owned text/media errors alongside detached native recovery.
-pub(crate) fn detached_preparation<T, E>(
-    roots: Vec<safemlx::Array>,
+pub(crate) fn detached_preparation<T, E, R: Retention>(
+    roots: R,
     operation: impl FnOnce() -> Result<T, E>,
     map_backend: impl FnOnce(crate::backend::error::Error) -> E,
 ) -> Result<T, E> {
@@ -96,6 +114,11 @@ trait Pending {
     fn observe_pending(&self);
     fn take_next(&mut self) -> Option<Box<dyn Pending>>;
     fn set_next(&mut self, next: Option<Box<dyn Pending>>);
+    fn next(&self) -> Option<&dyn Pending>;
+    fn describe_resources(
+        &self,
+        maximum: usize,
+    ) -> Result<Option<ResourceLifetimeDescription>, ResourceDescriptionError>;
 }
 
 struct Node<T, P> {
@@ -105,6 +128,15 @@ struct Node<T, P> {
 }
 
 impl<T: Retention, P: Probe> Pending for Node<T, P> {
+    fn next(&self) -> Option<&dyn Pending> {
+        self.next.as_deref()
+    }
+    fn describe_resources(
+        &self,
+        maximum: usize,
+    ) -> Result<Option<ResourceLifetimeDescription>, ResourceDescriptionError> {
+        self.retention.describe_resources(maximum)
+    }
     fn progress(&self) -> bool {
         let status = self.probe.progress();
         self.retention.observe(status);
@@ -160,7 +192,11 @@ impl Drop for Orphans {
 
 thread_local! {
     static ORPHANS: RefCell<Orphans> = RefCell::new(Orphans::default());
+    static REAPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+mod resources;
+pub(crate) use resources::describe_resources;
 
 fn quarantine(node: Box<dyn Pending>) {
     let mut pending = Some(node);
@@ -178,6 +214,17 @@ fn quarantine(node: Box<dyn Pending>) {
 
 /// Advances old records without waiting or holding a reentrant list borrow.
 pub(crate) fn reap() {
+    // A snapshot cannot treat a temporarily extracted retirement list as empty.
+    let Ok(previous) = REAPING.try_with(|flag| flag.replace(true)) else {
+        return;
+    };
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let _ = REAPING.try_with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(previous);
     let mut pending = ORPHANS
         .try_with(|orphans| {
             orphans

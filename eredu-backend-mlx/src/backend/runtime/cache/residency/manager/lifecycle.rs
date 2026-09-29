@@ -136,8 +136,13 @@ impl CacheResidencyManager {
                 protected,
             )?;
         }
-        for (layer, tail) in tails {
-            fork.set_tail_state(layer, tail.bytes, tail.end)?;
+        for (stream, tail) in tails {
+            fork.set_tail_state(
+                stream.global_layer,
+                stream.representation,
+                tail.bytes,
+                tail.end,
+            )?;
         }
         Ok(fork)
     }
@@ -180,13 +185,15 @@ impl CacheResidencyManager {
     pub fn set_tail_state(
         &self,
         layer: usize,
+        representation: CacheRepresentation,
         bytes: u64,
         end: i64,
     ) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
+        let stream = CacheStreamId::new(layer, representation);
         let previous = state
             .lifecycle
-            .set_tail(layer, MutableCacheTail { bytes, end });
+            .set_tail(stream, MutableCacheTail { bytes, end });
         let allocated = previous.is_none_or(|tail| tail.bytes == 0) && bytes > 0;
         if allocated {
             state.telemetry.report.tail_allocations += 1;
@@ -194,7 +201,7 @@ impl CacheResidencyManager {
         drop(state);
         if let Err(error) = self.rebalance(None, false) {
             let mut state = self.lock()?;
-            state.lifecycle.restore_tail(layer, previous);
+            state.lifecycle.restore_tail(stream, previous);
             if allocated {
                 state.telemetry.report.tail_allocations =
                     state.telemetry.report.tail_allocations.saturating_sub(1);
@@ -262,6 +269,75 @@ impl CacheResidencyManager {
         Ok(id)
     }
 
+    /// Checks retained named records without promoting payloads or changing counters.
+    /// A mutable tail must be restored by its owning state, never reconstructed from pages.
+    pub(crate) fn validate_append_stream_layout(
+        &self,
+        layer: usize,
+        lane: u32,
+        rank: Option<CacheRankIdentity>,
+        spec: &eredu_runtime::AppendStreamSpec,
+        limits: eredu_runtime::AppendStreamLimits,
+    ) -> Result<(), CacheResidencyError> {
+        use eredu_nn::TensorElementType as T;
+        let dtype = dtype_name(match spec.element {
+            T::Bool => Dtype::Bool,
+            T::F16 => Dtype::Float16,
+            T::Bf16 => Dtype::Bfloat16,
+            T::F32 => Dtype::Float32,
+            T::F64 => Dtype::Float64,
+            T::I8 => Dtype::Int8,
+            T::I16 => Dtype::Int16,
+            T::I32 => Dtype::Int32,
+            T::I64 => Dtype::Int64,
+            T::U8 => Dtype::Uint8,
+            T::U16 => Dtype::Uint16,
+            T::U32 => Dtype::Uint32,
+            T::U64 => Dtype::Uint64,
+            T::Complex64 => Dtype::Complex64,
+        });
+        let representation = CacheRepresentation::AppendStream {
+            slot: spec.slot,
+            lane,
+        };
+        let state = self.lock()?;
+        if state
+            .lifecycle
+            .tail(CacheStreamId::new(layer, representation))
+            .is_some_and(|tail| tail.bytes != 0)
+        {
+            return Err(CacheResidencyError::ArrayMismatch(
+                "cannot reopen an append stream with an unsealed mutable tail".into(),
+            ));
+        }
+        let mut frontier = 0;
+        for (id, record) in state
+            .blocks
+            .iter()
+            .filter(|(id, _)| id.global_layer == layer && id.representation == representation)
+        {
+            let count = id.end - id.start;
+            if id.start != frontier
+                || count <= 0
+                || count > limits.page_entries as i64
+                || id.end > limits.entries as i64
+                || id.rank != rank
+                || record.shapes
+                    != [
+                        vec![1, 1, count as i32, spec.width],
+                        vec![1, 1, count as i32, 0],
+                    ]
+                || record.dtypes.iter().any(|actual| *actual != dtype)
+            {
+                return Err(CacheResidencyError::ArrayMismatch(
+                    "stored append stream differs from its declared geometry or range".into(),
+                ));
+            }
+            frontier = id.end;
+        }
+        Ok(())
+    }
+
     /// Returns ordered block identities for a layer and visible token range.
     pub fn layer_block_ids(
         &self,
@@ -280,6 +356,29 @@ impl CacheResidencyManager {
                     && id.representation == representation
                     && id.start < visible_end
                     && (id.end > visible_start || id.start < prefix_tokens)
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Catalogs only blocks intersecting sorted selected positions. The returned
+    /// metadata is bounded by the selection, including widely separated rows.
+    pub(crate) fn selected_layer_block_ids(
+        &self,
+        layer: usize,
+        representation: CacheRepresentation,
+        positions: &[i32],
+    ) -> Result<Vec<CacheBlockId>, CacheResidencyError> {
+        let state = self.lock()?;
+        Ok(state
+            .blocks
+            .keys()
+            .filter(|id| {
+                if id.global_layer != layer || id.representation != representation {
+                    return false;
+                }
+                let index = positions.partition_point(|p| i64::from(*p) < id.start);
+                positions.get(index).is_some_and(|p| i64::from(*p) < id.end)
             })
             .cloned()
             .collect())
@@ -419,7 +518,7 @@ impl CacheResidencyManager {
             replacement_id
                 .clone()
                 .map(|id| (id, end <= protected_prefix_tokens)),
-            global_layer,
+            CacheStreamId::new(global_layer, representation),
             MutableCacheTail { bytes: 0, end },
         )?;
 
@@ -553,13 +652,25 @@ fn validate_block_arrays(
     token_count: i64,
 ) -> Result<(), CacheResidencyError> {
     let [first, second] = arrays.arrays();
+    if matches!(arrays, CacheBlockArrays::AppendStream { .. })
+        && (first.ndim() != 4
+            || second.ndim() != 4
+            || first.shape()[..2] != [1, 1]
+            || first.dim(-1) <= 0
+            || second.shape()[..2] != [1, 1]
+            || second.dim(-1) != 0)
+    {
+        return Err(CacheResidencyError::ArrayMismatch(
+            "append stream block has invalid record geometry".into(),
+        ));
+    }
     if first.dtype() != second.dtype() {
         return Err(CacheResidencyError::ArrayMismatch(
             "both arrays in a cache block must share a dtype".into(),
         ));
     }
     let sequence_axis = match arrays {
-        CacheBlockArrays::KeyValue { .. } => {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
             if first.ndim() < 2 || second.ndim() < 2 {
                 return Err(CacheResidencyError::ArrayMismatch(
                     "key/value blocks must have a sequence axis".into(),
@@ -584,7 +695,7 @@ fn validate_block_arrays(
         ));
     }
     match arrays {
-        CacheBlockArrays::KeyValue { .. } => {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
             if first.ndim() != second.ndim()
                 || first.shape()[..first.ndim() - 2] != second.shape()[..second.ndim() - 2]
             {

@@ -9,6 +9,7 @@ pub(crate) type PredictionPlacementSlot = Arc<OnceLock<Arc<PreparedPredictionPla
 #[derive(Debug, Clone)]
 pub struct PreparedPredictionPlacement {
     topology: ParallelRankTopology,
+    qwen4_spec: Option<Arc<crate::qwen4_exp::mtp::PredictionSpec>>,
     parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     layout: Option<Arc<LocalModelLayout>>,
     modules: Vec<eredu_runtime::prediction_resources::PreparedPredictionModule>,
@@ -22,11 +23,39 @@ impl PreparedPredictionPlacement {
     ) -> Self {
         Self {
             topology,
+            qwen4_spec: None,
             parameters,
             layout,
             modules: Vec::new(),
             state: Vec::new(),
         }
+    }
+
+    pub(super) fn qwen4(
+        topology: ParallelRankTopology,
+        spec: Arc<crate::qwen4_exp::mtp::PredictionSpec>,
+        parameters: Arc<eredu_runtime::ArchitectureParameterDescription>,
+        layout: Arc<LocalModelLayout>,
+        modules: Vec<eredu_runtime::prediction_resources::PreparedPredictionModule>,
+        state: &eredu_runtime::StateLayout,
+    ) -> Self {
+        let mut placement = Self::from_prepared(topology, Some(parameters), Some(layout));
+        placement.qwen4_spec = Some(spec);
+        placement.modules = modules;
+        placement.state = state
+            .layers()
+            .iter()
+            .zip(state.layer_prefix_offsets())
+            .enumerate()
+            .map(|(layer, (policy, processed_token_offset))| {
+                eredu_runtime::prediction_resources::PredictionStateLayer {
+                    layer,
+                    policy: policy.clone(),
+                    processed_token_offset,
+                }
+            })
+            .collect();
+        placement
     }
 
     /// Actual local module declarations, in ordinary parameter traversal order.
@@ -51,6 +80,9 @@ impl PreparedPredictionPlacement {
     pub fn local_layout(&self) -> Option<&LocalModelLayout> {
         self.layout.as_deref()
     }
+    pub(crate) fn qwen4_spec(&self) -> Option<&crate::qwen4_exp::mtp::PredictionSpec> {
+        self.qwen4_spec.as_deref()
+    }
     /// Projects a peer through the same tensor-only placement compiler. Prediction
     /// units are replicated over the other axes by their prepared construction.
     pub fn layout_for_rank(&self, rank: usize) -> Result<Option<Arc<LocalModelLayout>>, String> {
@@ -62,6 +94,16 @@ impl PreparedPredictionPlacement {
         let Some(parameters) = &self.parameters else {
             return Ok(None);
         };
+        if let Some(spec) = &self.qwen4_spec {
+            return spec
+                .tensor_partition(
+                    topology.tensor_parallel_rank(),
+                    topology.tensor_parallel_size(),
+                )
+                .and_then(|partition| partition.projected_layout(parameters))
+                .map(|layout| Some(Arc::new(layout)))
+                .map_err(|error| error.to_string());
+        }
         let tensor = tensor_rank(topology).map_err(|error| error.to_string())?;
         crate::partitioned_execution::derive_partitioned_local_layout(parameters, tensor)
             .map(|layout| Some(Arc::new(layout)))
@@ -203,7 +245,7 @@ where
 }
 
 impl<M> PreparedPredictionUnit<M> {
-    fn resource_module(
+    pub(super) fn resource_module(
         &self,
         ordinal: usize,
     ) -> eredu_runtime::prediction_resources::PreparedPredictionModule {

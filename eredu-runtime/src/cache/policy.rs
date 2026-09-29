@@ -186,7 +186,7 @@ impl PagedCacheOptions {
         self.host_budget_bytes
     }
 
-    /// Returns the recent block count protected on the execution device per layer.
+    /// Returns the recent block count protected on the execution device per independently advancing stream.
     pub const fn recent_device_blocks(&self) -> usize {
         self.recent_device_blocks
     }

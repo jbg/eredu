@@ -65,7 +65,7 @@ pub(super) fn shared_arrays_for_unit(
 pub(super) fn shared_host_buffers_for_unit(
     state: &ManagerState,
     id: &OffloadUnitId,
-) -> Result<BTreeMap<String, Arc<ImmutableHostTransferBuffer>>, ResidencyError> {
+) -> Result<BTreeMap<String, Arc<ResidentHostAllocation>>, ResidencyError> {
     let unit = state
         .control
         .unit(id)
@@ -96,7 +96,7 @@ pub(super) fn materialize_host_buffers(
     bindings: &[WeightBinding],
     source_stream: &Stream,
     context: &MlxParameterMaterializationContext,
-    shared: &BTreeMap<String, Arc<ImmutableHostTransferBuffer>>,
+    shared: &BTreeMap<String, Arc<ResidentHostAllocation>>,
 ) -> Result<ResidentHostBuffers, ResidencyError> {
     let mut buffers = shared.clone();
     for binding in bindings {
@@ -187,7 +187,10 @@ pub(super) fn materialize_host_buffers(
                 actual_bytes: actual,
             });
         }
-        buffers.insert(binding.name().to_owned(), Arc::new(buffer.freeze()));
+        buffers.insert(
+            binding.name().to_owned(),
+            Arc::new(ResidentHostAllocation::new(buffer.freeze())?),
+        );
         let status = retained.finish();
         if status.failed || status.blocked {
             return Err(ResidencyError::Mlx {
@@ -197,7 +200,10 @@ pub(super) fn materialize_host_buffers(
             });
         }
     }
-    Ok(ResidentHostBuffers { buffers })
+    Ok(ResidentHostBuffers {
+        owner: host_resources::identity("mlx.resident_host_owner"),
+        buffers,
+    })
 }
 
 pub(super) fn prepare_from_disk(
@@ -342,14 +348,14 @@ pub(super) fn prepare_copy_to_device(
     let mut arrays = BTreeMap::new();
     retained.retained_host.push(Arc::clone(&host));
     for (name, buffer) in &host.buffers {
-        let submitted =
-            buffer
-                .copy_to_array(device_stream)
-                .map_err(|source| ResidencyError::Mlx {
-                    id: id.clone(),
-                    operation: "host-buffer-to-device copy",
-                    source,
-                })?;
+        let submitted = buffer
+            .buffer
+            .copy_to_array(device_stream)
+            .map_err(|source| ResidencyError::Mlx {
+                id: id.clone(),
+                operation: "host-buffer-to-device copy",
+                source,
+            })?;
         let (array, completion) = submitted.into_parts();
         retained.retained_arrays.push(array.clone());
         arrays.insert(name.clone(), array);
@@ -440,14 +446,20 @@ pub(super) fn host_buffers_nbytes(
                 .buffers
                 .get(binding.name())
                 .ok_or(ResidencyError::StatePoisoned)?;
-            let bytes = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "host-buffer byte inspection",
-                source,
-            })?)
-            .map_err(|_| ResidencyError::ArithmeticOverflow {
-                context: "host-buffer byte conversion",
-            })?;
+            let bytes =
+                u64::try_from(
+                    buffer
+                        .buffer
+                        .nbytes()
+                        .map_err(|source| ResidencyError::Mlx {
+                            id: internal_id(),
+                            operation: "host-buffer byte inspection",
+                            source,
+                        })?,
+                )
+                .map_err(|_| ResidencyError::ArithmeticOverflow {
+                    context: "host-buffer byte conversion",
+                })?;
             total
                 .checked_add(bytes)
                 .ok_or(ResidencyError::ArithmeticOverflow {
@@ -468,18 +480,120 @@ pub(super) fn host_buffers_capacity(
                 .buffers
                 .get(binding.name())
                 .ok_or(ResidencyError::StatePoisoned)?;
-            let bytes = u64::try_from(buffer.capacity().map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "host-buffer capacity inspection",
-                source,
-            })?)
-            .map_err(|_| ResidencyError::ArithmeticOverflow {
-                context: "host-buffer capacity conversion",
-            })?;
+            let bytes =
+                u64::try_from(
+                    buffer
+                        .buffer
+                        .capacity()
+                        .map_err(|source| ResidencyError::Mlx {
+                            id: internal_id(),
+                            operation: "host-buffer capacity inspection",
+                            source,
+                        })?,
+                )
+                .map_err(|_| ResidencyError::ArithmeticOverflow {
+                    context: "host-buffer capacity conversion",
+                })?;
             total
                 .checked_add(bytes)
                 .ok_or(ResidencyError::ArithmeticOverflow {
                     context: "resident host-buffer capacity total",
                 })
         })
+}
+
+/// Batches byte-preserving source reads across independently resident units.
+/// Selection and admission already happened; this never broadens a source range.
+/// Units requiring aliases, host copies or transformations use the ordinary path.
+pub(super) fn prepare_direct_units(
+    state: &ManagerState,
+    sources: &ResidencySources,
+    ids: &[OffloadUnitId],
+    missing: &[bool],
+    retained: &mut ResidentTransferResources,
+) -> Result<BTreeMap<OffloadUnitId, PreparedResidentArrays>, ResidencyError> {
+    let mut result = BTreeMap::new();
+    let mut batch = Vec::new();
+    let mut owners = Vec::new();
+    let mut budget = eredu_runtime::ParameterBatchBudget::default();
+    fn finish(
+        reads: &mut Vec<DirectRecipeRead>,
+        owners: &mut Vec<(OffloadUnitId, String)>,
+        result: &mut BTreeMap<OffloadUnitId, PreparedResidentArrays>,
+        state: &ManagerState,
+        retained: &mut ResidentTransferResources,
+    ) -> Result<(), ResidencyError> {
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let arrays =
+            DirectRecipeRead::materialize_many(std::mem::take(reads)).map_err(|source| {
+                ResidencyError::Recipe {
+                    binding: "<residency batch>".into(),
+                    source,
+                }
+            })?;
+        retained.retained_arrays.extend(arrays.iter().cloned());
+        for ((id, name), input) in std::mem::take(owners).into_iter().zip(arrays) {
+            let output = if state.source_stream == state.device_stream {
+                input
+            } else {
+                input
+                    .copy(&state.device_stream)
+                    .map_err(|source| ResidencyError::Recipe {
+                        binding: name.clone(),
+                        source: WeightRecipeError::Mlx(source),
+                    })?
+            };
+            retained.retained_arrays.push(output.clone());
+            result
+                .entry(id)
+                .or_insert_with(|| PreparedResidentArrays {
+                    arrays: BTreeMap::new(),
+                    direction: TransferDirection::DiskToDevice,
+                })
+                .arrays
+                .insert(name, output);
+        }
+        Ok(())
+    }
+    for (id, missing) in ids.iter().zip(missing) {
+        if !missing || state.storage[id].host.is_some() {
+            continue;
+        }
+        let unit = state
+            .control
+            .unit(id)
+            .ok_or(ResidencyError::StatePoisoned)?;
+        if unit.bindings().iter().any(WeightBinding::is_alias) {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        for binding in unit.bindings() {
+            let recipe = binding.source_recipe();
+            let read =
+                DirectRecipeRead::prepare(&recipe, sources.source(id)).map_err(|source| {
+                    ResidencyError::Recipe {
+                        binding: binding.name().into(),
+                        source,
+                    }
+                })?;
+            let Some(read) = read else {
+                candidates.clear();
+                break;
+            };
+            candidates.push((binding, read));
+        }
+        for (binding, read) in candidates {
+            if !budget.try_push(binding.expected_bytes()) {
+                finish(&mut batch, &mut owners, &mut result, state, retained)?;
+                budget = eredu_runtime::ParameterBatchBudget::default();
+                budget.try_push(binding.expected_bytes());
+            }
+            owners.push((id.clone(), binding.name().into()));
+            batch.push(read);
+        }
+    }
+    finish(&mut batch, &mut owners, &mut result, state, retained)?;
+    Ok(result)
 }

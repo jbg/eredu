@@ -46,6 +46,32 @@ impl<P> RoutedBankProviders<P> {
     pub fn bank_mut(&mut self, id: RoutedBankId) -> Option<&mut P> {
         self.banks.get_mut(&id)
     }
+    /// Moves selected auxiliary banks without cloning providers or residency owners.
+    /// Empty requests preserve the collection; invalid requests leave it unchanged.
+    pub fn split_off(&mut self, ids: &[RoutedBankId]) -> Result<Option<Self>, eredu_nn::Error> {
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let requested: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        if requested.len() != ids.len()
+            || requested.len() >= self.banks.len()
+            || requested.iter().any(|id| !self.banks.contains_key(id))
+        {
+            return Err(eredu_nn::Error::backend(
+                "auxiliary banks must be unique, present and leave a primary provider",
+            ));
+        }
+        let banks = requested
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    self.banks.remove(&id).expect("validated auxiliary bank"),
+                )
+            })
+            .collect();
+        Ok(Some(Self { banks }))
+    }
     fn selected<E>(&mut self, id: RoutedBankId) -> Result<&mut P, RoutedBankProviderError<E>> {
         self.banks
             .get_mut(&id)
@@ -53,10 +79,34 @@ impl<P> RoutedBankProviders<P> {
     }
 }
 
-impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B>
+impl<B: GroupedNeuralBackend, P: ParameterProvider<B>> ParameterProvider<B>
     for RoutedBankProviders<P>
 {
     type Error = RoutedBankProviderError<P::Error>;
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.banks
+            .values()
+            .any(|provider| provider.has_row_parameter(parameter))
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        rows: &[u64],
+        access: crate::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        let mut matching = self
+            .banks
+            .values_mut()
+            .filter(|provider| provider.has_row_parameter(&spec.parameter));
+        let provider = matching
+            .next()
+            .ok_or_else(|| crate::RowLookupError::Missing(spec.parameter.clone()))?;
+        if matching.next().is_some() {
+            return Err(crate::RowLookupError::Specification(spec.parameter.clone()));
+        }
+        provider.lookup_rows(spec, rows, access, context)
+    }
     fn routing_control(
         &mut self,
         bank: RoutedBankId,
@@ -122,8 +172,8 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B
             .map_err(RoutedBankProviderError::Provider)
     }
 }
-impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B>>
-    TensorParallelRoutedExpertProvider<B> for RoutedBankProviders<P>
+impl<B: GroupedNeuralBackend, P: TensorParallelParameterProvider<B>>
+    TensorParallelParameterProvider<B> for RoutedBankProviders<P>
 {
     fn forward_grouped_tensor_parallel(
         &mut self,
@@ -162,10 +212,20 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B>>
 
 // Erasure happens after portable preparation has selected each bank's equation
 // and resource owner. The box retains that provider and its completion state.
-impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertProvider<B>
-    for Box<P>
-{
+impl<B: GroupedNeuralBackend, P: ParameterProvider<B> + ?Sized> ParameterProvider<B> for Box<P> {
     type Error = P::Error;
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.as_ref().has_row_parameter(parameter)
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        rows: &[u64],
+        access: crate::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        self.as_mut().lookup_rows(spec, rows, access, context)
+    }
     fn routing_control(
         &mut self,
         bank: RoutedBankId,
@@ -220,8 +280,8 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertP
             .forward_relu2_routed(resident, request, context)
     }
 }
-impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B> + ?Sized>
-    TensorParallelRoutedExpertProvider<B> for Box<P>
+impl<B: GroupedNeuralBackend, P: TensorParallelParameterProvider<B> + ?Sized>
+    TensorParallelParameterProvider<B> for Box<P>
 {
     fn forward_grouped_tensor_parallel(
         &mut self,
@@ -252,5 +312,55 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B> + ?Sized>
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
         self.as_mut()
             .forward_relu2_routed_tensor_parallel(resident, request, partitions, context)
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn auxiliary_split_moves_owners_and_preserves_failed_requests() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ids = [
+            RoutedBankId::new(0),
+            RoutedBankId::new(2),
+            RoutedBankId::new(5),
+        ];
+        let mut providers =
+            RoutedBankProviders::new(ids.map(|id| (id, Owner(drops.clone())))).unwrap();
+        for invalid in [
+            vec![ids[1], ids[1]],
+            vec![RoutedBankId::new(7)],
+            ids.to_vec(),
+        ] {
+            assert!(providers.split_off(&invalid).is_err());
+            assert_eq!(providers.banks().len(), 3);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        assert!(providers.split_off(&[]).unwrap().is_none());
+        let auxiliary = providers.split_off(&ids[1..]).unwrap().unwrap();
+        assert_eq!(
+            providers.banks().keys().copied().collect::<Vec<_>>(),
+            ids[..1]
+        );
+        assert_eq!(
+            auxiliary.banks().keys().copied().collect::<Vec<_>>(),
+            ids[1..]
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(providers);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(auxiliary);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 }

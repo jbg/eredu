@@ -688,6 +688,44 @@ extern "C" int _mlx_array_is_available(bool* res, const mlx_array arr) {
   return 0;
 }
 
+extern "C" int _mlx_array_storage_metadata(
+    uintptr_t* identity,
+    bool* allocator_owned,
+    size_t* allocator_capacity,
+    const mlx_array arr) {
+  try {
+    if (!identity || !allocator_owned || !allocator_capacity) {
+      throw std::invalid_argument("Invalid array storage metadata outputs.");
+    }
+    *identity = 0;
+    *allocator_owned = false;
+    *allocator_capacity = 0;
+    const auto& value = mlx_array_get_(arr);
+    // Availability is only observed. Never evaluate, wait or call data(),
+    // which can perform a device-to-host copy.
+    if (!value.is_available()) {
+      return 0;
+    }
+    const auto& data = value.data_shared_ptr();
+    if (!data || !data->buffer.ptr()) {
+      return 0;
+    }
+    *identity = reinterpret_cast<uintptr_t>(data.get());
+    using AllocatorDeleter = void (*)(mlx::core::allocator::Buffer);
+    const auto* deleter = data->d.target<AllocatorDeleter>();
+    // allocator::size is unsafe for arbitrary imported buffers. A custom
+    // deleter remains unknown even when it happens to free allocator storage.
+    if (deleter && *deleter == &mlx::core::allocator::free) {
+      *allocator_owned = true;
+      *allocator_capacity = value.buffer_size();
+    }
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+
 extern "C" int _mlx_array_wait(const mlx_array arr) {
   try {
     mlx_array_get_(arr).wait();

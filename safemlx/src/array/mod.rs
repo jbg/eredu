@@ -11,6 +11,9 @@ use safemlx_sys::mlx_array;
 use std::ffi::c_void;
 
 mod element;
+mod storage;
+
+pub use storage::{inspect_storage, ArrayBackingStorage, ArrayStorageSurvey};
 
 cfg_safetensors! {
     mod safetensors;
@@ -688,7 +691,7 @@ impl Array {
     /// This is a snapshot, not a host-read guard; use [`Self::evaluated`] to read
     /// tensor contents safely.
     pub fn is_available(&self) -> crate::error::Result<bool> {
-        let _guard = runtime_lock::enter();
+        let _guard = runtime_lock::enter_for_metadata();
         // SAFETY: the owned native array remains alive; Guarded supplies a valid
         // output pointer and translates failures from this nonblocking query.
         bool::try_from_op(|ready| unsafe {

@@ -38,6 +38,8 @@ pub struct CaptureSession {
     last_transaction_epoch: Option<eredu_core::DistributedCommitEpoch>,
     partition: Option<partition::PartitionCaptureRun>,
     pub(crate) plan: std::sync::Arc<AdmittedCapturePlan>,
+    prefill_original: Option<std::sync::Arc<AdmittedCapturePlan>>,
+    prefill_progress: Option<CapturePrefillSpan>,
     pub(crate) ledger: CaptureLedger,
     pub(crate) records: Option<Vec<CaptureRecord>>,
     pub(crate) prediction: u64,
@@ -66,12 +68,40 @@ impl CaptureSession {
             partition: None,
             ledger: CaptureLedger::new(&plan),
             plan: std::sync::Arc::new(plan),
+            prefill_original: None,
+            prefill_progress: None,
             records: None,
             prediction: 0,
             phase: CapturePhase::Prefill,
             capture_seconds: 0.0,
             interventions: None,
         }
+    }
+
+    /// Selects one physical prefill chunk while retaining the original admitted
+    /// request and cumulative ledger. The caller drains this step before selecting
+    /// another chunk; snapshots are taken only at that drained boundary.
+    pub fn set_prefill_span(&mut self, span: CapturePrefillSpan) -> Result<(), CaptureError> {
+        if self.records.is_some() || self.transaction.is_some() || self.prefill_original.is_some() {
+            return Err(CaptureError::Invalid(
+                "prefill span requires a drained capture boundary".into(),
+            ));
+        }
+        if (span.start != 0 || span.end != span.total)
+            && self
+                .interventions
+                .as_ref()
+                .is_some_and(|run| !run.plan.is_empty())
+        {
+            return Err(CaptureError::Unsupported(
+                "chunked prefill interventions require absolute payload projection".into(),
+            ));
+        }
+        let projected = self.plan.for_prefill_span(span)?;
+        self.prefill_original = Some(std::sync::Arc::clone(&self.plan));
+        self.plan = std::sync::Arc::new(projected);
+        self.checkpoint_ready = false;
+        Ok(())
     }
 
     /// Borrows this run's immutable admission.
@@ -227,6 +257,12 @@ impl CaptureSession {
         phase: CapturePhase,
         prediction: u64,
     ) -> Result<(), CaptureError> {
+        if self.plan.prefill_span().is_some() && (phase != CapturePhase::Prefill || prediction != 0)
+        {
+            return Err(CaptureError::Invalid(
+                "prefill span cannot describe a decode prediction".into(),
+            ));
+        }
         if self.plan.invocation_bounds().is_some() != self.invocation.is_some() {
             return Err(CaptureError::Invalid(
                 "capture invocation geometry/authority mismatch".into(),
@@ -282,7 +318,22 @@ impl CaptureSession {
                 source_shape: None,
                 source_dtype: None,
                 selected_shape: None,
-                outcome: if selection.schedule.includes(phase, prediction) {
+                outcome: if self.plan.prefill_span().is_some_and(|span| {
+                    selection
+                        .slices
+                        .iter()
+                        .any(|slice| slice.start == slice.end)
+                        || (span.end < span.total
+                            && matches!(
+                                selection.transform,
+                                CaptureTransform::TokenScores { .. }
+                                    | CaptureTransform::TopCandidates { .. }
+                            ))
+                }) {
+                    CaptureOutcome::Skipped {
+                        reason: CaptureSkipReason::NotInvoked,
+                    }
+                } else if selection.schedule.includes(phase, prediction) {
                     CaptureOutcome::Missing
                 } else {
                     CaptureOutcome::Skipped {
@@ -415,11 +466,16 @@ impl CaptureSession {
                     .iter()
                     .any(|record| matches!(record.outcome, CaptureOutcome::Failed { .. }));
         }
-        self.records.take().map(|records| CapturedStep {
+        let prefill_span = self.plan.prefill_span();
+        if committed && self.records.is_some() && prefill_span.is_some() {
+            self.prefill_progress = prefill_span;
+        }
+        let result = self.records.take().map(|records| CapturedStep {
             outcome,
             phase: self.phase,
             invocation: self.invocation.take(),
             prediction_index: self.prediction,
+            prefill_span,
             records,
             partitions: self
                 .partition
@@ -432,7 +488,11 @@ impl CaptureSession {
             step_usage: self.ledger.step(),
             cumulative_usage: self.ledger.total(),
             capture_seconds: self.capture_seconds,
-        })
+        });
+        if let Some(original) = self.prefill_original.take() {
+            self.plan = original;
+        }
+        result
     }
 }
 

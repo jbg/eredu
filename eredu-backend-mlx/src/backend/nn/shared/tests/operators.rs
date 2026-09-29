@@ -103,8 +103,15 @@ fn mlx_portable_normalization_geometry_preserves_additive_l2() {
             &input, &gate, &weight, groups, epsilon, stream
         )
         .is_err());
-        assert!(MlxNeuralBackend::silu_gated_group_rms_norm(
-            &input, &gate, &weight, groups, epsilon, stream
+        assert!(MlxNeuralBackend::output_gated_group_rms_norm(
+            &input,
+            &gate,
+            &weight,
+            groups,
+            epsilon,
+            eredu_nn::OutputGateActivation::Silu,
+            eredu_nn::OutputGatedNormArithmetic::RoundedNormalization,
+            stream
         )
         .is_err());
     }
@@ -653,33 +660,64 @@ fn mlx_learned_rms_bf16_rounding_matches_independent_reference() {
 }
 
 #[test]
-#[ignore = "explicit MLX grouped-normalization parity; run outside the sandbox"]
-fn mlx_silu_gated_group_norm_matches_scalar_reference() {
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+fn mlx_output_gated_group_norm_matches_scalar_reference() {
+    output_gated_group_norm_reference(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution outside the sandbox"]
+fn mlx_output_gated_group_norm_matches_scalar_reference_metal() {
+    output_gated_group_norm_reference(DeviceType::Gpu);
+}
+
+fn output_gated_group_norm_reference(device: DeviceType) {
+    use eredu_nn::{OutputGateActivation as Gate, OutputGatedNormArithmetic as Arithmetic};
+    let execution = ExecutionContext::new(Device::new(device, 0));
     let stream = execution.stream();
-    let values = [1.0_f32, -2.0, 3.0, -4.0];
-    let gates = [0.5_f32, -1.0, 1.5, -0.25];
-    let weights = [1.0_f32, 2.0, 0.5, -1.0];
+    let values = [1.125_f32, -2.25, 3.5, -4.75];
+    let gates = [0.5625_f32, -1.125, 1.625, -0.28125];
+    let weights = [1.3125_f32, 2.125, 0.5625, -1.0625];
     let epsilon = 1e-5;
-    let input = MlxTensor::from_array(Array::from_slice(&values, &[1, 4]));
-    let gate = MlxTensor::from_array(Array::from_slice(&gates, &[1, 4]));
-    let weight = MlxTensor::from_array(Array::from_slice(&weights, &[4]));
-    let mut expected = [0.0_f32; 4];
-    for group in 0..2 {
-        let start = group * 2;
-        let variance =
-            (values[start] * values[start] + values[start + 1] * values[start + 1]) / 2.0;
-        let scale = (variance + epsilon).sqrt().recip();
-        for index in start..start + 2 {
-            let silu_gate = gates[index] / (1.0 + (-gates[index]).exp());
-            expected[index] = values[index] * scale * weights[index] * silu_gate;
+    let mut differed = false;
+    for activation in [Gate::Silu, Gate::Sigmoid] {
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            for weight_dtype in [dtype, Dtype::Float32] {
+                let round = |x| if dtype == Dtype::Bfloat16 { half::bf16::from_f32(x).to_f32() } else { x };
+                let mut previous = None;
+                for arithmetic in [Arithmetic::Float32, Arithmetic::RoundedNormalization] {
+                    let mut expected = [0.0_f32; 4];
+                    for group in 0..2 {
+                        let start = group * 2;
+                        let variance = (values[start] * values[start] + values[start+1] * values[start+1]) / 2.;
+                        let scale = (variance + epsilon).sqrt().recip();
+                        for index in start..start+2 {
+                            let normalized = values[index] * scale;
+                            let learned = match arithmetic {
+                                Arithmetic::Float32 => normalized * weights[index],
+                                Arithmetic::RoundedNormalization => {
+                                    let learned = round(normalized) * weights[index];
+                                    if weight_dtype == dtype { round(learned) } else { learned }
+                                }
+                            };
+                            let numerator = match activation { Gate::Silu => gates[index], Gate::Sigmoid => 1. };
+                            expected[index] = round(learned * (numerator / (1. + (-gates[index]).exp())));
+                        }
+                    }
+                    let tensor = |values: &[f32], shape: &[i32], dtype| MlxTensor::from_array(Array::from_slice(values,shape).as_dtype(dtype,stream).unwrap());
+                    let actual = MlxNeuralBackend::output_gated_group_rms_norm(
+                        &tensor(&values,&[1,4],dtype), &tensor(&gates,&[1,4],dtype),
+                        &tensor(&weights,&[4],weight_dtype), 2, epsilon, activation, arithmetic, stream,
+                    ).unwrap();
+                    assert_eq!(actual.as_array().dtype(),dtype);
+                    let actual = MlxTensor::from_array(actual.as_array().as_dtype(Dtype::Float32,stream).unwrap());
+                    close(&actual,&expected,if dtype == Dtype::Bfloat16 { 0. } else { 1e-5 });
+                    if let Some(previous) = previous { differed |= previous != expected; }
+                    previous = Some(expected);
+                }
+            }
         }
     }
-    let actual = <MlxNeuralBackend as NeuralBackend>::silu_gated_group_rms_norm(
-        &input, &gate, &weight, 2, epsilon, stream,
-    )
-    .unwrap();
-    close(&actual, &expected, 1e-5);
+    assert!(differed, "fixture must distinguish the intermediate rounding policies");
 }
 
 #[test]
@@ -1225,4 +1263,104 @@ fn hyper_head_coefficients_cpu() {
 #[ignore = "requires native MLX Metal execution"]
 fn hyper_head_coefficients_metal() {
     verify_hyper_head_coefficients(DeviceType::Gpu);
+}
+
+#[test]
+fn mlx_dilated_causal_convolution_matches_scalar_history() {
+    use eredu_nn::{
+        CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec, ConvolutionActivation,
+    };
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let mut conv = CausalDepthwiseConvolution::<MlxNeuralBackend>::new(
+        CausalDepthwiseConvolutionSpec {
+            channels: 1,
+            kernel_size: 3,
+            dilation: 3,
+            weight: ParameterSpec::trainable("dilated.weight").unwrap(),
+            bias: None,
+            activation: ConvolutionActivation::Identity,
+        },
+        stream,
+    )
+    .unwrap();
+    conv.weight.replace(MlxTensor::from_array(Array::from_slice(
+        &[0.5_f32, -1.0, 2.0],
+        &[1, 1, 3],
+    )));
+    let input = MlxTensor::from_array(Array::from_slice(
+        &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        &[1, 8, 1],
+    ));
+    let whole = conv.forward(&input, None, stream).unwrap();
+    close(
+        &whole.output,
+        &[2.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.5, 12.0],
+        1e-6,
+    );
+    close(
+        whole.history.as_ref().unwrap(),
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        1e-6,
+    );
+    let mut history = None;
+    let mut outputs = Vec::new();
+    for (start, end) in [(0, 1), (1, 3), (3, 7), (7, 8)] {
+        let slice = input
+            .index(
+                &[
+                    eredu_nn::Index::Full,
+                    eredu_nn::Index::Range(start, end),
+                    eredu_nn::Index::Full,
+                ],
+                stream,
+            )
+            .unwrap();
+        let next = conv.forward(&slice, history.as_ref(), stream).unwrap();
+        history = next.history;
+        outputs.push(next.output);
+    }
+    close(
+        &MlxTensor::concatenate(&outputs, 1, stream).unwrap(),
+        &[2.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.5, 12.0],
+        1e-6,
+    );
+    close(
+        history.as_ref().unwrap(),
+        &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        1e-6,
+    );
+}
+
+#[test]
+fn mlx_elementwise_signed_root_preserves_zero_and_rounding_boundaries() {
+    let execution=ExecutionContext::new(Device::new(DeviceType::Cpu,0));
+    let stream=execution.stream();
+    for dtype in [Dtype::Float32,Dtype::Bfloat16] {
+        let input=MlxTensor::from_array(Array::from_slice(&[-0.0f32,0.,-1e-12,1e-12,-4.,9.],&[6]).as_dtype(dtype,stream).unwrap());
+        let output=input.abs(stream).unwrap().maximum_scalar(1e-6,stream).unwrap().sqrt(stream).unwrap().multiply(&input.sign(stream).unwrap(),stream).unwrap();
+        assert_eq!(output.as_array().dtype(),dtype);
+        let expected=Array::from_slice(&[0.0f32,0.,-0.001,0.001,-2.,3.],&[6]).as_dtype(dtype,stream).unwrap().as_dtype(Dtype::Float32,stream).unwrap().evaluated().unwrap().as_slice::<f32>().to_vec();
+        let actual=MlxTensor::from_array(output.as_array().as_dtype(Dtype::Float32,stream).unwrap());
+        close(&actual,&expected,if dtype==Dtype::Float32 {1e-8} else {1e-5});
+    }
+}
+
+#[test]
+fn mlx_resident_append_stream_preserves_integer_bits_across_pages_and_checkpoints() {
+    use eredu_runtime::{AppendOnlyStream,AppendStreamSpec,AppendStreamLimits,ResidentAppendStream};
+    use eredu_nn::TensorElementType;
+    let execution=ExecutionContext::new(Device::new(DeviceType::Cpu,0));let context=execution.stream();
+    let mut stream=ResidentAppendStream::<MlxTensor>::new(AppendStreamSpec {slot:3,width:2,element:TensorElementType::I32},AppendStreamLimits {entries:8,page_entries:2,read_entries:3},64,80,4096).unwrap();
+    let values=[i32::MAX,i32::MIN,16777217,-16777217,3,4,5,6];
+    stream.append(0,MlxTensor::from_i32_slice(&values[..6],&[3,2],context).unwrap(),context).unwrap();
+    let mut snapshot=stream.clone();
+    stream.append(3,MlxTensor::from_i32_slice(&values[6..],&[1,2],context).unwrap(),context).unwrap();
+    assert_eq!(snapshot.len(),3);assert_eq!(stream.len(),4);
+    assert_eq!(snapshot.read(0..3,context).unwrap().to_i32_vec(context).unwrap(),values[..6]);
+    assert_eq!(stream.read(1..4,context).unwrap().to_i32_vec(context).unwrap(),values[2..]);
+    assert!(stream.read(0..4,context).is_err());
+    assert!(stream.append(2,MlxTensor::from_i32_slice(&[7,8],&[1,2],context).unwrap(),context).is_err());
+    assert_eq!(stream.len(),4);stream.clear();assert_eq!(stream.len(),0);
+    assert_eq!(snapshot.read(0..3,context).unwrap().to_i32_vec(context).unwrap(),values[..6]);
 }

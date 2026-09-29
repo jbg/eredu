@@ -68,12 +68,14 @@ impl ModelConfigurationResolver for ModelConfigurations {
 
     fn sidecar_names(&self, plan: &Self::ArtifactPlan) -> &[&str] {
         match plan.model_kind() {
-            ModelKind::Gemma4 | ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe | ModelKind::Qwen35 => {
-                &[
-                    crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
-                    crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
-                ]
-            }
+            ModelKind::Gemma4
+            | ModelKind::Qwen3Vl
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+            | ModelKind::Qwen4Exp => &[
+                crate::processor_plan::PROCESSOR_CONFIG_FILENAME,
+                crate::processor_plan::VIDEO_PROCESSOR_CONFIG_FILENAME,
+            ],
             ModelKind::MuseGlimmer => &[crate::processor_plan::MUSE_PROCESSOR_CONFIG_FILENAME],
             _ => &[],
         }
@@ -103,6 +105,7 @@ impl ModelConfigurationResolver for ModelConfigurations {
                         | ModelKind::Qwen3Vl
                         | ModelKind::Qwen3VlMoe
                         | ModelKind::Qwen35
+                        | ModelKind::Qwen4Exp
                 ) {
                     (
                         sidecars
@@ -241,6 +244,8 @@ pub enum ModelKind {
     Qwen3VlMoe,
     /// Qwen3.5 dense or MoE decoder.
     Qwen35,
+    /// Qwen3.8 Flash-Next gated multi-stream and indexed-attention family.
+    Qwen4Exp,
 }
 
 impl Serialize for ModelKind {
@@ -264,7 +269,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::Gemma4,
@@ -285,6 +290,7 @@ impl ModelKind {
         Self::Qwen3Vl,
         Self::Qwen3VlMoe,
         Self::Qwen35,
+        Self::Qwen4Exp,
     ];
 
     /// Canonical family name published through the neutral artifact protocol.
@@ -310,6 +316,7 @@ impl ModelKind {
             Self::Qwen3Vl => "qwen3_vl",
             Self::Qwen3VlMoe => "qwen3_vl_moe",
             Self::Qwen35 => "qwen3_5",
+            Self::Qwen4Exp => "qwen4_exp",
         }
     }
 
@@ -358,6 +365,7 @@ impl ModelKind {
             "qwen3_next" => Ok(Self::Qwen3Next),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
             "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
+            "qwen4_exp" | "qwen4_exp_text" => Ok(Self::Qwen4Exp),
             "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35),
             other => Err(ArtifactError::UnsupportedModelType(other.into())),
         }
@@ -412,6 +420,8 @@ pub enum GgufArchitecture {
     Qwen3VlMoe,
     /// `qwen35`.
     Qwen35,
+    /// Qwen3.8 Flash-Next gated multi-stream and indexed-attention family.
+    Qwen4Exp,
     /// `qwen35moe`.
     Qwen35Moe,
     /// `qwen3next`.
@@ -444,6 +454,7 @@ impl GgufArchitecture {
             "qwen3vl" => Ok(Self::Qwen3Vl),
             "qwen3vlmoe" => Ok(Self::Qwen3VlMoe),
             "qwen35" => Ok(Self::Qwen35),
+            "qwen4exp" => Ok(Self::Qwen4Exp),
             "qwen35moe" => Ok(Self::Qwen35Moe),
             "qwen3next" => Ok(Self::Qwen3Next),
             other => Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
@@ -471,6 +482,7 @@ impl GgufArchitecture {
             Self::Qwen3Vl => ModelKind::Qwen3Vl,
             Self::Qwen3VlMoe => ModelKind::Qwen3VlMoe,
             Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
+            Self::Qwen4Exp => ModelKind::Qwen4Exp,
             Self::Qwen3Next => ModelKind::Qwen3Next,
         }
     }
@@ -500,6 +512,7 @@ impl GgufArchitecture {
             Self::Qwen3Vl => "qwen3vl",
             Self::Qwen3VlMoe => "qwen3vlmoe",
             Self::Qwen35 => "qwen35",
+            Self::Qwen4Exp => "qwen4exp",
             Self::Qwen35Moe => "qwen35moe",
             Self::Qwen3Next => "qwen3next",
         }
@@ -574,7 +587,13 @@ fn effective_model_type(
 ) -> Result<String, ArtifactError> {
     if matches!(
         metadata.model_type.as_str(),
-        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
+        "gemma4"
+            | "gemma4_unified"
+            | "qwen3_vl"
+            | "qwen3_vl_moe"
+            | "qwen3_5"
+            | "qwen3_5_moe"
+            | "qwen4_exp"
     ) {
         let effective_model_type = metadata
             .text_config
@@ -676,6 +695,11 @@ pub enum SafetensorsModelConfig {
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
     QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
+    /// Flash-Next configuration and exact SafeTensors encoding policy.
+    Qwen4Exp(
+        crate::qwen4_exp::config::Config,
+        crate::qwen4_exp::checkpoint::schema::SafetensorsEncoding,
+    ),
     /// Qwen3-VL family geometry.
     QwenVl(crate::qwen::vl::ModelArgs),
 }
@@ -688,6 +712,7 @@ pub struct SafetensorsArchitecturePlan {
     checkpoint: SafetensorsCheckpointPlan,
     checkpoint_resolution: Option<ResolvedCheckpointPlan>,
     moshi_recipes: Option<AtomicRecipeSet>,
+    qwen4_exp_target: Option<std::sync::Arc<crate::qwen4_exp::prepared::SafetensorsTargetPlan>>,
 }
 
 /// Typed, normalized family configuration retained from GGUF admission.
@@ -723,6 +748,8 @@ pub enum GgufModelConfig {
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
     QwenHybrid(crate::qwen::hybrid::ParsedHybridConfig),
+    /// Exact Flash-Next header, representations and target geometry.
+    Qwen4Exp(std::sync::Arc<crate::qwen4_exp::prepared::GgufTargetPlan>),
 }
 
 impl SafetensorsModelConfig {
@@ -743,6 +770,7 @@ impl SafetensorsModelConfig {
             Self::Qwen(args) => args.num_experts > 0,
             Self::QwenHybrid(args) => args.text.num_experts > 0,
             Self::QwenVl(args) => args.text.num_experts > 0,
+            Self::Qwen4Exp(config, _) => config.experts.count > 0,
         }
     }
 }
@@ -764,6 +792,7 @@ impl GgufModelConfig {
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
             Self::QwenHybrid(args) => args.text.num_experts > 0,
+            Self::Qwen4Exp(plan) => plan.text_plan().config().experts.count > 0,
         }
     }
 }
@@ -778,6 +807,14 @@ pub struct GgufArchitecturePlan {
 }
 
 impl GgufArchitecturePlan {
+    /// Retained complete Flash-Next header admission.
+    pub fn qwen4_exp_target_plan(&self) -> Option<&crate::qwen4_exp::prepared::GgufTargetPlan> {
+        match &self.model {
+            GgufModelConfig::Qwen4Exp(plan) => Some(plan),
+            _ => None,
+        }
+    }
+
     pub(crate) fn new(
         architecture: GgufArchitecture,
         model: GgufModelConfig,
@@ -819,6 +856,13 @@ impl GgufArchitecturePlan {
 }
 
 impl SafetensorsArchitecturePlan {
+    /// Complete Flash-Next header, available only after catalog admission.
+    pub fn qwen4_exp_target_plan(
+        &self,
+    ) -> Option<&crate::qwen4_exp::prepared::SafetensorsTargetPlan> {
+        self.qwen4_exp_target.as_deref()
+    }
+
     /// Canonical family selected for this exact configuration.
     pub const fn model_kind(&self) -> ModelKind {
         self.kind
@@ -988,6 +1032,7 @@ impl SafetensorsArchitecturePlan {
                     checkpoint: checkpoint.clone(),
                     checkpoint_resolution: None,
                     moshi_recipes: None,
+                    qwen4_exp_target: None,
                 };
                 let extension_sources = extension.source_keys(&target)?;
                 let target_sources = resolution
@@ -1007,6 +1052,7 @@ impl SafetensorsArchitecturePlan {
                 checkpoint,
                 checkpoint_resolution,
                 moshi_recipes: None,
+                qwen4_exp_target: None,
             },
             extension,
         )))
@@ -1014,6 +1060,18 @@ impl SafetensorsArchitecturePlan {
 
     pub(crate) fn admit_catalog(&mut self, tensors: &TensorCatalog) -> Result<(), ArtifactError> {
         let catalog = PortableSafetensorsCatalog(tensors);
+        if let SafetensorsModelConfig::Qwen4Exp(config, encoding) = &self.model {
+            let header = crate::qwen4_exp::prepared::SafetensorsTargetPlan::prepare(
+                &catalog,
+                config.clone(),
+                encoding.clone(),
+            )
+            .map_err(|error| ArtifactError::InvalidArchitecturePlan(error.to_string()))?;
+            self.checkpoint = header.checkpoint().clone();
+            self.checkpoint_resolution = Some(header.resolution().clone());
+            self.qwen4_exp_target = Some(std::sync::Arc::new(header));
+            return Ok(());
+        }
         if let SafetensorsModelConfig::QwenHybrid(config) = &self.model {
             let (config, checkpoint) =
                 crate::qwen::hybrid::safetensors_catalog_plan(config, &catalog)
@@ -1367,6 +1425,13 @@ fn resolve_safetensors_architecture(
         ModelKind::Qwen2 | ModelKind::Qwen3 => crate::qwen::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::Qwen)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::Qwen4Exp => crate::qwen4_exp::config::Config::from_json(json)
+            .map_err(|error| invalid_configuration(kind, error))
+            .and_then(|config| {
+                crate::qwen4_exp::checkpoint::schema::SafetensorsEncoding::from_json(json)
+                    .map(|encoding| SafetensorsModelConfig::Qwen4Exp(config, encoding))
+                    .map_err(|error| invalid_configuration(kind, error))
+            }),
         ModelKind::Qwen3Next | ModelKind::Qwen35 => {
             crate::qwen::hybrid::model_args_from_config_value(json)
                 .map(SafetensorsModelConfig::QwenHybrid)
@@ -1379,6 +1444,10 @@ fn resolve_safetensors_architecture(
         }
     }?;
     let checkpoint = match &model {
+        SafetensorsModelConfig::Qwen4Exp(config, encoding) => {
+            crate::qwen4_exp::checkpoint::schema::safetensors_config_plan(config, encoding)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::DeepSeekV3(args) => {
             crate::deepseek::v3_safetensors_plan(args, true)
                 .map_err(|error| invalid_configuration(kind, error))?
@@ -1432,6 +1501,7 @@ fn resolve_safetensors_architecture(
         checkpoint,
         checkpoint_resolution: None,
         moshi_recipes: None,
+        qwen4_exp_target: None,
     })
 }
 
@@ -1927,6 +1997,8 @@ mod tests {
             ("qwen3_vl_moe_text", ModelKind::Qwen3VlMoe),
             ("qwen3_5_text", ModelKind::Qwen35),
             ("qwen3_5_moe_text", ModelKind::Qwen35),
+            ("qwen4_exp", ModelKind::Qwen4Exp),
+            ("qwen4_exp_text", ModelKind::Qwen4Exp),
         ] {
             assert_eq!(ModelKind::resolve_model_type(model_type).unwrap(), family);
             assert_eq!(
@@ -1935,6 +2007,139 @@ mod tests {
                     .canonical_name(),
                 family.canonical_name()
             );
+        }
+    }
+
+    #[test]
+    fn flash_next_configuration_is_distinct_and_requires_catalog_admission() {
+        let json: Value =
+            serde_json::from_str(include_str!("qwen4_exp/config/released.json")).unwrap();
+        let resolved = resolve_model_config(&json).unwrap();
+        assert_eq!(resolved.kind, ModelKind::Qwen4Exp);
+        assert_eq!(resolved.effective_model_type, "qwen4_exp_text");
+        let SafetensorsModelConfig::Qwen4Exp(config, encoding) = resolved.architecture.model()
+        else {
+            panic!("Flash-Next must retain its distinct normalized configuration");
+        };
+        assert_eq!(
+            config.layers.get(3),
+            Some(&crate::qwen4_exp::config::LayerKind::Indexed)
+        );
+        assert!(!encoding.scalar_fp8_table());
+        assert!(resolved.architecture.qwen4_exp_target_plan().is_none());
+        assert!(resolved.architecture.checkpoint_resolution().is_none());
+        let graph = crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
+            resolved.architecture.clone(),
+        )
+        .architecture_descriptor();
+        assert!(graph.node("residual.expansion").is_some());
+        assert!(graph.node("output.norm").is_none());
+        assert_eq!(
+            graph.node("output.collapse").unwrap().kind,
+            eredu_core::ArchitectureNodeKind::Projector
+        );
+        assert_eq!(
+            graph
+                .node("decoder.layers.3.mixer")
+                .unwrap()
+                .attention
+                .as_ref()
+                .unwrap()
+                .query_heads,
+            Some(config.attention.heads as usize)
+        );
+        for &layer in &config.ngram.layers {
+            assert!(graph
+                .node(&format!("decoder.layers.{layer}.lexical.table"))
+                .is_some());
+        }
+        let mut architecture = resolved.architecture;
+        assert!(architecture
+            .admit_catalog(&TensorCatalog::new(Vec::new()).unwrap())
+            .is_err());
+        assert!(architecture.qwen4_exp_target_plan().is_none());
+
+        let mut mismatched = json.clone();
+        mismatched["text_config"]["model_type"] = serde_json::json!("qwen3_5_text");
+        assert!(resolve_model_identity(&mismatched).is_err());
+        assert_eq!(
+            GgufArchitecture::resolve("qwen4exp").unwrap(),
+            GgufArchitecture::Qwen4Exp
+        );
+        assert_eq!(GgufArchitecture::Qwen4Exp.model_kind(), ModelKind::Qwen4Exp);
+        assert_eq!(GgufArchitecture::Qwen4Exp.metadata_name(), "qwen4exp");
+    }
+
+    #[test]
+    fn flash_next_released_headers_admit_bf16_and_fp8_without_payloads() {
+        for (encoded, bytes) in [
+            (
+                false,
+                include_str!("qwen4_exp/checkpoint/fixtures/bf16.json"),
+            ),
+            (true, include_str!("qwen4_exp/checkpoint/fixtures/fp8.json")),
+        ] {
+            let mut json: Value =
+                serde_json::from_str(include_str!("qwen4_exp/config/released.json")).unwrap();
+            if encoded {
+                json["quantization_config"] = serde_json::from_str(include_str!(
+                    "qwen4_exp/checkpoint/fixtures/fp8-policy.json"
+                ))
+                .unwrap();
+            }
+            let fixture: Value = serde_json::from_str(bytes).unwrap();
+            let mut descriptors = Vec::new();
+            for record in fixture["tensors"].as_array().unwrap() {
+                let mut names = vec![record["name"].as_str().unwrap().to_owned()];
+                for (axis, values) in record["axes"].as_array().unwrap().iter().enumerate() {
+                    names = names
+                        .into_iter()
+                        .flat_map(|name| {
+                            values.as_array().unwrap().iter().map(move |value| {
+                                name.replace(&format!("{{{axis}}}"), &value.to_string())
+                            })
+                        })
+                        .collect();
+                }
+                let shape: Vec<usize> = serde_json::from_value(record["shape"].clone()).unwrap();
+                let dtype = match record["dtype"].as_str().unwrap() {
+                    "BF16" => TensorDtype::Bf16,
+                    "F16" => TensorDtype::F16,
+                    "F32" => TensorDtype::F32,
+                    "I64" => TensorDtype::I64,
+                    "F8_E4M3" => TensorDtype::Encoded("F8_E4M3".into()),
+                    other => panic!("unexpected fixture dtype {other}"),
+                };
+                descriptors.extend(names.into_iter().map(|name| {
+                    eredu_core::checkpoint::TensorDescriptor {
+                        name,
+                        shape: shape.clone(),
+                        dtype: dtype.clone(),
+                        storage: None,
+                    }
+                }));
+            }
+            assert_eq!(
+                descriptors.len(),
+                fixture["tensor_count"].as_u64().unwrap() as usize
+            );
+            let catalog = TensorCatalog::new(descriptors.clone()).unwrap();
+            let mut plan = resolve_model_config(&json).unwrap().architecture;
+            plan.admit_catalog(&catalog).unwrap();
+            let header = plan.qwen4_exp_target_plan().unwrap();
+            assert_eq!(header.resolution().source_keys().len(), descriptors.len());
+            assert_eq!(plan.checkpoint_resolution().unwrap(), header.resolution());
+            let mut malformed = descriptors;
+            let integer = malformed
+                .iter_mut()
+                .find(|tensor| tensor.name.ends_with("layer_multipliers"))
+                .unwrap();
+            integer.dtype = TensorDtype::F32;
+            let mut rejected = resolve_model_config(&json).unwrap().architecture;
+            assert!(rejected
+                .admit_catalog(&TensorCatalog::new(malformed).unwrap())
+                .is_err());
+            assert!(rejected.qwen4_exp_target_plan().is_none());
         }
     }
 

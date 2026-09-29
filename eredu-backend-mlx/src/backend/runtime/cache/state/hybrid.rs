@@ -1,6 +1,10 @@
 //! Mixed attention and fixed-component state realization.
 
 use super::*;
+use eredu_runtime::AppendStreamBinding;
+mod streams;
+use streams::LayerStreams;
+pub use streams::MlxAppendStream;
 
 // Numeric conformance reports include integer media positions as well as
 // floating cache values. Preserve every integer exactly in this test-only
@@ -143,6 +147,7 @@ impl MlxHybridAttentionState {
 pub struct MlxHybridLayerState {
     attention: Option<MlxHybridAttentionState>,
     fixed: BTreeMap<StateTensorRole, Option<MlxTensor>>,
+    streams: LayerStreams,
     fixed_offset: i32,
 }
 
@@ -156,6 +161,7 @@ impl MlxHybridLayerState {
         Ok(Self {
             attention,
             fixed: self.fixed.clone(),
+            streams: self.streams.checkpoint()?,
             fixed_offset: self.fixed_offset,
         })
     }
@@ -188,6 +194,7 @@ impl MlxHybridLayerState {
                 .map(|tensor| (tensor.role, None))
                 .collect(),
             fixed_offset: 0,
+            streams: LayerStreams::default(),
         })
     }
 
@@ -226,6 +233,7 @@ impl MlxHybridLayerState {
                 .map(|tensor| (tensor.role, None))
                 .collect(),
             fixed_offset: 0,
+            streams: LayerStreams::default(),
         })
     }
 
@@ -239,9 +247,9 @@ impl MlxHybridLayerState {
         let attention_policy = hybrid_attention_policy(layer, policy)?;
         let attention_components = match policy {
             LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => 0,
-            LayerCachePolicy::KeyOnly { .. } | LayerCachePolicy::KeyOnlyWithFixedState { .. } => 1,
+            LayerCachePolicy::KeyOnly { .. } | LayerCachePolicy::KeyOnlyWithState { .. } => 1,
             LayerCachePolicy::KeyValue { .. }
-            | LayerCachePolicy::KeyValueWithFixedState { .. }
+            | LayerCachePolicy::KeyValueWithState { .. }
             | LayerCachePolicy::CompressedLatentRotary { .. } => 2,
         };
         let (attention_components, fixed_components) = components
@@ -251,10 +259,20 @@ impl MlxHybridLayerState {
                     "selected hybrid state omits attention components at layer {layer}"
                 ))
             })?;
-        if fixed_components.len() != policy.fixed_state().len() {
+        let (fixed_components, stream_components) = fixed_components
+            .split_at_checked(policy.fixed_state().len())
+            .ok_or_else(|| Exception::custom("selected hybrid state omits fixed components"))?;
+        if stream_components.len() != policy.append_streams().len() {
             return Err(Exception::custom(format!(
                 "selected hybrid state fixed-component count differs at layer {layer}"
             )));
+        }
+        for (component, declaration) in stream_components.iter().zip(policy.append_streams()) {
+            if component.component() != &declaration.component() {
+                return Err(Exception::custom(
+                    "selected append-stream contract differs from layout",
+                ));
+            }
         }
         for component in fixed_components {
             if !matches!(component.component().role(), StateComponentRole::Fixed(_)) {
@@ -342,6 +360,7 @@ impl MlxHybridLayerState {
                 .map(|tensor| (tensor.role, None))
                 .collect(),
             fixed_offset: 0,
+            streams: LayerStreams::default(),
         })
     }
 
@@ -353,6 +372,7 @@ impl MlxHybridLayerState {
         for component in self.fixed.values_mut() {
             *component = None;
         }
+        self.streams.clear()?;
         self.fixed_offset = 0;
         Ok(())
     }
@@ -370,6 +390,7 @@ impl RuntimeLayerState<MlxNeuralBackend> for MlxHybridLayerState {
             .flatten()
             .collect::<Vec<_>>();
         retained.extend(self.fixed.values().filter_map(Option::as_ref));
+        retained.extend(self.streams.retained_values());
         retained.into_iter()
     }
 }
@@ -388,6 +409,16 @@ impl RuntimeStateComponents<MlxNeuralBackend> for MlxHybridLayerState {
         self.fixed
             .get_mut(&role)
             .ok_or(StateError::UnknownComponent { role })
+    }
+
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<MlxTensor>)>,
+    ) -> Result<(), StateError> {
+        eredu_runtime::state::replace_fixed_components(
+            self.fixed.iter_mut().map(|(role, slot)| (*role, slot)),
+            values,
+        )
     }
 
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
@@ -466,6 +497,20 @@ impl AttentionCache<MlxTensor> for MlxHybridLayerState {
             request,
             stream,
         )
+    }
+    fn indexed_attention<N: eredu_nn::NeuralBackend<Tensor = MlxTensor>>(
+        &mut self,
+        request: eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => {
+                cache.indexed_attention::<N>(request, stream)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no key/value attention cache",
+            )),
+        }
     }
     fn relative_attention<N: eredu_nn::NeuralBackend<Tensor = MlxTensor>>(
         &mut self,
@@ -609,48 +654,64 @@ impl MlxHybridState {
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
-        self.layers.iter().all(|layer| match &layer.attention {
-            None
-            | Some(MlxHybridAttentionState::KeyValue(
-                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
-            )) => true,
-            Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => self
-                .manager
-                .as_ref()
-                .is_some_and(|manager| manager.session_id() == cache.manager().session_id()),
-            Some(MlxHybridAttentionState::Compressed(cache)) => {
-                cache.residency_manager().is_none_or(|paging| {
-                    self.manager
-                        .as_ref()
-                        .is_some_and(|manager| manager.session_id() == paging.session_id())
-                })
-            }
+        self.layers.iter().all(|layer| {
+            layer.streams.consistent_manager(self.manager.as_ref())
+                && match &layer.attention {
+                    None
+                    | Some(MlxHybridAttentionState::KeyValue(
+                        MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
+                    )) => true,
+                    Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(
+                        cache,
+                    ))) => self.manager.as_ref().is_some_and(|manager| {
+                        manager.session_id() == cache.manager().session_id()
+                    }),
+                    Some(MlxHybridAttentionState::Compressed(cache)) => {
+                        cache.residency_manager().is_none_or(|paging| {
+                            self.manager
+                                .as_ref()
+                                .is_some_and(|manager| manager.session_id() == paging.session_id())
+                        })
+                    }
+                }
         })
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
-        self.manager
+        let manager = self
+            .manager
             .as_ref()
             .map(|manager| manager.isolated_snapshot_bytes())
-            .unwrap_or(Some(0))
+            .unwrap_or(Some(0))?;
+        self.layers.iter().try_fold(manager, |bytes, layer| {
+            bytes.checked_add(layer.streams.metadata_bytes()?)
+        })
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
         let paged = self
             .layers
             .iter()
-            .filter(|layer| {
-                layer
-                    .attention
-                    .as_ref()
-                    .and_then(MlxHybridAttentionState::manager)
-                    .is_some()
-            })
-            .count() as u64;
-        additional
+            .map(|layer| layer.streams.paged_count() as u64)
+            .sum::<u64>()
+            + self
+                .layers
+                .iter()
+                .filter(|layer| {
+                    layer
+                        .attention
+                        .as_ref()
+                        .and_then(MlxHybridAttentionState::manager)
+                        .is_some()
+                })
+                .count() as u64;
+        let pages = additional
             .checked_add(1)?
             .checked_mul(paged)?
-            .checked_mul(8192)
+            .checked_mul(8192)?;
+        self.layers.iter().try_fold(pages, |bytes, layer| {
+            bytes.checked_add(layer.streams.snapshot_growth(additional)?)
+        })
     }
 
     /// Deeply copies attention and every architecture-declared fixed tensor.
@@ -733,6 +794,7 @@ impl MlxHybridState {
                     })
                     .collect::<Result<_, Exception>>()?;
                 Ok(MlxHybridLayerState {
+                    streams: layer.streams.fork(manager.as_ref(), stream)?,
                     attention,
                     fixed,
                     fixed_offset: layer.fixed_offset,
@@ -748,27 +810,35 @@ impl MlxHybridState {
     }
 
     /// Creates device-resident attention and fixed state from a neutral layout.
-    pub fn device(layout: StateLayout) -> Result<Self, Exception> {
-        Self::device_with_global_layer_start(layout, 0)
+    pub fn device(
+        layout: StateLayout,
+        bindings: &[AppendStreamBinding],
+    ) -> Result<Self, Exception> {
+        Self::device_with_global_layer_start(layout, 0, bindings)
     }
 
     /// Creates device-resident state addressed from an architecture-global layer.
     pub fn device_with_global_layer_start(
         layout: StateLayout,
         global_layer_start: usize,
+        bindings: &[AppendStreamBinding],
     ) -> Result<Self, Exception> {
+        AppendStreamBinding::validate_layout(&layout, bindings)
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let layers = layout
             .layers()
             .iter()
             .enumerate()
             .map(|(layer, policy)| MlxHybridLayerState::device(layer, policy))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        let mut state = Self {
             layout,
             global_layer_start,
             layers,
             manager: None,
-        })
+        };
+        state.initialize_streams(bindings, None, StateComponentPlacement::Device, None)?;
+        Ok(state)
     }
 
     /// Creates paged attention with device-resident fixed components.
@@ -776,8 +846,9 @@ impl MlxHybridState {
         layout: StateLayout,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
+        bindings: &[AppendStreamBinding],
     ) -> Result<Self, Exception> {
-        Self::paged_with_global_layer_start(layout, manager, rank, 0)
+        Self::paged_with_global_layer_start(layout, manager, rank, 0, bindings)
     }
 
     /// Creates paged state addressed from an architecture-global layer.
@@ -786,7 +857,10 @@ impl MlxHybridState {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
         global_layer_start: usize,
+        bindings: &[AppendStreamBinding],
     ) -> Result<Self, Exception> {
+        AppendStreamBinding::validate_layout(&layout, bindings)
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let layers = layout
             .layers()
             .iter()
@@ -798,12 +872,14 @@ impl MlxHybridState {
                 MlxHybridLayerState::paged(global_layer, policy, &manager, rank)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        let mut state = Self {
             layout,
             global_layer_start,
             layers,
             manager: Some(manager),
-        })
+        };
+        state.initialize_streams(bindings, None, StateComponentPlacement::Paged, rank)?;
+        Ok(state)
     }
 
     /// Creates the exact component placements selected before allocation.
@@ -826,6 +902,9 @@ impl MlxHybridState {
         rank: Option<CacheRankIdentity>,
         global_layer_start: usize,
     ) -> Result<Self, Exception> {
+        let bindings = selected.append_streams();
+        AppendStreamBinding::validate_selected(selected, bindings)
+            .map_err(|e| Exception::custom(e.to_string()))?;
         let selected_layers = selected_state_layers(selected)?;
         let layout = selected.layout().clone();
         let layers = layout
@@ -846,12 +925,56 @@ impl MlxHybridState {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        let mut state = Self {
             layout,
             global_layer_start,
             layers,
             manager,
-        })
+        };
+        state.initialize_streams(
+            bindings,
+            Some(selected),
+            StateComponentPlacement::Device,
+            rank,
+        )?;
+        Ok(state)
+    }
+
+    fn initialize_streams(
+        &mut self,
+        bindings: &[AppendStreamBinding],
+        selected: Option<&SelectedStateRealization>,
+        default: StateComponentPlacement,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<(), Exception> {
+        let placements = selected.map(selected_state_layers).transpose()?;
+        for (layer, state) in self.layers.iter_mut().enumerate() {
+            let local = bindings
+                .iter()
+                .filter(|b| b.layer == layer)
+                .cloned()
+                .collect::<Vec<_>>();
+            state.streams = LayerStreams::new(
+                self.global_layer_start + layer,
+                &local,
+                |slot| {
+                    if let Some(placements) = &placements {
+                        placements[layer]
+                            .iter()
+                            .find(|c| {
+                                c.component().role() == StateComponentRole::AppendStream { slot }
+                            })
+                            .map(SelectedStateComponentRealization::placement)
+                            .ok_or_else(|| Exception::custom("selected stream placement missing"))
+                    } else {
+                        Ok(default)
+                    }
+                },
+                self.manager.as_ref(),
+                rank,
+            )?;
+        }
+        Ok(())
     }
 
     /// Borrows ordinary layer state without changing native storage or frontiers.
@@ -944,10 +1067,9 @@ impl MlxHybridState {
         Ok(())
     }
 
-    /// Creates an independently advanceable speculative fork.
-    ///
-    /// Mutable device arrays are copied. Paged forks share only immutable
-    /// sealed blocks and the architecture-independent residency manager.
+    /// Captures an exact sequential transaction checkpoint.
+    /// Immutable append roots remain shared; independently advancing branches
+    /// use the model-wide fork operation to receive a separate paging manager.
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
         Ok(Self {
             layout: self.layout.clone(),
@@ -970,6 +1092,7 @@ impl MlxHybridState {
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut fork = self.deep_clone_state()?;
         for layer in &mut fork.layers {
+            layer.streams = layer.streams.fork(Some(&manager), stream)?;
             match layer.attention.as_mut() {
                 Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
                     cache.rebind_paging_manager(manager.clone());
@@ -1013,6 +1136,7 @@ impl MlxHybridState {
                     ));
                 }
             }
+            current.streams.restore(&previous.streams, stream)?;
             current.fixed.clone_from(&previous.fixed);
             current.fixed_offset = previous.fixed_offset;
         }
@@ -1203,6 +1327,7 @@ impl MlxHybridState {
             }
             if let Some(attention) = &mut state.attention {
                 attention.finalize()?;
+                state.streams.finalize()?;
                 if attention.manager().is_none() {
                     return Err(Exception::custom(
                         "prompt persistence requires paged hybrid attention state",
@@ -1244,6 +1369,9 @@ impl MlxHybridState {
                 self.layers.len()
             )));
         }
+        for layer in &self.layers {
+            layer.streams.validate_batch(descriptor.batch_size())?;
+        }
         let mut manager = self.manager.clone();
         for (layer, (state, delta)) in self
             .layers
@@ -1267,6 +1395,7 @@ impl MlxHybridState {
             }
             if let Some(attention) = &mut state.attention {
                 attention.finalize()?;
+                state.streams.finalize()?;
                 manager.get_or_insert_with(|| {
                     attention
                         .manager()
@@ -1350,7 +1479,7 @@ fn hybrid_attention_policy(
     match policy {
         LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => Ok(None),
         LayerCachePolicy::KeyValue { attention, .. }
-        | LayerCachePolicy::KeyValueWithFixedState { attention, .. } => attention
+        | LayerCachePolicy::KeyValueWithState { attention, .. } => attention
             .sliding_window_i32()
             .map(|window| HybridAttentionPolicy::KeyValue {
                 window,
@@ -1359,7 +1488,7 @@ fn hybrid_attention_policy(
             .map(Some)
             .map_err(|error| Exception::custom(error.to_string())),
         LayerCachePolicy::KeyOnly { attention, .. }
-        | LayerCachePolicy::KeyOnlyWithFixedState { attention, .. } => attention
+        | LayerCachePolicy::KeyOnlyWithState { attention, .. } => attention
             .sliding_window_i32()
             .map(|window| HybridAttentionPolicy::KeyValue {
                 window,
@@ -1380,3 +1509,15 @@ mod semantic_transaction_tests;
 #[cfg(test)]
 #[path = "tests/isolated_snapshots.rs"]
 mod isolated_snapshot_tests;
+
+#[cfg(test)]
+#[path = "tests/integer_history.rs"]
+mod integer_history_tests;
+
+#[cfg(test)]
+#[path = "tests/qsa_partial.rs"]
+mod qsa_partial_tests;
+
+#[cfg(test)]
+#[path = "tests/qsa_indexed.rs"]
+mod qsa_indexed_tests;

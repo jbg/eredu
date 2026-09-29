@@ -26,14 +26,87 @@ impl MechanismInvocation {
             Ok(())
         };
         match *self {
+            Self::LayerNormalization {
+                rows,
+                width,
+                element,
+                weight,
+                weight_element,
+                bias,
+                bias_element,
+            } => {
+                if (!weight && weight_element.is_some()) || (!bias && bias_element.is_some()) {
+                    return Err(Error::backend(
+                        "absent layer normalization parameter has a scalar representation",
+                    ));
+                }
+                if [Some(element), weight_element, bias_element]
+                    .into_iter()
+                    .flatten()
+                    .any(|element| {
+                        !matches!(
+                            element,
+                            TensorElementType::F16
+                                | TensorElementType::Bf16
+                                | TensorElementType::F32
+                                | TensorElementType::F64
+                        )
+                    })
+                {
+                    return Err(Error::backend(
+                        "layer normalization requires floating representations",
+                    ));
+                }
+                add("input", &[rows, width], element, Input)?;
+                add("output", &[rows, width], element, Output)?;
+            }
+            Self::MultiAxisRotary {
+                ref position_shape,
+                position_element,
+                ref spec,
+            } => {
+                let dimensions = spec.dimensions()? as u64;
+                if position_shape.len() < 2
+                    || position_shape.last().copied() != Some(spec.axes.len() as u64)
+                {
+                    return Err(Error::backend(
+                        "multi-axis rotary position shape must end in its configured axis count",
+                    ));
+                }
+                add("positions", position_shape, position_element, Input)?;
+                let mut output_shape = position_shape.clone();
+                *output_shape.last_mut().unwrap() = dimensions;
+                add("cosine", &output_shape, TensorElementType::F32, Output)?;
+                add("sine", &output_shape, TensorElementType::F32, Output)?;
+            }
             Self::Projection {
                 rows,
                 input,
                 output,
                 format,
                 element,
+                bias,
+                bias_element,
                 ..
             } => {
+                if !bias && bias_element.is_some() {
+                    return Err(Error::backend(
+                        "absent projection bias has a scalar representation",
+                    ));
+                }
+                if bias_element.is_some_and(|element| {
+                    !matches!(
+                        element,
+                        TensorElementType::F16
+                            | TensorElementType::Bf16
+                            | TensorElementType::F32
+                            | TensorElementType::F64
+                    )
+                }) {
+                    return Err(Error::backend(
+                        "projection bias representation must be floating point",
+                    ));
+                }
                 format.validate().map_err(Error::backend)?;
                 add("input", &[rows, input], element, Input)?;
                 add("output", &[rows, output], element, Output)?;
@@ -74,20 +147,79 @@ impl MechanismInvocation {
                     Output,
                 )?;
             }
+            Self::IndexedAttention {
+                batch,
+                query_heads,
+                kv_heads,
+                queries,
+                selected,
+                local,
+                key_width,
+                value_width,
+                element,
+                ..
+            } => {
+                if kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) || key_width == 0 {
+                    return Err(Error::backend("invalid selected attention head geometry"));
+                }
+                selected
+                    .checked_add(local)
+                    .ok_or_else(|| Error::backend("selected attention extent overflowed"))?;
+                add(
+                    "queries",
+                    &[batch, query_heads, queries, key_width],
+                    element,
+                    Input,
+                )?;
+                if selected > 0 {
+                    add(
+                        "selected_positions",
+                        &[batch, queries, selected],
+                        TensorElementType::I32,
+                        Input,
+                    )?;
+                }
+                if local > 0 {
+                    add(
+                        "local_keys",
+                        &[batch, kv_heads, local, key_width],
+                        element,
+                        Input,
+                    )?;
+                    add(
+                        "local_values",
+                        &[batch, kv_heads, local, value_width],
+                        element,
+                        Input,
+                    )?;
+                }
+                add(
+                    "output",
+                    &[batch, query_heads, queries, value_width],
+                    element,
+                    Output,
+                )?;
+            }
             Self::Convolution {
                 batch,
                 tokens,
                 channels,
                 kernel,
+                dilation,
                 element,
             } => {
-                if kernel == 0 {
-                    return Err(Error::backend("convolution kernel must be positive"));
+                if kernel == 0 || dilation == 0 {
+                    return Err(Error::backend(
+                        "convolution kernel and dilation must be positive",
+                    ));
                 }
+                let history = (kernel - 1)
+                    .checked_mul(dilation)
+                    .ok_or_else(|| Error::backend("convolution history length overflowed"))?;
                 add("input", &[batch, tokens, channels], element, Input)?;
                 add("output", &[batch, tokens, channels], element, Output)?;
                 if kernel > 1 {
-                    add("history", &[batch, kernel - 1, channels], element, State)?;
+                    add("history", &[batch, history, channels], element, State)?;
                 }
             }
             Self::Recurrent {

@@ -4,7 +4,7 @@ use eredu_nn::{
     AttentionCache, Error, GroupedNeuralBackend, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
-use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
+use eredu_runtime::{ParameterProvider, ResidentExpertProvider, RuntimeStateComponents};
 
 use crate::decoder::{Attention, AttentionInput};
 
@@ -151,6 +151,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
             ReplicatedOperator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
             ReplicatedOperator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
+                    selected_positions: None,
                     hidden: &normalized,
                     mask,
                     cache: Some(state),
@@ -386,7 +387,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_instrumented_with_provider(
@@ -417,7 +418,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
@@ -447,7 +448,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let boundary = match &self.operator {
@@ -471,6 +472,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             Operator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
             Operator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
+                    selected_positions: None,
                     hidden: &normalized,
                     mask,
                     cache: Some(state),
@@ -524,7 +526,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
@@ -553,7 +555,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_parallel_instrumented_with_provider(
@@ -584,7 +586,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     ) -> Result<B::Tensor, Error>
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let boundary = match &self.operator {
@@ -610,6 +612,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             }
             Operator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
+                    selected_positions: None,
                     hidden: &normalized,
                     mask,
                     cache: Some(state),

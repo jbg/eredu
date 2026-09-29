@@ -402,6 +402,20 @@ const bfloat16_t* mlx_array_data_bfloat16(const mlx_array arr);
 int _mlx_array_is_available(bool* res, const mlx_array arr);
 
 /**
+ * Non-evaluating storage metadata for an available array. The identity is an
+ * internal, borrowed Data address, valid only while the caller retains the
+ * queried arrays; it must not be exported as a persistent allocation identity.
+ * Capacity is allocator-charged storage, excluding allocator/runtime overhead.
+ * Custom/imported storage has unknown capacity. Distinct Data identities do
+ * not establish disjoint storage for such external allocations.
+ */
+int _mlx_array_storage_metadata(
+    uintptr_t* identity,
+    bool* allocator_owned,
+    size_t* allocator_capacity,
+    const mlx_array arr);
+
+/**
  * Wait on the array to be available. After this `_mlx_array_is_available`
  * returns `true`. Internal function: use at your own risk.
  */

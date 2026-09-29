@@ -7,7 +7,7 @@ use eredu_nn::{
     NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
     PoolingAttentionCache, Tensor,
 };
-use eredu_runtime::{ExpertPass, RoutedExpertProvider};
+use eredu_runtime::{ExpertPass, ParameterProvider};
 
 use crate::decoder::ComponentInstrumentation;
 
@@ -234,7 +234,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_decoder(
@@ -291,7 +291,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -332,7 +332,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -419,7 +419,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
@@ -626,7 +626,7 @@ where
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_execution(
@@ -697,7 +697,7 @@ where
     ) -> Result<PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
         H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
@@ -788,7 +788,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
@@ -894,7 +894,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {

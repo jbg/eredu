@@ -14,7 +14,7 @@ use super::acquisition::preflight_selected_entry_bindings;
 use super::*;
 use crate::tests::support::grouped_provider::ParameterBankSelection;
 use eredu_core::residency::CacheEvictionPolicy;
-use eredu_runtime::WeightBinding;
+use eredu_runtime::{ParameterBank, WeightBinding};
 
 fn stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -215,7 +215,13 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
     let error = AddressableParameterBank::new_selected_shared(
         store.clone(),
         selected,
-        ParameterBankOptions::default(),
+        &eredu_runtime::SelectedRowLookups::select(
+            eredu_runtime::PreparedRowLookups::default(),
+            eredu_runtime::ParameterBankLoadOptions::default(),
+            0,
+            &MlxRowLookupSupport,
+        )
+        .unwrap(),
         stream(),
         stream(),
     )
@@ -247,7 +253,13 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     let error = AddressableParameterBank::new_selected_shared(
         store.clone(),
         selected,
-        ParameterBankOptions::default(),
+        &eredu_runtime::SelectedRowLookups::select(
+            eredu_runtime::PreparedRowLookups::default(),
+            eredu_runtime::ParameterBankLoadOptions::default(),
+            0,
+            &MlxRowLookupSupport,
+        )
+        .unwrap(),
         stream(),
         stream(),
     )
@@ -285,7 +297,13 @@ fn residency_report_retains_exact_selected_entry_placement() {
     let bank = AddressableParameterBank::new_selected_shared(
         store,
         selected,
-        ParameterBankOptions::default(),
+        &eredu_runtime::SelectedRowLookups::select(
+            eredu_runtime::PreparedRowLookups::default(),
+            eredu_runtime::ParameterBankLoadOptions::default(),
+            0,
+            &MlxRowLookupSupport,
+        )
+        .unwrap(),
         stream(),
         stream(),
     )
@@ -460,6 +478,7 @@ fn quantized_cache_materializes_only_rank_local_entry_and_tp_recipes() {
     let cache = AddressableParameterBank::new_shared_with_policy(
         transformed.store,
         transformed.entries,
+        Vec::new(),
         options,
         ResidencyPolicy::Cacheable,
         MemoryTier::Disk,

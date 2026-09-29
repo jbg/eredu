@@ -11,6 +11,33 @@ use eredu_checkpoint::LinearFormat;
 /// One invocation's typed logical geometry, derived from ordinary operator inputs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MechanismInvocation {
+    /// Affine final-axis layer normalization. Logical outputs use the nominal
+    /// input representation; the selected backend establishes actual promotion.
+    LayerNormalization {
+        /// Independent normalized rows.
+        rows: u64,
+        /// Final-axis feature count.
+        width: u64,
+        /// Input scalar representation.
+        element: TensorElementType,
+        /// Learned multiplicative scale is present.
+        weight: bool,
+        /// Actual scale representation, or unknown when present.
+        weight_element: Option<TensorElementType>,
+        /// Learned additive bias is present.
+        bias: bool,
+        /// Actual bias representation, or unknown when present.
+        bias_element: Option<TensorElementType>,
+    },
+    /// Cosine/sine construction from explicit spatial or temporal positions.
+    MultiAxisRotary {
+        /// Full position tensor shape, ending in the number of configured axes.
+        position_shape: Vec<u64>,
+        /// Representation of caller-owned positions, before native conversion.
+        position_element: TensorElementType,
+        /// Ordinary portable rotary policy, including layout and axis widths.
+        spec: crate::multimodal::MultiAxisRotarySpec,
+    },
     /// Dense or packed affine projection; physical parameter storage is described separately.
     Projection {
         /// Independent input rows.
@@ -27,6 +54,9 @@ pub enum MechanismInvocation {
         weight_element: Option<TensorElementType>,
         /// Ordinary output bias is present.
         bias: bool,
+        /// Actual output bias representation, when known. `None` with `bias`
+        /// true means unknown; an absent bias must have no representation.
+        bias_element: Option<TensorElementType>,
     },
     /// Grouped-query attention, before backend kernel/tile selection.
     Attention {
@@ -53,6 +83,32 @@ pub enum MechanismInvocation {
         /// Learned sink logits are present.
         sinks: bool,
     },
+    /// Selected-position grouped-query attention. Retained source history is
+    /// owned and accounted by the cache; `selected` bounds one query's reads.
+    IndexedAttention {
+        /// Independent sequences.
+        batch: u64,
+        /// Query heads.
+        query_heads: u64,
+        /// Key/value heads.
+        kv_heads: u64,
+        /// Query rows per head.
+        queries: u64,
+        /// Selected slots per query, including invalid padding and duplicates.
+        selected: u64,
+        /// Optional unindexed local source length.
+        local: u64,
+        /// Query/key width.
+        key_width: u64,
+        /// Value width.
+        value_width: u64,
+        /// Activation representation.
+        element: TensorElementType,
+        /// Required score rounding.
+        arithmetic: AttentionArithmetic,
+        /// Learned sink logits are present.
+        sinks: bool,
+    },
     /// Causal depthwise convolution including its retained history.
     Convolution {
         /// Batch size.
@@ -63,6 +119,8 @@ pub enum MechanismInvocation {
         channels: u64,
         /// Kernel width, including the current token.
         kernel: u64,
+        /// Spacing between consecutive kernel taps.
+        dilation: u64,
         /// Input scalar representation.
         element: TensorElementType,
     },
@@ -215,6 +273,19 @@ impl MechanismBytes {
     /// Known minimum with an unbounded remainder.
     pub const fn unknown(lower: u64) -> Self {
         Self { lower, upper: None }
+    }
+    /// Validates a capacity interval for one new allocation request. Every
+    /// possible capacity must contain its requested payload. An unknown upper
+    /// bound remains valid and does not establish finite allocation admission.
+    /// This checks the interval, not allocator provenance or allocation success.
+    pub fn validate_for_payload(self, payload_bytes: u64) -> Result<(), Error> {
+        self.validate()?;
+        if self.lower < payload_bytes {
+            return Err(Error::backend(
+                "allocation capacity lower bound is below requested payload",
+            ));
+        }
+        Ok(())
     }
     fn validate(self) -> Result<(), Error> {
         if self.upper.is_some_and(|upper| upper < self.lower) {

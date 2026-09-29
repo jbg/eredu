@@ -253,7 +253,7 @@ fn compressed_latent_host_demotion_and_rehydration_preserve_atomic_pairs() {
                 &rotary_values[..2]
             );
         }
-        CacheBlockArrays::KeyValue { .. } => {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
             panic!("compressed-latent block was rehydrated as key/value state")
         }
     }
@@ -316,7 +316,7 @@ fn compressed_latent_live_disk_demotion_and_rehydration_preserve_atomic_pairs() 
                 &rotary_values[..2]
             );
         }
-        CacheBlockArrays::KeyValue { .. } => {
+        CacheBlockArrays::KeyValue { .. } | CacheBlockArrays::AppendStream { .. } => {
             panic!("compressed-latent disk block was rehydrated as key/value state")
         }
     }

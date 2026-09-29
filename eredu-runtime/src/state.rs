@@ -378,6 +378,9 @@ impl StateLayout {
             .checked_add(bytes::<Vec<StateComponentPolicy>>(self.components.len())?)?
             .checked_add(bytes::<StateSegmentSpec>(self.segments.len())?)?;
         for layer in self.layers.iter() {
+            total = total.checked_add(bytes::<eredu_core::cache::AppendStreamPolicy>(
+                layer.append_streams().len(),
+            )?)?;
             total = total.checked_add(bytes::<StateTensorPolicy>(layer.fixed_state().len())?)?;
             for tensor in layer.fixed_state() {
                 total = total.checked_add(bytes::<StateTensorDimension>(tensor.shape.len())?)?;
@@ -519,8 +522,45 @@ pub trait RuntimeStateComponents<B: NeuralBackend>: RuntimeLayerState<B> {
         role: StateTensorRole,
     ) -> Result<&mut Option<B::Tensor>, StateError>;
 
+    /// Atomically replaces declared components after their tensor work succeeds.
+    /// Unknown or duplicate roles must leave every component unchanged. The owner
+    /// retains submission and rollback authority for surrounding attention/streams.
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(StateTensorRole, Option<B::Tensor>)>,
+    ) -> Result<(), StateError>;
+
     /// Advances a fixed-state-only layer after a successful operator call.
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError>;
+}
+
+/// Validates an entire component publication before moving any tensor handle.
+/// Concrete state implementations supply their existing declared slots; no new
+/// state roles or backend values are inferred by this mechanism.
+pub fn replace_fixed_components<'a, T: 'a>(
+    slots: impl IntoIterator<Item = (StateTensorRole, &'a mut Option<T>)>,
+    values: Vec<(StateTensorRole, Option<T>)>,
+) -> Result<(), StateError> {
+    let mut declared = std::collections::BTreeMap::new();
+    for (role, value) in slots {
+        if declared.insert(role, value).is_some() {
+            return Err(StateError::DuplicateComponent { role });
+        }
+    }
+    let mut slots = declared;
+    let mut seen = std::collections::BTreeSet::new();
+    for (role, _) in &values {
+        if !seen.insert(*role) {
+            return Err(StateError::DuplicateComponent { role: *role });
+        }
+        if !slots.contains_key(role) {
+            return Err(StateError::UnknownComponent { role: *role });
+        }
+    }
+    for (role, value) in values {
+        **slots.get_mut(&role).expect("validated declared slot") = value;
+    }
+    Ok(())
 }
 
 /// Mutable state realization consumed by generic resident and layerwise engines.
@@ -972,6 +1012,12 @@ pub enum StateError {
         /// Requested semantic component.
         role: StateTensorRole,
     },
+    /// A publication attempts to assign a component more than once.
+    #[error("runtime state publication repeats component {role:?}")]
+    DuplicateComponent {
+        /// Repeated semantic component.
+        role: StateTensorRole,
+    },
     /// A fixed-state token frontier could not be advanced safely.
     #[error("invalid fixed-state advance: {0}")]
     InvalidAdvance(String),
@@ -981,6 +1027,33 @@ pub enum StateError {
 mod tests {
     use super::*;
     use eredu_core::{AttentionPolicy, LayerSchedule};
+
+    #[test]
+    fn component_publication_validates_all_roles_before_changing_any_value() {
+        let a = StateTensorRole::Auxiliary { slot: 0 };
+        let b = StateTensorRole::IntegerHistory { slot: 1 };
+        let mut slots = std::collections::BTreeMap::from([(a, Some(17)), (b, Some(-23))]);
+        for values in [
+            vec![
+                (a, Some(99)),
+                (StateTensorRole::Auxiliary { slot: 9 }, None),
+            ],
+            vec![(a, Some(99)), (a, None)],
+        ] {
+            assert!(
+                replace_fixed_components(slots.iter_mut().map(|(r, v)| (*r, v)), values).is_err()
+            );
+            assert_eq!(slots[&a], Some(17));
+            assert_eq!(slots[&b], Some(-23));
+        }
+        replace_fixed_components(
+            slots.iter_mut().map(|(r, v)| (*r, v)),
+            vec![(b, None), (a, Some(71))],
+        )
+        .unwrap();
+        assert_eq!(slots[&a], Some(71));
+        assert_eq!(slots[&b], None);
+    }
 
     fn layout() -> StateLayout {
         StateLayout::new(

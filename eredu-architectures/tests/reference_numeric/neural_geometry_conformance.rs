@@ -41,8 +41,15 @@ fn numeric_grouped_normalization_rejects_bad_geometry_without_panics() {
             &input, &gate, &weight, groups, epsilon, &context
         )
         .is_err());
-        assert!(NumericBackend::silu_gated_group_rms_norm(
-            &input, &gate, &weight, groups, epsilon, &context
+        assert!(NumericBackend::output_gated_group_rms_norm(
+            &input,
+            &gate,
+            &weight,
+            groups,
+            epsilon,
+            eredu_nn::OutputGateActivation::Silu,
+            eredu_nn::OutputGatedNormArithmetic::RoundedNormalization,
+            &context
         )
         .is_err());
     }

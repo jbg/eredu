@@ -536,6 +536,7 @@ fn compact_convolution_history_releases_prompt_backing_storage() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let mut convolution = CausalDepthwiseConvolution::<MlxNeuralBackend>::new(
         CausalDepthwiseConvolutionSpec {
+            dilation: 1,
             channels: 32,
             kernel_size: 4,
             weight: ParameterSpec::trainable("conv.weight").unwrap(),

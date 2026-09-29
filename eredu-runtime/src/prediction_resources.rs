@@ -391,7 +391,7 @@ pub fn describe_prediction_resources(
         .collect::<Vec<_>>();
     let mut description = crate::execution_resources::describe_prepared_resources(
         selected,
-        None,
+        &[],
         slots,
         &declarations,
         &query.prepared,
@@ -451,6 +451,7 @@ pub fn describe_prediction_resources(
             let sliding = if !matches!(
                 component.role(),
                 eredu_core::cache::StateComponentRole::Fixed(_)
+                    | eredu_core::cache::StateComponentRole::AppendStream { .. }
             ) {
                 layer
                     .policy

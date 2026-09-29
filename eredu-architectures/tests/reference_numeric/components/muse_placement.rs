@@ -530,7 +530,10 @@ fn muse_decoder_ingress_remains_pending_through_vision_execution() {
     )
     .unwrap();
     let mut forward =
-        <Model as CompositeArchitecture<NumericBackend, State>>::begin_composite_forward_parallel(
+        <Model as eredu_architectures::composite_execution::ParallelCompositeArchitecture<
+            NumericBackend,
+            State,
+        >>::begin_composite_forward_parallel(
             &mut model,
             PreparedCompositeInput::new(&input, &admitted).unwrap(),
             &mut state,

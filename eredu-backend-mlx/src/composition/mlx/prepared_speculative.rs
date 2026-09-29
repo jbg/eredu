@@ -68,26 +68,50 @@ where
 {
     type Input = MlxModelInput;
 
-    fn with_prefill<R>(
+    fn with_prefill_chunks(
         &mut self,
         input: Self::Input,
+        maximum_chunk_tokens: usize,
         context: &Stream,
-        operation: impl for<'a> FnOnce(
+        mut operation: impl for<'a> FnMut(
             A::Input<'a>,
             MlxTensor,
             Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
-        ) -> Result<R, Exception>,
-    ) -> Result<R, Exception> {
+        ) -> Result<A::ForwardContext, Exception>,
+    ) -> Result<(), Exception> {
+        if maximum_chunk_tokens == 0 {
+            return Err(Exception::custom(
+                "prediction prefill chunk size must be positive",
+            ));
+        }
         input.with_borrowed(|input| {
             let tokens = input::text_token_ids(input, context)
                 .map(MlxTensor::from_array)
                 .map_err(Exception::from_source)?;
-            let prepared_tokens = tokens.clone();
-            operation(
-                A::text_input(&prepared_tokens, None),
-                tokens,
-                input.cache_identity(),
-            )
+            let sequence = tokens.as_array().shape()[1] as usize;
+            if sequence > maximum_chunk_tokens && !A::supports_chunked_prefill() {
+                return Err(Exception::custom(
+                    "selected architecture cannot split prediction prefill input",
+                ));
+            }
+            for start in (0..sequence).step_by(maximum_chunk_tokens) {
+                let end = start.saturating_add(maximum_chunk_tokens).min(sequence);
+                let chunk = if start == 0 && end == sequence {
+                    tokens.clone()
+                } else {
+                    MlxTensor::from_array(
+                        tokens
+                            .as_array()
+                            .try_index_device((.., start as i32..end as i32), context)?,
+                    )
+                };
+                operation(
+                    A::text_input(&chunk, None),
+                    chunk.clone(),
+                    input.cache_identity(),
+                )?;
+            }
+            Ok(())
         })
     }
 

@@ -686,7 +686,12 @@ impl PagedCompressedLatentCache {
                 candidate_latent.nbytes() as u64 + candidate_rotary.nbytes() as u64;
             let candidate_end = candidate_tail_start + candidate_latent.dim(1) as i64;
             self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, candidate_end)
+                .set_tail_state(
+                    self.global_layer,
+                    eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+                    candidate_bytes,
+                    candidate_end,
+                )
                 .map_err(cache_residency_exception)?;
             self.tail_start = candidate_tail_start;
             self.tail_latent = Some(candidate_latent);
@@ -732,10 +737,12 @@ impl PagedCompressedLatentCache {
                 rollback_error.get_or_insert_with(|| cache_residency_exception(error));
             }
         }
-        if let Err(error) =
-            self.manager
-                .set_tail_state(self.global_layer, self.tail_bytes(), previous_offset)
-        {
+        if let Err(error) = self.manager.set_tail_state(
+            self.global_layer,
+            eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+            self.tail_bytes(),
+            previous_offset,
+        ) {
             rollback_error.get_or_insert_with(|| cache_residency_exception(error));
         }
         match rollback_error {
@@ -775,7 +782,12 @@ impl PagedCompressedLatentCache {
                 .map(|array| array.nbytes() as u64)
                 .sum();
             self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, len)
+                .set_tail_state(
+                    self.global_layer,
+                    eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+                    candidate_bytes,
+                    len,
+                )
                 .map_err(cache_residency_exception)?;
             self.tail_latent = candidate_latent;
             self.tail_rotary = candidate_rotary;
@@ -847,7 +859,12 @@ impl PagedCompressedLatentCache {
             .take()
             .expect("compressed latent and rotary tails are initialized atomically");
         let end = self.tail_start + latent.dim(1) as i64;
-        if let Err(error) = self.manager.set_tail_state(self.global_layer, 0, end) {
+        if let Err(error) = self.manager.set_tail_state(
+            self.global_layer,
+            eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+            0,
+            end,
+        ) {
             self.tail_latent = Some(latent);
             self.tail_rotary = Some(rotary_key);
             return Err(cache_residency_exception(error));
@@ -866,7 +883,12 @@ impl PagedCompressedLatentCache {
             self.tail_latent = Some(latent);
             self.tail_rotary = Some(rotary_key);
             self.manager
-                .set_tail_state(self.global_layer, self.tail_bytes(), end)
+                .set_tail_state(
+                    self.global_layer,
+                    eredu_core::cache::CacheRepresentation::CompressedLatentRotary,
+                    self.tail_bytes(),
+                    end,
+                )
                 .map_err(cache_residency_exception)?;
             return Err(cache_residency_exception(error));
         }

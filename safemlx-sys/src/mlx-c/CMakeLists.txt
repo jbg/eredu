@@ -120,6 +120,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     mlx-patch-test-binary
     ${CMAKE_CURRENT_LIST_DIR}/tests/event_submission_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/array_storage_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
     ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
@@ -134,7 +135,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")

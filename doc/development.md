@@ -55,8 +55,7 @@ The root must be absolute and should have only one Cargo build writing to it
 at a time. Each target, Cargo profile, and native feature configuration has
 its own subdirectory. Ordinary builds without this variable retain Cargo's
 default build-directory behavior. Changing a Rust package version or
-`CARGO_TARGET_DIR` no longer discards native compilation when this cache is
-used. CMake still configures the project and tracks compiler flags, sources,
+`CARGO_TARGET_DIR` preserves native compilation when this cache is used. CMake still configures the project and tracks compiler flags, sources,
 and the content-identified MLX patches. `cargo clean` does not remove this
 external native directory; remove the selected `.native-build` tree explicitly
 when a completely fresh native build is wanted.
@@ -86,8 +85,7 @@ Rust keys include the source commit and fall back across compatible dependency
 versions, allowing the snapshot to improve after source-only fixes. Gate cleanup
 keeps only the newest snapshot per configuration, with a 4 GiB aggregate Rust
 budget across all cache revisions, and removes the superseded `rust-v2`
-snapshots. The `rust-v4` keys fall back to compatible `rust-v3` snapshots during
-migration. Archive subsets have distinct exact keys on the same commit but
+snapshots. The `rust-v4` keys fall back to compatible `rust-v3` snapshots. Archive subsets have distinct exact keys on the same commit but
 share fallback artifacts. Exact hits are not saved again. Cleanup leaves all native
 caches untouched. Pull requests restore caches but do not save Rust snapshots or
 run cache cleanup. Missing caches only affect performance, never test selection.

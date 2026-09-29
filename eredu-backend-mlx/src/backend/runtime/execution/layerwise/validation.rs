@@ -68,6 +68,15 @@ mod validate_unused_tests {
         let consumed = BTreeSet::from(["claimed.weight".into()]);
         validate_unused(&ResolvedTestSource, &consumed, |_| false).unwrap();
     }
+
+    #[test]
+    fn declared_unconsumed_parameter_is_rejected() {
+        let error = validate_unused(&ResolvedTestSource, &BTreeSet::new(), |_| false)
+            .expect_err("a resolved schema does not authorize silently dropping declared weights");
+        assert!(matches!(error,
+            Error::LayerwiseModel(LayerwiseModelError::UnexpectedCheckpointParameters { unused })
+                if unused == ["claimed.weight"]));
+    }
 }
 
 /// Validates that required host storage fits the configured offload budget.

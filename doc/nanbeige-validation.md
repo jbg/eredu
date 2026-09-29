@@ -25,48 +25,31 @@ cargo test -p eredu-architectures --test reference_numeric discovery::
 cargo test -p eredu-architectures --test reference_numeric nanbeige_official_gguf_layout
 ```
 
-## Native tools and reasoning regression from Goose
+## Native tools and reasoning
 
-Investigated against Eredu `7cb5dee5afc4ac50c27aab9993aabc7edffbe879` using
-the same pinned checkpoint below on 2026-09-09. Both shard SHA-256 hashes were
-rechecked and matched. The embedded template was used without modifications.
+Tagged-parameter activation occurs at `<tool_call>`. Grammar and parsing accept
+XML whitespace between structural tags while raw parameter values preserve their
+whitespace, including newlines and carriage returns. EOS is masked until an active
+call is complete. Interrupted calls emit no `ToolCallEnd` and cannot execute. See
+[the wire-format contract](tool-calling.md) for framing and replay rules.
 
-Two facade runtime defects were demonstrated:
-
-1. The tagged-parameter dialect activated on `<tool_call>\n` and required exact
-   newlines between tags. The observed `<tool_call>  <function=todo__todo_write>`
-   therefore remained ordinary text. Activation now occurs at `<tool_call>`;
-   the grammar and parser accept XML whitespace between structural tags. Raw
-   parameter values retain their whitespace, including extra newlines and CR.
-   See [the wire-format contract](tool-calling.md) for framing and replay rules.
-2. The grammar vocabulary promoted every bracketed added token to a special
-   token. Nanbeige declares `<think>`, `</think>`, `<tool_call>` and
-   `</tool_call>` as **non-special** added tokens. The promoted `</think>` ID
-   `166104` could not match the grammar's ordinary text spelling. This masked
-   the model's chosen reasoning terminator and caused repeated reasoning.
-   Vocabulary construction now honors the tokenizer's `special` flag. Explicit
-   structural token IDs still work for ordinary added tokens, including LFM2.
-
-The Goose session `20260909_1` recorded 98 output tokens, a `stop_sequence`
-finish, and only an incomplete `<tool_call>` after reasoning. Its logs do not
-retain raw sampled token IDs or logits, so the precise model decision cannot be
-reconstructed. Previously this marker alone did not activate constraints and
-could be followed by termination. Now activation immediately masks EOS until a
-call is complete. Budget exhaustion or another interruption still cannot execute
-a partial call: parsing reports an incomplete call and emits no `ToolCallEnd`.
+Grammar vocabulary honors each tokenizer entry's `special` flag. Nanbeige's
+`<think>`, `</think>`, `<tool_call>` and `</tool_call>` are non-special added tokens;
+they participate in ordinary text spelling. Explicit structural token IDs also
+work for non-special added tokens.
 
 ### Matched prompt comparison
 
-The request was exactly:
+The comparison request is:
 
 ```text
 System: You are a concise assistant. Follow the user's instructions and use tools when requested.
 User: Reply with just the word hello.
 ```
 
-Thinking was enabled. The official template rendered a 40-token prompt ending
-in `<|im_start|>assistant\n<think>\n`. Python and Eredu rendered identical
-UTF-8 text and produced identical prompt IDs, with no extra BOS token:
+Thinking is enabled. The official template renders a 40-token prompt ending
+in `<|im_start|>assistant\n<think>\n`. Python and Eredu render identical
+UTF-8 text and produce identical prompt IDs, with no extra BOS token:
 
 ```text
 [166100,8481,13,4321,392,261,38503,13886,152361,7916,269,2028,152402,
@@ -74,42 +57,34 @@ UTF-8 text and produced identical prompt IDs, with no extra BOS token:
 37380,358,983,269,3670,32349,152361,166101,13,166100,66354,13,166103,13]
 ```
 
-Eredu used MLX Metal with the original BF16 checkpoint. The independent reference
-used the unchanged released `modeling_nanbeige.py`, PyTorch 2.14.0,
-Transformers 4.48.3, CPU float32 and eager attention. Its model source SHA-256 was
+The recorded Eredu run uses MLX Metal with the checkpoint BF16 weights. The
+independent reference uses the unchanged released `modeling_nanbeige.py`, PyTorch 2.14.0,
+Transformers 4.48.3, CPU float32 and eager attention. Its model source SHA-256 is
 `eab3554c228491b99ff518d6a27b3d3cc5320d541966be369069bd1c5f545fcf`.
-The reference loaded the released fast tokenizer directly through
+The reference loads the released fast tokenizer directly through
 `PreTrainedTokenizerFast`: the legacy Llama tokenizer class requests a slow
 SentencePiece conversion in this environment. Prompt rendering and token IDs
-were checked for exact equality before inference; no model/template patches
-were applied.
+match exactly before inference; the comparison uses unmodified model/template
+sources.
 
 | Run | Output tokens | Result |
 | --- | ---: | --- |
-| Original Eredu, ordinary greedy | 70 | `hello` |
-| Original Eredu, constrained greedy, budget 256 | 256 | repeated reasoning, no final answer |
-| Publisher, greedy | 70 | `hello`; all output IDs match ordinary Eredu |
-| Fixed Eredu, ordinary / constrained / controlled greedy, budget 2048 | 70 each | identical output IDs; `hello` |
-| Fixed Eredu, ordinary / constrained / controlled temperature 0.6, budget 2048 | 68 each | identical output IDs; `hello` |
+| Publisher, greedy | 70 | `hello`; all output IDs match Eredu |
+| Eredu, ordinary / constrained / controlled greedy, budget 2048 | 70 each | identical output IDs; `hello` |
+| Eredu, ordinary / constrained / controlled temperature 0.6, budget 2048 | 68 each | identical output IDs; `hello` |
 | Publisher, temperature 0.6, budget 2048 | 148 | `hello` |
 
-At zero-based output position **65**, ordinary Eredu and the publisher choose
-`166104` (`</think>`); the original constrained run chooses `1526` instead.
-The publisher ranks the closing token first, with logit `40.0951538` using
-cached decode. Recomputing the entire prefix without cache also ranks it first,
-with logit `40.0951843`. The first 65 generated token IDs agree. This locates the
-demonstrated divergence in constraint filtering, rather than the template,
-weights, sampling selection or cached model equations.
+At zero-based output position 65, greedy Eredu and the publisher choose
+`166104` (`</think>`). The publisher ranks it first with cached logit `40.0951538`
+and uncached logit `40.0951843`.
 
-The final sampled comparison explicitly sets temperature `0.6`, top-k `40`,
+The sampled comparison explicitly sets temperature `0.6`, top-k `40`,
 top-p `0.95`, min-p `0.05`, repetition penalty `1`, seed `0` and budget `2048`
 in both implementations. These match the supplied checkpoint directory's
 effective Eredu sampling defaults with the requested temperature override;
 that directory has no `generation_config.json`. Different native RNGs and
 numerical precision mean equal seeds do not imply identical cross-runtime
 sampled outputs. Within Eredu, all three drivers produce exactly the same IDs.
-The original greedy isolation probe disabled top-k/top-p filtering, which does
-not affect argmax; final greedy runs use the same explicit settings as sampling.
 
 ### Tool execution and portable coverage
 
@@ -131,19 +106,9 @@ Unicode and preserved boundary whitespace, string enums, nullable/JSON values,
 schema rejection, every incomplete call prefix, parallel calls, and replay of
 tool results. Replay rejects unescaped `</parameter>` in raw string arguments.
 
-Verification: 176 facade unit tests, 53 backend conformance tests and 19 portable
-facade tests passed (three existing opt-in tests ignored). All three selected
-native tests passed: Nanbeige's eight tool/result round trips, LFM2 native tools,
-and LFM2 optional keyword arguments. Targeted portable/native Clippy with
-`--no-deps -- -D warnings`, formatting and Python syntax checks passed. A broader
-Clippy invocation also checks dependencies and stops at the pre-existing
-`manual_is_multiple_of` lint in `eredu-architectures/src/nanbeige/mod.rs:342`.
-
-No model-name heuristic, checkpoint/template change, generation default change,
-or forced reasoning-length limit was added. Neither matched reference run
-reproduced the reported unbounded reasoning. This establishes the fix for these
-requests, not a guarantee that all prompts finish within a given token budget
-or that a model always chooses the appropriate tool.
+These requests establish matching driver behavior for the recorded fixtures.
+They do not guarantee that arbitrary prompts finish within a particular token
+budget or select an appropriate tool.
 
 ### Reproduce the chat comparison
 
@@ -176,16 +141,13 @@ cargo test -p eredu --no-default-features --lib --test portable_facade --test ba
 reports containing the prompt, token IDs, settings and semantic events.
 `chat_reference.py` verifies rendering/tokenization equality, records the
 unconstrained closing-token rank at every step and checks the closing prediction
-again without cache. Local investigation logs and reports are under
-`/private/tmp/eredu-nanbeige/`, including `before-*`, `final-*`,
-`publisher-greedy.*`, `publisher-sampled.*` and `final-native-tools.log`.
+again without cache.
 
 ## Released checkpoint
 
-Validated on 2026-09-09 using the official
+The reference artifact is the official
 [Nanbeige/Nanbeige4.2-3B checkpoint](https://huggingface.co/Nanbeige/Nanbeige4.2-3B/tree/0e137298720f7241e83b8aabecc4263dcc7d84b3),
-revision `0e137298720f7241e83b8aabecc4263dcc7d84b3`. The two downloaded
-SafeTensors shards were checked against the publisher's LFS SHA-256 hashes:
+revision `0e137298720f7241e83b8aabecc4263dcc7d84b3`. The two SafeTensors shards match the publisher's LFS SHA-256 hashes:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -196,15 +158,15 @@ The index contains 201 tensors and 8,339,601,408 bytes of BF16 tensor data.
 The 22 physical blocks execute twice. Query projection width is 6144 despite
 hidden width 3072; each of the 44 logical invocations has its own KV cache.
 
-The native CPU run on an Apple M3 Ultra used checkpoint BF16 weights. The
-independent reference ran the publisher's `modeling_nanbeige.py` unchanged,
+The recorded native CPU run on an Apple M3 Ultra uses checkpoint BF16 weights. The
+independent reference uses the publisher's `modeling_nanbeige.py` unchanged,
 with Python 3.11.16, PyTorch 2.14.0, Transformers 4.48.3, float32 and eager
-attention. It used no compatibility patches. The raw prompt was
+attention. It uses no compatibility patches. The raw prompt is
 `The capital of France is`, token IDs `[363, 5463, 290, 7914, 322]`.
 
-One prefill and four cached decode steps passed the standard parity thresholds:
+One prefill and four cached decode steps pass the standard parity thresholds:
 relative L2 at most 0.02, cosine similarity at least 0.999, top-five overlap at
-least four and matching argmax. All five predictions matched, with all five
+least four and matching argmax. All five predictions match, with all five
 top-five candidates shared on every row.
 
 | Logit row | Relative L2 | Cosine similarity | Matching argmax |
@@ -215,13 +177,12 @@ top-five candidates shared on every row.
 | Decode 3 | 0.017338 | 0.999853 | 166104 |
 | Decode 4 | 0.013785 | 0.999920 | 13 |
 
-The latest resident run reproduced the original native logits exactly. It
-reported 14,637,625,344 active allocator bytes after loading. Resident
-materialization currently creates a separate module for each logical invocation,
+The resident measurement reports 14,637,625,344 active allocator bytes after
+loading. Resident materialization creates a separate module for each logical invocation,
 including copies of repeated block weights. Storage schemas describe physical
 weights; execution and residency estimates include the actual replicas.
-The complete official checkpoint also passed with a one-block host window and
-disk streaming. Both modes produced bit-for-bit identical logits to the resident
+The complete official checkpoint also passes with a one-block host window and
+disk streaming. Both modes produce bit-for-bit identical logits to the resident
 run for the prefill and all four decode steps. On this CPU setup the MLX allocator
 counters include host staging allocations as well as active execution tensors;
 they should not be interpreted as accelerator memory savings.
@@ -261,13 +222,13 @@ CARGO_INCREMENTAL=0 cargo run -p eredu-evaluation --bin eredu-parity -- \
 ```
 
 `checkpoint_probe --residency-plan PATH` accepts a serialized `ResidencyPlan`.
-A one-block host window used:
+A one-block host window uses:
 
 ```json
 {"mode":"layerwise_host","device_layer_window":1,"device_budget_bytes":4294967296,"host_budget_bytes":34359738368}
 ```
 
-The disk-streamed plan used:
+The disk-streamed plan uses:
 
 ```json
 {"mode":"dense_disk_stream","device_budget_bytes":4294967296,"host_budget_bytes":34359738368,"host_lookahead":1,"background_queue":1}
@@ -297,9 +258,9 @@ not be interpreted as the SafeTensors split-half layout.
 | Controlled sessions | Native ordinary/controlled greedy and seeded sampling equality; snapshot, restore and fork of all logical caches |
 | Discovery and text | Executable captures for logical layers; cache identity includes loop policy; official tokenizer template fixture |
 
-Packed GGUF parity passed the same standard thresholds as above. Maximum
-absolute logit error was below `3e-7` for Q8_0 and `9.23e-4` for Q4_0; all
-argmax predictions matched. Host and disk results matched their resident GGUF
+Packed GGUF parity passes the same standard thresholds as above. Maximum
+absolute logit error is below `3e-7` for Q8_0 and `9.23e-4` for Q4_0; all
+argmax predictions match. Host and disk results match their resident GGUF
 results exactly. The quantized fixture generator is independent of Eredu:
 
 ```sh
@@ -320,8 +281,8 @@ target/debug/eredu-parity \
   --output "$NANBEIGE_VALIDATION/tiny-q8-parity.json"
 ```
 
-Native distributed TP/PP and accelerator execution were not run on this
-single-host CPU validation setup. Parallel support has numerical neutral
+This single-host CPU validation matrix contains no native distributed TP/PP
+or accelerator measurements. Parallel support has numerical neutral
 conformance coverage, rather than a claim of native distributed validation.
 
 Run the checked-in behavioral suites with:

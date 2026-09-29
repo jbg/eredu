@@ -831,6 +831,10 @@ impl NeuralBackend for ReferenceBackend {
 }
 
 impl eredu_nn::DistributedNeuralBackend for ReferenceBackend {
+    fn parallel_rank(_: &()) -> usize {
+        0
+    }
+
     fn vocabulary_parallel_embedding(
         spec: EmbeddingSpec,
         range: VocabularyParallelRange,
@@ -1550,6 +1554,18 @@ impl RuntimeStateComponents<ReferenceBackend> for ReferenceCache {
         _role: eredu_core::cache::StateTensorRole,
     ) -> Result<&mut Option<ReferenceTensor>, StateError> {
         Ok(&mut self.fixed)
+    }
+
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<ReferenceTensor>)>,
+    ) -> Result<(), StateError> {
+        match values.first().map(|(role, _)| *role) {
+            Some(role) => {
+                eredu_runtime::state::replace_fixed_components([(role, &mut self.fixed)], values)
+            }
+            None => Ok(()),
+        }
     }
 
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {

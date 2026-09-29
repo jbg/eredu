@@ -60,7 +60,7 @@ impl<B: GroupedNeuralBackend> Projections<B> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<Option<B::Tensor>, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let Some(values) = &mut self.values else {
@@ -128,7 +128,7 @@ impl<B: GroupedNeuralBackend> Projections<B> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let FeedForward::Routed {
@@ -233,7 +233,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let FeedForward::Routed {

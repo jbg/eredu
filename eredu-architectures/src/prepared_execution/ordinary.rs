@@ -135,25 +135,44 @@ where
     }
 }
 
+/// Architecture-owned construction authority retained through cold selection.
+///
+/// The value owns the exact prepared source, equations, state geometry and selected
+/// mechanisms. Backends choose typed bindings without rebuilding artifact plans.
+#[derive(Clone)]
+pub enum RetainedArchitectureConstruction {
+    /// Routed partition with exact rank sources, placement and local state authority.
+    Qwen4Partition(Box<crate::qwen4_exp::prepared::PreparedTargetPartition>),
+    /// Conditional partition with exact target, projector, local state and row sources.
+    Qwen4ConditionalPartition(Box<crate::qwen4_exp::prepared::PreparedConditionalPartition>),
+    /// Ordinary attention, fixed components and named append-only streams.
+    Qwen4Exp(Box<crate::qwen4_exp::prepared::SelectedTargetExecution>),
+    /// Joint image/video and target execution with retained processor admission.
+    Qwen4Conditional(Box<crate::qwen4_exp::prepared::SelectedConditionalExecution>),
+}
+
 /// Routed text construction with architecture-owned equation and state dispatch.
-pub struct RoutedRoute<'a, B: NeuralBackend, S, PS, G, R, T, P = WithoutPrediction> {
+pub struct RoutedRoute<'a, B: NeuralBackend, S, PS, SS, G, R, T, U, P = WithoutPrediction> {
     context: &'a <B::Tensor as Tensor>::Context,
     source_context: &'a <B::Tensor as Tensor>::Context,
     gated: G,
     relu2: R,
     pooling: T,
+    streams: U,
     prediction: P,
-    states: PhantomData<fn() -> (S, PS)>,
+    states: PhantomData<fn() -> (S, PS, SS)>,
 }
 
-impl<'a, B: NeuralBackend, S, PS, G, R, T> RoutedRoute<'a, B, S, PS, G, R, T> {
-    /// Binds exact gated, ReLU-squared, and pooling visitors; architecture code chooses one.
+impl<'a, B: NeuralBackend, S, PS, SS, G, R, T, U> RoutedRoute<'a, B, S, PS, SS, G, R, T, U> {
+    /// Binds exact gated, ReLU-squared, pooling and append-stream visitors.
+    /// Architecture code chooses the selected state profile.
     pub fn new(
         context: &'a <B::Tensor as Tensor>::Context,
         source_context: &'a <B::Tensor as Tensor>::Context,
         gated: G,
         relu2: R,
         pooling: T,
+        streams: U,
     ) -> Self {
         Self {
             context,
@@ -161,54 +180,127 @@ impl<'a, B: NeuralBackend, S, PS, G, R, T> RoutedRoute<'a, B, S, PS, G, R, T> {
             gated,
             relu2,
             pooling,
+            streams,
             prediction: WithoutPrediction,
             states: PhantomData,
         }
     }
 }
 
-impl<'a, B: NeuralBackend, S, PS, G, R, T, P> RoutedRoute<'a, B, S, PS, G, R, T, P> {
+impl<'a, B: NeuralBackend, S, PS, SS, G, R, T, U, P> RoutedRoute<'a, B, S, PS, SS, G, R, T, U, P> {
     /// Adds native extension materialization and a routed prediction-profile visitor.
     pub fn with_prediction<M, F, V>(
         self,
         materialize: F,
         visitor: V,
-    ) -> RoutedRoute<'a, B, S, PS, G, R, T, PredictionMechanisms<M, (S, PS), F, V>> {
+    ) -> RoutedRoute<'a, B, S, PS, SS, G, R, T, U, PredictionMechanisms<M, (S, PS), F, V>> {
         RoutedRoute {
             context: self.context,
             source_context: self.source_context,
             gated: self.gated,
             relu2: self.relu2,
             pooling: self.pooling,
+            streams: self.streams,
             prediction: PredictionMechanisms::new(materialize, visitor),
             states: PhantomData,
         }
     }
 }
-impl<B: NeuralBackend, S, PS, G, R, T, P> sealed::Sealed for RoutedRoute<'_, B, S, PS, G, R, T, P> {}
-
-impl<B, S, PS, G, R, T, P, C, E, F> PreparedExecutionRoute<SelectedRoutedTextRealization, C, E, F>
-    for RoutedRoute<'_, B, S, PS, G, R, T, P>
+impl<'a, B, S, PS, SS, G, R, T, U, P> RoutedRoute<'a, B, S, PS, SS, G, R, T, U, P>
 where
     B: eredu_nn::GroupedNeuralBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend
-        + eredu_nn::HyperNeuralBackend,
+        + eredu_nn::HyperNeuralBackend
+        + 'static,
+    SS: LayerRuntimeState<B>,
+    SS::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>,
+    U: RoutedTextArchitectureVisitor<B, SS>,
+{
+    /// Constructs an exact retained target with its selected typed state profile.
+    ///
+    /// Prediction owners use the same selected target visitor and shared driver.
+    pub fn construct_retained(
+        self,
+        retained: RetainedArchitectureConstruction,
+        prediction: Option<PredictionBinding>,
+    ) -> Result<U::Output, PreparedExecutionError<U::Error>> {
+        match retained {
+            RetainedArchitectureConstruction::Qwen4Conditional(_)
+            | RetainedArchitectureConstruction::Qwen4Partition(_)
+            | RetainedArchitectureConstruction::Qwen4ConditionalPartition(_) => {
+                Err(PreparedExecutionError::Architecture(
+                    "construction authority does not match nonpartitioned routed route".into(),
+                ))
+            }
+            RetainedArchitectureConstruction::Qwen4Exp(selected) => {
+                let selected = *selected;
+                if let Some(binding) = prediction {
+                    let (target, weights, target_source, provider_source) = selected
+                        .prepare_prediction_execution::<B, SS>(self.context)
+                        .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?
+                        .into_parts();
+                    let weights = weights
+                        .with_discovery_binding(&binding)
+                        .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
+                    return self
+                        .streams
+                        .visit_prediction(target, weights, target_source, provider_source, binding)
+                        .map_err(routed_error);
+                }
+                if selected.prediction_state().is_some() {
+                    return Err(PreparedExecutionError::PredictionSourceMismatch);
+                }
+                selected
+                    .visit::<B, SS, U>(self.context, self.streams)
+                    .map_err(routed_error)
+            }
+        }
+    }
+}
+
+impl<B: NeuralBackend, S, PS, SS, G, R, T, U, P> sealed::Sealed
+    for RoutedRoute<'_, B, S, PS, SS, G, R, T, U, P>
+{
+}
+
+impl<B, S, PS, SS, G, R, T, U, P, C, E, F>
+    PreparedExecutionRoute<SelectedRoutedTextRealization, C, E, F>
+    for RoutedRoute<'_, B, S, PS, SS, G, R, T, U, P>
+where
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend
+        + 'static,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: LayerRuntimeState<B>,
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
+    SS: LayerRuntimeState<B>,
+    SS::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>,
     G: RoutedTextArchitectureVisitor<B, S, Output = E, Error = F>,
     R: Relu2RoutedTextArchitectureVisitor<B, S, Output = E, Error = F>,
     T: RoutedTextArchitectureVisitor<B, PS, Output = E, Error = F>,
+    U: RoutedTextArchitectureVisitor<B, SS, Output = E, Error = F>,
     P: PredictionConstruction<B, SelectedRoutedTextRealization, C, E, F>,
 {
     fn construct(
         self,
         mut branch: PreparedConstructionBranch<SelectedRoutedTextRealization, C>,
     ) -> Result<E, PreparedExecutionError<F>> {
+        if let Some(retained) = branch.retained_construction.take() {
+            if branch.prediction.is_some() {
+                return Err(PreparedExecutionError::UnavailablePrediction);
+            }
+            return self.construct_retained(retained, branch.retained_prediction.take());
+        }
         if let Some(prediction) = branch.prediction.take() {
             return self.prediction.construct(
                 prediction,
@@ -313,10 +405,16 @@ impl<B: NeuralBackend, S, V, P> sealed::Sealed for CompositeRoute<'_, B, S, V, P
 impl<B, S, V, P, C, E, F> PreparedExecutionRoute<SelectedCompositeTextRealization, C, E, F>
     for CompositeRoute<'_, B, S, V, P>
 where
-    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    B: eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::HyperNeuralBackend
+        + Clone
+        + 'static,
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S, Output = E, Error = F>,
     P: PredictionConstruction<B, SelectedCompositeTextRealization, C, E, F>,
@@ -325,6 +423,32 @@ where
         self,
         mut branch: PreparedConstructionBranch<SelectedCompositeTextRealization, C>,
     ) -> Result<E, PreparedExecutionError<F>> {
+        if let Some(retained) = branch.retained_construction.take() {
+            if branch.prediction.is_some() {
+                return Err(PreparedExecutionError::UnavailablePrediction);
+            }
+            return match retained {
+                RetainedArchitectureConstruction::Qwen4Conditional(selected) => {
+                    if let Some(binding) = branch.retained_prediction.take() {
+                        selected.visit_composite_prediction::<B, S, V>(
+                            self.context,
+                            self.visitor,
+                            binding,
+                        )
+                    } else {
+                        selected.visit_composite::<B, S, V>(self.context, self.visitor)
+                    }
+                }
+                RetainedArchitectureConstruction::Qwen4Exp(_)
+                | RetainedArchitectureConstruction::Qwen4Partition(_)
+                | RetainedArchitectureConstruction::Qwen4ConditionalPartition(_) => {
+                    Err(PreparedExecutionError::Architecture(
+                        "construction authority does not match nonpartitioned composite route"
+                            .into(),
+                    ))
+                }
+            };
+        }
         if let Some(prediction) = branch.prediction.take() {
             return self.prediction.construct(
                 prediction,

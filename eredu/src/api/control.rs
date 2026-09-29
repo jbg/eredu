@@ -257,6 +257,37 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     CommittedTokenSource for Source<'_, '_, B, F>
 {
     type Error = TextContinuationError<B::Error, ControlConstraintError>;
+    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
+        let started = Instant::now();
+        let result = self.state.advance_prefill(self.driver);
+        if matches!(result, Ok(false)) {
+            return result;
+        }
+        let captures = self.state.take_completed_step(self.driver);
+        let advanced = match result {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                if let Ok(captures) = captures {
+                    let mut delivery = self.delivery.borrow_mut();
+                    let (delivery, emit) = &mut *delivery;
+                    delivery.token(None, false, captures, started.elapsed().as_secs_f64(), emit);
+                }
+                return Err(error);
+            }
+        };
+        let captures = captures?;
+        let mut delivery = self.delivery.borrow_mut();
+        let (delivery, emit) = &mut *delivery;
+        delivery.preparation_elapsed += started.elapsed();
+        delivery.send(
+            ObservedGenerationEvent::PrefillProgress {
+                captures,
+                step_seconds: started.elapsed().as_secs_f64(),
+            },
+            emit,
+        );
+        Ok(advanced)
+    }
     fn finish_step<T, E>(
         &mut self,
         local: Result<T, E>,
@@ -578,6 +609,10 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
                 {
                     self.state.boundary(&mut self.driver)?;
                     self.lifecycle.cancel_without_prediction()?;
+                } else if self.cursor.token_ids().len() == committed_before
+                    && self.cursor.finish_reason().is_none()
+                {
+                    self.lifecycle.complete_prefill()?;
                 } else {
                     self.lifecycle
                         .complete_prediction(self.cursor.finish_reason())?;
@@ -780,7 +815,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Requires executable semantic support; never falls back to text.
     pub fn start_controlled_chat<'a>(
         &'a mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
@@ -844,7 +879,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// ```
     pub fn start_controlled_text<'a>(
         &'a mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
@@ -860,7 +895,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     fn start_controlled_generation<'a>(
         &'a mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
@@ -999,10 +1034,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 .finish_text_preparation(Stage::Request, host, |error| {
                     PreparedChatError::Backend(error).into()
                 })?;
-        let prompt = B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids)
-            .map_err(|error| {
-                PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
-            });
+        let prompt = match prepared.prompt {
+            Some(prompt) => Ok(prompt),
+            None => B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids),
+        }
+        .map_err(|error| PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)));
         let prompt = self.runtime.finish_text_preparation(
             Stage::Prompt,
             prompt,

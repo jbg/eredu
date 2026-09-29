@@ -219,9 +219,27 @@ impl LocalLoadOptions {
         self.normalized.required_session_capabilities()
     }
 
+    /// Selects portable drafting intent before checkpoint preparation.
+    pub fn with_drafting(mut self, drafting: eredu_runtime::DraftingLoadRequest) -> Self {
+        self.normalized = self.normalized.with_drafting(drafting);
+        self
+    }
+
     /// Portable drafting policy retained from explicit or planned loading.
     pub const fn drafting(&self) -> eredu_runtime::DraftingLoadRequest {
         self.normalized.drafting()
+    }
+
+    /// Supplies a separate artifact for the selected embedded prediction extension.
+    /// The architecture validates the artifact against the target before loading.
+    pub fn with_prediction_source(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.normalized = self.normalized.with_prediction_source(path);
+        self
+    }
+
+    /// Explicit embedded prediction artifact, if supplied.
+    pub fn prediction_source(&self) -> Option<&std::path::Path> {
+        self.normalized.prediction_source()
     }
 
     fn into_backend(self) -> eredu_backend_mlx::MlxLoadRequest {
@@ -649,6 +667,23 @@ mod tests {
         default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
         DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
     };
+
+    #[test]
+    fn explicit_prediction_source_survives_local_backend_option_roundtrip() {
+        let options = super::LocalLoadOptions::default()
+            .with_drafting(eredu_runtime::DraftingLoadRequest::embedded(2).unwrap())
+            .with_prediction_source("prediction");
+        let backend = options.clone().into_backend();
+        backend.normalized().validate_model_preparation().unwrap();
+        assert_eq!(
+            backend.normalized().prediction_source(),
+            Some(std::path::Path::new("prediction"))
+        );
+        assert_eq!(
+            super::LocalLoadOptions::from_backend(backend).unwrap(),
+            options
+        );
+    }
 
     #[test]
     fn local_overhead_covers_retained_cache_and_checks_overflow() {

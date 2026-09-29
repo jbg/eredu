@@ -98,7 +98,6 @@ fn batched_units_detach_prior_shards_at_mapping_capacity() {
 }
 
 #[test]
-#[ignore = "requires local MLX host-transfer device support"]
 fn cross_unit_alias_reacquisition_reuses_one_pinned_owner_read() {
     let (_dir, store) = fixture_store();
     let owner = unit(

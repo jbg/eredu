@@ -1001,7 +1001,7 @@ fn v3_whole_model_declared_terms_reconstruct_scores_and_preserve_cached_observat
                 assert!(capture.values.contains_key(&whole.effective_output));
             }
             let modules = model();
-            let gain = &modules.static_modules().norm.weight;
+            let gain = &modules.static_modules().boundary.norm.weight;
             let head = &modules.static_modules().lm_head.as_ref().unwrap().weight;
             let width = args.hidden_size as usize;
             for (row, output) in residual

@@ -3,6 +3,9 @@ use eredu::api::{ControlledGenerationRecord, ObservedGenerationEvent, TraceLimit
 use eredu_core::{capture::CapturePlan, execution_control::*};
 use std::ops::ControlFlow;
 
+#[path = "control/flash_next.rs"]
+mod flash_next;
+
 #[path = "control/snapshots.rs"]
 mod snapshots;
 

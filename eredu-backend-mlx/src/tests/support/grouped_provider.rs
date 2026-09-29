@@ -5,8 +5,8 @@ use safemlx::{ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::error::Error;
 use crate::backend::runtime::residency::parameter_bank::{
-    AcquiredParameterGroups, AddressableParameterBank, AddressableParameterBankError,
-    BankAccessClass, MlxIndexedMovement, ParameterBankKey,
+    AcquiredParameters, AddressableParameterBank, AddressableParameterBankError, BankAccessClass,
+    MlxIndexedMovement, ParameterBankKey,
 };
 use crate::MlxTensor;
 
@@ -61,7 +61,7 @@ pub(crate) fn execute_selections_bounded<F>(
     mut execute_bank: F,
 ) -> Result<Array, Error>
 where
-    F: FnMut(&Array, &AcquiredParameterGroups, &Array, &Array, &Stream) -> Result<Array, Error>,
+    F: FnMut(&Array, &AcquiredParameters, &Array, &Array, &Stream) -> Result<Array, Error>,
 {
     let ParameterBankSelection {
         namespace,

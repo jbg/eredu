@@ -7,8 +7,8 @@ use eredu_nn::{
     TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
+    TensorParallelParameterProvider,
 };
 
 use crate::{
@@ -72,7 +72,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         RoutedMlp::forward_with_provider(self, input, pass, provider, context)
@@ -92,7 +92,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         RoutedMlp::forward_parallel_with_provider(self, input, pass, parallel, provider, context)
@@ -190,7 +190,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.router.select(input, context)?;
@@ -220,7 +220,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let routes = self.router.select(input, context)?;

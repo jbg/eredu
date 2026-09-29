@@ -164,7 +164,7 @@ pub(crate) fn publish_bank_parameter_replacements(
 impl AddressableParameterBank {
     pub(super) fn compact_parameter_binding(
         &self,
-        acquisition: &AcquiredParameterGroups,
+        acquisition: &AcquiredParameters,
         binding: &str,
         stream: &Stream,
     ) -> Result<Array, AddressableParameterBankError> {

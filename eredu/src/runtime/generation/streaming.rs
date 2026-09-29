@@ -1125,6 +1125,12 @@ where
 pub(crate) trait CommittedTokenSource {
     type Error;
 
+    /// Completes one nonsampling prompt chunk. False preserves the ordinary
+    /// token-producing step; true yields a quiescent boundary to the caller.
+    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
@@ -1277,6 +1283,12 @@ impl CommittedGenerationCursor {
         if self.sequence.observe_cancellation(cancellation) {
             pipeline.cancel(emit);
             self.finish_reason = Some(FinishReason::Cancelled);
+            return Ok(());
+        }
+        if source
+            .advance_prefill()
+            .map_err(CommittedGenerationError::Source)?
+        {
             return Ok(());
         }
         let token_id = source
@@ -2405,6 +2417,67 @@ mod tests {
         child.finish(FinishReason::Eos).unwrap();
         assert!(child.take_events().is_empty());
         assert_exactly_one_finished(&events, FinishReason::StopSequence);
+    }
+
+    #[test]
+    fn committed_cursor_yields_between_prefill_chunks_without_token_or_semantic_commit() {
+        struct PrefixSource {
+            remaining: usize,
+            source: SyntheticModel,
+        }
+        impl CommittedTokenSource for PrefixSource {
+            type Error = Infallible;
+            fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
+                if self.remaining == 0 {
+                    return Ok(false);
+                }
+                self.remaining -= 1;
+                Ok(true)
+            }
+            fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+                self.source.next_token()
+            }
+            fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
+                self.source.grammar_is_complete()
+            }
+        }
+        let calls = Rc::new(Cell::new(0));
+        let mut source = PrefixSource {
+            remaining: 2,
+            source: SyntheticModel::new([65, 66], None, calls.clone()),
+        };
+        let mut pipeline = CommittedTokenPipeline::new(
+            RawTokenDecoder::new(SyntheticCommittedDecoder, []),
+            ToolRuntimeParser::text([] as [&str; 0]),
+        );
+        let mut cursor = super::CommittedGenerationCursor::new(&[], NonZeroUsize::new(2).unwrap());
+        let cancellation = GenerationCancellationToken::new();
+        let mut events = Vec::new();
+        for remaining in [1, 0] {
+            cursor
+                .step(&mut source, &mut pipeline, &cancellation, &mut |event| {
+                    events.push(event)
+                })
+                .unwrap();
+            assert_eq!(source.remaining, remaining);
+            assert_eq!(calls.get(), 0);
+            assert!(cursor.sequence.tokens().is_empty());
+            assert!(events.is_empty());
+            assert_eq!(cursor.finish_reason(), None);
+            let _saved_cursor = cursor.clone();
+            let _saved_pipeline = pipeline.fork().unwrap();
+        }
+        while cursor.finish_reason().is_none() {
+            cursor
+                .step(&mut source, &mut pipeline, &cancellation, &mut |event| {
+                    events.push(event)
+                })
+                .unwrap();
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(cursor.sequence.tokens(), [65, 66]);
+        assert_eq!(cursor.finish_reason(), Some(FinishReason::MaxTokens));
+        assert_exactly_one_finished(&events, FinishReason::MaxTokens);
     }
 
     #[test]

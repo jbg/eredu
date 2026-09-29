@@ -104,6 +104,9 @@ impl InputPayloadKind {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum InputMetadataKey {
+    /// Original decoder token IDs retained when embeddings replace token lookup.
+    /// Family admission validates vocabulary and alignment with decoder positions.
+    OriginalTokenIds,
     /// One or more `(time, height, width)` patch-grid rows.
     PatchGrid,
     /// Explicit spatial or temporal patch coordinates, including padding.
@@ -192,6 +195,7 @@ impl InputMetadataKey {
     /// Returns whether this metadata is meaningful for `modality`.
     pub const fn accepts(self, modality: InputModality) -> bool {
         match self {
+            Self::OriginalTokenIds => true,
             Self::PatchGrid | Self::PatchPositions => {
                 matches!(modality, InputModality::Image | InputModality::Video)
             }
@@ -204,6 +208,7 @@ impl InputMetadataKey {
             Self::PatchGrid => 0,
             Self::PatchPositions => 1,
             Self::AudioMask => 2,
+            Self::OriginalTokenIds => 3,
         }
     }
 
@@ -212,6 +217,7 @@ impl InputMetadataKey {
             0 => Ok(Self::PatchGrid),
             1 => Ok(Self::PatchPositions),
             2 => Ok(Self::AudioMask),
+            3 => Ok(Self::OriginalTokenIds),
             _ => Err(PreparedInputError::InvalidWireValue {
                 field: "metadata key",
                 value: tag,
@@ -719,6 +725,16 @@ mod tests {
                     height: 2,
                     width: 2,
                 }],
+            )
+            .unwrap(),
+            InputPartDescriptor::new(
+                InputModality::Text,
+                InputPayloadKind::Embeddings,
+                tensor(TensorDtype::F32, &[1, 2, 8]),
+                [(
+                    InputMetadataKey::OriginalTokenIds,
+                    tensor(TensorDtype::I32, &[1, 2]),
+                )],
             )
             .unwrap(),
         ])

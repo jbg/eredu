@@ -47,7 +47,9 @@ pub fn open_prompt_cache(
                 rank: block.rank,
             };
             let shard = safe_prompt_cache_shard_path(&cache_root, &block.shard)?;
-            let buffered = buffer_prompt_cache_shard(&shard)?;
+            let source = Arc::new(eredu_runtime::RetainedCacheShard::open_block(
+                &shard, block,
+            )?);
             let record = CacheBlockRecord {
                 physical: MlxCacheBlockStorage::disk(
                     id.clone(),
@@ -56,9 +58,9 @@ pub fn open_prompt_cache(
                         first_name: block.first_array.clone(),
                         second_name: block.second_array.clone(),
                         persistent: true,
-                        buffered: Some(buffered),
+                        source: Some(source),
+                        logical_bytes: block.logical_bytes,
                         payload_sha256: Some(block.payload_sha256.clone()),
-                        payload_verification: Arc::new(OnceLock::new()),
                     },
                 ),
                 bytes: block.logical_bytes,
@@ -66,9 +68,13 @@ pub fn open_prompt_cache(
                 dtypes: [block.first_dtype.clone(), block.second_dtype.clone()],
                 imported: true,
             };
-            state
-                .lifecycle
-                .insert(id.clone(), block.end <= manifest.sink_tokens as i64)?;
+            state.lifecycle.insert(
+                id.clone(),
+                !matches!(
+                    block.representation,
+                    CacheRepresentation::AppendStream { .. }
+                ) && block.end <= manifest.sink_tokens as i64,
+            )?;
             if state.blocks.insert(id.clone(), record).is_some() {
                 return Err(CacheLifecycleError::DuplicateBlock(id).into());
             }
@@ -79,7 +85,7 @@ pub fn open_prompt_cache(
             .iter()
             .map(|block| block.logical_bytes)
             .sum::<u64>();
-        state.telemetry.report.imported_buffered_shards += manifest.blocks.len() as u64;
+        state.telemetry.report.imported_retained_shards += manifest.blocks.len() as u64;
         update_report_totals(&mut state);
     }
     Ok((manager, manifest))
@@ -254,6 +260,50 @@ impl CacheResidencyManager {
                     payload_sha256,
                 });
             }
+            let mut stream_frontiers = Vec::new();
+            {
+                let state = self.lock()?;
+                for (index, policy) in descriptor.layer_layout().iter().enumerate() {
+                    let layer = descriptor.global_layer_start() + index;
+                    for stream in policy.append_streams() {
+                        for lane in 0..descriptor.batch_size() {
+                            let lane = u32::try_from(lane).map_err(|_| {
+                                CacheResidencyError::ArrayMismatch(
+                                    "append-stream batch exceeds u32".into(),
+                                )
+                            })?;
+                            let representation = CacheRepresentation::AppendStream {
+                                slot: stream.slot(),
+                                lane,
+                            };
+                            if state
+                                .lifecycle
+                                .tail(CacheStreamId::new(layer, representation))
+                                .is_some_and(|tail| tail.bytes != 0)
+                            {
+                                return Err(CacheResidencyError::ArrayMismatch("append-stream tail must be finalized before prompt persistence".into()));
+                            }
+                            let records = manifest_blocks
+                                .iter()
+                                .filter(|block| {
+                                    block.global_layer == layer
+                                        && block.representation == representation
+                                })
+                                .map(|block| block.end as usize)
+                                .max()
+                                .unwrap_or(0);
+                            stream_frontiers.push(eredu_core::cache::PromptCacheStreamFrontier {
+                                global_layer: layer,
+                                slot: stream.slot(),
+                                lane,
+                                records,
+                            });
+                        }
+                    }
+                }
+            }
+            stream_frontiers
+                .sort_by_key(|frontier| (frontier.global_layer, frontier.slot, frontier.lane));
             let manifest = PromptCacheManifest {
                 schema_version: PROMPT_CACHE_SCHEMA_VERSION,
                 model_family: descriptor.model_family().to_owned(),
@@ -277,6 +327,7 @@ impl CacheResidencyManager {
                 application_namespace: options.application_namespace().map(str::to_owned),
                 blocks: manifest_blocks,
                 state_tensors: manifest_state,
+                stream_frontiers,
             };
             publication.commit(&manifest)?;
             let mut state = self.lock()?;

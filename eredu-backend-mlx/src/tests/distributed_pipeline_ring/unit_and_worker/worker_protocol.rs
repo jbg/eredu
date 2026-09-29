@@ -124,6 +124,7 @@ fn pipeline_ring_worker() {
         match cartesian_axes.as_deref() {
             None | Some("pp") => (1, 2, 1),
             Some("tp") => (2, 1, 1),
+            Some("tp4") => (4, 1, 1),
             Some("ep") => (1, 1, 2),
             Some("tp-pp") => (2, 2, 1),
             Some("tp-ep") => (2, 1, 2),
@@ -216,6 +217,18 @@ fn pipeline_ring_worker() {
     let device = DeviceAssignment::new(device_type, 0);
     let stream = Stream::new_with_device(&device.device().unwrap());
     let weights_stream = fixture_weights_stream(&stream);
+    if family == FixtureFamily::Qwen4Exp {
+        qwen4_exp::worker(
+            &checkpoint,
+            &prompt_cache_root,
+            topology,
+            device,
+            &native_group,
+            &stream,
+            &weights_stream,
+        );
+        return;
+    }
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let component_media = std::env::var_os(COMPONENT_CAPTURE_MEDIA).is_some()
             || (std::env::var_os(OPAQUE_QWEN_HYBRID_MTP).is_some()
@@ -1768,8 +1781,7 @@ fn pipeline_ring_worker() {
                         eredu_runtime::RunSpeculativeGeneration::new(options),
                     )
                 };
-                let error = result
-                    .expect_err("one scheduler rejection must reach every rank");
+                let error = result.expect_err("one scheduler rejection must reach every rank");
                 assert_eq!(publications, 0);
                 let original: &(dyn std::error::Error + 'static) = match &failure {
                     Some(error) => error,

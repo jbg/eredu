@@ -22,23 +22,36 @@ fn finish<T, E: std::error::Error + Send + Sync + 'static>(
 
 /// Borrows a provider and a retained execution-group vote. This adds no tensor
 /// observation; the vote runs even when local execution returns an error.
-pub struct AgreeingRoutedExpertProvider<'a, P, F> {
+pub struct AgreeingParameterProvider<'a, P, F> {
     provider: &'a mut P,
     agree: F,
 }
-impl<'a, P, F: FnMut(bool) -> Result<bool, Error>> AgreeingRoutedExpertProvider<'a, P, F> {
+impl<'a, P, F: FnMut(bool) -> Result<bool, Error>> AgreeingParameterProvider<'a, P, F> {
     /// Binds the exact participant agreement selected for these provider calls.
     pub fn new(provider: &'a mut P, agree: F) -> Self {
         Self { provider, agree }
     }
 }
-impl<B, P, F> RoutedExpertProvider<B> for AgreeingRoutedExpertProvider<'_, P, F>
+impl<B, P, F> ParameterProvider<B> for AgreeingParameterProvider<'_, P, F>
 where
     B: GroupedNeuralBackend,
-    P: RoutedExpertProvider<B>,
+    P: ParameterProvider<B>,
     F: FnMut(bool) -> Result<bool, Error>,
 {
     type Error = Error;
+    fn has_row_parameter(&self, parameter: &eredu_nn::ParameterId) -> bool {
+        self.provider.has_row_parameter(parameter)
+    }
+    fn lookup_rows(
+        &mut self,
+        spec: &crate::RowLookupSpec,
+        rows: &[u64],
+        access: crate::ParameterBankAccess,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, crate::RowLookupError> {
+        let local = self.provider.lookup_rows(spec, rows, access, context);
+        finish(local, &mut self.agree).map_err(crate::RowLookupError::Tensor)
+    }
     fn routing_control(
         &mut self,
         bank: RoutedBankId,
@@ -100,10 +113,10 @@ where
         finish(local, &mut self.agree)
     }
 }
-impl<B, P, F> TensorParallelRoutedExpertProvider<B> for AgreeingRoutedExpertProvider<'_, P, F>
+impl<B, P, F> TensorParallelParameterProvider<B> for AgreeingParameterProvider<'_, P, F>
 where
     B: GroupedNeuralBackend,
-    P: TensorParallelRoutedExpertProvider<B>,
+    P: TensorParallelParameterProvider<B>,
     F: FnMut(bool) -> Result<bool, Error>,
 {
     fn forward_grouped_tensor_parallel(

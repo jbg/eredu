@@ -4,7 +4,7 @@ use eredu_nn::{
     AttentionCache, Error, GroupedNeuralBackend, NormalizationConstructionSpec, ParameterSpec,
     Tensor,
 };
-use eredu_runtime::{ExpertPass, RoutedExpertProvider};
+use eredu_runtime::{ExpertPass, ParameterProvider};
 
 use crate::decoder::{Attention, AttentionInput, BlockFactory};
 
@@ -118,7 +118,7 @@ pub fn forward_with_provider<B, C, P>(
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: AttentionCache<B::Tensor>,
-    P: RoutedExpertProvider<B>,
+    P: ParameterProvider<B>,
     P::Error: std::fmt::Display,
 {
     block.forward_with_feed_forward(input, context, |mlp, hidden, context| {
@@ -138,7 +138,7 @@ pub fn forward_parallel_with_provider<B, C, P>(
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     C: AttentionCache<B::Tensor>,
-    P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+    P: eredu_runtime::TensorParallelParameterProvider<B>,
     P::Error: std::fmt::Display,
 {
     block.forward_tensor_parallel_with_feed_forward(

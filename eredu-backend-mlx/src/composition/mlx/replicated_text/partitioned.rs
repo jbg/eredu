@@ -47,6 +47,7 @@ impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeu
             }
             eredu_runtime::BoundaryTensorDtype::Uint32 => source == Dtype::Uint32,
             eredu_runtime::BoundaryTensorDtype::Int32 => source == Dtype::Int32,
+            eredu_runtime::BoundaryTensorDtype::Float32 => source == Dtype::Float32,
             _ => false,
         };
         if !valid {
@@ -83,6 +84,7 @@ pub(super) fn mlx_boundary_dtype(
         eredu_runtime::BoundaryTensorDtype::Activation => mlx_pipeline_activation_dtype(activation),
         eredu_runtime::BoundaryTensorDtype::Uint32 => Ok(Dtype::Uint32),
         eredu_runtime::BoundaryTensorDtype::Int32 => Ok(Dtype::Int32),
+        eredu_runtime::BoundaryTensorDtype::Float32 => Ok(Dtype::Float32),
         _ => Err(eredu_nn::Error::backend(
             "MLX pipeline boundary uses an unsupported logical dtype",
         )),

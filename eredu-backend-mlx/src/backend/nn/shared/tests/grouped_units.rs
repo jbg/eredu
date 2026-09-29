@@ -659,7 +659,7 @@ impl eredu_runtime::ActivationObserver<MlxTensor, ComputeError> for ProviderCapt
     }
 }
 fn verify_provider(device: DeviceType) {
-    use eredu_runtime::{RoutedExpertProvider, TensorParallelRoutedExpertProvider};
+    use eredu_runtime::{ParameterProvider, TensorParallelParameterProvider};
     let execution = ExecutionContext::new(Device::new(device, 0));
     let stream = execution.stream();
     let (input, routes) = inputs(67);
@@ -689,7 +689,7 @@ fn verify_provider(device: DeviceType) {
                 };
                 let actual = match (&mut module, tp) {
                     (Bank::Gated(bank), false) => {
-                        RoutedExpertProvider::<MlxNeuralBackend>::forward_grouped(
+                        ParameterProvider::<MlxNeuralBackend>::forward_grouped(
                             &mut provider,
                             bank,
                             request,
@@ -698,7 +698,7 @@ fn verify_provider(device: DeviceType) {
                         .unwrap()
                     }
                     (Bank::Relu(bank), false) => {
-                        RoutedExpertProvider::<MlxNeuralBackend>::forward_relu2_routed(
+                        ParameterProvider::<MlxNeuralBackend>::forward_relu2_routed(
                             &mut provider,
                             bank,
                             request,
@@ -707,28 +707,29 @@ fn verify_provider(device: DeviceType) {
                         .unwrap()
                     }
                     (bank, true) => {
-                        let output = match bank {
-                            Bank::Gated(bank) => TensorParallelRoutedExpertProvider::<
-                                MlxNeuralBackend,
-                            >::forward_grouped_tensor_parallel(
-                                &mut provider,
-                                bank,
-                                request,
-                                1,
-                                stream,
-                            )
-                            .unwrap(),
-                            Bank::Relu(bank) => TensorParallelRoutedExpertProvider::<
-                                MlxNeuralBackend,
-                            >::forward_relu2_routed_tensor_parallel(
-                                &mut provider,
-                                bank,
-                                request,
-                                1,
-                                stream,
-                            )
-                            .unwrap(),
-                        };
+                        let output =
+                            match bank {
+                                Bank::Gated(bank) => TensorParallelParameterProvider::<
+                                    MlxNeuralBackend,
+                                >::forward_grouped_tensor_parallel(
+                                    &mut provider,
+                                    bank,
+                                    request,
+                                    1,
+                                    stream,
+                                )
+                                .unwrap(),
+                                Bank::Relu(bank) => TensorParallelParameterProvider::<
+                                    MlxNeuralBackend,
+                                >::forward_relu2_routed_tensor_parallel(
+                                    &mut provider,
+                                    bank,
+                                    request,
+                                    1,
+                                    stream,
+                                )
+                                .unwrap(),
+                            };
                         match output {
                             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(output) => {
                                 output

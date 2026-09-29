@@ -134,6 +134,7 @@ fn auxiliary_phase_spans_all_depths_and_agrees_failures_before_publication() {
                                 rank,
                                 coordinator,
                             }),
+                            false,
                         );
                         let mut observer = TransactionProbe {
                             active: !(rank == 1 && fault == "participation"),
@@ -249,6 +250,7 @@ fn auxiliary_delivery_obeys_aborted_and_indeterminate_final_decisions() {
                 result: decision,
                 commits: Rc::new(Cell::new(0)),
             },
+            false,
         );
         let mut observer = TransactionProbe {
             active: true,

@@ -2,6 +2,9 @@
 
 use super::*;
 use eredu_architectures::{prepared_execution::*, prepared_sources::PreparedModelSources};
+use eredu_runtime::{
+    ReplicatedTextArchitecture, ReplicatedTextExecutionStrategy, ReplicatedTextSession,
+};
 
 pub(super) fn prepare(
     inspection: &eredu_core::ArtifactInspection<
@@ -130,13 +133,16 @@ pub(super) fn prepare_plan_with_banks_and_sequence_maximum(
 }
 
 #[derive(Clone)]
-struct NumericPreparedCommunication {
-    world: Arc<NumericPartitionWorld>,
+pub(super) struct NumericPreparedCommunication {
+    pub(super) world: Arc<NumericPartitionWorld>,
     manifest: CommunicationManifest,
 }
 
 impl NumericPreparedCommunication {
-    fn realize(sources: &PreparedModelSources, context: &NumericContext) -> Result<Self, String> {
+    pub(super) fn realize(
+        sources: &PreparedModelSources,
+        context: &NumericContext,
+    ) -> Result<Self, String> {
         let manifest = sources
             .selected()
             .communication_manifest()
@@ -160,9 +166,9 @@ impl NumericPreparedCommunication {
     }
 }
 
-struct PartitionAssembler<'a, E> {
-    context: &'a NumericContext,
-    executable: std::marker::PhantomData<E>,
+pub(super) struct PartitionAssembler<'a, E> {
+    pub(super) context: &'a NumericContext,
+    pub(super) executable: std::marker::PhantomData<E>,
 }
 
 impl<E> PreparedExecutableAssembler<NumericPreparedCommunication> for PartitionAssembler<'_, E> {
@@ -261,8 +267,8 @@ pub(super) fn routed(
         }
     };
     type State = DeviceState<NumericBackend, NumericHybridLayerState>;
-    let route = PartitionedRoutedRoute::<NumericBackend, State, State, _, _>::new(
-        context, context, visitor, visitor,
+    let route = PartitionedRoutedRoute::<NumericBackend, State, State, State, _, _, _>::new(
+        context, context, visitor, visitor, visitor,
     );
     construct_prepared_execution(
         sources,
@@ -363,4 +369,58 @@ pub(super) fn assert_shared_route_and_native_pairing_contract() {
         .all(|position| *position == 0));
     assert_eq!(provider_calls.load(Ordering::Relaxed), 0);
     assert!(world.trace().is_empty());
+}
+
+/// Keeps the concrete partition session available to specialized shared drivers.
+pub(super) trait SessionConsumer<A>
+where
+    A: ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+{
+    type Output;
+    fn finish<D>(
+        self,
+        session: ReplicatedTextSession<A, NumericBackend, NumericReplicatedMechanisms, D>,
+        context: NumericContext,
+        identity: eredu_core::cache::PromptCacheModelIdentity,
+    ) -> Result<Self::Output, Error>
+    where
+        D: ReplicatedTextExecutionStrategy<
+                A,
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                NumericReplicatedPolicy<A::Unit>,
+                NumericReplicatedPolicy<A::Unit>,
+            > + 'static;
+}
+pub(super) struct EraseSession;
+impl<A> SessionConsumer<A> for EraseSession
+where
+    A: ReplicatedTextArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+            Error = Error,
+        > + 'static,
+{
+    type Output = NumericPartitionExecutable;
+    fn finish<D>(
+        self,
+        session: ReplicatedTextSession<A, NumericBackend, NumericReplicatedMechanisms, D>,
+        context: NumericContext,
+        identity: eredu_core::cache::PromptCacheModelIdentity,
+    ) -> Result<Self::Output, Error>
+    where
+        D: ReplicatedTextExecutionStrategy<
+                A,
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+                NumericReplicatedPolicy<A::Unit>,
+                NumericReplicatedPolicy<A::Unit>,
+            > + 'static,
+    {
+        Ok(erase_numeric_partition_session(session, context, identity))
+    }
 }

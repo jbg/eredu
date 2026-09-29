@@ -1,5 +1,57 @@
 use super::*;
 
+type CompositeRequestContinuation<A> = <<A as CompositeArchitecture<
+    MlxNeuralBackend,
+    MlxHybridState,
+>>::PrefillRequest as eredu_runtime::prefill::ChunkedPrefillRequest<
+    PreparedCompositeArchitecture<A>,
+    MlxNeuralBackend,
+    MlxHybridState,
+>>::Continuation;
+
+struct CompositePrefillCursor<A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>,
+{
+    cursor:
+        eredu_runtime::prefill::PrefillCursor<A::PrefillRequest, CompositeRequestContinuation<A>>,
+}
+
+impl<A> ErasedPrefillCursor for CompositePrefillCursor<A>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>,
+{
+    fn clone_box(&self) -> Box<dyn ErasedPrefillCursor> {
+        Box::new(Self {
+            cursor: self.cursor.clone(),
+        })
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn next_range(&self) -> std::ops::Range<usize> {
+        self.cursor.next_range()
+    }
+    fn token_count(&self) -> usize {
+        self.cursor.token_count()
+    }
+    fn retained_bytes(&self) -> Result<usize, Error> {
+        use eredu_runtime::prefill::ChunkedPrefillRequest;
+        let request = self.cursor.request();
+        let mut values = request.request_values();
+        if let Some(continuation) = self.cursor.continuation() {
+            values.extend(request.retained_values(continuation));
+        }
+        values
+            .into_iter()
+            .try_fold(std::mem::size_of::<Self>(), |bytes, value| {
+                bytes.checked_add(value.as_array().nbytes()).ok_or_else(|| {
+                    Error::ArchitectureModel("prefill request retention size overflow".into())
+                })
+            })
+    }
+}
+
 pub(in crate::composition::mlx::replicated_text) trait CompositePredictionCapability<A, D>:
     Sized
 where
@@ -105,6 +157,10 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedComposite<
         eredu_runtime::RoutedBankId,
         crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
     >,
+    partition_row_pool: Option<(
+        crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+        eredu_runtime::SelectedRowLookupRequirements,
+    )>,
     #[cfg(test)]
     selected_residency: eredu_runtime::LayerWeightResidency,
     partition_sampling_group: Option<crate::backend::runtime::distributed::Group>,
@@ -237,19 +293,20 @@ where
 {
     type Input = super::MlxModelInput;
 
-    fn with_prefill<R>(
+    fn with_prefill_chunks(
         &mut self,
         input: Self::Input,
+        maximum_chunk_tokens: usize,
         context: &Stream,
-        operation: impl for<'a> FnOnce(
+        mut operation: impl for<'a> FnMut(
             <PreparedCompositeArchitecture<A> as eredu_runtime::LayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::Input<'a>,
             MlxTensor,
             Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
-        ) -> Result<R, Exception>,
-    ) -> Result<R, Exception> {
+        ) -> Result<A::ForwardContext, Exception>,
+    ) -> Result<(), Exception> {
         input.with_borrowed(|input| {
             let (prepared, admitted, identity) =
                 prepare_composite_prediction_input::<A>(self.admission, self.processor, input)
@@ -258,7 +315,54 @@ where
                 PreparedCompositeInput::new(&prepared, &admitted).map_err(Exception::custom)?;
             let tokens = A::prepared_prediction_token_ids(paired, context)
                 .map_err(Exception::from_source)?;
-            operation(paired, tokens, identity.as_ref())
+            let [_, sequence] = tokens.as_array().shape() else {
+                return Err(Exception::custom("prediction token ids must have rank two"));
+            };
+            let sequence = usize::try_from(*sequence).map_err(|_| {
+                Exception::custom("prediction input has a negative sequence length")
+            })?;
+            if maximum_chunk_tokens == 0 {
+                return Err(Exception::custom(
+                    "prediction prefill chunk size must be positive",
+                ));
+            }
+            use eredu_runtime::prefill::ChunkedPrefillRequest;
+            let request = A::prepare_prefill_request(prepared, admitted, context)
+                .map_err(Exception::from_source)?;
+            if request.token_count() != sequence {
+                return Err(Exception::custom(
+                    "prediction token count differs from prepared request",
+                ));
+            }
+            let chunk_tokens = maximum_chunk_tokens.min(request.maximum_chunk_tokens());
+            if chunk_tokens == 0 {
+                return Err(Exception::custom(
+                    "prepared prediction request has no chunk capacity",
+                ));
+            }
+            let mut continuation = None;
+            for start in (0..sequence).step_by(chunk_tokens) {
+                let end = start.saturating_add(chunk_tokens).min(sequence);
+                let chunk = MlxTensor::from_array(
+                    tokens
+                        .as_array()
+                        .try_index_device((.., start as i32..end as i32), context)?,
+                );
+                let forward = request
+                    .with_chunk(start..end, continuation.as_ref(), |paired| {
+                        operation(paired, chunk, identity.as_ref())
+                    })
+                    .map_err(Exception::from_source)??;
+                let next = request.continuation(&forward);
+                // Complete shared encoder products before the next invocation can
+                // acquire different layer weights; immutable continuations keep
+                // the exact request's original token and position identities.
+                for value in request.retained_values(&next) {
+                    value.as_array().evaluated()?;
+                }
+                continuation = Some(next);
+            }
+            Ok(())
         })
     }
 
@@ -378,6 +482,17 @@ where
         super::finish_prediction_state_operation(result, restored)
     }
 
+    pub(super) fn with_partition_row_pool(
+        mut self,
+        pool: Option<(
+            crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
+            eredu_runtime::SelectedRowLookupRequirements,
+        )>,
+    ) -> Self {
+        self.partition_row_pool = pool;
+        self
+    }
+
     pub(super) fn with_parameter_banks(
         mut self,
         parameter_banks: std::collections::BTreeMap<
@@ -435,6 +550,7 @@ where
             parameter_tasks: self.parameter_tasks,
             prepared_bank_parameters: self.prepared_bank_parameters,
             parameter_banks: self.parameter_banks,
+            partition_row_pool: self.partition_row_pool,
             session: self.session,
             admission: self.admission,
             processor: self.processor,
@@ -480,6 +596,7 @@ where
             parameter_tasks: session.parameter_materialization_tasks().to_vec(),
             prepared_bank_parameters: Vec::new(),
             parameter_banks: Default::default(),
+            partition_row_pool: None,
             session,
             admission,
             processor,
@@ -550,6 +667,88 @@ where
         + 'static,
     P: CompositePredictionCapability<A, D> + 'static,
 {
+    fn supports_chunked_prefill(&self) -> bool {
+        self.session.prefill_chunking_support().is_ok()
+    }
+
+    fn supports_retained_prefill(&self) -> bool {
+        self.supports_chunked_prefill()
+    }
+
+    fn start_prefill_cursor(
+        &mut self,
+        input: Result<input::ModelInput<'_>, Error>,
+        max_tokens: usize,
+        capture_geometry: Option<eredu_core::capture::CaptureRequestShape>,
+        stream: &Stream,
+    ) -> Result<Option<Box<dyn ErasedPrefillCursor>>, Error> {
+        use eredu_runtime::prefill::ChunkedPrefillRequest;
+        let prepared = input.and_then(|input| {
+            let prepared = self.prepare(input)?;
+            if let Some(request) = capture_geometry {
+                let [batch, sequence] = prepared.1.decoder_shape();
+                request
+                    .validate_prefill(batch, sequence)
+                    .map_err(Error::before_model_mutation)?;
+            }
+            Ok(prepared)
+        });
+        let prepared = self
+            .session
+            .prepare_prefill(
+                prepared.map_err(eredu_nn::Error::backend_source),
+                |(_, admitted, _)| eredu_runtime::prefill::PrefillRequestDescriptor {
+                    tokens: admitted.decoder_positions() as usize,
+                    chunk_tokens: Some(max_tokens),
+                },
+                stream,
+            )
+            .map_err(Error::before_model_mutation)?;
+        let (prepared, admitted, identity) = prepared;
+        let request = A::prepare_prefill_request(prepared, admitted, stream);
+        let chunk_tokens = request.as_ref().map_or(max_tokens, |request| {
+            max_tokens.min(request.maximum_chunk_tokens())
+        });
+        let cursor = self
+            .session
+            .start_prefill(request, chunk_tokens, identity, stream)
+            .map_err(Error::before_model_mutation)?;
+        Ok(Some(Box::new(CompositePrefillCursor::<A> { cursor })))
+    }
+
+    fn advance_prefill_cursor(
+        &mut self,
+        cursor: &mut dyn ErasedPrefillCursor,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        let cursor = cursor
+            .as_any_mut()
+            .downcast_mut::<CompositePrefillCursor<A>>()
+            .ok_or_else(|| {
+                Error::before_model_mutation(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "prefill cursor belongs to another architecture",
+                ))
+            })?;
+        let before = self.session.successful_state_restoration_generation();
+        #[cfg(test)]
+        crate::tests::support::path_instrumentation::forward();
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let output = self
+            .session
+            .advance_prefill(&mut cursor.cursor, stream, &mut observer)
+            .map(|step| step.output.into_array())
+            .map_err(|error| {
+                Error::after_replicated_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
+        Ok(self.published(output))
+    }
+
     fn prepared_input_plans(
         &self,
         input: input::ModelInput<'_>,
@@ -1046,7 +1245,26 @@ where
         Option<crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport>,
         Error,
     > {
-        self.session.execution_strategy().parameter_bank_report()
+        use crate::backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport;
+        let report = self.session.execution_strategy().parameter_bank_report()?;
+        let report = if report.is_some() || self.parameter_banks.is_empty() {
+            report
+        } else {
+            Some(ParameterBanksResidencyReport::new(
+                self.parameter_banks
+                    .iter()
+                    .map(|(id, bank)| bank.report().map(|report| (*id, report)))
+                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+            ))
+        };
+        match &self.partition_row_pool {
+            Some((pool, requirements)) => Ok(Some(
+                report
+                    .unwrap_or_else(|| ParameterBanksResidencyReport::new(Default::default()))
+                    .with_rows(pool.row_report(*requirements)?),
+            )),
+            None => Ok(report),
+        }
     }
 
     fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity {
@@ -1229,6 +1447,7 @@ where
         stream: &Stream,
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
+        let mut chunk_limit = None;
         let prepared = input.and_then(|input| {
             if mask.is_some() {
                 return Err(Error::ArchitectureModel(
@@ -1242,15 +1461,69 @@ where
                     .validate_prefill(batch, sequence)
                     .map_err(eredu_nn::Error::backend_source)?;
             }
+            if let Some(limit) = A::prefill_chunk_limit(&prepared.1)
+                .map_err(Error::before_model_mutation)?
+                .filter(|limit| (*limit as u64) < prepared.1.decoder_positions())
+            {
+                use eredu_runtime::prefill::ChunkedPrefillContextError;
+                let unsupported = if P::present() {
+                    Some(ChunkedPrefillContextError::Prediction)
+                } else if capture_geometry.is_some() {
+                    Some(ChunkedPrefillContextError::CaptureGeometry)
+                } else {
+                    None
+                };
+                if let Some(error) = unsupported {
+                    return Err(Error::before_model_mutation(error));
+                }
+                chunk_limit = Some(limit);
+            }
             Ok(prepared)
         });
-        let (paired, cache_identity) = match prepared {
-            Ok((ref prepared, ref admitted, ref identity)) => (
-                PreparedCompositeInput::new(prepared, admitted).map_err(eredu_nn::Error::backend),
-                identity.clone(),
-            ),
-            Err(error) => (Err(eredu_nn::Error::backend_source(error)), None),
-        };
+        let prepared = self
+            .session
+            .prepare_prefill(
+                prepared.map_err(eredu_nn::Error::backend_source),
+                |(_, admitted, _)| eredu_runtime::prefill::PrefillRequestDescriptor {
+                    tokens: admitted.decoder_positions() as usize,
+                    chunk_tokens: chunk_limit,
+                },
+                stream,
+            )
+            .map_err(Error::before_model_mutation)?;
+        if let Some(chunk_tokens) = chunk_limit {
+            let (prepared, admitted, identity) = prepared;
+            let request = A::prepare_prefill_request(prepared, admitted, stream);
+            let mut cursor = self
+                .session
+                .start_prefill(request, chunk_tokens, identity, stream)
+                .map_err(Error::before_model_mutation)?;
+            #[cfg(test)]
+            crate::tests::support::path_instrumentation::forward();
+            let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+            let before = self.session.successful_state_restoration_generation();
+            let output = self
+                .session
+                .finish_prefill(&mut cursor, stream, &mut observer)
+                .map(MlxTensor::into_array)
+                .map_err(|error| {
+                    if cursor.position() == 0 {
+                        Error::after_replicated_model_call(
+                            error,
+                            before,
+                            self.session.successful_state_restoration_generation(),
+                        )
+                    } else {
+                        // Earlier chunks remain committed. Restoration of the failed
+                        // chunk must not claim preservation of the entire call's state.
+                        Error::Other(Box::new(error))
+                    }
+                })?;
+            return Ok(self.published(output));
+        }
+        let (prepared, admitted, cache_identity) = prepared;
+        let paired =
+            PreparedCompositeInput::new(&prepared, &admitted).map_err(eredu_nn::Error::backend);
         #[cfg(test)]
         if paired.is_ok() {
             crate::tests::support::path_instrumentation::forward();

@@ -448,7 +448,7 @@ fn pooling_attention_geometry(
 ) -> Result<PoolingAttentionGeometry, Exception> {
     let (attention, tensors) = match policy {
         LayerCachePolicy::KeyOnly { attention, .. } => (attention, &[][..]),
-        LayerCachePolicy::KeyOnlyWithFixedState {
+        LayerCachePolicy::KeyOnlyWithState {
             attention, tensors, ..
         } => (attention, tensors.as_slice()),
         _ => {

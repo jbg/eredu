@@ -32,9 +32,9 @@ use eredu_runtime::{
     ArchitectureStatePartitionRule, DeviceState, ExpertPass, LayerRuntimeState,
     LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
     NoAuxiliaryBoundarySchema, ParameterBackend, ParameterGroupOwner, ParameterGroupSpec,
-    PartitionOwnership, PenaltyConfig, PredictionDirective, ReplicatedTextParameterOwner,
-    ReplicatedTextParameterPresence, ReplicatedTextParameterRole, ResettableRuntimeLayerState,
-    ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest,
+    ParameterProvider, PartitionOwnership, PenaltyConfig, PredictionDirective,
+    ReplicatedTextParameterOwner, ReplicatedTextParameterPresence, ReplicatedTextParameterRole,
+    ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertRequest,
     RuntimeLayerState, RuntimeState, RuntimeStateComponents, Sampler, SamplingBackend,
     SequentialDecisionDriver, SequentialDecisionMode, SequentialDecisionPlan,
     SequentialDecisionSource, SequentialDecisionTraversal, StateError, StaticParameterVisitor,
@@ -135,7 +135,7 @@ fn llama_parallel_layout(
     let static_modules = architecture.static_modules();
     let mut groups = llama::static_parallel_parameter_groups::<ReferenceBackend>(
         &static_modules.embeddings,
-        &static_modules.norm,
+        &static_modules.boundary.norm,
         static_modules.lm_head.as_ref(),
         "model",
     )
@@ -290,7 +290,7 @@ fn shared_decoder_parallel_geometry_rejects_cross_config_reuse() {
     let qwen_model = qwen::LayeredModel::<ReferenceBackend>::new(qwen_args.clone(), &()).unwrap();
     let mut qwen_groups = qwen::static_parallel_parameter_groups::<ReferenceBackend>(
         &qwen_model.static_modules().embeddings,
-        &qwen_model.static_modules().norm,
+        &qwen_model.static_modules().boundary.norm,
         qwen_model.static_modules().lm_head.as_ref(),
         &qwen_args.parameter_root,
     )
@@ -4348,7 +4348,7 @@ struct ProbeExpertProvider {
     calls: Vec<(usize, ExpertPass, Vec<i32>, Vec<i32>)>,
 }
 
-impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
+impl ParameterProvider<ReferenceBackend> for ProbeExpertProvider {
     type Error = std::convert::Infallible;
 
     fn forward_grouped(

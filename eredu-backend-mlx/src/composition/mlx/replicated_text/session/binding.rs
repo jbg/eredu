@@ -276,6 +276,7 @@ impl ReplicatedTextStateProfiles<MlxNeuralBackend> for MlxReplicatedStateProfile
     type AttentionState = MlxKeyValueState;
     type ComponentState = MlxHybridState;
     type AttentionComponentState = MlxHybridState;
+    type AttentionStreamState = MlxHybridState;
     type CompressedState = MlxHybridState;
     type CompressedComponentState = MlxHybridState;
 }

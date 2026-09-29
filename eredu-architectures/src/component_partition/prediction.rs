@@ -6,6 +6,8 @@ use eredu_core::{
     component::{ComponentExecutionScope, ComponentExecutionScopeKind, ComponentResidualBase},
 };
 
+mod qwen4;
+
 impl ComponentPartitionLayouts {
     pub(crate) fn with_prediction(
         mut self,
@@ -41,6 +43,9 @@ impl ComponentPartitionLayouts {
                 );
             }
             let local = &tensors[&tensor_rank];
+            if let Some(spec) = prepared.qwen4_spec() {
+                qwen4::register(&mut self.layouts[rank], descriptor, spec, local, execution)?;
+            }
             for scope in &descriptor.component_scopes {
                 let invocation = match scope.kind {
                     ComponentExecutionScopeKind::Prediction { depth } => {

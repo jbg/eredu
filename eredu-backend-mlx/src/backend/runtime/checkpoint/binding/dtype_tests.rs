@@ -360,7 +360,7 @@ fn unsupported_direct_reads_are_prepared_only_once() {
         }
         fn prepare_encoded_read(
             &self,
-            _: &[String],
+            _: &[TensorReadRequest],
         ) -> Result<Option<EncodedReadBatch>, StoreError> {
             assert_eq!(
                 self.preparations.fetch_add(1, Ordering::Relaxed),

@@ -38,14 +38,12 @@ pub use parallel::{
 pub use partitioned::PartitionedLayeredModel;
 
 use eredu_core::cache::PromptCacheTopology;
-use eredu_nn::{
-    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Tensor,
-};
+use eredu_nn::{AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Tensor};
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
     LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, ModelStateIdentity,
     OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
-    ParameterGroupOwner, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParameterGroupOwner, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
@@ -104,7 +102,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     {
         let modules = self.decoder.static_modules();
         visitor.visit("embedding", &modules.embeddings)?;
-        visitor.visit("norm", &modules.norm)?;
+        visitor.visit("norm", &modules.boundary.norm)?;
         if let Some(head) = &modules.lm_head {
             visitor.visit("output", head)?;
         }
@@ -117,7 +115,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     {
         let modules = self.decoder.static_modules_mut();
         visitor.visit_mut("embedding", &mut modules.embeddings)?;
-        visitor.visit_mut("norm", &mut modules.norm)?;
+        visitor.visit_mut("norm", &mut modules.boundary.norm)?;
         if let Some(head) = &mut modules.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -130,7 +128,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let decoder = HybridDecoder::new(static_spec(&args), "model.layers", layers, context)?;
+        let decoder = HybridDecoder::new(
+            StaticModules::from_spec(static_spec(&args), context)?,
+            "model.layers",
+            layers,
+        )?;
         Ok(Self {
             args,
             decoder,
@@ -148,7 +150,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         geometry.validate_for(&args).map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
         let spec = static_spec(&args);
-        let mut decoder = HybridDecoder::new(spec.clone(), "model.layers", layers, context)?;
+        let mut decoder = HybridDecoder::new(
+            StaticModules::from_spec(spec.clone(), context)?,
+            "model.layers",
+            layers,
+        )?;
         *decoder.static_modules_mut() = StaticModules::from_parallel_spec(
             spec,
             geometry.embedding_range().clone(),
@@ -299,11 +305,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S::LayerState: RuntimeStateComponents<B>,
     {
         let hidden = match input {
-            LayeredPartitionInput::Tokens(tokens) => self
-                .decoder
-                .static_modules_mut()
-                .embeddings
-                .forward(tokens, context)?,
+            LayeredPartitionInput::Tokens(tokens) => {
+                self.decoder.static_modules_mut().embed(tokens, context)?
+            }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
         self.begin_embedded_partition_with_layout(
@@ -461,7 +465,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             ));
         }
         let modules = self.decoder.static_modules_mut();
-        let hidden = instrumentation.normalize_readout(hidden, &mut modules.norm, context)?;
+        let hidden =
+            instrumentation.normalize_readout(hidden, &mut modules.boundary.norm, context)?;
         let logits = match &mut modules.lm_head {
             Some(head) => instrumentation.project_vocabulary::<B>(
                 "projection_input",
@@ -623,8 +628,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
     }
 
@@ -1086,7 +1090,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.decoder.unit_path(group, index)?;
@@ -1116,7 +1120,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -1172,7 +1176,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -1215,7 +1219,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.decoder.unit_path(group, index)?;

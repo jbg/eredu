@@ -7,8 +7,8 @@ use eredu_nn::{
     Parameterized, PoolingAttentionCache, Tensor,
 };
 use eredu_runtime::{
-    observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
-    RoutedExpertProvider,
+    observe_and_intervene, ActivationObserver, ExpertPass, ParameterProvider,
+    ResidentExpertProvider,
 };
 
 use super::{
@@ -271,7 +271,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_cycle(
@@ -332,7 +332,7 @@ where
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -415,7 +415,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -557,7 +557,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
@@ -1003,7 +1003,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<B::Tensor, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let normalized = self.input_norm.forward(input, context)?;
@@ -1121,7 +1121,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<B::Tensor, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
@@ -1164,7 +1164,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     ) -> Result<B::Tensor, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
@@ -1250,7 +1250,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     where
         C: CompressedAttentionCache<B::Tensor>,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let input = observe_and_intervene(observer, &format!("{path}.input"), input)?;
@@ -1276,7 +1276,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
     where
         C: CompressedAttentionCache<B::Tensor>,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);

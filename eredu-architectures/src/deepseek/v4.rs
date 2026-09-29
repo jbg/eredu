@@ -18,7 +18,7 @@ use eredu_nn::{
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, ModelStateIdentity, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture, RoutedExpertProvider,
+    ParallelRoutedLayeredArchitecture, ParameterProvider, PartitionedLayeredArchitecture,
     RoutedLayeredArchitecture, StateLayout, StateSegmentLifetime, StateSegmentSpec,
 };
 
@@ -166,7 +166,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         Model::forward_unit_with_provider(
@@ -188,7 +188,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
@@ -229,7 +229,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -328,7 +328,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         Model::forward_unit_parallel_with_provider(
@@ -672,7 +672,7 @@ where
         V: eredu_runtime::StaticParameterVisitor<B>,
     {
         visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.norm)?;
+        visitor.visit("norm", &self.static_modules.text.boundary.norm)?;
         if let Some(head) = &self.static_modules.text.lm_head {
             visitor.visit("output", head)?;
         }
@@ -688,7 +688,7 @@ where
         V: eredu_runtime::StaticParameterVisitorMut<B>,
     {
         visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.text.boundary.norm)?;
         if let Some(head) = &mut self.static_modules.text.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -1280,7 +1280,7 @@ where
         )?;
         let normalized = instrumentation.normalize_readout(
             &collapsed,
-            &mut self.static_modules.text.norm,
+            &mut self.static_modules.text.boundary.norm,
             context,
         )?;
         let head = self
@@ -1316,7 +1316,11 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let hidden = self.static_modules.hyper_head.forward(hidden, context)?;
-        self.static_modules.text.norm.forward(&hidden, context)
+        self.static_modules
+            .text
+            .boundary
+            .norm
+            .forward(&hidden, context)
     }
 
     /// Applies the complete tensor-parallel target output boundary.
@@ -1383,7 +1387,7 @@ where
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let embedded = self
@@ -1473,7 +1477,7 @@ where
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         let embedded = B::vocabulary_parallel_lookup(
@@ -1596,7 +1600,7 @@ where
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -2144,7 +2148,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         M: AsMut<Unit<B>>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.pipeline_dspark_proposal_inner(
@@ -2219,7 +2223,7 @@ where
     where
         C: PoolingAttentionCache<B::Tensor>,
         M: AsMut<Unit<B>>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.pipeline_dspark_proposal_neutral_parallel_inner(
@@ -2420,7 +2424,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.groups.unit_count(group)?;
@@ -2519,7 +2523,7 @@ where
     where
         S: LayerRuntimeState<B>,
         S::LayerState: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.groups.unit_count(group)?;
@@ -2706,7 +2710,7 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: PoolingAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
-        P: eredu_runtime::RoutedExpertProvider<B>,
+        P: eredu_runtime::ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match unit {
@@ -3814,15 +3818,56 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
-    fn partition_text_input<'a>(input: Self::Input<'a>) -> (&'a B::Tensor, Option<&'a B::Tensor>) {
+    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
         match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
-            EmbeddedInput::Draft { .. }
-            | EmbeddedInput::DsparkContext { .. }
-            | EmbeddedInput::DsparkProposal { .. } => {
-                unreachable!("prediction-free V4 partition received prediction input")
-            }
+            EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
+            _ => Err(eredu_nn::Error::backend(
+                "target partition received prediction input",
+            )),
         }
+    }
+
+    fn begin_text_partition<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        incoming: Option<(
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        )>,
+        state: &mut S,
+        expected: &eredu_runtime::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<eredu_runtime::LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let (tokens, mask) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            _ => {
+                return Err(eredu_nn::Error::backend(
+                    "target partition received prediction input",
+                ))
+            }
+        };
+        let input = match incoming {
+            Some((hidden, auxiliary)) => {
+                eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
+            }
+            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+        };
+        self.begin_partition_observed(
+            input,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            parallel,
+            context,
+            observer,
+        )
     }
 
     fn partition_output_width(&self) -> i32 {
@@ -3936,8 +3981,14 @@ pub fn state_layout(args: &V4Args) -> Result<StateLayout, Error> {
             if fixed.is_empty() {
                 LayerCachePolicy::key_only(attention, 1, args.head_dim).map_err(Error::backend)
             } else {
-                LayerCachePolicy::key_only_with_fixed_state(attention, 1, args.head_dim, fixed)
-                    .map_err(Error::backend)
+                LayerCachePolicy::key_only_with_state(
+                    attention,
+                    1,
+                    args.head_dim,
+                    fixed,
+                    Vec::new(),
+                )
+                .map_err(Error::backend)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4066,10 +4117,8 @@ fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>
     args: &V4Args,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Tensor, Error> {
-    hidden.expand_dims(2, context)?.broadcast_to(
-        &[hidden.dim(0), hidden.dim(1), args.hc_mult, args.hidden_size],
-        context,
-    )
+    eredu_nn::residual_streams::ResidualStreamGeometry::new(args.hc_mult, args.hidden_size)?
+        .expand(hidden, context)
 }
 
 #[cfg(test)]

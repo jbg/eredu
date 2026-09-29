@@ -142,6 +142,41 @@ pub struct FlattenedPatchSpec {
 }
 
 impl FlattenedPatchSpec {
+    /// Describes the dense affine geometry of [`project_flattened_patches`].
+    ///
+    /// This is an unbound `Tensor::linear` invocation after reshaping the patch
+    /// kernel, not a constructed backend linear operator. Weight representation,
+    /// reshape storage and native kernel selection remain unresolved; callers
+    /// must not substitute a bound linear operator's optimized storage facts.
+    pub fn memory_invocation(
+        self,
+        patches: u64,
+        element: crate::TensorElementType,
+        bias: bool,
+    ) -> Result<crate::mechanism_memory::MechanismInvocation, Error> {
+        let input = self.input_width()?;
+        self.output
+            .checked_mul(input)
+            .ok_or_else(|| Error::backend("flattened patch weight dimensions overflowed i32"))?;
+        if patches == 0 || patches > i32::MAX as u64 {
+            return Err(Error::backend(
+                "flattened patch count must fit positive i32",
+            ));
+        }
+        let invocation = crate::mechanism_memory::MechanismInvocation::Projection {
+            rows: patches,
+            input: input as u64,
+            output: self.output as u64,
+            format: eredu_checkpoint::LinearFormat::Dense,
+            element,
+            weight_element: None,
+            bias,
+            bias_element: None,
+        };
+        invocation.logical_values()?;
+        Ok(invocation)
+    }
+
     /// Returns the flattened input width after validating the geometry.
     pub fn input_width(self) -> Result<i32, Error> {
         if self.channels <= 0
@@ -307,7 +342,7 @@ impl MultiAxisRotarySpec {
     }
 }
 
-/// Builds backend-native cosine and sine tensors for explicit multi-axis positions.
+/// Builds backend-native F32 cosine and sine tensors for explicit multi-axis positions.
 pub fn multi_axis_rotary_embeddings<T: Tensor>(
     position_ids: &T,
     spec: &MultiAxisRotarySpec,
@@ -610,6 +645,60 @@ pub fn reference_multi_axis_rotary_embeddings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flattened_patch_memory_preserves_temporal_channel_geometry() {
+        let spec = FlattenedPatchSpec {
+            channels: 3,
+            temporal: 2,
+            height: 4,
+            width: 5,
+            output: 7,
+        };
+        for bias in [false, true] {
+            let invocation = spec
+                .memory_invocation(11, crate::TensorElementType::Bf16, bias)
+                .unwrap();
+            assert!(matches!(
+                invocation,
+                crate::mechanism_memory::MechanismInvocation::Projection {
+                    rows: 11,
+                    input: 120,
+                    output: 7,
+                    format: eredu_checkpoint::LinearFormat::Dense,
+                    weight_element: None,
+                    bias: actual,
+                    ..
+                } if actual == bias
+            ));
+            let values = invocation.logical_values().unwrap();
+            assert_eq!(values[0].logical_bytes().unwrap(), 11 * 120 * 2);
+            assert_eq!(values[1].logical_bytes().unwrap(), 11 * 7 * 2);
+        }
+        for patches in [0, i32::MAX as u64 + 1] {
+            assert!(spec
+                .memory_invocation(patches, crate::TensorElementType::F32, true)
+                .is_err());
+        }
+        for invalid in [
+            FlattenedPatchSpec {
+                temporal: 0,
+                ..spec
+            },
+            FlattenedPatchSpec {
+                width: i32::MAX,
+                ..spec
+            },
+            FlattenedPatchSpec {
+                output: i32::MAX,
+                ..spec
+            },
+        ] {
+            assert!(invalid
+                .memory_invocation(1, crate::TensorElementType::F32, true)
+                .is_err());
+        }
+    }
 
     #[test]
     fn flattened_patch_reference_projects_each_row() {

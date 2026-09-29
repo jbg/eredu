@@ -254,6 +254,10 @@ pub struct ArchitectureParameterDescription {
     graph: ExecutionGraph,
     unit_layout: ExecutionUnitLayout,
     groups: Vec<OwnedParameterGroupSpec>,
+    partition_layout: Option<(
+        eredu_core::ParallelRankTopology,
+        std::sync::Arc<crate::LocalModelLayout>,
+    )>,
 }
 
 impl ArchitectureParameterDescription {
@@ -296,7 +300,55 @@ impl ArchitectureParameterDescription {
             graph: graph.clone(),
             unit_layout: layout.clone(),
             groups,
+            partition_layout: None,
         })
+    }
+
+    /// Retains architecture-authored placement for this bound rank. Consumers must
+    /// not derive other ranks from member rules when this authority is present.
+    pub fn with_partition_layout(
+        mut self,
+        topology: eredu_core::ParallelRankTopology,
+        layout: crate::LocalModelLayout,
+    ) -> Result<Self, ArchitectureParameterError> {
+        let mut count = 0;
+        for group in &self.groups {
+            for member in group.members() {
+                count += 1;
+                let tensor = layout.tensor(member.target()).ok_or_else(|| {
+                    ArchitectureParameterError::InvalidLayout(format!(
+                        "retained partition layout has no parameter {}",
+                        member.target()
+                    ))
+                })?;
+                if tensor.global_shape() != member.global_shape()
+                    || tensor.logical_name() != group.logical_name()
+                    || tensor.role() != group.role()
+                {
+                    return Err(ArchitectureParameterError::InvalidLayout(format!(
+                        "retained partition layout changed parameter {}",
+                        member.target()
+                    )));
+                }
+            }
+        }
+        if count != layout.len() {
+            return Err(ArchitectureParameterError::InvalidLayout(
+                "retained partition layout contains undeclared parameters".into(),
+            ));
+        }
+        self.partition_layout = Some((topology, std::sync::Arc::new(layout)));
+        Ok(self)
+    }
+
+    /// Exact placement retained by architecture construction, when member rules
+    /// alone cannot reconstruct its rank semantics.
+    pub fn partition_layout(
+        &self,
+    ) -> Option<(eredu_core::ParallelRankTopology, &crate::LocalModelLayout)> {
+        self.partition_layout
+            .as_ref()
+            .map(|(rank, layout)| (*rank, layout.as_ref()))
     }
 
     /// Returns the canonical execution graph that owns these parameter groups.
@@ -467,6 +519,8 @@ pub enum ArchitectureParameterError {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum BoundaryTensorDtype {
+    /// Exact FP32 auxiliary values, independent of activation transport precision.
+    Float32,
     /// The selected execution activation dtype.
     Activation,
     /// Exact unsigned 32-bit integer values.
@@ -1816,24 +1870,55 @@ impl LayeredPartitionDriver {
         M: PartitionedLayeredArchitecture<B, S>,
         M::Error: std::fmt::Display,
     {
+        self.begin_with_preparation(
+            architecture,
+            state,
+            parallel,
+            context,
+            |architecture, state, expected| match observer {
+                Some(observer) => architecture.begin_partition_observed(
+                    input, mask, state, expected, 0, parallel, context, observer,
+                ),
+                None => match parallel {
+                    Some(parallel) => architecture.begin_partition_parallel(
+                        input, mask, state, expected, 0, parallel, context,
+                    ),
+                    None => architecture.begin_partition(input, mask, state, expected, 0, context),
+                },
+            },
+        )
+    }
+
+    /// Prepares architecture-owned request ingress and enters the selected group once.
+    /// The callback receives the exact local state layout; local state ordinals start at zero.
+    pub fn begin_with_preparation<B, S, M, F>(
+        &self,
+        architecture: &mut M,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        prepare: F,
+    ) -> Result<
+        LayeredForwardState<B::Tensor, M::ForwardContext>,
+        LayeredPartitionBeginError<M::Error>,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
+        F: FnOnce(
+            &mut M,
+            &mut S,
+            &StateLayout,
+        ) -> Result<LayeredForwardState<B::Tensor, M::ForwardContext>, M::Error>,
+    {
         let expected = self
             .state_layout
             .as_ref()
             .ok_or(LayeredPartitionBeginError::MissingState { group: self.group })?;
-        // `state` is the partition-local allocation selected by `PartitionState`.
-        // Global ownership is carried separately by that partition's offset, so
-        // architecture code must index this allocation from local ordinal zero.
-        let mut forward = match observer {
-            Some(observer) => architecture.begin_partition_observed(
-                input, mask, state, expected, 0, parallel, context, observer,
-            ),
-            None => match parallel {
-                Some(parallel) => architecture
-                    .begin_partition_parallel(input, mask, state, expected, 0, parallel, context),
-                None => architecture.begin_partition(input, mask, state, expected, 0, context),
-            },
-        }
-        .map_err(LayeredPartitionBeginError::Architecture)?;
+        let mut forward = prepare(architecture, state, expected)
+            .map_err(LayeredPartitionBeginError::Architecture)?;
         forward.hidden = architecture
             .enter_partition_group(
                 self.group,
@@ -1980,7 +2065,7 @@ where
     },
     /// Architecture-owned partition entry failed.
     #[error("partition architecture entry failed: {0}")]
-    Architecture(E),
+    Architecture(#[source] E),
 }
 
 /// Invalid concrete realization or boundary use of a layered partition.
@@ -2541,10 +2626,9 @@ mod tests {
         assert!(!partition.ownership().owns_static_role("projector"));
         assert_eq!(description.select_owned(&partition).len(), 1);
         assert_eq!(description.select_static_roles(&partition), ["projector"]);
-        assert!(
-            owner.is_owned_by(partition.ownership(), |group, unit| partition
-                .owns_unit(group.as_str(), unit))
-        );
+        assert!(owner.is_owned_by(partition.ownership(), |group, unit| {
+            partition.owns_unit(group.as_str(), unit)
+        }));
         assert!(owner.refines_storage_owner(&ParameterGroupOwner::static_role("projector")));
         assert!(!owner.refines_storage_owner(&ParameterGroupOwner::static_role("embedding")));
         let replica = PartitionOwnership::new(false, false, Vec::<String>::new())

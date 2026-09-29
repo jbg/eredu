@@ -6,7 +6,7 @@ use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     AttentionCache, AttentionRequest, BlockwiseAttentionBackend, CompressedAttentionBlock,
     CompressedAttentionCache, CompressedAttentionScan, CompressedAttentionState,
-    CompressedAttentionView, EmbeddingOperator, Error, NeuralBackend, Parameterized, Tensor,
+    CompressedAttentionView, Error, NeuralBackend, Parameterized, Tensor,
 };
 use eredu_runtime::{
     module_parameter_group, ArchitectureParameterDescription, ExecutionUnitLayout,
@@ -195,6 +195,12 @@ impl<B: NeuralBackend, C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>
     ) -> Result<&mut Option<B::Tensor>, StateError> {
         Err(StateError::UnknownComponent { role })
     }
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<B::Tensor>)>,
+    ) -> Result<(), StateError> {
+        eredu_runtime::state::replace_fixed_components(std::iter::empty(), values)
+    }
     fn advance_fixed(&mut self, _tokens: i32) -> Result<(), StateError> {
         Err(StateError::InvalidAdvance(
             "attention-only state has no fixed frontier".into(),
@@ -230,6 +236,12 @@ impl<B: NeuralBackend, C: RuntimeStateComponents<B>> RuntimeStateComponents<B>
         role: eredu_core::cache::StateTensorRole,
     ) -> Result<&mut Option<B::Tensor>, StateError> {
         self.inner.fixed_component(role)
+    }
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<B::Tensor>)>,
+    ) -> Result<(), StateError> {
+        self.inner.replace_fixed_components(values)
     }
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
         self.inner.advance_fixed(tokens)
@@ -290,6 +302,12 @@ impl<B: NeuralBackend, C: RuntimeLayerState<B>> RuntimeStateComponents<B>
         role: eredu_core::cache::StateTensorRole,
     ) -> Result<&mut Option<B::Tensor>, StateError> {
         Err(StateError::UnknownComponent { role })
+    }
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<B::Tensor>)>,
+    ) -> Result<(), StateError> {
+        eredu_runtime::state::replace_fixed_components(std::iter::empty(), values)
     }
     fn advance_fixed(&mut self, _tokens: i32) -> Result<(), StateError> {
         Err(StateError::InvalidAdvance(
@@ -357,6 +375,12 @@ impl<B: NeuralBackend, C: CompressedAttentionCache<B::Tensor> + RuntimeLayerStat
         role: eredu_core::cache::StateTensorRole,
     ) -> Result<&mut Option<B::Tensor>, StateError> {
         Err(StateError::UnknownComponent { role })
+    }
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<B::Tensor>)>,
+    ) -> Result<(), StateError> {
+        eredu_runtime::state::replace_fixed_components(std::iter::empty(), values)
     }
     fn advance_fixed(&mut self, _tokens: i32) -> Result<(), StateError> {
         Err(StateError::InvalidAdvance(
@@ -437,7 +461,11 @@ impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F
         F::validate(&config)?;
         let layers = F::layer_count(&config)?;
         Ok(Self {
-            decoder: HybridDecoder::new(F::static_spec(&config), "model.layers", layers, context)?,
+            decoder: HybridDecoder::new(
+                StaticModules::from_spec(F::static_spec(&config), context)?,
+                "model.layers",
+                layers,
+            )?,
             config,
             prediction_capture: false,
             family: PhantomData,
@@ -472,11 +500,7 @@ where
                 parallel,
                 context,
             ),
-            None => self
-                .decoder
-                .static_modules_mut()
-                .embeddings
-                .forward(tokens, context),
+            None => self.decoder.static_modules_mut().embed(tokens, context),
         }
     }
 
@@ -562,7 +586,11 @@ impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P>
         F::validate(&config)?;
         let layers = F::layer_count(&config)?;
         Ok(Self {
-            decoder: HybridDecoder::new(F::static_spec(&config), "model.layers", layers, context)?,
+            decoder: HybridDecoder::new(
+                StaticModules::from_spec(F::static_spec(&config), context)?,
+                "model.layers",
+                layers,
+            )?,
             config,
             family: PhantomData,
         })
@@ -617,7 +645,7 @@ fn parameter_description<B: NeuralBackend, U: Parameterized<B::Tensor>>(
         "norm",
         "norm",
         ParameterRole::Replicated,
-        &modules.norm,
+        &modules.boundary.norm,
         tied_head,
     )?;
     if let Some(head) = &modules.lm_head {
@@ -707,7 +735,7 @@ macro_rules! architecture_parameters {
             {
                 let modules = self.decoder.static_modules();
                 visitor.visit("embedding", &modules.embeddings)?;
-                visitor.visit("norm", &modules.norm)?;
+                visitor.visit("norm", &modules.boundary.norm)?;
                 if let Some(head) = &modules.lm_head {
                     visitor.visit("output", head)?;
                 }
@@ -720,7 +748,7 @@ macro_rules! architecture_parameters {
             {
                 let modules = self.decoder.static_modules_mut();
                 visitor.visit_mut("embedding", &mut modules.embeddings)?;
-                visitor.visit_mut("norm", &mut modules.norm)?;
+                visitor.visit_mut("norm", &mut modules.boundary.norm)?;
                 if let Some(head) = &mut modules.lm_head {
                     visitor.visit_mut("output", head)?;
                 }
@@ -910,8 +938,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let position = F::mask_layer(&self.config)
             .map(|layer| {
                 state
@@ -1041,8 +1068,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let position = F::mask_layer(&self.config)
             .map(|layer| {
                 state
@@ -1166,8 +1192,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
         Ok(LayeredForwardState {
             hidden,
@@ -1286,8 +1311,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let mask = causal_mask::<B>(hidden.dim(1), input.mask, None, context)?;
         Ok(LayeredForwardState {
             hidden,
@@ -1402,8 +1426,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let position = F::mask_layer(&self.config)
             .map(|layer| {
                 state
@@ -1529,8 +1552,7 @@ where
         let hidden = self
             .decoder
             .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
+            .embed(input.tokens, context)?;
         let position = F::mask_layer(&self.config)
             .map(|layer| {
                 state

@@ -413,7 +413,7 @@ fn prediction_target_forks_preserve_kv_and_compressed_paging_sessions() {
     )
     .unwrap();
     let canonical =
-        MlxHybridState::paged(compressed_layout, prediction_cache_manager(), None).unwrap();
+        MlxHybridState::paged(compressed_layout, prediction_cache_manager(), None, &[]).unwrap();
     let canonical_checkpoint = canonical.deep_checkpoint().unwrap();
     let mut fork = fork_mlx_prediction_target_state(&canonical, stream).unwrap();
     let fork_checkpoint = fork.deep_checkpoint().unwrap();
@@ -424,4 +424,39 @@ fn prediction_target_forks_preserve_kv_and_compressed_paging_sessions() {
         .unwrap_err()
         .to_string()
         .contains("does not belong to the same paged layer"));
+}
+
+#[test]
+fn mlx_pipeline_fp32_auxiliary_precision_is_independent_of_bf16_activation_wire() {
+    use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+    let (stream, _) = execution_streams();
+    let values = [0.6001234f32, 0.8001234, -0.3001234, 0.1001234];
+    let tensor = MlxTensor::from_array(Array::from_slice(&values, &[1, 2, 2]));
+    let converted = MlxPartitionTensorAllocator
+        .tensor_to_wire(
+            tensor,
+            eredu_runtime::BoundaryTensorDtype::Float32,
+            eredu_runtime::PipelineActivationDtype::Bfloat16,
+            &stream,
+        )
+        .unwrap();
+    assert_eq!(converted.as_array().dtype(), Dtype::Float32);
+    assert_eq!(
+        converted
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap(),
+        values
+    );
+    let placeholder = MlxPartitionTensorAllocator
+        .tensor_placeholder(
+            &[1, 2, 2],
+            eredu_runtime::BoundaryTensorDtype::Float32,
+            eredu_runtime::PipelineActivationDtype::Bfloat16,
+            &stream,
+        )
+        .unwrap();
+    assert_eq!(placeholder.as_array().dtype(), Dtype::Float32);
 }

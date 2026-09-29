@@ -12,8 +12,8 @@ use eredu_nn::{
     TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
-    ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    TensorParallelRoutedExpertProvider,
+    ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
+    TensorParallelParameterProvider,
 };
 
 use crate::decoder::ComponentInstrumentation;
@@ -684,7 +684,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_provider_observed(
@@ -707,7 +707,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_inner(
@@ -735,7 +735,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_parallel_with_provider_observed(
@@ -760,7 +760,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor>,
-        P: TensorParallelRoutedExpertProvider<B>,
+        P: TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         self.forward_inner(

@@ -310,7 +310,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
     /// costs remain unknown. Forecasting does not consume capture/trace budgets.
     pub fn forecast_observed_generation(
         &self,
-        prepared: &PreparedObservedGeneration,
+        prepared: &PreparedObservedGeneration<B>,
         options: &GenerationForecastOptions,
     ) -> Result<GenerationForecast, GenerationForecastError> {
         if prepared.session_identity != self.session_identity {
@@ -320,8 +320,11 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         }
         let instrumented = !prepared.plan.is_empty() || prepared.intervention.is_some();
         let mut result = self.forecast_count(
-            self.count_token_ids(&prepared.prompt_token_ids)?,
-            None,
+            match prepared.prompt.as_ref() {
+                Some(prompt) => self.count_prepared_input(prompt)?,
+                None => self.count_token_ids(&prepared.prompt_token_ids)?,
+            },
+            prepared.prompt.as_ref(),
             prepared.settings,
             options,
             instrumented,

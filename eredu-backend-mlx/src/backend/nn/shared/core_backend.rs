@@ -102,6 +102,30 @@ impl ParameterBackend for MlxNeuralBackend {
 }
 
 impl NeuralBackend for MlxNeuralBackend {
+    fn mechanism_memory_in_context(
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+        context: &Stream,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+        let device = context
+            .get_device()
+            .and_then(|device| device.get_type())
+            .map_err(ComputeError::backend)?;
+        crate::backend::nn::memory::describe_for_device(invocation, device)
+    }
+
+    fn segmented_attention_memory(
+        invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
+        context: &Stream,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
+        // The ordinary MLX segmented primitive invokes native SDPA for each
+        // segment. Slicing and final concatenation are outside this contract.
+        let device = context
+            .get_device()
+            .and_then(|d| d.get_type())
+            .map_err(ComputeError::backend_source)?;
+        crate::backend::nn::memory::describe_unmasked_segment(invocation, device)
+    }
+
     fn mechanism_memory(
         invocation: &eredu_nn::mechanism_memory::MechanismInvocation,
     ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, ComputeError> {
@@ -198,7 +222,12 @@ impl NeuralBackend for MlxNeuralBackend {
         } else {
             None
         };
-        Ok(MlxRotary { native, explicit })
+        Ok(MlxRotary {
+            native,
+            explicit,
+            dimensions: spec.dimensions,
+            traditional: spec.traditional,
+        })
     }
 
     fn silu(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -301,12 +330,14 @@ impl NeuralBackend for MlxNeuralBackend {
         compute_tensor(input.multiply(compute(denominator.rsqrt(context))?, context))
     }
 
-    fn silu_gated_group_rms_norm(
+    fn output_gated_group_rms_norm(
         input: &MlxTensor,
         gate: &MlxTensor,
         weight: &MlxTensor,
         groups: i32,
         epsilon: f32,
+        activation: eredu_nn::OutputGateActivation,
+        arithmetic: eredu_nn::OutputGatedNormArithmetic,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         let input = input.as_array();
@@ -323,7 +354,7 @@ impl NeuralBackend for MlxNeuralBackend {
         let width = geometry.width();
         if weight.shape() != [width] {
             return Err(ComputeError::backend(
-                "invalid SiLU-gated grouped RMS normalization geometry",
+                "invalid output-gated grouped RMS normalization geometry",
             ));
         }
         let input = compute(input.as_dtype(Dtype::Float32, context))?;
@@ -340,10 +371,19 @@ impl NeuralBackend for MlxNeuralBackend {
         ))?;
         let normalized = compute(grouped.multiply(&scale, context))?;
         let normalized = compute(normalized.reshape(&shape, context))?;
+        let normalized = match arithmetic {
+            eredu_nn::OutputGatedNormArithmetic::Float32 => normalized,
+            eredu_nn::OutputGatedNormArithmetic::RoundedNormalization => {
+                compute(normalized.as_dtype(dtype, context))?
+            }
+        };
         let normalized = compute(normalized.multiply(weight, context))?;
         let gate = compute(gate.as_dtype(Dtype::Float32, context))?;
-        let gate =
-            compute(gate.multiply(compute(safemlx::ops::sigmoid(&gate, context))?, context))?;
+        let activated = compute(safemlx::ops::sigmoid(&gate, context))?;
+        let gate = match activation {
+            eredu_nn::OutputGateActivation::Silu => compute(gate.multiply(activated, context))?,
+            eredu_nn::OutputGateActivation::Sigmoid => activated,
+        };
         compute(normalized.multiply(&gate, context))?
             .as_dtype(dtype, context)
             .map(MlxTensor::from_array)
@@ -698,19 +738,7 @@ impl NeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         input.validate()?;
-        compute_tensor(common::attention::indexed_sparse_attention(
-            input.queries.as_array(),
-            input.local_keys.as_array(),
-            input.local_values.as_array(),
-            input.pooled_keys.as_array(),
-            input.pooled_values.as_array(),
-            input.selected_positions.as_array(),
-            input.scale,
-            input.local_mask.map(MlxTensor::as_array),
-            input.pooled_mask.map(MlxTensor::as_array),
-            input.sinks.map(MlxTensor::as_array),
-            context,
-        ))
+        compute_tensor(common::attention::indexed_sparse_attention(&input, context))
     }
 
     fn pooled_attention(
@@ -983,6 +1011,10 @@ impl NeuralBackend for MlxNeuralBackend {
 }
 
 impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
+    fn parallel_rank(parallel: &Group) -> usize {
+        parallel.rank()
+    }
+
     fn vocabulary_parallel_embedding(
         spec: EmbeddingSpec,
         range: VocabularyParallelRange,

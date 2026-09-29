@@ -87,6 +87,22 @@ pub struct ComponentPartitionLayout {
 }
 
 impl ComponentPartitionLayout {
+    pub(crate) fn register_unit_observation(
+        &mut self,
+        descriptor: &ArchitectureDescriptor,
+        path: &str,
+        local: bool,
+    ) -> Result<(), ComponentPartitionError> {
+        replicated_observation(
+            &mut self.observations,
+            descriptor,
+            path,
+            "hidden",
+            local,
+            ObservationHookSite::Unit,
+        )
+    }
+
     /// Projects an immutable global activation operation onto this invocation.
     /// Nonexporting replicas still participate; absence means this rank does not
     /// execute the invocation. This grants no distributed execution authority.

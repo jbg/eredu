@@ -1230,7 +1230,8 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::MuseGlimmerMoe => {
                 write_muse_glimmer_component_fixture(checkpoint.path(), true, false)
             }
-            FixtureFamily::DeepSeekGguf
+            FixtureFamily::Qwen4Exp
+            | FixtureFamily::DeepSeekGguf
             | FixtureFamily::MuseGlimmerGguf(_)
             | FixtureFamily::DeepSeekDenseGguf
             | FixtureFamily::Qwen2Gguf
@@ -1311,6 +1312,10 @@ fn run_ring_pipeline_processes(
         .exists();
     for rank in 0..world_size {
         let mut command = Command::new(&executable);
+        if family == FixtureFamily::Qwen4Exp {
+            // Prepared generic visitors retain large debug-build stack frames.
+            command.env("RUST_MIN_STACK", "33554432");
+        }
         if mixed_fp8_fixture {
             command.env("EREDU_RING_DEEPSEEK_MIXED_FP8", "1");
         }

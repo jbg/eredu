@@ -587,9 +587,11 @@ impl
                 .collect::<BTreeSet<_>>(),
             self.target_keys
         );
-        let session = prepared
-            .construct_resident_session::<NumericBackend, NumericReplicatedMechanisms>(
+        let (session, _) = prepared
+            .construct_resident_session::<NumericBackend, NumericReplicatedMechanisms, eredu_runtime::NoRowLookups>(
                 NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint),
+                None,
+                &[],
                 self.context,
             )?;
         self.run_session(session, extension)
@@ -844,8 +846,8 @@ fn execute_config(
                 .unwrap()
                 .contains('E'));
     let run = if routed {
-        let route = RoutedRoute::<NumericBackend, State, State, _, _, _>::new(
-            &context, &context, Ordinary, Ordinary, Ordinary,
+        let route = RoutedRoute::<NumericBackend, State, State, State, _, _, _, _>::new(
+            &context, &context, Ordinary, Ordinary, Ordinary, Ordinary,
         )
         .with_prediction::<Materializer, _, _>(materialize, visitor);
         construct_prepared_execution(

@@ -25,7 +25,7 @@ pub enum ResourceLifetime {
 }
 
 /// Described allocations and the references that keep them live.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLifetimeDescription {
     /// Ordinary prepared or mechanism resources, preserving coverage and bounds.
     pub resources: ResourceDescription,

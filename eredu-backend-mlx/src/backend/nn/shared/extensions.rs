@@ -410,6 +410,19 @@ macro_rules! impl_attention_cache {
                 ))
                 .map(|(keys, values)| (MlxTensor::from_array(keys), MlxTensor::from_array(values)))
             }
+            fn indexed_attention<N: NeuralBackend<Tensor = MlxTensor>>(
+                &mut self,
+                request: eredu_nn::IndexedAttentionInput<'_, MlxTensor>,
+                context: &Stream,
+            ) -> Result<MlxTensor, ComputeError> {
+                request.validate()?;
+                if let Some(output) = compute(KeyValueCache::paged_indexed_attention(
+                    self, &request, context,
+                ))? {
+                    return Ok(MlxTensor::from_array(output));
+                }
+                N::indexed_attention(request, context)
+            }
             fn relative_attention<N: NeuralBackend<Tensor = MlxTensor>>(
                 &mut self,
                 request: eredu_nn::RelativeAttentionInput<'_, MlxTensor>,

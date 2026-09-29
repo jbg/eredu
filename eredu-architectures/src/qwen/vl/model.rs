@@ -12,8 +12,8 @@ use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
     ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
     LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, PartitionedLayeredArchitecture,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ParameterProvider,
+    PartitionedLayeredArchitecture, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use crate::decoder::static_parallel_parameter_groups;
@@ -211,6 +211,27 @@ pub fn prepare_input<T: Tensor>(
     })
 }
 
+impl<B, S> crate::composite_execution::ParallelCompositeArchitecture<B, S> for LayeredModel<B>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn begin_composite_forward_parallel<'a>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        prepare_input(input, context)?.with_model_input(|input| {
+            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+                self, input, state, parallel, context,
+            )
+        })
+    }
+}
+
 impl<B, S> CompositeArchitecture<B, S> for LayeredModel<B>
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
@@ -218,6 +239,16 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type InputPartPlan = QwenVlInputPartPlan;
+    type PrefillRequest =
+        crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
+
+    fn prepare_prefill_request(
+        prepared: eredu_runtime::PreparedModelInput<B::Tensor>,
+        admitted: crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::PrefillRequest, Self::Error> {
+        crate::composite_execution::SingleCompositePrefillRequest::new(prepared, admitted)
+    }
     type AdmissionConfig = ModelArgs;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
@@ -422,7 +453,7 @@ where
         &self,
         _unit: usize,
         _routed: bool,
-    ) -> Result<(usize, usize), Self::Error> {
+    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
         // The tensor-parallel attention contribution precedes expert routing;
         // the routed activation contribution remains partial until its exact
         // post-exchange row reduction.
@@ -597,23 +628,6 @@ where
             <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
         })
     }
-
-    fn begin_composite_forward_parallel<'a>(
-        &mut self,
-        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
-        state: &mut S,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend,
-    {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                self, input, state, parallel, context,
-            )
-        })
-    }
 }
 
 enum PreparedPart<T> {
@@ -667,7 +681,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -689,7 +703,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         LayeredModel::forward_unit_with_provider(
@@ -725,7 +739,7 @@ where
         observer: &mut O,
     ) -> Result<B::Tensor, Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
@@ -748,7 +762,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>
     where
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         LayeredModel::forward_unit_with_provider_parallel(
@@ -1057,8 +1071,8 @@ pub enum PipelinePartitionInput<'a, T> {
     },
 }
 
-const fn qwen_vl_routed_tensor_reductions() -> (usize, usize) {
-    (1, 1)
+fn qwen_vl_routed_tensor_reductions() -> crate::partitioned_execution::RoutedTensorReductions {
+    crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1)
 }
 
 /// One neutral composite model for dense and MoE Qwen3-VL.
@@ -1115,7 +1129,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     {
         visitor.visit("vision", &self.static_modules.vision)?;
         visitor.visit("embedding", &self.static_modules.text.embeddings)?;
-        visitor.visit("norm", &self.static_modules.text.norm)?;
+        visitor.visit("norm", &self.static_modules.text.boundary.norm)?;
         if let Some(head) = &self.static_modules.text.lm_head {
             visitor.visit("output", head)?;
         }
@@ -1128,7 +1142,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     {
         visitor.visit_mut("vision", &mut self.static_modules.vision)?;
         visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
-        visitor.visit_mut("norm", &mut self.static_modules.text.norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.text.boundary.norm)?;
         if let Some(head) = &mut self.static_modules.text.lm_head {
             visitor.visit_mut("output", head)?;
         }
@@ -1457,7 +1471,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         );
         let text_static = static_parallel_parameter_groups::<B>(
             &text_modules.embeddings,
-            &text_modules.norm,
+            &text_modules.boundary.norm,
             text_modules.lm_head.as_ref(),
             &self.args.text.parameter_root,
         )
@@ -1557,7 +1571,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.text.norm.forward(hidden, context)?;
+        let hidden = self
+            .static_modules
+            .text
+            .boundary
+            .norm
+            .forward(hidden, context)?;
         match &mut self.static_modules.text.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -1844,7 +1863,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.text.norm.forward(hidden, context)?;
+        let hidden = self
+            .static_modules
+            .text
+            .boundary
+            .norm
+            .forward(hidden, context)?;
         match &mut self.static_modules.text.lm_head {
             Some(head) => head.forward(&hidden, context),
             None => self
@@ -2213,7 +2237,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: RoutedExpertProvider<B>,
+        P: ParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
@@ -2246,6 +2270,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 let sine = &forward.rotary.1;
                 let output = block.forward_with_feed_forward(
                     AttentionInput {
+                        selected_positions: None,
                         hidden,
                         mask,
                         cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),
@@ -2294,7 +2319,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
-        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P: eredu_runtime::TensorParallelParameterProvider<B>,
         P::Error: std::fmt::Display,
     {
         match (group, unit) {
@@ -2328,6 +2353,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 let sine = &forward.rotary.1;
                 let output = block.forward_tensor_parallel_with_feed_forward(
                     AttentionInput {
+                        selected_positions: None,
                         hidden,
                         mask,
                         cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),
@@ -2762,6 +2788,7 @@ where
                 let state_ordinal = self.text_state_ordinal(index)?;
                 let output = block.forward(
                     AttentionInput {
+                        selected_positions: None,
                         hidden,
                         mask: forward.mask.as_ref(),
                         cache: Some(state.layer(state_ordinal).map_err(|error| {
@@ -3127,7 +3154,12 @@ where
         if self.parallel_geometry.is_none() {
             return Err(Error::backend("Qwen3-VL model has no local geometry"));
         }
-        let hidden = self.static_modules.text.norm.forward(hidden, context)?;
+        let hidden = self
+            .static_modules
+            .text
+            .boundary
+            .norm
+            .forward(hidden, context)?;
         match &mut self.static_modules.text.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -3291,6 +3323,9 @@ mod boundary_tests {
 
     #[test]
     fn routed_partition_declares_attention_and_expert_output_sums() {
-        assert_eq!(qwen_vl_routed_tensor_reductions(), (1, 1));
+        assert_eq!(
+            qwen_vl_routed_tensor_reductions(),
+            crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1)
+        );
     }
 }

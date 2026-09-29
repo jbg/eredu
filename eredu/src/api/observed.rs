@@ -45,7 +45,8 @@ pub use eredu_runtime::execution_control::TraceLimits;
 /// Both controlled entry points accept this value, including intervened requests:
 /// [`LoadedModel::start_controlled_chat`] requires semantic support, while
 /// [`LoadedModel::start_controlled_text`] explicitly selects ordinary text decoding.
-pub struct PreparedObservedGeneration {
+pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
+    pub(super) prompt: Option<B::Prompt>,
     pub(super) chat: PreparedChat,
     pub(super) prompt_token_ids: Vec<u32>,
     pub(super) settings: PreparedChatGenerationSettings,
@@ -58,7 +59,7 @@ pub struct PreparedObservedGeneration {
     pub(super) trace_limits: TraceLimits,
 }
 
-impl PreparedObservedGeneration {
+impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
     /// Prompt alignment in the checkpoint's canonical tokenizer vocabulary.
     pub fn prompt_token_ids(&self) -> &[u32] {
         &self.prompt_token_ids
@@ -148,6 +149,13 @@ pub enum ObservedGenerationEvent {
         status: eredu_core::execution_control::GenerationStatus,
         /// Absolute prediction that would execute next.
         next_prediction: u64,
+    },
+    /// One completed nonfinal prompt chunk; no token or semantic text commits.
+    PrefillProgress {
+        /// Physical chunk geometry and captures, if observation was requested.
+        captures: Option<CapturedStep>,
+        /// Wall time of this completed prefix and capture settlement.
+        step_seconds: f64,
     },
     /// Captures from an operation that failed before a token was committed.
     CaptureFailure {
@@ -265,7 +273,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         capture: CapturePlan,
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         let prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
         self.admit_prepared_interventions(prepared, intervention)
     }
@@ -281,7 +289,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         capture: CapturePlan,
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         let prepared =
             self.prepare_observed_token_ids(chat, prefix, settings, capture, trace_limits)?;
         self.admit_prepared_interventions(prepared, intervention)
@@ -289,9 +297,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     fn admit_prepared_interventions(
         &self,
-        mut prepared: PreparedObservedGeneration,
+        mut prepared: PreparedObservedGeneration<B>,
         intervention: InterventionPlan,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         if intervention.schema_version != eredu_core::intervention::INTERVENTION_SCHEMA_VERSION {
             return Err(CaptureError::Invalid("unsupported intervention schema".into()).into());
         }
@@ -364,7 +372,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         let prompt_token_ids = self
             .tokenizer
             .encode(chat.rendered_prompt(), false)
@@ -385,7 +393,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         settings: PreparedChatGenerationSettings,
         plan: CapturePlan,
         trace_limits: TraceLimits,
-    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
         if prompt_token_ids.is_empty()
             || prompt_token_ids
                 .iter()
@@ -407,6 +415,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             return Err(CaptureError::Invalid("trace byte limits must be positive".into()).into());
         }
         Ok(PreparedObservedGeneration {
+            prompt: None,
             chat: chat.clone(),
             prompt_token_ids,
             settings,
@@ -420,6 +429,31 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         })
     }
 
+    /// Admits an already prepared text/media prompt for observed or controlled execution.
+    /// `original_token_ids` must be the complete ordered decoder IDs retained by
+    /// `prompt`, including media placeholders. They provide capture and trace alignment;
+    /// embeddings are never used to reconstruct IDs. The backend still validates the
+    /// prepared input and its full decoder geometry before executing any chunk.
+    pub fn prepare_observed_input(
+        &self,
+        chat: &PreparedChat,
+        prompt: B::Prompt,
+        original_token_ids: Vec<u32>,
+        settings: PreparedChatGenerationSettings,
+        plan: CapturePlan,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration<B>, PreparedChatError> {
+        let mut prepared = self.prepare_observed_token_ids(
+            chat,
+            original_token_ids,
+            settings,
+            plan,
+            trace_limits,
+        )?;
+        prepared.prompt = Some(prompt);
+        Ok(prepared)
+    }
+
     /// Runs the ordinary prepared-chat generator with demand-driven host delivery.
     /// Return `Break(())` from the callback or cancel the shared token to stop at
     /// a token boundary. `Break` also stops further callback delivery; the returned
@@ -428,7 +462,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// outstanding submissions; native failures retain resources through recovery.
     pub fn generate_observed_chat<F>(
         &mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
@@ -450,7 +484,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     /// as `generate_prepared_text` and `start_controlled_text`.
     pub fn generate_observed_text<F>(
         &mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
@@ -469,7 +503,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
 
     fn generate_observed<F>(
         &mut self,
-        prepared: PreparedObservedGeneration,
+        prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
@@ -526,7 +560,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 generation: prepared.resolved,
                 seed: prepared.settings.seed,
             });
-        let mut on_token = |token_id: Option<u32>, captures, step_seconds| {
+        let mut on_token = |kind: super::request::GenerationStepKind, captures, step_seconds| {
             let mut delivery = delivery.borrow_mut();
             let index = delivery.prediction;
             let input_range = if index == 0 {
@@ -534,16 +568,26 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             } else {
                 [prompt_length + index - 1, prompt_length + index]
             };
-            let Some(token_id) = token_id else {
-                if let Some(captures) = captures {
-                    delivery.send(ObservedGenerationEvent::CaptureFailure {
-                        prediction_index: index,
-                        input_range,
+            let token_id = match kind {
+                super::request::GenerationStepKind::Token(token) => token,
+                super::request::GenerationStepKind::Prefill => {
+                    delivery.send(ObservedGenerationEvent::PrefillProgress {
                         captures,
                         step_seconds,
                     });
+                    return;
                 }
-                return;
+                super::request::GenerationStepKind::Failed => {
+                    if let Some(captures) = captures {
+                        delivery.send(ObservedGenerationEvent::CaptureFailure {
+                            prediction_index: index,
+                            input_range,
+                            captures,
+                            step_seconds,
+                        });
+                    }
+                    return;
+                }
             };
             delivery.prediction += 1;
             delivery.send(ObservedGenerationEvent::Token {
@@ -570,7 +614,12 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let delivery_failure = || delivery.borrow().failure.clone();
         let result = self.generate_prepared(
             PreparedChatGenerationRequest {
-                input: PreparedChatInput::token_ids(&prepared.chat, prepared.prompt_token_ids),
+                input: match prepared.prompt {
+                    Some(prompt) => {
+                        PreparedChatInput::prepared_backend_input(&prepared.chat, prompt)
+                    }
+                    None => PreparedChatInput::token_ids(&prepared.chat, prepared.prompt_token_ids),
+                },
                 settings: prepared.settings,
                 caller_stop_sequences,
                 cancellation,

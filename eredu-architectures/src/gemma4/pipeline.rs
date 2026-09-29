@@ -145,7 +145,7 @@ pub(crate) fn partition_state_layout(
                 num_key_value_heads,
                 head_dim,
             }
-            | LayerCachePolicy::KeyValueWithFixedState {
+            | LayerCachePolicy::KeyValueWithState {
                 attention,
                 num_key_value_heads,
                 head_dim,
@@ -156,7 +156,7 @@ pub(crate) fn partition_state_layout(
                 num_key_heads,
                 head_dim,
             }
-            | LayerCachePolicy::KeyOnlyWithFixedState {
+            | LayerCachePolicy::KeyOnlyWithState {
                 attention,
                 num_key_heads,
                 head_dim,
@@ -230,7 +230,7 @@ mod tests {
                     layout.layer(owner),
                     Some(
                         LayerCachePolicy::KeyValue { .. }
-                            | LayerCachePolicy::KeyValueWithFixedState { .. }
+                            | LayerCachePolicy::KeyValueWithState { .. }
                     )
                 ));
             }

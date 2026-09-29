@@ -18,6 +18,8 @@ pub mod expert;
 pub mod fp8;
 pub mod gguf_store;
 pub mod recipe;
+/// Compact row-addressable recipes and bounded, duplicate-aware read planning.
+pub mod rows;
 /// Canonical SafeTensors index parsing and shard-path admission.
 pub mod safetensors;
 pub mod schema;

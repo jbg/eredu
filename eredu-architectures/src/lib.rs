@@ -79,7 +79,8 @@ pub mod preparation;
 /// Architecture-owned total cold-preparation selection.
 pub mod preparation_selection;
 pub use preparation_selection::{
-    select_preparation, PreparationMechanismProvider, PreparationSelectionError,
+    select_preparation, PreparationMechanismProvider, PreparationRowLookupMechanisms,
+    PreparationSelectionError,
 };
 /// Total prepared-model construction through typed native mechanism visitors.
 pub mod prepared_execution;
@@ -117,7 +118,7 @@ pub use expert_residency::{
 pub use routed_text::{
     routed_text_requirements, select_routed_text_realization,
     visit_pooling_routed_text_architecture, visit_relu2_routed_text_architecture,
-    visit_routed_text_architecture, EmptyPartitionRoutedExpertProvider, GatedProductOperation,
+    visit_routed_text_architecture, EmptyPartitionParameterProvider, GatedProductOperation,
     LinearOperation, PlannedAddressableGatedProduct, PlannedAddressableLinear,
     PlannedAddressableRelu2, PlannedResidentGatedProduct, PlannedResidentRelu2,
     PreparedRoutedTextArchitecture, Relu2Operation, Relu2RoutedTextArchitectureVisitor,
@@ -130,8 +131,12 @@ pub use routed_text::{
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;
+/// Shared gated-delta recurrence with explicit construction and arithmetic policy.
+pub mod gated_delta;
 /// Shared assembly for heterogeneous stateful text decoders.
 pub mod hybrid_decoder;
+/// Shared/routed feed-forward construction independent of model-family naming.
+pub mod shared_routed;
 
 /// Inkling multimodal routed decoder family.
 pub mod inkling;
@@ -166,3 +171,6 @@ pub mod nemotron_h;
 
 /// Qwen2, Qwen3, and Qwen3-MoE text decoder architecture.
 pub mod qwen;
+
+/// Qwen4 experimental family equations and checkpoint contracts.
+pub mod qwen4_exp;

@@ -223,12 +223,12 @@ fn verify_live(device: DeviceType) {
                                             )
                                             .unwrap();
                                             bank.bind_local_parameters(bindings).unwrap();
-                                            RoutedExpertProvider::<MlxNeuralBackend>::forward_grouped(
-                                        &mut provider,
-                                        &mut bank,
-                                        request,
-                                        &stream,
-                                    )
+                                            ParameterProvider::<MlxNeuralBackend>::forward_grouped(
+                                                &mut provider,
+                                                &mut bank,
+                                                request,
+                                                &stream,
+                                            )
                                         } else {
                                             let mut bank = MlxNeuralBackend::grouped_relu2(
                                                 GroupedRelu2Spec::new(
@@ -243,7 +243,7 @@ fn verify_live(device: DeviceType) {
                                             )
                                             .unwrap();
                                             bank.bind_local_parameters(bindings).unwrap();
-                                            RoutedExpertProvider::<MlxNeuralBackend>::forward_relu2_routed(
+                                            ParameterProvider::<MlxNeuralBackend>::forward_relu2_routed(
                                         &mut provider,
                                         &mut bank,
                                         request,

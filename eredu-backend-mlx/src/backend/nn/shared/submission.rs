@@ -633,7 +633,7 @@ impl SumReductionBackend for MlxNeuralBackend {
         let input = value.into_array();
         #[cfg(test)]
         trace_partition_collective("sum", &input, group, "");
-        validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
+        validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         let output = crate::backend::runtime::distributed::all_sum(&input, group, executor)?;
         let completion = collective_completion(input, &output, group, executor, Vec::new())?;
         Ok(Submission {
@@ -891,6 +891,7 @@ impl FailureAgreementBackend for MlxNeuralBackend {
 
     fn agree_success(
         local_success: bool,
+        descriptor: Option<[u64; 8]>,
         group: &Group,
         executor: &Stream,
     ) -> Result<Submission<MlxFailureAgreement, MlxCommunicationCompletion>, Self::CommunicationError>
@@ -904,7 +905,26 @@ impl FailureAgreementBackend for MlxNeuralBackend {
                 "failure-agreement group size exceeds the advertised i32 status count",
             )
         })?;
-        let input = Array::from_slice(&[i32::from(local_success)], &[1]);
+        let input = if let Some(descriptor) = descriptor {
+            // Each rank owns one disjoint frame. Summing copies exact integer
+            // bit patterns with zeros and therefore implements an exact gather
+            // through the existing member-only bounded status protocol.
+            let length = group
+                .size()
+                .checked_mul(MlxFailureAgreement::DESCRIPTOR_WORDS)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    safemlx::error::Exception::custom("agreement descriptor extent exceeds i32")
+                })?;
+            let mut words = vec![0i32; length as usize];
+            let start = group.rank() * MlxFailureAgreement::DESCRIPTOR_WORDS;
+            words[start..start + MlxFailureAgreement::DESCRIPTOR_WORDS].copy_from_slice(
+                &MlxFailureAgreement::descriptor_words(local_success, descriptor),
+            );
+            Array::from_slice(&words, &[length])
+        } else {
+            Array::from_slice(&[i32::from(local_success)], &[1])
+        };
         #[cfg(test)]
         trace_partition_collective(
             "agreement",
@@ -919,7 +939,8 @@ impl FailureAgreementBackend for MlxNeuralBackend {
             executor,
         )?;
         let completion = collective_completion(input, &output, group, executor, Vec::new())?;
-        let (agreement, completion) = completion.with_failure_agreement(output, member_count);
+        let (agreement, completion) =
+            completion.with_failure_agreement(output, member_count, descriptor.is_some());
         Ok(Submission {
             output: agreement,
             completion,

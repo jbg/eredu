@@ -561,6 +561,7 @@ version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-core",
+ "eredu-evaluation",
  "eredu-gguf",
  "eredu-media",
  "eredu-nn",
@@ -638,6 +639,8 @@ dependencies = [
  "eredu-backend-mlx",
  "eredu-checkpoint",
  "eredu-core",
+ "eredu-evaluation",
+ "eredu-gguf",
  "eredu-runtime",
  "eredu-text",
  "hf-cache-reader",
@@ -645,6 +648,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokenizers",
 ]
 
 [[package]]
@@ -678,8 +682,10 @@ version = "0.5.0"
 dependencies = [
  "clap",
  "eredu-architectures",
+ "eredu-checkpoint",
  "eredu-codec",
  "eredu-core",
+ "eredu-gguf",
  "eredu-nn",
  "eredu-runtime",
  "half",

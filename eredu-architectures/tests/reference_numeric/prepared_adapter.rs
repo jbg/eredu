@@ -8,6 +8,60 @@ pub(super) struct NumericPreparationProvider {
 }
 
 impl eredu_architectures::PreparationMechanismProvider for NumericPreparationProvider {
+    fn floating_state_dtype(
+        &self,
+        source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        eredu_runtime::ReplicatedTextMechanismSupport::floating_state_dtype(
+            &NumericMechanismSupport::default(),
+            source,
+        )
+    }
+
+    fn state_capabilities(
+        &self,
+        requirements: &eredu_runtime::StateRealizationRequirements,
+        policy: &eredu_runtime::CacheResidencyPolicy,
+    ) -> eredu_runtime::StateMechanismCapabilities {
+        eredu_runtime::synthesize_state_capabilities(
+            requirements,
+            policy,
+            &NumericMechanismSupport {
+                persistent_session: true,
+                addressable: self.addressable,
+            },
+        )
+    }
+
+    fn row_lookup_storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
+        Some(eredu_runtime::AddressableStorageCapabilities::new(
+            true,
+            true,
+            true,
+            1 << 20,
+        ))
+    }
+
+    fn row_lookup_workspace(
+        &self,
+        _: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
+        Ok(Some(eredu_runtime::RowLookupWorkspace {
+            decode_bytes: 64,
+            scalar_bytes: 0,
+        }))
+    }
+
+    fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
+        &self,
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &C,
+    ) -> Result<u64, String> {
+        recipe
+            .peak_materialization_bytes(source)
+            .map_err(|error| error.to_string())
+    }
+
     fn preparation_capabilities(&self) -> eredu_core::PreparationMechanismCapabilities {
         eredu_core::PreparationMechanismCapabilities::new(true, true)
             .with_input_modalities(eredu_core::InputModalities {
@@ -49,6 +103,7 @@ impl eredu_architectures::PreparationMechanismProvider for NumericPreparationPro
                 addressable: self.addressable,
             },
         )
+        .with_chunked_prefill(true)
     }
 
     fn processor_capabilities(&self) -> eredu_runtime::MediaPrimitiveCapabilities {
@@ -180,6 +235,8 @@ pub(super) fn routed(
         NumericBackend,
         State,
         State,
+        State,
+        _,
         _,
         _,
         _,
@@ -188,6 +245,7 @@ pub(super) fn routed(
         context,
         NumericRoutedVisitor { context, tokens },
         NumericRelu2RoutedVisitor { context, tokens },
+        NumericRoutedVisitor { context, tokens },
         NumericRoutedVisitor { context, tokens },
     ));
     construct_prepared_execution(sources, None, routes, RunAssembler)

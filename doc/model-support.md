@@ -68,7 +68,8 @@ projector.
 | Qwen2 / Qwen2.5 | text | yes | `qwen2` | dense text models; exact full/sliding schedules |
 | Qwen3 | text | yes | `qwen3`, `qwen3moe` | dense and MoE |
 | Qwen3-VL | text, image, video | yes | `qwen3vl`, `qwen3vlmoe` + projector | dense and MoE text decoders, MRoPE and DeepStack |
-| Qwen3-Next / Qwen3.5 / Qwen3.6 / Qwen3.8 | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | shared Qwen3.5 hybrid recurrent/full-attention contract; dense and MoE, projector and embedded-MTP support; official Qwen3.6/3.8 chat and tagged-parameter tools |
+| Qwen3-Next / Qwen3.5 / Qwen3.6 / Qwen3.8 using `qwen3_5` | text; image/video where present | yes | `qwen3next`, `qwen35`, `qwen35moe` | shared Qwen3.5 hybrid recurrent/full-attention contract; dense and MoE, projector and embedded-MTP support; official Qwen3.6/3.8 chat and tagged-parameter tools |
+| Qwen3.8-Flash-Next (`qwen4_exp`) | text, image, video | `qwen4_exp`, `qwen4_exp_text` | `qwen4exp` | distinct family route; resident/host/disk, image/video MTP, chunked media capture/control and snapshot fixtures; ordinary text and media TP/PP/EP native conformance; released-payload parity pending |
 | DeepSeek-V3 / R1 | text | yes | `deepseek2` | compressed MLA, dense-to-MoE schedules, native block FP8 |
 | DeepSeek-V4 | text | yes | `deepseek4` | mHC compressed sparse attention, routed/shared experts, native FP8 and mixed FP4; SafeTensors embedded MTP and fused DSpark; base GGUF target only |
 | GPT-OSS | text | yes | `gpt-oss` | Harmony chat, scheduled attention, native MXFP4 experts |
@@ -184,9 +185,15 @@ tool support. See [Native tool calling](tool-calling.md).
 Accordingly, a full checkpoint-support claim covers more than loading tensor
 weights: it includes the checkpoint tokenizer and template sidecars, reasoning
 controls and history, media placeholders where applicable, and native tool
-rendering, constraints, and response parsing. Qwen3.6 and Qwen3.8 retain the
-`qwen3_5` / `qwen3_5_text` architecture contract. Their released templates use
-tagged function parameters rather than the older Qwen JSON-in-XML protocol;
+rendering, constraints, and response parsing. The supported Qwen3.6 and Qwen3.8
+checkpoints use the `qwen3_5` / `qwen3_5_text` architecture contract (including
+the pinned Qwen3.8-27B configuration fixture). This does not cover
+Qwen3.8-Flash-Next, which uses the distinct `qwen4_exp` / `qwen4_exp_text` and
+`qwen4exp` contracts. Its pinned template fixtures cover reasoning controls,
+tagged parameters, EOS aliases and tool-result replay through ordinary and
+controlled drivers. Active tool-grammar snapshots have the typed support limits
+in [execution control](execution-control.md). The supported Qwen3.6/3.8 templates
+use tagged function parameters.
 Qwen3.8 additionally accepts `reasoning_effort` values `low`, `medium`, and
 `xhigh`, while Qwen3.6 has no effort selector.
 
@@ -217,3 +224,42 @@ rules.
   prompt-cache persistence.
 - A non-replicated topology must use the matching distributed loader rather
   than the complete single-model loader.
+
+
+## Flash-Next execution
+
+SafeTensors and published GGUF artifacts use architecture-owned target/vision declarations
+and exact retained source binding. Vision blocks, experts and table rows are independently
+addressable. Ordinary loading supports resident, host-layerwise and disk-streamed weights;
+text and image/video construction supports TP, PP, EP and their combinations.
+
+Architecture defaults select one sequence lane, at most 512 tokens per invocation, declared
+context capacity, tiled QSA selection and a shared 64 MiB device table cache without a host
+table cache. These are execution limits, not eager allocations or physical-fit guarantees.
+Generic parameter-bank and state policies remain authoritative.
+
+SafeTensors vision and explicit GGUF projectors support architecture-default media selection.
+`MediaLoadRequest::Disabled` selects text-only execution. Prepared/projected media preserve
+original token IDs and rotary positions. Raw preparation uses processor JSON or projector
+metadata; optional coarse host-processing limits apply before expensive host work.
+
+`prepare_observed_input` accepts a prepared backend prompt plus its explicit original decoder
+IDs. Ordinary and controlled generation share the retained request cursor. A controlled step
+commits one nonfinal chunk without sampling, and captures retain absolute prompt spans.
+Snapshots, restore and fork preserve cursor/model state and immutable encoder products.
+Partial-chunk interventions return a typed rejection; single-invocation interventions work.
+
+Explicit embedded drafting selects joint target/prediction execution. GGUF targets require a
+matching SafeTensors prediction companion through `ExecutionPlan::with_prediction_source`;
+GGUF embedding/output weights remain authoritative. The caller supplies matching training
+lineage. MTP owns separate state and streams text/media prefill across invocation boundaries,
+using the shared speculative driver's control boundaries.
+
+Memory reports include state history, weights, table caches and operator workspace ranges.
+Sparse attention retains full K/V history. Estimates and optional storage diagnostics do not
+constitute complete physical-memory accounting. Missing native facts remain unknown.
+
+The [validation report](qwen4-exp-validation.md) specifies numerical fixtures, native
+format/topology coverage, pinned reference sources and reproducible commands. Released-payload
+parity and throughput, distributed FP8/quantized-table trajectories and physical multi-GPU
+execution are unverified.

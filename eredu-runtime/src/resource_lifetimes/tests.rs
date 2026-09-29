@@ -651,3 +651,153 @@ fn capacity_lower_includes_payload_without_adding_the_two() {
     ))]);
     assert_eq!(peak(&r, "unified"), (50, None));
 }
+
+// A complete report for this independently declared scratch scope is not a
+// complete operation report. The fixture supplies an optional new allocation:
+// zero when skipped, otherwise the allocator's finite rounded/reuse bound.
+fn optional_scratch_description(
+    invocation: &str,
+    payload: u64,
+    capacity: u64,
+    unknown_result: bool,
+) -> ResourceLifetimeDescription {
+    MechanismBytes {
+        lower: payload,
+        upper: Some(capacity),
+    }
+    .validate_for_payload(payload)
+    .unwrap();
+    let mut contract = MechanismMemoryContract {
+        values: vec![],
+        storage: vec![MechanismStorage {
+            name: "optional_scratch".into(),
+            role: MechanismStorageRole::Scratch,
+            payload: MechanismBytes {
+                lower: 0,
+                upper: Some(payload),
+            },
+            capacity: MechanismBytes {
+                lower: 0,
+                upper: Some(capacity),
+            },
+            backing: MechanismBacking::Invocation,
+            placement: MechanismPlacement::Execution,
+            retention: StorageRetention::NativeCompletion,
+            detail: "independent fixture: optional fresh buffer with a certified allocator bound"
+                .into(),
+        }],
+        missing: vec![],
+    };
+    if unknown_result {
+        contract.storage.push(MechanismStorage {
+            name: "result".into(),
+            role: MechanismStorageRole::Output,
+            payload: MechanismBytes::exact(16),
+            capacity: MechanismBytes::unknown(16),
+            backing: MechanismBacking::Unknown,
+            placement: MechanismPlacement::Execution,
+            retention: StorageRetention::Returned,
+            detail: "result may reuse an input or acquire distinct backing; owner is unestablished"
+                .into(),
+        });
+    }
+    let scope = if unknown_result {
+        format!("operation:{invocation}")
+    } else {
+        format!("scratch-only:{invocation}")
+    };
+    let pool = Observed::Available {
+        value: id("unified"),
+        kind: ObservationKind::Exact,
+        source: "independent fixture physical pool".into(),
+    };
+    let resources = describe_mechanism_resources(
+        contract,
+        &MechanismResourceQuery {
+            invocation: id(&scope),
+            execution_pool: pool.clone(),
+            host_pool: pool,
+            owner_backings: BTreeMap::new(),
+        },
+    )
+    .unwrap();
+    describe_mechanism_lifetimes(
+        &resources,
+        &MechanismLifetimeBindings {
+            completion: id(invocation),
+            evaluation: None,
+            owners: BTreeMap::new(),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn finite_optional_scratch_capacity_survives_mechanism_and_lifetime_composition() {
+    let described = optional_scratch_description("first", 24, 64, false);
+    assert_eq!(described.resources.coverage, ResourceCoverage::Complete);
+    assert_eq!(described.resources.allocations.len(), 1);
+    assert!(!described.live_at_acquire);
+    let result = report(vec![
+        ResourceLifetimeEvent::Acquire(described),
+        complete("first"),
+    ]);
+    assert!(result.missing.is_empty());
+    assert!(result.unplaced.is_empty());
+    assert_eq!(peak(&result, "unified"), (0, Some(64)));
+    assert_eq!(result.pools[0].peak.payload.upper_bytes, Some(24));
+    // Compare only this declared scope. These assertions add no production
+    // admission gate, reservation, or whole-operation fit claim.
+    let ceiling = 64;
+    assert!(result.pools[0].peak.capacity.upper_bytes.unwrap() <= ceiling);
+    assert!(result.pools[0].peak.capacity.upper_bytes.unwrap() > ceiling - 1);
+}
+
+#[test]
+fn finite_scratch_capacity_does_not_resolve_unknown_operation_result_backing() {
+    let described = optional_scratch_description("whole", 24, 64, true);
+    assert!(matches!(
+        described.resources.coverage,
+        ResourceCoverage::Partial { .. }
+    ));
+    // Only the independently identified scratch becomes an allocation. The
+    // unbound result must survive as a coverage gap rather than a free output.
+    assert_eq!(described.resources.allocations.len(), 1);
+    let result = report(vec![
+        ResourceLifetimeEvent::Acquire(described),
+        complete("whole"),
+    ]);
+    assert_eq!(peak(&result, "unified"), (0, None));
+    assert!(result
+        .missing
+        .iter()
+        .any(|reason| reason.contains("result")));
+    assert_eq!(result.pools[0].peak.payload.upper_bytes, None);
+}
+
+#[test]
+fn optional_scratch_overlap_uses_capacity_and_actual_completion_order() {
+    let first = optional_scratch_description("first", 24, 64, false);
+    let second = optional_scratch_description("second", 40, 128, false);
+    let overlap = report(vec![
+        ResourceLifetimeEvent::Acquire(first.clone()),
+        ResourceLifetimeEvent::Acquire(second.clone()),
+        complete("first"),
+        complete("second"),
+    ]);
+    let serial = report(vec![
+        ResourceLifetimeEvent::Acquire(first),
+        complete("first"),
+        ResourceLifetimeEvent::Acquire(second),
+        complete("second"),
+    ]);
+    assert!(overlap.missing.is_empty());
+    assert!(serial.missing.is_empty());
+    assert_eq!(peak(&overlap, "unified"), (0, Some(192)));
+    assert_eq!(peak(&serial, "unified"), (0, Some(128)));
+    assert_eq!(overlap.pools[0].peak.payload.upper_bytes, Some(64));
+    assert_eq!(serial.pools[0].peak.payload.upper_bytes, Some(40));
+    let ceiling = 128;
+    assert!(serial.pools[0].peak.capacity.upper_bytes.unwrap() <= ceiling);
+    assert!(overlap.pools[0].peak.capacity.upper_bytes.unwrap() > ceiling);
+}

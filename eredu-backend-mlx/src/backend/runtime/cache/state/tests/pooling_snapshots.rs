@@ -54,11 +54,12 @@ fn policy(streams: usize) -> LayerCachePolicy {
     if streams == 0 {
         LayerCachePolicy::key_only(AttentionPolicy::sliding(7).unwrap(), 1, 8).unwrap()
     } else {
-        LayerCachePolicy::key_only_with_fixed_state(
+        LayerCachePolicy::key_only_with_state(
             AttentionPolicy::sliding(7).unwrap(),
             1,
             8,
             tensors,
+            Vec::new(),
         )
         .unwrap()
     }

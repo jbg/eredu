@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        mpsc, Arc, Condvar, Mutex, MutexGuard, Weak,
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -24,15 +24,14 @@ use safemlx::{
     ImmutableHostTransferBuffer, Stream,
 };
 use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
-use sha2::{Digest, Sha256};
 
 use eredu_core::{
     cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner, StateTensorRole,
-        PROMPT_CACHE_SCHEMA_VERSION,
+        CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheStreamId, CacheTier,
+        PromptCacheBlock, PromptCacheDescriptor, PromptCacheError, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner,
+        StateTensorRole, PROMPT_CACHE_SCHEMA_VERSION,
     },
     residency::CacheEvictionPolicy,
 };
@@ -78,6 +77,18 @@ impl CacheHistoryRetention {
 #[derive(Debug, Clone)]
 /// Device arrays held by one resident attention-cache block.
 pub enum CacheBlockArrays {
+    /// Named records. The zero-width reserved array preserves the shared two-array
+    /// paging format without allocating a second payload.
+    AppendStream {
+        /// Architecture-declared stream slot.
+        slot: u32,
+        /// Independent batch lane.
+        lane: u32,
+        /// Exact records, shaped `[1, 1, entries, width]`.
+        records: Array,
+        /// Same scalar type, shaped `[1, 1, entries, 0]`.
+        reserved: Array,
+    },
     /// Conventional key/value attention state.
     KeyValue {
         /// Key-cache values.
@@ -98,6 +109,17 @@ impl CacheBlockArrays {
     fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, safemlx::error::Exception> {
         let copy = |array: &Array| array.contiguous(false, stream)?.deep_clone();
         Ok(match self {
+            Self::AppendStream {
+                slot,
+                lane,
+                records,
+                reserved,
+            } => Self::AppendStream {
+                slot: *slot,
+                lane: *lane,
+                records: copy(records)?,
+                reserved: copy(reserved)?,
+            },
             Self::KeyValue { keys, values } => Self::KeyValue {
                 keys: copy(keys)?,
                 values: copy(values)?,
@@ -112,6 +134,10 @@ impl CacheBlockArrays {
     /// Returns the portable representation encoded by these arrays.
     pub fn representation(&self) -> CacheRepresentation {
         match self {
+            Self::AppendStream { slot, lane, .. } => CacheRepresentation::AppendStream {
+                slot: *slot,
+                lane: *lane,
+            },
             Self::KeyValue { .. } => CacheRepresentation::KeyValue,
             Self::CompressedLatentRotary { .. } => CacheRepresentation::CompressedLatentRotary,
         }
@@ -119,6 +145,9 @@ impl CacheBlockArrays {
 
     fn arrays(&self) -> [&Array; 2] {
         match self {
+            Self::AppendStream {
+                records, reserved, ..
+            } => [records, reserved],
             Self::KeyValue { keys, values } => [keys, values],
             Self::CompressedLatentRotary { latent, rotary_key } => [latent, rotary_key],
         }
@@ -212,6 +241,12 @@ fn dtype_name(dtype: Dtype) -> String {
 
 #[derive(Debug, Clone)]
 enum HostCacheBlock {
+    AppendStream {
+        slot: u32,
+        lane: u32,
+        records: Arc<ImmutableHostTransferBuffer>,
+        reserved: Arc<ImmutableHostTransferBuffer>,
+    },
     KeyValue {
         keys: Arc<ImmutableHostTransferBuffer>,
         values: Arc<ImmutableHostTransferBuffer>,
@@ -255,6 +290,12 @@ impl HostCacheBlock {
                 .freeze(),
         );
         Ok(match arrays {
+            CacheBlockArrays::AppendStream { slot, lane, .. } => Self::AppendStream {
+                slot: *slot,
+                lane: *lane,
+                records: first,
+                reserved: second,
+            },
             CacheBlockArrays::KeyValue { .. } => Self::KeyValue {
                 keys: first,
                 values: second,
@@ -274,6 +315,12 @@ impl HostCacheBlock {
         let first = Arc::new(first);
         let second = Arc::new(second);
         match representation {
+            CacheRepresentation::AppendStream { slot, lane } => Self::AppendStream {
+                slot,
+                lane,
+                records: first,
+                reserved: second,
+            },
             CacheRepresentation::KeyValue => Self::KeyValue {
                 keys: first,
                 values: second,
@@ -287,6 +334,10 @@ impl HostCacheBlock {
 
     fn representation(&self) -> CacheRepresentation {
         match self {
+            Self::AppendStream { slot, lane, .. } => CacheRepresentation::AppendStream {
+                slot: *slot,
+                lane: *lane,
+            },
             Self::KeyValue { .. } => CacheRepresentation::KeyValue,
             Self::CompressedLatentRotary { .. } => CacheRepresentation::CompressedLatentRotary,
         }
@@ -294,6 +345,9 @@ impl HostCacheBlock {
 
     fn buffers(&self) -> [&ImmutableHostTransferBuffer; 2] {
         match self {
+            Self::AppendStream {
+                records, reserved, ..
+            } => [records, reserved],
             Self::KeyValue { keys, values } => [keys, values],
             Self::CompressedLatentRotary { latent, rotary_key } => [latent, rotary_key],
         }
@@ -366,6 +420,12 @@ impl HostCacheBlock {
         let (first, first_completion) = first.into_parts();
         let (second, second_completion) = second.into_parts();
         let arrays = match self {
+            Self::AppendStream { slot, lane, .. } => CacheBlockArrays::AppendStream {
+                slot: *slot,
+                lane: *lane,
+                records: first,
+                reserved: second,
+            },
             Self::KeyValue { .. } => CacheBlockArrays::KeyValue {
                 keys: first,
                 values: second,

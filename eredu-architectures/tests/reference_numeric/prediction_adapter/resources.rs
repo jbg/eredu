@@ -138,15 +138,19 @@ pub(super) fn assert_prepared_prediction_resources(
         .unwrap()
         .unwrap();
     assert_eq!(first, second);
-    assert!(first.allocations.iter().any(|allocation| allocation
-        .uses
-        .iter()
-        .any(|usage| usage.role == ResourceRole::MutableState)));
+    assert!(first.allocations.iter().any(|allocation| {
+        allocation
+            .uses
+            .iter()
+            .any(|usage| usage.role == ResourceRole::MutableState)
+    }));
     // Without prepared backing slots, borrowed target weights are not invented.
-    assert!(!first.allocations.iter().any(|allocation| allocation
-        .uses
-        .iter()
-        .any(|usage| usage.role == ResourceRole::Parameters)));
+    assert!(!first.allocations.iter().any(|allocation| {
+        allocation
+            .uses
+            .iter()
+            .any(|usage| usage.role == ResourceRole::Parameters)
+    }));
     assert_eq!(
         before,
         last_reference_stage_evidence(),

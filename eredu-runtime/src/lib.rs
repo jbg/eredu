@@ -11,6 +11,8 @@
 pub mod automatic_support;
 /// Backend execution, parameter, transfer, and collective capabilities.
 pub mod backend;
+/// Explicit finite invocation and streaming-mechanism load policy.
+pub mod bounded_execution;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
 pub mod cache;
 /// Bounded observation admission and collection.
@@ -25,8 +27,11 @@ pub mod composite;
 pub mod decision;
 /// Backend-neutral dense-stream residency telemetry.
 pub mod dense;
+/// Bounded observations of detached native work and its retained resources.
+pub mod detached_resources;
 /// Backend-neutral speculative-state fork, commit, and rollback ownership.
 pub mod draft;
+/// Logical request encoder workspace admission.
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
 /// Completed-token lifecycle, snapshot reservation and branch accounting policy.
@@ -41,6 +46,8 @@ pub mod expert;
 pub mod generation;
 /// Backend-neutral ownership of prepared multimodal tensors.
 pub mod input;
+/// Explicit prepared-input copy admission.
+pub mod input_transfer;
 pub mod inspection;
 /// Immutable intervention scheduling and evidence using the shared capture ledger.
 pub mod intervention;
@@ -52,6 +59,8 @@ pub mod load_request;
 pub mod mechanism_resources;
 /// Exact mechanism capability synthesis from neutral requirements.
 pub mod mechanism_synthesis;
+/// Explicit media input readiness and logical request-resource policy.
+pub mod media_load_request;
 /// Request-specific generation-memory estimates and fit advice.
 pub mod memory_estimation;
 pub mod memory_forecast;
@@ -69,6 +78,10 @@ pub mod placement;
 pub mod prediction_resources;
 /// Backend-neutral bounded background weight-prefetch execution.
 pub mod prefetch;
+/// Request-bounded chunked prefill through shared session advancement.
+pub mod prefill;
+/// Request preparation buffer bounds and typed admission.
+pub mod processor_resources;
 /// Explicit native projection storage coverage without native handles.
 pub mod projection_memory;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
@@ -94,6 +107,7 @@ pub mod realtime_session;
 pub mod replicated_session;
 /// Selection contracts for replicated text architectures.
 pub mod replicated_text;
+/// Logical request preparation, retention, and target-span assembly limits.
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
 /// Execution-order, retention and per-physical-pool resource peak composition.
@@ -119,6 +133,10 @@ pub use backend::{
     SubmissionBackend, SumReductionBackend, TransferBackend, UnevenGatherBackend,
     VariableAllToAllBackend,
 };
+pub use bounded_execution::{
+    AppendStreamLoadPolicy, BoundedExecutionPolicy, BoundedExecutionPolicyError, InvocationLimits,
+    RowLookupLoadPolicy, TiledSelectionLimits,
+};
 pub use cache::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     prompt_cache_rank_path, resolve_prompt_cache_root, safe_prompt_cache_shard_path,
@@ -132,7 +150,7 @@ pub use cache::{
     CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
     CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
     LiveCacheBlockPublication, LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail,
-    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
+    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication, RetainedCacheShard,
     ReversiblePromptCachePublication, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
     MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
     PROMPT_CACHE_GENERATIONS_DIRECTORY,
@@ -191,11 +209,10 @@ pub use expert::{
     AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
     AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation,
     ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
-    ObservedExpertProviderError, ParameterBankAcquisition, ProviderUnitObserver,
-    ResidentExpertProvider, RoutedBankId, RoutedBankProviderError, RoutedBankProviders,
-    RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoints, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
-    TensorParallelRoutedExpertProvider,
+    ObservedExpertProviderError, ParameterProvider, ProviderUnitObserver, ResidentExpertProvider,
+    RoutedBankId, RoutedBankProviderError, RoutedBankProviders, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput, RoutedObservationPoints, RoutedUnitBatch,
+    RoutedUnitInvocation, RoutedUnitObserver, TensorParallelParameterProvider,
 };
 pub use expert::{
     select_routes_with_observer, select_routes_with_provider, with_exchanged_unit_observer,
@@ -234,9 +251,10 @@ pub use mechanism_resources::{
     describe_mechanism_resources, MechanismResourceDescription, MechanismResourceQuery,
 };
 pub use mechanism_synthesis::{
-    synthesize_replicated_text_capabilities, BackendMechanismFacts, ReplicatedTextMechanismSupport,
-    StateLifecycleCapabilities,
+    synthesize_replicated_text_capabilities, synthesize_state_capabilities, BackendMechanismFacts,
+    ReplicatedTextMechanismSupport, StateLifecycleCapabilities,
 };
+pub use media_load_request::{MediaExecutionPolicy, MediaExecutionPolicyError, MediaLoadRequest};
 pub use parallel::{
     aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
     expand_linear_format_parameter_groups, module_parameter_group, partition_chunk_range,
@@ -358,19 +376,19 @@ pub use replicated_text::{
     partitioned_replicated_text_materialization_tasks,
     plan_local_replicated_text_materialization_tasks, plan_replicated_text_materialization_tasks,
     replicated_text_materialization_tasks, select_replicated_text_realization,
-    selected_materialization_task_bytes, AddressableStorageCapabilities, AddressableStorageTiers,
-    BackendMechanismCapabilities, GroupedOperationRequirement, ParameterTransformConstraint,
-    ParameterTransformTarget, ReplicatedTextArchitecture, ReplicatedTextContractError,
-    ReplicatedTextMaterializationPartitionPlan, ReplicatedTextMaterializationTask,
-    ReplicatedTextOutputCompanion, ReplicatedTextOutputSelection, ReplicatedTextParameterOwner,
-    ReplicatedTextParameterPresence, ReplicatedTextParameterRequirement,
-    ReplicatedTextParameterRole, ReplicatedTextPhysicalSource, ReplicatedTextRequirements,
-    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, ReplicatedTextStateAccess,
-    ReplicatedTextTransformGroup, SelectedParameterRealization, SelectedReplicatedTextRealization,
-    SelectedStateComponentRealization, SelectedStateRealization, StateComponentMechanism,
-    StateComponentPlacement, StateMechanismCapabilities, StateStorageDtype,
-    WeightLoweringCapability, WeightLoweringDescriptor, WeightLoweringKind,
-    WeightResidencyMechanism,
+    select_state_realization, selected_materialization_task_bytes, AddressableStorageCapabilities,
+    AddressableStorageTiers, BackendMechanismCapabilities, GroupedOperationRequirement,
+    ParameterTransformConstraint, ParameterTransformTarget, ReplicatedTextArchitecture,
+    ReplicatedTextContractError, ReplicatedTextMaterializationPartitionPlan,
+    ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
+    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
+    ReplicatedTextParameterRequirement, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
+    ReplicatedTextStateAccess, ReplicatedTextTransformGroup, SelectedParameterRealization,
+    SelectedReplicatedTextRealization, SelectedStateComponentRealization, SelectedStateRealization,
+    StateComponentMechanism, StateComponentPlacement, StateMechanismCapabilities,
+    StateRealizationRequirements, StateStorageDtype, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind, WeightResidencyMechanism,
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, QuantizationCompanionBindings, ResidencyAcquisition,
@@ -378,7 +396,8 @@ pub use residency::{
     ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer,
     ResidencyTransferOwner, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
     ResidentLayerGroupReport, ResidentParameterConversion, ResidentParameterConversionBinding,
-    WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
+    RowResidencyRange, WeightBinding, WeightBindingPlan, WeightBindingSelectionError,
+    WeightMaterializationReport,
 };
 pub use speculative::{RunSpeculativeGeneration, SpeculativeScheduler};
 pub use speculative_selection::{
@@ -413,3 +432,34 @@ pub use weight_residency::{
 
 /// Generic calibrated target workspace composition from ordinary module topology.
 pub mod workspace_resources;
+
+mod parameter_bank;
+pub use parameter_bank::{ParameterBank, ParameterBankAcquisition};
+
+/// Bounded row-addressable parameter lookup.
+pub mod row_lookup;
+pub use row_lookup::{
+    BoundedRowLookup, NoRowLookups, PreparedRowLookup, PreparedRowLookups, PreparedRowScale,
+    RowEncoding, RowLookupBank, RowLookupDescriptor, RowLookupDescriptors, RowLookupError,
+    RowLookupLimits, RowLookupMechanismSupport, RowLookupProvider, RowLookupProviders,
+    RowLookupRequirements, RowLookupSelectionError, RowLookupSpec, RowLookupWorkspace,
+    RowScaleDescriptor, RowScaleSource, SelectedRowLookupPlans, SelectedRowLookupRequirements,
+    SelectedRowLookups, TensorParallelRowLookup,
+};
+
+mod parameter_providers;
+pub use parameter_providers::ParameterProviders;
+
+/// Exact original token identity and visibility through shared request preparation.
+pub mod token_input;
+pub use token_input::{OriginalTokenIds, TokenInputError, TokenVisibility};
+
+/// Bounded integer state through ordinary fixed-component lifecycle contracts.
+pub mod integer_history;
+pub use integer_history::{IntegerHistoryError, IntegerHistorySpec};
+
+pub mod append_stream;
+pub use append_stream::{
+    AppendOnlyStream, AppendStreamAllowances, AppendStreamBinding, AppendStreamError,
+    AppendStreamLimits, AppendStreamSpec, ResidentAppendStream, RuntimeAppendStreams,
+};

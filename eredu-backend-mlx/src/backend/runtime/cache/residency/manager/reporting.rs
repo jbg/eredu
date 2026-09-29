@@ -3,6 +3,30 @@
 use super::*;
 
 impl CacheResidencyManager {
+    /// Records range activity before copies execute; failure and rollback do not refund it.
+    pub(crate) fn record_append_stream_read(
+        &self,
+        layer: usize,
+        blocks: u64,
+        bytes: u64,
+        scratch: u64,
+    ) -> Result<(), CacheResidencyError> {
+        let mut state = self.lock()?;
+        state.telemetry.report.append_stream_read_blocks += blocks;
+        state.telemetry.report.append_stream_read_bytes += bytes;
+        state.telemetry.report.append_stream_scratch_peak_bytes = state
+            .telemetry
+            .report
+            .append_stream_scratch_peak_bytes
+            .max(scratch);
+        let activity = state.layer_activity_mut(layer);
+        activity.append_stream_read_blocks += blocks;
+        activity.append_stream_read_bytes += bytes;
+        activity.append_stream_scratch_peak_bytes =
+            activity.append_stream_scratch_peak_bytes.max(scratch);
+        Ok(())
+    }
+
     /// Returns a bounded aggregate snapshot without retaining per-block history.
     pub fn report(&self) -> Result<CacheResidencyReport, CacheResidencyError> {
         let mut state = self.lock()?;
@@ -11,6 +35,30 @@ impl CacheResidencyManager {
             sample_process(&mut state.telemetry.report);
         }
         Ok(state.telemetry.report.clone())
+    }
+
+    /// Records selected reads immediately; later failures do not erase activity.
+    pub(crate) fn record_selected_attention(
+        &self,
+        global_layer: usize,
+        blocks: u64,
+        bytes: u64,
+        scratch_bytes: u64,
+    ) -> Result<(), CacheResidencyError> {
+        let mut state = self.lock()?;
+        state.telemetry.report.selected_attention_blocks += blocks;
+        state.telemetry.report.selected_attention_bytes += bytes;
+        state.telemetry.report.attention_scratch_peak_bytes = state
+            .telemetry
+            .report
+            .attention_scratch_peak_bytes
+            .max(scratch_bytes);
+        let activity = state.layer_activity_mut(global_layer);
+        activity.selected_attention_blocks += blocks;
+        activity.selected_attention_bytes += bytes;
+        activity.attention_scratch_peak_bytes =
+            activity.attention_scratch_peak_bytes.max(scratch_bytes);
+        Ok(())
     }
 
     /// Records one attention scan and its scratch-memory use in telemetry.
@@ -73,6 +121,7 @@ pub(in super::super) fn update_report_totals(state: &mut CacheManagerState) {
     let report = &mut state.telemetry.report;
     report.key_value_blocks = 0;
     report.compressed_latent_blocks = 0;
+    report.append_stream_blocks = 0;
     report.device_blocks = 0;
     report.host_blocks = 0;
     report.disk_blocks = 0;
@@ -90,18 +139,32 @@ pub(in super::super) fn update_report_totals(state: &mut CacheManagerState) {
     report.logical_cached_tokens = 0;
     let mut per_layer = BTreeMap::<usize, CacheLayerResidencyStats>::new();
     let mut layer_ends: HashMap<usize, i64> = HashMap::new();
-    for (layer, tail) in tails {
-        layer_ends.insert(layer, tail.end);
+    for (stream, tail) in tails {
+        let layer = stream.global_layer;
+        if !matches!(
+            stream.representation,
+            CacheRepresentation::AppendStream { .. }
+        ) {
+            layer_ends
+                .entry(layer)
+                .and_modify(|end| *end = (*end).max(tail.end))
+                .or_insert(tail.end);
+        }
         let layer_report = per_layer.entry(layer).or_default();
         layer_report.current_device_bytes += tail.bytes;
         layer_report.mutable_tail_bytes += tail.bytes;
-        layer_report.logical_cached_tokens = tail.end.max(0) as u64;
+        layer_report.logical_cached_tokens =
+            layer_ends.get(&layer).copied().unwrap_or(0).max(0) as u64;
     }
     for record in state.blocks.values() {
         let layer_report = per_layer
             .entry(record.physical.id().global_layer)
             .or_default();
         match record.physical.id().representation {
+            CacheRepresentation::AppendStream { .. } => {
+                report.append_stream_blocks += 1;
+                layer_report.append_stream_blocks += 1;
+            }
             CacheRepresentation::KeyValue => {
                 report.key_value_blocks += 1;
                 layer_report.key_value_blocks += 1;
@@ -193,13 +256,18 @@ pub(in super::super) fn update_report_totals(state: &mut CacheManagerState) {
             report.protected_prefix_blocks += 1;
             layer_report.protected_prefix_blocks += 1;
         }
-        layer_report.logical_cached_tokens = layer_report
-            .logical_cached_tokens
-            .max(record.physical.id().end.max(0) as u64);
-        layer_ends
-            .entry(record.physical.id().global_layer)
-            .and_modify(|end| *end = (*end).max(record.physical.id().end))
-            .or_insert(record.physical.id().end);
+        if !matches!(
+            record.physical.id().representation,
+            CacheRepresentation::AppendStream { .. }
+        ) {
+            layer_report.logical_cached_tokens = layer_report
+                .logical_cached_tokens
+                .max(record.physical.id().end.max(0) as u64);
+            layer_ends
+                .entry(record.physical.id().global_layer)
+                .and_modify(|end| *end = (*end).max(record.physical.id().end))
+                .or_insert(record.physical.id().end);
+        }
     }
     for (operation_id, reservation) in &state.retiring_host_demotions {
         let covered_by_demoting_record = state.blocks.get(&reservation.id).is_some_and(|record| {

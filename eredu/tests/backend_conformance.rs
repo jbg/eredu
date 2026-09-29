@@ -2025,7 +2025,7 @@ fn realize_residency_copy<R, E>(
     materialize: impl FnOnce(&OffloadUnitSpec, MemoryTier) -> Result<R, E>,
     mut release: impl FnMut(R),
 ) -> Result<(), E> {
-    let spec = ledger.spec(id).unwrap().clone();
+    let spec = ledger.spec(id).unwrap().into_owned();
     let evicted = ledger
         .reserve_copy(id, tier, spec.bytes(), &BTreeSet::new())
         .unwrap();

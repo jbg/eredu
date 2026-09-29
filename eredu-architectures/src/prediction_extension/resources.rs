@@ -9,17 +9,28 @@ impl crate::SelectedPreparation {
         &self,
     ) -> Result<Option<EmbeddedPredictionTopology>, eredu_core::resources::ResourceDescriptionError>
     {
-        let Some(extension) = self.prediction_extension() else {
+        let Some(selected) = self.prediction_realization() else {
             return Ok(None);
         };
-        let selected = self
-            .prediction_realization()
-            .ok_or_else(|| invalid("prediction extension has no selected strategy"))?;
-        let descriptor =
+        let extension = self.prediction_extension();
+        let retained = self
+            .qwen4_construction()
+            .map(|construction| construction.prediction_discovery())
+            .transpose()
+            .map_err(|error| invalid(error.to_string()))?
+            .flatten();
+        let descriptor = if let Some((descriptor, _)) = &retained {
+            descriptor.clone()
+        } else if let Some(extension) = extension {
             crate::processor_plan::ArtifactArchitecturePlan::from_safetensors_architecture(
                 extension.complete_architecture().clone(),
             )
-            .architecture_descriptor();
+            .architecture_descriptor()
+        } else {
+            return Err(invalid(
+                "selected prediction has no retained architecture discovery",
+            ));
+        };
         let mut nodes = Vec::new();
         let mut invocations = Vec::new();
         let mut state_layers = Vec::new();
@@ -90,37 +101,52 @@ impl crate::SelectedPreparation {
             .filter(|group| groups.contains(&group.id))
             .cloned()
             .collect();
-        let complete_state = super::prediction_extension_capability(extension)
+        let complete_state = extension
+            .map(super::prediction_extension_capability)
+            .transpose()
             .map_err(|e| invalid(e.to_string()))?;
         let state = state_layers
             .iter()
             .map(|&layer| {
-                let policy = complete_state
-                    .state_layout()
-                    .layer_layout()
-                    .get(layer)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "prediction state layer {layer} is absent from ordinary capability"
-                        ))
-                    })?;
+                let (policy, processed_token_offset) = if let Some((_, selected_state)) = &retained
+                {
+                    let layout = selected_state.layout();
+                    (
+                        layout.layers().get(layer),
+                        layout.layer_prefix_offsets().get(layer).copied(),
+                    )
+                } else if let Some(complete_state) = &complete_state {
+                    let layout = complete_state.state_layout();
+                    (
+                        layout.layer_layout().get(layer),
+                        layout.layer_prefix_offsets().get(layer).copied(),
+                    )
+                } else {
+                    (None, None)
+                };
+                let policy = policy.ok_or_else(|| {
+                    invalid(format!(
+                        "prediction state layer {layer} is absent from selected state"
+                    ))
+                })?;
                 Ok(eredu_runtime::prediction_resources::PredictionStateLayer {
                     layer,
                     policy: policy.clone(),
-                    processed_token_offset: complete_state.state_layout().layer_prefix_offsets()
-                        [layer],
+                    processed_token_offset: processed_token_offset
+                        .ok_or_else(|| invalid("prediction state prefix is missing"))?,
                 })
             })
             .collect::<Result<Vec<_>, eredu_core::resources::ResourceDescriptionError>>()?;
-        let (mut execution_topology, mut missing) = match extension.complete_architecture().model() {
-            crate::configuration::SafetensorsModelConfig::QwenHybrid(args) => (
+        let (mut execution_topology, mut missing) = match extension.map(|extension| extension.complete_architecture().model()) {
+            Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)) => (
                 Some(crate::qwen::hybrid::topology::prediction(&args.text).map_err(|e| invalid(e.to_string()))?),
                 Vec::new(),
             ),
-            crate::configuration::SafetensorsModelConfig::DeepSeekV3(_) => (None, vec!["prediction multi-head latent attention and routed/shared feed-forward invocation topology is unavailable".into()]),
-            crate::configuration::SafetensorsModelConfig::DeepSeekV4(_) => (None, vec!["prediction pooling attention, compressed state and hyper-connection invocation topology is unavailable".into()]),
-            crate::configuration::SafetensorsModelConfig::Inkling(_) => (None, vec!["prediction learned relative attention and auxiliary causal-convolution invocation topology is unavailable".into()]),
-            crate::configuration::SafetensorsModelConfig::NemotronH(_) => (None, vec!["prediction patterned attention/routed-expert and fusion invocation topology is unavailable".into()]),
+            Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(_)) => (None, vec!["prediction multi-head latent attention and routed/shared feed-forward invocation topology is unavailable".into()]),
+            Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(_)) => (None, vec!["prediction pooling attention, compressed state and hyper-connection invocation topology is unavailable".into()]),
+            Some(crate::configuration::SafetensorsModelConfig::Inkling(_)) => (None, vec!["prediction learned relative attention and auxiliary causal-convolution invocation topology is unavailable".into()]),
+            Some(crate::configuration::SafetensorsModelConfig::NemotronH(_)) => (None, vec!["prediction patterned attention/routed-expert and fusion invocation topology is unavailable".into()]),
+            None if retained.is_some() => (None, vec!["prediction recurrent/indexed attention, gated residual fusion and routed/shared feed-forward invocation topology is unavailable".into()]),
             _ => (None, vec!["selected prediction module invocation topology is unavailable".into()]),
         };
         if self.execution().parallel_topology().is_some() {

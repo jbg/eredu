@@ -8,6 +8,7 @@
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt,
     time::Duration,
@@ -15,6 +16,8 @@ use std::{
 
 mod conversion_retention;
 mod prefetch;
+mod ranges;
+pub use ranges::OffloadUnitRange;
 
 pub use conversion_retention::{
     unreported_parameter_conversion_retention, ExecutionConversionRetentionReport,
@@ -61,7 +64,7 @@ pub struct ResidentParameterConversion {
 }
 
 /// Current serialized residency-plan schema.
-pub const OFFLOAD_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const OFFLOAD_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// A storage or execution-memory tier used by an offload plan.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -389,6 +392,8 @@ pub struct OffloadPlan {
     schema_version: u32,
     config: OffloadConfig,
     units: Vec<OffloadUnitSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ranges: Vec<OffloadUnitRange>,
     #[serde(skip)]
     planned_bytes: TierByteTotals,
 }
@@ -401,6 +406,16 @@ impl OffloadPlan {
         config: OffloadConfig,
         units: impl IntoIterator<Item = OffloadUnitSpec>,
     ) -> Result<Self, OffloadError> {
+        Self::with_ranges(config, units, std::iter::empty())
+    }
+
+    /// Validates explicit units and compact, source-backed namespaces together.
+    /// No member enumeration or payload acquisition occurs here.
+    pub fn with_ranges(
+        config: OffloadConfig,
+        units: impl IntoIterator<Item = OffloadUnitSpec>,
+        ranges: impl IntoIterator<Item = OffloadUnitRange>,
+    ) -> Result<Self, OffloadError> {
         let mut units = units.into_iter().collect::<Vec<_>>();
         units.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -410,9 +425,28 @@ impl OffloadPlan {
             });
         }
 
+        let mut ranges = ranges.into_iter().collect::<Vec<_>>();
+        ranges.sort_by(|a, b| (a.prefix(), a.start()).cmp(&(b.prefix(), b.start())));
+        for pair in ranges.windows(2) {
+            if pair[0].prefix() == pair[1].prefix() && pair[0].end() > pair[1].start() {
+                return Err(OffloadError::OverlappingUnitRanges {
+                    prefix: pair[0].prefix().clone(),
+                });
+            }
+        }
+        for unit in &units {
+            if ranges.iter().any(|range| range.member(unit.id()).is_some()) {
+                return Err(OffloadError::DuplicateUnitId {
+                    id: unit.id().clone(),
+                });
+            }
+        }
         let mut planned_bytes = TierByteTotals::default();
         for unit in &units {
             planned_bytes.checked_add(unit.tier, unit.bytes)?;
+        }
+        for range in &ranges {
+            planned_bytes.checked_add(MemoryTier::Disk, range.total_bytes())?;
         }
 
         validate_budget(
@@ -430,6 +464,7 @@ impl OffloadPlan {
             schema_version: OFFLOAD_PLAN_SCHEMA_VERSION,
             config,
             units,
+            ranges,
             planned_bytes,
         })
     }
@@ -441,7 +476,7 @@ impl OffloadPlan {
 
     /// Revalidates every invariant represented by this plan.
     pub fn validate(&self) -> Result<(), OffloadError> {
-        Self::new(self.config, self.units.clone()).map(|_| ())
+        Self::with_ranges(self.config, self.units.clone(), self.ranges.clone()).map(|_| ())
     }
 
     /// Returns the configuration used to validate this plan.
@@ -449,17 +484,32 @@ impl OffloadPlan {
         self.config
     }
 
-    /// Returns assignments in stable logical-identifier order.
+    /// Returns explicit assignments, excluding compact source-backed ranges.
     pub fn units(&self) -> &[OffloadUnitSpec] {
         &self.units
     }
 
     /// Looks up a unit by its logical identifier.
-    pub fn unit(&self, id: &OffloadUnitId) -> Option<&OffloadUnitSpec> {
+    pub fn unit(&self, id: &OffloadUnitId) -> Option<Cow<'_, OffloadUnitSpec>> {
         self.units
             .binary_search_by(|unit| unit.id.cmp(id))
             .ok()
-            .map(|index| &self.units[index])
+            .map(|index| Cow::Borrowed(&self.units[index]))
+            .or_else(|| {
+                self.ranges
+                    .iter()
+                    .find_map(|range| range.unit(id))
+                    .map(Cow::Owned)
+            })
+    }
+
+    /// Compact source-backed namespaces, without expanding logical entries.
+    pub fn ranges(&self) -> &[OffloadUnitRange] {
+        &self.ranges
+    }
+
+    fn is_explicit(&self, id: &OffloadUnitId) -> bool {
+        self.units.binary_search_by(|unit| unit.id.cmp(id)).is_ok()
     }
 
     /// Returns checked planned byte totals for every tier.
@@ -473,6 +523,8 @@ struct SerializedOffloadPlan {
     schema_version: u32,
     config: OffloadConfig,
     units: Vec<OffloadUnitSpec>,
+    #[serde(default)]
+    ranges: Vec<OffloadUnitRange>,
 }
 
 impl<'de> Deserialize<'de> for OffloadPlan {
@@ -483,7 +535,7 @@ impl<'de> Deserialize<'de> for OffloadPlan {
                 value.schema_version,
             )));
         }
-        Self::new(value.config, value.units).map_err(D::Error::custom)
+        Self::with_ranges(value.config, value.units, value.ranges).map_err(D::Error::custom)
     }
 }
 
@@ -507,6 +559,18 @@ fn validate_budget(
 /// Structured validation failures for offload contracts.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum OffloadError {
+    /// Empty, zero-sized or pinned source-backed namespace.
+    #[error("invalid source-backed offload range {prefix}")]
+    InvalidUnitRange {
+        /// Rejected namespace.
+        prefix: OffloadUnitId,
+    },
+    /// Two compact descriptors authorize the same member IDs.
+    #[error("overlapping offload ranges in namespace {prefix}")]
+    OverlappingUnitRanges {
+        /// Conflicting namespace.
+        prefix: OffloadUnitId,
+    },
     /// A serialized plan used an unsupported schema version.
     #[error("unsupported offload plan schema version {0}")]
     UnsupportedSchemaVersion(u32),
@@ -1338,14 +1402,18 @@ impl ResidencyLedger {
 
     /// Returns whether the plan contains a unit.
     pub fn contains(&self, id: &OffloadUnitId) -> bool {
-        self.units.contains_key(id)
+        self.units.contains_key(id) || self.plan.unit(id).is_some()
     }
 
     /// Returns one planned unit specification.
-    pub fn spec(&self, id: &OffloadUnitId) -> Result<&OffloadUnitSpec, ResidencyLedgerError> {
+    pub fn spec(
+        &self,
+        id: &OffloadUnitId,
+    ) -> Result<Cow<'_, OffloadUnitSpec>, ResidencyLedgerError> {
         self.units
             .get(id)
-            .map(|unit| &unit.spec)
+            .map(|unit| Cow::Borrowed(&unit.spec))
+            .or_else(|| self.plan.unit(id))
             .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })
     }
 
@@ -1356,11 +1424,11 @@ impl ResidencyLedger {
         tier: MemoryTier,
     ) -> Result<Option<ResidentCopyStatus>, ResidencyLedgerError> {
         validate_ledger_tier(tier, "copy status")?;
+        self.spec(id)?;
         Ok(self
             .units
             .get(id)
-            .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })?
-            .copy(tier)
+            .and_then(|unit| unit.copy(tier))
             .and_then(|copy| copy.status()))
     }
 
@@ -1371,6 +1439,21 @@ impl ResidencyLedger {
         tier: MemoryTier,
     ) -> Result<bool, ResidencyLedgerError> {
         Ok(self.copy_status(id, tier)?.is_some())
+    }
+
+    /// Whether a tier owns either a reservation or a published allocation.
+    /// Metadata retirement must preserve unpublished and in-flight work too.
+    pub fn has_allocation(
+        &self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+    ) -> Result<bool, ResidencyLedgerError> {
+        validate_ledger_tier(tier, "allocation status")?;
+        self.spec(id)?;
+        Ok(self
+            .units
+            .get(id)
+            .is_some_and(|unit| unit.copy(tier).is_some()))
     }
 
     /// Validates one ordered, duplicate-free batch of known units.
@@ -1422,11 +1505,11 @@ impl ResidencyLedger {
             if *required_bytes == 0 {
                 return Err(ResidencyLedgerError::ZeroReservation { id: id.clone() });
             }
-            let unit = self
+            if self
                 .units
                 .get(id)
-                .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })?;
-            if unit.copy(tier).is_some() {
+                .is_some_and(|unit| unit.copy(tier).is_some())
+            {
                 return Err(ResidencyLedgerError::CopyAlreadyExists {
                     id: id.clone(),
                     tier,
@@ -1496,6 +1579,17 @@ impl ResidencyLedger {
         self.set_tier_bytes(tier, charged);
         for (id, required_bytes) in requests {
             let tick = self.next_tick();
+            if !self.units.contains_key(id) {
+                let spec = self.spec(id)?.into_owned();
+                self.units.insert(
+                    id.clone(),
+                    LedgerUnit {
+                        spec,
+                        host: None,
+                        device: None,
+                    },
+                );
+            }
             *self
                 .units
                 .get_mut(id)
@@ -1721,10 +1815,10 @@ impl ResidencyLedger {
         tier: MemoryTier,
     ) -> Result<Option<EvictedResidencyCopy>, ResidencyLedgerError> {
         validate_ledger_tier(tier, "evict")?;
-        let unit = self
-            .units
-            .get(id)
-            .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })?;
+        self.spec(id)?;
+        let Some(unit) = self.units.get(id) else {
+            return Ok(None);
+        };
         let Some(copy) = unit.copy(tier).and_then(|copy| copy.status()) else {
             return Ok(None);
         };
@@ -1913,6 +2007,14 @@ impl ResidencyLedger {
             .checked_sub(copy.bytes)
             .ok_or_else(|| inconsistent(id, tier, "copy removal accounting"))?;
         self.set_tier_bytes(tier, bytes);
+        if !self.plan.is_explicit(id)
+            && self
+                .units
+                .get(id)
+                .is_some_and(|unit| unit.host.is_none() && unit.device.is_none())
+        {
+            self.units.remove(id);
+        }
         self.update_resident_telemetry(tier);
         if record_eviction {
             self.telemetry.record_tier_eviction(tier, copy.bytes);

@@ -11,9 +11,11 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 mod candidate_tests;
 mod invocation;
+mod prefill;
 #[cfg(test)]
 mod prepared_geometry_tests;
 pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape};
+pub use prefill::CapturePrefillSpan;
 mod routed;
 mod tensor_wire;
 pub use routed::*;
@@ -651,6 +653,7 @@ impl CapturePlan {
             points,
             request,
             invocation_bounds,
+            prefill_span: None,
             identity,
         })
     }
@@ -726,6 +729,7 @@ pub struct AdmittedCapturePlan {
     points: Vec<ObservationPoint>,
     request: CaptureRequestShape,
     invocation_bounds: Option<CaptureInvocationBounds>,
+    prefill_span: Option<CapturePrefillSpan>,
     identity: String,
 }
 
@@ -763,7 +767,14 @@ impl AdmittedCapturePlan {
                 bounds.validate(shape, prediction)?;
                 Ok(shape)
             }
-            (None, None) => self.request.invocation_shape(phase, prediction),
+            (None, None) => match (phase, self.prefill_span) {
+                (CapturePhase::Prefill, Some(span)) => Ok(CaptureInvocationShape {
+                    batch: self.request.batch,
+                    sequence: span.end - span.start,
+                    context: Some(span.end),
+                }),
+                _ => self.request.invocation_shape(phase, prediction),
+            },
             _ => Err(CaptureError::Invalid(
                 "capture invocation authority/geometry mismatch".into(),
             )),
@@ -1482,6 +1493,9 @@ pub struct CapturedStep {
     pub invocation: Option<CaptureInvocationShape>,
     /// Run-relative prediction index; zero is predicted by prefill.
     pub prediction_index: u64,
+    /// Absolute positions of this completed or aborted prefill chunk in its request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_span: Option<CapturePrefillSpan>,
     /// At most one record for each admitted selection.
     pub records: Vec<CaptureRecord>,
     /// Verified global ownership and forward provenance for partitioned records.

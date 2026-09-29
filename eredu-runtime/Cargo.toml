@@ -13,6 +13,7 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
+eredu-gguf.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
@@ -23,5 +24,4 @@ safetensors = "0.8"
 thiserror.workspace = true
 
 [dev-dependencies]
-eredu-gguf.workspace = true
 tempfile.workspace = true

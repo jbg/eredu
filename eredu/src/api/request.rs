@@ -562,13 +562,20 @@ pub(super) fn prepared_text_control_runtime(
     })
 }
 
+pub(super) enum GenerationStepKind {
+    Token(u32),
+    Prefill,
+    Failed,
+}
+
 pub(super) struct BackendGenerationTokenSource<'a, B>
 where
     B: eredu_core::TextGenerationBackend,
 {
     pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
-    pub(super) on_token:
-        Option<&'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64)>,
+    pub(super) on_token: Option<
+        &'a mut dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64),
+    >,
     pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     pub(super) capture_enabled: bool,
     pub(super) generation_started: std::time::Instant,
@@ -580,6 +587,40 @@ where
     B: eredu_core::TextGenerationBackend,
 {
     type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
+
+    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
+        let started = std::time::Instant::now();
+        let result = self.generator.advance_prefill();
+        if matches!(result, Ok(false)) {
+            return result;
+        }
+        let captures = self
+            .generator
+            .take_captured_step()
+            .map_err(eredu_core::ControlledTextGenerationError::Backend);
+        let advanced = match result {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                if let (Some(callback), Ok(captures)) = (&mut self.on_token, captures) {
+                    callback(
+                        GenerationStepKind::Failed,
+                        captures,
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let captures = captures?;
+        if let Some(callback) = &mut self.on_token {
+            callback(
+                GenerationStepKind::Prefill,
+                captures,
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        Ok(advanced)
+    }
 
     fn finish_step<T, E>(
         &mut self,
@@ -617,7 +658,7 @@ where
                         (&mut self.on_token, self.generator.take_captured_step())
                     {
                         callback(
-                            None,
+                            GenerationStepKind::Failed,
                             Some(capture),
                             started.unwrap().elapsed().as_secs_f64(),
                         );
@@ -637,7 +678,7 @@ where
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
         if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
             callback(
-                Some(token),
+                GenerationStepKind::Token(token),
                 capture,
                 started.unwrap().elapsed().as_secs_f64(),
             );

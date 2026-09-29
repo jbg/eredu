@@ -26,7 +26,7 @@ fn text_checkpoint_aliases(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub use block::{expert_bank_spec, Block, FeedForward, SharedRoutedGatedProduct, TokenMixer};
+pub use block::{expert_bank_spec, Block, FeedForward, TokenMixer};
 pub use checkpoint::{
     composite_safetensors_plan, conditional_load_time_quantization,
     conditional_projector_gguf_plan, conditional_unit_recipes, conditional_with_checkpoint_formats,
@@ -35,11 +35,10 @@ pub use checkpoint::{
     translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use conditional::{
-    prepare_input as prepare_conditional_input, ConditionalForwardContext, ConditionalInput,
-    ConditionalLayeredModel, ConditionalPartitionInput, ConditionalPipelineBoundary,
-    ConditionalPipelineBoundarySchema, ConditionalPipelinePrepared, ConditionalPipelineVisionState,
-    ConditionalStaticModules, ConditionalUnit, PreparedInput as PreparedConditionalInput,
-    VISION_EXECUTION_GROUP,
+    ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
+    ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
+    ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
+    ConditionalUnit, VISION_EXECUTION_GROUP,
 };
 pub use config::{
     conditional_prompt_cache_architecture_fingerprint, fp8_block_row_widths,
@@ -49,7 +48,7 @@ pub use config::{
     HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry, HybridVariant,
     ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
-pub use linear_attention::LinearAttention;
+pub use linear_attention::recurrent_spec;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
 pub use mtp::{
     prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,

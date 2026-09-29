@@ -5,7 +5,7 @@
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
 
-use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
+use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeDtype};
 use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, TensorSelection};
 
 use safemlx::{
@@ -18,28 +18,23 @@ use crate::backend::runtime::checkpoint::store::{
 };
 
 /// Conservative native tensor and host-index buffers of the recipe materializer.
-/// Direct encoded initialization needs only its output. The ordinary path can
+/// A metadata-only bound covers the ordinary path even when binding later selects
+/// direct encoded initialization. The ordinary path can
 /// retain every source until completion; count all intermediates, source copies,
 /// and the final contiguous output even when the allocator can recycle them.
 /// Native driver bookkeeping and allocator caches are not tensor workspace.
-pub(crate) fn native_recipe_workspace(
+pub(crate) fn native_recipe_workspace<C: RecipeCatalog + ?Sized>(
     recipe: &DerivedWeightRecipe,
-    source: &dyn CheckpointSource,
+    source: &C,
 ) -> Result<u64, String> {
-    if DirectRecipeRead::prepare(recipe, source)
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
-        return recipe
-            .infer(source)
-            .map(|metadata| metadata.byte_len())
-            .map_err(|error| error.to_string());
-    }
     fn add(left: u64, right: u64) -> Result<u64, String> {
         left.checked_add(right)
             .ok_or_else(|| "native recipe workspace overflow".into())
     }
-    fn buffers(recipe: &DerivedWeightRecipe, source: &dyn CheckpointSource) -> Result<u64, String> {
+    fn buffers<C: RecipeCatalog + ?Sized>(
+        recipe: &DerivedWeightRecipe,
+        source: &C,
+    ) -> Result<u64, String> {
         let output = recipe
             .infer(source)
             .map_err(|error| error.to_string())?
@@ -290,6 +285,22 @@ pub(crate) fn preflight_mlx_recipe(
     recipe: &DerivedWeightRecipe,
     source: &dyn CheckpointSource,
 ) -> Result<(), WeightRecipeError> {
+    preflight_mlx_recipe_metadata(recipe, source, &|key| {
+        Ok(source.source_provenance(key)?.source_encoding)
+    })
+}
+
+/// Validates recipe representations using immutable headers, without a readable source.
+pub(crate) fn preflight_mlx_recipe_metadata<C: RecipeCatalog + ?Sized>(
+    recipe: &DerivedWeightRecipe,
+    source: &C,
+    encoding: &impl Fn(
+        &str,
+    ) -> Result<
+        eredu_checkpoint::SourceTensorEncoding,
+        eredu_checkpoint::store::StoreError,
+    >,
+) -> Result<(), WeightRecipeError> {
     fn validate_selection(selection: &TensorSelection) -> Result<(), WeightRecipeError> {
         match selection {
             TensorSelection::Full => {}
@@ -328,24 +339,36 @@ pub(crate) fn preflight_mlx_recipe(
 
     // MLX representation limits here are constant and contain no device facts.
     struct MlxRecipeRepresentation;
-    fn visit(
+    fn visit<C: RecipeCatalog + ?Sized>(
         recipe: &DerivedWeightRecipe,
-        source: &dyn CheckpointSource,
+        source: &C,
+        encoding: &impl Fn(
+            &str,
+        ) -> Result<
+            eredu_checkpoint::SourceTensorEncoding,
+            eredu_checkpoint::store::StoreError,
+        >,
     ) -> Result<(), WeightRecipeError> {
         if let Some(cache) = source.recipe_cache() {
             cache
                 .validate::<MlxRecipeRepresentation>(recipe, || {
-                    visit_uncached(recipe, source).map_err(|error| error.to_string())
+                    visit_uncached(recipe, source, encoding).map_err(|error| error.to_string())
                 })
                 .map_err(WeightRecipeError::Preflight)
         } else {
-            visit_uncached(recipe, source)
+            visit_uncached(recipe, source, encoding)
         }
     }
 
-    fn visit_uncached(
+    fn visit_uncached<C: RecipeCatalog + ?Sized>(
         recipe: &DerivedWeightRecipe,
-        source: &dyn CheckpointSource,
+        source: &C,
+        encoding: &impl Fn(
+            &str,
+        ) -> Result<
+            eredu_checkpoint::SourceTensorEncoding,
+            eredu_checkpoint::store::StoreError,
+        >,
     ) -> Result<(), WeightRecipeError> {
         let metadata = recipe.infer(source)?;
         for dimension in metadata.shape() {
@@ -356,7 +379,7 @@ pub(crate) fn preflight_mlx_recipe(
         match recipe {
             DerivedWeightRecipe::Source { key, selection } => {
                 validate_selection(selection)?;
-                let source_metadata = source.source_metadata(key)?;
+                let source_metadata = source.tensor_metadata(key)?;
                 for dimension in source_metadata
                     .logical_shape
                     .iter()
@@ -367,8 +390,7 @@ pub(crate) fn preflight_mlx_recipe(
                 usize::try_from(source_metadata.encoded_byte_len).map_err(|_| {
                     WeightRecipeError::ArithmeticOverflow("checkpoint source byte length")
                 })?;
-                let provenance = source.source_provenance(key)?;
-                match provenance.source_encoding {
+                match encoding(key)? {
                     eredu_checkpoint::SourceTensorEncoding::Safetensors(dtype) => {
                         super::store::safetensors_dtype(key, &dtype)?;
                     }
@@ -387,32 +409,32 @@ pub(crate) fn preflight_mlx_recipe(
             | DerivedWeightRecipe::Stack { axis, inputs } => {
                 usize_to_i32(*axis, "recipe join axis")?;
                 for input in inputs {
-                    visit(input, source)?;
+                    visit(input, source, encoding)?;
                 }
             }
             DerivedWeightRecipe::Select { input, selection } => {
                 validate_selection(selection)?;
-                visit(input, source)?;
+                visit(input, source, encoding)?;
             }
             DerivedWeightRecipe::Transpose { input, axes } => {
                 for axis in axes {
                     usize_to_i32(*axis, "transpose axis")?;
                 }
-                visit(input, source)?;
+                visit(input, source, encoding)?;
             }
             DerivedWeightRecipe::Cast { input, dtype }
             | DerivedWeightRecipe::View { input, dtype, .. } => {
                 mlx_dtype(dtype)?;
-                visit(input, source)?;
+                visit(input, source, encoding)?;
             }
             DerivedWeightRecipe::Reshape { input, .. }
             | DerivedWeightRecipe::NegLog { input }
-            | DerivedWeightRecipe::SubtractOne { input } => visit(input, source)?,
+            | DerivedWeightRecipe::SubtractOne { input } => visit(input, source, encoding)?,
         }
         Ok(())
     }
 
-    visit(recipe, source)
+    visit(recipe, source, encoding)
 }
 
 /// Lowers a terminal logical MXFP4 value recipe to MLX's packed U32 storage.

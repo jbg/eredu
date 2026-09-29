@@ -194,3 +194,6 @@ include!("tests/lifecycle.rs");
 include!("tests/transfer.rs");
 include!("tests/materialization.rs");
 include!("tests/accounting.rs");
+include!("tests/rows.rs");
+
+include!("tests/host_resources.rs");

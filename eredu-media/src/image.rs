@@ -175,6 +175,66 @@ impl NormalizedImage {
     }
 }
 
+/// Additional live data-buffer bound for resize followed by F32 normalization.
+/// Excludes the borrowed input, allocator bookkeeping and fixed object headers.
+/// The separable resize implementation is pinned in this crate's manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RgbPreparationBuffers {
+    /// Final channel-first normalized data.
+    pub normalized_bytes: u64,
+    /// Maximum simultaneous additional data buffers, including the final result.
+    pub peak_bytes: u64,
+}
+
+/// Bounds RGB8 bicubic/Lanczos resize and normalization without allocating pixels.
+/// Includes the packed source copy, RGBA32F vertical intermediate, resized RGB8,
+/// normalized F32 output, and a conservative interpolation-weight growth allowance.
+pub fn rgb_preparation_buffers(
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+) -> Result<RgbPreparationBuffers, MediaError> {
+    let overflow = || MediaError::invalid("RGB preparation buffer geometry overflow");
+    if [source_width, source_height, width, height].contains(&0) {
+        return Err(MediaError::invalid(
+            "RGB preparation dimensions must be positive",
+        ));
+    }
+    let product = |a: u64, b: u64, c: u64| {
+        a.checked_mul(b)
+            .and_then(|v| v.checked_mul(c))
+            .ok_or_else(overflow)
+    };
+    let rgb = product(width.into(), height.into(), 3)?;
+    let normalized_bytes = rgb.checked_mul(4).ok_or_else(overflow)?;
+    let normalization = rgb.checked_add(normalized_bytes).ok_or_else(overflow)?;
+    let peak_bytes = if (source_width, source_height) == (width, height) {
+        normalization
+    } else {
+        let source = product(source_width.into(), source_height.into(), 3)?;
+        let intermediate = product(source_width.into(), height.into(), 16)?;
+        // At most one source axis of F32 weights, including old/new Vec growth
+        // and the minimum allocation capacity. Both passes are sequential.
+        let weights = u64::from(source_width.max(source_height).max(4))
+            .checked_mul(16)
+            .ok_or_else(overflow)?;
+        source
+            .checked_add(intermediate)
+            .and_then(|v| v.checked_add(rgb))
+            .and_then(|v| v.checked_add(weights))
+            .ok_or_else(overflow)?
+            .max(normalization)
+    };
+    if peak_bytes > isize::MAX as u64 {
+        return Err(overflow());
+    }
+    Ok(RgbPreparationBuffers {
+        normalized_bytes,
+        peak_bytes,
+    })
+}
+
 /// Resizes an RGB8 image using bicubic interpolation.
 pub fn resize_rgb8_bicubic(
     image: RgbImageView<'_>,
@@ -373,5 +433,38 @@ mod tests {
         assert!(rescale_and_normalize_rgb8(view, f32::NAN, [0.0; 3], [1.0; 3]).is_err());
         assert!(rescale_and_normalize_rgb8(view, 1.0, [f32::NAN; 3], [1.0; 3]).is_err());
         assert!(rescale_and_normalize_rgb8(view, 1.0, [0.0; 3], [0.0; 3]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod preparation_buffer_tests {
+    use super::*;
+    #[test]
+    fn buffer_bounds_include_separable_intermediate_and_identity_copy() {
+        assert_eq!(
+            rgb_preparation_buffers(10, 20, 5, 4).unwrap(),
+            RgbPreparationBuffers {
+                normalized_bytes: 240,
+                peak_bytes: 1620
+            }
+        );
+        assert_eq!(
+            rgb_preparation_buffers(5, 4, 5, 4).unwrap(),
+            RgbPreparationBuffers {
+                normalized_bytes: 240,
+                peak_bytes: 300
+            }
+        );
+        // A small output does not imply small resize workspace for a wide source.
+        assert!(
+            rgb_preparation_buffers(1_000_000, 1, 1, 1)
+                .unwrap()
+                .peak_bytes
+                > 30_000_000
+        );
+        assert!(rgb_preparation_buffers(u32::MAX, u32::MAX, u32::MAX, u32::MAX).is_err());
+        // A representable output must not admit an unaddressable intermediate Vec.
+        assert!(rgb_preparation_buffers(2_000_000_000, 1, 1, 300_000_000).is_err());
+        assert!(rgb_preparation_buffers(0, 1, 1, 1).is_err());
     }
 }

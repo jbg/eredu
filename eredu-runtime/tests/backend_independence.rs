@@ -851,6 +851,7 @@ impl FailureAgreementBackend for FakeBackend {
 
     fn agree_success(
         local_success: bool,
+        _: Option<[u64; 8]>,
         _: &Self::CommunicationGroup,
         _: &Self::Executor,
     ) -> Result<Submission<bool, Self::CommunicationCompletion>, Self::CommunicationError> {
@@ -1704,7 +1705,32 @@ fn independent_backend_consumes_canonical_binding_and_placement_plans() {
             false,
         ),
     );
-    let placed = place_weight_bindings(bindings, &store, &layout).unwrap();
+    // Placement and sizing consume a metadata-only catalog with no payload API.
+    struct Header(eredu_checkpoint::store::TensorMetadata);
+    impl eredu_checkpoint::recipe::RecipeCatalog for Header {
+        fn tensor_metadata(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+        {
+            if key == self.0.name {
+                Ok(self.0.clone())
+            } else {
+                Err(eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() })
+            }
+        }
+    }
+    let header = Header(eredu_checkpoint::store::WeightStore::metadata(&store, "weight").unwrap());
+    let recipe = DerivedWeightRecipe::source("weight", TensorSelection::Full);
+    let peak =
+        eredu_runtime::placed_recipe_peak_bytes(&recipe, "weight", &header, Some(&layout), false)
+            .unwrap();
+    assert_eq!(
+        peak,
+        eredu_runtime::placed_recipe_peak_bytes(&recipe, "weight", &store, Some(&layout), false)
+            .unwrap()
+    );
+    let placed = place_weight_bindings(bindings, &header, &layout).unwrap();
     assert_eq!(placed[0].expected_bytes(), 8);
     assert_eq!(
         placed[0].source_recipe(),
@@ -2716,6 +2742,22 @@ impl RuntimeStateComponents<FakeBackend> for HybridLayerState {
         }
     }
 
+    fn replace_fixed_components(
+        &mut self,
+        values: Vec<(eredu_core::cache::StateTensorRole, Option<FakeTensor>)>,
+    ) -> Result<(), StateError> {
+        eredu_runtime::state::replace_fixed_components(
+            [
+                (StateTensorRole::Recurrent, &mut self.recurrent),
+                (
+                    StateTensorRole::Convolution { slot: 0 },
+                    &mut self.convolution,
+                ),
+            ],
+            values,
+        )
+    }
+
     fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
         self.position = self
             .position
@@ -2738,7 +2780,7 @@ fn hybrid_policy() -> LayerCachePolicy {
         )
         .unwrap()
     };
-    LayerCachePolicy::key_value_with_fixed_state(
+    LayerCachePolicy::key_value_with_state(
         AttentionPolicy::Full,
         1,
         4,
@@ -2752,6 +2794,7 @@ fn hybrid_policy() -> LayerCachePolicy {
                 MutableStateResidency::AlwaysDeviceMutable,
             ),
         ],
+        Vec::new(),
     )
     .unwrap()
 }
@@ -3653,6 +3696,7 @@ fn reference_prompt_cache_manifest(
         distributed_commit: descriptor.distributed_commit(),
         application_namespace: None,
         blocks,
+        stream_frontiers: Vec::new(),
         state_tensors: Vec::new(),
     })
 }
@@ -3685,7 +3729,7 @@ fn try_select_reference_text(
     eredu_runtime::SelectedReplicatedTextRealization,
     eredu_runtime::ReplicatedTextSelectionError,
 > {
-    try_select_reference_text_with_completion(architecture, residency, denied, true)
+    try_select_reference_text_with_completion(architecture, residency, denied, true, false)
 }
 
 fn try_select_reference_text_with_completion(
@@ -3693,6 +3737,7 @@ fn try_select_reference_text_with_completion(
     residency: LayerWeightResidency,
     denied: Option<DeniedReferenceMechanism>,
     exact_completion: bool,
+    chunked_request: bool,
 ) -> Result<
     eredu_runtime::SelectedReplicatedTextRealization,
     eredu_runtime::ReplicatedTextSelectionError,
@@ -3745,7 +3790,8 @@ fn try_select_reference_text_with_completion(
         vec![parameter],
     )
     .unwrap()
-    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32);
+    .with_floating_state_source(eredu_core::checkpoint::TensorDtype::F32)
+    .with_chunked_prefill(chunked_request);
     let component_mechanisms = if denied == Some(DeniedReferenceMechanism::State) {
         Vec::new()
     } else {
@@ -3797,6 +3843,7 @@ fn try_select_reference_text_with_completion(
         weight_residencies,
         state_mechanisms,
     )
+    .with_chunked_prefill(chunked_request)
     .with_session(session_capabilities)
     .with_prompt_cache(denied != Some(DeniedReferenceMechanism::Persistence))
     .with_exact_completion(denied != Some(DeniedReferenceMechanism::Completion));
@@ -4663,7 +4710,9 @@ fn observed_prediction_target_reuses_capture_transaction_and_recovers_delivery_f
         let tokens = FakeTensor(vec![1, 2]);
         let mut invoke = |observer: &mut Probe| {
             if prefill {
-                session.prefill_input_prediction_target_observed(&tokens, &(), observer)
+                session
+                    .prefill_input_prediction_target_observed(&tokens, &(), observer)
+                    .map(|(logits, capture, _)| (logits, capture))
             } else {
                 session.decode_input_prediction_target_observed(&tokens, &(), observer)
             }
@@ -5117,6 +5166,7 @@ where
 }
 
 struct ConcurrentCheckpointCoordinator {
+    descriptors: std::sync::Mutex<[Option<[u64; 8]>; 2]>,
     rendezvous: std::sync::Barrier,
     failed: std::sync::atomic::AtomicBool,
     calls: std::sync::Mutex<Vec<(usize, DistributedExecutionPhase, bool)>>,
@@ -5125,6 +5175,7 @@ struct ConcurrentCheckpointCoordinator {
 impl ConcurrentCheckpointCoordinator {
     fn new() -> Self {
         Self {
+            descriptors: std::sync::Mutex::new([None; 2]),
             rendezvous: std::sync::Barrier::new(2),
             failed: std::sync::atomic::AtomicBool::new(false),
             calls: std::sync::Mutex::new(Vec::new()),
@@ -5160,6 +5211,37 @@ where
 {
     const ENABLED: bool = true;
     const PHASE_FAILURE_AGREEMENT: bool = true;
+
+    const DESCRIPTOR_AGREEMENT: bool = true;
+
+    fn agree_descriptor(
+        &mut self,
+        communication: &PartitionCommunication<FakeBackend, (), (), I>,
+        group: CollectiveGroupId,
+        phase: DistributedExecutionPhase,
+        local_success: bool,
+        descriptor: [u64; 8],
+        executor: &(),
+    ) -> Result<bool, eredu_runtime::PartitionExecutionError> {
+        if let Self::Concurrent(concurrent) = self {
+            concurrent.coordinator.descriptors.lock().unwrap()[concurrent.rank] = Some(descriptor);
+            concurrent.coordinator.rendezvous.wait();
+            let exact = {
+                let descriptors = concurrent.coordinator.descriptors.lock().unwrap();
+                descriptors[0] == descriptors[1]
+            };
+            concurrent.coordinator.rendezvous.wait();
+            self.agree_phase(
+                communication,
+                group,
+                phase,
+                local_success && exact,
+                executor,
+            )
+        } else {
+            self.agree_phase(communication, group, phase, local_success, executor)
+        }
+    }
 
     fn agree_phase(
         &mut self,
@@ -5345,7 +5427,7 @@ fn run_partitioned_agreement_rank_with_observer(
     observer: Option<&mut dyn eredu_runtime::ActivationObserver<FakeTensor, Error>>,
 ) -> AgreementRun {
     let (mut session, counters, prompt_model_identity) =
-        partitioned_agreement_session(rank, local_failure, agreement);
+        partitioned_agreement_session(rank, local_failure, agreement, false);
     let result = if let Some(observer) = observer {
         session.decode_with_observer(&FakeTensor(vec![3]), &(), observer)
     } else {
@@ -5420,6 +5502,7 @@ fn partitioned_agreement_session(
     rank: usize,
     local_failure: LocalPartitionFailure,
     agreement: TestPhaseAgreement,
+    chunked_request: bool,
 ) -> (
     ReferencePartitionedSession,
     ReplicatedSessionCounters,
@@ -5433,7 +5516,16 @@ fn partitioned_agreement_session(
         inconsistent_transport: false,
         inconsistent_identity: false,
     };
-    let selected = selected_reference_text(&architecture, LayerWeightResidency::FullyResident);
+    // The cursor fixture supplies its own admitted request contract. Ordinary
+    // fake text execution keeps its separate, non-chunked declaration.
+    let selected = try_select_reference_text_with_completion(
+        &architecture,
+        LayerWeightResidency::FullyResident,
+        None,
+        true,
+        chunked_request,
+    )
+    .unwrap();
     let parameters = architecture.parameter_description(&()).unwrap();
     let partition = ArchitecturePartition::from_architecture::<
         FakeBackend,
@@ -9467,6 +9559,7 @@ fn transactional_observation_requires_available_completion_before_work() {
                 residency,
                 (!available).then_some(DeniedReferenceMechanism::Completion),
                 false,
+                false,
             )
             .unwrap();
             assert!(!selected.exact_completion());
@@ -9568,6 +9661,7 @@ fn asymmetric_input_rejection_precedes_capture_and_preserves_state_for_retry() {
                                     rank,
                                     coordinator,
                                 }),
+                                false,
                             );
                             // Retain nonempty, distinguishable prior state through rejection.
                             assert_eq!(
@@ -9694,7 +9788,7 @@ fn completed_text_prefill_settles_state_and_rolls_back_before_publication() {
             inconsistent_identity: false,
         };
         let selected =
-            try_select_reference_text_with_completion(&architecture, residency, None, false)
+            try_select_reference_text_with_completion(&architecture, residency, None, false, false)
                 .unwrap();
         assert!(!selected.exact_completion());
         let identity = selected.requirements().architecture_identity().to_owned();
@@ -9745,3 +9839,6 @@ fn completed_text_prefill_settles_state_and_rolls_back_before_publication() {
         assert_eq!(counters.snapshot().completion_attempts, 3);
     }
 }
+
+#[path = "backend_independence/prefill.rs"]
+mod prefill_agreement_tests;

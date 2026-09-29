@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, F>(
+pub(super) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, F>(
     prepared: eredu_architectures::partitioned_execution::PreparedRoutedPartitionedArchitecture<
         MlxNeuralBackend,
         A,
@@ -15,6 +15,7 @@ pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, 
         eredu_runtime::RoutedBankId,
         MlxSharedAddressableBank,
     >,
+    row_binding: Option<super::routed::MlxPartitionRows>,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -28,10 +29,13 @@ where
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
-    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<MlxNeuralBackend> + 'static,
+    Provider: eredu_runtime::TensorParallelParameterProvider<MlxNeuralBackend> + 'static,
     Provider::Error: std::fmt::Display,
     F: ReplicatedExecutableFinalizer<A, S>,
 {
+    let row_pool = row_binding
+        .as_ref()
+        .and_then(super::routed::MlxPartitionRows::reporting_pool);
     let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
     let activation_dtype = facts.activation_dtype();
     let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
@@ -82,12 +86,17 @@ where
                 let distributed = distributed.take().ok_or_else(|| {
                     Error::Parallel("routed pipeline communication was already consumed".into())
                 })?;
+                let row_status = execution.row_lookup_status_group()
+                    .map(|id| distributed.selected_group(id).cloned().ok_or_else(||
+                        Error::Parallel("selected row status group is not bound".into())))
+                    .transpose()?;
                 let (communication, parallel, sampling, communication_executor) = distributed
                     .into_partition_communication(
                         manifest,
                         execution.communication_tensor_group(),
                         execution.sampling_group(),
                     )?;
+                let rows = row_binding.map(|rows| rows.bind(parallel.as_ref(), row_status.as_ref(), weights_stream, stream)).transpose()?;
                 let parallel = execution
                     .select_parallel(parallel)
                     .map_err(Error::ArchitectureModel)?;
@@ -99,7 +108,7 @@ where
                 let movement =
                     super::super::distributed::expert::MlxExpertRouteTensorMovement::new(context);
                 let unit_strategy = execution
-                    .pipeline_unit_strategy(provider, movement)
+                    .pipeline_unit_strategy(eredu_runtime::ParameterProviders { grouped: provider, rows }, movement)
                     .map_err(Error::ArchitectureModel)?;
                 let executor = eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new_with_unit_strategy(
                     architecture,
@@ -145,7 +154,9 @@ where
         publication_authority.local_public_output(),
         stream,
     );
-    completed = completed.with_parameter_banks(parameter_bank)?;
+    completed = completed
+        .with_parameter_banks(parameter_bank)?
+        .with_partition_row_pool(row_pool);
     finalizer.finish(completed)
 }
 

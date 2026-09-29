@@ -69,11 +69,21 @@ impl<T, L, E> EmbeddedPredictionObservers<T, L, E> {
         self.internal()?.take_activation_error()
     }
 
-    fn internal(&mut self) -> Option<&mut dyn SpeculativeActivationObserver<T, E>> {
+    /// Borrows the admitted observer for one actual target or prediction invocation.
+    pub fn internal(&mut self) -> Option<&mut dyn SpeculativeActivationObserver<T, E>> {
         match self.internal.as_mut() {
             Some(observer) => Some(&mut **observer),
             None => None,
         }
+    }
+
+    /// Observes and applies interventions to the capture consumed by prediction.
+    /// Streaming prefill calls this once per chunk before seeding prediction state.
+    pub fn target_capture(&mut self, value: &T) -> Result<T, E>
+    where
+        T: Clone,
+    {
+        self.tensor(EMBEDDED_TARGET_CAPTURE_PATH, value)
     }
 
     fn tensor(&mut self, path: &str, value: &T) -> Result<T, E>
@@ -647,14 +657,15 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
         _output: &mut EmbeddedPredictionOutput<M::Tensor>,
     ) -> Result<Self::Telemetry, M::Error>;
 
-    /// Runs ordinary-target prefill and returns its exact selected capture.
-    fn prefill_target<'a>(
+    /// Streams target and prediction prefill, retaining only the final target chunk.
+    /// The returned count covers the complete input, independently of that chunk.
+    fn prefill_with_prediction<'a>(
         &mut self,
         input: Self::Input,
         cache: &mut Self::TargetCache,
         context: M::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<M::Tensor, M::Error>>,
-    ) -> Result<EmbeddedPredictionOutput<M::Tensor>, M::Error>;
+        observers: &mut EmbeddedPredictionObservers<M::Tensor, M::Logits, M::Error>,
+    ) -> Result<(EmbeddedPredictionOutput<M::Tensor>, usize), M::Error>;
 
     /// Runs ordinary-target verification and returns its exact selected capture.
     fn verify_target<'a>(
@@ -665,16 +676,6 @@ pub trait EmbeddedPredictionStrategy<M: SpeculativeTensorMechanisms + 'static> {
         observer: Option<&mut dyn SpeculativeActivationObserver<M::Tensor, M::Error>>,
         phase: SpeculativeActivationPhase,
     ) -> Result<EmbeddedPredictionOutput<M::Tensor>, M::Error>;
-
-    /// Seeds prediction-local state from a successful ordinary-target transaction.
-    fn seed_prediction_cache<'a>(
-        &mut self,
-        output: &EmbeddedPredictionOutput<M::Tensor>,
-        tokens: &M::Tensor,
-        cache: &mut Self::TargetCache,
-        context: M::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<M::Tensor, M::Error>>,
-    ) -> Result<(), M::Error>;
 
     /// Forks prediction-local state from the authoritative target lane.
     fn prediction_cache(&self, cache: &Self::TargetCache) -> Self::PredictionCache;
@@ -752,17 +753,21 @@ where
     /// Owned request input accepted by the public backend.
     type Input;
 
-    /// Lowers an owned prefill request and lends the exact architecture input plus token tensor.
-    fn with_prefill<R>(
+    /// Lends successive causal chunks, preserving the complete request identity.
+    /// Each callback must finish before the next chunk's native input is created.
+    /// Its returned forward context supplies architecture-owned continuation
+    /// products; lowering completes those retained tensors before reusing them.
+    fn with_prefill_chunks(
         &mut self,
         input: Self::Input,
+        maximum_chunk_tokens: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        operation: impl for<'a> FnOnce(
+        operation: impl for<'a> FnMut(
             A::Input<'a>,
             B::Tensor,
             Option<&'a eredu_runtime::PreparedInputCacheIdentity>,
-        ) -> Result<R, E>,
-    ) -> Result<R, E>;
+        ) -> Result<A::ForwardContext, E>,
+    ) -> Result<(), E>;
 
     /// Lowers verified tokens to the architecture's exact decode input.
     fn with_decode<R>(
@@ -929,7 +934,8 @@ where
     /// Keeps one auxiliary invocation in the ordinary session transaction. The
     /// unobserved path retains its existing execution and validation behavior.
     fn prediction_phase<R>(
-        &mut self,
+        session: &mut eredu_runtime::ReplicatedTextSession<A, B, SM, D>,
+        extension: &mut P,
         lane: &mut P::LaneState,
         pass: eredu_runtime::ExpertPass,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -948,9 +954,9 @@ where
         N::validate(|| {
             let Some(observer) = observer else {
                 return execute(
-                    self.extension,
+                    extension,
                     &mut ReplicatedPredictionInvoker {
-                        session: self.session,
+                        session,
                         context,
                         _native: PhantomData,
                     },
@@ -958,11 +964,11 @@ where
                     None,
                 );
             };
-            self.session.with_prediction_observation(
+            session.with_prediction_observation(
                 pass,
                 context,
                 observer,
-                &mut (&mut *self.extension, lane),
+                &mut (&mut *extension, lane),
                 |session, (extension, lane), observer| {
                     execute(
                         extension,
@@ -981,6 +987,46 @@ where
                 |error| N::session_failure(eredu_core::BackendFailure::from_error(error)),
             )
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_prediction_rows(
+        session: &mut eredu_runtime::ReplicatedTextSession<A, B, SM, D>,
+        extension: &mut P,
+        capture: &B::Tensor,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        lane: &mut P::LaneState,
+        sequence: usize,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut dyn SpeculativeActivationObserver<B::Tensor, M::Error>>,
+    ) -> Result<(), M::Error>
+    where
+        A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
+        N: ReplicatedPredictionNative<A, B, S, M>,
+    {
+        observation::neural(
+            observer,
+            SpeculativeActivationPhase::PredictionPrefill,
+            sequence,
+            N::session_error,
+            |observer| {
+                Self::prediction_phase(
+                    session,
+                    extension,
+                    lane,
+                    eredu_runtime::ExpertPass::Prefill,
+                    context,
+                    observer,
+                    |extension, invoker, lane, observer| {
+                        extension.prefill_observed::<S, _>(
+                            invoker, capture, hidden, tokens, lane, observer,
+                        )
+                    },
+                    |extension, lane, _| extension.complete_state(lane, &[], context),
+                )
+            },
+        )
     }
 
     /// Realizes one typed target/prediction lane before final executor erasure.
@@ -1272,13 +1318,13 @@ where
         N::take_telemetry()
     }
 
-    fn prefill_target<'a>(
+    fn prefill_with_prediction<'a>(
         &mut self,
         input: Self::Input,
         cache: &mut Self::TargetCache,
         context: M::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<B::Tensor, M::Error>>,
-    ) -> Result<EmbeddedPredictionOutput<B::Tensor>, M::Error> {
+        observers: &mut EmbeddedPredictionObservers<B::Tensor, M::Logits, M::Error>,
+    ) -> Result<(EmbeddedPredictionOutput<B::Tensor>, usize), M::Error> {
         let tensor_context = N::target_context(context);
         let Self {
             session,
@@ -1287,7 +1333,13 @@ where
             input: lowerer,
             ..
         } = self;
-        lowerer.with_prefill(input, tensor_context, |prepared, tokens, identity| {
+        let maximum_chunk_tokens = extension
+            .maximum_prefill_chunk_tokens(selected)
+            .unwrap_or(usize::MAX);
+        let mut last = None;
+        let mut tail = None;
+        let mut total_tokens = 0usize;
+        lowerer.with_prefill_chunks(input, maximum_chunk_tokens, tensor_context, |prepared, tokens, identity| {
             let sequence = M::sequence_len(&tokens)?;
             cache
                 .bind_prepared_input(identity)
@@ -1301,13 +1353,13 @@ where
                 cache.restore_target(lane);
                 return Err(N::session_error(error));
             }
-            let result = observation::neural(observer, SpeculativeActivationPhase::TargetPrefill,
+            let result = observation::neural(observers.internal(), SpeculativeActivationPhase::TargetPrefill,
                 sequence, N::session_error, |observer| N::validate(|| {
                     match observer {
                         Some(observer) => session.prefill_input_prediction_target_observed(prepared, tensor_context, observer),
                         None => session.prefill_input_prediction_target(prepared, tensor_context),
                     }
-                    .map(|(logits, capture)| EmbeddedPredictionOutput::new(logits, capture, tokens))
+                    .map(|(logits, capture, forward)| (EmbeddedPredictionOutput::new(logits, capture, tokens), forward))
                     .map_err(N::session_error)
                 }));
             let restored = match session
@@ -1324,7 +1376,7 @@ where
                     .and(Err(N::session_error(error))),
             };
             cache.restore_target(lane);
-            let output = match (result, restored) {
+            let (mut output, forward) = match (result, restored) {
                 (Err(error), _) => return Err(error),
                 (Ok(output), Ok(())) => output,
                 (Ok(_), Err(error)) => return Err(error),
@@ -1338,8 +1390,38 @@ where
             cache
                 .retain_capture_generation(N::generation)
                 .map_err(N::session_error)?;
-            Ok(output)
-        })
+            output.capture = observers.target_capture(output.capture())?;
+            extension
+                .validate_capture(selected, &lane, N::shape(output.capture()))
+                .map_err(N::session_error)?;
+            validate_prediction_output::<M>(&output, Some(sequence))?;
+            if sequence == 0 {
+                return Err(M::empty_prediction_input());
+            }
+            // Sequential prediction pairs hidden[t] with original token[t + 1].
+            // Keep only the previous chunk's final row to bridge that shifted pair.
+            if let Some(previous) = tail.take() {
+                let first = M::token_range(output.tokens(), 0, 1, context)?;
+                Self::prefill_prediction_rows(session, extension, &previous, &previous,
+                    &first, cache.prediction_mut(), 1, tensor_context, observers.internal())?;
+            }
+            let prediction_sequence = extension.prefill_sequence_len(sequence);
+            if prediction_sequence != 0 {
+                let hidden = M::tensor_prefix(output.capture(), sequence - 1, context)?;
+                let next = M::token_range(output.tokens(), 1, sequence, context)?;
+                Self::prefill_prediction_rows(session, extension, output.capture(), &hidden,
+                    &next, cache.prediction_mut(), prediction_sequence, tensor_context,
+                    observers.internal())?;
+            }
+            if maximum_chunk_tokens != usize::MAX {
+                tail = Some(M::tensor_row(output.capture(), sequence - 1, context)?);
+            }
+            total_tokens = total_tokens.checked_add(sequence)
+                .ok_or_else(|| N::session_error("prediction prefill token count overflow"))?;
+            last = Some(output);
+            Ok(forward)
+        })?;
+        Ok((last.ok_or_else(M::empty_prediction_input)?, total_tokens))
     }
 
     fn verify_target<'a>(
@@ -1411,60 +1493,6 @@ where
         })
     }
 
-    fn seed_prediction_cache<'a>(
-        &mut self,
-        output: &EmbeddedPredictionOutput<B::Tensor>,
-        tokens: &B::Tensor,
-        cache: &mut Self::TargetCache,
-        context: M::Context<'a>,
-        observer: Option<&mut dyn SpeculativeActivationObserver<B::Tensor, M::Error>>,
-    ) -> Result<(), M::Error> {
-        let sequence = M::sequence_len(tokens)?;
-        let lane_identity = cache
-            .lane_identity(self.selected, N::generation)
-            .map_err(N::session_error)?;
-        self.extension
-            .validate_capture(self.selected, &lane_identity, N::shape(output.capture()))
-            .map_err(N::session_error)?;
-        let prediction_sequence = self.extension.prefill_sequence_len(sequence);
-        if prediction_sequence == 0 {
-            return Ok(());
-        }
-        let hidden = M::tensor_prefix(output.capture(), sequence.saturating_sub(1), context)?;
-        let next = M::token_range(tokens, 1, sequence, context)?;
-        let checkpoint = cache.prediction_fork();
-        let tensor_context = N::target_context(context);
-        let result = observation::neural(
-            observer,
-            SpeculativeActivationPhase::PredictionPrefill,
-            prediction_sequence,
-            N::session_error,
-            |observer| {
-                self.prediction_phase(
-                    cache.prediction_mut(),
-                    eredu_runtime::ExpertPass::Prefill,
-                    tensor_context,
-                    observer,
-                    |extension, invoker, lane, observer| {
-                        extension.prefill_observed::<S, _>(
-                            invoker,
-                            output.capture(),
-                            &hidden,
-                            &next,
-                            lane,
-                            observer,
-                        )
-                    },
-                    |extension, lane, _| extension.complete_state(lane, &[], tensor_context),
-                )
-            },
-        );
-        if result.is_err() {
-            cache.commit_prediction(&checkpoint);
-        }
-        result
-    }
-
     fn prediction_cache(&self, cache: &Self::TargetCache) -> Self::PredictionCache {
         cache.prediction_fork()
     }
@@ -1507,7 +1535,9 @@ where
             1,
             N::session_error,
             |observer| {
-                self.prediction_phase(
+                Self::prediction_phase(
+                    self.session,
+                    self.extension,
                     cache.prediction_mut(),
                     eredu_runtime::ExpertPass::Decode,
                     tensor_context,
@@ -1565,7 +1595,9 @@ where
                 capacity,
                 N::session_error,
                 |observer| {
-                    self.prediction_phase(
+                    Self::prediction_phase(
+                        self.session,
+                        self.extension,
                         &mut proposal,
                         eredu_runtime::ExpertPass::Decode,
                         tensor_context,
@@ -1620,7 +1652,9 @@ where
             M::sequence_len(tokens)?,
             N::session_error,
             |observer| {
-                self.prediction_phase(
+                Self::prediction_phase(
+                    self.session,
+                    self.extension,
                     cache.prediction_mut(),
                     eredu_runtime::ExpertPass::Decode,
                     tensor_context,
@@ -1688,6 +1722,9 @@ pub struct EmbeddedPredictionTargetState<T, C> {
 #[derive(Clone)]
 pub struct EmbeddedPredictionDraftState<T, C: Clone> {
     capture: T,
+    // The committed target frontier remains available after proposal captures
+    // diverge. Sequential cache commitment replays only target-aligned inputs.
+    anchor_capture: T,
     prediction_cache: DraftStateTransaction<C>,
     depth: usize,
     fused_logits: Option<T>,
@@ -2608,16 +2645,23 @@ where
         output: &EmbeddedPredictionOutput<M::Tensor>,
         expected: Option<usize>,
     ) -> Result<usize, M::Error> {
-        let logits = M::sequence_len(output.logits())?;
-        let capture = M::sequence_len(output.capture())?;
-        let tokens = M::sequence_len(output.tokens())?;
-        if logits != capture || logits != tokens || expected.is_some_and(|value| value != logits) {
-            return Err(M::invalid_prediction_output(
-                logits, capture, tokens, expected,
-            ));
-        }
-        Ok(logits)
+        validate_prediction_output::<M>(output, expected)
     }
+}
+
+fn validate_prediction_output<M: SpeculativeTensorMechanisms>(
+    output: &EmbeddedPredictionOutput<M::Tensor>,
+    expected: Option<usize>,
+) -> Result<usize, M::Error> {
+    let logits = M::sequence_len(output.logits())?;
+    let capture = M::sequence_len(output.capture())?;
+    let tokens = M::sequence_len(output.tokens())?;
+    if logits != capture || logits != tokens || expected.is_some_and(|value| value != logits) {
+        return Err(M::invalid_prediction_output(
+            logits, capture, tokens, expected,
+        ));
+    }
+    Ok(logits)
 }
 
 impl<S, M> SpeculativeExecutor for EmbeddedPredictionExecutor<'_, S, M>
@@ -2672,8 +2716,10 @@ where
             return Ok(None);
         };
         if let Some(embedded) = &mut observation.embedded {
-            embedded.retained_feature_bytes =
-                M::control_tensor_estimate(&state.capture).map(|e| e.retained_bytes);
+            // A proposal retains its immutable target anchor alongside the
+            // mutable prediction capture. Charge both even for native shared views.
+            embedded.retained_feature_bytes = M::control_tensor_estimate(&state.capture)
+                .and_then(|e| e.retained_bytes.checked_mul(2));
         }
         observation.seed_bytes = self
             .strategy
@@ -2869,29 +2915,21 @@ where
         }
         let checkpoint = S::checkpoint_target(cache)?;
         let result = (|| {
-            let mut output =
-                self.strategy
-                    .prefill_target(input, cache, context, self.observers.internal())?;
-            output.capture = self
-                .observers
-                .tensor(EMBEDDED_TARGET_CAPTURE_PATH, &output.capture)?;
+            let (output, total_tokens) = self.strategy.prefill_with_prediction(
+                input,
+                cache,
+                context,
+                &mut self.observers,
+            )?;
             let sequence = Self::validate_output(&output, None)?;
             if sequence == 0 {
                 return Err(M::empty_prediction_input());
             }
-            let tokens = output.tokens().clone();
-            self.strategy.seed_prediction_cache(
-                &output,
-                &tokens,
-                cache,
-                context,
-                self.observers.internal(),
-            )?;
             let row = sequence - 1;
             let logits = M::logits_row(output.logits(), row, context)?;
             let state =
                 Self::state_at(&output, row, self.strategy.prediction_cache(cache), context)?;
-            Ok(SpeculativePrefill::new(logits, state, sequence))
+            Ok(SpeculativePrefill::new(logits, state, total_tokens))
         })();
         match result {
             Ok(prefill) => Ok(prefill),
@@ -2926,6 +2964,7 @@ where
         }
         Ok(EmbeddedPredictionDraftState {
             capture: state.capture.clone(),
+            anchor_capture: state.capture.clone(),
             prediction_cache,
             depth: 0,
             fused_logits,
@@ -3038,6 +3077,23 @@ where
             Self::validate_output(&output.output, Some(input_len))?;
             if verified_inputs == 0 || verified_inputs > input_len {
                 return Err(M::invalid_prediction_commit(verified_inputs, input_len));
+            }
+            if draft_state.fused_logits.is_none() {
+                // Proposal depths may have consumed rejected tokens and predicted
+                // captures. Neither belongs in the accepted-context cache, even
+                // when all sampled tokens happen to be accepted. Restore the
+                // pre-proposal prediction lane and replay the committed anchor
+                // from the target's actual capture through every prediction unit.
+                let accepted = draft_state.prediction_cache.checkpoint().clone();
+                *draft_state.prediction_cache.draft_mut() = accepted;
+                let anchor = M::token_prefix(&output.inputs, 1, context)?;
+                self.strategy.advance_prediction_cache(
+                    &draft_state.anchor_capture,
+                    &anchor,
+                    draft_state.prediction_cache.draft_mut(),
+                    context,
+                    self.observers.internal(),
+                )?;
             }
             if verified_inputs > 1 {
                 let captures =

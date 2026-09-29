@@ -8,12 +8,11 @@ use eredu_core::{
     PreparationMechanismCapabilities, SessionCapabilities,
 };
 use eredu_runtime::{
-    BackendMechanismCapabilities, CacheResidencyPolicy, CommunicationCapabilities,
-    DraftingLoadRequest, GroupedOperationRequirement, MediaPrimitiveCapabilities,
-    NormalizedLoadRequest, NormalizedLoadRequestError, ProcessorSelectionError,
-    ReplicatedTextRequirements, ReplicatedTextSelectionError, ReplicatedTextSelectionRequest,
-    SelectedProcessorExecution, SelectedReplicatedTextRealization,
-    SpeculativeMechanismCapabilities, SpeculativeSelectionError,
+    BackendMechanismCapabilities, CommunicationCapabilities, DraftingLoadRequest,
+    GroupedOperationRequirement, MediaPrimitiveCapabilities, NormalizedLoadRequest,
+    NormalizedLoadRequestError, ProcessorSelectionError, ReplicatedTextRequirements,
+    ReplicatedTextSelectionError, ReplicatedTextSelectionRequest, SelectedProcessorExecution,
+    SelectedReplicatedTextRealization, SpeculativeMechanismCapabilities, SpeculativeSelectionError,
 };
 
 use crate::{
@@ -58,6 +57,37 @@ use crate::{
 /// execution branch, or inspect model-family identity. Architecture code supplies
 /// exact neutral requirements and retains every selection decision.
 pub trait PreparationMechanismProvider {
+    /// Floating activation and state representation produced by materializing the
+    /// declared embedding dtype. This is an immutable native mechanism fact.
+    fn floating_state_dtype(
+        &self,
+        _source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        None
+    }
+
+    /// Storage tiers and completion ownership for addressable table rows.
+    fn row_lookup_storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
+        None
+    }
+
+    /// Exact row decoder and scalar-recipe support, using immutable headers only.
+    fn row_lookup_workspace(
+        &self,
+        _descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
+        Ok(None)
+    }
+
+    /// Native row decoder storage and retention facts for one bounded acquisition.
+    fn row_lookup_decode_memory(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_runtime::RowLookupError>
+    {
+        descriptor.decode_memory()
+    }
+
     /// Native temporary geometry for explicit input-score attention. No family
     /// identity, tensor, stream or device is consulted.
     fn input_score_attention_workspace(
@@ -68,10 +98,10 @@ pub trait PreparationMechanismProvider {
 
     /// Conservative live buffers for one physical recipe, including native
     /// copies and index buffers. This must inspect metadata only.
-    fn recipe_materialization_workspace(
+    fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
         &self,
         _recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
-        _source: &dyn eredu_checkpoint::store::CheckpointSource,
+        _source: &C,
     ) -> Result<u64, String> {
         Err("backend did not report native recipe workspace".into())
     }
@@ -99,6 +129,15 @@ pub trait PreparationMechanismProvider {
         request: &ReplicatedTextSelectionRequest,
     ) -> BackendMechanismCapabilities;
 
+    /// Mechanisms for an independently owned auxiliary state role.
+    fn state_capabilities(
+        &self,
+        _requirements: &eredu_runtime::StateRealizationRequirements,
+        _policy: &eredu_runtime::CacheResidencyPolicy,
+    ) -> eredu_runtime::StateMechanismCapabilities {
+        eredu_runtime::StateMechanismCapabilities::new([])
+    }
+
     /// Portable media and prepared-tensor primitives.
     fn processor_capabilities(&self) -> MediaPrimitiveCapabilities;
 
@@ -109,13 +148,69 @@ pub trait PreparationMechanismProvider {
     fn communication_capabilities(&self) -> CommunicationCapabilities;
 }
 
+/// Projects preparation facts into the shared metadata-only row selector.
+/// The borrowed provider can record every query for cached-selection agreement.
+pub struct PreparationRowLookupMechanisms<'a, P: ?Sized> {
+    provider: &'a P,
+}
+
+impl<'a, P: PreparationMechanismProvider + ?Sized> PreparationRowLookupMechanisms<'a, P> {
+    /// Borrows the same provider used by ordinary preparation selection.
+    pub const fn new(provider: &'a P) -> Self {
+        Self { provider }
+    }
+}
+
+impl<P: PreparationMechanismProvider + ?Sized> eredu_runtime::RowLookupMechanismSupport
+    for PreparationRowLookupMechanisms<'_, P>
+{
+    fn storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
+        self.provider.row_lookup_storage()
+    }
+
+    fn workspace(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
+        self.provider.row_lookup_workspace(descriptor)
+    }
+
+    fn decode_memory(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_runtime::RowLookupError>
+    {
+        self.provider.row_lookup_decode_memory(descriptor)
+    }
+}
+
+mod qwen4;
+
 /// Structured failure from total cold preparation selection.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreparationSelectionError {
+    /// Request-specific target bounds cannot be lowered from admitted headers.
+    #[error(transparent)]
+    Qwen4TargetLoad(#[from] std::sync::Arc<crate::qwen4_exp::prepared::TargetLoadError>),
+    /// Exact retained target mechanisms are unavailable.
+    #[error(transparent)]
+    Qwen4TargetSelection(#[from] std::sync::Arc<crate::qwen4_exp::prepared::TargetSelectionError>),
+    /// The selected family/container has no ordinary companion binding route.
+    #[error("separate prediction-source loading is not implemented for this family/container")]
+    PredictionSourceUnsupported,
+    /// The separately supplied prediction artifact failed header admission.
+    #[error(transparent)]
+    PredictionSource(#[from] std::sync::Arc<eredu_core::artifact::ArtifactError>),
     /// The normalized request is internally contradictory.
     #[error(transparent)]
     Request(#[from] NormalizedLoadRequestError),
+    /// Explicit media intent needs the retained conditional source and cursor route.
+    #[error("ordinary loading of explicit media execution requires retained conditional source and prefill cursor wiring, which is not yet implemented")]
+    MediaPreparationRequired,
+    /// The selected composite cannot currently be projected to a text-only constructor.
+    #[error("media-disabled loading requires a text-only projection of this composite execution, which is not yet implemented")]
+    MediaDisabledForComposite,
     /// Facade-owned GGUF tokenizer identities have not been resolved yet.
     #[error("GGUF {0:?} media token IDs must be resolved before preparation selection")]
     UnresolvedGgufSpecialTokens(GgufSpecialTokenKind),
@@ -185,7 +280,6 @@ pub enum PreparationSelectionError {
 
 struct ExecutionClassSelection<'a, P> {
     request: &'a NormalizedLoadRequest,
-    policy: eredu_core::PreparationPolicy,
     admitted_session: SessionCapabilities,
     processor: Option<SelectedProcessorExecution>,
     partitioned_base: bool,
@@ -194,33 +288,10 @@ struct ExecutionClassSelection<'a, P> {
 
 impl<P> ExecutionClassSelection<'_, P> {
     fn text_request(&self) -> ReplicatedTextSelectionRequest {
-        let mut request = ReplicatedTextSelectionRequest::new(
-            self.request.weight_residency().layers(),
-            self.request.state_residency().clone(),
-        )
-        .with_max_cached_shards(
-            std::num::NonZeroUsize::new(self.request.max_cached_shards())
-                .expect("validated source reader limit is positive"),
-        )
-        .with_parameter_conversion_retention(self.request.parameter_conversion_retention())
-        .with_session(self.admitted_session)
-        .with_prompt_cache(
-            self.request.prompt_cache_persistence()
-                || matches!(
-                    self.request.state_residency(),
-                    CacheResidencyPolicy::Paged(_)
-                ),
-        )
-        .with_exact_completion(true);
-        if !self.partitioned_base {
-            if let Some(topology) = self.policy.topology() {
-                request = request.with_topology(topology);
-            }
-        }
-        if let Some(quantization) = self.policy.quantization() {
-            request = request.with_quantization(quantization);
-        }
-        request
+        self.request
+            .validate_model_preparation()
+            .expect("execution class selection retains a validated load request")
+            .text_selection_request(self.admitted_session, self.partitioned_base)
     }
 }
 
@@ -259,6 +330,12 @@ where
         self,
         requirements: CompositeTextRequirements,
     ) -> Result<Self::Composite, Self::Error> {
+        if matches!(
+            self.request.media_execution(),
+            eredu_runtime::MediaLoadRequest::Disabled
+        ) {
+            return Err(PreparationSelectionError::MediaDisabledForComposite);
+        }
         let request = self.text_request();
         let processor = self
             .processor
@@ -393,6 +470,13 @@ where
     P: PreparationMechanismProvider,
 {
     let validated = request.validate_model_preparation()?;
+    if matches!(
+        request.media_execution(),
+        eredu_runtime::MediaLoadRequest::Required(_)
+    ) && inspection.architecture_plan().model_kind() != crate::ModelKind::Qwen4Exp
+    {
+        return Err(PreparationSelectionError::MediaPreparationRequired);
+    }
     if let Some(kind) = inspection
         .architecture_plan()
         .required_gguf_special_tokens()
@@ -413,6 +497,16 @@ where
         return Err(PreparationSelectionError::MissingGroupedOperations(
             missing_grouped,
         ));
+    }
+
+    if request.prediction_source().is_some()
+        && (inspection.architecture_plan().model_kind() != crate::ModelKind::Qwen4Exp
+            || inspection.format() != ArtifactFormat::Gguf)
+    {
+        return Err(PreparationSelectionError::PredictionSourceUnsupported);
+    }
+    if inspection.architecture_plan().model_kind() == crate::ModelKind::Qwen4Exp {
+        return qwen4::select(inspection, request, mechanisms, admission);
     }
 
     let projection = inspection
@@ -443,7 +537,12 @@ where
     });
     let execution_inspection = projected_inspection.as_ref().unwrap_or(inspection);
 
-    let processor = select_processor(execution_inspection, &policy, mechanisms)?;
+    let processor = select_processor(
+        execution_inspection,
+        &policy,
+        request.media_execution(),
+        mechanisms,
+    )?;
     let parallel = request
         .parallel_topology()
         .filter(|topology| !topology.is_replicated());
@@ -453,7 +552,6 @@ where
     }
     let base = ExecutionClassSelection {
         request,
-        policy,
         admitted_session: admission.session_capabilities(),
         processor,
         partitioned_base: parallel.is_some(),
@@ -573,6 +671,7 @@ fn architecture_admission_capabilities(
 fn select_processor<P>(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     policy: &eredu_core::PreparationPolicy,
+    media: &eredu_runtime::MediaLoadRequest,
     mechanisms: &P,
 ) -> Result<Option<SelectedProcessorExecution>, PreparationSelectionError>
 where
@@ -581,6 +680,9 @@ where
     composite_processor_execution_requirements(inspection.architecture_plan())
         .map_err(PreparationSelectionError::ProcessorRequirements)?
         .map(|requirements| {
+            if matches!(media, eredu_runtime::MediaLoadRequest::Disabled) {
+                return Err(PreparationSelectionError::MediaDisabledForComposite);
+            }
             let request = eredu_runtime::ProcessorSelectionRequest::new(
                 requirements
                     .modalities()
@@ -734,6 +836,7 @@ pub(crate) mod tests {
 
     use super::*;
 
+    mod media_policy;
     mod resource_descriptions;
 
     #[derive(Default)]
@@ -916,10 +1019,10 @@ pub(crate) mod tests {
             self.input_score_workspace
         }
 
-        fn recipe_materialization_workspace(
+        fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
             &self,
             recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
-            source: &dyn eredu_checkpoint::store::CheckpointSource,
+            source: &C,
         ) -> Result<u64, String> {
             recipe
                 .peak_materialization_bytes(source)
@@ -1347,7 +1450,7 @@ pub(crate) mod tests {
             ),
             (
                 prediction_config(),
-                "selected prediction extension retains a complete prefill pass",
+                "selected prediction extension owns its internal prefill schedule",
             ),
         ] {
             let (_root, inspection) = inspected_config(config);

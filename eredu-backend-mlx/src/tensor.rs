@@ -102,6 +102,41 @@ impl Tensor for MlxTensor {
         self.0.shape()
     }
 
+    fn element_type(&self) -> Option<eredu_nn::TensorElementType> {
+        crate::backend::nn::memory::element_type(self.0.dtype())
+    }
+
+    fn inspect_storage(
+        values: &[&Self],
+    ) -> Result<eredu_nn::tensor_storage::TensorStorageSurvey, Error> {
+        use eredu_nn::tensor_storage::{TensorStorageBacking, TensorStorageSurvey};
+        let arrays = values
+            .iter()
+            .map(|value| value.as_array())
+            .collect::<Vec<_>>();
+        let native = safemlx::inspect_storage(&arrays).map_err(Error::backend_source)?;
+        let backings = native
+            .backings
+            .into_iter()
+            .map(|backing| {
+                Ok(TensorStorageBacking {
+                    allocator_owned: backing.allocator_owned,
+                    allocator_capacity_bytes: backing
+                        .allocator_capacity_bytes
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(Error::backend_source)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let survey = TensorStorageSurvey {
+            values: native.values,
+            backings,
+        };
+        survey.validate(values.len())?;
+        Ok(survey)
+    }
+
     fn publish_parameter(&mut self, replacement: &Self) {
         crate::backend::nn::parameter_conversion::invalidate(&self.0);
         *self = replacement.clone();
@@ -185,12 +220,40 @@ impl Tensor for MlxTensor {
         tensor(Array::multiply(self.as_array(), rhs.as_array(), context))
     }
 
+    fn cast_float(
+        &self,
+        element: eredu_nn::TensorElementType,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        use eredu_nn::TensorElementType as T;
+        use safemlx::Dtype as D;
+        if !matches!(
+            self.element_type(),
+            Some(T::F16 | T::Bf16 | T::F32 | T::F64)
+        ) {
+            return Err(Error::backend("floating cast requires a floating input"));
+        }
+        let dtype = match element {
+            T::F16 => D::Float16,
+            T::Bf16 => D::Bfloat16,
+            T::F32 => D::Float32,
+            T::F64 => D::Float64,
+            _ => return Err(Error::backend("floating cast requires a floating output")),
+        };
+        tensor(self.as_array().as_dtype(dtype, context))
+    }
+
     fn multiply_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
-        tensor(Array::multiply(
-            self.as_array(),
-            Array::from_f32(rhs),
-            context,
-        ))
+        let output = Array::multiply(self.as_array(), Array::from_f32(rhs), context)
+            .map_err(Error::backend)?;
+        if matches!(
+            self.as_array().dtype(),
+            safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16
+        ) {
+            tensor(output.as_dtype(self.as_array().dtype(), context))
+        } else {
+            Ok(MlxTensor::from_array(output))
+        }
     }
 
     fn divide(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
@@ -201,16 +264,30 @@ impl Tensor for MlxTensor {
         tensor(Array::square(self.as_array(), context))
     }
 
+    fn abs(&self, context: &Self::Context) -> Result<Self, Error> {
+        tensor(safemlx::ops::abs(self.as_array(), context))
+    }
+    fn sign(&self, context: &Self::Context) -> Result<Self, Error> {
+        tensor(safemlx::ops::sign(self.as_array(), context))
+    }
+    fn sqrt(&self, context: &Self::Context) -> Result<Self, Error> {
+        tensor(safemlx::ops::sqrt(self.as_array(), context))
+    }
     fn tanh(&self, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::tanh(self.as_array(), context))
     }
 
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
-        tensor(safemlx::ops::maximum(
-            self.as_array(),
-            Array::from_f32(rhs),
-            context,
-        ))
+        let output = safemlx::ops::maximum(self.as_array(), Array::from_f32(rhs), context)
+            .map_err(Error::backend)?;
+        if matches!(
+            self.as_array().dtype(),
+            safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16
+        ) {
+            tensor(output.as_dtype(self.as_array().dtype(), context))
+        } else {
+            Ok(MlxTensor::from_array(output))
+        }
     }
 
     fn maximum_i32(&self, rhs: i32, context: &Self::Context) -> Result<Self, Error> {

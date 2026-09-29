@@ -6,9 +6,12 @@ use eredu::api::{inspect_local_model, LocalInspectionOptions, LocalLoadOptions};
 use eredu_backend_mlx::{backend::MlxBackend, MlxBackendFactory};
 use eredu_core::{DevicePlan, ExecutionPlan, QuantizationRequest};
 
+#[path = "selected_backend_api/qwen4_exp.rs"]
+mod qwen4_exp;
+
 fn operate_selected_text_control(
     model: &mut eredu::api::LoadedModel<MlxBackend<'static>>,
-    request: eredu::api::PreparedObservedGeneration,
+    request: eredu::api::PreparedObservedGeneration<MlxBackend<'static>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use eredu_core::execution_control::{GenerationControlHandle, SnapshotLimits};
     use std::ops::ControlFlow;
@@ -52,7 +55,7 @@ fn operate_selected_text_control(
 fn mlx_text_control_uses_generic_model_and_snapshot_types() {
     let _: fn(
         &mut eredu::api::LoadedModel<MlxBackend<'static>>,
-        eredu::api::PreparedObservedGeneration,
+        eredu::api::PreparedObservedGeneration<MlxBackend<'static>>,
     ) -> Result<(), Box<dyn std::error::Error>> = operate_selected_text_control;
 }
 

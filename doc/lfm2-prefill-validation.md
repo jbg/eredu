@@ -2,22 +2,22 @@
 
 Ordinary replicated dense and routed LFM2/LFM2.5 text generation uses the shared
 core prefill driver, including controlled generation. `PrefillChunkPolicy::Bounded`
-selects the maximum positions per eligible invocation; its default remains 512.
-`Unchunked` remains available for callers preferring a full pass. No device-memory
-heuristic or allocator cap is added.
+selects the maximum positions per eligible invocation; its default is 512.
+`Unchunked` is available for callers preferring a full pass. No device-memory
+heuristic or allocator cap applies.
 
 The attention cache and absolute positions advance across chunks. Each convolution
 retains its last `kernel_size - 1` gated inputs, compacted through the general
 neutral tensor contract. Ordinary prefill completes output and retained state
 before publication. Cancellation is checked between completed chunks, with no
-sampling or token commitment for intermediate prefixes. The first controlled step
-still owns the entire prompt; pause/snapshot boundaries remain completed tokens.
+sampling or token commitment for intermediate prefixes. Each controlled step can complete one nonfinal chunk and emit `PrefillProgress`;
+pause and snapshot boundaries include those completed chunks.
 Cancellation may leave partial prompt state and requires reset before a different
 request. Native work already submitted is settled rather than preempted.
 
 Shared dense and heterogeneous readout helpers select the last hidden position
 before vocabulary projection. Both direct and routed text strategies honor that
-selection. Prefixes currently compute one unused vocabulary row. Observed and
+selection. Prefixes compute one unused vocabulary row. Observed and
 speculative paths retain their full-output contracts. Capture/intervention,
 structured inputs, prediction extensions and distributed generation retain their
 existing full-pass restrictions; these are implementation gaps with the reasons
@@ -83,7 +83,7 @@ inferred from chunk size. Released BF16/quantized numerical tolerances are not
 inferred from this F32 comparison.
 
 
-## Recorded released result (2026-09-26)
+## Released measurements
 
 The pinned F32 comparison passes on macOS Metal with PyTorch 2.14.0 and
 Transformers 5.17.0. Maximum absolute errors over all four full-vocabulary
@@ -102,22 +102,6 @@ or predictions for other devices. The 1,024-token case reduces additional peak
 active memory by approximately 54%. The released test completes in 4.60 seconds.
 
 
-A separate load-time GGUF requantization probe failed during exact source-provenance
-admission, before prefill, when applying affine four-bit transformation to the
-synthetic F32 GGUF embedding. The prefill matrix therefore keeps GGUF's admitted
-file encoding and exercises load-time affine quantization through SafeTensors.
-This change does not repair or claim validation of GGUF requantization.
-
-
-Final regression results: all 13 LFM2 neutral numerical tests pass, including
-partition/residency/component regressions; all 75 runtime conformance tests pass;
-the nine core prefill tests and cold selection test pass. The native CPU/Metal
-matrix and retention tests pass (four ordinary tests, 23.49 seconds); the explicit
-released reference passes separately. The public native LFM2 forecast/controlled
-regression passes (0.99 seconds). Portable backend conformance and facade tests
-pass (112 and 27 tests respectively; one existing opt-in test is ignored).
-
-Formatting, boundary checks, production-library Clippy and focused native-test
-Clippy pass. Broader all-target Clippy is blocked by eight existing
-`cloned_ref_to_slice_refs` warnings in the unrelated
-`eredu-runtime/src/memory_forecast/retention.rs` tests.
+The prefill matrix preserves GGUF's admitted file encoding and exercises load-time
+affine quantization through SafeTensors. It contains no load-time GGUF
+requantization acceptance measurement.

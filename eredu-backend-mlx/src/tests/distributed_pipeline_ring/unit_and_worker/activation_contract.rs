@@ -42,6 +42,7 @@ enum FixtureFamily {
     MuseGlimmer,
     MuseGlimmerMoe,
     MuseGlimmerGguf(bool),
+    Qwen4Exp,
     Qwen2,
     Qwen2Gguf,
     Qwen3,
@@ -106,6 +107,7 @@ impl FixtureFamily {
             Self::MuseGlimmerMoe => "muse-glimmer-moe",
             Self::MuseGlimmerGguf(false) => "muse-glimmer-gguf",
             Self::MuseGlimmerGguf(true) => "muse-glimmer-moe-gguf",
+            Self::Qwen4Exp => "qwen4-exp",
             Self::Qwen2 => "qwen2",
             Self::Qwen2Gguf => "qwen2-gguf",
             Self::Qwen3 => "qwen3",
@@ -158,6 +160,7 @@ impl FixtureFamily {
             Self::MuseGlimmerMoe,
             Self::MuseGlimmerGguf(false),
             Self::MuseGlimmerGguf(true),
+            Self::Qwen4Exp,
             Self::Qwen2,
             Self::Qwen2Gguf,
             Self::Qwen3,
@@ -198,6 +201,7 @@ impl FixtureFamily {
 
     fn layer_count(self) -> usize {
         match self {
+            Self::Qwen4Exp => 4,
             Self::K2Dense | Self::K2Mova | Self::K2Fp8(_) => 3,
             Self::Llama
             | Self::Mistral
@@ -306,6 +310,7 @@ impl FixtureFamily {
             Self::MuseGlimmer | Self::MuseGlimmerMoe | Self::MuseGlimmerGguf(_) => {
                 "muse_glimmer_text"
             }
+            Self::Qwen4Exp => "qwen4_exp_text",
             Self::Qwen2 | Self::Qwen2Gguf => "qwen2",
             Self::Qwen3 | Self::Qwen3Gguf => "qwen3",
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => "qwen3_moe",

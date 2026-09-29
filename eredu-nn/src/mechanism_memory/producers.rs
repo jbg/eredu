@@ -43,6 +43,7 @@ impl LinearSpec {
             element,
             weight_element,
             bias: self.bias.is_some(),
+            bias_element: None,
         })
     }
 }
@@ -73,6 +74,34 @@ impl<T: Tensor> AttentionRequest<'_, T> {
     }
 }
 
+impl<T: Tensor> crate::IndexedAttentionInput<'_, T> {
+    /// Describes selected workspace without treating sparse computation as a
+    /// reduction in retained K/V history. No position values are evaluated.
+    pub fn memory_invocation(
+        &self,
+        element: TensorElementType,
+    ) -> Result<MechanismInvocation, Error> {
+        self.validate()?;
+        let [batch, query_heads, queries, key_width] = shape4(self.queries.shape())?;
+        checked(MechanismInvocation::IndexedAttention {
+            batch,
+            query_heads,
+            queries,
+            key_width,
+            kv_heads: positive(self.keys.shape()[1])?,
+            selected: self.selected_positions.shape()[2] as u64,
+            local: self
+                .local
+                .as_ref()
+                .map_or(0, |local| local.keys.shape()[2] as u64),
+            value_width: positive(self.values.shape()[3])?,
+            element,
+            arithmetic: self.arithmetic,
+            sinks: self.sinks.is_some(),
+        })
+    }
+}
+
 impl CausalDepthwiseConvolutionSpec {
     /// Describes output and bounded history from the ordinary convolution spec.
     pub fn memory_invocation(
@@ -87,6 +116,7 @@ impl CausalDepthwiseConvolutionSpec {
             tokens,
             channels: positive(self.channels)?,
             kernel: positive(self.kernel_size)?,
+            dilation: positive(self.dilation)?,
             element,
         })
     }
@@ -223,4 +253,19 @@ pub fn cache_update_invocation<T: Tensor, C: AttentionCache<T> + ?Sized>(
         value_width,
         element,
     })
+}
+
+impl crate::multimodal::MultiAxisRotarySpec {
+    /// Describes cosine/sine construction using the ordinary position shape.
+    pub fn memory_invocation(
+        &self,
+        position_shape: &[u64],
+        position_element: TensorElementType,
+    ) -> Result<MechanismInvocation, Error> {
+        checked(MechanismInvocation::MultiAxisRotary {
+            position_shape: position_shape.to_vec(),
+            position_element,
+            spec: self.clone(),
+        })
+    }
 }

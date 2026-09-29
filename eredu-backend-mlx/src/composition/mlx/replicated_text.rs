@@ -91,6 +91,7 @@ mod state;
 pub(super) use capability::*;
 pub(super) use lowering::*;
 use partitioned::*;
+pub(crate) use prediction::ErasedPrefillCursor;
 pub(super) use prediction::*;
 pub(super) use session::binding::*;
 use session::*;

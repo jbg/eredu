@@ -1,5 +1,14 @@
 //! Prepared neutral construction for embedded prediction extensions.
 
+mod qwen4_exp;
+mod routed_preparation;
+pub(crate) use qwen4_exp::speculative_contract as qwen4_speculative_contract;
+pub use qwen4_exp::{
+    MaterializedQwen4Prediction, PredictionConstructionError, PreparedQwen4PredictionWeights,
+    Qwen4PredictionTarget,
+};
+pub use routed_preparation::PreparedRoutedPrediction;
+
 use eredu_nn::EmbeddingOperator as _;
 use std::num::NonZeroUsize;
 
@@ -720,6 +729,11 @@ impl<M> PreparedPredictionUnit<M> {
         })
     }
 
+    fn with_residency(mut self, residency: eredu_runtime::LayerWeightResidency) -> Self {
+        self.residency = residency;
+        self
+    }
+
     fn with_source_layout(mut self, layout: Option<std::sync::Arc<LocalModelLayout>>) -> Self {
         self.source_layout = layout;
         self
@@ -1154,6 +1168,18 @@ where
             self.depth(),
             selected,
         )
+    }
+
+    /// Maximum target prefill span for a sequential predictor that supports causal
+    /// streaming of hidden rows paired with the following original token. The shared
+    /// driver preserves that pair across chunk boundaries. No declaration keeps the
+    /// complete-input prefill contract, including for fused context builders.
+    /// Declaring extensions also apply the selected capture's architecture-owned bounds.
+    fn maximum_prefill_chunk_tokens(
+        &self,
+        _selected: &eredu_runtime::SelectedSpeculativeRealization,
+    ) -> Option<usize> {
+        None
     }
 
     /// Physical rows consumed while seeding prediction state. Sequential

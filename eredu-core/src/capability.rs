@@ -213,7 +213,8 @@ pub struct StateMemoryAssumptions {
 pub struct RuntimeStateEstimate {
     /// Context-independent recurrent/convolution state.
     pub fixed_state_bytes: u64,
-    /// Unbounded bytes added per position before multiplying by batch.
+    /// Rounded-up amortized unbounded bytes per position before multiplying by
+    /// batch. Blocked records grow in steps; this is not a one-step peak.
     pub bytes_per_position_per_batch: u64,
     /// Persistent context-dependent bytes at the requested length.
     pub context_state_bytes: u64,
@@ -531,7 +532,7 @@ fn attention_scalars_per_position(policy: &LayerCachePolicy) -> Result<u64, Capa
             head_dim,
             ..
         }
-        | LayerCachePolicy::KeyValueWithFixedState {
+        | LayerCachePolicy::KeyValueWithState {
             num_key_value_heads,
             head_dim,
             ..
@@ -549,7 +550,7 @@ fn attention_scalars_per_position(policy: &LayerCachePolicy) -> Result<u64, Capa
             head_dim,
             ..
         }
-        | LayerCachePolicy::KeyOnlyWithFixedState {
+        | LayerCachePolicy::KeyOnlyWithState {
             num_key_heads,
             head_dim,
             ..
@@ -581,8 +582,8 @@ fn is_context_dependent_dimension(dimension: &StateTensorDimension) -> bool {
     )
 }
 
-fn state_tensor_dtype_bytes(tensor: &StateTensorPolicy, floating_scalar_bytes: u64) -> u64 {
-    match tensor.dtype {
+fn state_dtype_bytes(dtype: StateTensorDtype, floating_scalar_bytes: u64) -> u64 {
+    match dtype {
         StateTensorDtype::Floating => floating_scalar_bytes,
         StateTensorDtype::Float32 | StateTensorDtype::Int32 | StateTensorDtype::Uint32 => 4,
     }
@@ -630,7 +631,7 @@ fn state_tensor_bytes(
     })?;
     checked_mul(
         scalars,
-        state_tensor_dtype_bytes(tensor, floating_scalar_bytes),
+        state_dtype_bytes(tensor.dtype, floating_scalar_bytes),
         "runtime state tensor bytes",
     )
 }
@@ -662,7 +663,7 @@ fn state_tensor_bytes_per_position_per_batch(
     }
     let bytes = checked_mul(
         scalars,
-        state_tensor_dtype_bytes(tensor, floating_scalar_bytes),
+        state_dtype_bytes(tensor.dtype, floating_scalar_bytes),
         "state growth bytes",
     )?;
     Ok(bytes.div_ceil(divisor))
@@ -792,6 +793,31 @@ fn estimate_runtime_state_impl(
                         floating_scalar_bytes,
                         "unbounded bytes per position",
                     )?,
+                    "unbounded bytes-per-position total",
+                )?;
+            }
+        }
+        // Named streams are optional, lane-local histories: padding can leave
+        // them empty even at a nonempty token frontier. Their maximum is useful
+        // for admission; it cannot establish a required installed payload.
+        if !payload_lower_bound {
+            for stream in policy.append_streams() {
+                let record_bytes = checked_mul(
+                    stream.width() as u64,
+                    state_dtype_bytes(stream.dtype(), floating_scalar_bytes),
+                    "append stream record bytes",
+                )?;
+                let records = stream.maximum_records(layer_positions_usize) as u64;
+                let bytes = checked_mul(
+                    checked_mul(records, record_bytes, "append stream lane bytes")?,
+                    batch_size,
+                    "append stream batch bytes",
+                )?;
+                context_state_bytes =
+                    checked_add(context_state_bytes, bytes, "context state byte total")?;
+                unbounded_per_position = checked_add(
+                    unbounded_per_position,
+                    record_bytes.div_ceil(u64::from(stream.record_tokens())),
                     "unbounded bytes-per-position total",
                 )?;
             }
@@ -1133,3 +1159,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "capability/append_tests.rs"]
+mod append_tests;

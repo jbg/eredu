@@ -1,8 +1,8 @@
-//! Compatibility lowering for reports written before ordinary module topology.
+//! Aggregate workspace lowering for reports without ordinary module topology.
 //!
 //! These aggregate records cannot identify projection encodings, exact invocation
 //! sequences, or parameter aliases. Do not invent an ordinary topology from them.
-//! Preserve their historical linear/logit and layer-overlap envelope, reuse the
+//! Use their declared linear/logit and layer-overlap envelope, reuse the
 //! same calibrated mechanisms, and feed one aggregate allocation to the common
 //! lifetime composer. Production preparation does not construct these records.
 
@@ -128,6 +128,7 @@ fn aggregate_envelope(
                 query,
                 conv.channels,
                 conv.kernel_size,
+                1,
                 u64::from(request.scalar_bytes.get()).max(4),
             )?,
         )?;
@@ -225,8 +226,8 @@ fn aggregate_envelope(
     }
 
     let mut replacement = cache_replacement(&execution.cache_update, persistent);
-    // Old reports asserted replacement bytes at the lower end. Preserve that
-    // historical contract without changing ordinary topology's possible overlap.
+    // Aggregate CopyState reports include replacement bytes in the lower bound.
+    // Ordinary topology describes its possible overlap independently.
     if execution.cache_update == CacheUpdateWorkspace::CopyState {
         replacement.lower_bytes = persistent;
     }

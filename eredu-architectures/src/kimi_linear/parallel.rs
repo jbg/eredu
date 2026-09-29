@@ -846,7 +846,7 @@ where
         module_parameter_group::<B::Tensor, _>(
             "model.norm",
             ParameterRole::Replicated,
-            &modules.norm,
+            &modules.boundary.norm,
             |_, _| Ok(MemberSharding::Replicated),
         )?,
     ];

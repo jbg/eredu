@@ -17,7 +17,7 @@ pub(super) struct Bank {
     pool: Rc<RefCell<Pool>>,
 }
 
-impl AddressableGroupedBank<NumericBackend> for Bank {
+impl eredu_runtime::ParameterBank<NumericBackend> for Bank {
     type Acquisition = NumericBankAcquisition;
     type Report = NumericBankReport;
     type Error = Error;
@@ -67,6 +67,21 @@ impl AddressableGroupedBank<NumericBackend> for Bank {
         });
         self.inner.acquire(request, context)
     }
+    fn complete(
+        &mut self,
+        acquisition: Self::Acquisition,
+        output: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<(), Error> {
+        REFERENCE_STAGE_EVIDENCE.with(|e| e.borrow_mut().bank_completions += 1);
+        self.inner.complete(acquisition, output, context)
+    }
+    fn report(&self) -> Result<Self::Report, Error> {
+        self.inner.report()
+    }
+}
+
+impl AddressableGroupedBank<NumericBackend> for Bank {
     fn gated_product_groups(
         &mut self,
         acquisition: &Self::Acquisition,
@@ -90,18 +105,6 @@ impl AddressableGroupedBank<NumericBackend> for Bank {
         context: &NumericContext,
     ) -> Result<NumericRelu2Groups, Error> {
         self.inner.relu2_groups(acquisition, spec, context)
-    }
-    fn complete(
-        &mut self,
-        acquisition: Self::Acquisition,
-        output: &NumericTensor,
-        context: &NumericContext,
-    ) -> Result<(), Error> {
-        REFERENCE_STAGE_EVIDENCE.with(|e| e.borrow_mut().bank_completions += 1);
-        self.inner.complete(acquisition, output, context)
-    }
-    fn report(&self) -> Result<Self::Report, Error> {
-        self.inner.report()
     }
 }
 

@@ -110,16 +110,50 @@ impl<'a> MlxPreparationMechanisms<'a> {
 }
 
 impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechanisms<'_> {
+    fn floating_state_dtype(
+        &self,
+        source: &eredu_core::checkpoint::TensorDtype,
+    ) -> Option<eredu_runtime::StateStorageDtype> {
+        super::super::replicated_text::floating_state_storage_dtype(source)
+    }
+
+    fn row_lookup_storage(&self) -> Option<eredu_runtime::AddressableStorageCapabilities> {
+        eredu_runtime::RowLookupMechanismSupport::storage(
+            &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
+        )
+    }
+
+    fn row_lookup_workspace(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<Option<eredu_runtime::RowLookupWorkspace>, eredu_runtime::RowLookupError> {
+        eredu_runtime::RowLookupMechanismSupport::workspace(
+            &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
+            descriptor,
+        )
+    }
+
+    fn row_lookup_decode_memory(
+        &self,
+        descriptor: &eredu_runtime::RowLookupDescriptor,
+    ) -> Result<eredu_nn::mechanism_memory::MechanismMemoryContract, eredu_runtime::RowLookupError>
+    {
+        eredu_runtime::RowLookupMechanismSupport::decode_memory(
+            &crate::backend::runtime::residency::parameter_bank::MlxRowLookupSupport,
+            descriptor,
+        )
+    }
+
     fn input_score_attention_workspace(
         &self,
     ) -> Option<eredu_runtime::memory_estimation::InputScoreAttentionMechanism> {
         Some(crate::backend::nn::attention::INPUT_SCORE_WORKSPACE)
     }
 
-    fn recipe_materialization_workspace(
+    fn recipe_materialization_workspace<C: eredu_checkpoint::recipe::RecipeCatalog + ?Sized>(
         &self,
         recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
-        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        source: &C,
     ) -> Result<u64, String> {
         crate::backend::runtime::checkpoint::recipe::native_recipe_workspace(recipe, source)
     }
@@ -154,6 +188,14 @@ impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechani
         request: &eredu_runtime::ReplicatedTextSelectionRequest,
     ) -> eredu_runtime::BackendMechanismCapabilities {
         super::super::replicated_text::capabilities(requirements, request)
+    }
+
+    fn state_capabilities(
+        &self,
+        requirements: &eredu_runtime::StateRealizationRequirements,
+        policy: &eredu_runtime::CacheResidencyPolicy,
+    ) -> eredu_runtime::StateMechanismCapabilities {
+        super::super::replicated_text::state_capabilities(requirements, policy)
     }
 
     fn processor_capabilities(&self) -> eredu_runtime::MediaPrimitiveCapabilities {
