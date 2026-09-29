@@ -223,7 +223,8 @@ explicit in this file and manifests. If a boundary needs stronger mechanical
 enforcement, prefer introducing a crate boundary or narrowing visibility.
 
 When changing any boundary above, update `doc/backend-architecture.md` in the
-same change. Useful verification commands are:
+same change. Select relevant verification commands from the examples below;
+this list is not a mandatory checklist for every change:
 
 ```sh
 cargo check -p eredu-gguf
@@ -240,6 +241,54 @@ cargo check -p eredu-backend-mlx --no-default-features
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
 ```
+
+## Selective validation
+
+Test and check activity must resolve a specific, credible uncertainty about the
+change. Minimize both test maintenance and execution cost while retaining the
+evidence needed to establish correctness. The model-family integration and
+controlled-inference conformance requirements above still apply when introducing
+those capabilities; they do not require rerunning their full matrices for every
+refactor.
+
+### Running tests and checks
+
+- Before each run, identify the affected behavior and concrete failure it could
+  reveal, or the observed failure it should confirm as fixed. Do not run tests
+  merely to accumulate passing results.
+- Use compiler checks for type, API, visibility, and feature-boundary changes.
+  Do not write or run behavioral tests solely to demonstrate properties already
+  enforced by types.
+- Choose the smallest existing test or check that can expose each distinct risk.
+  Prefer one informative test over several overlapping tests. Use numerical,
+  distributed, media, or lifecycle tests when they uniquely exercise affected
+  behavior.
+- Do not automatically run whole crate or workspace suites, every family, all
+  feature configurations, or a full format/topology/residency matrix. Broaden
+  validation only when the changed scope, an observed failure, or an unresolved
+  concern gives a concrete reason.
+- After an informative pass, move on. Repeat a passing test or rebuild a passing
+  configuration only after a relevant subsequent change or when investigating
+  an unresolved concern. Apply this restraint to builds and checks as well as
+  tests.
+- Resolve failures found and report material validation gaps. Completion requires
+  relevant evidence of correctness, not an exhaustive passing-test inventory.
+
+### Writing tests
+
+- Reuse or adapt existing coverage first. Add a test only for a distinct behavioral
+  risk without adequate coverage, with an independent expected result or an
+  externally meaningful contract.
+- Do not mirror implementation helper calls, compute expected values using the
+  implementation under test, enumerate fields merely because they exist, or test
+  forwarding methods only for forwarding.
+- Avoid asserting the same invariant at every layer. Choose the layer where a
+  failure is most directly attributable; add coverage at another layer only for
+  a distinct integration risk.
+- Keep fixtures and assertions focused on the behavior at risk. Do not expand
+  combinatorial fixtures or introduce a new validation harness without a concrete
+  coverage need. Comparisons across formats or backends must allow legitimate
+  representation, precision, and provenance differences.
 
 ## Documentation
 
