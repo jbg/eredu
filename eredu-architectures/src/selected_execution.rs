@@ -1252,7 +1252,9 @@ impl SelectedPreparation {
             return Err("selected prediction extension owns its internal prefill schedule");
         }
         match self.execution.kind.as_ref() {
-            SelectedExecutionKind::Replicated(_) | SelectedExecutionKind::Routed(_) => {
+            SelectedExecutionKind::Replicated(_)
+            | SelectedExecutionKind::Routed(_)
+            | SelectedExecutionKind::Composite(_) => {
                 self.text_realization().prefill_chunking_support()
             }
             _ => Err("selected execution class retains a complete prefill pass"),

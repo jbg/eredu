@@ -83,6 +83,22 @@ pub enum TokenMixerTopology {
         /// Rotary transforms are applied to query and key values.
         rotary: bool,
     },
+    /// Gated-delta recurrence with FP32 normalized Q/K and accumulated state.
+    /// Backend scan scratch/retention remains an explicit unknown tail.
+    GatedDelta {
+        /// Heads after query/key expansion.
+        value_heads: u64,
+        /// Recurrent matrix key width.
+        key_width: u64,
+        /// Recurrent matrix value width.
+        value_width: u64,
+        /// QKV convolution channels before head expansion.
+        convolution_channels: u64,
+        /// Causal convolution kernel width.
+        kernel: u64,
+        /// Input QKV, gate, update, decay and output projections.
+        projections: Vec<ProjectionTopology>,
+    },
     /// Three-way gated causal convolution and output projection.
     GatedConvolution {
         /// Independent convolution channels.

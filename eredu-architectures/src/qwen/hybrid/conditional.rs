@@ -248,6 +248,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn supports_chunked_text_prefill() -> bool {
+        super::CHUNKED_TEXT_PREFILL
+    }
+
     type InputPartPlan = QwenInputPartPlan;
     type PrefillRequest =
         crate::composite_execution::SingleCompositePrefillRequest<B::Tensor, Self::InputPartPlan>;
@@ -2636,6 +2640,25 @@ where
             forward.target_hidden = Some(hidden.clone());
         }
         Ok(hidden.clone())
+    }
+
+    fn projects_final_text_position() -> bool {
+        true
+    }
+
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish_forward(
+            &crate::decoder::final_hidden_position(hidden, context)?,
+            state,
+            forward,
+            context,
+        )
     }
 
     fn finish_forward(

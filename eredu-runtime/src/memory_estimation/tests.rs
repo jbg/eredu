@@ -1489,3 +1489,40 @@ fn native_attention_frontiers_release_only_completed_transient_workspaces() {
     let old: InputScoreAttentionMechanism = serde_json::from_value(wire).unwrap();
     assert!(!old.full_key_tiles.unwrap().evaluates_input_dependencies);
 }
+
+#[test]
+fn recurrent_workspace_retains_known_output_and_unknown_scan_tail() {
+    use crate::execution_topology::*;
+    let mut r = request();
+    let mut topology = generic_topology();
+    topology.layers[0].mixer = TokenMixerTopology::GatedDelta {
+        value_heads: 16,
+        key_width: 128,
+        value_width: 128,
+        convolution_channels: 6144,
+        kernel: 4,
+        projections: vec![
+            ProjectionTopology {
+                input: 32,
+                output: 6144,
+                parameter: "qkv".into(),
+                format: eredu_checkpoint::LinearFormat::Dense,
+                bias: false,
+            },
+            ProjectionTopology {
+                input: 2048,
+                output: 32,
+                parameter: "out".into(),
+                format: eredu_checkpoint::LinearFormat::Dense,
+                bias: false,
+            },
+        ],
+    };
+    r.domains[0].executions[0].execution_topology = Some(topology);
+    let report = estimate_generation_memory(&r).unwrap();
+    let workspace = &report.domains[0].phases[0].workspace;
+    // Eight prefill rows of FP32 scan output exist even with opaque scratch.
+    assert!(workspace.lower_bytes >= 8 * 16 * 128 * 4);
+    assert_eq!(workspace.upper_bytes, None);
+    assert_ne!(report.domains[0].fit, MemoryFit::LikelyFit);
+}

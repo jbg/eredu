@@ -47,7 +47,9 @@ required invocation limit.
 `LoadedModel::prefill_chunking_support()` reports the executable's support or a
 fallback reason. MLX plain-text adapters support ordinary replicated shared decoder
 architectures, including grouped-query and sliding attention, and dense/routed LFM2
-and LFM2.5. Their plain-text splitting path retains a complete pass for capture and
+and LFM2.5, plus target-only Qwen hybrid text and composite text input. Qwen carries
+convolution history, FP32 recurrent state, attention caches and positions across prefixes.
+Its selected embedded prediction path remains separately scheduled. Their plain-text splitting path retains a complete pass for capture and
 distributed execution. LFM2 retains convolution history, attention caches and absolute
 positions across passes; convolution-only schedules use the same driver.
 
@@ -75,7 +77,8 @@ wall-clock cancellation deadline or the total attention-cache size.
 
 Chunk size remains caller-selected, with the existing 512-token default and
 `Unchunked` option. This policy imposes no allocator cap or device-size heuristic; architecture
-geometry and history limits apply independently. See [LFM2 prefill validation](lfm2-prefill-validation.md).
+geometry and history limits apply independently. See [LFM2 prefill validation](lfm2-prefill-validation.md) and
+[Qwen3.5 prefill validation](qwen35-prefill-validation.md).
 
 The focused native regression runs outside the sandbox:
 

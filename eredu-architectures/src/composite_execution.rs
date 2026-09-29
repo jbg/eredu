@@ -261,6 +261,17 @@ where
     B: NeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
 {
+    /// Prepared requests implement partial invocations with retained continuations.
+    fn supports_retained_prefill() -> bool {
+        false
+    }
+
+    /// Ordinary unobserved plain-text passes preserve state across prefix boundaries.
+    /// This does not authorize splitting prepared media or observed invocations.
+    fn supports_chunked_text_prefill() -> bool {
+        false
+    }
+
     /// One architecture-specific plan for each ordered input part, with a neutral
     /// accounting projection of the same admitted geometry.
     type InputPartPlan: Clone + Into<crate::media_plan::PreparedInputPartPlan> + 'static;
@@ -844,6 +855,21 @@ where
         index: usize,
     ) -> Self::RetainedContextValues<'a> {
         self.inner.retained_context_values(forward, group, index)
+    }
+
+    fn projects_final_text_position() -> bool {
+        A::projects_final_text_position()
+    }
+
+    fn finish_text_forward(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.inner
+            .finish_text_forward(hidden, state, forward, context)
     }
 
     fn finish_forward_observed<O>(

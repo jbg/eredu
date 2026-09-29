@@ -23,6 +23,11 @@ pub enum PhysicalArtifactPreparation {
         /// Exact chosen alias and layout resolution.
         resolution: ResolvedCheckpointPlan,
     },
+    /// Header-only admission supports cold forecasting but grants no file-opening authority.
+    MetadataOnly {
+        /// Exact chosen aliases from supplied immutable headers.
+        resolution: ResolvedCheckpointPlan,
+    },
     /// Exact admitted GGUF headers and canonical physical-to-logical mapping.
     Gguf {
         /// Admitted container headers and file identities.
@@ -37,11 +42,14 @@ impl PhysicalArtifactPreparation {
     /// Resolution authorizing this physical artifact.
     pub fn resolution(&self) -> &ResolvedCheckpointPlan {
         match self {
-            Self::Safetensors { resolution, .. } | Self::Gguf { resolution, .. } => resolution,
+            Self::Safetensors { resolution, .. }
+            | Self::Gguf { resolution, .. }
+            | Self::MetadataOnly { resolution } => resolution,
         }
     }
     pub(crate) fn open(&self, cache: usize) -> Result<SharedCheckpointSource, ArtifactError> {
         match self {
+            Self::MetadataOnly { .. } => Err(ArtifactError::MetadataOnly),
             Self::Safetensors {
                 tensors,
                 shards,
@@ -162,7 +170,16 @@ pub(crate) fn source_declarations(
                 if let Some(extension) = plan.prediction_extension() {
                     declarations.roles.insert(ArtifactSourceRole::Prediction, BTreeMap::from([(PhysicalArtifactId::Primary, extension.source_keys(target).map_err(|e| invalid(e.to_string()))?)]));
                 }
-                declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Safetensors { tensors: inspection.tensors().clone(), shards: inspection.safetensors_shards().ok_or_else(|| invalid("SafeTensors artifact has no admitted shards".into()))?.clone(), resolution });
+                let physical = if inspection.metadata_provenance().is_some() {
+                    PhysicalArtifactPreparation::MetadataOnly { resolution }
+                } else {
+                    PhysicalArtifactPreparation::Safetensors {
+                        tensors: inspection.tensors().clone(),
+                        shards: inspection.safetensors_shards().ok_or_else(|| invalid("SafeTensors artifact has no admitted shards".into()))?.clone(),
+                        resolution,
+                    }
+                };
+                declarations.artifacts.insert(PhysicalArtifactId::Primary, physical);
             }
             eredu_core::ArtifactFormat::Gguf => {
                 let primary = plan.gguf_plan().ok_or_else(|| invalid("GGUF artifact omitted its architecture plan".into()))?;

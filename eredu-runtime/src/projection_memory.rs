@@ -172,7 +172,9 @@ pub(crate) fn refine(
             visit(p, rows, true)?;
         }
         match &layer.mixer {
-            T::Attention { projections, .. } | T::GatedConvolution { projections, .. } => {
+            T::Attention { projections, .. }
+            | T::GatedDelta { projections, .. }
+            | T::GatedConvolution { projections, .. } => {
                 for p in projections {
                     visit(p, rows, true)?;
                 }

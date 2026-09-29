@@ -7364,6 +7364,33 @@ vocabulary projection. Observed, speculative and partitioned full-output entry
 points retain their established contracts. No backend family branch or facade
 scheduling policy is introduced.
 
+Qwen hybrid target-only text execution also declares prefix continuity, including
+text input through its composite adapter. The neutral composite contract distinguishes
+plain-text prefix support from retained prepared-media cursors. The backend consumes
+those declarations, refuses plain splitting for structured input/capture/distributed
+execution, and admits each prefix's tensors without installing a suffix under the
+whole request's prepared-input cache identity. Internal fragment ownership carries
+that admitted whole-input identity separately; nonfinal completion clears committed
+prompt identity, and successful final completion publishes it atomically. Snapshot
+copies retain fragment ownership and failed completion follows ordinary rollback.
+Ordinary composite readout delegates
+final-position selection to the architecture; observed and prediction readout remains
+full-output. Composite state-offset reporting preserves reset-state workspace topology
+and invalidates it for unprojected continuation states.
+
+The MLX gated-delta prefill mechanism evaluates both sequence and final recurrent
+state before returning. This bounds retention of upstream lazy graphs across native
+scan invocations; single-token decode retains its asynchronous contract. It adds no
+family dispatch, cancellation policy, allocator cap, or hardware-fit claim. Runtime
+workspace topology includes recurrent projections, convolution geometry and FP32 scan
+output, while leaving uncalibrated scan scratch and state-version retention explicitly
+unbounded. See [Qwen3.5 prefill validation](qwen35-prefill-validation.md).
+
+Header-only SafeTensors inspection retains a `MetadataOnly` physical declaration with
+its admitted alias resolution. It supports cold selection and forecasting without
+inventing shard identities. Opening that declaration and preparing sources both reject
+with `ArtifactError::MetadataOnly`.
+
 ### Selected history and addressable parameter banks
 
 `eredu-nn::IndexedAttentionInput` declares grouped K/V heads, absolute selected

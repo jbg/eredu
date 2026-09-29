@@ -5,6 +5,9 @@ Qwen hybrid admission supports the MLX-VLM SafeTensors layout used by
 and GGUF layouts. The converted layout is selected from the tensor catalog,
 not the repository name or quantization bit width.
 
+Text-prefill memory, chunking, cancellation and the pinned 2B four-bit measurements
+are documented in [Qwen3.5 prefill validation](qwen35-prefill-validation.md).
+
 ## Compatibility behavior
 
 - `language_model.model.*` and `vision_tower.*` bind to canonical text and

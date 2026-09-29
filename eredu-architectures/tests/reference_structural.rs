@@ -4748,6 +4748,7 @@ fn prepared_invocation_topology_matches_constructed_projection_geometry() {
             std::iter::once(&topology.output).chain(topology.layers.iter().flat_map(|layer| {
                 let mixer = match &layer.mixer {
                     TokenMixerTopology::Attention { projections, .. }
+                    | TokenMixerTopology::GatedDelta { projections, .. }
                     | TokenMixerTopology::GatedConvolution { projections, .. } => projections,
                     TokenMixerTopology::Unknown { .. } => panic!("fixture requires covered mixer"),
                 };

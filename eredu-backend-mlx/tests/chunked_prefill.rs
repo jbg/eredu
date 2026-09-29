@@ -74,6 +74,48 @@ fn lfm2_fixture(sparse: bool, convolution_only: bool) -> tempfile::TempDir {
     write_fixture(config, shapes)
 }
 
+fn qwen_hybrid_fixture(composite: bool) -> tempfile::TempDir {
+    let text = serde_json::json!({
+        "model_type": "qwen3_5_text", "vocab_size": 64, "hidden_size": 32,
+        "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "max_position_embeddings": 128, "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+        "intermediate_size": 64, "num_experts": 0,
+        "layer_types": ["linear_attention", "full_attention"],
+        "tie_word_embeddings": true
+    });
+    let config = if composite {
+        serde_json::json!({
+            "model_type": "qwen3_5", "image_token_id": 62, "video_token_id": 63,
+            "text_config": text,
+            "vision_config": {
+                "depth": 1, "hidden_size": 32, "intermediate_size": 64,
+                "num_heads": 4, "num_position_embeddings": 16,
+                "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+                "temporal_patch_size": 2, "out_hidden_size": 32,
+                "deepstack_visual_indexes": []
+            }
+        })
+    } else {
+        text
+    };
+    let args = eredu_architectures::qwen::hybrid::model_args_from_config_value(&config).unwrap();
+    let plan = eredu_architectures::qwen::hybrid::composite_safetensors_plan(&args).unwrap();
+    let shapes = plan
+        .common_tensors
+        .iter()
+        .chain(
+            plan.layout_groups
+                .iter()
+                .flat_map(|group| &group.variants[0].tensors),
+        )
+        .map(|tensor| (tensor.key.clone(), tensor.shape.clone()))
+        .collect();
+    write_fixture(config, shapes)
+}
+
 fn write_fixture(
     config: serde_json::Value,
     shapes: Vec<(String, Vec<usize>)>,
@@ -252,7 +294,7 @@ impl TokenFilterController for Unconstrained {
     }
 }
 
-fn run(device: DeviceType) {
+fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
     let stream = Stream::new_with_device(&Device::new(device, 0));
     let weights_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let config = TextGenerationConfig::new(
@@ -266,15 +308,7 @@ fn run(device: DeviceType) {
         )
         .unwrap(),
     );
-    for (family, root) in [
-        ("llama", fixture(false)),
-        ("mistral", fixture(true)),
-        ("lfm2", lfm2_fixture(false, false)),
-        ("lfm2-moe", lfm2_fixture(true, false)),
-        ("lfm2-gguf", lfm2_gguf_fixture(false)),
-        ("lfm2-moe-gguf", lfm2_gguf_fixture(true)),
-        ("lfm2-convolution", lfm2_fixture(false, true)),
-    ] {
+    for (family, root) in families {
         let gguf = root.path().join("model.gguf");
         let path = if gguf.exists() {
             gguf.as_path()
@@ -314,7 +348,10 @@ fn run(device: DeviceType) {
                 eredu_core::load_model(&backend, path, MlxLoadRequest::from_normalized(request))
                     .unwrap_or_else(|error| panic!("{family}, case={case}: {error}"));
             let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-            assert!(MlxBackend::text_prefill_chunking_support(&runtime).is_ok());
+            assert!(
+                MlxBackend::text_prefill_chunking_support(&runtime).is_ok(),
+                "{family}, case={case}"
+            );
             assert_eq!(
                 cold_chunking.is_ok(),
                 MlxBackend::text_prefill_chunking_support(&runtime).is_ok()
@@ -430,6 +467,45 @@ fn run(device: DeviceType) {
             }
         }
     }
+}
+
+fn run(device: DeviceType) {
+    run_cases(
+        device,
+        vec![
+            ("llama", fixture(false)),
+            ("mistral", fixture(true)),
+            ("lfm2", lfm2_fixture(false, false)),
+            ("lfm2-moe", lfm2_fixture(true, false)),
+            ("lfm2-gguf", lfm2_gguf_fixture(false)),
+            ("lfm2-moe-gguf", lfm2_gguf_fixture(true)),
+            ("lfm2-convolution", lfm2_fixture(false, true)),
+        ],
+    );
+}
+
+#[test]
+fn qwen_hybrid_chunked_prefill() {
+    run_cases(
+        DeviceType::Cpu,
+        vec![
+            ("qwen-hybrid", qwen_hybrid_fixture(false)),
+            ("qwen-composite", qwen_hybrid_fixture(true)),
+        ],
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "requires Metal with MLX_ENABLE_TF32=0 for strict FP32 numerical comparison"]
+fn qwen_hybrid_metal_chunked_prefill() {
+    run_cases(
+        DeviceType::Gpu,
+        vec![
+            ("qwen-hybrid", qwen_hybrid_fixture(false)),
+            ("qwen-composite", qwen_hybrid_fixture(true)),
+        ],
+    );
 }
 
 #[test]
@@ -697,4 +773,106 @@ fn released_checkpoint_chunked_prefill_and_cached_decode_match_reference() {
             "chunked peak must improve for the released long-prompt fixture: {peaks:?}"
         );
     }
+}
+
+#[test]
+fn composite_chunked_prefill_commits_whole_prompt_cache_identity() {
+    use eredu_core::cache::{PromptCacheDescriptor, PromptCacheOptions};
+    use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+    let root = qwen_hybrid_fixture(true);
+    let cache = tempfile::tempdir().unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let backend = native::backend(&stream, &stream);
+    let request =
+        NormalizedLoadRequest::default().with_state_residency(CacheResidencyPolicy::Paged(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        ));
+    let model = eredu_core::load_model(
+        &backend,
+        root.path(),
+        MlxLoadRequest::from_normalized(request),
+    )
+    .unwrap();
+    let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+    let ids = vec![3, 10, 17, 24, 31, 38, 45, 52, 59];
+    let original = MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
+    let identity = original.cache_identity().unwrap().clone();
+    let descriptor = PromptCacheDescriptor::from_model_identity(
+        runtime.session().prompt_cache_model_identity().unwrap(),
+        "fixture",
+        identity.prefix_content_fingerprint(),
+        1,
+    )
+    .unwrap();
+    let mut prompt = original.clone();
+    let config = TextGenerationConfig::new(
+        eredu_core::resolve_generation_config(
+            None,
+            GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut state = MlxBackend::start_text_generation(runtime.backend(), config).unwrap();
+    let chunk = NonZeroUsize::new(2).unwrap();
+    assert!(MlxBackend::prefill_text_prefix(&mut runtime, &mut prompt, chunk, &mut state).unwrap());
+    let destination = cache.path().join("prefix");
+    while MlxBackend::prefill_text_prefix(&mut runtime, &mut prompt, chunk, &mut state).unwrap() {}
+    runtime.prefill(prompt).unwrap().wait().unwrap();
+    let (backend, session) = runtime.parts_mut();
+    session
+        .save_prompt_cache(
+            backend,
+            &destination,
+            descriptor.clone(),
+            &ids,
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
+    let expected = values(
+        runtime
+            .decode(Array::from_slice(&[5_u32], &[1, 1]))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .logits()
+            .unwrap(),
+    );
+    runtime.reset().unwrap();
+    let (backend, session) = runtime.parts_mut();
+    session
+        .load_prompt_cache_for_input(backend, &destination, &descriptor, &ids, &original)
+        .unwrap();
+    let actual = values(
+        runtime
+            .decode(Array::from_slice(&[5_u32], &[1, 1]))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .logits()
+            .unwrap(),
+    );
+    assert_close(&actual, &expected);
+    runtime.reset().unwrap();
+    let mut partial = original;
+    assert!(
+        MlxBackend::prefill_text_prefix(&mut runtime, &mut partial, chunk, &mut state).unwrap()
+    );
+    let destination = cache.path().join("partial");
+    let (backend, session) = runtime.parts_mut();
+    assert!(session
+        .save_prompt_cache(
+            backend,
+            &destination,
+            descriptor.clone(),
+            &ids,
+            &PromptCacheOptions::default()
+        )
+        .is_err());
+    assert!(!destination.exists());
 }

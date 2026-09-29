@@ -87,6 +87,7 @@ pub fn selected_generation_memory_geometry(
             layer.input_projections.iter_mut().for_each(&update);
             match &mut layer.mixer {
                 TokenMixerTopology::Attention { projections, .. }
+                | TokenMixerTopology::GatedDelta { projections, .. }
                 | TokenMixerTopology::GatedConvolution { projections, .. } => {
                     projections.iter_mut().for_each(&update)
                 }

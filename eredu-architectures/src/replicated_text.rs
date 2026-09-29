@@ -513,6 +513,7 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
+    const CHUNKED_PREFILL: bool = crate::qwen::hybrid::CHUNKED_TEXT_PREFILL;
     type Config = crate::qwen::hybrid::HybridConfig;
     type Unit = crate::qwen::hybrid::block::ReplicatedBlock<B>;
 
@@ -2511,6 +2512,9 @@ impl EligibleConfig<'_> {
             | Self::K2Horizon(_)
             | Self::GptOss(_) => crate::decoder::CHUNKED_TEXT_PREFILL,
             Self::Lfm2(_) => crate::lfm2::CHUNKED_TEXT_PREFILL,
+            Self::QwenHybrid(_) | Self::QwenCompositeHybrid(_) => {
+                crate::qwen::hybrid::CHUNKED_TEXT_PREFILL
+            }
             _ => false,
         }
     }
@@ -8105,6 +8109,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
+    fn supports_chunked_prefill() -> bool {
+        crate::qwen::hybrid::CHUNKED_TEXT_PREFILL
+    }
+
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a> {
         crate::qwen::hybrid::EmbeddedInput::Target { tokens, mask }
     }

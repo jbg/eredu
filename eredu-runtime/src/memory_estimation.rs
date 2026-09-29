@@ -833,6 +833,12 @@ pub(crate) fn memory_uncertainties(
                     {
                         uncertainties.push(format!("{prefix}: {reason}"));
                     }
+                    if matches!(
+                        layer.mixer,
+                        crate::execution_topology::TokenMixerTopology::GatedDelta { .. }
+                    ) {
+                        uncertainties.push(format!("{prefix}: FP32 gated-delta output is included; selected scan scratch and lazy state-version retention upper bound unavailable"));
+                    }
                     if let crate::execution_topology::FeedForwardTopology::Unknown { reason } =
                         &layer.feed_forward
                     {

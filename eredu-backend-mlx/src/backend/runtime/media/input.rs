@@ -27,6 +27,7 @@ pub struct ModelInput<'a> {
     /// Ordered input parts consumed by the model.
     pub parts: &'a [InputPart],
     cache_identity: Option<&'a PreparedInputCacheIdentity>,
+    prefill_fragment: bool,
 }
 
 impl<'a> ModelInput<'a> {
@@ -35,6 +36,7 @@ impl<'a> ModelInput<'a> {
         Self {
             parts,
             cache_identity: None,
+            prefill_fragment: false,
         }
     }
 
@@ -46,7 +48,25 @@ impl<'a> ModelInput<'a> {
         Self {
             parts,
             cache_identity: Some(cache_identity),
+            prefill_fragment: false,
         }
+    }
+
+    /// Internal prefix ownership: only the final suffix carries the admitted
+    /// whole-request identity. Public prepared-input identities remain exact.
+    pub(crate) fn prefill_fragment(
+        parts: &'a [InputPart],
+        identity: Option<&'a PreparedInputCacheIdentity>,
+    ) -> Self {
+        Self {
+            parts,
+            cache_identity: identity,
+            prefill_fragment: true,
+        }
+    }
+
+    pub(crate) const fn is_prefill_fragment(self) -> bool {
+        self.prefill_fragment
     }
 
     /// Returns the identity coupled to these exact prepared values, when supplied.

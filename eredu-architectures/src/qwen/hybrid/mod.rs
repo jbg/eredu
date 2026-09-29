@@ -1,5 +1,8 @@
 //! One backend-neutral hybrid decoder shared by Qwen3-Next and Qwen3.5.
 
+/// Target-only causal text passes preserve convolution, recurrent and attention state.
+pub(crate) const CHUNKED_TEXT_PREFILL: bool = true;
+
 pub(crate) mod block;
 mod checkpoint;
 mod conditional;

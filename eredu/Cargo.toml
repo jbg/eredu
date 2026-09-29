@@ -91,6 +91,11 @@ path = "examples/native_tool_calling.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "prefill_memory_probe"
+path = "examples/prefill_memory_probe.rs"
+required-features = ["mlx", "metal"]
+
+[[example]]
 name = "chat_probe"
 path = "examples/chat_probe.rs"
 required-features = ["mlx"]

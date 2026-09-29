@@ -1387,6 +1387,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn metadata_only_selection_forecasts_without_source_authority() {
+        use eredu_core::artifact::{
+            ArtifactMetadata, CheckpointMetadata, MetadataProvenance, SafetensorsHeader,
+        };
+        let (root, _) = inspected_llama();
+        let mut bytes = std::fs::read(root.path().join("model.safetensors")).unwrap();
+        let file_len = bytes.len() as u64;
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        bytes.truncate(8 + header_len);
+        let metadata = ArtifactMetadata {
+            provenance: MetadataProvenance {
+                source: "headers-only/fixture".into(),
+                revision: "pinned".into(),
+            },
+            checkpoint: CheckpointMetadata::SafeTensors {
+                config: std::fs::read(root.path().join("config.json")).unwrap(),
+                index: None,
+                headers: vec![SafetensorsHeader {
+                    member: "model.safetensors".into(),
+                    bytes,
+                    file_len,
+                }],
+            },
+            sidecars: Default::default(),
+        };
+        root.close().unwrap();
+        let outcome = crate::inspect_model_metadata(
+            &metadata,
+            &NormalizedLoadRequest::default(),
+            &BoundedIndependentAdapter {
+                chunked_prefill: true,
+                ..Default::default()
+            },
+            eredu_core::MediaFeatureAvailability {
+                image: false,
+                audio: false,
+            },
+        );
+        let selected = outcome
+            .selected()
+            .unwrap_or_else(|| panic!("{:?}", outcome.report()));
+        assert_eq!(selected.preparation().prefill_chunking_support(), Ok(()));
+        let geometry = crate::memory_estimation::selected_generation_memory_geometry(
+            selected.inspection().architecture_plan(),
+            selected.preparation().execution(),
+        )
+        .unwrap();
+        assert!(geometry.execution_topology.is_some());
+        let sources =
+            crate::artifact_preparation::source_declarations(selected.inspection()).unwrap();
+        assert!(matches!(
+            sources.bind(0),
+            Err(eredu_core::artifact::ArtifactError::MetadataOnly)
+        ));
+        assert!(matches!(
+            selected.clone().prepare_sources(),
+            Err(
+                crate::prepared_sources::PreparedModelSourcesError::Artifact(
+                    eredu_core::artifact::ArtifactError::MetadataOnly
+                )
+            )
+        ));
+    }
+
+    #[test]
     fn cold_prefill_chunking_combines_architecture_backend_and_selected_path() {
         let mechanisms = BoundedIndependentAdapter {
             chunked_prefill: true,
@@ -1446,7 +1511,7 @@ pub(crate) mod tests {
         for (config, reason) in [
             (
                 composite_config(),
-                "selected execution class retains a complete prefill pass",
+                "selected architecture does not implement chunked prefill",
             ),
             (
                 prediction_config(),

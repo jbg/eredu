@@ -7,6 +7,7 @@ fn layer(
     config: &HybridConfig,
     root: &str,
     policy: HybridLayerPolicy,
+    index: usize,
 ) -> Result<TextLayerTopology, Error> {
     let mixer = match policy {
         HybridLayerPolicy::SelfAttention(_) => TokenMixerTopology::Attention {
@@ -18,13 +19,33 @@ fn layer(
             softcap: false,
             sinks: false,
             output_gate: true,
-            projections: super::block::attention_projection_specs(config, root)?.iter().map(ProjectionTopology::from_spec).collect::<Result<_, _>>()?,
+            projections: super::block::attention_projection_specs(config, root)?
+                .iter()
+                .map(ProjectionTopology::from_spec)
+                .collect::<Result<_, _>>()?,
             query_key_normalization: true,
             rotary: true,
         },
-        HybridLayerPolicy::LinearAttention => TokenMixerTopology::Unknown {
-            reason: format!("{root}: gated delta recurrent attention, convolution and recurrent-update invocation topology is unavailable"),
-        },
+        HybridLayerPolicy::LinearAttention => {
+            let spec = super::linear_attention::recurrent_spec(config, index)?;
+            TokenMixerTopology::GatedDelta {
+                value_heads: spec.value_heads as u64,
+                key_width: spec.key_head_dim as u64,
+                value_width: spec.value_head_dim as u64,
+                convolution_channels: spec.convolution.channels as u64,
+                kernel: spec.convolution.kernel_size as u64,
+                projections: [
+                    &spec.input_qkv,
+                    &spec.input_gate,
+                    &spec.input_beta,
+                    &spec.input_decay,
+                    &spec.output,
+                ]
+                .into_iter()
+                .map(ProjectionTopology::from_spec)
+                .collect::<Result<_, _>>()?,
+            }
+        }
     };
     let feed_forward = if config.is_moe() {
         FeedForwardTopology::Unknown {
@@ -78,7 +99,7 @@ pub(crate) fn target(config: &HybridConfig) -> Result<TextExecutionTopology, Err
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, policy)| layer(config, &format!("model.layers.{index}"), policy))
+        .map(|(index, policy)| layer(config, &format!("model.layers.{index}"), policy, index))
         .collect::<Result<_, _>>()?;
     stack(config, layers)
 }
@@ -94,6 +115,7 @@ pub(crate) fn prediction(config: &HybridConfig) -> Result<TextExecutionTopology,
                 config,
                 &format!("mtp.layers.{index}"),
                 HybridLayerPolicy::SelfAttention(eredu_core::AttentionPolicy::Full),
+                index as usize,
             )?;
             layer.input_projections.push(fusion.clone());
             layer.normalization_count += 3;
@@ -123,9 +145,10 @@ mod tests {
         }))
         .unwrap();
         let target = target(&parsed.text).unwrap();
-        assert!(
-            matches!(&target.layers[0].mixer, TokenMixerTopology::Unknown { reason } if reason.contains("gated delta recurrent"))
-        );
+        assert!(matches!(
+            &target.layers[0].mixer,
+            TokenMixerTopology::GatedDelta { .. }
+        ));
         let prediction = prediction(&parsed.text).unwrap();
         assert!(prediction
             .layers

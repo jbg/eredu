@@ -142,6 +142,39 @@ fn recurrent_channels(gate_activation: eredu_nn::OutputGateActivation) {
                 );
                 let before = state.clone();
                 let ordinary = layer.forward(&input, &mut state, &context).unwrap();
+                // Prefix boundaries shorter than the convolution history must
+                // preserve both recurrence and history, including continuation
+                // from an already nonempty state.
+                for chunk in [1_usize, 2] {
+                    let mut split_state = before.clone();
+                    let mut data = Vec::new();
+                    for rows in input.data.chunks(chunk * 8) {
+                        let part =
+                            NumericTensor::new([1, (rows.len() / 8) as i32, 8], rows.to_vec());
+                        data.extend(
+                            layer
+                                .forward(&part, &mut split_state, &context)
+                                .unwrap()
+                                .data,
+                        );
+                    }
+                    assert_tensor_close(
+                        &NumericTensor::new(input.shape.clone(), data),
+                        &ordinary,
+                        "recurrent prefix output equals full pass",
+                    );
+                    assert_eq!(split_state.fixed_offset, state.fixed_offset);
+                    for (role, value) in &state.fixed {
+                        if let Some(expected) = value {
+                            assert_tensor_close(
+                                split_state.fixed[role].as_ref().unwrap(),
+                                expected,
+                                "recurrent prefix preserves fixed state",
+                            );
+                        }
+                    }
+                }
+
                 let mut observed_state = before.clone();
                 let mut captured = Components::strict();
                 let actual = layer

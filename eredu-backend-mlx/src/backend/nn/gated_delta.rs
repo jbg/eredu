@@ -407,6 +407,14 @@ pub fn gated_delta_scan(
     if stream.get_device()?.get_type()? == DeviceType::Gpu {
         let output_dtype = query.dtype();
         let (state, output) = metal_scan(state, query, key, value, log_decay, beta, stream)?;
+        if sequence > 1 {
+            // A prefill scan is a native evaluation boundary. Its two outputs
+            // otherwise retain all earlier projections, convolution products and
+            // intermediate recurrent states until the complete decoder finishes.
+            // Evaluate both roots: evaluating only the sequence cannot establish
+            // completion of the final state retained by the next invocation.
+            safemlx::transforms::eval([&state, &output])?;
+        }
         return Ok((state, output.as_dtype(output_dtype, stream)?));
     }
 

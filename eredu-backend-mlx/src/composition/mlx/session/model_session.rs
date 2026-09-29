@@ -336,6 +336,7 @@ impl<P: Probe> Drop for SessionOperation<'_, P> {
 pub struct MlxModelInput {
     parts: Vec<input::InputPart>,
     cache_identity: Option<eredu_runtime::PreparedInputCacheIdentity>,
+    prefill_fragment: bool,
     prefill_cursor: Option<Box<dyn crate::composition::mlx::replicated_text::ErasedPrefillCursor>>,
 }
 
@@ -344,6 +345,7 @@ impl Clone for MlxModelInput {
         Self {
             parts: self.parts.clone(),
             cache_identity: self.cache_identity.clone(),
+            prefill_fragment: self.prefill_fragment,
             prefill_cursor: self
                 .prefill_cursor
                 .as_ref()
@@ -374,6 +376,7 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
         Self {
             parts: input.parts.to_vec(),
             cache_identity: input.cache_identity().cloned(),
+            prefill_fragment: input.is_prefill_fragment(),
             prefill_cursor: None,
         }
     }
@@ -425,6 +428,7 @@ impl MlxModelInput {
             eredu_runtime::PreparedInputInspector::identity(&input::MlxInputInspector, array)
         })
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        self.prefill_fragment = false;
         self.cache_identity = Some(
             prepared
                 .cache_identity(fingerprint)
@@ -435,6 +439,12 @@ impl MlxModelInput {
 
     /// Borrows the owned input parts as a model-input view for one operation.
     pub fn with_borrowed<T>(&self, execute: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
+        if self.prefill_fragment {
+            return execute(input::ModelInput::prefill_fragment(
+                &self.parts,
+                self.cache_identity.as_ref(),
+            ));
+        }
         let input = match self.cache_identity.as_ref() {
             Some(identity) => input::ModelInput::with_cache_identity(&self.parts, identity),
             None => input::ModelInput::new(&self.parts),
@@ -1983,6 +1993,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 Ok(MlxModelInput {
                     parts: vec![input::token_ids_part(&tokens)?],
                     cache_identity: None,
+                    prefill_fragment: true,
                     prefill_cursor: None,
                 })
             };

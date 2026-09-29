@@ -2953,6 +2953,18 @@ where
         input: Result<A::Input<'a>, A::Error>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.prefill_input_final_position_with_identity(input, None, context)
+    }
+
+    /// Completes a prefix and atomically publishes its admitted whole-request
+    /// identity. Nonfinal fragments pass `None`, invalidating earlier prompt
+    /// identity only after successful completion; failures retain rollback state.
+    pub fn prefill_input_final_position_with_identity<'a>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<PreparedInputCacheIdentity>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         if !self.selected.exact_completion_available() {
             return Err(ReplicatedTextSessionError::Contract(
                 "completed text prefill requires exact output and state completion".into(),
@@ -2964,6 +2976,9 @@ where
             self.prefill_input_result_with_observer(input, None, context, &mut crate::NoopObserver);
         self.complete_text_prefill = false;
         D::set_last_text_output_only(&mut self.execution, false);
+        if output.is_ok() {
+            self.committed_prompt_input_identity = identity;
+        }
         output
     }
 

@@ -668,11 +668,71 @@ where
     P: CompositePredictionCapability<A, D> + 'static,
 {
     fn supports_chunked_prefill(&self) -> bool {
-        self.session.prefill_chunking_support().is_ok()
+        !P::present() && (A::supports_chunked_text_prefill() || self.supports_retained_prefill())
     }
 
     fn supports_retained_prefill(&self) -> bool {
-        self.supports_chunked_prefill()
+        A::supports_retained_prefill() && self.session.prefill_chunking_support().is_ok()
+    }
+
+    fn projects_final_prefill_position(&self) -> bool {
+        !P::present() && D::SELECTS_FINAL_TEXT_OUTPUT && A::projects_final_text_position()
+    }
+
+    fn forecast_state_offset(&self) -> Result<Option<i32>, Exception> {
+        self.session
+            .report()
+            .map(|report| Some(report.state_report().offset))
+            .map_err(Exception::from_source)
+    }
+
+    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
+        if !self.projects_final_prefill_position() {
+            return self.prefill_result_with_observer(
+                Ok(input),
+                None,
+                None,
+                stream,
+                &mut eredu_runtime::NoopObserver,
+            );
+        }
+        // Internal fragments carry whole-request identity separately from the
+        // suffix tensor geometry. Ordinary caller-supplied identities still go
+        // through exact prepared-input validation.
+        let prepared = self
+            .prepare(if input.is_prefill_fragment() {
+                input::ModelInput::new(input.parts)
+            } else {
+                input
+            })
+            .map_err(eredu_nn::Error::backend_source);
+        let identity = if input.is_prefill_fragment() {
+            input.cache_identity().cloned()
+        } else {
+            prepared
+                .as_ref()
+                .ok()
+                .and_then(|(_, _, identity)| identity.clone())
+        };
+        let paired = match prepared {
+            Ok((ref prepared, ref admitted, _)) => {
+                PreparedCompositeInput::new(prepared, admitted).map_err(eredu_nn::Error::backend)
+            }
+            Err(error) => Err(error),
+        };
+        let before = self.session.successful_state_restoration_generation();
+        let output = self
+            .session
+            .prefill_input_final_position_with_identity(paired, identity, stream)
+            .map(MlxTensor::into_array)
+            .map_err(|error| {
+                Error::after_replicated_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })?;
+        Ok(self.published(output))
     }
 
     fn start_prefill_cursor(

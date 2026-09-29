@@ -225,6 +225,7 @@ pub fn describe_text_workspace(
             matches!(
                 layer.mixer,
                 TokenMixerTopology::GatedConvolution { .. }
+                    | TokenMixerTopology::GatedDelta { .. }
                     | TokenMixerTopology::Attention {
                         input_scores: true,
                         ..
@@ -319,6 +320,7 @@ pub fn describe_text_workspace(
         }
         let projections = match &layer.mixer {
             TokenMixerTopology::Attention { projections, .. }
+            | TokenMixerTopology::GatedDelta { projections, .. }
             | TokenMixerTopology::GatedConvolution { projections, .. } => projections.as_slice(),
             TokenMixerTopology::Unknown { .. } => &[],
         };
@@ -488,6 +490,44 @@ pub fn describe_text_workspace(
                     )?;
                     attention_scratch = attention_scratch.maximum(&scratch);
                 }
+            }
+            TokenMixerTopology::GatedDelta {
+                value_heads,
+                key_width,
+                value_width,
+                convolution_channels,
+                kernel,
+                ..
+            } => {
+                charge(
+                    &mut schedule,
+                    "recurrent-convolution-output",
+                    product(&[rows, *convolution_channels, scalar_bytes])?,
+                    convolution_intermediates(
+                        request.batch_size,
+                        query,
+                        *convolution_channels,
+                        *kernel,
+                        1,
+                        upper_scalar,
+                    )?,
+                )?;
+                // The scan returns FP32 sequence values and FP32 matrix state.
+                // Matrix state installed in the session is counted separately.
+                // Native scan temporaries, per-chunk state versions, contiguous
+                // copies and lazy graph retention have no calibrated upper bound.
+                schedule.allocation("gated-delta-scan", MemoryBytes {
+                    lower_bytes: product(&[rows, *value_heads, *value_width, 4])?,
+                    upper_bytes: None,
+                    kind: ObservationKind::Estimated,
+                    detail: "FP32 gated-delta sequence output; selected scan scratch and lazy state-version retention upper bound unavailable".into(),
+                }, hold.clone())?;
+                charge(
+                    &mut schedule,
+                    "recurrent-normalized-query-key",
+                    0,
+                    product(&[rows, *value_heads, *key_width, 4, 2])?,
+                )?;
             }
             TokenMixerTopology::GatedConvolution {
                 channels,
@@ -1035,6 +1075,28 @@ fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityE
                         "attention output projection disagrees with value heads",
                     ));
                 }
+            }
+            TokenMixerTopology::GatedDelta {
+                value_heads,
+                key_width,
+                value_width,
+                convolution_channels,
+                kernel,
+                projections,
+            } => {
+                if [
+                    value_heads,
+                    key_width,
+                    value_width,
+                    convolution_channels,
+                    kernel,
+                ]
+                .into_iter()
+                .any(|n| *n == 0)
+                {
+                    return Err(invalid("gated-delta dimensions must be positive"));
+                }
+                check_projections(projections, topology.hidden_size, topology.hidden_size)?;
             }
             TokenMixerTopology::GatedConvolution {
                 channels,

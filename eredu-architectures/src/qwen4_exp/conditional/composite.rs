@@ -14,6 +14,10 @@ where
 {
     type InputPartPlan = MediaInputPartPlan<B::Tensor>;
     type AdmissionConfig = MediaAdmissionConfig;
+    fn supports_retained_prefill() -> bool {
+        true
+    }
+
     type PrefillRequest = super::prefill::MediaPrefillRequest<B::Tensor>;
 
     fn prefill_chunk_limit(
