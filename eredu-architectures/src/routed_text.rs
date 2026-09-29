@@ -2321,6 +2321,13 @@ where
         bank_residency,
         eredu_runtime::ParameterBankResidency::IndependentCache(_)
     ) {
+        // Auxiliary owners share bank selection but have separate module contracts.
+        // Their parameters must not enter the primary architecture's task catalog.
+        let auxiliary_targets = text
+            .auxiliary_parameters()
+            .iter()
+            .map(|parameter| parameter.name())
+            .collect::<BTreeSet<_>>();
         banks
             .values()
             .flat_map(|bank| bank.catalog.units())
@@ -2328,6 +2335,7 @@ where
                 unit.distribution() == crate::ExpertResidencyDistribution::ExpertParallel
             })
             .flat_map(crate::ExpertResidencyUnit::parameters)
+            .filter(|parameter| !auxiliary_targets.contains(parameter.logical_target()))
             .map(|parameter| parameter.logical_target().to_owned())
             .collect::<BTreeSet<_>>()
     } else {

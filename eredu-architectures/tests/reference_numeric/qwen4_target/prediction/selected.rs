@@ -288,6 +288,39 @@ pub(super) fn check(
             .clone()
             .visit::<NumericBackend, State, _>(ctx, TargetHandoff(true))
             .unwrap();
+        if let LayerWeightResidency::DenseDiskStream(disk) = residency {
+            let cached_request = RoutedTextSelectionRequest::new(
+                request.text().clone(),
+                WeightResidency::with_independent_parameter_banks(
+                    OrdinaryWeightResidency::DenseDiskStream(disk),
+                    options,
+                ),
+            )
+            .unwrap();
+            let cached = plan
+                .clone()
+                .select(
+                    &cached_request,
+                    &capabilities,
+                    Some(&prediction_capabilities),
+                )
+                .unwrap();
+            let (handoff, _) = cached
+                .clone()
+                .prepare::<NumericBackend, State>(ctx)
+                .unwrap();
+            assert_eq!(handoff.banks(), cached.realization().banks());
+            let (mut modules, _, _, _) = handoff.into_parts();
+            assert!(modules
+                .take_contract()
+                .materialization_tasks()
+                .iter()
+                .all(|task| !task.name().contains(".mlp.experts.")
+                    && !task.name().starts_with("mtp.")));
+            cached
+                .prepare_prediction_weights::<NumericBackend>(ctx)
+                .unwrap();
+        }
         assert_eq!(
             source.source_diagnostics().unwrap().physical_reads,
             before,

@@ -5026,6 +5026,9 @@ including generated quantization companions absent from the original source
 catalog. Architecture construction forwards those exact member-task identities
 as addressable ownership. Ordinary module binding still rejects any uncovered
 destination; it does not infer scale/bias names or silently load bank-owned copies.
+Joint target/prediction selection retains both roles' banks, while the target's
+addressable parameter catalog excludes declared auxiliary parameters. Prediction
+module construction validates those parameters against its separate selected tasks.
 
 Exact replicated-text affine transforms preserve the admitted floating source precision for
 generated scales and biases, matching independent-bank materialization and neutral
