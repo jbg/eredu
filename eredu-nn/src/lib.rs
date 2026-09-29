@@ -1181,6 +1181,8 @@ pub enum NormalizationScale {
     /// Ordinary learned multiplicative scale.
     Learned(ParameterSpec),
     /// Learned scale offset by a fixed scalar at execution time.
+    /// Normalization and scale arithmetic use float32; the final result is cast
+    /// back to the input dtype.
     LearnedOffset {
         /// Stable checkpoint slot containing the learned offset tensor.
         weight: ParameterSpec,

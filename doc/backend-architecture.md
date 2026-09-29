@@ -19,6 +19,11 @@ The feed-forward spec preserves FP32 scores, input-dtype routing coefficients,
 ascending expert-ID accumulation, and the sigmoid-gated shared branch. A global
 router may dispatch to a smaller rank-local expert bank through the existing provider.
 
+`NormalizationScale::LearnedOffset` uses float32 normalization and evaluates the
+learned scale plus offset in float32, then casts the scaled result to the input
+dtype. MLX applies this contract to grouped and ungrouped normalization alike,
+including low-precision QSA summaries retained by declared append streams.
+
 `eredu-nn::NeuralBackend::output_gated_group_rms_norm` explicitly selects SiLU or
 sigmoid gating after float32 normalization. `OutputGatedNormArithmetic` selects either FP32 intermediates
 or a cast of normalized values to the input dtype before learned scaling. In the

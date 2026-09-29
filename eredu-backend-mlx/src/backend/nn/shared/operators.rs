@@ -233,7 +233,8 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
                 input.shape()
             )));
         }
-        if let Some(groups) = self.groups {
+        if self.groups.is_some() || self.offset.is_some() {
+            let groups = self.groups.unwrap_or(1);
             let mut shape = input.shape().to_vec();
             shape.pop();
             shape.extend([groups, self.dimensions / groups]);
@@ -250,21 +251,11 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
             }
             return compute_tensor(normalized.as_dtype(input.dtype(), context));
         }
-        match (&mut self.module, self.offset) {
-            (Some(module), None) => compute_tensor(module.forward(input, context)),
-            (Some(module), Some(offset)) => {
-                let scale = compute(module.weight.as_ref().add(Array::from_f32(offset), context))?;
-                compute_tensor(super::super::normalization::input_precision_rms(
-                    input,
-                    &scale,
-                    self.epsilon,
-                    context,
-                ))
-            }
-            (None, None) => {
+        match &mut self.module {
+            Some(module) => compute_tensor(module.forward(input, context)),
+            None => {
                 mlx_weightless_rms_norm(input, self.epsilon, context).map(MlxTensor::from_array)
             }
-            (None, Some(_)) => unreachable!("validated normalization construction"),
         }
     }
 }

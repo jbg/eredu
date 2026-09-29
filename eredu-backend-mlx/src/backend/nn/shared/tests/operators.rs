@@ -622,6 +622,58 @@ fn mlx_learned_rms_bf16_rounding_matches_independent_reference() {
 }
 
 #[test]
+#[ignore = "explicit CPU and Metal normalization parity; run outside the sandbox"]
+fn mlx_learned_offset_rms_preserves_precision_and_float32_scale_arithmetic() {
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        let stream = Stream::new_with_device(&Device::new(device, 0));
+        for dtype in [Dtype::Bfloat16, Dtype::Float16, Dtype::Float32] {
+            let round = |value: f32| match dtype {
+                Dtype::Bfloat16 => half::bf16::from_f32(value).to_f32(),
+                Dtype::Float16 => half::f16::from_f32(value).to_f32(),
+                _ => value,
+            };
+            let values = [0.375f32, -1.25, 2.5, -0.625];
+            let weights = [0.00390625f32, -0.25, 0.125, 0.75];
+            let epsilon = 0.125;
+            let variance = values.iter().map(|x| x * x).sum::<f32>() / 4.0;
+            let expected = values
+                .iter()
+                .zip(weights)
+                .map(|(x, w)| round(x * (variance + epsilon).sqrt().recip() * (1.0 + w)))
+                .collect::<Vec<_>>();
+            let mut normalization = MlxNeuralBackend::normalization(
+                NormalizationConstructionSpec {
+                    dimensions: 4,
+                    groups: None,
+                    epsilon,
+                    scale: NormalizationScale::LearnedOffset {
+                        weight: ParameterSpec::trainable("gain").unwrap(),
+                        offset: 1.0,
+                    },
+                },
+                &stream,
+            )
+            .unwrap();
+            normalization.module.as_mut().unwrap().weight = crate::module::PhysicalParam::new(
+                Array::from_slice(&weights, &[4])
+                    .as_dtype(dtype, &stream)
+                    .unwrap(),
+            );
+            let input = Array::from_slice(&values, &[1, 4])
+                .as_dtype(dtype, &stream)
+                .unwrap();
+            let output = normalization.forward(&input, &stream).unwrap();
+            assert_eq!(output.dtype(), dtype, "{device:?}");
+            close(
+                &MlxTensor::from_array(output.as_dtype(Dtype::Float32, &stream).unwrap()),
+                &expected,
+                if dtype == Dtype::Float32 { 1e-6 } else { 0.0 },
+            );
+        }
+    }
+}
+
+#[test]
 fn mlx_output_gated_group_norm_matches_scalar_reference() {
     output_gated_group_norm_reference(DeviceType::Cpu);
 }
