@@ -185,11 +185,12 @@ pub(crate) fn source_declarations(
                 let primary = plan.gguf_plan().ok_or_else(|| invalid("GGUF artifact omitted its architecture plan".into()))?;
                 let validated = inspection.validated_gguf().ok_or_else(|| invalid("GGUF artifact omitted its validated headers".into()))?;
                 if validated.companions().any(|(role, _)| *role != GgufCompanionRole::MediaProjector) { return Err(invalid("GGUF artifact retained an unsupported companion role".into())); }
-                let resolution = eredu_checkpoint::validation::resolve_gguf_plan(validated.checkpoint(), primary.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;
+                let checkpoint = primary.prepared_checkpoint(validated.checkpoint());
+                let resolution = eredu_checkpoint::validation::resolve_gguf_plan(checkpoint, primary.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;
                 let mapping = plan.gguf_media_projector().map_or(primary.tensor_mapping(), |p| p.primary_tensor_mapping());
-                let catalog = eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(validated.checkpoint(), &resolution, mapping).map_err(|e| invalid(e.to_string()))?;
+                let catalog = eredu_checkpoint::gguf_store::GgufCatalog::from_resolved_checkpoint(checkpoint, &resolution, mapping).map_err(|e| invalid(e.to_string()))?;
                 declarations.roles.insert(ArtifactSourceRole::Target, BTreeMap::from([(PhysicalArtifactId::Primary, catalog.keys().into_iter().collect())]));
-                declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Gguf { checkpoint: validated.checkpoint().clone(), mapping: mapping.to_vec(), resolution });
+                declarations.artifacts.insert(PhysicalArtifactId::Primary, PhysicalArtifactPreparation::Gguf { checkpoint: checkpoint.clone(), mapping: mapping.to_vec(), resolution });
                 match (plan.gguf_media_projector(), validated.companion(&GgufCompanionRole::MediaProjector)) {
                     (Some(projector), Some(companion)) => {
                         let resolution = eredu_checkpoint::validation::resolve_gguf_plan(companion.checkpoint(), projector.checkpoint()).map_err(|e| invalid(format!("{e:?}")))?;

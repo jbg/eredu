@@ -857,3 +857,100 @@ fn q8_0_metal_grouped_matches_float_with_repeated_ids() {
         .unwrap()
         .item::<bool>(&stream));
 }
+
+#[test]
+#[ignore = "requires an accessible Metal device"]
+fn q4k_grouped_decode_preserves_sliced_banks_and_repeated_routes() {
+    let stream = Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+    let raw = repeated_blocks(3 * 67 * 10);
+    let bank = NativeQuantizedTensor::from_q4k_bytes(&raw, &[3, 67, 2560], &stream)
+        .unwrap()
+        .row_view(2, 65)
+        .unwrap();
+    let dense = bank.dequantize(&stream).unwrap();
+    for routes in [10, 17] {
+        let ids = Array::from_slice(
+            &(0..routes).map(|i| (i * 2) % 3).collect::<Vec<_>>(),
+            &[routes],
+        );
+        let values = (0..routes * 2560)
+            .map(|i| ((i * 13) % 37) as f32 / 19. - 1.)
+            .collect::<Vec<_>>();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let input = Array::from_slice(&values, &[routes, 2560])
+                .as_dtype(dtype, &stream)
+                .unwrap();
+            let actual = native_grouped_linear(&input, &bank, &ids, &stream).unwrap();
+            let selected = dense.try_index_device(&ids, &stream).unwrap();
+            let expected = matmul(
+                input
+                    .as_dtype(Dtype::Float32, &stream)
+                    .unwrap()
+                    .reshape(&[routes, 1, 2560], &stream)
+                    .unwrap(),
+                selected.swap_axes(-1, -2, &stream).unwrap(),
+                &stream,
+            )
+            .unwrap()
+            .reshape(&[routes, 65], &stream)
+            .unwrap()
+            .as_dtype(dtype, &stream)
+            .unwrap();
+            let tolerance = if dtype == Dtype::Bfloat16 { 1e-2 } else { 2e-3 };
+            assert!(
+                actual
+                    .all_close(&expected, Some(tolerance), Some(tolerance), None, &stream)
+                    .unwrap()
+                    .item::<bool>(&stream),
+                "{routes} routes {dtype:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual Metal kernel benchmark; requires an accessible device"]
+fn q4k_grouped_decode_benchmark() {
+    let stream = Stream::new_with_device(&crate::Device::new(DeviceType::Gpu, 0));
+    let bank = NativeQuantizedTensor::from_q4k_bytes(
+        &repeated_blocks(32 * 640 * 10),
+        &[32, 640, 2560],
+        &stream,
+    )
+    .unwrap();
+    let input = Array::from_slice(
+        &(0..10 * 2560)
+            .map(|i| ((i * 13) % 37) as f32 / 19. - 1.)
+            .collect::<Vec<_>>(),
+        &[10, 2560],
+    );
+    let ids = Array::from_slice(&[31i32, 0, 4, 8, 6, 12, 1, 25, 3, 29], &[10]);
+    eval([&input, &ids, bank.storage.bytes()]).unwrap();
+    let old = kernels::q4k_grouped_kernel().unwrap();
+    let config = dispatch::q4k_config(10, &bank, 10, 640, Dtype::Float32)
+        .with_template_arg_int("MATRIX_COUNT", 32);
+    for variant in [false, true] {
+        let mut times = Vec::new();
+        for iteration in 0..24 {
+            let out = if variant {
+                native_grouped_linear(&input, &bank, &ids, &stream).unwrap()
+            } else {
+                old.apply_one_device([&input, bank.storage.bytes(), &ids], &config, &stream)
+                    .unwrap()
+            };
+            let time = safemlx::transforms::async_eval_timed([&out], &stream)
+                .unwrap()
+                .elapsed()
+                .unwrap()
+                .as_secs_f64();
+            if iteration >= 4 {
+                times.push(time);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "grouped vector={variant}: median {:.3} ms",
+            times[times.len() / 2] * 1000.
+        );
+    }
+}

@@ -268,11 +268,7 @@ impl<B: NeuralBackend> CachedQsaSelector<B> {
             return Err(QsaError::Geometry);
         }
         let slots = self.state.selection.token_budget + self.state.selection.ratio - 1;
-        let count = batch
-            .checked_mul(tokens)
-            .and_then(|n| n.checked_mul(slots as usize))
-            .ok_or(QsaError::Geometry)?;
-        let mut selected = Vec::with_capacity(count);
+        let mut selected = Vec::with_capacity(rows);
         for (lane, partial) in partials.iter_mut().enumerate() {
             let (keys, positions) = state.append_stream_pair(
                 QsaStreamStateSpec::KEYS,
@@ -324,21 +320,43 @@ impl<B: NeuralBackend> CachedQsaSelector<B> {
                         &[self.state.selection.heads, self.state.selection.dimensions],
                         context,
                     )?;
-                let values = select_positions(
-                    self.state.selection,
-                    &query,
-                    keys,
-                    positions,
-                    partial.tail(),
-                    context,
-                )?;
-                if values.iter().any(|v| *v > position) {
-                    return Err(QsaError::Geometry);
-                }
-                selected.extend(values);
+                // Prefill completes each query's selector before retaining the
+                // next; otherwise lazy score tiles would accumulate per token.
+                let native = if tokens == 1 {
+                    select_positions_tensor(
+                        self.state.selection,
+                        &query,
+                        keys,
+                        positions,
+                        partial.tail(),
+                        position + 1,
+                        context,
+                    )?
+                } else {
+                    None
+                };
+                let values = match native {
+                    Some(values) => values,
+                    None => {
+                        let values = select_positions(
+                            self.state.selection,
+                            &query,
+                            keys,
+                            positions,
+                            partial.tail(),
+                            context,
+                        )?;
+                        if values.iter().any(|v| *v > position) {
+                            return Err(QsaError::Geometry);
+                        }
+                        B::Tensor::from_i32_slice(&values, &[slots], context)?
+                    }
+                };
+                selected.push(values);
             }
         }
-        let selected = B::Tensor::from_i32_slice(&selected, &[shape[0], shape[1], slots], context)?;
+        let selected = B::Tensor::concatenate(&selected, 0, context)?
+            .reshape(&[shape[0], shape[1], slots], context)?;
         self.state
             .partial
             .write::<B, _>(state, &partials, scratch, context)?;

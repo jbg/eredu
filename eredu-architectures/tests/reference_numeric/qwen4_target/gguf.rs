@@ -427,9 +427,15 @@ fn gguf_target_uses_shared_selection_and_sessions_across_residency() {
 
 #[test]
 fn gguf_scalar_view_target_matches_independently_decoded_weights() {
-    let (_dir, gguf, st) = fixtures(true);
-    let a = run(&gguf, LayerWeightResidency::FullyResident, &[1, 2, 4, 3, 9]);
-    let b = run(&st, LayerWeightResidency::FullyResident, &[19]);
+    let (dir, _, _) = fixtures(true);
+    let a = super::registry::run(
+        &dir.path().join("target.gguf"),
+        LayerWeightResidency::FullyResident,
+    );
+    let b = super::registry::run(
+        &dir.path().join("safetensors"),
+        LayerWeightResidency::FullyResident,
+    );
     for (a, b) in a.0.iter().zip(&b.0) {
         assert_tensor_close(a, b, "GGUF scalar source view session");
     }
@@ -452,6 +458,18 @@ fn gguf_packed_target_retains_logical_geometry_companions_and_bounded_experts() 
     ] {
         fixture.replace_encoding(name, eredu_gguf::GgmlType::Q4_0, block.repeat(rows));
     }
+    // Unlike concatenated gate/up recipes, down projections retain direct GGUF
+    // sources. Exercise native byte blocks as well as unpacked affine companions.
+    fixture.replace_encoding(
+        "blk.0.ffn_down_exps.weight",
+        eredu_gguf::GgmlType::IQ4NL,
+        block.repeat(96),
+    );
+    fixture.replace_encoding(
+        "blk.1.ffn_down_exps.weight",
+        eredu_gguf::GgmlType::Q4_0,
+        block.repeat(96),
+    );
     fixture.write(&path);
     let header = GgufTargetPlan::prepare(&eredu_gguf::Checkpoint::open(path).unwrap()).unwrap();
     let source = super::super::qwen4_gguf::open_text_source(header.text_plan());

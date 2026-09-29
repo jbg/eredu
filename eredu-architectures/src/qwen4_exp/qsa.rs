@@ -89,7 +89,12 @@ impl QsaSelectionSpec {
             })
             .ok_or(QsaError::Geometry)?;
         tensor
-            .checked_add(tile.checked_mul(16).ok_or(QsaError::Geometry)?)
+            .checked_add(
+                tile.checked_mul(self.ratio as u64)
+                    .and_then(|n| n.checked_mul(16))
+                    .ok_or(QsaError::Geometry)?,
+            )
+            .and_then(|n| n.checked_add(tile.checked_mul(16)?))
             .and_then(|n| slots.checked_mul(64).and_then(|v| n.checked_add(v)))
             .ok_or(QsaError::Geometry)
     }
@@ -219,6 +224,77 @@ pub fn select_positions<T: Tensor, K: AppendOnlyStream<T>, P: AppendOnlyStream<T
     }
     selected.resize((spec.token_budget + spec.ratio - 1) as usize, -1);
     Ok(selected)
+}
+
+/// Bounded tensor selection with optional native ranking and deferred validation.
+/// Returns `None` when row-selection mechanisms are unavailable or the history
+/// exceeds one admitted tile.
+/// Family scoring, tiling, causal positions and padding remain architecture-owned.
+pub fn select_positions_tensor<T: Tensor, K: AppendOnlyStream<T>, P: AppendOnlyStream<T>>(
+    spec: QsaSelectionSpec,
+    query: &T,
+    keys: &mut K,
+    positions: &mut P,
+    tail: &[i32],
+    upper: i32,
+    context: &T::Context,
+) -> Result<Option<T>, QsaError> {
+    spec.validate()?;
+    if upper < 0
+        || query.shape() != [spec.heads, spec.dimensions]
+        || keys.specification().width != spec.dimensions
+        || positions.specification().width != spec.ratio
+        || positions.specification().element != TensorElementType::I32
+        || keys.len() != positions.len()
+        || tail.len() >= spec.ratio as usize
+        || tail.iter().any(|p| *p < 0 || *p >= upper)
+        || !tail.windows(2).all(|p| p[0] < p[1])
+    {
+        return Err(QsaError::Geometry);
+    }
+    // A lazy chain of tiles would retain unbounded temporary graphs. Keep the
+    // native path within one admitted tile; longer histories use the bounded
+    // portable selector, which completes each tile before advancing.
+    if !T::supports_row_selection(context) || keys.len() > spec.tile_blocks as usize {
+        return Ok(None);
+    }
+    let selected = if keys.len() > 0 {
+        let query = query.cast_float(TensorElementType::F32, context)?;
+        let tile = keys
+            .read(0..keys.len(), context)?
+            .cast_float(TensorElementType::F32, context)?;
+        let rows = positions.read(0..positions.len(), context)?;
+        if tile.shape() != [keys.len() as i32, spec.dimensions]
+            || rows.shape() != [keys.len() as i32, spec.ratio]
+        {
+            return Err(QsaError::Geometry);
+        }
+        let scores =
+            T::matmul(&query, &tile.transpose(context)?, context)?.maximum_scalar(0., context)?;
+        let scores = T::sum_axis(&scores, 0, false, context)?
+            .multiply_scalar(1. / (spec.dimensions as f32).sqrt(), context)?;
+        let Some((_, rows)) = scores.topk_rows(&rows, spec.token_budget / spec.ratio, context)?
+        else {
+            return Ok(None);
+        };
+        let Some(selected) =
+            rows.sorted_unique_indices(tail.first().copied().unwrap_or(upper), context)?
+        else {
+            return Ok(None);
+        };
+        selected
+    } else {
+        T::from_i32_slice(&[], &[0], context)?
+    };
+    let used = selected.dim(0) + tail.len() as i32;
+    let slots = spec.token_budget + spec.ratio - 1;
+    let tail = T::from_i32_slice(tail, &[tail.len() as i32], context)?;
+    let padding = T::from_i32_slice(&vec![-1; (slots - used) as usize], &[slots - used], context)?;
+    Ok(Some(T::concatenate(
+        &[selected, tail, padding],
+        0,
+        context,
+    )?))
 }
 
 /// Projection, normalization and rotary declarations for one QSA indexer.

@@ -111,7 +111,11 @@ pub(super) fn q4k_config(
         .with_output_arg([output_rows, output_cols], dtype)
 }
 
-pub(super) fn q4k_decode_config(view: &NativeQuantizedTensor, dtype: Dtype) -> CustomKernelConfig {
+pub(super) fn q4k_decode_config(
+    view: &NativeQuantizedTensor,
+    dtype: Dtype,
+    routes: i32,
+) -> CustomKernelConfig {
     let output_pairs = (view.rows + Q4K_DECODE_ROWS_PER_SIMD - 1) / Q4K_DECODE_ROWS_PER_SIMD;
     let pair_grid = ((output_pairs + Q4K_DECODE_SIMD_GROUPS - 1) / Q4K_DECODE_SIMD_GROUPS)
         * Q4K_DECODE_SIMD_GROUPS;
@@ -120,10 +124,11 @@ pub(super) fn q4k_decode_config(view: &NativeQuantizedTensor, dtype: Dtype) -> C
         .with_template_arg_int("OUT_DIM", view.rows)
         .with_template_arg_int("BLOCKS", view.columns / Q4_K_BLOCK_VALUES)
         .with_template_arg_int("ROW_START", view.row_start)
+        .with_template_arg_int("PHYSICAL_ROWS", view.physical_rows)
         .with_template_arg_int("ROWS_PER_SIMD", Q4K_DECODE_ROWS_PER_SIMD)
-        .with_grid([REDUCTION_TILE, pair_grid, 1])
+        .with_grid([REDUCTION_TILE, pair_grid, routes])
         .with_thread_group([REDUCTION_TILE, Q4K_DECODE_SIMD_GROUPS, 1])
-        .with_output_arg([1, view.rows], dtype)
+        .with_output_arg([routes, view.rows], dtype)
 }
 
 pub(super) fn qk_decode_config(
@@ -172,7 +177,7 @@ pub(super) fn q4k_linear_metal(
     let flat = input.reshape(&[outer, view.columns], stream)?;
     let output = match k_quant_linear_kernel_class(outer) {
         KQuantLinearKernelClass::MatrixVector => {
-            let config = q4k_decode_config(view, dtype);
+            let config = q4k_decode_config(view, dtype, 1);
             Q4K_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
                 if cell.borrow().is_none() {
                     *cell.borrow_mut() = Some(q4k_linear_kernel()?);
@@ -438,6 +443,18 @@ pub(super) fn q4k_grouped_metal(
 ) -> Result<Array, Exception> {
     let dtype = validate_activation_dtype(input)?;
     let routes = input.dim(0);
+    if routes <= 16 {
+        let config = q4k_decode_config(view, dtype, routes);
+        return Q4K_GROUPED_DECODE_KERNEL.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(q4k_grouped_decode_kernel()?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("Q4_K grouped decode initialized")
+                .apply_one_device([input, view.storage.bytes(), group_ids], &config, stream)
+        });
+    }
     let config = q4k_config(routes, view, routes, view.rows, dtype)
         .with_template_arg_int("MATRIX_COUNT", view.matrix_count);
     Q4K_GROUPED_KERNEL.with(|cell| -> Result<_, Exception> {

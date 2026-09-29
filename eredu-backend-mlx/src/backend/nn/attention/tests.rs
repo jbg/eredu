@@ -1036,3 +1036,68 @@ fn explicit_rotary_preserves_tail_and_pair_order_for_all_embedding_ranks() {
         super::apply_rotary_embeddings(&input, &malformed, &malformed, 4, false, stream).is_err()
     );
 }
+
+#[cfg(feature = "metal")]
+#[test]
+fn resident_indexed_decode_preserves_slots_and_deferred_validation() {
+    use crate::{backend::nn::tensor::TokenValidationScope, MlxTensor};
+    use eredu_nn::{AttentionArithmetic, IndexedAttentionInput, LocalAttentionInput};
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = context.stream();
+    let tensor = |v: &[f32], shape: &[i32]| MlxTensor::from_array(Array::from_slice(v, shape));
+    let queries = tensor(&[1.], &[1, 1, 1, 1]);
+    let keys = tensor(&[f32::NAN, 1., 2.], &[1, 1, 3, 1]);
+    let values = tensor(&[f32::NAN, 4., 8.], &[1, 1, 3, 1]);
+    let positions = MlxTensor::from_array(Array::from_slice(&[12i32, 11, 12, -1, 999], &[1, 1, 5]));
+    let validity = MlxTensor::from_array(Array::from_slice(
+        &[true, true, true, true, false],
+        &[1, 1, 5],
+    ));
+    let local_keys = tensor(&[0.], &[1, 1, 1, 1]);
+    let local_values = tensor(&[2.], &[1, 1, 1, 1]);
+    let sink = tensor(&[0.], &[1]);
+    let request = IndexedAttentionInput {
+        queries: &queries,
+        keys: &keys,
+        values: &values,
+        key_position_offset: 10,
+        selected_positions: &positions,
+        validity: Some(&validity),
+        mask: None,
+        local: Some(LocalAttentionInput {
+            keys: &local_keys,
+            values: &local_values,
+            mask: None,
+        }),
+        scale: 1.,
+        arithmetic: AttentionArithmetic::Fused,
+        sinks: Some(&sink),
+    };
+    let scope = TokenValidationScope::begin().unwrap();
+    let output = indexed_sparse_attention(&request, stream).unwrap();
+    let validations = scope.finish();
+    safemlx::transforms::eval(validations.arrays().chain(std::iter::once(&output))).unwrap();
+    validations.validate_completed().unwrap();
+    let e = 1.0f32.exp();
+    let expected = (16. * e * e + 4. * e + 2.) / (2. * e * e + e + 2.);
+    assert!((output.evaluated().unwrap().as_slice::<f32>()[0] - expected).abs() < 1e-5);
+    let none = MlxTensor::from_array(Array::from_slice(&[-1i32; 5], &[1, 1, 5]));
+    let empty = IndexedAttentionInput {
+        selected_positions: &none,
+        validity: None,
+        local: None,
+        sinks: None,
+        ..request
+    };
+    let output = indexed_sparse_attention(&empty, stream).unwrap();
+    assert_eq!(output.evaluated().unwrap().as_slice::<f32>(), &[0.]);
+    let scope = TokenValidationScope::begin().unwrap();
+    let invalid = IndexedAttentionInput {
+        validity: None,
+        ..request
+    };
+    let output = indexed_sparse_attention(&invalid, stream).unwrap();
+    let validations = scope.finish();
+    safemlx::transforms::eval(validations.arrays().chain(std::iter::once(&output))).unwrap();
+    assert!(validations.validate_completed().is_err());
+}

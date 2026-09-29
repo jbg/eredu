@@ -318,7 +318,7 @@ impl eredu_architectures::routed_text::RoutedTextArchitectureVisitor<NumericBack
         .map_err(|e| e.to_string())
     }
 }
-fn run(path: &std::path::Path, residency: LayerWeightResidency) -> Trajectory {
+pub(super) fn run(path: &std::path::Path, residency: LayerWeightResidency) -> Trajectory {
     let request = load_policy::request(residency);
     run_with_request(path, residency, &request)
 }

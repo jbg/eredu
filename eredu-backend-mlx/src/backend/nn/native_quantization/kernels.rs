@@ -117,14 +117,22 @@ pub(super) fn iq_grouped_kernel(
 }
 
 pub(super) fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
-    // The lane decomposition and two-row SIMD reuse follow llama.cpp's Metal
-    // Q4_K matrix-vector kernel (MIT), adapted to MLX custom-kernel arguments,
-    // activation dtypes, row views, and output allocation.
-    MetalKernel::new(
-        "native_q4k_decode_2row",
-        ["input", "weight"],
-        ["out"],
-        concat!(
+    q4k_vector_kernel(false)
+}
+
+pub(super) fn q4k_grouped_decode_kernel() -> Result<MetalKernel, Exception> {
+    q4k_vector_kernel(true)
+}
+
+fn q4k_vector_kernel(grouped: bool) -> Result<MetalKernel, Exception> {
+    // Two-output-row SIMD reuse follows llama.cpp's MIT-licensed Q4_K
+    // matrix-vector kernel; grouped calls add a route and physical bank offset.
+    let routing = if grouped {
+        "uint route = thread_position_in_grid.z; uint group = uint(group_ids[route]);"
+    } else {
+        "uint route = 0; uint group = 0;"
+    };
+    let source = [routing, concat!(
             // Four eight-lane quads divide the packed blocks between the SIMD
             // lanes. Each SIMD group computes two output rows, reusing the
             // activation values and their sums across both rows.
@@ -138,7 +146,7 @@ pub(super) fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
             "float sums[ROWS_PER_SIMD];",
             "for (uint row = 0; row < ROWS_PER_SIMD; ++row) sums[row] = 0.0f;",
             "for (uint block = ix; block < BLOCKS; block += 4u) {",
-            " uint input_base = block * 256u + 64u * iq + 8u * ir;",
+            " uint input_base = route * BLOCKS * 256u + block * 256u + 64u * iq + 8u * ir;",
             " float yl[16];",
             " float yh[16];",
             " float4 sumy = float4(0.0f);",
@@ -155,7 +163,7 @@ pub(super) fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
             " for (uint row = 0; row < ROWS_PER_SIMD; ++row) {",
             "  uint out_col = first_out + row;",
             "  if (out_col >= OUT_DIM) continue;",
-            "  uint physical_row = ROW_START + out_col;",
+            "  uint physical_row = group * PHYSICAL_ROWS + ROW_START + out_col;",
             "  uint base = (physical_row * BLOCKS + block) * 144u;",
             "  const device ushort* sc = (const device ushort*)(weight + base + 4u) + iq;",
             "  const device ushort* q1 = (const device ushort*)(weight + base + 16u) + 16u * iq + 4u * ir;",
@@ -192,9 +200,22 @@ pub(super) fn q4k_linear_kernel() -> Result<MetalKernel, Exception> {
             "for (uint row = 0; row < ROWS_PER_SIMD; ++row) {",
             " float total = simd_sum(sums[row]);",
             " uint out_col = first_out + row;",
-            " if (lane == 0u && out_col < OUT_DIM) out[out_col] = T(total);",
+            " if (lane == 0u && out_col < OUT_DIM) out[route * OUT_DIM + out_col] = T(total);",
             "}"
-        ),
+        )].concat();
+    MetalKernel::new(
+        if grouped {
+            "native_q4k_grouped_decode_2row"
+        } else {
+            "native_q4k_decode_2row"
+        },
+        if grouped {
+            vec!["input", "weight", "group_ids"]
+        } else {
+            vec!["input", "weight"]
+        },
+        ["out"],
+        source,
         Q4K_METAL_HEADER,
         true,
         false,

@@ -535,3 +535,106 @@ fn append_stream_failed_read_retains_lease_until_native_completion() {
     settled.set(true);
     crate::backend::submission_recovery::wait_for_retirement(|| manager.remove_block(&id).is_ok());
 }
+
+#[cfg(feature = "metal")]
+#[test]
+fn qsa_device_selection_matches_portable_and_defers_invalid_scores() {
+    use crate::backend::nn::tensor::TokenValidationScope;
+    use eredu_architectures::qwen4_exp::qsa::{
+        select_positions, select_positions_tensor, QsaSelectionSpec,
+    };
+    use eredu_nn::Tensor;
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let bounds = AppendStreamLimits {
+        entries: 32,
+        page_entries: 8,
+        read_entries: 8,
+    };
+    let mut keys = ResidentAppendStream::new(
+        AppendStreamSpec {
+            slot: 0,
+            width: 2,
+            element: TensorElementType::F32,
+        },
+        bounds,
+        4096,
+        4096,
+        65536,
+    )
+    .unwrap();
+    let mut positions = ResidentAppendStream::new(spec(1), bounds, 4096, 4096, 65536).unwrap();
+    keys.append(
+        0,
+        Array::from_slice(
+            &[
+                10.0f32, 0., 0., 4., -1., 5., 2., 2., 0., 1., 1., 0., -2., -3., 1., 1.,
+            ],
+            &[8, 2],
+        )
+        .into(),
+        &stream,
+    )
+    .unwrap();
+    positions
+        .append(
+            0,
+            records(&[0, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
+            &stream,
+        )
+        .unwrap();
+    let mut selection = QsaSelectionSpec {
+        heads: 2,
+        dimensions: 2,
+        ratio: 2,
+        token_budget: 4,
+        tile_blocks: 8,
+        workspace_bytes: 0,
+    };
+    selection.workspace_bytes = selection.required_workspace().unwrap();
+    let query = Array::from_slice(&[1.0f32, 0., 0., 1.], &[2, 2]).into();
+    for budget in [4, 8, 16] {
+        selection.token_budget = budget;
+        selection.workspace_bytes = selection.required_workspace().unwrap();
+        let expected =
+            select_positions(selection, &query, &mut keys, &mut positions, &[20], &stream).unwrap();
+        let scope = TokenValidationScope::begin().unwrap();
+        let actual = select_positions_tensor(
+            selection,
+            &query,
+            &mut keys,
+            &mut positions,
+            &[20],
+            21,
+            &stream,
+        )
+        .unwrap()
+        .unwrap();
+        let validations = scope.finish();
+        safemlx::transforms::eval(
+            validations
+                .arrays()
+                .chain(std::iter::once(actual.as_array())),
+        )
+        .unwrap();
+        validations.validate_completed().unwrap();
+        assert_eq!(actual.to_i32_vec(&stream).unwrap(), expected);
+    }
+    // Invalid data is rejected at the ordinary submission completion boundary.
+    let scope = TokenValidationScope::begin().unwrap();
+    let scores: MlxTensor = Array::from_slice(&[f32::NAN, 1.], &[2]).into();
+    let _ = scores
+        .topk_rows(&records(&[0, 1, 2, 3]), 1, &stream)
+        .unwrap()
+        .unwrap();
+    let validations = scope.finish();
+    safemlx::transforms::eval(validations.arrays()).unwrap();
+    assert!(validations.validate_completed().is_err());
+    let scope = TokenValidationScope::begin().unwrap();
+    let _ = records(&[0, 2, 2, 3])
+        .sorted_unique_indices(4, &stream)
+        .unwrap()
+        .unwrap();
+    let validations = scope.finish();
+    safemlx::transforms::eval(validations.arrays()).unwrap();
+    assert!(validations.validate_completed().is_err());
+}

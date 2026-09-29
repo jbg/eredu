@@ -29,13 +29,13 @@ use eredu::{
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
-    AutomaticPlanRequest, AutomaticPlanner, DeviceCapabilities, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest, ResidencyPlan, SemanticEvent,
-    SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
-    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, DeviceCapabilities, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
+    HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest,
+    ResidencyPlan, SemanticEvent, SessionCapabilities, SpeculativeSchedulerOptions,
+    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -965,7 +965,6 @@ fn requested_load_quantization(args: &Cli) -> Result<Option<QuantizationRequest>
 
 const AUTO_DEVICE_FALLBACK_BYTES: u64 = 4 << 30;
 const AUTO_HOST_FALLBACK_BYTES: u64 = 16 << 30;
-const AUTO_HEADROOM_PERCENT: u64 = 30;
 const AUTO_EXPERT_SHARE_PERCENT: u64 = 40;
 const AUTO_CACHE_SCHEMA_VERSION: u32 = 1;
 const AUTO_BENCHMARK_SCHEMA_VERSION: u32 = 1;
@@ -1212,7 +1211,11 @@ fn write_auto_plan_cache(
 
 fn automatic_budget(available: Option<u64>, fallback: u64) -> u64 {
     available
-        .map(|bytes| bytes.saturating_mul(100 - AUTO_HEADROOM_PERCENT) / 100)
+        .map(|bytes| {
+            bytes.saturating_mul(
+                100 - u64::from(AutomaticPlannerPolicy::default().memory_headroom_percent),
+            ) / 100
+        })
         .unwrap_or(fallback)
         .max(1)
 }

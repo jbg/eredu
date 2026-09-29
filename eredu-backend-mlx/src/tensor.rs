@@ -358,6 +358,107 @@ impl Tensor for MlxTensor {
         )
     }
 
+    fn supports_row_selection(context: &Self::Context) -> bool {
+        context
+            .get_device()
+            .and_then(|device| device.get_type())
+            .is_ok_and(|device| device == safemlx::DeviceType::Gpu)
+    }
+
+    fn topk_rows(
+        &self,
+        rows: &Self,
+        count: i32,
+        context: &Self::Context,
+    ) -> Result<Option<(Self, Self)>, Error> {
+        if context
+            .get_device()
+            .map_err(Error::backend)?
+            .get_type()
+            .map_err(Error::backend)?
+            != safemlx::DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        if self.0.ndim() != 1
+            || self.0.dtype() != Dtype::Float32
+            || rows.0.ndim() != 2
+            || rows.0.dtype() != Dtype::Int32
+            || rows.0.dim(0) != self.0.dim(0)
+            || count <= 0
+        {
+            return Err(Error::backend("invalid top-k row geometry"));
+        }
+        let invalid =
+            backend(backend(self.0.abs(context))?.lt(Array::from_f32(f32::INFINITY), context))?;
+        let invalid = backend(invalid.logical_not(context))?;
+        backend(crate::backend::nn::tensor::register_device_validation(
+            backend(invalid.any(false, context))?,
+            "nonfinite row selection score",
+        ))?;
+        let order = backend(safemlx::ops::argsort_axis(
+            &backend(self.0.multiply(Array::from_f32(-1.), context))?,
+            0,
+            context,
+        ))?;
+        let order = backend(order.try_index_device(..count.min(self.0.dim(0)), context))?;
+        Ok(Some((
+            backend(self.0.take_axis(&order, 0, context))?.into(),
+            backend(rows.0.take_axis(&order, 0, context))?.into(),
+        )))
+    }
+
+    fn sorted_unique_indices(
+        &self,
+        upper: i32,
+        context: &Self::Context,
+    ) -> Result<Option<Self>, Error> {
+        if context
+            .get_device()
+            .map_err(Error::backend)?
+            .get_type()
+            .map_err(Error::backend)?
+            != safemlx::DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        if self.0.ndim() != 2 || self.0.dtype() != Dtype::Int32 || upper < 0 {
+            return Err(Error::backend("invalid ordered index geometry"));
+        }
+        let range = backend(self.0.lt(Array::from_int(0), context))?;
+        let range = backend(range.logical_or(
+            &backend(self.0.ge(Array::from_int(upper), context))?,
+            context,
+        ))?;
+        let mut invalid = backend(range.any(false, context))?;
+        if self.0.dim(1) > 1 {
+            let left = backend(self.0.try_index_device((.., ..self.0.dim(1) - 1), context))?;
+            let right = backend(self.0.try_index_device((.., 1..), context))?;
+            invalid = backend(invalid.logical_or(
+                &backend(backend(left.ge(right, context))?.any(false, context))?,
+                context,
+            ))?;
+        }
+        let sorted = backend(safemlx::ops::sort_axis(
+            &backend(self.0.reshape(&[-1], context))?,
+            0,
+            context,
+        ))?;
+        if sorted.dim(0) > 1 {
+            let left = backend(sorted.try_index_device(..sorted.dim(0) - 1, context))?;
+            let right = backend(sorted.try_index_device(1.., context))?;
+            invalid = backend(invalid.logical_or(
+                &backend(backend(left.eq(right, context))?.any(false, context))?,
+                context,
+            ))?;
+        }
+        backend(crate::backend::nn::tensor::register_device_validation(
+            invalid,
+            "invalid ordered unique indices",
+        ))?;
+        Ok(Some(sorted.into()))
+    }
+
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error> {
         let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend)?;
         let normalized = if axis < 0 { axis + rank } else { axis };

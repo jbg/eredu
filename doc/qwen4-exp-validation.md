@@ -215,3 +215,34 @@ prompt IDs, including a prompt crossing the QSA selection budget for released va
 The MTP reference is the pinned SGLang implementation below. CLI MTP setup has these limits:
 manual `--no-auto` detection uses a projection hook that excludes retained Flash-Next construction, and a GGUF target's matching
 SafeTensors prediction companion has no CLI flag; the public execution plan supports it.
+
+## Resident GGUF decode measurement
+
+An M5 Max with 128 GiB unified memory runs
+`agentionai/Qwen3.8-Flash-Next-AP-GGUF:AP-Q4_K_XL`, revision
+`0061a60e46ad672a73cec31cb627dc841d4760a4`, with 74,132,044,800 bytes of
+resident executable parameters. The checkpoint remains in its original packed
+formats; drafting is disabled. A 65-token prompt followed by 512 generated tokens
+measures 10.72 decode tokens/s, 8.852 s to the first token, 56.512 s generation time,
+and 70.80 GiB peak MLX memory. Generated tokens include the model's reasoning.
+This is one unprofiled local run, not a hardware-independent throughput guarantee.
+
+```sh
+CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu" \
+  cargo build --release -p eredu-cli
+HF_HUB_CACHE="/Volumes/External SSD/hf" target/release/eredu \
+  -m agentionai/Qwen3.8-Flash-Next-AP-GGUF:AP-Q4_K_XL \
+  --revision 0061a60e46ad672a73cec31cb627dc841d4760a4 \
+  --no-auto --speculative-draft-tokens 0 --verbose --max-tokens 512 \
+  'Explain the physics of why the sky is blue in detail.'
+```
+
+Native checks cover exact routing IDs against the value-only CPU partition,
+QSA selection against the portable bounded selector, deferred validation failures,
+indexed attention against scalar references (including BF16, masks, source origins,
+duplicate slots, sinks and local sources), and Q4_K grouped row views against
+independently decoded weights. The grouped Q4_K comparison uses 0.002 relative and
+absolute tolerance for FP32/FP16 and 0.01 for BF16. The deterministic 128- and
+512-token smoke outputs, including reasoning, match the saved resident reference
+outputs exactly. Portable QSA checks cover chunking, snapshots, ragged state and
+partitioned execution.

@@ -14,7 +14,7 @@ thread_local! {
     };
 }
 
-/// One lazy device-side index-domain assertion.
+/// One lazy device-side value or index-domain assertion.
 pub struct TokenValidation {
     invalid: Array,
     message: String,
@@ -51,7 +51,7 @@ impl TokenValidationBatch {
     }
 }
 
-/// RAII collector for token assertions belonging to one semantic submission.
+/// RAII collector for device assertions belonging to one semantic submission.
 pub struct TokenValidationScope {
     active: bool,
 }
@@ -91,6 +91,13 @@ impl Drop for TokenValidationScope {
             });
         }
     }
+}
+
+pub(crate) fn register_device_validation(invalid: Array, message: &str) -> Result<(), Exception> {
+    register_token_validation(TokenValidation {
+        invalid,
+        message: message.into(),
+    })
 }
 
 fn register_token_validation(validation: TokenValidation) -> Result<(), Exception> {

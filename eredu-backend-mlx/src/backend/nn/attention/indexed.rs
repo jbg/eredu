@@ -101,6 +101,11 @@ pub fn indexed_sparse_attention(
     input: &IndexedAttentionInput<'_, MlxTensor>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if input.queries.as_array().shape().get(2) == Some(&1)
+        && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu
+    {
+        return resident_decode(input, stream);
+    }
     indexed_attention_with_reader(input, stream, |batch, positions, stream| {
         let origin = i64::from(input.key_position_offset);
         let length = i64::from(input.keys.as_array().dim(2));
@@ -125,6 +130,144 @@ pub fn indexed_sparse_attention(
         };
         Ok((gather(input.keys)?, gather(input.values)?))
     })
+}
+
+// One resident query per batch needs no host position list or reader lease.
+// Keep indices and validity on-device and retain assertions until completion.
+fn resident_decode(
+    input: &IndexedAttentionInput<'_, MlxTensor>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    input
+        .validate()
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let q = input.queries.as_array();
+    let source_keys = input.keys.as_array();
+    let source_values = input.values.as_array();
+    let length = source_keys.dim(2);
+    let selected = input.selected_positions.as_array().dim(2);
+    if !matches!(
+        input.selected_positions.as_array().dtype(),
+        Dtype::Int32 | Dtype::Uint32
+    ) || input
+        .validity
+        .is_some_and(|v| v.as_array().dtype() != Dtype::Bool)
+    {
+        return Err(Exception::custom(
+            "indexed positions/validity must be 32-bit integers/boolean",
+        ));
+    }
+    let mut outputs = Vec::new();
+    for batch in 0..q.dim(0) {
+        let positions = input
+            .selected_positions
+            .as_array()
+            .try_index_device((batch, 0, ..), stream)?
+            .as_dtype(Dtype::Int64, stream)?;
+        let mut valid = positions.ne(Array::from_int(-1), stream)?;
+        if let Some(validity) = input.validity {
+            valid = valid.logical_and(
+                validity
+                    .as_array()
+                    .try_index_device((batch, 0, ..), stream)?,
+                stream,
+            )?;
+        }
+        let indices = positions.subtract(Array::from_int(input.key_position_offset), stream)?;
+        let in_range = indices
+            .ge(Array::from_int(0), stream)?
+            .logical_and(indices.lt(Array::from_int(length), stream)?, stream)?;
+        super::super::tensor::register_device_validation(
+            valid
+                .logical_and(in_range.logical_not(stream)?, stream)?
+                .any(false, stream)?,
+            "indexed position is outside retained source",
+        )?;
+        valid = valid.logical_and(in_range, stream)?;
+        let safe = r#where(&valid, &indices, Array::from_int(0), stream)?
+            .as_dtype(Dtype::Int32, stream)?;
+        let row_valid = valid.reshape(&[1, 1, selected, 1], stream)?;
+        let gather = |source: &Array| -> Result<Array, Exception> {
+            if length == 0 {
+                return zeros_dtype(
+                    &[1, source.dim(1), selected, source.dim(3)],
+                    source.dtype(),
+                    stream,
+                );
+            }
+            let rows = take_axis(
+                source.try_index_device((batch..batch + 1, .., .., ..), stream)?,
+                &safe,
+                2,
+                stream,
+            )?;
+            r#where(&row_valid, rows, Array::from_f32(0.), stream)?.as_dtype(source.dtype(), stream)
+        };
+        let keys = gather(source_keys)?;
+        let values = gather(source_values)?;
+        let mask = r#where(
+            valid.reshape(&[1, 1, 1, selected], stream)?,
+            mask_row(input.mask, input, batch, 0, selected, stream)?,
+            Array::from_f32(f32::NEG_INFINITY),
+            stream,
+        )?;
+        outputs.push(attend_selected(
+            input, batch, 0, keys, values, mask, stream,
+        )?);
+    }
+    concatenate_axis(&outputs, 0, stream)
+}
+
+fn attend_selected(
+    input: &IndexedAttentionInput<'_, MlxTensor>,
+    batch: i32,
+    query: i32,
+    selected_keys: Array,
+    selected_values: Array,
+    selected_mask: Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let q = input.queries.as_array();
+    let (keys, values, mask) = if let Some(local) = &input.local {
+        let local_keys = local
+            .keys
+            .as_array()
+            .try_index_device((batch..batch + 1, .., .., ..), stream)?;
+        let local_values = local
+            .values
+            .as_array()
+            .try_index_device((batch..batch + 1, .., .., ..), stream)?;
+        let local_mask = mask_row(local.mask, input, batch, query, local_keys.dim(2), stream)?;
+        (
+            concatenate_axis(&[local_keys, selected_keys], 2, stream)?,
+            concatenate_axis(&[local_values, selected_values], 2, stream)?,
+            concatenate_axis(&[local_mask, selected_mask], -1, stream)?,
+        )
+    } else {
+        (selected_keys, selected_values, selected_mask)
+    };
+    let query = q.try_index_device((batch..batch + 1, .., query..query + 1, ..), stream)?;
+    if keys.dim(2) == 0 {
+        return zeros_dtype(&[1, q.dim(1), 1, values.dim(3)], q.dtype(), stream);
+    }
+    let mut output = super::attention_with_softcap(
+        &query,
+        &keys,
+        &values,
+        input.scale,
+        Some(&mask),
+        input.sinks.map(MlxTensor::as_array),
+        None,
+        input.arithmetic,
+        stream,
+    )?;
+    if input.sinks.is_none() {
+        let any = mask
+            .gt(Array::from_f32(f32::NEG_INFINITY), stream)?
+            .any_axis(-1, true, stream)?;
+        output = r#where(any, output, Array::from_f32(0.), stream)?.as_dtype(q.dtype(), stream)?;
+    }
+    Ok(output)
 }
 
 /// Executes through a cache-owned reader. The reader receives sorted unique
@@ -219,52 +362,15 @@ pub(crate) fn indexed_attention_with_reader(
                 Array::from_f32(f32::NEG_INFINITY),
                 stream,
             )?;
-            let (keys, values, mask) = if let Some(local) = &input.local {
-                let local_keys = local
-                    .keys
-                    .as_array()
-                    .try_index_device((batch..batch + 1, .., .., ..), stream)?;
-                let local_values = local
-                    .values
-                    .as_array()
-                    .try_index_device((batch..batch + 1, .., .., ..), stream)?;
-                let local_mask =
-                    mask_row(local.mask, input, batch, query, local_keys.dim(2), stream)?;
-                (
-                    concatenate_axis(&[local_keys, selected_keys], 2, stream)?,
-                    concatenate_axis(&[local_values, selected_values], 2, stream)?,
-                    concatenate_axis(&[local_mask, selected_mask], -1, stream)?,
-                )
-            } else {
-                (selected_keys, selected_values, selected_mask)
-            };
-            let query = q.try_index_device((batch..batch + 1, .., query..query + 1, ..), stream)?;
-            if keys.dim(2) == 0 {
-                outputs.push(zeros_dtype(
-                    &[1, q.dim(1), 1, values.dim(3)],
-                    q.dtype(),
-                    stream,
-                )?);
-                continue;
-            }
-            let mut output = super::attention_with_softcap(
-                &query,
-                &keys,
-                &values,
-                input.scale,
-                Some(&mask),
-                input.sinks.map(MlxTensor::as_array),
-                None,
-                input.arithmetic,
+            let output = attend_selected(
+                input,
+                batch,
+                query,
+                selected_keys,
+                selected_values,
+                selected_mask,
                 stream,
             )?;
-            if input.sinks.is_none() {
-                let any = mask
-                    .gt(Array::from_f32(f32::NEG_INFINITY), stream)?
-                    .any_axis(-1, true, stream)?;
-                output = r#where(any, output, Array::from_f32(0.0), stream)?
-                    .as_dtype(q.dtype(), stream)?;
-            }
             // Complete the bounded gather/attention graph before retaining the
             // next query. Only completed output rows accumulate across a prefill.
             safemlx::transforms::eval([&output])?;

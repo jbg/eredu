@@ -5074,6 +5074,38 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Indices outside the supported axis domain must fail; deferred validation must prevent the
     /// native gather from reading outside its source while work is pending.
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error>;
+    /// Whether both optional row ranking and validated index compaction are
+    /// available in this execution context. This query does not evaluate tensors.
+    fn supports_row_selection(context: &Self::Context) -> bool {
+        let _ = context;
+        false
+    }
+    /// Optional bounded device selection: this rank-one F32 score tensor ranks
+    /// the rows of an I32 matrix. Returns up to `count` scores/rows in descending
+    /// score order, breaking ties by original row index. Nonfinite scores fail,
+    /// possibly at submission completion. `None` requests a portable fallback.
+    fn topk_rows(
+        &self,
+        rows: &Self,
+        count: i32,
+        context: &Self::Context,
+    ) -> Result<Option<(Self, Self)>, Error> {
+        let _ = (rows, count, context);
+        Ok(None)
+    }
+    /// Optional device compaction of an I32 matrix of ascending index rows.
+    /// Every row must be strictly increasing with values in `[0, upper)`;
+    /// values must also be globally unique. Returns a sorted rank-one tensor.
+    /// Validation may be deferred until submission completion. `None` requests
+    /// a portable fallback; invalid values must never cause an unchecked gather.
+    fn sorted_unique_indices(
+        &self,
+        upper: i32,
+        context: &Self::Context,
+    ) -> Result<Option<Self>, Error> {
+        let _ = (upper, context);
+        Ok(None)
+    }
     /// Creates a zero tensor with the same shape and physical dtype.
     fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {
         let _ = context;

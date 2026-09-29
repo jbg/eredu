@@ -416,7 +416,7 @@ impl Default for AutomaticPlannerPolicy {
         Self {
             device_memory_fallback_bytes: 4 << 30,
             host_memory_fallback_bytes: 16 << 30,
-            memory_headroom_percent: 30,
+            memory_headroom_percent: 10,
             expert_cache_share_percent: 40,
             device_layer_window: 1,
             max_cached_shards: DEFAULT_MAX_CACHED_SHARDS,
@@ -1427,6 +1427,16 @@ impl AutomaticPlanner {
                 request.device.backend, request.device.device, self.policy.memory_headroom_percent
             ),
         }];
+        entries.push(PlanExplanationEntry {
+            level: PlanExplanationLevel::Decision,
+            code: "residency_memory_budget".into(),
+            detail: format!(
+                "parameter estimate: {}; device budget: {} bytes; host budget: {} bytes after headroom",
+                model_bytes.map_or_else(|| "unavailable".into(), |bytes| format!("{bytes} bytes")),
+                device_budget,
+                host_budget,
+            ),
+        });
         let mut selected = None;
         for candidate in candidates {
             validate_candidate(&candidate, request)?;
@@ -2042,7 +2052,7 @@ mod tests {
         let report = AutomaticPlanner::default()
             .plan(
                 &MockPlanningBackend {
-                    model_bytes: 10 << 30,
+                    model_bytes: 11 << 30,
                     embedded_layers: 2,
                     embedded_capacity: Some(2),
                     ..MockPlanningBackend::default()
@@ -2062,6 +2072,28 @@ mod tests {
             observed_u64(&report.resources.pinned_parameter_bytes),
             Some(1 << 20)
         );
+    }
+
+    #[test]
+    fn automatic_resident_selection_reserves_headroom_from_available_memory() {
+        // The device has 16 GiB total but only 12 GiB available. Ten GiB fits
+        // with the default reserve; eleven fits physical RAM but not the budget.
+        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
+        for (model_gib, resident) in [(10, true), (11, false)] {
+            let report = AutomaticPlanner::default()
+                .plan(
+                    &MockPlanningBackend {
+                        model_bytes: model_gib << 30,
+                        ..MockPlanningBackend::default()
+                    },
+                    &request,
+                )
+                .unwrap();
+            assert_eq!(
+                matches!(report.plan.residency(), ResidencyPlan::FullyResident),
+                resident,
+            );
+        }
     }
 
     #[test]
@@ -2211,7 +2243,7 @@ mod tests {
     fn automatic_planning_validates_each_exact_candidate_once_and_retains_the_final_proof() {
         let backend = RetainedPlanningBackend {
             inner: MockPlanningBackend {
-                model_bytes: 10 << 30,
+                model_bytes: 11 << 30,
                 embedded_layers: 2,
                 embedded_capacity: Some(2),
                 ..MockPlanningBackend::default()

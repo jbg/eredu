@@ -2,6 +2,7 @@ use super::*;
 use eredu_nn::{RoutingArithmetic, RoutingPrecision};
 
 mod intervention;
+mod partition;
 
 /// Selector score transform used before top-k group selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -606,11 +607,17 @@ fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array,
             .eq(&cutoff, stream)?
             .as_dtype(Dtype::Int32, stream)?
             .sum_axis(-1, false, stream)?;
-        if all_ties
-            .gt(selected_ties, stream)?
-            .any(None, stream)?
-            .try_item::<bool>(stream)?
-        {
+        let tied = all_ties.gt(selected_ties, stream)?.any(None, stream)?;
+        if let Some(repaired) = partition::repair(
+            &descending.as_dtype(Dtype::Float32, stream)?,
+            &indices,
+            &tied,
+            count,
+            stream,
+        )? {
+            return Ok(repaired);
+        }
+        if tied.try_item::<bool>(stream)? {
             // Native GPU partitions break cutoff ties by index. Share the
             // value-only partition when a tie crosses the cutoff. Only scores
             // and indices cross streams; expert tensors retain their storage.
@@ -765,6 +772,36 @@ fn native_largest_partition_shares_value_only_cutoff_ties() {
             actual.as_slice::<i32>(),
             expected.as_slice::<i32>(),
             "width {width}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+#[test]
+fn native_partition_matches_value_only_cpu_on_repeated_scores() {
+    let cpu = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let gpu = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    for (width, count) in [(32, 1), (64, 4), (512, 8), (1024, 16)] {
+        let values = (0..width * 5)
+            .map(|i| ((i * 17 + i / width * 3) % 11) as f32)
+            .collect::<Vec<_>>();
+        let scores = Array::from_slice(&values, &[5, width]);
+        let expected = largest_indices(&scores, count, &cpu)
+            .unwrap()
+            .as_dtype(Dtype::Int32, &cpu)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        let actual = largest_indices(&scores, count, &gpu)
+            .unwrap()
+            .as_dtype(Dtype::Int32, &gpu)
+            .unwrap()
+            .into_evaluated()
+            .unwrap();
+        assert_eq!(
+            actual.as_slice::<i32>(),
+            expected.as_slice::<i32>(),
+            "width {width}, count {count}"
         );
     }
 }

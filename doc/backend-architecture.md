@@ -7555,6 +7555,14 @@ integer controls and selected parameter transforms. Prompt-cache and speculative
 identity use the bound fingerprint. Equal headers and state shapes alone cannot authorize
 restoring state computed with different controls.
 
+Routed expert admission compares member recipes against the admitted catalog output
+geometry. Direct GGUF outputs may contain packed words, native block bytes or scale
+companions; their shapes differ from the physical GGUF tensor's decoded dimensions.
+The physical source shape and exact bounded member recipe remain independently checked.
+Ordinary source preparation retains architecture-selected GGUF representations,
+including bounded F32 views for head permutations that cross quantization blocks;
+binding opens those retained views with the same metadata used for cold selection.
+
 Architecture-owned GGUF recipes map metadata and tensors, undo normalization offsets,
 negative exponential recurrent coefficients, recurrent head permutations and convolution
 squeezing, and join split indexer projections. The shared gated-delta head-layout recipe
@@ -7938,3 +7946,46 @@ Reusable miniature artifacts and comparison fixtures belong to `eredu-evaluation
 dependencies. Production architectures, facade and backends do not depend on evaluation. Native
 conformance uses ordinary selected constructors and erased executables. Numerical, distributed
 and released-artifact verification scope is recorded in the family validation report.
+
+### Automatic residency memory reserve
+
+The automatic planner reserves 10% of observed available memory for runtime state,
+temporary allocations and observation drift. Resident admission compares selected
+materialized parameter bytes against the remaining device budget; installed memory
+does not replace a current availability observation. This percentage is a tunable
+heuristic, not a request-specific bound on context state or activation workspace.
+The plan explanation includes parameter bytes and post-reserve host/device budgets.
+CLI cached-plan admission uses the same default reserve as fresh planning.
+
+### Native selection without intermediate host reads
+
+The MLX routed selector retains cutoff-tie detection as a device reduction. Metal
+repairs tied partitions for banks up to 1024 entries and selection widths up to 16
+using the value-only partition convention of the CPU reference. Prefix ordering
+uses native stable sorting. Larger geometries retain the general compatibility
+path. The compatibility kernel derives from libc++ selection under
+Apache-2.0 WITH LLVM-exception; its source records the attribution.
+
+`Tensor::topk_rows` and `Tensor::sorted_unique_indices` are optional neutral row
+ranking and validated index-compaction mechanisms. The MLX realization uses device
+sorting/gathering and retains finite-score, range, ordering and uniqueness checks
+in the submission validation batch. Completion checks these assertions before
+publishing the submission; standalone synchronous calls validate before returning.
+QSA scoring equations, causal bounds, stream geometry and padding remain in
+`eredu-architectures`. The native path operates on one decode query per lane within one admitted summary
+tile; prefill and longer histories retain completed-tile portable selection instead of retaining an
+unbounded lazy graph. Workspace includes the bounded position tile.
+
+Resident indexed attention queues a single decode query per batch directly from
+device positions, preserving slot multiplicity, invalid-slot masking, source
+origins, local sources and sinks. Range assertions join the same completion
+batch. It does not materialize a host position list or complete an intermediate
+attention result. Cache-owned paged readers and multi-query prefill retain the
+completed-query bounded gather path.
+
+Small Q4_K grouped projections (up to 16 routes) share the ordinary two-output-row
+SIMD vector kernel, with independent route/input and physical-bank offsets.
+Larger route batches retain the grouped prefill kernel. Encoded blocks and row
+views remain unchanged; FP32 accumulation precedes the requested activation dtype.
+The ignored `q4k_grouped_decode_benchmark` compares device timeline durations for
+both kernels after warmup; its fixture is a `[32,640,2560]` bank with ten routes.

@@ -3283,6 +3283,30 @@ fn validate_catalog_parameter_topology<O: RoutedGroupedOperationValidation>(
                         ))
                     })?
                     .to_vec();
+                // GGUF source geometry counts decoded weights, while its catalog
+                // output describes packed words, native bytes, or scale companions.
+                // Member recipes select that output, not the on-disk tensor shape.
+                if matches!(
+                    requirement.source_encoding(),
+                    Some(eredu_checkpoint::SourceTensorEncoding::Gguf { .. })
+                ) {
+                    let [source] = requirement.sources() else {
+                        return Err(RoutedTextRequirementsError::Invalid(format!(
+                            "bank target {:?} requires one direct GGUF source",
+                            parameter.logical_target()
+                        )));
+                    };
+                    let output = recipe_source
+                        .tensor_metadata(source)
+                        .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?;
+                    if output.physical_shape != expected_physical {
+                        return Err(RoutedTextRequirementsError::Invalid(format!(
+                            "bank target {:?} GGUF source shape differs from admitted physical geometry",
+                            parameter.logical_target()
+                        )));
+                    }
+                    expected_physical = output.logical_shape;
+                }
                 if occurrences > 1 {
                     let first = expected_physical.first_mut().ok_or_else(|| {
                         RoutedTextRequirementsError::Invalid(

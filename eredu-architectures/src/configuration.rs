@@ -829,6 +829,17 @@ impl GgufArchitecturePlan {
         }
     }
 
+    /// Preserves source representations selected by architecture admission.
+    pub(crate) fn prepared_checkpoint<'a>(
+        &'a self,
+        admitted: &'a eredu_gguf::Checkpoint,
+    ) -> &'a eredu_gguf::Checkpoint {
+        match &self.model {
+            GgufModelConfig::Qwen4Exp(plan) => plan.text_plan().checkpoint(),
+            _ => admitted,
+        }
+    }
+
     /// Exact GGUF architecture selected for this checkpoint.
     pub const fn architecture(&self) -> GgufArchitecture {
         self.architecture
