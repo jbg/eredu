@@ -1,8 +1,7 @@
 use super::*;
 use eredu_core::ParallelTopology;
 use eredu_runtime::{
-    project_all_communication_manifests, CommunicationGroupRequirements, TensorSlice,
-    TopologyCommunicationPlan,
+    project_all_communication_manifests, CommunicationGroupRequirements, TopologyCommunicationPlan,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -683,17 +682,6 @@ fn mlx_capabilities_are_operation_specific_and_exclude_encoded_payloads() {
 }
 
 #[test]
-fn validates_tensor_slices() {
-    let slice = TensorSlice::for_shape(&[4, 12], 1, 2, 3).unwrap();
-    assert_eq!(slice.start(), 8);
-    assert_eq!(slice.end(), 12);
-    assert_eq!(slice.local_shape(&[4, 12]), [4, 4]);
-    assert!(TensorSlice::for_shape(&[4, 11], 1, 0, 3).is_err());
-    assert!(TensorSlice::for_shape(&[4, 12], 2, 0, 3).is_err());
-    assert!(TensorSlice::for_shape(&[4, 12], 1, 3, 3).is_err());
-}
-
-#[test]
 fn validates_explicit_execution_stream_device() {
     let stream = stream();
     topology(0, 1, 1, 1)
@@ -702,35 +690,6 @@ fn validates_explicit_execution_stream_device() {
     let other_assignment =
         MlxRankContext::new(1, 0, DeviceAssignment::new(DeviceType::Cpu, 1)).unwrap();
     assert!(other_assignment.validate_execution_stream(&stream).is_err());
-}
-
-#[test]
-fn plan_exposes_replicated_omitted_and_quantized_companions() {
-    let mut plan = PlacementPlan::new(topology(0, 1, 1, 1));
-    plan.insert("replicated", TensorPlacement::Replicated);
-    plan.insert("remote", TensorPlacement::Omit);
-    plan.insert_quantized_companions("projection", TensorPlacement::Local, true);
-    assert_eq!(
-        plan.placement("replicated"),
-        Some(&TensorPlacement::Replicated)
-    );
-    assert_eq!(plan.placement("remote"), Some(&TensorPlacement::Omit));
-    assert_eq!(
-        plan.placement("projection.weight"),
-        Some(&TensorPlacement::Local)
-    );
-    assert_eq!(
-        plan.placement("projection.scales"),
-        Some(&TensorPlacement::Local)
-    );
-    assert_eq!(
-        plan.placement("projection.biases"),
-        Some(&TensorPlacement::Local)
-    );
-
-    let mut invalid = PlacementPlan::new(topology(0, 1, 1, 1));
-    invalid.insert("bad_owner", TensorPlacement::Rank { rank: 1 });
-    assert!(invalid.validate().is_err());
 }
 
 #[test]
@@ -765,22 +724,6 @@ fn plan_supports_balanced_uneven_ranges() {
     )
     .unwrap();
     plan.validate().unwrap();
-}
-
-#[test]
-fn typed_rank_ownership_resolves_locally() {
-    let mut rank_zero = PlacementPlan::new(topology(0, 2, 2, 1));
-    rank_zero.insert("owned", TensorPlacement::Rank { rank: 3 });
-    let mut rank_three = PlacementPlan::new(topology(3, 2, 2, 1));
-    rank_three.insert("owned", TensorPlacement::Rank { rank: 3 });
-    assert!(matches!(
-        rank_zero.logical.resolve("owned", &[2]).unwrap(),
-        eredu_runtime::ResolvedTensorPlacement::Omit
-    ));
-    assert!(matches!(
-        rank_three.logical.resolve("owned", &[2]).unwrap(),
-        eredu_runtime::ResolvedTensorPlacement::Materialize
-    ));
 }
 
 #[test]

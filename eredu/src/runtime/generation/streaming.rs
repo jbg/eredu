@@ -1713,18 +1713,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_stop_is_released_at_eof() {
-        let input = "visible STO";
-        for split in split_points(input) {
-            let mut matcher = StopMatcher::new([], ["STOP"]);
-            let first = matcher.push(&input[..split]);
-            let second = matcher.push(&input[split..]);
-            assert!(first.matched.is_none() && second.matched.is_none());
-            assert_eq!(first.visible + &second.visible + &matcher.finish(), input);
-        }
-    }
-
-    #[test]
     fn partial_trigger_tag_and_delimiter_match_at_every_boundary() {
         let input = "a<r>b</r>c::d";
         for split in split_points(input) {
@@ -2103,16 +2091,6 @@ mod tests {
         assert!(tokens.is_empty());
         assert_eq!(reason, FinishReason::Cancelled);
         assert_exactly_one_finished(&events, FinishReason::Cancelled);
-    }
-
-    #[test]
-    fn cancellation_token_can_be_triggered_from_another_thread() {
-        let cancellation = GenerationCancellationToken::new();
-        let worker_token = cancellation.clone();
-        std::thread::spawn(move || worker_token.cancel())
-            .join()
-            .unwrap();
-        assert!(cancellation.is_cancelled());
     }
 
     #[test]

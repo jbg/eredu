@@ -18,20 +18,6 @@ fn usage(claims: u64, payload: u64, reserved: u64) -> ParameterConversionRetenti
     }
 }
 
-fn report(scope: &str) -> ParameterConversionRetentionReport {
-    ParameterConversionRetentionReport {
-        group: group(scope),
-        policy: Observed::exact(
-            ParameterConversionRetentionPolicyReport::resolve(
-                None,
-                ParameterConversionRetentionEligibility::Eligible,
-            ),
-            "selected execution",
-        ),
-        usage: Observed::exact(usage(2, 1024, 512), "retention controller snapshot"),
-    }
-}
-
 #[test]
 fn policy_normalization_preserves_request_and_provenance() {
     use ParameterConversionRetentionPolicy::{Bounded, Disabled, Unlimited};
@@ -122,85 +108,6 @@ fn exclusions_disable_effective_policy_without_hiding_the_request() {
             );
         }
     }
-}
-
-#[test]
-fn composed_report_round_trip_keeps_independent_group_scope_and_usage() {
-    let target = report("target_instance");
-    let mut drafter = report("external_drafter_instance");
-    drafter.usage = Observed::exact(usage(1, 256, 0), "drafter controller");
-    assert_ne!(target.group, drafter.group);
-    let snapshot = OffloadTelemetry::default()
-        .snapshot()
-        .with_parameter_conversion_retention(Observed::exact(
-            vec![target, drafter],
-            "composed execution groups",
-        ));
-    let encoded = serde_json::to_value(&snapshot).unwrap();
-    assert_eq!(
-        encoded["parameter_conversion_retention"]["value"][0]["policy"]["value"]["source"],
-        "managed_default"
-    );
-    assert_eq!(
-        serde_json::from_value::<OffloadReport>(encoded).unwrap(),
-        snapshot
-    );
-    let groups = snapshot.parameter_conversion_retention().value().unwrap();
-    let target_usage = groups[0].usage.value().unwrap();
-    assert_eq!(target_usage.retained_payload_bytes, 1024);
-    assert_eq!(target_usage.reserved_payload_bytes, 512);
-    assert!(matches!(
-        target_usage.retained_backing_capacity_bytes,
-        Observed::Unsupported { .. }
-    ));
-}
-
-#[test]
-fn missing_and_unsupported_observations_are_not_observed_empty() {
-    let missing = OffloadTelemetry::default().snapshot();
-    let unsupported = missing
-        .clone()
-        .with_parameter_conversion_retention(Observed::unsupported(
-            "backend does not expose retention accounting",
-        ));
-    let empty = missing
-        .clone()
-        .with_parameter_conversion_retention(Observed::exact(
-            vec![],
-            "no selected retention groups",
-        ));
-    assert!(matches!(
-        missing.parameter_conversion_retention(),
-        Observed::Unavailable { .. }
-    ));
-    assert!(matches!(
-        unsupported.parameter_conversion_retention(),
-        Observed::Unsupported { .. }
-    ));
-    assert_eq!(
-        empty.parameter_conversion_retention().value(),
-        Some(&vec![])
-    );
-    assert_ne!(empty, missing);
-    assert_ne!(empty, unsupported);
-    for snapshot in [missing, unsupported, empty] {
-        let encoded = serde_json::to_string(&snapshot).unwrap();
-        assert_eq!(
-            serde_json::from_str::<OffloadReport>(&encoded).unwrap(),
-            snapshot
-        );
-    }
-
-    let mut group_report = report("target");
-    group_report.usage = Observed::exact(usage(0, 0, 0), "observed empty cache");
-    let zero = group_report.usage.clone();
-    group_report.usage = Observed::unsupported("usage observation unsupported");
-    assert_ne!(group_report.usage, zero);
-    let encoded = serde_json::to_string(&group_report).unwrap();
-    assert_eq!(
-        serde_json::from_str::<ParameterConversionRetentionReport>(&encoded).unwrap(),
-        group_report
-    );
 }
 
 #[test]

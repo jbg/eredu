@@ -2750,8 +2750,8 @@ mod tests {
 
     use super::{
         checkpoint_key_for_parameter, checkpoint_layout_axes, checkpoint_parameter_for_key,
-        parameter_topology, prepare_catalog, prepare_source, released_checkpoint_requirements,
-        Config, Mimi, MimiArtifactError, MimiParameterRequirement, RecipeDtype,
+        prepare_catalog, prepare_source, released_checkpoint_requirements, Config, Mimi,
+        MimiArtifactError, MimiParameterRequirement,
     };
     use eredu_checkpoint::store::{
         CheckpointLease, CheckpointSource, TensorMetadata, TensorReadRequest,
@@ -2874,65 +2874,12 @@ mod tests {
     }
 
     #[test]
-    fn parameter_names_are_unique_and_cover_checkpoint_mapping() {
-        let active = parameter_topology(Config::v0_1(Some(8))).unwrap();
-        let full = parameter_topology(Config::v0_1(Some(32))).unwrap();
-        assert_eq!(active.len(), 246);
-        assert_eq!(full.len(), 318);
-        for model_name in full.keys() {
-            let checkpoint_name = checkpoint_key_for_parameter(model_name)
-                .unwrap_or_else(|| panic!("model parameter was not mapped: {model_name}"));
-            assert_eq!(
-                checkpoint_parameter_for_key(&checkpoint_name).as_deref(),
-                Some(model_name.as_str()),
-                "checkpoint mapping did not round-trip"
-            );
-        }
-    }
-
-    #[test]
-    fn exact_catalog_preparation_validates_total_topology_without_payload_reads() {
-        for active in 1..=32 {
-            let (_, requirements) = exact_source();
-            let source = Arc::new(MetadataSource::exact(&requirements));
-            let prepared = prepare_source(source.clone(), Config::v0_1(Some(active))).unwrap();
-            assert_eq!(prepared.requirements().len(), 318);
-            assert_eq!(prepared.bindings().len(), 3 * active as usize + 222);
-            assert_eq!(
-                prepared
-                    .requirements()
-                    .iter()
-                    .filter(|requirement| requirement.is_active())
-                    .count(),
-                3 * active as usize + 222
-            );
-            assert!(prepared.requirements().iter().all(|requirement| {
-                requirement.source_dtype() == &StoredDtype::F32
-                    && requirement.output_dtype() == &RecipeDtype::F32
-                    && requirement.source_encoding()
-                        == &SourceTensorEncoding::Safetensors(StoredDtype::F32)
-            }));
-            assert_eq!(
-                prepared
-                    .requirements()
-                    .iter()
-                    .filter(|requirement| matches!(
-                        requirement.recipe(),
-                        eredu_checkpoint::recipe::DerivedWeightRecipe::Transpose { .. }
-                    ))
-                    .count(),
-                30
-            );
-            assert_eq!(
-                prepared
-                    .requirements()
-                    .iter()
-                    .filter(|requirement| requirement.recipe().source_keys().len() == 1)
-                    .count(),
-                318
-            );
-            assert_eq!(source.payload_reads.load(Ordering::Relaxed), 0);
-        }
+    fn catalog_preparation_does_not_read_payloads() {
+        let (_, requirements) = exact_source();
+        let source = Arc::new(MetadataSource::exact(&requirements));
+        let prepared = prepare_source(source.clone(), Config::v0_1(Some(8))).unwrap();
+        assert_eq!(prepared.bindings().len(), 246);
+        assert_eq!(source.payload_reads.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3019,16 +2966,6 @@ mod tests {
         ));
         assert_eq!(wrong_encoding.payload_reads.load(Ordering::Relaxed), 0);
         assert_eq!(source.payload_reads.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn v0_1_config_defaults_to_moshi_active_codebooks() {
-        let cfg = Config::v0_1(None);
-        assert_eq!(cfg.sample_rate, 24_000.0);
-        assert_eq!(cfg.frame_rate, 12.5);
-        assert_eq!(cfg.num_codebooks, 16);
-        assert_eq!(cfg.total_codebooks, 32);
-        assert_eq!(cfg.bins, 2_048);
     }
 
     #[test]

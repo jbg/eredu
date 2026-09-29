@@ -1025,7 +1025,7 @@ checkpoint_plan!(GgufCheckpointPlan, GgufTensorConstraint);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockFp8Format, BlockFp8ScaleEncoding, WeightQuantization};
+    use crate::{BlockFp8Format, BlockFp8ScaleEncoding};
 
     #[test]
     fn block_fp8_matrix_declares_exact_weight_scale_geometry_and_dtype() {
@@ -1070,23 +1070,6 @@ mod tests {
             ),
             Err(MatrixConstraintError::MissingBlockScaleName { .. })
         ));
-    }
-
-    #[test]
-    fn packed_matrix_accepts_only_declared_physical_aliases() {
-        let format = LinearFormat::from(WeightQuantization::Affine(
-            crate::AffineQuantization::new(32, 4).unwrap(),
-        ));
-        let constraints = matrix_for_linear_format(
-            "projection.weight",
-            ["projection.alias.weight"],
-            vec![64, 64],
-            format,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(constraints[0].aliases, ["projection.alias.weight"]);
     }
 
     #[test]

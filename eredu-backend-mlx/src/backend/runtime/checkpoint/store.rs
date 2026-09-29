@@ -30,16 +30,11 @@ use super::gguf::GgufTensor;
 #[cfg(test)]
 use super::gguf::GgufCheckpoint;
 #[cfg(test)]
-use eredu_checkpoint::gguf_store::{
-    GgufPhysicalSelection, GgufWeightStore as NeutralGgufWeightStore,
-};
+use eredu_checkpoint::gguf_store::GgufWeightStore as NeutralGgufWeightStore;
 #[cfg(test)]
 use eredu_checkpoint::store::{
     CheckpointSource, ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorReadRequest,
-    WeightStoreBackend, WeightStoreDiagnostics,
 };
-#[cfg(test)]
-use eredu_gguf::TensorSelection as GgufTensorSelection;
 
 pub(super) fn safetensors_dtype(
     key: &str,
@@ -195,9 +190,6 @@ mod materialization;
 
 pub use leases::WeightLease;
 pub use materialization::{PendingWeightMaterialization, WeightMaterialization};
-
-#[cfg(test)]
-use leases::WeightLeaseSource;
 
 #[cfg(test)]
 mod tests;

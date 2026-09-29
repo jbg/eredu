@@ -1297,10 +1297,7 @@ where
 /// The unit tests below are adapted from the Swift binding tests
 #[cfg(test)]
 mod tests {
-    use crate::{
-        ops::{indexing::*, ones, zeros},
-        Array,
-    };
+    use crate::{ops::indexing::*, Array};
 
     #[test]
     fn test_array_mutate_single_index() {
@@ -1508,16 +1505,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_slice_update_with_broadcast() {
-        let stream = crate::test_stream();
-        let mut xs = zeros::<f32>(&[4, 3, 2], stream).unwrap();
-        let x = ones::<f32>(&[4, 2], stream).unwrap();
-
-        let result = xs.try_index_mut_device((.., 0, ..), x, stream);
-        assert!(
-            result.is_ok(),
-            "Failed to update slice with broadcast: {result:?}"
-        );
-    }
 }

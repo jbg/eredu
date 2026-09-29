@@ -1,13 +1,13 @@
 // Residency, persistence, and resource-lifetime tests.
 
 use super::{
-    cpu_stream, hash_prompt_cache_shard_payload,
-    host_cache_capacity_upper_bound, inspect_prompt_cache, open_prompt_cache, load_host_cache_block_direct,
-    CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind,
+    cpu_stream, hash_prompt_cache_shard_payload, host_cache_capacity_upper_bound,
+    inspect_prompt_cache, load_host_cache_block_direct, open_prompt_cache, CacheBlockArrays,
+    CacheBlockId, CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind,
     CacheLayerResidencyStats, CacheManagerState, CachePoolError, CachePoolResource,
-    CacheRankIdentity, CacheRepresentation, CacheStreamId, CacheResidencyError, CacheResidencyManager,
-    CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask,
-    DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
+    CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheResidencyPool,
+    CacheStoragePhase, CacheStreamId, CacheTier, DiskLocation, DiskResult, DiskTask, DiskWorker,
+    DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
     HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
     StateTensorOwner, StateTensorRole,
 };
@@ -15,10 +15,10 @@ use eredu_core::cache::{
     prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
     MutableStateResidency, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
     PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
-    PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-    StateTensorPolicy, PROMPT_CACHE_SCHEMA_VERSION,
+    PromptCacheTopology, StateTensorDimension, StateTensorDtype, StateTensorPolicy,
+    PROMPT_CACHE_SCHEMA_VERSION,
 };
-use eredu_core::{AttentionPolicy, LayerSchedule};
+use eredu_core::LayerSchedule;
 use eredu_runtime::{
     resolve_prompt_cache_root, CachePoolLimits, CacheResidencyConfigurationError, MutableCacheTail,
     PromptCachePersistenceError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT, PROMPT_CACHE_CURRENT_FILE,
@@ -31,7 +31,6 @@ use safemlx::{
 use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 use std::{
     fs,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
@@ -160,12 +159,6 @@ fn key_value_layout(
     windows: impl IntoIterator<Item = Option<i32>>,
 ) -> LayerSchedule<LayerCachePolicy> {
     PromptCacheModelIdentity::key_value_layouts(windows, 1, 1).unwrap()
-}
-
-fn stable_hash(value: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn prompt_model_identity() -> PromptCacheModelIdentity {
@@ -406,8 +399,12 @@ fn exercise_backend_cache_lifecycle(device: Device, expected_storage: HostTransf
         .seal_block(0, 0, 1, None, backend_key_value_block(&stream), false)
         .unwrap();
     let competing = CacheResidencyManager::new(options()).unwrap();
-    competing.set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 8, 1).unwrap();
-    let aggregate_error = competing.set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 12, 1).unwrap_err();
+    competing
+        .set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 8, 1)
+        .unwrap();
+    let aggregate_error = competing
+        .set_tail_state(0, eredu_core::cache::CacheRepresentation::KeyValue, 12, 1)
+        .unwrap_err();
     assert!(matches!(
         aggregate_error,
         CacheResidencyError::Pool(CachePoolError::BudgetExceeded {

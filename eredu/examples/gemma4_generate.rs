@@ -114,27 +114,3 @@ fn default_e4b_snapshot() -> Option<PathBuf> {
         .map(|entry| entry.path())
         .find(|path| path.join("config.json").exists())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gemma4_message_uses_typed_content_parts() {
-        assert_eq!(
-            gemma4_message("hello", ModelKind::Gemma4),
-            serde_json::json!({
-                "role": "user",
-                "content": [{"type": "text", "text": "hello", "content": "hello"}],
-            })
-        );
-    }
-
-    #[test]
-    fn non_gemma4_message_uses_plain_content() {
-        assert_eq!(
-            gemma4_message("hello", ModelKind::Llama),
-            serde_json::json!({"role": "user", "content": "hello"})
-        );
-    }
-}

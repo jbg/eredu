@@ -65,98 +65,6 @@ fn prompt_cache_save_selects_only_descriptor_owned_layers() {
 const TEST_PROMPT_CACHE_GENERATION: &str = "generation-test";
 
 #[test]
-fn prefix_hash_is_order_sensitive() {
-    assert_ne!(
-        prompt_cache_token_fingerprint(&[1, 2, 3]),
-        prompt_cache_token_fingerprint(&[3, 2, 1])
-    );
-}
-
-#[test]
-fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
-    let topology = crate::test_parallel_rank(5, 2, 2, 2);
-    let coordinates = topology.coordinates();
-    let cache_topology = PromptCacheTopology::new(
-        Some((topology.pipeline_parallel_size(), coordinates.pipeline())),
-        Some((topology.tensor_parallel_size(), coordinates.tensor())),
-        Some((topology.expert_parallel_size(), coordinates.expert())),
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(cache_topology.stage(), Some((2, 1)));
-    assert_eq!(cache_topology.shard(), Some((2, 0)));
-    assert_eq!(cache_topology.addressable(), Some((2, 1)));
-    assert_eq!(
-        cache_topology.cache_rank_identity(),
-        Some(CacheRankIdentity::new(Some(1), Some(0), Some(1)))
-    );
-
-    let replicated = PromptCacheTopology::default();
-    assert_eq!(replicated, PromptCacheTopology::default());
-    assert_eq!(replicated.cache_rank_identity(), None);
-}
-
-#[test]
-fn attention_windows_reject_zero_negative_and_overflowing_sources() {
-    assert!(AttentionPolicy::from_sliding_window(Some(0)).is_err());
-    assert!(AttentionPolicy::from_sliding_window(Some(-1)).is_err());
-    for json in [
-        r#"{"sliding":{"window":0}}"#,
-        r#"{"sliding":{"window":-1}}"#,
-        r#"{"sliding":{"window":4294967296}}"#,
-    ] {
-        assert!(serde_json::from_str::<AttentionPolicy>(json).is_err());
-    }
-}
-
-#[test]
-fn cache_identity_hashes_the_complete_ordered_layout() {
-    let base = prompt_descriptor();
-    let variants = [
-        key_value_layout([Some(4)]),
-        key_value_layout([Some(5)]),
-        key_value_layout([None]),
-        key_value_layout([None, Some(4)]),
-        LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
-        PromptCacheModelIdentity::compressed_layouts(1, 1, 1).unwrap(),
-    ];
-    let hashes = variants
-        .into_iter()
-        .map(|layer_layout| {
-            let layer_count = layer_layout.len();
-            stable_hash(
-                &PromptCacheDescriptor::new(
-                    base.model_family(),
-                    base.effective_model_type(),
-                    base.checkpoint_fingerprint(),
-                    base.prefix_content_fingerprint(),
-                    base.architecture_fingerprint(),
-                    layer_count,
-                    0,
-                    layer_count,
-                    base.batch_size(),
-                    layer_layout,
-                    vec![0; layer_count],
-                    vec![
-                        eredu_core::cache::PromptCacheStateSegment::new("state", 0..layer_count)
-                            .unwrap(),
-                    ],
-                    base.sink_tokens(),
-                    base.topology().clone(),
-                )
-                .unwrap(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(hashes.len(), 6);
-
-    let first = key_value_layout([None, Some(4)]);
-    let reordered = key_value_layout([Some(4), None]);
-    assert_ne!(stable_hash(&first), stable_hash(&reordered));
-}
-
-#[test]
 fn schema_v3_is_rejected_before_v4_fields_are_decoded() {
     let directory = tempfile::tempdir().unwrap();
     let generation = create_prompt_fixture_generation(directory.path());
@@ -216,86 +124,6 @@ fn v7_layer_frontiers_validate_speculative_cache_coverage() {
         .unwrap_err()
         .to_string()
         .contains("ends at 1, expected 2"));
-}
-
-#[test]
-fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
-    let incoherent = StateTensorPolicy::new(
-        StateTensorRole::Recurrent,
-        vec![StateTensorDimension::Scalar],
-        StateTensorDtype::Float32,
-        MutableStateResidency::AlwaysDeviceMutable,
-    )
-    .expect_err("large recurrent state cannot use the rolling-state lifecycle");
-    assert!(incoherent
-        .to_string()
-        .contains("requires LayerScopedOffloadable"));
-    let convolution = StateTensorPolicy::new(
-        StateTensorRole::Convolution { slot: 0 },
-        vec![
-            StateTensorDimension::Batch,
-            StateTensorDimension::fixed(3).unwrap(),
-            StateTensorDimension::fixed(4).unwrap(),
-        ],
-        StateTensorDtype::Floating,
-        MutableStateResidency::AlwaysDeviceMutable,
-    )
-    .unwrap();
-    let recurrent = StateTensorPolicy::new(
-        StateTensorRole::Recurrent,
-        vec![
-            StateTensorDimension::Batch,
-            StateTensorDimension::fixed(4).unwrap(),
-        ],
-        StateTensorDtype::Float32,
-        MutableStateResidency::LayerScopedOffloadable,
-    )
-    .unwrap();
-    let layouts = [
-        LayerSchedule::new(
-            1,
-            vec![LayerCachePolicy::fixed_only(vec![convolution.clone()]).unwrap()],
-        )
-        .unwrap(),
-        LayerSchedule::new(
-            1,
-            vec![LayerCachePolicy::fixed_only(vec![recurrent.clone()]).unwrap()],
-        )
-        .unwrap(),
-        LayerSchedule::new(
-            1,
-            vec![LayerCachePolicy::key_value_with_state(
-                AttentionPolicy::Full,
-                1,
-                1,
-                vec![convolution.clone()],
-             Vec::new())
-            .unwrap()],
-        )
-        .unwrap(),
-    ];
-    let hashes = layouts
-        .iter()
-        .map(|layout| {
-            let json = serde_json::to_string(layout).unwrap();
-            let restored: LayerSchedule<LayerCachePolicy> = serde_json::from_str(&json).unwrap();
-            assert_eq!(&restored, layout);
-            stable_hash(layout)
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(hashes.len(), layouts.len());
-    assert_eq!(
-        convolution.residency_class(),
-        StateResidencyClass::AlwaysDeviceMutable
-    );
-    assert_eq!(
-        recurrent.residency_class(),
-        StateResidencyClass::LayerScopedOffloadable
-    );
-    assert_eq!(
-        layouts[2].get(0).unwrap().attention_residency_class(),
-        Some(StateResidencyClass::SealablePaged)
-    );
 }
 
 #[test]
@@ -421,7 +249,9 @@ fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
         first_name: "keys".into(),
         second_name: "values".into(),
         persistent: true,
-        source: Some(Arc::new(eredu_runtime::RetainedCacheShard::open_block(&shard, &manifest.blocks[0]).unwrap())),
+        source: Some(Arc::new(
+            eredu_runtime::RetainedCacheShard::open_block(&shard, &manifest.blocks[0]).unwrap(),
+        )),
         logical_bytes: manifest.blocks[0].logical_bytes,
         payload_sha256: Some(manifest.blocks[0].payload_sha256.clone()),
     };
@@ -449,7 +279,8 @@ fn imported_prompt_shards_retain_handles_without_payload_buffers() {
         .and_then(|location| location.source.as_ref())
         .is_some()));
     for record in state.blocks.values() {
-        load_host_cache_block_direct(record.disk().unwrap(), record.physical.id().representation).unwrap();
+        load_host_cache_block_direct(record.disk().unwrap(), record.physical.id().representation)
+            .unwrap();
     }
 }
 

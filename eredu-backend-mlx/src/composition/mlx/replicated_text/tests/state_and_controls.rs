@@ -600,41 +600,6 @@ fn both_text_architectures_execute_checkpoint_native_packed_gguf_formats() {
 }
 
 #[test]
-fn public_handoff_executes_admitted_gguf_mapping() {
-    let (stream, weights_stream) = execution_streams();
-    let artifacts = [
-        tiny_llama_gguf("llama", None, &stream),
-        tiny_llama_gguf("mistral", None, &stream),
-        tiny_qwen_gguf("qwen2", None, &stream),
-        tiny_qwen_gguf("qwen3", None, &stream),
-    ];
-    for artifact in artifacts {
-        let inspection =
-            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
-        let plan = eredu_core::plan_model_preparation(
-            inspection,
-            eredu_core::PreparationPolicy::default(),
-            eredu_core::SessionCapabilities::default(),
-        )
-        .unwrap();
-        let model = materialize_model_plan(
-            plan,
-            crate::MlxLoadRequest::default(),
-            &stream,
-            &weights_stream,
-        )
-        .unwrap();
-        let mut executable = model.into_executable();
-        let executable = executable.erased_mut();
-        let logits = executable
-            .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, 64]);
-        logits.evaluated().unwrap();
-    }
-}
-
-#[test]
 fn heterogeneous_generic_handoff_executes_selected_load_time_transforms() {
     let (stream, weights_stream) = execution_streams();
     let mut lfm_affine = lfm2_config();

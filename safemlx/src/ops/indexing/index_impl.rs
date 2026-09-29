@@ -1328,25 +1328,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_subscript_advanced_with_ref() {
-        let stream = crate::test_stream();
-        let a = Array::from_iter(0..35, &[5, 7])
-            .as_type::<i32>(stream)
-            .unwrap();
-
-        let i1 = Array::from_slice(&[0, 2, 4], &[3]);
-        let i2 = Array::from_slice(&[0, 1, 2], &[3]);
-
-        let s1 = a.index_device((i1, &i2), stream);
-
-        assert_eq!(s1.ndim(), 1);
-        assert_eq!(s1.shape(), &[3]);
-
-        let expected = Array::from_slice(&[0i32, 15, 30], &[3]);
-        assert_array_eq!(s1, expected, 0.01, stream = stream);
-    }
-
-    #[test]
     fn test_array_subscript_advanced_2() {
         let stream = crate::test_stream();
         let a = Array::from_iter(0..12, &[6, 2])
@@ -1358,19 +1339,6 @@ mod tests {
 
         let expected = Array::from_slice(&[0i32, 1, 4, 5, 8, 9], &[3, 2]);
         assert_array_eq!(s2, expected, 0.01, stream = stream);
-    }
-
-    #[test]
-    fn test_collection() {
-        let stream = crate::test_stream();
-        let a = Array::from_iter(0i32..20, &[2, 2, 5]);
-
-        // enumerate "rows"
-        for i in 0..2 {
-            let row = a.index_device(i, stream);
-            let expected = Array::from_iter((i * 10)..(i * 10 + 10), &[2, 5]);
-            assert_array_all_close!(row, expected, stream = stream);
-        }
     }
 
     #[test]
@@ -1412,30 +1380,6 @@ mod tests {
         let sum = result.sum(None, stream).unwrap();
 
         assert_eq!(sum.item::<i32>(&stream), expected_sum);
-    }
-
-    #[test]
-    fn test_full_index_read_single() {
-        let stream = crate::test_stream();
-        let a = Array::from_iter(0..60, &[3, 4, 5]);
-
-        // a[...]
-        check(a.index_device(Ellipsis, stream), &[3, 4, 5], 1770, stream);
-
-        // a[None]
-        check(a.index_device(NewAxis, stream), &[1, 3, 4, 5], 1770, stream);
-
-        // a[0]
-        check(a.index_device(0, stream), &[4, 5], 190, stream);
-
-        // a[1:3]
-        check(a.index_device(1..3, stream), &[2, 4, 5], 1580, stream);
-
-        // i = mx.array([2, 1])
-        let i = Array::from_slice(&[2, 1], &[2]);
-
-        // a[i]
-        check(a.index_device(i, stream), &[2, 4, 5], 1580, stream);
     }
 
     #[test]

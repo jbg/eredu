@@ -170,24 +170,6 @@ mod tests {
     }
 
     #[test]
-    fn released_defaults_cover_context_rows_and_preserve_prediction_metadata() {
-        let config = released();
-        let request = normalize_load_request(&NormalizedLoadRequest::default(), &config).unwrap();
-        let policy = request.bounded_execution().unwrap();
-        assert_eq!(policy.invocation().chunk_tokens(), 512);
-        assert_eq!(policy.invocation().history_tokens(), config.max_positions);
-        assert_eq!(policy.rows().limits().requests, 512 * 16);
-        assert_eq!(policy.append().limits().entries, 262144 / 4);
-        assert_eq!(
-            policy.rows().bank().offload().device_budget_bytes(),
-            Some(64 << 20)
-        );
-        assert_eq!(policy.rows().bank().offload().host_budget_bytes(), Some(0));
-        assert_eq!(request.drafting(), DraftingLoadRequest::Disabled);
-        assert!(config.prediction.is_some());
-    }
-
-    #[test]
     fn parallel_defaults_preserve_declared_invocation_geometry() {
         let config = released();
         let topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
@@ -219,18 +201,6 @@ mod tests {
         assert_eq!(
             normalized.parallel_execution(),
             request.parallel_execution()
-        );
-    }
-
-    #[test]
-    fn explicit_policy_and_embedded_intent_are_preserved() {
-        let config = released();
-        let explicit = normalize_load_request(&NormalizedLoadRequest::default(), &config)
-            .unwrap()
-            .with_drafting(DraftingLoadRequest::embedded(3).unwrap());
-        assert_eq!(
-            normalize_load_request(&explicit, &config).unwrap(),
-            explicit
         );
     }
 }

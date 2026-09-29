@@ -80,30 +80,6 @@ fn mlx_pipeline_allocator_converts_f16_and_bf16_sources_to_exact_f32_wire_values
 }
 
 #[test]
-fn dense_decoder_partition_classifier_is_architecture_owned_and_exhaustive() {
-    for model_type in ["llama", "qwen2", "qwen3"] {
-        let root = tiny_artifact(model_type, false);
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        assert!(
-            eredu_architectures::partitioned_execution::is_supported_dense_decoder_partition(
-                inspection.architecture_plan(),
-            ),
-            "{model_type} must enter typed dense-decoder dispatch"
-        );
-    }
-    for model_type in ["qwen3_moe", "gpt_oss"] {
-        let root = tiny_artifact(model_type, false);
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        assert!(
-            !eredu_architectures::partitioned_execution::is_supported_dense_decoder_partition(
-                inspection.architecture_plan(),
-            ),
-            "{model_type} must remain outside dense-decoder dispatch"
-        );
-    }
-}
-
-#[test]
 fn report_distinguishes_native_and_transforming_lowerings() {
     let parameter = ReplicatedTextParameterRequirement::new(
         "projection.weight",

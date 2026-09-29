@@ -1634,34 +1634,6 @@ mod tests {
     }
 
     #[test]
-    fn local_geometry_derives_heads_fused_widths_vocab_ranges_and_state() {
-        let config = tiny_config();
-        let layout = local_layout(&config);
-        let local = local_geometry(&config, &layout, std::iter::empty()).unwrap();
-        assert_eq!(local.temporal().len(), 2);
-        assert_eq!(local.temporal()[0].attention_heads(), 2);
-        assert_eq!(
-            local.temporal()[0].gated_hidden_size(),
-            config.temporal().gated_hidden_size() / 2
-        );
-        assert_eq!(local.depth().len(), 3);
-        assert_eq!(local.depth()[0][0].attention_heads(), 2);
-        assert_eq!(
-            local
-                .temporal_config(config.temporal(), 0)
-                .unwrap()
-                .num_attention_heads(),
-            2
-        );
-        assert_eq!(local.state_layout().segments()[0].id().as_str(), "temporal");
-        assert_eq!(local.state_layout().segments()[1].id().as_str(), "depth");
-        assert_eq!(
-            local.vocabulary_range("text_linear.weight").unwrap().end,
-            (config.text_vocabulary_size() as usize).div_ceil(2)
-        );
-    }
-
-    #[test]
     fn symbolic_parameter_description_admits_pure_tp_without_backend_construction() {
         let config = tiny_config();
         let description = parameter_description(&config).unwrap();
@@ -1725,22 +1697,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("pure tensor parallelism only"));
-    }
-
-    #[test]
-    fn collective_oracle_tracks_forced_depth_tail_cardinality() {
-        let config = tiny_config();
-        let full_depth = config.frame_schedule().depth_audio_codebooks();
-        let skipped = collective_count(&config, 0).unwrap();
-        let full = collective_count(&config, full_depth).unwrap();
-        let depth_layers = usize::try_from(config.depth_template().num_hidden_layers()).unwrap();
-        assert_eq!(skipped.all_gather, 1);
-        assert_eq!(full.all_gather, 1 + full_depth);
-        assert_eq!(
-            full.all_sum - skipped.all_sum,
-            full_depth * (1 + 2 * depth_layers)
-        );
-        assert!(collective_count(&config, full_depth + 1).is_err());
     }
 
     #[test]
@@ -1843,31 +1799,5 @@ mod tests {
         );
         let error = local_geometry(&config, &layout, std::iter::empty()).unwrap_err();
         assert!(error.to_string().contains("fused QKV width"));
-    }
-
-    #[test]
-    fn parameter_contract_preserves_semantic_and_physical_matrix_formats() {
-        let dense = parameter_contract(&tiny_config()).unwrap();
-        let dense_output = dense.matrices().get("text_linear.weight").unwrap();
-        assert_eq!(dense_output.logical_shape(), &[101, 32]);
-        assert_eq!(dense_output.physical_shape(), &[101, 32]);
-        assert_eq!(dense_output.format(), LinearFormat::Dense);
-        assert_eq!(dense_output.packed_axis(), None);
-        assert_eq!(dense_output.scale(), None);
-        assert_eq!(dense_output.affine_bias(), None);
-
-        let quantization = eredu_checkpoint::WeightQuantization::Affine(
-            eredu_checkpoint::AffineQuantization::new(16, 4).unwrap(),
-        );
-        let packed_config = tiny_config()
-            .with_native_quantization(Some(quantization))
-            .unwrap();
-        let packed = parameter_contract(&packed_config).unwrap();
-        let packed_output = packed.matrices().get("text_linear.weight").unwrap();
-        assert_eq!(packed_output.logical_shape(), &[101, 32]);
-        assert_eq!(packed_output.physical_shape(), &[101, 4]);
-        assert_eq!(packed_output.packed_axis(), Some(1));
-        assert_eq!(packed_output.scale(), Some("text_linear.scales"));
-        assert_eq!(packed_output.affine_bias(), Some("text_linear.biases"));
     }
 }

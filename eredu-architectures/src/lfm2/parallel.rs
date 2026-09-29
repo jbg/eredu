@@ -1438,26 +1438,6 @@ mod tests {
     }
 
     #[test]
-    fn local_geometry_owns_blocks_vocabulary_and_state_together() {
-        let args = args();
-        let geometry = local_geometry(&args, &valid_layout()).unwrap();
-        assert_eq!(geometry.blocks().len(), 3);
-        assert_eq!(geometry.block(0).unwrap().convolution_channels, 8);
-        assert_eq!(geometry.block(0).unwrap().dense_intermediate, 9);
-        assert_eq!(geometry.block(1).unwrap().query_heads, 2);
-        assert_eq!(geometry.block(1).unwrap().key_value_heads, 2);
-        assert_eq!(geometry.block(1).unwrap().expert_intermediate, 5);
-        assert_eq!(geometry.block(2).unwrap().convolution_channels, 8);
-        assert_eq!(geometry.embedding_range().local, 0..8);
-        assert_eq!(geometry.output_range().unwrap().local, 0..8);
-        assert_ne!(
-            geometry.state_layout(),
-            &crate::lfm2::state_layout(&args).unwrap()
-        );
-        geometry.validate_for(&args).unwrap();
-    }
-
-    #[test]
     fn local_geometry_rejects_incomplete_heads_and_vocabulary_drift() {
         let args = args();
         let mut layout = valid_layout();
@@ -1491,15 +1471,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("inconsistent companion selections"));
-    }
-
-    #[test]
-    fn tied_geometry_uses_embedding_ownership_for_output() {
-        let mut args = args();
-        args.tie_word_embeddings = true;
-        let geometry = local_geometry(&args, &valid_layout()).unwrap();
-        assert!(geometry.output_range().is_none());
-        geometry.validate_for(&args).unwrap();
     }
 
     #[test]

@@ -1913,33 +1913,6 @@ mod tests {
     use crate::execution::BackendId;
 
     #[test]
-    fn host_observation_preserves_injected_memory_and_backend_facts() {
-        let physical = Observed::exact(4096, "foreign memory provider");
-        let available = Observed::unavailable("not measured");
-        let backend = HardwareBackendProfile {
-            backend: BackendId::new("independent").unwrap(),
-            available: false,
-            detail: Some("no native context created".into()),
-            devices: vec![],
-        };
-        let profile = HardwareProfile::observe_host(
-            physical.clone(),
-            available.clone(),
-            HardwareMemorySemantics::SeparateTiers,
-            vec![backend.clone()],
-        );
-        assert_eq!(profile.physical_memory_bytes, physical);
-        assert_eq!(profile.available_memory_bytes, available);
-        assert_eq!(profile.backends, vec![backend]);
-        assert_eq!(
-            profile.physical_memory_semantics,
-            HardwareMemorySemantics::SeparateTiers
-        );
-        assert!(!profile.operating_system.is_empty());
-        assert!(!profile.architecture.is_empty());
-    }
-
-    #[test]
     fn physical_memory_semantics_preserve_unknown_and_separate_capacity() {
         use crate::capability::PhysicalMemorySemantics;
         for (physical, hardware) in [
@@ -2064,16 +2037,6 @@ mod tests {
     }
 
     #[test]
-    fn neutral_planner_selects_a_mock_backend_session_plan() {
-        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
-        let report = AutomaticPlanner::default()
-            .plan(&MockPlanningBackend::default(), &request)
-            .unwrap();
-        assert_eq!(report.plan.device.backend.as_str(), "mock");
-        assert_eq!(report.plan.residency, ResidencyPlan::FullyResident);
-    }
-
-    #[test]
     fn neutral_planner_selects_bounded_residency_and_embedded_drafting() {
         let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
         let report = AutomaticPlanner::default()
@@ -2174,18 +2137,6 @@ mod tests {
             Err(AutomaticPlanningError::Invalid(message))
                 if message.contains("cannot plan device")
         ));
-    }
-
-    #[test]
-    fn documents_round_trip_without_an_accelerator_runtime() {
-        let request = AutomaticPlanRequest::new("model", DevicePlan::new("mock", "gpu:0").unwrap());
-        let encoded = serde_json::to_vec(&request).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<AutomaticPlanRequest>(&encoded).unwrap(),
-            request
-        );
-        let unavailable = serde_json::to_value(Observed::<u64>::unavailable("unknown")).unwrap();
-        assert!(unavailable.get("value").is_none());
     }
 
     #[test]

@@ -636,16 +636,6 @@ fn lfm2_config() -> serde_json::Value {
     })
 }
 
-fn routed_lfm2_config() -> serde_json::Value {
-    let mut config = lfm2_config();
-    config["model_type"] = "lfm2_moe".into();
-    config["num_dense_layers"] = 1.into();
-    config["moe_intermediate_size"] = 8.into();
-    config["num_experts"] = 2.into();
-    config["num_experts_per_tok"] = 1.into();
-    config
-}
-
 fn kimi_linear_config() -> serde_json::Value {
     serde_json::json!({
         "model_type":"kimi_linear","vocab_size":64,"hidden_size":12,"num_hidden_layers":2,
@@ -930,65 +920,5 @@ fn tiny_qwen_gguf(
         &tensors,
         &metadata,
         |name, array| packed.filter(|_| name.ends_with(".weight") && array.ndim() == 2),
-    )
-}
-
-fn tiny_qwen_moe_gguf(stream: &Stream) -> crate::tests::support::test_utils::SyntheticGguf {
-    use std::collections::HashMap;
-
-    use eredu_gguf::MetadataValue;
-
-    let key = |suffix: &str| format!("qwen3moe.{suffix}");
-    let metadata = HashMap::from([
-        (
-            "general.architecture".into(),
-            MetadataValue::String("qwen3moe".into()),
-        ),
-        ("general.file_type".into(), MetadataValue::Uint32(0)),
-        (key("block_count"), MetadataValue::Uint32(1)),
-        (key("embedding_length"), MetadataValue::Uint32(32)),
-        (key("attention.head_count"), MetadataValue::Uint32(4)),
-        (key("attention.head_count_kv"), MetadataValue::Uint32(1)),
-        (key("attention.key_length"), MetadataValue::Uint32(8)),
-        (
-            key("attention.layer_norm_rms_epsilon"),
-            MetadataValue::Float32(1e-5),
-        ),
-        (key("feed_forward_length"), MetadataValue::Uint32(64)),
-        (key("expert_feed_forward_length"), MetadataValue::Uint32(16)),
-        (key("expert_count"), MetadataValue::Uint32(2)),
-        (key("expert_used_count"), MetadataValue::Uint32(1)),
-        (key("vocab_size"), MetadataValue::Uint32(64)),
-        (key("context_length"), MetadataValue::Uint32(32)),
-        (key("rope.freq_base"), MetadataValue::Float32(10_000.0)),
-    ]);
-    let tensors = [
-        ("token_embd.weight", vec![64, 32]),
-        ("output_norm.weight", vec![32]),
-        ("blk.0.attn_norm.weight", vec![32]),
-        ("blk.0.ffn_norm.weight", vec![32]),
-        ("blk.0.attn_q.weight", vec![32, 32]),
-        ("blk.0.attn_k.weight", vec![8, 32]),
-        ("blk.0.attn_v.weight", vec![8, 32]),
-        ("blk.0.attn_output.weight", vec![32, 32]),
-        ("blk.0.attn_q_norm.weight", vec![8]),
-        ("blk.0.attn_k_norm.weight", vec![8]),
-        ("blk.0.ffn_gate_inp.weight", vec![2, 32]),
-        ("blk.0.ffn_gate_exps.weight", vec![2, 16, 32]),
-        ("blk.0.ffn_up_exps.weight", vec![2, 16, 32]),
-        ("blk.0.ffn_down_exps.weight", vec![2, 32, 16]),
-    ]
-    .into_iter()
-    .map(|(name, shape)| {
-        (
-            name.to_owned(),
-            Array::zeros::<f32>(&shape, stream).unwrap(),
-        )
-    })
-    .collect::<HashMap<_, _>>();
-    crate::tests::support::test_utils::SyntheticGguf::with_packed_tensors(
-        &tensors,
-        &metadata,
-        |_, _| None,
     )
 }

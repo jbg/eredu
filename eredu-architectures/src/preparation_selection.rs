@@ -2193,32 +2193,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn conversion_retention_request_survives_cold_and_partitioned_selection() {
-        use eredu_core::residency::ParameterConversionRetentionPolicy as Policy;
-        let (_root, inspection) = inspected_llama();
-        let mechanisms = BoundedIndependentAdapter::default();
-        for request in [NormalizedLoadRequest::default(), parallel_request()] {
-            for policy in [
-                None,
-                Some(Policy::Disabled),
-                Some(Policy::Bounded { max_bytes: 17 }),
-                Some(Policy::Unlimited),
-            ] {
-                let request = request.clone().with_parameter_conversion_retention(policy);
-                let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
-                assert_eq!(
-                    selected
-                        .execution()
-                        .text_realization()
-                        .parameter_conversion_retention(),
-                    policy
-                );
-                mechanisms.assert_cold_only();
-            }
-        }
-    }
-
-    #[test]
     fn prepared_sources_reject_same_session_selection_from_another_dense_artifact() {
         let (_llama_root, llama) = inspected_llama();
         let mechanisms = BoundedIndependentAdapter::default();

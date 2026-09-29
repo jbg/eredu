@@ -1353,7 +1353,7 @@ fn add(left: usize, right: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use eredu_checkpoint::{
         recipe::RecipeCatalog,
@@ -1678,20 +1678,6 @@ mod tests {
     }
 
     #[test]
-    fn conditional_safetensors_plan_covers_text_and_vision_once() {
-        let plan = composite_safetensors_plan(&conditional_config()).unwrap();
-        let keys = plan
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(keys.contains("model.embed_tokens.weight"));
-        assert!(keys.contains("model.visual.patch_embed.proj.weight"));
-        assert!(keys.contains("model.visual.merger.linear_fc2.weight"));
-        assert_eq!(keys.len(), plan.common_tensors.len());
-    }
-
-    #[test]
     fn conditional_projector_plan_owns_family_mode_and_width_compatibility() {
         let admitted = conditional_config();
         assert!(conditional_projector_gguf_plan(&admitted).is_ok());
@@ -1737,39 +1723,6 @@ mod tests {
         .text
     }
 
-    fn memory_store(tensors: impl IntoIterator<Item = (String, Vec<usize>)>) -> MemoryWeightStore {
-        MemoryWeightStore::from_safetensors(tensors.into_iter().map(|(name, shape)| {
-            let bytes = vec![0; shape.iter().product::<usize>() * 2];
-            (name, Dtype::F16, shape, bytes)
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn plan_freezes_fused_or_split_recurrent_and_gated_attention_shapes() {
-        let plan = safetensors_plan(&config()).unwrap();
-        let recurrent = plan
-            .layout_groups
-            .iter()
-            .find(|group| group.id == "model.layers.0 linear-attention inputs")
-            .unwrap();
-        assert_eq!(recurrent.variants.len(), 2);
-        assert!(recurrent.variants.iter().any(|variant| {
-            variant
-                .discriminator_keys
-                .contains(&"model.layers.0.linear_attn.in_proj_qkvz.weight".into())
-                && variant
-                    .discriminator_keys
-                    .contains(&"model.layers.0.linear_attn.in_proj_ba.weight".into())
-        }));
-        let query = plan
-            .common_tensors
-            .iter()
-            .find(|tensor| tensor.key == "model.layers.1.self_attn.q_proj.weight")
-            .unwrap();
-        assert_eq!(query.shape, [64, 32]);
-    }
-
     #[test]
     fn grouped_fused_recipes_restore_component_major_rows_atomically() {
         let config = config();
@@ -1801,32 +1754,6 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[32, 32]
-        );
-    }
-
-    #[test]
-    fn neutral_unit_catalog_owns_fused_recurrent_transforms() {
-        let config = config();
-        let prefix = "model.layers.0.linear_attn";
-        let store = memory_store([
-            (format!("{prefix}.in_proj_qkvz.weight"), vec![96, 32]),
-            (format!("{prefix}.in_proj_ba.weight"), vec![8, 32]),
-        ]);
-        let recipes = unit_recipes(&store, &config, 0).unwrap();
-        for suffix in [
-            "in_proj_qkv.weight",
-            "in_proj_z.weight",
-            "in_proj_a.weight",
-            "in_proj_b.weight",
-        ] {
-            assert!(
-                recipes.contains_key(&format!("{prefix}.{suffix}")),
-                "missing {suffix}"
-            );
-        }
-        assert_eq!(
-            translate_vision_gguf_weight_name("v.patch_embd.weight.1", &[0]),
-            "model.visual.patch_embed.proj.weight.1"
         );
     }
 

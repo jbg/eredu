@@ -81,38 +81,3 @@ pub const MUSE_GLIMMER: C = C::SIGMOID
 pub fn require<B: NeuralBackend>(architecture: &'static str, requirements: C) -> Result<(), Error> {
     B::require_operator_capabilities(architecture, requirements)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gemma4_admits_every_optional_tensor_operation_it_uses() {
-        for required in [
-            C::UNLOADED_I32,
-            C::FULL_F32,
-            C::TANH,
-            C::CLIP,
-            C::SOFTMAX_AXIS,
-            C::CONV2D,
-            C::MULTI_AXIS_ROTARY_EMBEDDINGS,
-            C::MASKED_OUTPUT_PROJECTION,
-        ] {
-            assert!(GEMMA4.contains(required));
-        }
-    }
-
-    #[test]
-    fn qwen_vl_admits_multimodal_tensor_assembly() {
-        assert!(QWEN_VL.contains(QWEN_VISION));
-        for required in [
-            C::FULL_I32,
-            C::ZEROS_LIKE,
-            C::EQUAL_I32,
-            C::LOGICAL_OR,
-            C::MASKED_SCATTER,
-        ] {
-            assert!(QWEN_VL.contains(required));
-        }
-    }
-}

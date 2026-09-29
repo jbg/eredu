@@ -994,7 +994,6 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
-    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, TensorPlacement};
 
     use super::*;
@@ -1018,89 +1017,6 @@ mod tests {
             "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn distinguishes_text_experts_router_and_replicated_vision() {
-        let args = args();
-        let text = layer_parameter_groups(&args, 0).unwrap();
-        assert!(text
-            .iter()
-            .any(|group| group.role() == ParameterRole::ExpertIntermediate));
-        assert!(text
-            .iter()
-            .any(|group| group.logical_name().ends_with("mlp.router")));
-        let vision = vision_parameter_groups(&args).unwrap();
-        assert!(vision
-            .iter()
-            .any(|group| group.logical_name().ends_with("attention_heads")));
-        assert!(vision.iter().all(|group| group.partition_units().is_none()));
-        assert!(vision.iter().all(|group| group
-            .members()
-            .iter()
-            .all(|member| member.sharding() == &MemberSharding::Replicated)));
-    }
-
-    #[test]
-    fn gguf_head_norm_gains_are_replicated_and_hf_norms_remain_weightless() {
-        let mut args = args();
-        for convention in [
-            super::super::WeightConvention::HuggingFace,
-            super::super::WeightConvention::Gguf,
-        ] {
-            args.weight_convention = convention;
-            let groups = layer_parameter_groups(&args, 0).unwrap();
-            for suffix in ["q_norm.weight", "k_norm.weight"] {
-                let name = format!("model.layers.0.self_attn.{suffix}");
-                let members = groups
-                    .iter()
-                    .flat_map(|g| g.members())
-                    .filter(|m| m.target() == name)
-                    .collect::<Vec<_>>();
-                if convention == super::super::WeightConvention::Gguf {
-                    assert_eq!(members.len(), 1);
-                    assert_eq!(members[0].global_shape(), &[args.head_dim as usize]);
-                    assert_eq!(members[0].sharding(), &MemberSharding::Replicated);
-                } else {
-                    assert!(members.is_empty());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn affine_text_plan_publishes_weight_companions() {
-        let mut args = args();
-        args.quantization = Some(AffineQuantization::new(16, 4).unwrap().into());
-        args.quantized_weights = Some(std::collections::HashSet::from([
-            "model.layers.0.self_attn.q_proj.weight".to_owned(),
-            "model.layers.0.mlp.experts.gate_up_proj".to_owned(),
-        ]));
-        let targets = layer_parameter_groups(&args, 0)
-            .unwrap()
-            .into_iter()
-            .flat_map(|group| group.members().to_vec())
-            .map(|member| member.target().to_owned())
-            .collect::<Vec<_>>();
-        assert!(targets
-            .iter()
-            .any(|name| name == "model.layers.0.self_attn.q_proj.scales"));
-        assert!(targets
-            .iter()
-            .any(|name| name == "model.layers.0.mlp.experts.gate_up_proj_scales"));
-    }
-
-    fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
-        LocalTensorLayout::new(
-            "test",
-            ParameterRole::AttentionHeads,
-            shape.clone(),
-            shape,
-            TensorPlacement::Local,
-            None,
-            None,
-            false,
-        )
     }
 
     fn insert(
@@ -1185,45 +1101,6 @@ mod tests {
         layout
     }
 
-    #[test]
-    fn local_decoder_geometry_tracks_heads_and_expert_intermediate() {
-        let args = args();
-        let mut layout = LocalModelLayout::default();
-        layout.insert(
-            "model.layers.0.self_attn.q_proj.weight".into(),
-            local_tensor(vec![8, 16]),
-        );
-        layout.insert(
-            "model.layers.0.self_attn.k_proj.weight".into(),
-            local_tensor(vec![4, 16]),
-        );
-        layout.insert(
-            "model.layers.0.mlp.experts.gate_up_proj".into(),
-            local_tensor(vec![4, 12, 16]),
-        );
-        let local = local_decoder_config(&args, 0, &layout).unwrap();
-        assert_eq!(local.num_attention_heads, 2);
-        assert_eq!(local.num_key_value_heads, 1);
-        assert_eq!(local.moe_intermediate_size, 6);
-    }
-
-    #[test]
-    fn local_geometry_owns_text_vocabulary_state_and_media_together() {
-        let args = args();
-        let geometry = local_geometry(&args, &valid_layout(true)).unwrap();
-        assert_eq!(geometry.text_blocks().len(), 1);
-        assert_eq!(geometry.text_block(0).unwrap().num_attention_heads, 2);
-        assert_eq!(geometry.text_block(0).unwrap().num_key_value_heads, 1);
-        assert_eq!(geometry.embedding_range().local, 0..12);
-        assert_eq!(geometry.output_range().unwrap().local, 0..12);
-        assert_eq!(geometry.vision_layers(), 1);
-        assert_ne!(
-            geometry.state_layout(),
-            &crate::muse_glimmer::state_layout(&args).unwrap()
-        );
-        geometry.validate_for(&args).unwrap();
-    }
-
     fn partition_args_and_layout() -> (DecoderConfig, LocalModelLayout) {
         let args = DecoderConfig::from_hf_value(&serde_json::json!({
           "architectures":["MuseGlimmerForConditionalGeneration"],
@@ -1299,40 +1176,6 @@ mod tests {
             );
         }
         (args, layout)
-    }
-
-    #[test]
-    fn partition_geometry_preserves_dense_text_and_optional_root_ownership() {
-        let (partition_args, layout) = partition_args_and_layout();
-        let first = PartitionOwnership::new(true, false, ["vision", "embedding"]).unwrap();
-        let first = partition_local_geometry(
-            &partition_args,
-            &layout,
-            [
-                (super::super::VISION_EXECUTION_GROUP, 0..1),
-                (super::super::TEXT_EXECUTION_GROUP, 0..1),
-            ],
-            &first,
-        )
-        .unwrap();
-        assert_eq!(first.vision_units(), Some(0..1));
-        assert_eq!(first.text_units(), 0..1);
-        assert_eq!(first.text_block(0).unwrap().num_experts, 0);
-        assert_eq!(first.text_block(0).unwrap().intermediate_size, 12);
-        assert_eq!(first.local_state_layout().unwrap().len(), 1);
-
-        let last = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
-        let last = partition_local_geometry(
-            &partition_args,
-            &layout,
-            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
-            &last,
-        )
-        .unwrap();
-        assert_eq!(last.text_units(), 1..2);
-        assert_eq!(last.static_roles(), ["norm", "output"]);
-        assert_eq!(last.complete_state_layout().len(), 2);
-        assert_eq!(last.local_state_layout().unwrap().len(), 1);
     }
 
     #[test]

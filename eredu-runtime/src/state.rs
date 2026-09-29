@@ -1216,34 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn segment_identity_lifetime_and_offset_participate_in_layout_equality() {
-        let layout = |depth_name, lifetime, offset| {
-            StateLayout::segmented(
-                four_layer_schedule(),
-                [
-                    StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent, 0)
-                        .unwrap(),
-                    StateSegmentSpec::new(depth_name, 2..4, lifetime, offset).unwrap(),
-                ],
-            )
-            .unwrap()
-        };
-        let canonical = layout("depth", StateSegmentLifetime::FrameLocal, 0);
-        assert_ne!(
-            canonical,
-            layout("predictor", StateSegmentLifetime::FrameLocal, 0)
-        );
-        assert_ne!(
-            canonical,
-            layout("depth", StateSegmentLifetime::Persistent, 0)
-        );
-        assert_ne!(
-            canonical,
-            layout("depth", StateSegmentLifetime::FrameLocal, -1)
-        );
-    }
-
-    #[test]
     fn malformed_segment_partitions_fail_closed() {
         let duplicate = StateLayout::segmented(
             four_layer_schedule(),

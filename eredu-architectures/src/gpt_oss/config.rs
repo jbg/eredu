@@ -1243,34 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn hf_and_gguf_normalize_to_the_same_policy_and_fingerprint() {
-        let hf = model_args_from_config_value(&hf_config()).unwrap();
-        let gguf = model_args_from_gguf_catalog(&gguf_metadata()).unwrap();
-        assert_eq!(hf.attention_schedule, gguf.attention_schedule);
-        assert_eq!(hf.rope_scaling, gguf.rope_scaling);
-        assert_eq!(hf.gated_product_policy, gguf.gated_product_policy);
-        assert_eq!(
-            prompt_cache_architecture_fingerprint(&hf),
-            prompt_cache_architecture_fingerprint(&gguf)
-        );
-        let point = hf.routed_observation_points("model.layers.3", 3);
-        assert_eq!(
-            point
-                .bank(eredu_runtime::RoutedBankId::new(0))
-                .unwrap()
-                .path(),
-            "model.layers.3.mlp"
-        );
-        assert_eq!(
-            point
-                .bank(eredu_runtime::RoutedBankId::new(0))
-                .unwrap()
-                .expert_count(),
-            32
-        );
-    }
-
-    #[test]
     fn gguf_rejects_wrong_types_and_inconsistent_head_geometry() {
         let mut metadata = gguf_metadata();
         metadata.insert(

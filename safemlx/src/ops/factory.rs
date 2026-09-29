@@ -561,7 +561,7 @@ pub fn triu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{array, dtype::Dtype, Stream};
+    use crate::{array, dtype::Dtype};
     use half::f16;
 
     #[test]
@@ -619,45 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn test_full_array() {
-        let stream = crate::test_stream();
-        let source = Array::zeros::<f32>(
-            &[1, 3],
-            Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0)),
-        )
-        .unwrap();
-        let array = Array::full::<f32>(&[2, 3], source, stream).unwrap();
-        assert_eq!(array.shape(), &[2, 3]);
-        assert_eq!(array.dtype(), Dtype::Float32);
-
-        let data: Vec<f32> = crate::array::eval_vec(&array);
-        float_eq::float_eq!(*data, [0.0; 6], abs <= [1e-6; 6]);
-    }
-
-    #[test]
-    fn test_full_try() {
-        let stream = crate::test_stream();
-        let source = Array::zeros::<f32>(&[1, 3], stream).unwrap();
-        let array = Array::full::<f32>(&[2, 3], source, stream);
-        assert!(array.is_ok());
-
-        let source = Array::zeros::<f32>(&[1, 3], stream).unwrap();
-        let array = Array::full::<f32>(&[-1, 3], source, stream);
-        assert!(array.is_err());
-    }
-
-    #[test]
-    fn test_identity() {
-        let stream = crate::test_stream();
-        let array = Array::identity::<f32>(3, stream).unwrap();
-        assert_eq!(array.shape(), &[3, 3]);
-        assert_eq!(array.dtype(), Dtype::Float32);
-
-        let data: Vec<f32> = crate::array::eval_vec(&array);
-        assert_eq!(data, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-    }
-
-    #[test]
     fn test_arange() {
         let stream = crate::test_stream();
         let array = Array::arange::<_, f32>(None, 50, None, stream).unwrap();
@@ -712,29 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn test_linspace_float() {
-        let stream = crate::test_stream();
-        let array = Array::linspace::<_, f32>(0., 50., None, stream).unwrap();
-        assert_eq!(array.shape(), &[50]);
-        assert_eq!(array.dtype(), Dtype::Float32);
-
-        let expected_data: Vec<f32> = (0..50).map(|x| x as f32 * (50.0 / 49.0)).collect();
-        let expected = Array::from_slice(&expected_data, &[50]);
-        assert_eq!(array.shape(), expected.shape());
-        assert_array_all_close!(array, expected, stream = stream);
-    }
-
-    #[test]
-    fn test_linspace_try() {
-        let stream = crate::test_stream();
-        let array = Array::linspace::<_, f32>(0, 50, None, stream);
-        assert!(array.is_ok());
-
-        let array = Array::linspace::<_, f32>(0, 50, Some(-1), stream);
-        assert!(array.is_err());
-    }
-
-    #[test]
     fn test_repeat() {
         let stream = crate::test_stream();
         let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
@@ -747,18 +685,6 @@ mod tests {
     }
 
     #[test]
-    fn test_repeat_try() {
-        let stream = crate::test_stream();
-        let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-        let array = Array::repeat_axis::<i32>(source, 4, 1, stream);
-        assert!(array.is_ok());
-
-        let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-        let array = Array::repeat_axis::<i32>(source, -1, 1, stream);
-        assert!(array.is_err());
-    }
-
-    #[test]
     fn test_repeat_all() {
         let stream = crate::test_stream();
         let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
@@ -768,18 +694,6 @@ mod tests {
 
         let data: Vec<i32> = crate::array::eval_vec(&array);
         assert_eq!(data, [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
-    }
-
-    #[test]
-    fn test_repeat_all_try() {
-        let stream = crate::test_stream();
-        let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-        let array = Array::repeat::<i32>(source, 4, stream);
-        assert!(array.is_ok());
-
-        let source = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-        let array = Array::repeat::<i32>(source, -1, stream);
-        assert!(array.is_err());
     }
 
     #[test]

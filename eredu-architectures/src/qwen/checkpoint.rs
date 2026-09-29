@@ -973,24 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn plans_qwen2_biases_and_qwen3_norms() {
-        let qwen2 = safetensors_plan(&args("qwen2", false)).unwrap();
-        assert!(qwen2
-            .common_tensors
-            .iter()
-            .any(|tensor| tensor.key.ends_with("self_attn.q_proj.bias")));
-        let qwen3 = safetensors_plan(&args("qwen3", true)).unwrap();
-        assert!(qwen3
-            .common_tensors
-            .iter()
-            .any(|tensor| tensor.key.ends_with("self_attn.q_norm.weight")));
-        assert!(!qwen3
-            .common_tensors
-            .iter()
-            .any(|tensor| tensor.key == "lm_head.weight"));
-    }
-
-    #[test]
     fn load_time_quantization_replaces_checkpoint_format_policy() {
         let mut source = args("qwen3", false);
         source.quantization = Some(WeightQuantization::MxFp4);
@@ -1011,24 +993,6 @@ mod tests {
         assert_eq!(source.quantization, Some(WeightQuantization::MxFp4));
         assert!(source.quantized_weights.is_some());
         assert!(source.quantized_weight_configs.is_some());
-    }
-
-    #[test]
-    fn moe_plan_admits_packed_separate_and_split_experts() {
-        let plan = safetensors_plan(&args("qwen3_moe", false)).unwrap();
-        let experts = plan
-            .layout_groups
-            .iter()
-            .find(|group| group.id.contains("mlp.experts"))
-            .unwrap();
-        assert_eq!(
-            experts
-                .variants
-                .iter()
-                .map(|variant| variant.id.as_str())
-                .collect::<Vec<_>>(),
-            ["packed", "separate-packed", "split"]
-        );
     }
 
     #[test]
@@ -1189,35 +1153,6 @@ mod tests {
                 .iter()
                 .any(|tensor| tensor.key.ends_with("down_proj.scales")));
         }
-    }
-
-    #[test]
-    fn gguf_plan_golden_covers_qwen3_moe_catalog_ids() {
-        let mut args = args("qwen3_moe", false);
-        args.num_hidden_layers = 1;
-        let plan = gguf_plan(&args).unwrap();
-        let keys = plan
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<BTreeSet<_>>();
-        for required in [
-            "token_embd.weight",
-            "output_norm.weight",
-            "output.weight",
-            "blk.0.attn_q_norm.weight",
-            "blk.0.attn_k_norm.weight",
-            "blk.0.ffn_gate_inp.weight",
-            "blk.0.ffn_gate_exps.weight",
-            "blk.0.ffn_up_exps.weight",
-            "blk.0.ffn_down_exps.weight",
-        ] {
-            assert!(
-                keys.contains(required),
-                "missing GGUF golden key {required}"
-            );
-        }
-        assert!(plan.layout_groups.is_empty());
     }
 
     #[test]

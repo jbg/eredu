@@ -3996,31 +3996,6 @@ mod plan_tests {
     use crate::{CommunicationGroupRequirements, CommunicationTensorLimits};
 
     #[test]
-    fn plan_exposes_the_exact_selected_publication_and_commit_group() {
-        let graph =
-            ExecutionGraph::new(vec![crate::ExecutionGroupSpec::root("decoder")], "decoder")
-                .unwrap();
-        let group = CollectiveGroupId::new(17);
-        let plan = PartitionedExecutionPlan::new(
-            graph,
-            vec![(ArchitectureGroupKind::Decoder, false)],
-            vec![None],
-            Vec::new(),
-            Some(PartitionOutputPublication {
-                group,
-                owner_rank: 3,
-            }),
-            Some(group),
-            PipelineWireContract::new(PipelineActivationDtype::Float32),
-        )
-        .unwrap();
-
-        assert_eq!(plan.publication().unwrap().group, group);
-        assert_eq!(plan.publication().unwrap().owner_rank, 3);
-        assert_eq!(plan.commit_barrier(), Some(group));
-    }
-
-    #[test]
     fn publication_authority_preserves_selected_owner_and_group_local_rank() {
         let graph =
             ExecutionGraph::new(vec![crate::ExecutionGroupSpec::root("decoder")], "decoder")

@@ -10,12 +10,6 @@ pub type ModuleParamRef<'a> = NestedHashMap<Rc<str>, &'a Array>;
 /// Type alias for mutably borrowed module parameters.
 pub type ModuleParamMut<'a> = NestedHashMap<Rc<str>, &'a mut Array>;
 
-#[cfg(all(
-    test,
-    any(feature = "cuda", all(feature = "metal", target_os = "macos"))
-))]
-pub type FlattenedModuleParamMut<'a> = std::collections::HashMap<Rc<str>, &'a mut Array>;
-
 /// Trait for a neural network module.
 pub trait Module<Input>: PhysicalParameters + std::fmt::Debug {
     /// Output type of the module.

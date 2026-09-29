@@ -305,23 +305,7 @@ fn ring_four_process_qwen35_moe_pipeline_parameter_bank_session() {
 // These use the existing public capture, global-mask, parameter, overlay and
 // controlled-replay harness with the hybrid family's actual component points.
 fn run_qwen_hybrid_component_matrix(family: FixtureFamily, routed: bool) {
-    let topologies: &[&str] = if routed {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for axes in topologies {
-        eprintln!("Qwen hybrid components: {family:?} {axes} resident");
-        run_ring_cartesian_pipeline_mode(false, family, axes, WorkerMode::OpaqueComponentCapture);
-        eprintln!("Qwen hybrid components: {family:?} {axes} host");
-        run_ring_layerwise_host_cartesian_pipeline_mode(
-            family,
-            axes,
-            WorkerMode::OpaqueComponentCapture,
-        );
-        eprintln!("Qwen hybrid components: {family:?} {axes} disk");
-        run_ring_cartesian_pipeline_mode(true, family, axes, WorkerMode::OpaqueComponentCapture);
-    }
+    run_component_matrix_with_mode(family, routed, WorkerMode::OpaqueComponentCapture);
 }
 
 #[test]
@@ -349,17 +333,6 @@ fn ring_public_component_capture_qwen_35_hybrid_moe_matrix() {
 }
 
 #[test]
-#[ignore = "requires two local MLX Ring ranks"]
-fn ring_public_component_capture_qwen_next_hybrid_moe_tensor() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen3NextMoe,
-        "tp",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
 #[ignore = "spawns local MLX Ring ranks; run explicitly"]
 fn ring_public_component_capture_qwen_35_conditional_matrix() {
     run_qwen_hybrid_component_matrix(FixtureFamily::Qwen35Multimodal, false);
@@ -371,111 +344,48 @@ fn ring_public_component_capture_qwen_35_conditional_moe_matrix() {
     run_qwen_hybrid_component_matrix(FixtureFamily::Qwen35MoeMultimodal, true);
 }
 
-#[test]
-#[ignore = "requires four local MLX Ring ranks"]
-fn ring_public_component_capture_qwen_35_conditional_tensor_pipeline() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen35Multimodal,
-        "tp-pp",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
-#[ignore = "requires two local MLX Ring ranks"]
-fn ring_public_component_capture_qwen_35_conditional_pipeline_host() {
-    run_ring_layerwise_host_cartesian_pipeline_mode(
-        FixtureFamily::Qwen35Multimodal,
-        "pp",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
-#[ignore = "requires eight local MLX Ring ranks"]
-fn ring_public_component_capture_qwen_35_conditional_moe_tensor_pipeline_expert() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen35MoeMultimodal,
-        "tp-pp-ep",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
-#[ignore = "spawns local CPU Ring processes and opens loopback sockets; run explicitly"]
-fn ring_qwen_text_prediction_components_tensor_parallel() {
-    for family in [
-        FixtureFamily::Qwen3Next,
-        FixtureFamily::Qwen3NextMoe,
-        FixtureFamily::Qwen35,
-        FixtureFamily::Qwen35Moe,
-    ] {
-        eprintln!("Qwen prediction component family={family:?} mode=tp");
-        run_ring_cartesian_pipeline_mode(false, family, "tp", WorkerMode::OpaqueQwenHybridMtp);
-    }
-}
-
-#[test]
-#[ignore = "spawns local CPU Ring processes and opens loopback sockets; run explicitly"]
-fn ring_qwen_text_prediction_components_pipeline_parallel() {
-    for family in [
-        FixtureFamily::Qwen3Next,
-        FixtureFamily::Qwen3NextMoe,
-        FixtureFamily::Qwen35,
-        FixtureFamily::Qwen35Moe,
-    ] {
-        eprintln!("Qwen prediction component family={family:?} mode=pp");
-        run_ring_cartesian_pipeline_mode(false, family, "pp", WorkerMode::OpaqueQwenHybridMtp);
-    }
-}
-
 fn run_qwen_prediction_components(family: FixtureFamily, routed: bool) {
     run_component_matrix_with_mode(family, routed, WorkerMode::OpaqueQwenHybridMtp);
 }
 
 fn run_component_matrix_with_mode(family: FixtureFamily, routed: bool, mode: WorkerMode) {
-    let topologies: &[&str] = if routed {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for axes in topologies {
-        eprintln!("Components: {family:?} {axes} resident");
-        run_ring_cartesian_pipeline_mode(false, family, axes, mode);
-        eprintln!("Components: {family:?} {axes} host");
-        run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode);
-        eprintln!("Components: {family:?} {axes} disk");
-        run_ring_cartesian_pipeline_mode(true, family, axes, mode);
+    for &(axes, residency) in component_cases(routed) {
+        match residency {
+            WorkerResidency::FullyResident => {
+                run_ring_cartesian_pipeline_mode(false, family, axes, mode)
+            }
+            WorkerResidency::LayerwiseHost => {
+                run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode)
+            }
+            WorkerResidency::DenseDiskStream => {
+                run_ring_cartesian_pipeline_mode(true, family, axes, mode)
+            }
+        }
     }
 }
 
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_composite_independent_bank_components_tensor_parallel() {
-    for family in [
-        FixtureFamily::Inkling,
-        FixtureFamily::InklingGguf,
-        FixtureFamily::Qwen3NextMoe,
-        FixtureFamily::Qwen35Moe,
-        FixtureFamily::Qwen35MoeMultimodal,
-    ] {
-        eprintln!("Independent component TP2: {family:?}");
-        run_ring_cartesian_pipeline_mode(
-            false,
-            family,
-            "tp",
-            WorkerMode::OpaqueComponentCaptureAddressableBank,
-        );
+fn component_cases(routed: bool) -> &'static [(&'static str, WorkerResidency)] {
+    // Native capture uses the same collector across residency policies. Each
+    // transport topology is exercised once; the cases also cover all policies.
+    const DENSE: &[(&str, WorkerResidency)] = &[
+        ("tp", WorkerResidency::FullyResident),
+        ("pp", WorkerResidency::DenseDiskStream),
+        ("tp-pp", WorkerResidency::LayerwiseHost),
+    ];
+    const ROUTED: &[(&str, WorkerResidency)] = &[
+        ("tp", WorkerResidency::FullyResident),
+        ("pp", WorkerResidency::DenseDiskStream),
+        ("ep", WorkerResidency::FullyResident),
+        ("tp-pp", WorkerResidency::LayerwiseHost),
+        ("tp-ep", WorkerResidency::LayerwiseHost),
+        ("pp-ep", WorkerResidency::LayerwiseHost),
+        ("tp-pp-ep", WorkerResidency::DenseDiskStream),
+    ];
+    if routed {
+        ROUTED
+    } else {
+        DENSE
     }
-    eprintln!("Independent component TP2: Inkling affine");
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Inkling,
-        "tp",
-        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
-    );
 }
 
 #[test]
@@ -525,25 +435,6 @@ fn ring_qwen_independent_bank_components_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_inkling_target_components_tensor_parallel() {
-    for family in [FixtureFamily::InklingDense, FixtureFamily::Inkling] {
-        run_ring_cartesian_pipeline_mode(false, family, "tp", WorkerMode::OpaqueComponentCapture);
-    }
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_inkling_gguf_target_components_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::InklingGguf,
-        "tp",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_inkling_gguf_target_components_matrix() {
     run_component_matrix_with_mode(
@@ -574,20 +465,6 @@ fn ring_inkling_target_components_routed_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_inkling_target_quantized_components_tensor_parallel() {
-    for mode in [
-        WorkerMode::OpaqueComponentCaptureRequantize,
-        WorkerMode::OpaqueComponentCaptureMxFp4,
-    ] {
-        for family in [FixtureFamily::InklingDense, FixtureFamily::Inkling] {
-            eprintln!("Inkling target components: {family:?} {mode:?} tp");
-            run_ring_cartesian_pipeline_mode(false, family, "tp", mode);
-        }
-    }
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_inkling_target_affine_components_matrix() {
     for (family, routed) in [
@@ -614,31 +491,6 @@ fn ring_inkling_target_mxfp4_components_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_inkling_prediction_quantized_components_tensor_parallel() {
-    for mode in [
-        WorkerMode::OpaqueInklingComponentsRequantize,
-        WorkerMode::OpaqueInklingComponentsMxFp4,
-    ] {
-        for family in [FixtureFamily::InklingDense, FixtureFamily::Inkling] {
-            eprintln!("Inkling prediction components: {family:?} {mode:?} tp");
-            run_ring_cartesian_pipeline_mode(false, family, "tp", mode);
-        }
-    }
-}
-
-#[test]
-#[ignore = "spawns four local MLX Ring ranks; run explicitly"]
-fn ring_inkling_prediction_quantized_components_tensor_expert_parallel() {
-    for mode in [
-        WorkerMode::OpaqueInklingComponentsRequantize,
-        WorkerMode::OpaqueInklingComponentsMxFp4,
-    ] {
-        run_ring_cartesian_pipeline_mode(false, FixtureFamily::Inkling, "tp-ep", mode);
-    }
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_inkling_prediction_affine_components_matrix() {
     for (family, routed) in [
@@ -654,16 +506,6 @@ fn ring_inkling_prediction_affine_components_matrix() {
 }
 
 #[test]
-#[ignore = "spawns eight local MLX Ring ranks; run explicitly"]
-fn ring_inkling_prediction_affine_components_three_axes() {
-    let family = FixtureFamily::Inkling;
-    let mode = WorkerMode::OpaqueInklingComponentsRequantize;
-    run_ring_cartesian_pipeline_mode(false, family, "tp-pp-ep", mode);
-    run_ring_layerwise_host_cartesian_pipeline_mode(family, "tp-pp-ep", mode);
-    run_ring_cartesian_pipeline_mode(true, family, "tp-pp-ep", mode);
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_inkling_prediction_mxfp4_components_matrix() {
     for (family, routed) in [
@@ -672,17 +514,6 @@ fn ring_inkling_prediction_mxfp4_components_matrix() {
     ] {
         run_component_matrix_with_mode(family, routed, WorkerMode::OpaqueInklingComponentsMxFp4);
     }
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_inkling_prediction_components_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Inkling,
-        "tp",
-        WorkerMode::OpaqueInklingComponents,
-    );
 }
 
 #[test]
@@ -742,33 +573,11 @@ fn ring_qwen_prediction_components_35_conditional_moe_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_qwen_prediction_fp8_components_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen35MoeMultimodal,
-        "tp",
-        WorkerMode::OpaqueQwenHybridMtpFp8,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_qwen_prediction_fp8_components_conditional_moe_matrix() {
     run_component_matrix_with_mode(
         FixtureFamily::Qwen35MoeMultimodal,
         true,
-        WorkerMode::OpaqueQwenHybridMtpFp8,
-    );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_qwen_prediction_fp8_components_expert_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen35MoeMultimodal,
-        "ep",
         WorkerMode::OpaqueQwenHybridMtpFp8,
     );
 }
@@ -784,34 +593,12 @@ fn ring_nemotron_prediction_components_dense_target_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_nemotron_prediction_components_routed_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::NemotronH,
-        "tp",
-        WorkerMode::OpaqueNemotronHMtpRouted,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_nemotron_prediction_components_routed_target_matrix() {
     run_component_matrix_with_mode(
         FixtureFamily::NemotronH,
         true,
         WorkerMode::OpaqueNemotronHMtpRouted,
-    );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_nemotron_prediction_mxfp4_components_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::NemotronH,
-        "tp",
-        WorkerMode::OpaqueNemotronHMtpRoutedMxFp4,
     );
 }
 
@@ -836,17 +623,6 @@ fn ring_nemotron_prediction_mxfp4_components_routed_target_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_muse_components_tensor_parallel() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::MuseGlimmer,
-        "tp",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to four local MLX Ring ranks; run explicitly"]
 fn ring_muse_components_dense_matrix() {
     run_component_matrix_with_mode(
@@ -854,17 +630,6 @@ fn ring_muse_components_dense_matrix() {
         false,
         WorkerMode::OpaqueComponentCapture,
     );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_muse_components_routed_tensor_parallel() {
-    for mode in [
-        WorkerMode::OpaqueComponentCapture,
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    ] {
-        run_ring_cartesian_pipeline_mode(false, FixtureFamily::MuseGlimmerMoe, "tp", mode);
-    }
 }
 
 #[test]
@@ -884,26 +649,6 @@ fn ring_muse_components_independent_bank_matrix() {
         FixtureFamily::MuseGlimmerMoe,
         true,
         WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_muse_components_quantized_tensor_parallel() {
-    for family in [FixtureFamily::MuseGlimmer, FixtureFamily::MuseGlimmerMoe] {
-        for mode in [
-            WorkerMode::OpaqueComponentCaptureRequantize,
-            WorkerMode::OpaqueComponentCaptureMxFp4,
-        ] {
-            eprintln!("Muse quantized TP: {family:?} {mode:?}");
-            run_ring_cartesian_pipeline_mode(false, family, "tp", mode);
-        }
-    }
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::MuseGlimmerMoe,
-        "tp",
-        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
     );
 }
 
@@ -944,27 +689,6 @@ fn ring_muse_components_affine_independent_bank_matrix() {
 }
 
 #[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_muse_components_gguf_tensor_parallel() {
-    for routed in [false, true] {
-        eprintln!("Muse GGUF TP: sparse={routed} ordinary banks");
-        run_ring_cartesian_pipeline_mode(
-            false,
-            FixtureFamily::MuseGlimmerGguf(routed),
-            "tp",
-            WorkerMode::OpaqueComponentCapture,
-        );
-    }
-    eprintln!("Muse GGUF TP: sparse=true independent banks");
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::MuseGlimmerGguf(true),
-        "tp",
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_muse_components_gguf_matrix() {
     for routed in [false, true] {
@@ -987,32 +711,6 @@ fn ring_muse_components_gguf_independent_bank_matrix() {
 }
 
 #[test]
-#[ignore = "spawns eight local MLX Ring ranks; run explicitly"]
-fn ring_muse_components_tensor_pipeline_expert() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::MuseGlimmerMoe,
-        "tp-pp-ep",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_qwen_vl_components_tensor_parallel() {
-    for family in [FixtureFamily::Qwen3Vl, FixtureFamily::Qwen3VlMoe] {
-        eprintln!("Qwen3-VL component TP: {family:?}");
-        run_ring_cartesian_pipeline_mode(false, family, "tp", WorkerMode::OpaqueComponentCapture);
-    }
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen3VlMoe,
-        "tp",
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_qwen_vl_components_matrix() {
     for (family, routed) in [
@@ -1024,43 +722,12 @@ fn ring_qwen_vl_components_matrix() {
 }
 
 #[test]
-#[ignore = "spawns eight local MLX Ring ranks; run explicitly"]
-fn ring_qwen_vl_components_cartesian_replay() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen3VlMoe,
-        "tp-pp-ep",
-        WorkerMode::OpaqueComponentCapture,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_qwen_vl_components_independent_bank_matrix() {
     run_component_matrix_with_mode(
         FixtureFamily::Qwen3VlMoe,
         true,
         WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_qwen_vl_components_quantized_tensor_parallel() {
-    for family in [FixtureFamily::Qwen3Vl, FixtureFamily::Qwen3VlMoe] {
-        for mode in [
-            WorkerMode::OpaqueComponentCaptureRequantize,
-            WorkerMode::OpaqueComponentCaptureMxFp4,
-        ] {
-            eprintln!("Qwen3-VL quantized TP: {family:?} {mode:?}");
-            run_ring_cartesian_pipeline_mode(false, family, "tp", mode);
-        }
-    }
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::Qwen3VlMoe,
-        "tp",
-        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
     );
 }
 
@@ -1127,40 +794,9 @@ fn run_gemma4_component_case(
 }
 
 fn run_gemma4_component_matrix(sparse: bool, mode: WorkerMode) {
-    let axes: &[&str] = if sparse {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for axes in axes {
-        for (label, residency) in [
-            ("resident", WorkerResidency::FullyResident),
-            ("host", WorkerResidency::LayerwiseHost),
-            ("disk", WorkerResidency::DenseDiskStream),
-        ] {
-            eprintln!("Gemma4 components sparse={sparse} {axes} {label}");
-            run_gemma4_component_case(sparse, axes, residency, mode);
-        }
+    for &(axes, residency) in component_cases(sparse) {
+        run_gemma4_component_case(sparse, axes, residency, mode);
     }
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_gemma4_components_tensor_parallel() {
-    for sparse in [false, true] {
-        run_gemma4_component_case(
-            sparse,
-            "tp",
-            WorkerResidency::FullyResident,
-            WorkerMode::OpaqueComponentCapture,
-        );
-    }
-    run_gemma4_component_case(
-        true,
-        "tp",
-        WorkerResidency::FullyResident,
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
 }
 
 #[test]
@@ -1172,45 +808,9 @@ fn ring_gemma4_components_matrix() {
 }
 
 #[test]
-#[ignore = "spawns eight local MLX Ring ranks; run explicitly"]
-fn ring_gemma4_components_triple_axis() {
-    for residency in [
-        WorkerResidency::FullyResident,
-        WorkerResidency::LayerwiseHost,
-        WorkerResidency::DenseDiskStream,
-    ] {
-        run_gemma4_component_case(
-            true,
-            "tp-pp-ep",
-            residency,
-            WorkerMode::OpaqueComponentCapture,
-        );
-    }
-}
-
-#[test]
 #[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
 fn ring_gemma4_components_independent_bank_matrix() {
     run_gemma4_component_matrix(true, WorkerMode::OpaqueComponentCaptureAddressableBank);
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_gemma4_components_quantized_tensor_parallel() {
-    for sparse in [false, true] {
-        for mode in [
-            WorkerMode::OpaqueComponentCaptureRequantize,
-            WorkerMode::OpaqueComponentCaptureMxFp4,
-        ] {
-            run_gemma4_component_case(sparse, "tp", WorkerResidency::FullyResident, mode);
-        }
-    }
-    run_gemma4_component_case(
-        true,
-        "tp",
-        WorkerResidency::FullyResident,
-        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
-    );
 }
 
 #[test]
@@ -1261,39 +861,9 @@ fn run_gemma4_gguf_component_case(
 }
 
 fn run_gemma4_gguf_component_matrix(sparse: bool, mode: WorkerMode) {
-    let axes: &[&str] = if sparse {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for axes in axes {
-        for residency in [
-            WorkerResidency::FullyResident,
-            WorkerResidency::LayerwiseHost,
-            WorkerResidency::DenseDiskStream,
-        ] {
-            run_gemma4_gguf_component_case(sparse, axes, residency, mode);
-        }
+    for &(axes, residency) in component_cases(sparse) {
+        run_gemma4_gguf_component_case(sparse, axes, residency, mode);
     }
-}
-
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_gemma4_gguf_components_tensor_parallel() {
-    for sparse in [false, true] {
-        run_gemma4_gguf_component_case(
-            sparse,
-            "tp",
-            WorkerResidency::FullyResident,
-            WorkerMode::OpaqueComponentCapture,
-        );
-    }
-    run_gemma4_gguf_component_case(
-        true,
-        "tp",
-        WorkerResidency::FullyResident,
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
 }
 
 #[test]
@@ -1350,39 +920,9 @@ fn run_qwen_vl_gguf_encoded_component_case(
     );
 }
 
-#[test]
-#[ignore = "spawns local MLX Ring ranks; run explicitly"]
-fn ring_qwen_vl_gguf_components_tensor_parallel() {
-    for routed in [false, true] {
-        run_qwen_vl_gguf_component_case(
-            routed,
-            "tp",
-            WorkerResidency::FullyResident,
-            WorkerMode::OpaqueComponentCapture,
-        );
-    }
-    run_qwen_vl_gguf_component_case(
-        true,
-        "tp",
-        WorkerResidency::FullyResident,
-        WorkerMode::OpaqueComponentCaptureAddressableBank,
-    );
-}
-
 fn run_qwen_vl_gguf_component_matrix(routed: bool, mode: WorkerMode) {
-    let axes: &[&str] = if routed {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for &axes in axes {
-        for residency in [
-            WorkerResidency::FullyResident,
-            WorkerResidency::LayerwiseHost,
-            WorkerResidency::DenseDiskStream,
-        ] {
-            run_qwen_vl_gguf_component_case(routed, axes, residency, mode);
-        }
+    for &(axes, residency) in component_cases(routed) {
+        run_qwen_vl_gguf_component_case(routed, axes, residency, mode);
     }
 }
 
@@ -1475,19 +1015,8 @@ fn ring_qwen_vl_packed_gguf_components_focused() {
 }
 
 fn run_qwen_vl_packed_gguf_component_matrix(routed: bool, mode: WorkerMode) {
-    let axes: &[&str] = if routed {
-        &["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"]
-    } else {
-        &["tp", "pp", "tp-pp"]
-    };
-    for &axes in axes {
-        for residency in [
-            WorkerResidency::FullyResident,
-            WorkerResidency::LayerwiseHost,
-            WorkerResidency::DenseDiskStream,
-        ] {
-            run_qwen_vl_gguf_encoded_component_case(routed, axes, residency, mode, true);
-        }
+    for &(axes, residency) in component_cases(routed) {
+        run_qwen_vl_gguf_encoded_component_case(routed, axes, residency, mode, true);
     }
 }
 

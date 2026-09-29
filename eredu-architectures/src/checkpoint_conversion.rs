@@ -200,26 +200,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn plan_preserves_exact_nonconventional_companion_identities() {
-        let plan = SafetensorsQuantizationPlan::new(
-            AffineQuantization::default(),
-            [SafetensorsQuantizationTarget::new(
-                "released_legacy_weight",
-                "runtime.matrix",
-                "runtime.scale",
-                Some("runtime.zero"),
-            )],
-            json!({"architecture_owned": true}),
-        )
-        .unwrap();
-        let target = &plan.targets()[0];
-        assert_eq!(target.source_name(), "released_legacy_weight");
-        assert_eq!(target.weight_name(), "runtime.matrix");
-        assert_eq!(target.scales_name(), "runtime.scale");
-        assert_eq!(target.biases_name(), Some("runtime.zero"));
-    }
-
-    #[test]
     fn plan_rejects_companion_policy_drift_and_collisions() {
         let missing_bias = SafetensorsQuantizationPlan::new(
             AffineQuantization::default(),

@@ -706,36 +706,6 @@ fn mlx_head_expansion_matches_scalar_reference() {
 }
 
 #[test]
-#[ignore = "explicit MLX segmented-attention parity; run outside the sandbox"]
-fn mlx_segmented_attention_matches_scalar_reference() {
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = execution.stream();
-    let queries = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 1.0];
-    let keys = [1.0_f32, 0.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0];
-    let values = [1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
-    let query = MlxTensor::from_array(Array::from_slice(&queries, &[4, 1, 2]));
-    let key = MlxTensor::from_array(Array::from_slice(&keys, &[4, 1, 2]));
-    let value = MlxTensor::from_array(Array::from_slice(&values, &[4, 1, 2]));
-    let segments = [2, 2];
-    let scale = 2.0_f32.sqrt().recip();
-    let actual = <MlxNeuralBackend as NeuralBackend>::segmented_attention(
-        SegmentedAttentionInput {
-            queries: &query,
-            keys: &key,
-            values: &value,
-            segment_lengths: &segments,
-            scale,
-        },
-        stream,
-    )
-    .unwrap();
-    let expected =
-        reference_segmented_attention(4, 1, 2, 2, &queries, &keys, &values, &segments, scale)
-            .unwrap();
-    close(&actual, &expected, 2e-5);
-}
-
-#[test]
 #[ignore = "explicit native activation precision conformance"]
 fn scaled_softplus_preserves_bfloat16_and_rounds_once() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

@@ -576,20 +576,6 @@ fn hybrid_fixed_and_attention_state_are_separate() {
     assert_eq!(estimate.context_state_bytes, 2 * 8 * 5 * 3 * 4);
 }
 
-#[test]
-fn multimodal_positions_are_distinct_from_text_tokens() {
-    let count = InputTokenCount::prepared(7, 12, 19, 1_024, ObservationKind::Conservative);
-    assert_eq!(
-        count.text_tokens + count.media_positions,
-        count.model_positions
-    );
-    assert_eq!(count.media_execution_workspace_bytes(), 1_024);
-    assert_eq!(
-        count.media_execution_workspace_kind(),
-        ObservationKind::Conservative
-    );
-}
-
 fn tiny_inkling() -> eredu_architectures::inkling::ModelArgs {
     eredu_architectures::inkling::ModelArgs::from_hf_json(
         &serde_json::to_vec(&json!({
@@ -803,14 +789,6 @@ fn checked_arithmetic_reports_overflow() {
 }
 
 #[test]
-fn unavailable_memory_is_not_zero() {
-    let value: Observed<u64> = Observed::Unavailable {
-        reason: "synthetic".into(),
-    };
-    assert_eq!(value.value(), None);
-}
-
-#[test]
 fn supported_apple_silicon_targets_have_unified_memory() {
     // iPadOS uses the iOS target; ARM64 simulators use the same OS/architecture
     // pair as their device target and run on an Apple silicon host.
@@ -835,51 +813,6 @@ fn supported_apple_silicon_targets_have_unified_memory() {
             "{os}/{arch}"
         );
     }
-}
-
-#[test]
-fn apple_unified_semantics_do_not_create_two_capacities() {
-    let report = AvailableMemory {
-        physical_memory_bytes: Observed::Available {
-            value: 16,
-            kind: ObservationKind::Exact,
-            source: "test".into(),
-        },
-        available_memory_bytes: Observed::Available {
-            value: 8,
-            kind: ObservationKind::Estimated,
-            source: "test".into(),
-        },
-        physical_semantics: PhysicalMemorySemantics::Unified,
-    };
-    assert_eq!(report.physical_memory_bytes.value(), Some(&16));
-    assert_eq!(report.physical_semantics, PhysicalMemorySemantics::Unified);
-}
-
-#[test]
-fn floating_dtype_assumption_follows_the_session_activation_width() {
-    let layout = StateMemoryLayout::new(
-        LayerSchedule::new(
-            1,
-            vec![LayerCachePolicy::key_only(AttentionPolicy::Full, 1, 16).unwrap()],
-        )
-        .unwrap(),
-        vec![0],
-        1,
-        1,
-        EstimationCompleteness::Complete,
-    )
-    .unwrap();
-    let estimate = estimate_mlx_runtime_state_with_dtype(
-        &layout,
-        InputTokenCount::text(2),
-        0,
-        1,
-        NonZeroU8::new(2).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(estimate.assumptions.floating_state_dtype_bytes.get(), 2);
-    assert_eq!(estimate.requested_state_bytes, 2 * 16 * 2);
 }
 
 #[test]

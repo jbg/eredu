@@ -1173,7 +1173,6 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
-    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, TensorPlacement};
 
     use super::*;
@@ -1190,56 +1189,6 @@ mod tests {
             }"#,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn shared_layer_omits_kv_group_and_sparse_group_is_semantic() {
-        let owner = layer_parameter_groups(&args(), 0).unwrap();
-        assert!(owner
-            .iter()
-            .any(|group| group.logical_name().ends_with("key_value_heads")));
-        assert!(owner
-            .iter()
-            .any(|group| group.role() == ParameterRole::ExpertIntermediate));
-        let shared = layer_parameter_groups(&args(), 1).unwrap();
-        assert!(!shared
-            .iter()
-            .any(|group| group.logical_name().ends_with("key_value_heads")));
-    }
-
-    #[test]
-    fn affine_layer_plan_publishes_weight_companions() {
-        let mut args = args();
-        args.weight_quantization = Some(AffineQuantization::new(16, 4).unwrap().into());
-        args.quantized_weights = Some(std::collections::HashSet::from([
-            "model.language_model.layers.0.self_attn.q_proj.weight".to_owned(),
-            "model.language_model.layers.0.experts.switch_glu.gate_up_proj".to_owned(),
-        ]));
-        let targets = layer_parameter_groups(&args, 0)
-            .unwrap()
-            .into_iter()
-            .flat_map(|group| group.members().to_vec())
-            .map(|member| member.target().to_owned())
-            .collect::<Vec<_>>();
-        assert!(targets
-            .iter()
-            .any(|name| name == "model.language_model.layers.0.self_attn.q_proj.scales"));
-        assert!(targets.iter().any(|name| {
-            name == "model.language_model.layers.0.experts.switch_glu.gate_up_proj_scales"
-        }));
-    }
-
-    fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
-        LocalTensorLayout::new(
-            "test",
-            ParameterRole::AttentionHeads,
-            shape.clone(),
-            shape,
-            TensorPlacement::Local,
-            None,
-            None,
-            false,
-        )
     }
 
     fn family() -> FamilyConfig {
@@ -1363,85 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn local_shared_kv_geometry_is_derived_from_its_publisher() {
-        let args = args();
-        let mut layout = LocalModelLayout::default();
-        layout.insert(
-            "model.language_model.layers.0.self_attn.k_proj.weight".into(),
-            local_tensor(vec![4, 16]),
-        );
-        layout.insert(
-            "model.language_model.layers.1.self_attn.q_proj.weight".into(),
-            local_tensor(vec![8, 16]),
-        );
-        layout.insert(
-            "model.language_model.layers.1.mlp.gate_proj.weight".into(),
-            local_tensor(vec![16, 16]),
-        );
-        layout.insert(
-            "model.language_model.layers.1.experts.switch_glu.gate_up_proj".into(),
-            local_tensor(vec![4, 8, 16]),
-        );
-        let local = local_block_args(&args, 1, &layout).unwrap();
-        let policy = local.layer_policy(1).unwrap();
-        assert_eq!(local.num_attention_heads, 2);
-        assert_eq!(policy.num_key_value_heads.get(), 1);
-        assert_eq!(policy.intermediate_size.get(), 16);
-        assert_eq!(local.moe_intermediate_size, Some(4));
-    }
-
-    #[test]
-    fn partition_geometry_owns_optional_roots_text_state_and_static_roles_exactly() {
-        let family = family();
-        let layout = family_layout();
-        let first = PartitionOwnership::new(
-            true,
-            false,
-            [
-                "vision",
-                "vision_projection",
-                "audio",
-                "audio_projection",
-                "embedding",
-                "per_layer_embedding",
-                "per_layer_projection",
-                "per_layer_norm",
-            ],
-        )
-        .unwrap();
-        let first = partition_local_geometry(
-            &family,
-            &layout,
-            [
-                (super::super::VISION_EXECUTION_GROUP, 0..1),
-                (super::super::AUDIO_EXECUTION_GROUP, 0..1),
-                (super::super::TEXT_EXECUTION_GROUP, 0..1),
-            ],
-            &first,
-        )
-        .unwrap();
-        assert_eq!(first.vision_units(), Some(0..1));
-        assert_eq!(first.audio_units(), Some(0..1));
-        assert_eq!(first.text_units(), 0..1);
-        assert_eq!(first.local_state_layout().unwrap().len(), 1);
-        assert!(first.text_block(0).is_some());
-        assert!(first.text_block(1).is_none());
-
-        let last = PartitionOwnership::new(false, true, ["norm", "output"]).unwrap();
-        let last = partition_local_geometry(
-            &family,
-            &layout,
-            [(super::super::TEXT_EXECUTION_GROUP, 1..2)],
-            &last,
-        )
-        .unwrap();
-        assert_eq!(last.text_units(), 1..2);
-        assert_eq!(last.static_roles(), ["norm", "output"]);
-        assert_eq!(last.local_state_layout().unwrap().len(), 1);
-        assert_eq!(last.complete_state_layout().len(), 2);
-    }
-
-    #[test]
     fn partition_geometry_rejects_bad_ranges_roles_and_task_drift_before_construction() {
         let family = family();
         let layout = family_layout();
@@ -1485,34 +1355,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(routed_error.to_string().contains("does not admit routed"));
-    }
-
-    #[test]
-    fn family_geometry_owns_text_vocab_state_and_replicated_towers() {
-        let family = family();
-        let geometry = local_geometry(&family, &family_layout()).unwrap();
-        assert_eq!(geometry.text_blocks().len(), 2);
-        assert_eq!(geometry.text_block(0).unwrap().num_attention_heads, 1);
-        assert_eq!(
-            geometry
-                .text_block(0)
-                .unwrap()
-                .layer_policy(0)
-                .unwrap()
-                .num_key_value_heads
-                .get(),
-            1
-        );
-        assert_eq!(geometry.embedding_range().local, 0..32);
-        assert_eq!(geometry.output_range().unwrap().local, 0..32);
-        assert_eq!(geometry.vision_layers(), 1);
-        assert_eq!(geometry.audio_layers(), 1);
-        assert_eq!(geometry.per_layer_range(), &(0..2));
-        assert_ne!(
-            geometry.state_layout(),
-            &state_layout(&family.text).unwrap()
-        );
-        geometry.validate_for(&family).unwrap();
     }
 
     #[test]

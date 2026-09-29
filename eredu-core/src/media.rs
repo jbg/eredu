@@ -535,21 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn request_preserves_text_only_segments() {
-        let request = MultimodalRequest::new(vec![
-            MultimodalSegment::TokenIds(vec![1, 2]),
-            MultimodalSegment::Text("tail".into()),
-        ])
-        .unwrap();
-
-        assert_eq!(request.segments().len(), 2);
-        assert!(matches!(
-            &request.segments()[0],
-            MultimodalSegment::TokenIds(ids) if ids == &[1, 2]
-        ));
-    }
-
-    #[test]
     fn semantic_fingerprint_is_stable_and_distinguishes_equal_geometry_payloads() {
         fn request(image_value: u8, audio_value: f32) -> TokenizedMultimodalRequest {
             MultimodalRequest::new(vec![

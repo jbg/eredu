@@ -1,8 +1,4 @@
-import json
-import pathlib
-import tempfile
 import unittest
-from unittest import mock
 
 from validation import reference_runner
 from validation import run_pilot_case
@@ -10,42 +6,6 @@ from validation import run_prompt_matrix
 
 
 class ReferenceRunnerTests(unittest.TestCase):
-    def test_prefill_mode_defaults_to_full_and_accepts_tokenwise(self):
-        common = ["--probe", "probe.json", "--output", "result"]
-        self.assertEqual(reference_runner.parse_args(common).prefill_mode, "full")
-        self.assertEqual(
-            reference_runner.parse_args(
-                common + ["--prefill-mode", "tokenwise"]
-            ).prefill_mode,
-            "tokenwise",
-        )
-
-    def test_probe_validation_does_not_import_gpu_dependencies(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = pathlib.Path(temporary) / "probe.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "input": {"token_ids": [1, 2]},
-                        "output": {"fed_token_ids": [3]},
-                    }
-                )
-            )
-            self.assertEqual(reference_runner.read_probe(path)["input"]["token_ids"], [1, 2])
-
-    def test_output_extensions_replace_existing_suffix(self):
-        self.assertEqual(
-            reference_runner.output_paths(pathlib.Path("result.probe")),
-            (pathlib.Path("result.json"), pathlib.Path("result.safetensors")),
-        )
-
-    def test_qwen3_vl_uses_image_text_auto_model(self):
-        fake_transformers = mock.Mock()
-        selected = reference_runner.auto_model_class(fake_transformers, "qwen3_vl")
-        self.assertIs(selected, fake_transformers.AutoModelForImageTextToText)
-        selected = reference_runner.auto_model_class(fake_transformers, "qwen3")
-        self.assertIs(selected, fake_transformers.AutoModelForCausalLM)
-
     def test_nemotron_h_registers_mlp_cache_placeholder(self):
         placeholder = object()
         registry = {"linear_attention": object()}

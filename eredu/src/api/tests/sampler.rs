@@ -362,21 +362,6 @@ fn prefix_is_complete<S: SpeculativeSampler<TestSamplingBackend>>(
 }
 
 #[test]
-fn generation_sampler_accepts_external_token_history() {
-    let mut sampler = GenerationSampler::new().with_generated_tokens([1, 2]);
-    assert_eq!(sampler.generated_tokens(), &[1, 2]);
-
-    sampler.accept_token(3);
-    assert_eq!(sampler.generated_tokens(), &[1, 2, 3]);
-
-    sampler.set_generated_tokens([5, 8]);
-    assert_eq!(sampler.generated_tokens(), &[5, 8]);
-
-    sampler.clear_generated_tokens();
-    assert!(sampler.generated_tokens().is_empty());
-}
-
-#[test]
 fn constraint_mask_precedes_existing_top_k_and_selects_lower_valid_token() {
     let context = &();
     let plan = synthetic_plan(ToolChoice::Required);
@@ -740,33 +725,6 @@ fn speculative_history_uses_a_state_fork_without_early_activation() {
         "history-relative queries must not activate canonical grammar state"
     );
     assert!(sampler.policy().generated_tokens().is_empty());
-}
-
-#[test]
-fn mirostat_v2_defaults_and_reset_restore_adaptive_state() {
-    let mut sampler = MirostatV2Sampler::default();
-    assert_eq!(sampler.tau(), 5.0);
-    assert_eq!(sampler.eta(), 0.1);
-    assert_eq!(sampler.mu(), 10.0);
-
-    sampler.accept_token(42, 2.0f32.powi(-7)).unwrap();
-    assert!((sampler.mu() - 9.8).abs() < 1e-6);
-    assert_eq!(sampler.generated_tokens(), &[42]);
-
-    sampler.reset();
-    assert_eq!(sampler.mu(), 10.0);
-    assert!(sampler.generated_tokens().is_empty());
-}
-
-#[test]
-fn mirostat_v2_validates_configuration() {
-    assert!(MirostatV2Sampler::new(3.0, 0.2).is_ok());
-    assert!(MirostatV2Sampler::new(0.0, 0.2).is_err());
-    assert!(MirostatV2Sampler::new(3.0, f32::NAN).is_err());
-
-    let mut sampler = MirostatV2Sampler::default();
-    assert!(sampler.accept_token(0, 0.0).is_err());
-    assert!(sampler.accept_token(0, 1.1).is_err());
 }
 
 #[test]

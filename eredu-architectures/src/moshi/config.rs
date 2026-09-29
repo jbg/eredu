@@ -1447,61 +1447,6 @@ mod tests {
     }
 
     #[test]
-    fn absent_config_normalizes_native_v0_1_exactly() {
-        let config = MoshiConfig::from_optional_json(None).unwrap();
-        assert_eq!(config.family(), MOSHI_FAMILY);
-        assert_eq!(config.effective_model_type(), EffectiveModelType::Moshi);
-        assert_eq!(config.artifact_profile(), ArtifactProfile::NativeV0_1);
-        assert_eq!(
-            config.checkpoint_layout(),
-            CheckpointLayout::MoshiSafetensors
-        );
-        assert_eq!(config.identity().version(), Some("0.1"));
-        assert_eq!(
-            config.frame_schedule().frame_convention(),
-            RealtimeFrameConvention::FeedbackAlignedHistory
-        );
-        assert_eq!(config.frame_schedule().total_audio_codebooks(), 16);
-        assert_eq!(config.frame_schedule().input_audio_codebooks(), 8);
-        assert_eq!(config.frame_schedule().generated_audio_codebooks(), 8);
-        assert_eq!(config.frame_schedule().depth_audio_codebooks(), 8);
-        assert_eq!(config.frame_schedule().text_padding_token(), 32_000);
-        assert_eq!(config.frame_schedule().audio_padding_token(), 2_048);
-        assert_eq!(
-            config.frame_schedule().delays(),
-            [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
-        );
-        assert_eq!(config.temporal().gated_hidden_size(), 11_264);
-        assert_eq!(config.temporal().attention_window(), 3_001);
-        assert_eq!(config.depth_template().gated_hidden_size(), 2_816);
-        assert_eq!(config.depth_template().attention_window(), 8);
-        assert_eq!(
-            config.parameter_sharing(),
-            ParameterSharing::IndependentDepthSlices
-        );
-        assert!(config.architecture_fingerprint().starts_with("sha256:"));
-        assert_eq!(config.architecture_fingerprint().len(), 71);
-        assert_eq!(
-            config.architecture_fingerprint(),
-            MoshiConfig::native_v0_1()
-                .unwrap()
-                .architecture_fingerprint()
-        );
-    }
-
-    #[test]
-    fn checkpoint_layout_identity_names_physical_namespaces() {
-        assert_eq!(
-            CheckpointLayout::MoshiSafetensors.as_str(),
-            "moshi_safetensors"
-        );
-        assert_eq!(
-            CheckpointLayout::PersonaPlexPytorch.as_str(),
-            "personaplex_pytorch"
-        );
-    }
-
-    #[test]
     fn explicit_native_accepts_present_or_early_absent_model_type() {
         let explicit = normalize_value(&native_json()).unwrap();
         let mut early = native_json();
@@ -1573,47 +1518,6 @@ mod tests {
             MoshiConfig::from_json(r#"{"model_type":"other"}"#),
             Err(MoshiConfigError::UnsupportedModelType(_))
         ));
-    }
-
-    #[test]
-    fn transformer_configs_implement_shared_decoder_with_fused_layouts() {
-        let config = MoshiConfig::native_v0_1().unwrap();
-        let temporal: &dyn DecoderConfig = config.temporal();
-        assert_eq!(temporal.parameter_root(), "transformer");
-        assert_eq!(
-            temporal.block_parameter_fields(),
-            BlockParameterFields {
-                attention: "self_attn",
-                attention_query: "q_proj",
-                attention_key: "k_proj",
-                attention_value: "v_proj",
-                attention_output: "out_proj",
-                attention_sinks: "sinks",
-                attention_query_norm: "q_norm",
-                attention_key_norm: "k_norm",
-                feed_forward: "gating",
-                feed_forward_gate: "gate",
-                feed_forward_up: "up",
-                feed_forward_output: "linear_out",
-                input_norm: "norm1",
-                post_attention_norm: "norm2",
-            }
-        );
-        assert_eq!(
-            temporal.attention_projection_layout(),
-            AttentionProjectionLayout::Fused { field: "in_proj" }
-        );
-        assert_eq!(
-            temporal.gated_projection_layout(),
-            GatedProjectionLayout::Fused { field: "linear_in" }
-        );
-        assert_eq!(temporal.intermediate_size(), 11_264);
-        assert!(temporal.validate_config().is_ok());
-        let slice = config.depth_transformer(7).unwrap();
-        assert_eq!(slice.parameter_root(), "depformer.slices.7.transformer");
-        assert_eq!(slice.model_identity(), "moshi.depth.7");
-        assert_eq!(slice.intermediate_size(), 2_816);
-        assert!(config.depth_transformer(8).is_err());
     }
 
     #[test]

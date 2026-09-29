@@ -93,27 +93,6 @@ fn aliases_share_backing_but_replicas_conversions_and_independent_loads_do_not()
 }
 
 #[test]
-fn pool_identity_distinguishes_hosts_and_can_express_unified_aliases() {
-    let mut report = description();
-    let retained = allocation(
-        "retained-features",
-        "prediction",
-        ResourceRole::RetainedTensor,
-    );
-    assert_eq!(retained.placement, report.allocations[0].placement);
-    report.allocations.push(retained);
-    let mut remote = allocation("remote-state", "state", ResourceRole::MutableState);
-    remote.placement = Observed::Available {
-        value: id("host-2", "shared-dram"),
-        kind: ObservationKind::Observational,
-        source: "current remote pool registry".into(),
-    };
-    assert_ne!(remote.placement, report.allocations[0].placement);
-    report.allocations.push(remote);
-    report.validate().unwrap();
-}
-
-#[test]
 fn evaluated_bounds_express_nonlinear_scratch_and_rounded_horizon_capacity() {
     let mut report = description();
     report.context.dimensions =

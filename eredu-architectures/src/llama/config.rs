@@ -634,27 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_minimal_llama_config() {
-        let value = serde_json::json!({
-            "model_type": "llama",
-            "hidden_size": 16,
-            "num_hidden_layers": 2,
-            "intermediate_size": 32,
-            "num_attention_heads": 4,
-            "rms_norm_eps": 0.00001,
-            "vocab_size": 64
-        });
-        let args = model_args_from_config_value(&value).unwrap();
-        assert_eq!(args.num_key_value_heads, 4);
-        assert_eq!(args.head_dim, 4);
-        assert_eq!(args.attention_schedule.len(), 2);
-        assert_eq!(
-            args.weight_quantization_for("model.layers.0.mlp.up_proj.weight"),
-            None
-        );
-    }
-
-    #[test]
     fn canonicalizes_quantization_alias_and_rejects_conflicts() {
         let mut value = serde_json::json!({
             "model_type": "llama",

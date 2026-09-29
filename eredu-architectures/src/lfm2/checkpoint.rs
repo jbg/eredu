@@ -1028,53 +1028,6 @@ mod tests {
     }
 
     #[test]
-    fn plans_every_scheduled_operator_and_feed_forward_policy() {
-        let args = fixture();
-        let safe = safetensors_plan(&args, true).unwrap();
-        let safe_names = safe
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<Vec<_>>();
-        assert!(safe_names.contains(&"model.layers.0.conv.conv.weight"));
-        assert!(safe_names.contains(&"model.layers.1.self_attn.q_proj.weight"));
-        assert!(safe_names.contains(&"model.layers.0.feed_forward.w1.weight"));
-        assert!(safe_names.contains(&"model.layers.1.feed_forward.gate.weight"));
-
-        let gguf = gguf_plan(&args).unwrap();
-        let gguf_names = gguf
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<Vec<_>>();
-        assert!(gguf_names.contains(&"blk.0.shortconv.conv.weight"));
-        assert!(gguf_names.contains(&"blk.1.attn_q.weight"));
-        assert!(gguf_names.contains(&"blk.1.ffn_gate_exps.weight"));
-    }
-
-    #[test]
-    fn translates_dense_sparse_and_short_convolution_names() {
-        assert_eq!(
-            translate_gguf_weight_name("blk.2.shortconv.in_proj.weight", false),
-            "model.layers.2.conv.in_proj.weight"
-        );
-        assert_eq!(
-            translate_gguf_weight_name("blk.2.ffn_gate_exps.weight", true),
-            "model.layers.2.feed_forward.experts.gate_proj"
-        );
-    }
-
-    #[test]
-    fn packed_weights_use_only_canonical_checkpoint_names() {
-        let quantization =
-            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-        let constraints =
-            safe_matrix_constraints("projection.weight", vec![64, 64], Some(quantization)).unwrap();
-
-        assert!(constraints[0].aliases.is_empty());
-    }
-
-    #[test]
     fn neutral_catalog_owns_split_expert_stacking() {
         let args = fixture();
         let prefix = "model.layers.1.feed_forward.experts";

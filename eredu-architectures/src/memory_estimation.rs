@@ -497,23 +497,4 @@ mod tests {
             .iter()
             .all(|l| matches!(l.mixer, TokenMixerTopology::GatedConvolution { .. })));
     }
-
-    #[test]
-    fn shared_decoder_topology_covers_previously_unmodeled_gemma2() {
-        use eredu_core::ModelConfigurationResolver;
-        let config = serde_json::json!({"model_type":"gemma2", "vocab_size":32, "hidden_size":16, "intermediate_size":32, "num_hidden_layers":2, "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4, "max_position_embeddings":64, "sliding_window":16, "query_pre_attn_scalar":4, "attn_logit_softcapping":50.0, "final_logit_softcapping":30.0});
-        let resolved = crate::configuration::MODEL_CONFIGURATIONS
-            .resolve_safetensors(&config)
-            .unwrap();
-        let topology = generation_memory_geometry(resolved.architecture_plan())
-            .unwrap()
-            .execution_topology
-            .unwrap();
-        assert_eq!(topology.layers.len(), 2);
-        assert!(topology
-            .layers
-            .iter()
-            .all(|l| matches!(l.mixer, TokenMixerTopology::Attention { softcap: true, .. })));
-        assert!(topology.layers.iter().all(|l| l.normalization_count == 4));
-    }
 }

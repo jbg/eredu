@@ -43,8 +43,6 @@ use crate::{
 mod adapter;
 
 pub use adapter::completion::MlxCompletion;
-#[cfg(test)]
-use adapter::device::device_capabilities;
 pub(crate) use adapter::device::{MlxAcceleratorFamily, MlxDeviceIdentity};
 pub use adapter::model::MlxModel;
 pub use adapter::provider::MlxBackend;

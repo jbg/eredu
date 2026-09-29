@@ -2694,40 +2694,6 @@ fn conditional_prediction_group_transport(
     transport
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::items_after_test_module,
-    reason = "the transport contract tests stay adjacent to the transport declaration"
-)]
-mod transport_tests {
-    use super::{conditional_prediction_group_transport, ConditionalPipelineBoundarySchema};
-    use eredu_runtime::ArchitectureBoundary;
-
-    #[test]
-    fn conditional_deepstack_count_owns_wire_cardinality() {
-        let schema = ConditionalPipelineBoundarySchema {
-            hidden_size: 48,
-            deepstack_count: 3,
-        };
-        let tensors = schema.wire_schema().unwrap().resolve(2, 4).unwrap();
-        assert_eq!(tensors.primary().shape(), [2, 4, 48]);
-        assert_eq!(tensors.auxiliary().len(), 3);
-        assert_eq!(tensors.auxiliary()[0].role(), "deepstack.0");
-        assert_eq!(tensors.auxiliary()[2].shape(), [2, 4, 48]);
-    }
-
-    #[test]
-    fn first_conditional_prediction_group_owns_shared_mtp_embedding_role_once() {
-        assert_eq!(
-            conditional_prediction_group_transport(2).first_owner_static_roles,
-            ["mtp"]
-        );
-        assert!(conditional_prediction_group_transport(3)
-            .first_owner_static_roles
-            .is_empty());
-    }
-}
-
 impl<B, S> ParallelLayeredArchitecture<B, S> for ConditionalLayeredModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,

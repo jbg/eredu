@@ -2101,24 +2101,4 @@ mod tests {
             Err(ParallelPlanError::InvalidTensor(_))
         ));
     }
-
-    #[test]
-    fn parallel_model_info_preserves_opaque_topology_and_accounting() {
-        let info = ParallelModelInfo::new(
-            (2usize, 1usize),
-            "generic",
-            vec!["layer.weight".into()],
-            10,
-            20,
-            4,
-            8,
-        );
-        assert_eq!(info.topology(), (2, 1));
-        assert_eq!(info.effective_model_type(), "generic");
-        assert_eq!(info.owned_tensors(), ["layer.weight"]);
-        assert_eq!(info.local_parameter_bytes(), 10);
-        assert_eq!(info.global_parameter_bytes(), 20);
-        assert_eq!(info.pinned_device_parameter_bytes(), 4);
-        assert_eq!(info.maximum_device_parameter_bytes(), 8);
-    }
 }

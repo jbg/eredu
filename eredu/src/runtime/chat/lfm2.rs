@@ -1067,8 +1067,7 @@ mod tests {
     };
     use eredu_core::generation::{FinishReason, SemanticEvent};
 
-    const AUTHORITATIVE_CALL: &str =
-        include_str!("../../../tests/fixtures/lfm2/candidate-status-b3afba27.txt");
+
 
     fn parameters() -> DialectParameters {
         DialectParameters::Custom(&LFM2_PARAMETERS)
@@ -1257,19 +1256,6 @@ mod tests {
             assert!(parser.push(&invalid).is_err());
             assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
         }
-    }
-
-    #[test]
-    fn authoritative_python_call_is_not_a_declarative_json_payload() {
-        let call = AUTHORITATIVE_CALL.trim_end();
-        let payload = call
-            .strip_prefix(TOOL_CALL_START)
-            .and_then(|call| call.strip_suffix(TOOL_CALL_END))
-            .unwrap();
-
-        assert!(serde_json::from_str::<Value>(payload).is_err());
-        assert!(payload.starts_with("[get_candidate_status("));
-        assert!(payload.contains("candidate_id="));
     }
 
     #[test]

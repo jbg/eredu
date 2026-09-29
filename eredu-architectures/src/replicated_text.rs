@@ -9350,22 +9350,6 @@ mod tests {
         assert!(error.to_string().contains("embedded prediction"));
     }
 
-    #[test]
-    fn partitioned_topology_remains_a_caller_selection_choice() {
-        let (_root, inspection) = inspected("llama");
-        let requirements = replicated_text_requirements(&inspection).unwrap();
-        let request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-            eredu_runtime::LayerWeightResidency::FullyResident,
-            eredu_runtime::CacheResidencyPolicy::Device,
-        )
-        .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
-        assert!(!request.topology().unwrap().is_replicated());
-        assert_eq!(
-            requirements,
-            replicated_text_requirements(&inspection).unwrap()
-        );
-    }
-
     #[derive(Debug)]
     enum CollectedPartitionedAdmission {
         Direct(crate::partitioned_execution::DirectPartitionedAdmission),

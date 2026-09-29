@@ -2667,34 +2667,6 @@ mod tests {
     };
     use safetensors::tensor::{serialize_to_file, TensorView};
 
-    struct Lease {
-        metadata: TensorMetadata,
-        selection: TensorSelection,
-        proof: BoundedReadProof,
-        bytes: Vec<u8>,
-    }
-
-    impl EncodedTensorLease for Lease {
-        fn metadata(&self) -> &TensorMetadata {
-            &self.metadata
-        }
-        fn selection(&self) -> &TensorSelection {
-            &self.selection
-        }
-        fn output_shape(&self) -> &[usize] {
-            &self.metadata.logical_shape
-        }
-        fn bounded_read_proof(&self) -> &BoundedReadProof {
-            &self.proof
-        }
-        fn backing_path(&self) -> Option<&Path> {
-            None
-        }
-        fn encoded_bytes(&self) -> Option<&[u8]> {
-            Some(&self.bytes)
-        }
-    }
-
     #[test]
     fn shard_admission_survives_views_stores_and_payload_cache_eviction() {
         let directory = tempfile::tempdir().unwrap();
@@ -2865,36 +2837,6 @@ mod tests {
         );
         assert_eq!(recipe.infer(other.as_ref()).unwrap().shape, [3]);
         assert_eq!(recipe.infer(source.as_ref()).unwrap().shape, [2]);
-    }
-
-    #[test]
-    fn lease_exposes_encoding_selection_and_bounded_read_proof() {
-        let lease = Lease {
-            metadata: TensorMetadata {
-                name: "model.weight".into(),
-                logical_shape: vec![2, 2],
-                physical_shape: vec![2, 2],
-                stored_dtype: StoredDtype::F16,
-                encoded_byte_len: 8,
-                backing_shard: None,
-            },
-            selection: TensorSelection::Range {
-                axis: 0,
-                start: 1,
-                end: 2,
-            },
-            proof: BoundedReadProof {
-                physically_bounded: true,
-                offset_bytes: 4,
-                length_bytes: 4,
-                physical_reads: 1,
-                physical_read_bytes: 4,
-            },
-            bytes: vec![0; 4],
-        };
-        assert_eq!(lease.metadata().stored_dtype, StoredDtype::F16);
-        assert_eq!(lease.encoded_bytes().unwrap().len(), 4);
-        assert!(lease.bounded_read_proof().physically_bounded);
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {

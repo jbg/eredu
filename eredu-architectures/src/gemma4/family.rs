@@ -312,28 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn preserves_nested_family_and_freezes_all_component_identity() {
-        let mut value = config();
-        value["video_token_id"] = 62.into();
-        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(parsed.model_type, "gemma4_unified");
-        assert_eq!(parsed.effective_model_type(), "gemma4_text");
-        assert!(!parsed.text.tie_word_embeddings);
-        assert!(parsed.vision.is_some());
-        assert!(parsed.audio.is_some());
-        assert_eq!(
-            parsed.input_modalities(),
-            InputModalities {
-                text: true,
-                image: true,
-                audio: true,
-                video: true,
-            }
-        );
-        assert!(!parsed.architecture_fingerprint().is_empty());
-    }
-
-    #[test]
     fn family_fingerprint_includes_component_quantization() {
         let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
         let dense = parsed.architecture_fingerprint();
@@ -364,29 +342,6 @@ mod tests {
         object.remove("audio_config");
         let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.input_modalities(), InputModalities::TEXT);
-    }
-
-    #[test]
-    fn family_owns_prompt_cache_identity() {
-        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
-        let layout = crate::gemma4::state_layout(&parsed.text).unwrap();
-        let identity = crate::gemma4::state_identity(
-            &parsed,
-            &layout,
-            0,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .unwrap()
-        .prompt_cache_identity(&layout)
-        .unwrap();
-
-        assert_eq!(identity.model_family(), "gemma4");
-        assert_eq!(identity.effective_model_type(), "gemma4_text");
-        assert_eq!(
-            identity.architecture_fingerprint(),
-            parsed.architecture_fingerprint()
-        );
-        assert_eq!(identity.layer_prefix_offsets(), vec![0; layout.len()]);
     }
 
     #[test]

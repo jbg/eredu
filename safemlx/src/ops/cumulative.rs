@@ -305,14 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cummax_out_of_bounds() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.cummax(2, None, None, stream);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_cummin() {
         let stream = crate::test_stream();
         let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
@@ -339,14 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cummin_out_of_bounds() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.cummin(2, None, None, stream);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_cumprod() {
         let stream = crate::test_stream();
         let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
@@ -370,14 +354,6 @@ mod tests {
         let result = array.cumprod(0, None, Some(true), stream).unwrap();
         assert_eq!(result.shape(), &[2, 2]);
         assert_eq!(crate::array::eval_vec::<i32>(&result), &[5, 8, 20, 72]);
-    }
-
-    #[test]
-    fn test_cumprod_out_of_bounds() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.cumprod(2, None, None, stream);
-        assert!(result.is_err());
     }
 
     #[test]

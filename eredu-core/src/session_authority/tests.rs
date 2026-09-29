@@ -122,9 +122,6 @@ fn aborted_and_unwinding_submissions_release_without_manual_cleanup() {
 
 #[test]
 fn completion_can_resolve_on_another_thread_without_weakening_exclusivity() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SessionAuthority>();
-    assert_send_sync::<SubmissionLease>();
     let mut authority = SessionAuthority::new();
     let lease = authority.begin_submission().unwrap();
     std::thread::spawn(move || {

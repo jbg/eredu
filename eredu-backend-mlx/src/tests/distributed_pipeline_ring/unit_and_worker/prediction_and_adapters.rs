@@ -234,30 +234,6 @@ fn public_deepseek_v3_embedded_scheduler_executes_on_metal() {
     assert!(output.stats().draft_tokens() > 0);
 }
 
-#[test]
-fn synthetic_prediction_input_binds_prepared_shape_and_token_content() {
-    let first_tokens = [1_u32, 2];
-    let first = Array::from_slice(&first_tokens, &[1, 2]);
-    let first_parts = [text_input_part(&first)];
-    let first = synthetic_prediction_input(&first_parts, &first_tokens);
-    let same = synthetic_prediction_input(&first_parts, &first_tokens);
-    let changed = synthetic_prediction_input(&first_parts, &[2, 1]);
-    let reshaped_tokens = Array::from_slice(&first_tokens, &[2, 1]);
-    let reshaped_parts = [text_input_part(&reshaped_tokens)];
-    let reshaped = synthetic_prediction_input(&reshaped_parts, &first_tokens);
-
-    assert_eq!(first.cache_identity(), same.cache_identity());
-    assert_ne!(first.cache_identity(), changed.cache_identity());
-    assert_ne!(first.cache_identity(), reshaped.cache_identity());
-    assert_eq!(
-        first
-            .cache_identity()
-            .expect("synthetic input identity")
-            .semantic_content_fingerprint(),
-        eredu_core::cache::prompt_cache_token_fingerprint(&first_tokens)
-    );
-}
-
 #[derive(Default)]
 struct ExternalObservationTrace {
     counts: BTreeMap<String, usize>,

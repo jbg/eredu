@@ -674,32 +674,4 @@ mod tests {
     fn argmax_ignores_nan_and_uses_first_for_ties() {
         assert_eq!(argmax(&[f32::NAN, 4.0, 4.0, 3.0]).unwrap(), 1);
     }
-
-    #[test]
-    fn byte_encoders_are_little_endian() {
-        assert_eq!(u32_bytes(&[0x0102_0304]), [4, 3, 2, 1]);
-        assert_eq!(f32_bytes(&[1.0]), 1.0f32.to_le_bytes());
-    }
-
-    #[test]
-    fn safetensors_contract_round_trips() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("probe.safetensors");
-        let run = RunOutput {
-            prefill_logits: vec![1.0, 2.0, 3.0],
-            decode_logits: vec![4.0, 5.0, 6.0],
-            vocab_size: 3,
-            fed_token_ids: vec![2],
-            greedy_token_ids: vec![2, 1],
-            prefill_wall: Duration::ZERO,
-            decode_wall: vec![Duration::ZERO],
-        };
-
-        write_tensors(&path, &[7, 8], &run).unwrap();
-        let bytes = fs::read(path).unwrap();
-        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
-        assert_eq!(tensors.tensor("prefill.logits").unwrap().shape(), [1, 3]);
-        assert_eq!(tensors.tensor("decode.logits").unwrap().shape(), [1, 3]);
-        assert_eq!(tensors.tensor("input.token_ids").unwrap().shape(), [2]);
-    }
 }

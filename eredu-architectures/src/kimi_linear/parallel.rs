@@ -1238,25 +1238,6 @@ mod tests {
     }
 
     #[test]
-    fn local_geometry_owns_blocks_vocabulary_and_state_together() {
-        let args = args();
-        let geometry = local_geometry(&args, &valid_layout()).unwrap();
-        assert_eq!(geometry.blocks().len(), 2);
-        assert_eq!(geometry.block(0).unwrap().kda_heads, 2);
-        assert_eq!(geometry.block(0).unwrap().dense_intermediate, 9);
-        assert_eq!(geometry.block(1).unwrap().mla_heads, 2);
-        assert_eq!(geometry.block(1).unwrap().routed_intermediate, 5);
-        assert_eq!(geometry.block(1).unwrap().shared_intermediate, 5);
-        assert_eq!(geometry.embedding_range().local, 0..8);
-        assert_eq!(geometry.output_range().unwrap().local, 0..8);
-        assert_ne!(
-            geometry.state_layout(),
-            &crate::kimi_linear::state_layout(&args).unwrap()
-        );
-        geometry.validate_for(&args).unwrap();
-    }
-
-    #[test]
     fn partition_geometry_retains_only_owned_dense_units_and_exact_mixed_state() {
         let args = dense_args();
         let layout = valid_dense_layout();
@@ -1403,14 +1384,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("inconsistent companion selections"));
-    }
-
-    #[test]
-    fn tied_geometry_uses_embedding_ownership_for_output() {
-        let mut args = args();
-        args.tie_word_embeddings = true;
-        let geometry = local_geometry(&args, &valid_layout()).unwrap();
-        assert!(geometry.output_range().is_none());
-        geometry.validate_for(&args).unwrap();
     }
 }

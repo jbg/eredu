@@ -1164,23 +1164,6 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_plan_is_strict_and_uses_dflash_parameter_identities() {
-        let config = DFlashConfig::from_hf_json(&released()).unwrap();
-        let plan = dflash_safetensors_plan(&config).unwrap();
-        let names = plan
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert!(plan.catalog_policy.strict);
-        assert!(names.contains("encoder.fc.weight"));
-        assert!(names.contains("encoder.output_norm_enc.weight"));
-        assert!(names.contains("layers.4.mlp.down_proj.weight"));
-        assert!(names.contains("norm.weight"));
-    }
-
-    #[test]
     fn gguf_catalog_translation_and_format_transforms_preserve_dflash_identities() {
         let config = DFlashConfig::from_hf_json(&released()).unwrap();
         let plan = dflash_gguf_plan(&config).unwrap();

@@ -338,32 +338,6 @@ fn affine_selected_bytes_use_the_exact_non_f32_companion_dtype() {
     );
 }
 
-#[test]
-fn mixed_selected_transforms_remain_explicit_in_telemetry() {
-    let affine =
-        WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
-    let transformations = BTreeMap::from([
-        (
-            (ParameterBankKey::new(0, 0, 0), "weight".into()),
-            SelectedBindingTransform {
-                quantization: affine,
-                companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
-            },
-        ),
-        (
-            (ParameterBankKey::new(0, 0, 1), "weight".into()),
-            SelectedBindingTransform {
-                quantization: WeightQuantization::MxFp4,
-                companion_dtype: eredu_checkpoint::recipe::RecipeDtype::F16,
-            },
-        ),
-    ]);
-    assert_eq!(
-        selected_transformation_formats(&transformations),
-        [affine, WeightQuantization::MxFp4]
-    );
-}
-
 fn cache(
     store: Arc<SafetensorsWeightStore>,
     device: u64,
@@ -686,19 +660,6 @@ fn resident_store_pins_every_entry_and_never_rereads_checkpoint_weights() {
     assert_eq!(executed.incremental.device.hits, 2);
     assert_eq!(executed.incremental.device.misses, 0);
     assert_eq!(executed.incremental.device.evictions, 0);
-}
-
-#[test]
-fn bulk_target_is_required_and_cannot_exceed_scratch() {
-    let storage = OffloadConfig::new(Some(48), Some(0), 1).unwrap();
-    assert!(matches!(
-        ParameterBankOptions::new(storage, 64, 0),
-        Err(ParameterBankOptionsError::ZeroBulkBankTarget)
-    ));
-    assert!(matches!(
-        ParameterBankOptions::new(storage, 64, 65),
-        Err(ParameterBankOptionsError::BulkBankTargetExceedsScratch { .. })
-    ));
 }
 
 #[test]

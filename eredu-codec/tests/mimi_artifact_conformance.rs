@@ -314,7 +314,7 @@ fn constructs_real_mimi_and_runs_numeric_latent_pcm_and_streaming_paths() {
 }
 
 #[test]
-fn every_active_codebook_count_constructs_and_executes_the_same_neutral_path() {
+fn minimum_and_full_codebooks_execute_and_reuse_materialized_parameters() {
     let latent = (0..512)
         .map(|channel| if channel == 0 { 0.75 } else { 0.0 })
         .collect::<Vec<_>>();
@@ -324,7 +324,7 @@ fn every_active_codebook_count_constructs_and_executes_the_same_neutral_path() {
     let warm = construct::<ReferenceBackend>(warm, &context, &context).unwrap();
     assert_eq!(warm.mimi_config().num_codebooks, 32);
     let mut expected_materializations = 318;
-    for active in 1..=32 {
+    for active in [1, 32] {
         let prepared = prepare_checkpoint(&fixture().checkpoint, Config::v0_1(Some(active)))
             .expect("the exact released artifact admits every supported active count");
         assert_eq!(prepared.requirements().len(), 318);

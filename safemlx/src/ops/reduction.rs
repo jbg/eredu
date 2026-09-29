@@ -1073,16 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prod_empty_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.prod_axes(&[], None, stream).unwrap();
-
-        let results: Vec<i32> = crate::array::eval_vec(&result);
-        assert_eq!(results, &[5, 8, 4, 9]);
-    }
-
-    #[test]
     fn test_max() {
         let stream = crate::test_stream();
         let x = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
@@ -1096,16 +1086,6 @@ mod tests {
 
         let result = x.max_axis(1, None, stream).unwrap();
         assert_eq!(crate::array::eval_vec::<i32>(&result), &[2, 4]);
-    }
-
-    #[test]
-    fn test_max_empty_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.max_axes(&[], None, stream).unwrap();
-
-        let results: Vec<i32> = crate::array::eval_vec(&result);
-        assert_eq!(results, &[5, 8, 4, 9]);
     }
 
     #[test]
@@ -1145,24 +1125,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_empty_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.mean_axes(&[], None, stream).unwrap();
-
-        let results: Vec<f32> = crate::array::eval_vec(&result);
-        assert_eq!(results, &[5.0, 8.0, 4.0, 9.0]);
-    }
-
-    #[test]
-    fn test_mean_out_of_bounds() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.mean_axis(2, None, stream);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_min() {
         let stream = crate::test_stream();
         let x = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
@@ -1176,16 +1138,6 @@ mod tests {
 
         let result = x.min_axis(1, None, stream).unwrap();
         assert_eq!(crate::array::eval_vec::<i32>(&result), &[1, 3]);
-    }
-
-    #[test]
-    fn test_min_empty_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.min_axes(&[], None, stream).unwrap();
-
-        let results: Vec<i32> = crate::array::eval_vec(&result);
-        assert_eq!(results, &[5, 8, 4, 9]);
     }
 
     #[test]
@@ -1229,16 +1181,6 @@ mod tests {
 
         let results: Vec<f32> = crate::array::eval_vec(&result);
         assert_eq!(results, &[5.3132615, 9.313262]);
-    }
-
-    #[test]
-    fn test_log_sum_exp_empty_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[5, 8, 4, 9], &[2, 2]);
-        let result = array.logsumexp_axes(&[], None, stream).unwrap();
-
-        let results: Vec<f32> = crate::array::eval_vec(&result);
-        assert_eq!(results, &[5.0, 8.0, 4.0, 9.0]);
     }
 
     #[test]

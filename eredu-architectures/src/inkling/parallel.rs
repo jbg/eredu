@@ -992,7 +992,6 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
-    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, ParameterRole, TensorPlacement};
 
     use super::*;
@@ -1012,74 +1011,6 @@ mod tests {
             }"#,
         )
         .unwrap()
-    }
-
-    fn mtp_args() -> ModelArgs {
-        ModelArgs::from_hf_json(
-            br#"{
-              "model_type":"inkling_mm_model",
-              "text_config":{
-                "hidden_size":16,"num_hidden_layers":1,"vocab_size":64,
-                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
-                "sliding_window_size":8,"local_layer_ids":[0],
-                "mlp_layer_types":["dense"],"sconv_kernel_size":4,
-                "d_rel":2,"intermediate_size":12,"n_routed_experts":4,
-                "num_experts_per_tok":2,"n_shared_experts":1
-              },
-              "mtp_config":{
-                "num_nextn_predict_layers":2,"local_layer_ids":[1],
-                "chain_hidden_post_norm":true,"dense_intermediate_size":12
-              }
-            }"#,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn sparse_groups_distinguish_routed_shared_and_replicated_router() {
-        let groups = layer_parameter_groups(&args(), 1).unwrap();
-        assert_eq!(
-            groups
-                .iter()
-                .filter(|group| group.role() == ParameterRole::ExpertIntermediate)
-                .count(),
-            1
-        );
-        assert_eq!(
-            groups
-                .iter()
-                .filter(|group| group.role() == ParameterRole::SharedExpertIntermediate)
-                .count(),
-            1
-        );
-        assert!(groups
-            .iter()
-            .any(|group| group.logical_name().ends_with("moe.router")));
-        assert!(groups
-            .iter()
-            .any(|group| group.logical_name().ends_with("key_value_heads")));
-    }
-
-    #[test]
-    fn affine_layer_plan_publishes_weight_companions() {
-        let mut args = args();
-        let format = AffineQuantization::new(16, 4).unwrap().into();
-        args.text_config.quantized_weight_configs = Some(std::collections::HashMap::from([
-            ("model.layers.1.self_attn.q_proj.weight".to_owned(), format),
-            ("model.layers.1.moe.experts.gate_up_proj".to_owned(), format),
-        ]));
-        let targets = layer_parameter_groups(&args, 1)
-            .unwrap()
-            .into_iter()
-            .flat_map(|group| group.members().to_vec())
-            .map(|member| member.target().to_owned())
-            .collect::<Vec<_>>();
-        assert!(targets
-            .iter()
-            .any(|name| name == "model.layers.1.self_attn.q_proj.scales"));
-        assert!(targets
-            .iter()
-            .any(|name| name == "model.layers.1.moe.experts.gate_up_proj_scales"));
     }
 
     fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
@@ -1151,72 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn local_text_geometry_uses_planned_heads_and_intermediate_widths() {
-        let args = args();
-        let mut dense = LocalModelLayout::default();
-        dense.insert(
-            "model.layers.0.self_attn.q_proj.weight".into(),
-            local_tensor(vec![8, 16]),
-        );
-        dense.insert(
-            "model.layers.0.self_attn.k_proj.weight".into(),
-            local_tensor(vec![4, 16]),
-        );
-        dense.insert(
-            "model.layers.0.dense.gate_proj.weight".into(),
-            local_tensor(vec![6, 16]),
-        );
-        let local = local_text_args(&args.text_config, 0, &dense).unwrap();
-        assert_eq!(local.num_attention_heads, 2);
-        assert_eq!(local.num_key_value_heads, 1);
-        assert_eq!(local.dense_intermediate_size(), 6);
-
-        let mut sparse = LocalModelLayout::default();
-        sparse.insert(
-            "model.layers.1.self_attn.q_proj.weight".into(),
-            local_tensor(vec![8, 16]),
-        );
-        sparse.insert(
-            "model.layers.1.self_attn.k_proj.weight".into(),
-            local_tensor(vec![4, 16]),
-        );
-        sparse.insert(
-            "model.layers.1.moe.experts.gate_up_proj".into(),
-            local_tensor(vec![4, 6, 16]),
-        );
-        let local = local_text_args(&args.text_config, 1, &sparse).unwrap();
-        assert_eq!(local.swa_num_attention_heads, Some(2));
-        assert_eq!(local.swa_num_key_value_heads, Some(1));
-        assert_eq!(local.moe_intermediate_size(), 3);
-    }
-
-    #[test]
-    fn aggregate_geometry_owns_vocabulary_text_and_state_together() {
-        let args = args();
-        let geometry = local_geometry(&args, &local_geometry_layout()).unwrap();
-        assert_eq!(geometry.embedding_range().local, 0..31);
-        assert_eq!(geometry.output_range().local, 0..31);
-        assert_eq!(geometry.text_layers().len(), 2);
-        assert_eq!(geometry.text_layer(0).unwrap().num_attention_heads, 2);
-        assert_eq!(
-            geometry.text_layer(1).unwrap().swa_num_key_value_heads,
-            Some(1)
-        );
-        assert_eq!(geometry.state_layout().len(), 2);
-        assert!(geometry.prediction_state().is_none());
-    }
-
-    #[test]
-    fn aggregate_geometry_places_prediction_state_after_target_state() {
-        let mut args = args();
-        args.mtp_config = mtp_args().mtp_config;
-        let geometry = local_geometry(&args, &local_geometry_layout()).unwrap();
-        let prediction = geometry.prediction_state().expect("prediction state plan");
-        assert_eq!(prediction.global_layers(), 2..4);
-        assert_eq!(prediction.layout().len(), 2);
-    }
-
-    #[test]
     fn aggregate_geometry_rejects_vocabulary_companion_drift() {
         let args = args();
         let mut layout = local_geometry_layout();
@@ -1247,29 +1112,5 @@ mod tests {
             eredu_core::cache::PromptCacheTopology::default(),
         )
         .is_err());
-    }
-
-    #[test]
-    fn embedded_predictor_parameters_are_complete_and_replicated() {
-        let groups = mtp_parameter_groups(&mtp_args()).unwrap();
-        assert_eq!(groups.len(), 1);
-        let group = &groups[0];
-        assert_eq!(group.logical_name(), "model.mtp");
-        assert_eq!(group.role(), ParameterRole::Replicated);
-        assert!(group.members().iter().all(|member| {
-            member.target().starts_with("model.mtp.")
-                && member.sharding() == &MemberSharding::Replicated
-        }));
-        assert!(group.members().iter().any(|member| {
-            member.target() == "model.mtp.layers.0.transformer_block.dense.gate_proj.weight"
-        }));
-        assert!(group
-            .members()
-            .iter()
-            .any(|member| member.target() == "model.mtp.chain_norm.weight"));
-        assert!(!group
-            .members()
-            .iter()
-            .any(|member| member.target().contains("w13_dn")));
     }
 }

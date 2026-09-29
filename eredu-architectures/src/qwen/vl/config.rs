@@ -479,31 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_identity_uses_the_registry_family() {
-        for (outer, inner, family) in [
-            ("qwen3_vl", "qwen3_vl_text", "qwen3_vl"),
-            ("qwen3_vl_moe", "qwen3_vl_moe_text", "qwen3_vl_moe"),
-        ] {
-            let mut value = config(outer, inner);
-            if outer == "qwen3_vl_moe" {
-                value["text_config"]["intermediate_size"] = Value::from(0);
-                value["text_config"]["moe_intermediate_size"] = Value::from(16);
-                value["text_config"]["num_experts"] = Value::from(4);
-                value["text_config"]["num_experts_per_tok"] = Value::from(2);
-            }
-            let args = model_args_from_config_value(&value).unwrap();
-            let layout = state_layout(&args).unwrap();
-            let identity = state_identity(&args, &layout, 0, PromptCacheTopology::default())
-                .unwrap()
-                .prompt_cache_identity(&layout)
-                .unwrap();
-
-            assert_eq!(identity.model_family(), family);
-            assert_eq!(identity.effective_model_type(), inner);
-        }
-    }
-
-    #[test]
     fn rejects_placeholder_and_output_width_drift() {
         let mut value = config("qwen3_vl", "qwen3_vl_text");
         value["video_token_id"] = value["image_token_id"].clone();

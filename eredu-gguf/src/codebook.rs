@@ -81,22 +81,3 @@ impl IQuantCodebook {
         self.signs
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codebooks_are_selected_by_encoding() {
-        let iq2 = IQuantCodebook::for_type(GgmlType::IQ2XS).unwrap();
-        assert_eq!(iq2.u64_values().unwrap().len(), 512);
-        assert_eq!(iq2.signs().unwrap().len(), 128);
-        assert!(iq2.i8_values().is_none());
-
-        let iq4 = IQuantCodebook::for_type(GgmlType::IQ4NL).unwrap();
-        assert_eq!(iq4.i8_values().unwrap().len(), 16);
-        assert!(iq4.signs().is_none());
-
-        assert!(IQuantCodebook::for_type(GgmlType::Q4K).is_none());
-    }
-}

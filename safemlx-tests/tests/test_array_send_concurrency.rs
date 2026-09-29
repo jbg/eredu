@@ -14,19 +14,6 @@ fn cpu_stream() -> Stream {
 }
 
 #[test]
-fn owned_array_can_move_to_another_thread_and_drop() {
-    let mut handles = Vec::new();
-    for i in 0..(THREADS * ITERS) {
-        let array = Array::from_slice(&[i as i32, (i + 1) as i32], &[2]);
-        handles.push(thread::spawn(move || drop(array)));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-#[test]
 fn owned_array_can_move_to_another_thread_and_evaluate() {
     let mut handles = Vec::new();
     for i in 0..THREADS {

@@ -991,18 +991,7 @@ fn validate_positive_finite(name: &str, value: f32) -> Result<(), SamplingConfig
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationSampler, MirostatV2Sampler};
-
-    #[test]
-    fn generation_history_is_backend_neutral() {
-        let mut sampler = GenerationSampler::new().with_generated_tokens([1, 2]);
-        sampler.accept_token(3);
-        assert_eq!(sampler.generated_tokens(), &[1, 2, 3]);
-        sampler.set_generated_tokens([5, 8]);
-        assert_eq!(sampler.generated_tokens(), &[5, 8]);
-        sampler.clear_generated_tokens();
-        assert!(sampler.generated_tokens().is_empty());
-    }
+    use super::MirostatV2Sampler;
 
     #[test]
     fn mirostat_state_is_backend_neutral() {

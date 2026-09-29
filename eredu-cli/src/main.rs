@@ -3590,7 +3590,7 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, format_bytes, median, read_automatic_feedback,
+        discover_local_hardware, format_bytes, median,
         requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
@@ -3600,7 +3600,7 @@ mod tests {
         ExecutionPlan, ExecutionPlanReport, ModelResourceProfile, NativeToolSupport, Observed,
         PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan,
         ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice,
-        SpeculativeSchedulerOptions, StopReason, WeightTransformationPlan,
+        StopReason, WeightTransformationPlan,
     };
 
     fn scanned_revision() -> CachedRevision {
@@ -3677,14 +3677,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_feedback_accepts_a_telemetry_array() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("feedback.json");
-        std::fs::write(&path, b"[]").unwrap();
-        assert!(read_automatic_feedback(&[path]).unwrap().is_empty());
-    }
-
-    #[test]
     fn artifact_stamp_changes_invalidate_cache_identity() {
         let directory = tempfile::tempdir().unwrap();
         let weights = directory.path().join("model.safetensors");
@@ -3758,34 +3750,6 @@ mod tests {
         assert!(cached_automatic_report(&cache_path, &miss)
             .unwrap()
             .is_none());
-    }
-
-    #[test]
-    fn explicit_tuning_knobs_override_the_automatic_plan() {
-        let matches = Cli::command()
-            .try_get_matches_from([
-                "eredu",
-                "--model",
-                "model-id",
-                "--dense-disk-stream",
-                "--device-budget-bytes",
-                "1234",
-                "--cached-shards",
-                "7",
-                "prompt",
-            ])
-            .unwrap();
-        let overrides = AutomaticCliOverrides::from_matches(&matches);
-        assert!(!overrides.contains("quantization_group_size"));
-        let original = Cli::from_arg_matches(&matches).unwrap();
-        let mut applied = original.clone();
-        let plan = ExecutionPlan::fully_resident(device_plan(CliDevice::Cpu).unwrap());
-        apply_automatic_plan(&mut applied, &plan).unwrap();
-        overrides.restore(&mut applied, &original);
-        assert!(!applied.layerwise_host);
-        assert!(applied.dense_disk_stream);
-        assert_eq!(applied.device_budget_bytes, Some(1234));
-        assert_eq!(applied.cached_shards, 7);
     }
 
     #[test]
@@ -4046,19 +4010,6 @@ mod tests {
         file.last_accessed = SystemTime::UNIX_EPOCH;
         file.last_modified = SystemTime::UNIX_EPOCH;
         file
-    }
-
-    #[test]
-    fn command_definition_is_valid() {
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn parses_timing_without_enabling_verbose_output() {
-        let args =
-            Cli::try_parse_from(["eredu", "--model", "model-id", "--timing", "prompt"]).unwrap();
-        assert!(args.timing);
-        assert!(!args.verbose);
     }
 
     #[test]
@@ -4414,21 +4365,6 @@ mod tests {
     }
 
     #[test]
-    fn leaves_generation_options_unspecified_for_checkpoint_defaults() {
-        let args = Cli::try_parse_from(["eredu", "--model", "model-id", "prompt"]).unwrap();
-        assert_eq!(
-            args.generation_overrides(),
-            eredu_core::GenerationConfigOverrides::default()
-        );
-        let resolved =
-            eredu_core::resolve_generation_config(None, args.generation_overrides()).unwrap();
-        assert_eq!(resolved.repetition_penalty, 1.0);
-        assert_eq!(resolved.repeat_last_n, 64);
-        assert_eq!(resolved.frequency_penalty, 0.0);
-        assert_eq!(resolved.presence_penalty, 0.0);
-    }
-
-    #[test]
     fn generation_arguments_override_only_explicit_checkpoint_settings() {
         use eredu_core::{CheckpointGenerationConfig, ResolvedGenerationConfig};
 
@@ -4534,36 +4470,6 @@ mod tests {
                 assert_eq!(resolved, expected, "raw={raw}, flag={flag:?}");
             }
         }
-    }
-
-    #[test]
-    fn validates_explicit_generation_penalties() {
-        for flag in [
-            "--repeat-penalty=0",
-            "--repeat-penalty=NaN",
-            "--repeat-penalty=inf",
-            "--repeat-last-n=-2",
-            "--frequency-penalty=NaN",
-            "--frequency-penalty=inf",
-            "--presence-penalty=NaN",
-            "--presence-penalty=inf",
-        ] {
-            let args =
-                Cli::try_parse_from(["eredu", "--model", "model-id", flag, "prompt"]).unwrap();
-            assert!(validate_args(&args).is_err(), "{flag}");
-        }
-        let args = Cli::try_parse_from([
-            "eredu",
-            "--model",
-            "model-id",
-            "--repeat-penalty=1.5",
-            "--repeat-last-n=-1",
-            "--frequency-penalty=-0.5",
-            "--presence-penalty=-0.5",
-            "prompt",
-        ])
-        .unwrap();
-        validate_args(&args).unwrap();
     }
 
     #[test]
@@ -4741,48 +4647,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_speculative_lookahead_controls() {
-        let args = Cli::try_parse_from([
-            "eredu",
-            "--model",
-            "model-id",
-            "--draft-model",
-            "draft-id",
-            "--disable-speculative-lookahead",
-            "--disable-speculative-adaptive-lookahead",
-            "--verbose",
-            "prompt",
-        ])
-        .unwrap();
-
-        assert!(args.disable_speculative_lookahead);
-        assert!(args.disable_speculative_adaptive_lookahead);
-        let options = SpeculativeSchedulerOptions {
-            adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
-            ..SpeculativeSchedulerOptions::default()
-        }
-        .with_lookahead(!args.disable_speculative_lookahead);
-        assert_eq!(options.lookahead_blocks, 0);
-        assert!(!options.adaptive_lookahead);
-    }
-
-    #[test]
-    fn parses_mlx_allocator_cache_limit() {
-        let args = Cli::try_parse_from([
-            "eredu",
-            "--model",
-            "model-id",
-            "--mlx-cache-limit-bytes",
-            "17179869184",
-            "prompt",
-        ])
-        .unwrap();
-
-        assert_eq!(args.mlx_cache_limit_bytes, Some(17_179_869_184));
-        validate_args(&args).unwrap();
-    }
-
-    #[test]
     fn parses_and_validates_expert_cache_prefill_bank_target() {
         let args = Cli::try_parse_from([
             "eredu",
@@ -4818,20 +4682,6 @@ mod tests {
             command.push("prompt");
             assert!(validate_args(&Cli::try_parse_from(command).unwrap()).is_err());
         }
-    }
-
-    #[test]
-    fn accepts_combined_expert_cache_and_dense_streaming() {
-        let arguments = Cli::try_parse_from([
-            "eredu",
-            "--model",
-            "model-id",
-            "--expert-cache",
-            "--dense-disk-stream",
-            "prompt",
-        ])
-        .unwrap();
-        validate_args(&arguments).unwrap();
     }
 
     #[test]

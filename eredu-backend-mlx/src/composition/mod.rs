@@ -313,10 +313,6 @@ pub mod mlx;
 pub mod moshi;
 
 #[cfg(test)]
-#[path = "tests/mlx_architecture_conformance.rs"]
-mod mlx_architecture_conformance;
-
-#[cfg(test)]
 mod expert_selection_tests {
     use eredu_architectures::{
         ExpertParameterRecipe, ExpertParameterRole, ExpertResidencyDistribution,

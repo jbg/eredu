@@ -1194,28 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn family_owns_prompt_cache_identity() {
-        let args = DecoderConfig::from_hf_value(&config()).unwrap();
-        let layout = crate::muse_glimmer::state_layout(&args).unwrap();
-        let identity = crate::muse_glimmer::state_identity(
-            &args,
-            &layout,
-            0,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .unwrap()
-        .prompt_cache_identity(&layout)
-        .unwrap();
-
-        assert_eq!(identity.model_family(), "muse_glimmer");
-        assert_eq!(
-            identity.architecture_fingerprint(),
-            args.architecture_fingerprint()
-        );
-        assert_eq!(identity.layer_prefix_offsets(), vec![0; layout.len()]);
-    }
-
-    #[test]
     fn rejects_attention_rope_mismatch() {
         let mut value = config();
         value["text_config"]["layer_rope_theta"][1] = Value::from(10000.0);

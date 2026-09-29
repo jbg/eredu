@@ -1181,15 +1181,15 @@ macro_rules! nemotron_component_matrix {
         #[test]
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
-            for axes in [
-                None,
-                Some("tp"),
-                Some("ep"),
-                Some("tp-ep"),
-                Some("tp-pp"),
-                Some("pp-ep"),
-                Some("tp-pp-ep"),
-            ] {
+            for &(case_axes, residency) in component_cases(true) {
+                if residency != WorkerResidency::$residency {
+                    continue;
+                }
+                let axes = if case_axes == "pp" {
+                    None
+                } else {
+                    Some(case_axes)
+                };
                 let checkpoint = tempfile::tempdir().unwrap();
                 let (family, path) = if $gguf {
                     let path = checkpoint.path().join("model.gguf");
@@ -1199,7 +1199,10 @@ macro_rules! nemotron_component_matrix {
                     write_nemotron_component_fixture(checkpoint.path());
                     (FixtureFamily::NemotronH, checkpoint.path().to_owned())
                 };
-                eprintln!("Nemotron components {}, axes={axes:?}", stringify!($residency));
+                eprintln!(
+                    "Nemotron components {}, axes={axes:?}",
+                    stringify!($residency)
+                );
                 run_ring_pipeline_processes(
                     WorkerResidency::$residency,
                     family,
@@ -1212,13 +1215,37 @@ macro_rules! nemotron_component_matrix {
         }
     };
 }
-nemotron_component_matrix!(ring_public_component_capture_nemotron_resident, FullyResident, false);
-nemotron_component_matrix!(ring_public_component_capture_nemotron_host, LayerwiseHost, false);
-nemotron_component_matrix!(ring_public_component_capture_nemotron_disk, DenseDiskStream, false);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_resident,
+    FullyResident,
+    false
+);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_host,
+    LayerwiseHost,
+    false
+);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_disk,
+    DenseDiskStream,
+    false
+);
 
-nemotron_component_matrix!(ring_public_component_capture_nemotron_gguf_resident, FullyResident, true);
-nemotron_component_matrix!(ring_public_component_capture_nemotron_gguf_host, LayerwiseHost, true);
-nemotron_component_matrix!(ring_public_component_capture_nemotron_gguf_disk, DenseDiskStream, true);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_gguf_resident,
+    FullyResident,
+    true
+);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_gguf_host,
+    LayerwiseHost,
+    true
+);
+nemotron_component_matrix!(
+    ring_public_component_capture_nemotron_gguf_disk,
+    DenseDiskStream,
+    true
+);
 
 macro_rules! k2_fp8_component_matrix {
     ($name:ident, $residency:ident, $mode:ident) => {
@@ -1226,29 +1253,68 @@ macro_rules! k2_fp8_component_matrix {
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
             for partial in [false, true] {
-                for axes in [None, Some("tp"), Some("ep"), Some("tp-ep"),
-                    Some("tp-pp"), Some("pp-ep"), Some("tp-pp-ep")] {
+                for &(case_axes, residency) in component_cases(true) {
+                    if residency != WorkerResidency::$residency {
+                        continue;
+                    }
+                    let axes = if case_axes == "pp" {
+                        None
+                    } else {
+                        Some(case_axes)
+                    };
                     let checkpoint = tempfile::tempdir().unwrap();
                     write_k2_fp8_fixture(checkpoint.path(), partial);
                     let path = checkpoint.path().to_owned();
-                    eprintln!("K2 grouped FP8 {}, partial={partial}, axes={axes:?}", stringify!($residency));
-                    run_ring_pipeline_processes(WorkerResidency::$residency,
-                        FixtureFamily::K2Fp8(partial), WorkerMode::$mode,
-                        checkpoint, path, axes);
+                    eprintln!(
+                        "K2 grouped FP8 {}, partial={partial}, axes={axes:?}",
+                        stringify!($residency)
+                    );
+                    run_ring_pipeline_processes(
+                        WorkerResidency::$residency,
+                        FixtureFamily::K2Fp8(partial),
+                        WorkerMode::$mode,
+                        checkpoint,
+                        path,
+                        axes,
+                    );
                 }
             }
         }
     };
 }
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_resident, FullyResident, OpaqueComponentCapture);
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_host, LayerwiseHost, OpaqueComponentCapture);
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_disk, DenseDiskStream, OpaqueComponentCapture);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_resident,
+    FullyResident,
+    OpaqueComponentCapture
+);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_host,
+    LayerwiseHost,
+    OpaqueComponentCapture
+);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_disk,
+    DenseDiskStream,
+    OpaqueComponentCapture
+);
 
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_cached_resident, FullyResident, OpaqueComponentCaptureAddressableBank);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_cached_resident,
+    FullyResident,
+    OpaqueComponentCaptureAddressableBank
+);
 
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_cached_host, LayerwiseHost, OpaqueComponentCaptureAddressableBank);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_cached_host,
+    LayerwiseHost,
+    OpaqueComponentCaptureAddressableBank
+);
 
-k2_fp8_component_matrix!(ring_public_component_capture_k2_fp8_cached_disk, DenseDiskStream, OpaqueComponentCaptureAddressableBank);
+k2_fp8_component_matrix!(
+    ring_public_component_capture_k2_fp8_cached_disk,
+    DenseDiskStream,
+    OpaqueComponentCaptureAddressableBank
+);
 
 // These fixtures cover packed columns, ordinary biases, ReLU², and companion
 // storage through the same public independently cached parameter lifecycle.
@@ -1257,10 +1323,21 @@ macro_rules! cached_component_bank_matrix {
         #[test]
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
-            for family in [FixtureFamily::GptOss, FixtureFamily::Qwen3MoeGguf,
-                FixtureFamily::NemotronH, FixtureFamily::NemotronHGguf] {
-                for axes in [None, Some("tp"), Some("ep"), Some("tp-ep"),
-                    Some("tp-pp"), Some("pp-ep"), Some("tp-pp-ep")] {
+            for family in [
+                FixtureFamily::GptOss,
+                FixtureFamily::Qwen3MoeGguf,
+                FixtureFamily::NemotronH,
+                FixtureFamily::NemotronHGguf,
+            ] {
+                for &(case_axes, residency) in component_cases(true) {
+                    if residency != WorkerResidency::$residency {
+                        continue;
+                    }
+                    let axes = if case_axes == "pp" {
+                        None
+                    } else {
+                        Some(case_axes)
+                    };
                     let checkpoint = tempfile::tempdir().unwrap();
                     let path = match family {
                         FixtureFamily::GptOss => {
@@ -1283,126 +1360,272 @@ macro_rules! cached_component_bank_matrix {
                         }
                         _ => unreachable!(),
                     };
-                    eprintln!("Cached bank components {family:?}, {}, axes={axes:?}", stringify!($residency));
-                    run_ring_pipeline_processes(WorkerResidency::$residency, family,
-                        WorkerMode::OpaqueComponentCaptureAddressableBank, checkpoint, path, axes);
+                    eprintln!(
+                        "Cached bank components {family:?}, {}, axes={axes:?}",
+                        stringify!($residency)
+                    );
+                    run_ring_pipeline_processes(
+                        WorkerResidency::$residency,
+                        family,
+                        WorkerMode::OpaqueComponentCaptureAddressableBank,
+                        checkpoint,
+                        path,
+                        axes,
+                    );
                 }
             }
         }
     };
 }
-cached_component_bank_matrix!(ring_public_component_capture_cached_banks_resident, FullyResident);
-cached_component_bank_matrix!(ring_public_component_capture_cached_banks_host, LayerwiseHost);
-cached_component_bank_matrix!(ring_public_component_capture_cached_banks_disk, DenseDiskStream);
-
-#[test]
-#[ignore = "requires native MLX Ring tensor-parallel workers"]
-fn ring_public_component_capture_fp8_partition_tail_tensor() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_k2_fp8_fixture_with_dense_tail(checkpoint.path(), true, true);
-    let path = checkpoint.path().to_owned();
-    run_ring_pipeline_processes(WorkerResidency::FullyResident, FixtureFamily::K2Fp8(true),
-        WorkerMode::OpaqueComponentCapture, checkpoint, path, Some("tp"));
-}
-
-#[test]
-#[ignore = "requires native MLX Ring tensor-parallel workers"]
-fn ring_public_component_capture_fp8_fused_tail_tensor() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_k2_fp8_fixture_with_tails(checkpoint.path(), true, true, true);
-    let path = checkpoint.path().to_owned();
-    run_ring_pipeline_processes(WorkerResidency::FullyResident, FixtureFamily::K2Fp8(true),
-        WorkerMode::OpaqueComponentCapture, checkpoint, path, Some("tp"));
-}
+cached_component_bank_matrix!(
+    ring_public_component_capture_cached_banks_resident,
+    FullyResident
+);
+cached_component_bank_matrix!(
+    ring_public_component_capture_cached_banks_host,
+    LayerwiseHost
+);
+cached_component_bank_matrix!(
+    ring_public_component_capture_cached_banks_disk,
+    DenseDiskStream
+);
 
 macro_rules! fp8_partition_tail_matrix {
     ($name:ident, $residency:ident, $mode:ident) => {
         #[test]
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
-            for axes in [None, Some("tp"), Some("ep"), Some("tp-ep"),
-                Some("tp-pp"), Some("pp-ep"), Some("tp-pp-ep")] {
+            for &(case_axes, residency) in component_cases(true) {
+                if residency != WorkerResidency::$residency {
+                    continue;
+                }
+                let axes = if case_axes == "pp" {
+                    None
+                } else {
+                    Some(case_axes)
+                };
                 let checkpoint = tempfile::tempdir().unwrap();
                 write_k2_fp8_fixture_with_dense_tail(checkpoint.path(), true, true);
                 let path = checkpoint.path().to_owned();
-                eprintln!("FP8 sharded tail {}, {}, axes={axes:?}", stringify!($residency), stringify!($mode));
-                run_ring_pipeline_processes(WorkerResidency::$residency,
-                    FixtureFamily::K2Fp8(true), WorkerMode::$mode, checkpoint, path, axes);
+                eprintln!(
+                    "FP8 sharded tail {}, {}, axes={axes:?}",
+                    stringify!($residency),
+                    stringify!($mode)
+                );
+                run_ring_pipeline_processes(
+                    WorkerResidency::$residency,
+                    FixtureFamily::K2Fp8(true),
+                    WorkerMode::$mode,
+                    checkpoint,
+                    path,
+                    axes,
+                );
             }
         }
     };
 }
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_resident, FullyResident, OpaqueComponentCapture);
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_host, LayerwiseHost, OpaqueComponentCapture);
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_disk, DenseDiskStream, OpaqueComponentCapture);
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_cached_resident, FullyResident, OpaqueComponentCaptureAddressableBank);
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_cached_host, LayerwiseHost, OpaqueComponentCaptureAddressableBank);
-fp8_partition_tail_matrix!(ring_public_component_capture_fp8_partition_tail_matrix_cached_disk, DenseDiskStream, OpaqueComponentCaptureAddressableBank);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_resident,
+    FullyResident,
+    OpaqueComponentCapture
+);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_host,
+    LayerwiseHost,
+    OpaqueComponentCapture
+);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_disk,
+    DenseDiskStream,
+    OpaqueComponentCapture
+);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_cached_resident,
+    FullyResident,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_cached_host,
+    LayerwiseHost,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_partition_tail_matrix!(
+    ring_public_component_capture_fp8_partition_tail_matrix_cached_disk,
+    DenseDiskStream,
+    OpaqueComponentCaptureAddressableBank
+);
 
 macro_rules! fp8_fused_tail_matrix {
     ($name:ident, $residency:ident, $mode:ident) => {
         #[test]
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
-            for axes in [None, Some("tp"), Some("ep"), Some("tp-ep"),
-                Some("tp-pp"), Some("pp-ep"), Some("tp-pp-ep")] {
+            for &(case_axes, residency) in component_cases(true) {
+                if residency != WorkerResidency::$residency {
+                    continue;
+                }
+                let axes = if case_axes == "pp" {
+                    None
+                } else {
+                    Some(case_axes)
+                };
                 let checkpoint = tempfile::tempdir().unwrap();
                 write_k2_fp8_fixture_with_tails(checkpoint.path(), true, true, true);
                 let path = checkpoint.path().to_owned();
-                eprintln!("FP8 fused tail {}, {}, axes={axes:?}", stringify!($residency), stringify!($mode));
-                run_ring_pipeline_processes(WorkerResidency::$residency,
-                    FixtureFamily::K2Fp8(true), WorkerMode::$mode, checkpoint, path, axes);
+                eprintln!(
+                    "FP8 fused tail {}, {}, axes={axes:?}",
+                    stringify!($residency),
+                    stringify!($mode)
+                );
+                run_ring_pipeline_processes(
+                    WorkerResidency::$residency,
+                    FixtureFamily::K2Fp8(true),
+                    WorkerMode::$mode,
+                    checkpoint,
+                    path,
+                    axes,
+                );
             }
         }
     };
 }
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_resident, FullyResident, OpaqueComponentCapture);
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_host, LayerwiseHost, OpaqueComponentCapture);
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_disk, DenseDiskStream, OpaqueComponentCapture);
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_cached_resident, FullyResident, OpaqueComponentCaptureAddressableBank);
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_cached_host, LayerwiseHost, OpaqueComponentCaptureAddressableBank);
-fp8_fused_tail_matrix!(ring_public_component_capture_fp8_fused_tail_matrix_cached_disk, DenseDiskStream, OpaqueComponentCaptureAddressableBank);
-
-#[test]
-#[ignore = "requires native MLX Ring tensor-parallel workers"]
-fn ring_public_component_capture_fp8_attention_tail_tensor() {
-    let checkpoint = tempfile::tempdir().unwrap();
-    write_k2_fp8_fixture_with_attention_tails(checkpoint.path());
-    let path = checkpoint.path().to_owned();
-    run_ring_pipeline_processes(WorkerResidency::FullyResident, FixtureFamily::K2Fp8(true),
-        WorkerMode::OpaqueComponentCapture, checkpoint, path, Some("tp"));
-}
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_resident,
+    FullyResident,
+    OpaqueComponentCapture
+);
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_host,
+    LayerwiseHost,
+    OpaqueComponentCapture
+);
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_disk,
+    DenseDiskStream,
+    OpaqueComponentCapture
+);
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_cached_resident,
+    FullyResident,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_cached_host,
+    LayerwiseHost,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_fused_tail_matrix!(
+    ring_public_component_capture_fp8_fused_tail_matrix_cached_disk,
+    DenseDiskStream,
+    OpaqueComponentCaptureAddressableBank
+);
 
 macro_rules! fp8_attention_tail_matrix {
     ($name:ident, $residency:ident, $mode:ident) => {
-        fp8_attention_tail_matrix!($name, $residency, $mode, write_k2_fp8_fixture_with_attention_tails);
+        fp8_attention_tail_matrix!(
+            $name,
+            $residency,
+            $mode,
+            write_k2_fp8_fixture_with_attention_tails
+        );
     };
     ($name:ident, $residency:ident, $mode:ident, $write:ident) => {
         #[test]
         #[ignore = "requires native MLX Ring with up to eight loopback processes"]
         fn $name() {
-            for axes in [None, Some("tp"), Some("ep"), Some("tp-ep"),
-                Some("tp-pp"), Some("pp-ep"), Some("tp-pp-ep")] {
+            for &(case_axes, residency) in component_cases(true) {
+                if residency != WorkerResidency::$residency {
+                    continue;
+                }
+                let axes = if case_axes == "pp" {
+                    None
+                } else {
+                    Some(case_axes)
+                };
                 let checkpoint = tempfile::tempdir().unwrap();
                 $write(checkpoint.path());
                 let path = checkpoint.path().to_owned();
-                eprintln!("FP8 attention tail {}, {}, axes={axes:?}", stringify!($residency), stringify!($mode));
-                run_ring_pipeline_processes(WorkerResidency::$residency,
-                    FixtureFamily::K2Fp8(true), WorkerMode::$mode, checkpoint, path, axes);
+                eprintln!(
+                    "FP8 attention tail {}, {}, axes={axes:?}",
+                    stringify!($residency),
+                    stringify!($mode)
+                );
+                run_ring_pipeline_processes(
+                    WorkerResidency::$residency,
+                    FixtureFamily::K2Fp8(true),
+                    WorkerMode::$mode,
+                    checkpoint,
+                    path,
+                    axes,
+                );
             }
         }
     };
 }
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_resident, FullyResident, OpaqueComponentCapture);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_host, LayerwiseHost, OpaqueComponentCapture);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_disk, DenseDiskStream, OpaqueComponentCapture);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_cached_resident, FullyResident, OpaqueComponentCaptureAddressableBank);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_cached_host, LayerwiseHost, OpaqueComponentCaptureAddressableBank);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_attention_tail_matrix_cached_disk, DenseDiskStream, OpaqueComponentCaptureAddressableBank);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_resident,
+    FullyResident,
+    OpaqueComponentCapture
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_host,
+    LayerwiseHost,
+    OpaqueComponentCapture
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_disk,
+    DenseDiskStream,
+    OpaqueComponentCapture
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_cached_resident,
+    FullyResident,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_cached_host,
+    LayerwiseHost,
+    OpaqueComponentCaptureAddressableBank
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_attention_tail_matrix_cached_disk,
+    DenseDiskStream,
+    OpaqueComponentCaptureAddressableBank
+);
 
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_resident, FullyResident, OpaqueComponentCapture, write_k2_fp8_fixture_with_non_f32_scales);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_host, LayerwiseHost, OpaqueComponentCapture, write_k2_fp8_fixture_with_non_f32_scales);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_disk, DenseDiskStream, OpaqueComponentCapture, write_k2_fp8_fixture_with_non_f32_scales);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_cached_resident, FullyResident, OpaqueComponentCaptureAddressableBank, write_k2_fp8_fixture_with_non_f32_scales);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_cached_host, LayerwiseHost, OpaqueComponentCaptureAddressableBank, write_k2_fp8_fixture_with_non_f32_scales);
-fp8_attention_tail_matrix!(ring_public_component_capture_fp8_non_f32_scales_cached_disk, DenseDiskStream, OpaqueComponentCaptureAddressableBank, write_k2_fp8_fixture_with_non_f32_scales);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_resident,
+    FullyResident,
+    OpaqueComponentCapture,
+    write_k2_fp8_fixture_with_non_f32_scales
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_host,
+    LayerwiseHost,
+    OpaqueComponentCapture,
+    write_k2_fp8_fixture_with_non_f32_scales
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_disk,
+    DenseDiskStream,
+    OpaqueComponentCapture,
+    write_k2_fp8_fixture_with_non_f32_scales
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_cached_resident,
+    FullyResident,
+    OpaqueComponentCaptureAddressableBank,
+    write_k2_fp8_fixture_with_non_f32_scales
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_cached_host,
+    LayerwiseHost,
+    OpaqueComponentCaptureAddressableBank,
+    write_k2_fp8_fixture_with_non_f32_scales
+);
+fp8_attention_tail_matrix!(
+    ring_public_component_capture_fp8_non_f32_scales_cached_disk,
+    DenseDiskStream,
+    OpaqueComponentCaptureAddressableBank,
+    write_k2_fp8_fixture_with_non_f32_scales
+);

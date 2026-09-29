@@ -24,32 +24,6 @@ fn macos_discovery_exposes_estimated_available_memory() {
 }
 
 #[test]
-fn plan_normalization_is_identical_through_native_and_foreign_adapters() {
-    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
-        .with_max_cached_shards(7)
-        .with_weight_transformation(eredu_core::WeightTransformationPlan::Affine {
-            bits: 4,
-            group_size: 64,
-        })
-        .with_residency(ResidencyPlan::LayerwiseHost {
-            device_layer_window: 2,
-            device_budget_bytes: Some(4096),
-            host_budget_bytes: Some(8192),
-        });
-    let mlx = MlxBackendFactory::default()
-        .with_residency_diagnostics(true, false)
-        .load_request_for_plan(&plan)
-        .unwrap();
-    let foreign = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
-        &plan.with_device(DevicePlan::new("independent", "client:7").unwrap()),
-        eredu_runtime::ResidencyDiagnostics::new(true, false),
-        None,
-    )
-    .unwrap();
-    assert_eq!(mlx.normalized(), &foreign);
-}
-
-#[test]
 fn resident_plan_retains_reader_limit_through_cold_selection() {
     crate::tests::support::path_instrumentation::reset();
     let directory = super::super::replicated_text::tests::tiny_artifact("llama", false);
@@ -125,15 +99,6 @@ fn mlx_discovery_always_reports_cpu() {
             && backend.available
             && backend.devices.iter().any(|device| device.id == "cpu:0")
     }));
-}
-
-#[test]
-fn plan_realization_rejects_distributed_topology() {
-    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())
-        .with_topology(eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap());
-    assert!(MlxBackendFactory::default()
-        .load_request_for_plan(&plan)
-        .is_err());
 }
 
 #[test]

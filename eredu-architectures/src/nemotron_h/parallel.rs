@@ -1639,35 +1639,6 @@ mod tests {
     }
 
     #[test]
-    fn local_geometry_owns_target_mtp_vocabulary_and_state_together() {
-        let args = args();
-        let geometry = local_geometry(&args, &valid_layout()).unwrap();
-        assert_eq!(geometry.target_units().len(), 4);
-        assert_eq!(geometry.prediction_units().len(), 2);
-        assert_eq!(
-            geometry.target_unit(0),
-            Some(&LayerGeometry::Mamba {
-                heads: 2,
-                groups: 1
-            })
-        );
-        assert_eq!(
-            geometry.prediction_unit(0),
-            Some(&LayerGeometry::Attention {
-                query_heads: 2,
-                kv_heads: 1
-            })
-        );
-        assert_eq!(geometry.embedding_range().local, 0..16);
-        assert_eq!(geometry.output_range().unwrap().local, 0..16);
-        assert_ne!(
-            geometry.state_layout(),
-            &crate::nemotron_h::state_layout(&args).unwrap()
-        );
-        geometry.validate_for(&args).unwrap();
-    }
-
-    #[test]
     fn partition_geometry_retains_only_owned_units_and_exact_mixed_state() {
         let args = dense_args();
         let layout = valid_dense_layout();

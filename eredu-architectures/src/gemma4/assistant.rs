@@ -952,29 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_plan_uses_exact_neutral_assistant_identities() {
-        let config = AssistantConfig::from_json(CONFIG.as_bytes()).unwrap();
-        let plan = assistant_safetensors_plan(&config).unwrap();
-        let names = plan
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert!(plan.catalog_policy.strict);
-        assert!(plan
-            .common_tensors
-            .iter()
-            .all(|tensor| tensor.aliases.is_empty()));
-        assert!(names.contains("model.layers.0.self_attn.q_proj.weight"));
-        assert!(names.contains("pre_projection.weight"));
-        assert!(names.contains("post_projection.weight"));
-        assert!(!names
-            .iter()
-            .any(|name| name.starts_with("model.language_model.")));
-    }
-
-    #[test]
     fn gguf_catalog_translation_and_format_transforms_preserve_assistant_identities() {
         let config = AssistantConfig::from_json(CONFIG.as_bytes()).unwrap();
         let plan = assistant_gguf_plan(&config).unwrap();

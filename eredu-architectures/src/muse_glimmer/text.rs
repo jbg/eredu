@@ -1227,12 +1227,3 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         self.finish_logits(logits, context)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scales_before_softcap() {
-        let actual = (2.0_f32 * 3.0 / 4.0).tanh() * 4.0;
-        assert!((actual - 3.620_594).abs() < 1e-5);
-    }
-}

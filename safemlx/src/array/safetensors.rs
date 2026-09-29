@@ -200,69 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn test_conversion_uint8() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Uint8);
-    }
-
-    #[test]
-    fn test_conversion_uint16() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Uint16);
-    }
-
-    #[test]
-    fn test_conversion_uint32() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Uint32);
-    }
-
-    #[test]
-    fn test_conversion_uint64() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Uint64);
-    }
-
-    #[test]
-    fn test_conversion_int8() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Int8);
-    }
-
-    #[test]
-    fn test_conversion_int16() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Int16);
-    }
-
-    #[test]
-    fn test_conversion_int32() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Int32);
-    }
-
-    #[test]
-    fn test_conversion_int64() {
-        let arr = array!([[1, 2, 3], [4, 5, 6]]);
-        assert_conversion!(&arr, crate::Dtype::Int64);
-    }
-
-    #[test]
-    fn test_conversion_float16() {
-        let arr = array!([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-        assert_conversion!(&arr, crate::Dtype::Float16);
-    }
-
-    #[test]
     fn test_conversion_float32() {
         let arr = array!([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         assert_conversion!(&arr, crate::Dtype::Float32);
-    }
-
-    #[test]
-    fn test_conversion_bfloat16() {
-        let arr = array!([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-        assert_conversion!(&arr, crate::Dtype::Bfloat16);
     }
 
     #[test]

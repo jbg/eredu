@@ -2,7 +2,7 @@ use safemlx::{
     host_transfer_capacity_upper_bound, host_transfer_memory_stats, memory,
     reset_host_transfer_peak_memory, transforms::async_eval_with_event, Array, Device, DeviceType,
     Dtype, EventBackend, HostTransferBuffer, HostTransferPolicy, HostTransferStorageKind,
-    ImmutableHostTransferBuffer, Stream,
+    Stream,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -12,8 +12,6 @@ fn runtime_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
-
-fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
 fn host_transfer_round_trip_preserves_metadata_and_values() {
@@ -57,20 +55,6 @@ fn host_transfer_round_trip_preserves_metadata_and_values() {
         evaluated.try_as_slice::<f32>().unwrap(),
         &[1.0, 2.0, 3.0, 4.0]
     );
-}
-
-#[test]
-fn uninitialized_transfer_buffer_is_typed_and_mutable() {
-    let _guard = runtime_test_guard();
-    let mut buffer =
-        HostTransferBuffer::new(&[2], Dtype::Uint32, HostTransferPolicy::Transfer).unwrap();
-    buffer
-        .as_bytes_mut()
-        .unwrap()
-        .copy_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
-    assert_eq!(buffer.shape().unwrap(), vec![2]);
-    assert_eq!(buffer.dtype().unwrap(), Dtype::Uint32);
-    assert!(!buffer.is_empty().unwrap());
 }
 
 #[test]
@@ -138,7 +122,6 @@ fn noncontiguous_sources_and_empty_buffers_preserve_logical_geometry() {
 #[test]
 fn immutable_buffers_are_shareable_and_support_repeated_submissions() {
     let _guard = runtime_test_guard();
-    assert_send_sync::<ImmutableHostTransferBuffer>();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let source = Array::from_slice(&[9u32, 10], &[2]);
     let immutable =

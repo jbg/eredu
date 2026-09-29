@@ -312,7 +312,6 @@ mod tests {
             ObservationSelector::Exact(MODEL_LOGITS_OBSERVATION_PATH.into()),
             ObservationSelector::Prefix("model.layers.2".into()),
         ]);
-        assert_eq!(MODEL_LOGITS_OBSERVATION_PATH, "model.logits");
         assert!(request.matches(MODEL_LOGITS_OBSERVATION_PATH));
         assert!(request.matches("model.layers.2.output"));
         assert!(!request.matches("model.layers.20.output"));

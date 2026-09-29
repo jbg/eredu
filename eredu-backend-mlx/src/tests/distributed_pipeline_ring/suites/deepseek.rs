@@ -465,19 +465,21 @@ fn ring_deepseek_v3_mixed_cached_affine_partition_components() {
 }
 
 fn run_deepseek_v3_component_axes(family: FixtureFamily, mode: WorkerMode, axes: &[&'static str]) {
-    for &axes in axes {
-        for streamed in [false, true] {
-            eprintln!(
-                "V3 component case: {} {axes}, streamed={streamed}",
-                family.name()
-            );
-            run_ring_cartesian_pipeline_mode(streamed, family, axes, mode);
+    for &(case_axes, residency) in component_cases(true) {
+        if !axes.contains(&case_axes) {
+            continue;
         }
-        eprintln!(
-            "V3 component case: {} {axes}, layerwise host",
-            family.name()
-        );
-        run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode);
+        match residency {
+            WorkerResidency::FullyResident => {
+                run_ring_cartesian_pipeline_mode(false, family, case_axes, mode)
+            }
+            WorkerResidency::LayerwiseHost => {
+                run_ring_layerwise_host_cartesian_pipeline_mode(family, case_axes, mode)
+            }
+            WorkerResidency::DenseDiskStream => {
+                run_ring_cartesian_pipeline_mode(true, family, case_axes, mode)
+            }
+        }
     }
 }
 
@@ -538,27 +540,6 @@ fn ring_deepseek_v4_mtp_mxfp4_components_and_parameters_matrix() {
 }
 
 #[test]
-#[ignore = "spawns two local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_deepseek_v4_mtp_components_pipeline() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::DeepSeekV4,
-        "pp",
-        WorkerMode::OpaqueDeepSeekMtpTarget,
-    );
-}
-
-#[test]
-#[ignore = "spawns two local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_deepseek_v4_mtp_affine_components_host() {
-    run_ring_layerwise_host_cartesian_pipeline_mode(
-        FixtureFamily::DeepSeekV4,
-        "tp",
-        WorkerMode::OpaqueDeepSeekMtpTargetRequantize,
-    );
-}
-
-#[test]
 #[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
 fn ring_deepseek_v4_target_components_and_parameters_matrix() {
     run_deepseek_v4_target_components(WorkerMode::OpaqueComponentCapture);
@@ -577,52 +558,11 @@ fn ring_deepseek_v4_target_mxfp4_components_and_parameters_matrix() {
 }
 
 fn run_deepseek_v4_target_components(mode: WorkerMode) {
-    for axes in ["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
-        for residency in ["resident", "host", "disk"] {
-            eprintln!("V4 target component and parameter trial: {mode:?} {axes} {residency}");
-            if residency == "host" {
-                run_ring_layerwise_host_cartesian_pipeline_mode(
-                    FixtureFamily::DeepSeekV4,
-                    axes,
-                    mode,
-                );
-            } else {
-                run_ring_cartesian_pipeline_mode(
-                    residency == "disk",
-                    FixtureFamily::DeepSeekV4,
-                    axes,
-                    mode,
-                );
-            }
-        }
-    }
+    run_component_matrix_with_mode(FixtureFamily::DeepSeekV4, true, mode);
 }
 
 fn run_deepseek_prediction_components(family: FixtureFamily, mode: WorkerMode) {
-    for axes in ["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
-        for residency in ["resident", "host", "disk"] {
-            eprintln!(
-                "{} prediction components and parameters: {mode:?} {axes} {residency}",
-                family.name()
-            );
-            if residency == "host" {
-                run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode);
-            } else {
-                run_ring_cartesian_pipeline_mode(residency == "disk", family, axes, mode);
-            }
-        }
-    }
-}
-
-#[test]
-#[ignore = "spawns two local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_deepseek_v3_mtp_target_pipeline_opaque_session() {
-    run_ring_cartesian_pipeline_mode(
-        false,
-        FixtureFamily::DeepSeek,
-        "pp",
-        WorkerMode::OpaqueDeepSeekMtpTarget,
-    );
+    run_component_matrix_with_mode(family, true, mode);
 }
 
 /// Multi-block fused context/proposal captures, selected-position interventions,

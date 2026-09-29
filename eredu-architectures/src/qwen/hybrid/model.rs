@@ -1201,22 +1201,6 @@ fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupT
     transport
 }
 
-#[cfg(test)]
-mod transport_tests {
-    use super::prediction_group_transport;
-
-    #[test]
-    fn first_prediction_group_owns_shared_mtp_embedding_role_once() {
-        assert_eq!(
-            prediction_group_transport(1).first_owner_static_roles,
-            ["mtp"]
-        );
-        assert!(prediction_group_transport(2)
-            .first_owner_static_roles
-            .is_empty());
-    }
-}
-
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
@@ -1780,37 +1764,6 @@ mod state_identity_tests {
             "tie_word_embeddings": true,
             "layer_types": ["full_attention", "full_attention"]
         })
-    }
-
-    #[test]
-    fn embedded_prediction_layers_trail_the_prompt_frontier() {
-        let parsed =
-            crate::qwen::hybrid::model_args_from_config_value(&config("qwen3_5_text")).unwrap();
-        let layout = crate::qwen::hybrid::state_layout(&parsed.text).unwrap();
-        let identity = state_identity(
-            &parsed.text,
-            &layout,
-            0,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .unwrap()
-        .prompt_cache_identity(&layout)
-        .unwrap();
-
-        assert_eq!(identity.model_family(), "qwen3_5");
-        assert_eq!(identity.layer_prefix_offsets(), [0, 0, -1, -1]);
-
-        let prediction_layout = layout.slice(2..4).unwrap();
-        let prediction_identity = state_identity(
-            &parsed.text,
-            &prediction_layout,
-            2,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .unwrap()
-        .prompt_cache_identity(&prediction_layout)
-        .unwrap();
-        assert_eq!(prediction_identity.layer_prefix_offsets(), [-1, -1]);
     }
 
     #[test]

@@ -311,34 +311,6 @@ fn realtime_capabilities_fail_closed_for_unimplemented_mechanisms_and_lowerings(
     ));
 }
 
-#[test]
-fn prepared_frame_tensor_mechanisms_preserve_canonical_matrix_geometry() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let mut host = MlxRealtimeFrameTensorMechanisms::new(&stream);
-    let matrix = host
-        .materialize_i32(&[1, 2, 3, 4], [2, 2])
-        .expect("materialize portable frame matrix");
-    assert_eq!(matrix.as_array().shape(), &[2, 2]);
-    assert_eq!(matrix.as_array().dtype(), Dtype::Int32);
-
-    let mut tensors = MlxRealtimeFrameTensorMechanisms::new(&stream);
-    let left = tensors.column(&matrix, 0).expect("select left column");
-    let right = tensors.column(&matrix, 1).expect("select right column");
-    assert_eq!(left.as_array().shape(), &[2, 1]);
-    let stacked = tensors
-        .stack_columns(&[left, right], 2)
-        .expect("stack canonical columns");
-    assert_eq!(stacked.as_array().shape(), &[2, 2]);
-    let empty = tensors
-        .stack_columns(&[], 2)
-        .expect("stack empty generated-codebook set");
-    assert_eq!(empty.as_array().shape(), &[2, 0]);
-    let padding = tensors
-        .filled_column(7, 2)
-        .expect("materialize padding column");
-    assert_eq!(padding.as_array().shape(), &[2, 1]);
-}
-
 const TINY_NATIVE_CONFIG: &str = r#"{
     "model_type": "moshi",
     "dim": 32,

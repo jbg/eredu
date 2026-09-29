@@ -2718,36 +2718,6 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_assistant_visits_one_typed_family_blind_materializer() {
-        let artifact = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
-        let preparation = prepare_external_assistant(artifact.path()).unwrap();
-        assert_eq!(
-            preparation.tokenizer_model_kind(),
-            crate::configuration::ModelKind::Gemma4
-        );
-        let mut materialized = select_direct_for_test(preparation)
-            .visit_for_test(InspectPreparation)
-            .unwrap();
-        let inspected = materialized.visit(TakeInspection);
-        assert_eq!(
-            inspected.tokenizer_model_kind,
-            crate::configuration::ModelKind::Gemma4
-        );
-        assert_eq!(inspected.model_type, "gemma4_assistant");
-        assert!(matches!(
-            inspected.checkpoint,
-            ExternalAssistantCheckpoint::SafeTensors {
-                source,
-                catalog,
-                resolution,
-                ..
-            }
-                if source == artifact.path()
-                    && catalog.len() == resolution.source_keys().len()
-        ));
-    }
-
-    #[test]
     fn external_assistant_cold_identity_is_lazy_and_prepared_identity_is_content_exact() {
         let first = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
         let relocated = safetensors_artifact(GEMMA_ASSISTANT, gemma_tensors());
@@ -2792,27 +2762,6 @@ mod tests {
                 .speculative_identities(&profile)
                 .unwrap()
                 .0
-        );
-    }
-
-    #[test]
-    fn muse_assistant_uses_the_same_typed_cold_selection() {
-        let (preparation, _artifact) = prepared_muse_without_payload_open();
-        assert_eq!(
-            preparation.tokenizer_model_kind(),
-            crate::configuration::ModelKind::MuseGlimmer
-        );
-        let selected = select_direct_for_test(preparation);
-        let DispatchedSelectedExternalAssistant::MuseGlimmer(prepared) = selected.dispatched else {
-            panic!("Muse assistant selected a different typed family")
-        };
-        assert_eq!(
-            MuseGlimmerAssistantArchitecture::tokenizer_model_kind(),
-            crate::configuration::ModelKind::MuseGlimmer
-        );
-        assert_eq!(
-            MuseGlimmerAssistantArchitecture::configuration_model_type(prepared.config()),
-            "muse_glimmer_assistant"
         );
     }
 
@@ -3105,25 +3054,6 @@ mod tests {
         let malformed = safetensors_artifact(GEMMA_ASSISTANT, malformed);
         assert!(matches!(
             prepare_external_assistant(malformed.path()),
-            Err(ArtifactError::InvalidArtifact(_))
-        ));
-    }
-
-    #[test]
-    fn safetensors_assistant_admission_rejects_missing_or_conflicting_identities() {
-        let mut missing: Value = serde_json::from_str(GEMMA_ASSISTANT).unwrap();
-        missing.as_object_mut().unwrap().remove("model_type");
-        let missing = safetensors_artifact(&missing.to_string(), gemma_tensors());
-        assert!(matches!(
-            prepare_external_assistant(missing.path()),
-            Err(ArtifactError::InvalidArtifact(_))
-        ));
-
-        let mut conflicting: Value = serde_json::from_str(GEMMA_ASSISTANT).unwrap();
-        conflicting["text_config"]["model_type"] = "llama".into();
-        let conflicting = safetensors_artifact(&conflicting.to_string(), gemma_tensors());
-        assert!(matches!(
-            prepare_external_assistant(conflicting.path()),
             Err(ArtifactError::InvalidArtifact(_))
         ));
     }

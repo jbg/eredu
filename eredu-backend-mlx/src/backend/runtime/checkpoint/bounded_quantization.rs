@@ -55,7 +55,4 @@ pub use pipeline::BoundedQuantizedWeightStore;
 pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};
 
 #[cfg(test)]
-use layout::allocator_cache_requires_clear;
-
-#[cfg(test)]
 mod tests;

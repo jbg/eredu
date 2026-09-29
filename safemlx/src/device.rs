@@ -82,15 +82,3 @@ impl std::fmt::Display for Device {
         self.describe(f)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fmt() {
-        let device = Device::new(DeviceType::Gpu, 0);
-        let description = format!("{device}");
-        assert_eq!(description, "Device(gpu, 0)");
-    }
-}

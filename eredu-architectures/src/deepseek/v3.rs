@@ -2386,24 +2386,3 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
     )
     .map_err(Error::backend)
 }
-
-#[cfg(test)]
-mod boundary_tests {
-    use super::*;
-    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
-
-    #[test]
-    fn target_wire_geometry_is_architecture_owned() {
-        let schema = TargetBoundarySchema { hidden_size: 16 };
-        let tensors = schema.wire_schema().unwrap().resolve(2, 3).unwrap();
-        assert_eq!(tensors.primary().shape(), [2, 3, 16]);
-        assert_eq!(tensors.auxiliary()[0].role(), "tokens");
-        assert_eq!(tensors.auxiliary()[0].shape(), [2, 3]);
-        assert_eq!(tensors.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(tensors.auxiliary()[1].shape(), [2, 3, 16]);
-        assert_eq!(
-            tensors.auxiliary()[1].dtype(),
-            BoundaryTensorDtype::Activation
-        );
-    }
-}

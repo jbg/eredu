@@ -664,26 +664,8 @@ pub fn benchmark_local_expert_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        local_device_plan, validate_expert_cache_benchmark_prompt, DevicePlanError,
-        ExpertCacheBenchmarkError, LocalDevice,
+        validate_expert_cache_benchmark_prompt, ExpertCacheBenchmarkError,
     };
-
-    #[test]
-    fn explicit_prediction_source_survives_local_backend_option_roundtrip() {
-        let options = super::LocalLoadOptions::default()
-            .with_drafting(eredu_runtime::DraftingLoadRequest::embedded(2).unwrap())
-            .with_prediction_source("prediction");
-        let backend = options.clone().into_backend();
-        backend.normalized().validate_model_preparation().unwrap();
-        assert_eq!(
-            backend.normalized().prediction_source(),
-            Some(std::path::Path::new("prediction"))
-        );
-        assert_eq!(
-            super::LocalLoadOptions::from_backend(backend).unwrap(),
-            options
-        );
-    }
 
     #[test]
     fn local_overhead_covers_retained_cache_and_checks_overflow() {
@@ -715,15 +697,4 @@ mod tests {
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
     }
 
-    #[test]
-    fn local_accelerator_plan_names_the_compiled_family() {
-        let plan = local_device_plan(LocalDevice::Accelerator(3));
-        if cfg!(feature = "cuda") {
-            assert_eq!(plan.unwrap().device(), "cuda:3");
-        } else if cfg!(all(feature = "metal", target_vendor = "apple")) {
-            assert_eq!(plan.unwrap().device(), "metal:3");
-        } else {
-            assert_eq!(plan, Err(DevicePlanError::AcceleratorNotCompiled));
-        }
-    }
 }

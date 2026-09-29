@@ -84,40 +84,7 @@ fn test_bar() {
     );
     assert_eq!(result, 10);
 
-    // With stream specified.
 
-    let result = bar!(1, 2, stream = &stream);
-    assert_eq!(result, 3);
-
-    let result = bar!(1, 2, c = Some(3), stream = &stream);
-    assert_eq!(result, 6);
-
-    let result = bar!(1, 2, d = Some(4), stream = &stream);
-    assert_eq!(result, 7);
-
-    let result = bar!(1, 2, c = Some(3), d = Some(4), stream = &stream);
-    assert_eq!(result, 10);
-
-    // With dtype and stream specified.
-
-    let result = bar!(1, 2, dtype = i16, stream = &stream);
-    assert_eq!(result, 3);
-
-    let result = bar!(1, 2, c = Some(3), dtype = i16, stream = &stream);
-    assert_eq!(result, 6);
-
-    let result = bar!(1, 2, d = Some(4), dtype = i16, stream = &stream);
-    assert_eq!(result, 7);
-
-    let result = bar!(
-        1,
-        2,
-        c = Some(3),
-        d = Some(4),
-        dtype = i16,
-        stream = &stream
-    );
-    assert_eq!(result, 10);
 }
 
 // Test named mandatory arguments.

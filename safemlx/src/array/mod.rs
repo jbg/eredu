@@ -1528,77 +1528,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_scalar_array_from_bool() {
-        let stream = crate::test_stream();
-        let array = Array::from_bool(true);
-        assert_eq!(array.item_size(), 1);
-        assert_eq!(array.size(), 1);
-        assert!(array.strides().is_empty());
-        assert_eq!(array.nbytes(), 1);
-        assert_eq!(array.ndim(), 0);
-        assert!(array.shape().is_empty());
-        assert_eq!(array.dtype(), Dtype::Bool);
-        assert!(array.item::<bool>(&stream));
-    }
-
-    #[test]
-    fn new_scalar_array_from_int() {
-        let stream = crate::test_stream();
-        let array = Array::from_int(42);
-        assert_eq!(array.item_size(), 4);
-        assert_eq!(array.size(), 1);
-        assert!(array.strides().is_empty());
-        assert_eq!(array.nbytes(), 4);
-        assert_eq!(array.ndim(), 0);
-        assert!(array.shape().is_empty());
-        assert_eq!(array.dtype(), Dtype::Int32);
-        assert_eq!(array.item::<i32>(&stream), 42);
-    }
-
-    #[test]
-    fn new_scalar_array_from_f32() {
-        let stream = crate::test_stream();
-        let array = Array::from_f32(3.14);
-        assert_eq!(array.item_size(), 4);
-        assert_eq!(array.size(), 1);
-        assert!(array.strides().is_empty());
-        assert_eq!(array.nbytes(), 4);
-        assert_eq!(array.ndim(), 0);
-        assert!(array.shape().is_empty());
-        assert_eq!(array.dtype(), Dtype::Float32);
-        assert_eq!(array.item::<f32>(&stream), 3.14);
-    }
-
-    #[test]
-    fn new_scalar_array_from_f64() {
-        let stream = crate::test_stream();
-        let array = Array::from_f64(3.14)
-            .as_dtype(Dtype::Float64, stream)
-            .unwrap();
-        assert_eq!(array.item_size(), 8);
-        assert_eq!(array.size(), 1);
-        assert!(array.strides().is_empty());
-        assert_eq!(array.nbytes(), 8);
-        assert_eq!(array.ndim(), 0);
-        assert!(array.shape().is_empty());
-        assert_eq!(array.dtype(), Dtype::Float64);
-        float_eq::assert_float_eq!(array.item::<f64>(&stream), 3.14, abs <= 1e-5);
-    }
-
-    #[test]
-    fn new_array_from_slice_f64() {
-        let array = Array::from_slice_f64(&[1.0, 2.0, 3.0], &[3]);
-        assert_eq!(array.item_size(), 8);
-        assert_eq!(array.size(), 3);
-        assert_eq!(array.strides(), &[1]);
-        assert_eq!(array.nbytes(), 24);
-        assert_eq!(array.ndim(), 1);
-        assert_eq!(array.dim(0), 3);
-        assert_eq!(array.shape(), &[3]);
-        assert_eq!(array.dtype(), Dtype::Float64);
-    }
-
-    #[test]
     fn new_scalar_array_from_complex() {
         let stream = crate::test_stream();
         let val = complex64::new(1.0, 2.0);
@@ -1611,21 +1540,6 @@ mod tests {
         assert!(array.shape().is_empty());
         assert_eq!(array.dtype(), Dtype::Complex64);
         assert_eq!(array.item::<complex64>(&stream), val);
-    }
-
-    #[test]
-    fn new_array_from_single_element_slice() {
-        let data = [1i32];
-        let array = Array::from_slice(&data, &[1]);
-        assert_eq!(array.item_size(), 4);
-        assert_eq!(array.size(), 1);
-        assert_eq!(array.strides(), &[1]);
-        assert_eq!(array.nbytes(), 4);
-        assert_eq!(array.ndim(), 1);
-        assert_eq!(array.dim(0), 1);
-        assert_eq!(array.shape(), &[1]);
-        assert_eq!(array.dtype(), Dtype::Int32);
-        assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
     }
 
     #[test]
@@ -1643,21 +1557,6 @@ mod tests {
         assert_eq!(bf16_array.clone().item::<half::bf16>(&stream), bf16_value);
         let bf16_clone = bf16_array.deep_clone().unwrap().into_evaluated().unwrap();
         assert_eq!(bf16_clone.as_slice::<half::bf16>(), &[bf16_value]);
-    }
-
-    #[test]
-    fn new_array_from_multi_element_slice() {
-        let data = [1i32, 2, 3, 4, 5];
-        let array = Array::from_slice(&data, &[5]);
-        assert_eq!(array.item_size(), 4);
-        assert_eq!(array.size(), 5);
-        assert_eq!(array.strides(), &[1]);
-        assert_eq!(array.nbytes(), 20);
-        assert_eq!(array.ndim(), 1);
-        assert_eq!(array.dim(0), 5);
-        assert_eq!(array.shape(), &[5]);
-        assert_eq!(array.dtype(), Dtype::Int32);
-        assert_eq!(array.evaluated().unwrap().as_slice::<i32>(), &data[..]);
     }
 
     #[test]

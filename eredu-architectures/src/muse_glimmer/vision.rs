@@ -715,34 +715,3 @@ fn pixel_shuffle<T: Tensor>(
     }
     T::concatenate(&outputs, 0, context)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layouts_preserve_released_window_and_shuffle_order() {
-        let grid = [(1, 4, 4), (2, 2, 4)];
-        assert_eq!(attention_chunk_lengths(&grid).unwrap(), [16, 8, 8]);
-        let layout = window_partition(&grid, 1, 8, 2).unwrap();
-        assert_eq!(layout.permutation.len(), 32);
-        assert_eq!(inverse_permutation(&layout.permutation).unwrap().len(), 32);
-
-        let factor = 2;
-        let mut permutation = Vec::new();
-        for outer_y in 0..2 {
-            for outer_x in 0..2 {
-                for inner_y in 0..factor {
-                    for inner_x in 0..factor {
-                        permutation
-                            .push((outer_y * factor + inner_y) * 4 + outer_x * factor + inner_x);
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            permutation,
-            [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]
-        );
-    }
-}

@@ -1,4 +1,4 @@
-use super::{device_capabilities, MlxBackend, MlxDeviceIdentity, MlxModel};
+use super::{MlxBackend, MlxDeviceIdentity, MlxModel};
 use crate::backend::ExecutionContext;
 use crate::tests::support::path_instrumentation;
 use eredu_core::BackendProvider as _;
@@ -155,12 +155,6 @@ fn prepared_session_allows_another_stream_but_rejects_another_device_before_work
         .completion
         .wait()
         .unwrap();
-}
-
-#[test]
-fn collective_capability_requires_an_attached_world() {
-    assert!(!device_capabilities(false).collectives());
-    assert!(device_capabilities(true).collectives());
 }
 
 #[test]

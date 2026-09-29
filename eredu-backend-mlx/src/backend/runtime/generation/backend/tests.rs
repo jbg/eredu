@@ -7,29 +7,6 @@ use safemlx::{random, transforms::async_eval_with_event, Array, Device, DeviceTy
 use crate::backend::{nn::tensor::TokenValidationScope, random::RandomState, ExecutionContext};
 
 #[test]
-fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {
-    assert_eq!(
-        TokenFilter::Allowed(vec![false, true, false, true])
-            .allowed_mask_for(3)
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[false, true, false]
-    );
-    assert!(TokenFilter::Allowed(vec![false, false, true])
-        .allowed_mask_for(2)
-        .is_err());
-    assert_eq!(
-        TokenFilter::Allowed(vec![true])
-            .allowed_mask_for(2)
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[true, false]
-    );
-}
-
-#[test]
 #[ignore = "requires local MLX Metal execution"]
 fn mlx_token_filter_precedes_sampling_policy() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));

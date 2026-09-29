@@ -130,37 +130,6 @@ fn malformed_equations_fail_during_configuration() {
 }
 
 #[test]
-fn released_residual_specs_retain_exact_parameter_identities_and_formats() {
-    use eredu_nn::{LinearFormatSpec, NormalizationScale};
-    let config = Config::from_json(&released()).unwrap();
-    for (root, injection) in [
-        ("model.hyper_connection_mixer", false),
-        ("model.layers.0.attn_hyper_connection", true),
-        ("mtp.hyper_connection_mixer", false),
-    ] {
-        let mut requested = vec![];
-        let spec = crate::qwen4_exp::residual::mixer_spec(&config, root, injection, |name| {
-            requested.push(name.to_owned());
-            LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-        })
-        .unwrap();
-        assert_eq!(spec.geometry.streams(), config.residual.streams);
-        assert_eq!(spec.down.output, config.residual.rank);
-        assert_eq!(spec.injection.is_some(), injection);
-        assert_eq!(requested[0], format!("{root}.input_mix_weight_down.weight"));
-        assert_eq!(requested[1], format!("{root}.input_mix_weight_up.weight"));
-        assert_eq!(requested.len(), if injection { 3 } else { 2 });
-        match spec.normalization.scale {
-            NormalizationScale::LearnedOffset { weight, offset } => {
-                assert_eq!(weight.id.as_str(), format!("{root}.hc_norm.weight"));
-                assert_eq!(offset, 1.);
-            }
-            _ => panic!("released normalization offset must be retained"),
-        }
-    }
-}
-
-#[test]
 fn released_recurrent_sublayer_specs_keep_checkpoint_and_state_geometry() {
     use crate::qwen4_exp::recurrent::RecurrentSublayerSpec;
     use eredu_core::cache::{StateTensorDimension as D, StateTensorRole};

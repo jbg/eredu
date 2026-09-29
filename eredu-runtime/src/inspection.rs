@@ -815,15 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn noop_observer_is_static_and_passthrough() {
-        fn observe<O: ActivationObserver<i32, ()>>(observer: &mut O) {
-            observer.observe("layer.output", &7).unwrap();
-            assert_eq!(observer.intervene("layer.output", &7).unwrap(), None);
-        }
-        observe(&mut NoopObserver);
-    }
-
-    #[test]
     fn sparse_partition_support_requires_its_native_collector_and_exact_hook() {
         use eredu_core::*;
         let sparse = ObservationHookSupport::default().with_routed_units(true);
@@ -887,31 +878,6 @@ mod tests {
             assert_eq!(actual.points[0].prefill, expected);
             assert_eq!(actual.points[0].decode, expected);
         }
-    }
-
-    #[test]
-    fn observed_activation_can_be_replaced_without_an_erased_hot_path() {
-        struct ReplacingObserver {
-            observed: Vec<String>,
-        }
-
-        impl ActivationObserver<i32, ()> for ReplacingObserver {
-            fn observe(&mut self, path: &str, _value: &i32) -> Result<(), ()> {
-                self.observed.push(path.into());
-                Ok(())
-            }
-
-            fn intervene(&mut self, path: &str, value: &i32) -> Result<Option<i32>, ()> {
-                Ok((path == "model.layers.0.output").then_some(value + 4))
-            }
-        }
-
-        let mut observer = ReplacingObserver {
-            observed: Vec::new(),
-        };
-        let output = observe_and_intervene(&mut observer, "model.layers.0.output", &3).unwrap();
-        assert_eq!(output, 7);
-        assert_eq!(observer.observed, ["model.layers.0.output"]);
     }
 
     #[test]

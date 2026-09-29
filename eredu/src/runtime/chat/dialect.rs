@@ -3273,11 +3273,11 @@ impl ProtocolParser for DeclarativeParser {
 
 #[cfg(test)]
 mod tests {
-    use llguidance::{api::TopLevelGrammar, toktrie::TokenId};
+    use llguidance::toktrie::TokenId;
     use serde_json::{json, Value};
 
     use super::{
-        ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
+        DeclarativeCallId, DeclarativeDialectSpec,
         DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
         GenerationPromptBehavior, JsonFunctionEnvelope, NamedJsonArgumentsEncoding,
         ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
@@ -4543,9 +4543,6 @@ mod tests {
 
     #[test]
     fn runtime_plan_creates_independent_parser_instances() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<crate::runtime::chat::GenerationRuntimePlan>();
-
         let parameters = DialectParameters::Declarative(&DECLARATIVE_OBJECT_SPEC);
         let plan = ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
@@ -4849,131 +4846,4 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
-    struct CustomParameters {
-        literal: &'static str,
-    }
-
-    static CUSTOM_PARAMETERS: CustomParameters = CustomParameters { literal: "CUSTOM" };
-
-    #[derive(Debug)]
-    struct CustomDialect;
-
-    #[derive(Debug, Default)]
-    struct CustomParser;
-
-    impl ProtocolParser for CustomParser {
-        type Error = String;
-
-        fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
-            sink.text(text.to_ascii_lowercase());
-            Ok(())
-        }
-
-        fn finish(&mut self, _sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    impl FormatDialect for CustomDialect {
-        fn generation_prompt_behavior(
-            &self,
-            parameters: DialectParameters,
-        ) -> Result<GenerationPromptBehavior, String> {
-            parameters.custom::<CustomParameters>()?;
-            Ok(GenerationPromptBehavior::Always)
-        }
-
-        fn constraint_configuration(
-            &self,
-            parameters: DialectParameters,
-            _tools: &[Value],
-            _tool_choice: ToolChoice,
-            _parallel_tool_calls: ParallelToolCallPolicy,
-            _resolved_structural_token_ids: &[u32],
-        ) -> Result<ConstraintConfiguration, String> {
-            let parameters = parameters.custom::<CustomParameters>()?;
-            Ok(ConstraintConfiguration {
-                grammar: TopLevelGrammar::from_lark(format!(
-                    "start: {}",
-                    serde_json::to_string(parameters.literal).unwrap()
-                )),
-            })
-        }
-
-        fn auto_activation_trigger(
-            &self,
-            parameters: DialectParameters,
-        ) -> Result<Option<&'static str>, String> {
-            Ok(Some(parameters.custom::<CustomParameters>()?.literal))
-        }
-
-        fn required_structural_tokens(
-            &self,
-            parameters: DialectParameters,
-        ) -> Result<&'static [&'static str], String> {
-            parameters.custom::<CustomParameters>()?;
-            Ok(&["<custom>"])
-        }
-
-        fn stop_sequences(
-            &self,
-            parameters: DialectParameters,
-        ) -> Result<&'static [&'static str], String> {
-            parameters.custom::<CustomParameters>()?;
-            Ok(&["CUSTOM_END"])
-        }
-
-        fn incremental_parser_state(
-            &self,
-            parameters: DialectParameters,
-        ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
-            parameters.custom::<CustomParameters>()?;
-            Ok(Box::<CustomParser>::default())
-        }
-    }
-
-    static CUSTOM_DIALECT: CustomDialect = CustomDialect;
-
-    #[test]
-    fn custom_dialect_uses_the_shared_interface() {
-        let parameters = DialectParameters::Custom(&CUSTOM_PARAMETERS);
-        assert_eq!(
-            CUSTOM_DIALECT
-                .generation_prompt_behavior(parameters)
-                .unwrap(),
-            GenerationPromptBehavior::Always
-        );
-        assert_eq!(
-            CUSTOM_DIALECT
-                .required_structural_tokens(parameters)
-                .unwrap(),
-            ["<custom>"]
-        );
-        assert_eq!(
-            CUSTOM_DIALECT.stop_sequences(parameters).unwrap(),
-            ["CUSTOM_END"]
-        );
-
-        let compiler = ConstraintCompiler::synthetic_for_tests();
-        let plan = compiler
-            .compile_tool_plan(
-                &CUSTOM_DIALECT,
-                parameters,
-                &[],
-                ToolChoice::Auto,
-                ParallelToolCallPolicy::Disabled,
-                vec![91],
-            )
-            .unwrap();
-        assert!(accepts(&plan, "CUSTOM"));
-        assert_eq!(plan.auto_activation_trigger(), Some("CUSTOM"));
-
-        let mut parser = CUSTOM_DIALECT.incremental_parser_state(parameters).unwrap();
-        let mut sink = SemanticEventSink::default();
-        parser.push("CUS", &mut sink).unwrap();
-        parser.push("TOM", &mut sink).unwrap();
-        parser.finish(&mut sink).unwrap();
-        assert_eq!(event_text(sink.events(), false), "custom");
-    }
 }

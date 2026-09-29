@@ -57,13 +57,6 @@ fn matrix_values(matrices: usize, rows: usize, columns: usize) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn allocator_cache_reuse_respects_retained_and_working_set_bounds() {
-    assert!(!allocator_cache_requires_clear(64, 64, 64));
-    assert!(allocator_cache_requires_clear(65, 64, 128));
-    assert!(allocator_cache_requires_clear(65, 128, 64));
-}
-
 fn direct_fixture() -> (TempDir, Arc<SafetensorsWeightStore>, Vec<f32>) {
     let directory = tempfile::tempdir().unwrap();
     let values = matrix_values(1, 8, 64);

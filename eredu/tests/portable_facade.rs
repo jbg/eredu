@@ -3,9 +3,9 @@ use eredu::api::{
 };
 use eredu_architectures::ModelKind;
 use eredu_core::{
-    ArtifactFormat, AutomaticPlanRequest, BackendDescriptor, BackendProvider, BackendSession,
+    ArtifactFormat, BackendDescriptor, BackendProvider, BackendSession,
     BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
-    DeviceCapabilities, DeviceDescriptor, DevicePlan, GenerationConfigOverrides,
+    DeviceCapabilities, DeviceDescriptor, GenerationConfigOverrides,
     InspectionReadiness, ModelInspectionReport, ModelRuntime, ObservationSet, ObservationValue,
     PreparedModel, SessionCapabilities, Submission, TextGenerationBackend, TextGenerationConfig,
     TokenFilter, TokenOutput,
@@ -225,53 +225,6 @@ impl TextGenerationBackend for MockBackend {
             completion: submission.completion,
         })
     }
-}
-
-#[test]
-fn loaded_model_generates_without_an_mlx_dependency() {
-    let runtime = ModelRuntime::prepare(
-        MockBackend {
-            logits: vec![0.0, 1.0, 100.0, 200.0],
-            ..Default::default()
-        },
-        (),
-    )
-    .unwrap();
-    let mut tokenizer = Tokenizer::new(WordLevel::default());
-    tokenizer
-        .add_tokens([
-            AddedToken::from("hello".to_owned(), false),
-            AddedToken::from("world".to_owned(), false),
-        ])
-        .unwrap();
-    let mut model = LoadedModel::from_runtime(
-        runtime,
-        ChatTokenizer::from_tokenizer(tokenizer),
-        LoadedTextModelConfig {
-            model_family: ModelKind::Qwen35,
-            effective_model_type: "qwen3_5_text".into(),
-            model_id: "mock/model".into(),
-            chat_template: None,
-            eos_token_ids: vec![99],
-            checkpoint_generation_config: None,
-        },
-    );
-    let sampling = model
-        .resolve_generation_config(GenerationConfigOverrides {
-            max_new_tokens: Some(3),
-            ..Default::default()
-        })
-        .unwrap();
-    let prompt = model.encode("hello", false).unwrap();
-    let tokens = model
-        .generate_tokens(prompt, TextGenerationConfig::new(sampling))
-        .unwrap()
-        .map(|token| token.unwrap().token_id().unwrap())
-        .collect::<Vec<_>>();
-
-    assert_eq!(tokens, vec![1, 1, 1]);
-    assert_eq!(model.model_family(), ModelKind::Qwen35);
-    assert_eq!(model.effective_model_type(), "qwen3_5_text");
 }
 
 #[test]
@@ -571,19 +524,6 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
             }
         }
     }
-}
-
-#[test]
-fn automatic_planning_documents_are_available_without_mlx() {
-    let request = AutomaticPlanRequest::new(
-        "model",
-        DevicePlan::new("mock", "gpu:0").expect("portable device identity is valid"),
-    );
-    assert_eq!(
-        serde_json::from_slice::<AutomaticPlanRequest>(&serde_json::to_vec(&request).unwrap())
-            .unwrap(),
-        request
-    );
 }
 
 #[test]

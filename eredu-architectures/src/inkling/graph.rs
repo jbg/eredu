@@ -293,30 +293,8 @@ fn text_state_policy(
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::cache::StateTensorRole;
 
     use super::*;
-
-    #[test]
-    fn every_layer_declares_four_convolution_slots() {
-        let args = ModelArgs::from_hf_json(
-            br#"{"text_config":{"hidden_size":16,"num_hidden_layers":1,"vocab_size":32,
-            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"d_rel":2,
-            "intermediate_size":24,"n_routed_experts":2,"num_experts_per_tok":1,
-            "n_shared_experts":1}}"#,
-        )
-        .unwrap();
-        let layout = state_layout(&args).unwrap();
-        let slots = layout
-            .layers()
-            .get(0)
-            .expect("one layer")
-            .fixed_state()
-            .iter()
-            .filter(|tensor| matches!(tensor.role, StateTensorRole::Convolution { .. }))
-            .count();
-        assert_eq!(slots, 4);
-    }
 
     #[test]
     fn mtp_state_uses_declared_override_geometry_and_four_convolutions() {

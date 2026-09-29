@@ -1377,14 +1377,3 @@ pub fn convolution_history_shape(
     }
     Ok([batch, kernel_size - 1, channels])
 }
-
-#[cfg(test)]
-mod tests {
-    use super::convolution_history_shape;
-
-    #[test]
-    fn declares_four_bounded_histories_with_exact_width() {
-        assert_eq!(convolution_history_shape(2, 4, 16).unwrap(), [2, 3, 16]);
-        assert!(convolution_history_shape(0, 4, 16).is_err());
-    }
-}

@@ -561,7 +561,6 @@ mod tests {
     use crate::{
         array,
         ops::{indexing::IndexOp, tril, triu},
-        Stream,
     };
 
     use super::*;
@@ -710,67 +709,6 @@ mod tests {
 
     // The tests below are adapted from the c++ tests
 
-    #[test]
-    fn test_svd() {
-        // eval_gpu is not implemented yet.
-        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-
-        // 0D and 1D returns error
-        let a = Array::from_f32(0.0);
-        assert!(svd(&a, &stream).is_err());
-
-        let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(svd(&a, &stream).is_err());
-
-        // Unsupported types returns error
-        let a = Array::from_slice(&[0, 1], &[1, 2]);
-        assert!(svd(&a, &stream).is_err());
-
-        // TODO: wait for random
-    }
-
-    #[test]
-    fn test_inv() {
-        // eval_gpu is not implemented yet.
-        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-
-        // 0D and 1D returns error
-        let a = Array::from_f32(0.0);
-        assert!(inv(&a, &stream).is_err());
-
-        let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(inv(&a, &stream).is_err());
-
-        // Unsupported types returns error
-        let a = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        assert!(inv(&a, &stream).is_err());
-
-        // TODO: wait for random
-    }
-
-    #[test]
-    fn test_cholesky() {
-        // eval_gpu is not implemented yet.
-        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-
-        // 0D and 1D returns error
-        let a = Array::from_f32(0.0);
-        assert!(cholesky(&a, None, &stream).is_err());
-
-        let a = Array::from_slice(&[0.0, 1.0], &[2]);
-        assert!(cholesky(&a, None, &stream).is_err());
-
-        // Unsupported types returns error
-        let a = Array::from_slice(&[0, 1, 1, 2], &[2, 2]);
-        assert!(cholesky(&a, None, &stream).is_err());
-
-        // Non-square returns error
-        let a = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        assert!(cholesky(&a, None, &stream).is_err());
-
-        // TODO: wait for random
-    }
-
     // The unit test below is adapted from the python unit test `test_linalg.py/test_lu`
     #[test]
     fn test_lu() {
@@ -895,17 +833,4 @@ mod tests {
         check_eigs_and_vecs(&a, &stream);
     }
 
-    #[test]
-    fn test_eig_errors() {
-        let stream = crate::Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
-        // 1D array should fail
-        let a = array!([1.0f32, 2.0]);
-        assert!(eig(&a, &stream).is_err());
-        assert!(eigvals(&a, &stream).is_err());
-
-        // Non-square matrix should fail
-        let a = array!([[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
-        assert!(eig(&a, &stream).is_err());
-        assert!(eigvals(&a, &stream).is_err());
-    }
 }

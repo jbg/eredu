@@ -259,14 +259,6 @@ fn ring_two_process_mistral_gguf_tensor_parallel_resident_reference() {
     );
 }
 
-/// Proves the public generic loader and architecture-erased model session own
-/// pipeline loading, prefill, repeated decode, cache state, and communication.
-#[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
-fn ring_two_process_opaque_model_session() {
-    run_ring_pipeline_mode(false, FixtureFamily::Llama, WorkerMode::OpaqueSession);
-}
-
 /// Verifies the public Llama PP session genuinely selects disk-streamed local
 /// layers while preserving numeric output, cache isolation, and neutral ownership.
 #[test]

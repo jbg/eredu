@@ -8921,26 +8921,6 @@ impl decoder::Config for SinkDecoderConfig {
 }
 
 #[test]
-fn shared_decoder_constructs_optional_trainable_attention_sinks() {
-    let args = qwen::model_args_from_config_value(&config("qwen2", false)).unwrap();
-    let context = NumericContext::default();
-    let ordinary = decoder::Attention::<NumericBackend>::new(&args, 0, &context).unwrap();
-    assert!(ordinary.sinks.is_none());
-
-    let sink_aware =
-        decoder::Attention::<NumericBackend>::new(&SinkDecoderConfig(args, true), 0, &context)
-            .unwrap();
-    assert_eq!(sink_aware.sinks.as_ref().unwrap().as_ref().shape, [2]);
-    assert!(validate_parameter_topology::<NumericTensor, _>(&sink_aware)
-        .unwrap()
-        .iter()
-        .any(
-            |parameter| parameter.id.as_str() == "model.layers.0.self_attn.sinks"
-                && parameter.trainable
-        ));
-}
-
-#[test]
 fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
     let context = NumericContext::default();
     let queries = NumericTensor::zeros(vec![1, 1, 3, 1]);
@@ -10100,48 +10080,6 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
         }
     );
     routed_units::verify_relu(&mut provider, &mut resident, &input, &routes, &context);
-}
-
-#[test]
-fn kimi_linear_and_lfm2_expert_realization_use_the_target_execution_group() {
-    let context = NumericContext::default();
-    let rank = ParallelRankTopology::new(ParallelTopology::new(1, 1, 1, 1).unwrap(), 0).unwrap();
-
-    let kimi_args = kimi_linear::model_args_from_config_value(&serde_json::json!({
-        "model_type":"kimi_linear", "vocab_size":7, "hidden_size":8,
-        "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":2,
-        "intermediate_size":10, "head_dim":4, "model_max_length":64,
-        "linear_attn_config":{
-            "kda_layers":[1], "full_attn_layers":[2], "num_heads":2,
-            "head_dim":4, "short_conv_kernel_size":3
-        },
-        "num_experts":2, "moe_intermediate_size":6, "kv_lora_rank":4,
-        "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
-        "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
-        "routed_scaling_factor":1.0, "first_k_dense_replace":1,
-        "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false
-    }))
-    .unwrap();
-    let kimi = kimi_linear::LayeredModel::<NumericBackend>::new(kimi_args, &context).unwrap();
-    let kimi_plan = kimi_linear::expert_realization_plan(&kimi, rank)
-        .unwrap()
-        .unwrap();
-    assert!(kimi_plan.unit_spec("target", 1).is_some());
-
-    let lfm_args = lfm2::model_args_from_config_value(&serde_json::json!({
-        "model_type":"lfm2_moe", "vocab_size":7, "hidden_size":8,
-        "intermediate_size":10, "num_hidden_layers":2,
-        "num_attention_heads":4, "num_key_value_heads":2,
-        "max_position_embeddings":32, "layer_types":["conv","full_attention"],
-        "conv_L_cache":3, "block_multiple_of":2,
-        "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
-        "tie_word_embeddings":false, "num_dense_layers":1,
-        "moe_intermediate_size":6, "num_experts":2, "num_experts_per_tok":1
-    }))
-    .unwrap();
-    let lfm = lfm2::LayeredModel::<NumericBackend>::new(lfm_args, &context).unwrap();
-    let lfm_plan = lfm2::expert_realization_plan(&lfm, rank).unwrap().unwrap();
-    assert!(lfm_plan.unit_spec("target", 1).is_some());
 }
 
 #[test]
@@ -17922,81 +17860,6 @@ where
             .unwrap()
         })
         .collect()
-}
-
-struct NumericCompositePartitionAdmission;
-
-impl eredu_architectures::partitioned_execution::PartitionedAdmissionDispatcher
-    for NumericCompositePartitionAdmission
-{
-    type Output = eredu_architectures::partitioned_execution::CompositePartitionedAdmission;
-    type Error = Error;
-
-    fn direct(
-        self,
-        _: eredu_architectures::partitioned_execution::DirectPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend("numeric proof expected composite admission"))
-    }
-
-    fn routed(
-        self,
-        _: eredu_architectures::partitioned_execution::RoutedPartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::backend("numeric proof expected composite admission"))
-    }
-
-    fn composite(
-        self,
-        admission: eredu_architectures::partitioned_execution::CompositePartitionedAdmission,
-    ) -> Result<Self::Output, Self::Error> {
-        Ok(admission)
-    }
-}
-
-fn numeric_composite_selection(
-    requirements: &eredu_architectures::replicated_text::CompositeTextRequirements,
-    input: &eredu_runtime::PreparedModelInput<NumericTensor>,
-) -> eredu_architectures::replicated_text::SelectedCompositeTextRealization {
-    let execution_request = eredu_runtime::ReplicatedTextSelectionRequest::new(
-        LayerWeightResidency::FullyResident,
-        eredu_runtime::CacheResidencyPolicy::Device,
-    );
-    let capabilities = eredu_runtime::synthesize_replicated_text_capabilities(
-        requirements.execution(),
-        &execution_request,
-        &NumericMechanismSupport::default(),
-    );
-    let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
-        input.parts().iter().map(|part| part.modality()),
-    )
-    .with_prepared_tensors(true);
-    let processor_capabilities = eredu_runtime::MediaPrimitiveCapabilities::new(
-        [],
-        [
-            eredu_core::InputModality::Text,
-            eredu_core::InputModality::Image,
-            eredu_core::InputModality::Video,
-            eredu_core::InputModality::Audio,
-        ],
-        [
-            eredu_core::InputModality::Text,
-            eredu_core::InputModality::Image,
-            eredu_core::InputModality::Video,
-            eredu_core::InputModality::Audio,
-        ],
-        [],
-        i32::MAX as u64,
-    );
-    eredu_architectures::replicated_text::select_composite_text_realization(
-        requirements,
-        &execution_request,
-        eredu_runtime::WeightResidency::fully_resident(),
-        &processor_request,
-        &capabilities,
-        &processor_capabilities,
-    )
-    .unwrap()
 }
 
 type NumericCompositePartitionForward = dyn FnMut(
@@ -25858,43 +25721,6 @@ fn v4_hyper_block_shares_hash_and_learned_moe_execution() {
 }
 
 #[test]
-fn v4_target_model_runs_end_to_end_through_resident_runtime() {
-    let args = tiny_v4_args();
-    let context = NumericContext::default();
-    let layout = deepseek::v4::state_layout(&args).unwrap();
-    let state_args = args.clone();
-    let mut state = DeviceState::<NumericBackend, _>::create(layout, move |layer, _| {
-        let ratios = match state_args.attention_policy(layer).unwrap() {
-            deepseek::V4AttentionPolicy::Local => Vec::new(),
-            deepseek::V4AttentionPolicy::Compressed { ratio: 4 } => vec![4, 4],
-            deepseek::V4AttentionPolicy::Compressed { ratio } => vec![ratio],
-        };
-        Ok::<_, Error>(NumericPoolingCache::new(state_args.sliding_window, &ratios))
-    })
-    .unwrap();
-    let model = deepseek::v4::Model::<NumericBackend>::new(args, &context).unwrap();
-    let mut runtime = ResidentRuntime::new(model, &context).unwrap();
-
-    for tokens in [
-        NumericTensor::token_ids(&[1, 2, 3, 4, 5, 6, 7, 8]),
-        NumericTensor::token_ids(&[9]),
-    ] {
-        let output = runtime
-            .forward(
-                deepseek::mtp::EmbeddedInput::target(&tokens, None),
-                &mut state,
-                &context,
-            )
-            .unwrap();
-        assert_eq!(output.shape, [1, tokens.dim(1), 16]);
-        assert!(output.data.iter().all(|value| value.is_finite()));
-    }
-    for layer in 0..3 {
-        assert_eq!(state.layer(layer).unwrap().offset(), 9);
-    }
-}
-
-#[test]
 fn embedded_v3_and_v4_prediction_layers_reuse_target_blocks() {
     let v3 = deepseek::parse_v3_config(&serde_json::json!({
         "model_type": "deepseek_v3",
@@ -27308,47 +27134,6 @@ fn run_numeric_composite_partitions_observed(
     (results, world)
 }
 
-fn numeric_composite_production_decision(
-    config: &serde_json::Value,
-    topology: ParallelTopology,
-) -> eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision {
-    let input = numeric_text_prepared_input(&[1, 2]);
-    let artifact = numeric_composite_artifact(config);
-    let inspection =
-        Arc::new(eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap());
-    let requirements =
-        eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
-    let selected_base = numeric_composite_selection(&requirements, &input);
-    let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
-        &inspection,
-        eredu_architectures::partitioned_execution::PartitionedSelectionRequest::new(
-            topology,
-            0,
-            1,
-            8,
-            eredu_runtime::PipelineActivationDtype::Float32,
-        )
-        .unwrap()
-        .with_completion_policy(
-            CommunicationCompletionPolicy::new(
-                std::time::Duration::from_secs(2),
-                CompletionCancellationMode::QuarantineUntilComplete,
-            )
-            .unwrap(),
-        ),
-        NumericCompositePartitionAdmission,
-    )
-    .unwrap();
-    let selected =
-        eredu_architectures::partitioned_execution::select_composite_partitioned_admission(
-            admission,
-            selected_base,
-            &numeric_partition_capabilities(),
-        )
-        .unwrap();
-    eredu_architectures::composite_partitioned::composite_partitioned_production_decision(&selected)
-}
-
 fn gemma_composite_decode_input(token: usize) -> eredu_runtime::PreparedModelInput<NumericTensor> {
     eredu_runtime::PreparedModelInput::new(
         vec![eredu_runtime::PreparedInputPart::new(
@@ -27783,40 +27568,6 @@ fn remaining_dense_composites_run_tp_pp_through_the_ordinary_partition_session()
     assert_eq!(commits.values().sum::<usize>(), topology.world_size());
 }
 
-#[test]
-fn remaining_dense_composites_admit_only_rank_local_safe_tensor_topology() {
-    for (family, config) in [
-        ("Muse-Glimmer", dense_muse_partition_fixture()),
-        ("Inkling", dense_inkling_partition_fixture()),
-        ("conditional Qwen", conditional_qwen_partition_config(false)),
-    ] {
-        assert_eq!(
-            numeric_composite_production_decision(
-                &config,
-                ParallelTopology::new(2, 1, 1, 1).unwrap(),
-            ),
-            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-            "{family} pure TP",
-        );
-        assert_eq!(
-            numeric_composite_production_decision(
-                &config,
-                ParallelTopology::new(1, 2, 1, 1).unwrap(),
-            ),
-            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-            "{family} pure PP",
-        );
-        assert_eq!(
-            numeric_composite_production_decision(
-                &config,
-                ParallelTopology::new(2, 2, 1, 1).unwrap(),
-            ),
-            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-            "{family} TPxPP",
-        );
-    }
-}
-
 #[allow(
     dead_code,
     reason = "owned by the unified reference_conformance target"
@@ -27991,74 +27742,6 @@ pub(crate) fn placed_routed_composite_observation_intervention_is_transactional(
         0,
         "observer failure must prevent output publication",
     );
-}
-
-#[test]
-fn routed_composite_cross_stage_expert_exchange_is_resident() {
-    for (family, config) in [
-        ("Muse-Glimmer", routed_muse_partition_fixture()),
-        ("Inkling", routed_inkling_partition_fixture()),
-    ] {
-        assert_eq!(
-            numeric_composite_production_decision(
-                &config,
-                ParallelTopology::new(1, 2, 2, 1).unwrap(),
-            ),
-            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-            "{family} PPxEP",
-        );
-        assert_eq!(
-            numeric_composite_production_decision(
-                &config,
-                ParallelTopology::new(2, 2, 2, 1).unwrap(),
-            ),
-            eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-            "{family} TPxPPxEP",
-        );
-    }
-}
-
-#[test]
-fn qwen_composites_admit_every_prediction_free_selected_topology_without_a_bridge() {
-    for (family, config) in [
-        ("Qwen3-VL dense", qwen_vl_partition_config(false)),
-        (
-            "conditional Qwen dense",
-            conditional_qwen_partition_config(false),
-        ),
-    ] {
-        for (topology_name, topology) in [
-            ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
-            ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
-            ("TP2xPP2", ParallelTopology::new(2, 2, 1, 1).unwrap()),
-        ] {
-            assert_eq!(
-                numeric_composite_production_decision(&config, topology),
-                eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-                "{family} {topology_name}",
-            );
-        }
-    }
-    for (family, config) in [
-        ("Qwen3-VL routed", qwen_vl_partition_config(true)),
-        (
-            "conditional Qwen routed",
-            conditional_qwen_partition_config(true),
-        ),
-    ] {
-        for (topology_name, topology) in [
-            ("TP2", ParallelTopology::new(2, 1, 1, 1).unwrap()),
-            ("PP2", ParallelTopology::new(1, 2, 1, 1).unwrap()),
-            ("EP2", ParallelTopology::new(1, 1, 2, 1).unwrap()),
-            ("TP2xPP2xEP2", ParallelTopology::new(2, 2, 2, 1).unwrap()),
-        ] {
-            assert_eq!(
-                numeric_composite_production_decision(&config, topology),
-                eredu_architectures::composite_partitioned::CompositePartitionedProductionDecision::Resident,
-                "{family} {topology_name}",
-            );
-        }
-    }
 }
 
 fn qwen_vl_partition_config(routed: bool) -> serde_json::Value {

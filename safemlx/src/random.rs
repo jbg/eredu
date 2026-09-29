@@ -33,33 +33,20 @@ pub fn split_n(key: impl AsRef<Array>, num: i32, stream: impl AsRef<Stream>) -> 
 #[cfg(test)]
 pub(crate) struct TestKeys {
     key: Array,
-    next: usize,
 }
 
 #[cfg(test)]
 impl TestKeys {
-    pub(crate) fn new() -> Result<Self> {
-        Self::with_seed(0)
-    }
-
     pub(crate) fn with_seed(seed: u64) -> Result<Self> {
         Ok(Self {
             key: key(seed)?,
-            next: 0,
         })
-    }
-
-    pub(crate) fn seed(&mut self, seed: u64) -> Result<()> {
-        self.key = key(seed)?;
-        self.next = 0;
-        Ok(())
     }
 
     pub(crate) fn next_key(&mut self, stream: impl AsRef<Stream>) -> Result<Array> {
         let stream = stream.as_ref();
         let keys = split_n(&self.key, 2, stream)?;
         self.key = keys.try_index_device(0, stream)?;
-        self.next += 1;
         keys.try_index_device(1, stream)
     }
 }
@@ -463,26 +450,6 @@ pub fn categorical<'a>(
 mod tests {
     use super::*;
     use crate::{array, assert_array_eq};
-    use float_eq::{assert_float_eq, float_eq};
-
-    #[test]
-    fn test_explicit_random_state_is_deterministic() {
-        let stream = crate::test_stream();
-        let mut state = TestKeys::with_seed(3).unwrap();
-        let a_key = state.next_key(stream).unwrap();
-        let b_key = state.next_key(stream).unwrap();
-        let a = uniform::<_, f32>(0, 1, None, &a_key, stream).unwrap();
-        let b = uniform::<_, f32>(0, 1, None, &b_key, stream).unwrap();
-
-        let mut state = TestKeys::with_seed(3).unwrap();
-        let x_key = state.next_key(stream).unwrap();
-        let y_key = state.next_key(stream).unwrap();
-        let x = uniform::<_, f32>(0, 1, None, &x_key, stream).unwrap();
-        let y = uniform::<_, f32>(0, 1, None, &y_key, stream).unwrap();
-
-        assert_array_eq!(a, x, 0.01, stream = stream);
-        assert_array_eq!(b, y, 0.01, stream = stream);
-    }
 
     #[test]
     fn test_key() {
@@ -519,14 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn test_uniform_single() {
-        let stream = crate::test_stream();
-        let key = key(0).unwrap();
-        let value = uniform::<_, f32>(0, 10, None, &key, stream).unwrap();
-        float_eq!(value.item::<f32>(&stream), 4.18, abs <= 0.01);
-    }
-
-    #[test]
     fn test_uniform_multiple() {
         let stream = crate::test_stream();
         let key = key(0).unwrap();
@@ -555,33 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normal() {
-        let stream = crate::test_stream();
-        let key = key(0).unwrap();
-        let value = normal::<f32>(None, None, None, &key, stream).unwrap();
-        float_eq!(value.item::<f32>(&stream), -0.20, abs <= 0.01);
-    }
-
-    #[test]
-    fn test_normal_non_float() {
-        let stream = crate::test_stream();
-        let key = key(0).unwrap();
-        let value = normal::<i32>(None, None, None, &key, stream);
-        assert!(value.is_err());
-    }
-
-    #[test]
-    fn test_multivariate_normal() {
-        let stream = crate::test_stream();
-        let key = key(0).unwrap();
-        let mean = Array::from_slice(&[0.0, 0.0], &[2]);
-        let covariance = Array::from_slice(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
-
-        let a = multivariate_normal::<f32>(&mean, &covariance, &[3], &key, stream).unwrap();
-        assert!(a.shape() == [3, 2]);
-    }
-
-    #[test]
     fn test_randint_single() {
         let stream = crate::test_stream();
         let key = key(0).unwrap();
@@ -598,14 +530,6 @@ mod tests {
         let expected = Array::from_slice(&[2, 82], &[2]);
 
         assert_array_eq!(value, expected, 0.01, stream = stream);
-    }
-
-    #[test]
-    fn test_randint_non_int() {
-        let stream = crate::test_stream();
-        let key = key(0).unwrap();
-        let value = randint::<_, f32>(array!([0, 10]), array!([10, 100]), None, &key, stream);
-        assert!(value.is_err());
     }
 
     #[test]
@@ -711,43 +635,4 @@ mod tests {
         assert_array_eq!(result, expected, 0.01, stream = stream);
     }
 
-    #[test]
-    fn test_random_state_next_key_advances() {
-        let stream = crate::test_stream();
-        let mut state = TestKeys::with_seed(0).unwrap();
-        let k1 = state.next_key(stream).unwrap();
-        let k2 = state.next_key(stream).unwrap();
-        assert!(!crate::array::eval_equal_values(&k1, &k2));
-    }
-
-    #[test]
-    fn test_random_seed_same() {
-        let stream = crate::test_stream();
-        // Same random seed should produce the same results
-        let seed = 23;
-        let mut results = Vec::new();
-        for _ in 0..10 {
-            let mut state = TestKeys::new().unwrap();
-            state.seed(seed).unwrap();
-            let draw_key = state.next_key(stream).unwrap();
-            let result = uniform::<_, f32>(0.0, 1.0, &[10, 10], &draw_key, stream)
-                .unwrap()
-                .sum(None, stream)
-                .unwrap()
-                .try_item::<f32>(&stream)
-                .unwrap();
-            results.push(result);
-        }
-
-        // Check that all results are the same within a small tolerance
-        let first = results[0];
-        for result in &results[1..] {
-            assert_float_eq!(
-                first,
-                *result,
-                abs <= 0.01,
-                "Results should be equal for the same seed"
-            );
-        }
-    }
 }

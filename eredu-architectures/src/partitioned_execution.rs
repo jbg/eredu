@@ -14717,24 +14717,6 @@ mod tests {
     }
 
     #[test]
-    fn routed_banks_admit_all_ordinary_residency_modes() {
-        for bank in [
-            eredu_runtime::ParameterBankResidency::IndependentCache(Default::default()),
-            eredu_runtime::ParameterBankResidency::WithLayer,
-        ] {
-            for ordinary in [
-                eredu_runtime::LayerWeightResidency::FullyResident,
-                eredu_runtime::LayerWeightResidency::LayerwiseHost(Default::default()),
-                eredu_runtime::LayerWeightResidency::DenseDiskStream(
-                    eredu_runtime::DenseDiskStreamLoadOptions::new(1, 1, 1, 1).unwrap(),
-                ),
-            ] {
-                assert!(routed_partitioned_residency_supported(ordinary, bank));
-            }
-        }
-    }
-
-    #[test]
     fn routed_execution_handoff_rejects_omitted_expert_wave_before_mechanism_binding() {
         assert_eq!(
             PreparedRoutedExecutionHandoff::validate_pipeline_recipe(

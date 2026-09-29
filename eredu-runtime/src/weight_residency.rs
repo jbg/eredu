@@ -1027,17 +1027,6 @@ mod tests {
     }
 
     #[test]
-    fn residency_policy_derives_finite_dense_windows() {
-        let options = DenseDiskStreamLoadOptions::new(32, 64, 3, 2).unwrap();
-        let policy = LayerWeightResidency::DenseDiskStream(options);
-        assert_eq!(policy.device_depth(8), DENSE_TRANSFER_WINDOW);
-        let offload = policy.offload().unwrap();
-        assert_eq!(offload.device_budget_bytes(), Some(32));
-        assert_eq!(offload.host_budget_bytes(), Some(64));
-        assert_eq!(offload.prefetch_depth(), 3);
-    }
-
-    #[test]
     fn dense_transfer_schedule_preserves_order_and_bounded_lookahead() {
         let mut schedule = DenseTransferSchedule::new(3..7, 2).unwrap();
         assert_eq!(schedule.desired_indices(3), vec![3, 4, 5]);

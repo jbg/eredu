@@ -54,40 +54,17 @@ fn run_deepseek_encoded_bank_case(
     );
 }
 
-#[test]
-#[ignore = "requires native MLX and local Ring ranks; run explicitly"]
-fn ring_deepseek_encoded_independent_banks_focused() {
-    use DeepSeekEncodedBankFixture::*;
-    for encoding in [
-        V3,
-        V4Float,
-        V4Ue8m0,
-        V4Mixed,
-        DsparkFloat,
-        DsparkUe8m0,
-        DsparkMixed,
-    ] {
-        run_deepseek_encoded_bank_case(encoding, "tp", WorkerResidency::FullyResident);
-    }
-}
-
 macro_rules! deepseek_encoded_bank_matrix {
     ($name:ident, $encoding:ident) => {
         #[test]
         #[ignore = "requires native MLX and up to eight local Ring ranks; run explicitly"]
         fn $name() {
-            for axes in ["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
-                for residency in [
-                    WorkerResidency::FullyResident,
-                    WorkerResidency::LayerwiseHost,
-                    WorkerResidency::DenseDiskStream,
-                ] {
-                    run_deepseek_encoded_bank_case(
-                        DeepSeekEncodedBankFixture::$encoding,
-                        axes,
-                        residency,
-                    );
-                }
+            for &(axes, residency) in component_cases(true) {
+                run_deepseek_encoded_bank_case(
+                    DeepSeekEncodedBankFixture::$encoding,
+                    axes,
+                    residency,
+                );
             }
         }
     };

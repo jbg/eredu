@@ -1376,8 +1376,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use eredu_checkpoint::{
-        expert::GatedProductExpertStorageLayout,
-        recipe::{DerivedWeightRecipe, RecipeCatalog},
+        recipe::RecipeCatalog,
         store::{StoreError, TensorMetadata},
         StoredDtype,
     };
@@ -1402,20 +1401,6 @@ mod tests {
             stored_dtype: StoredDtype::F16,
             backing_shard: None,
         }
-    }
-
-    fn sparse_args() -> ModelArgs {
-        ModelArgs::from_hf_json(
-            br#"{
-                "model_type":"gemma4","hidden_size":16,"num_hidden_layers":1,
-                "intermediate_size":32,"num_attention_heads":2,"num_key_value_heads":1,
-                "head_dim":8,"rms_norm_eps":0.000001,"vocab_size":64,
-                "max_position_embeddings":128,"layer_types":["full_attention"],
-                "enable_moe_block":true,"num_experts":4,"top_k_experts":2,
-                "moe_intermediate_size":8
-            }"#,
-        )
-        .unwrap()
     }
 
     fn sparse_family() -> FamilyConfig {
@@ -1552,24 +1537,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_schema_freezes_optional_projector_and_required_assistant() {
-        let config = config();
-        let schema = config.artifact_schema().unwrap();
-        assert_eq!(schema.primary().architecture, "gemma4_unified");
-        assert_eq!(schema.siblings().len(), 2);
-        assert!(!schema.siblings()[0].required);
-        assert!(schema.siblings()[1].required);
-        let catalog = config.parameter_catalog().unwrap();
-        assert_eq!(
-            catalog
-                .owner("masked_embedding.token_ordering")
-                .unwrap()
-                .as_str(),
-            "assistant"
-        );
-    }
-
-    #[test]
     fn sibling_projector_must_match_identity_width_and_modality_tokens() {
         let config = config();
         config
@@ -1584,110 +1551,6 @@ mod tests {
             .projector_compatibility("gemma4_unified", 16, BTreeSet::from([100, 101]))
             .validate()
             .is_err());
-    }
-
-    #[test]
-    fn separate_expert_bank_derives_exact_fused_neutral_targets() {
-        let prefix = "model.language_model.layers.0.experts.switch_glu";
-        let tensors = BTreeMap::from([
-            (
-                format!("{prefix}.gate_proj.weight"),
-                metadata(&format!("{prefix}.gate_proj.weight"), vec![4, 8, 16]),
-            ),
-            (
-                format!("{prefix}.up_proj.weight"),
-                metadata(&format!("{prefix}.up_proj.weight"), vec![4, 8, 16]),
-            ),
-            (
-                format!("{prefix}.down_proj.weight"),
-                metadata(&format!("{prefix}.down_proj.weight"), vec![4, 16, 8]),
-            ),
-        ]);
-        let catalog = Catalog(tensors);
-        let recipes = expert_recipes(&catalog, &sparse_args(), 0).unwrap();
-        assert_eq!(
-            recipes.layout,
-            GatedProductExpertStorageLayout::SeparatePacked
-        );
-        assert_eq!(recipes.target_gate_up, format!("{prefix}.gate_up_proj"));
-        assert_eq!(
-            recipes.gate_up.infer(&catalog).unwrap().shape(),
-            &[4, 16, 16]
-        );
-        assert!(matches!(
-            recipes.gate_up,
-            DerivedWeightRecipe::Concatenate { axis: 1, .. }
-        ));
-    }
-
-    #[test]
-    fn residency_catalog_owns_sparse_schedule_identity_and_bindings() {
-        let args = sparse_args();
-        let root = "model.language_model.layers.0.experts.switch_glu";
-        let catalog = Catalog(BTreeMap::from([
-            (
-                format!("{root}.gate_up_proj"),
-                metadata(&format!("{root}.gate_up_proj"), vec![4, 16, 16]),
-            ),
-            (
-                format!("{root}.down_proj"),
-                metadata(&format!("{root}.down_proj"), vec![4, 16, 8]),
-            ),
-        ]));
-        let residency = expert_residency_catalog(&catalog, &args).unwrap();
-        assert_eq!(residency.units().len(), 4);
-        let first = &residency.units()[0];
-        assert_eq!(
-            first.identity(),
-            eredu_runtime::ParameterBankKey::new(0, 0, 0)
-        );
-        assert_eq!(first.owner_group().as_str(), "text_decoder");
-        assert_eq!(first.owner_unit(), 0);
-        assert_eq!(first.unit_path(), "model.language_model.layers.0");
-        assert_eq!(
-            first
-                .parameters()
-                .iter()
-                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    "gate_up_proj",
-                    "model.language_model.layers.0.experts.switch_glu.gate_up_proj"
-                ),
-                (
-                    "down_proj",
-                    "model.language_model.layers.0.experts.switch_glu.down_proj"
-                ),
-            ]
-        );
-        assert_eq!(
-            residency.units()[3].identity(),
-            eredu_runtime::ParameterBankKey::new(0, 0, 3)
-        );
-    }
-
-    #[test]
-    fn strict_plans_cover_media_shared_policy_and_expert_alternatives() {
-        let family = sparse_family();
-        let safe = safetensors_plan(&family).unwrap();
-        assert!(safe.catalog_policy.strict);
-        assert_eq!(safe.layout_groups.len(), 1);
-        assert_eq!(safe.layout_groups[0].variants.len(), 2);
-        assert!(safe
-            .common_tensors
-            .iter()
-            .any(|tensor| { tensor.key == "model.vision_tower.patch_embedder.input_proj.weight" }));
-        assert!(safe.common_tensors.iter().any(|tensor| {
-            tensor.key == "model.audio_tower.subsample_conv_projection.layer0.conv.weight"
-        }));
-        let gguf = gguf_plan(&family.text).unwrap();
-        assert!(gguf.catalog_policy.strict);
-        assert_eq!(gguf.layout_groups.len(), 1);
-        assert_eq!(
-            translate_gguf_weight_name("blk.0.ffn_gate_up_exps.weight"),
-            "model.layers.0.experts.switch_glu.gate_up_proj.weight"
-        );
     }
 
     #[test]

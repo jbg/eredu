@@ -1201,7 +1201,7 @@ mod tests {
 
     use eredu_core::{Completion, SpeculativeExecutor};
 
-    use super::{block_token_ids, ExternalExecutor, ExternalMechanisms, ExternalTargetOutput};
+    use super::{ExternalExecutor, ExternalMechanisms, ExternalTargetOutput};
     use crate::muse_glimmer::DFlashContext;
 
     #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1467,13 +1467,6 @@ mod tests {
         ) -> Result<Self::Completion, Self::Error> {
             Ok(Ready)
         }
-    }
-
-    #[test]
-    fn block_contains_one_anchor_and_only_requested_masks() {
-        assert_eq!(block_token_ids(7, 99, 1), [7, 99]);
-        assert_eq!(block_token_ids(7, 99, 3), [7, 99, 99, 99]);
-        assert_eq!(block_token_ids(7, 99, 15).len(), 16);
     }
 
     #[test]

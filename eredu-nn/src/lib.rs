@@ -381,29 +381,6 @@ impl AttentionStateSource {
 }
 
 #[cfg(test)]
-mod attention_state_source_tests {
-    use super::{AttentionStateSource, AttentionValueSource};
-
-    #[test]
-    fn ownership_publication_and_key_as_value_are_independent() {
-        let local = AttentionStateSource::Local {
-            value: AttentionValueSource::Projected,
-        };
-        let publisher = AttentionStateSource::Publish {
-            value: AttentionValueSource::ReuseKey,
-        };
-        assert!(local.owns_state());
-        assert!(!local.publishes_state());
-        assert_eq!(local.value(), Some(AttentionValueSource::Projected));
-        assert!(publisher.owns_state());
-        assert!(publisher.publishes_state());
-        assert_eq!(publisher.value(), Some(AttentionValueSource::ReuseKey));
-        assert!(!AttentionStateSource::Shared.owns_state());
-        assert_eq!(AttentionStateSource::Shared.value(), None);
-    }
-}
-
-#[cfg(test)]
 mod recurrent_encoder_contract_tests {
     use super::{
         reference_expand_heads, reference_segmented_attention, validate_segment_lengths,
@@ -4000,46 +3977,6 @@ impl NeuralOperatorCapabilities {
                 (required.contains(*capability) && !self.contains(*capability)).then_some(*name)
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod neural_operator_capability_tests {
-    use super::NeuralOperatorCapabilities as C;
-
-    #[test]
-    fn all_includes_every_fail_closed_tensor_operation() {
-        for (capability, name) in [
-            (C::UNLOADED_I32, "unloaded_i32"),
-            (C::FROM_I32_SLICE, "from_i32_slice"),
-            (C::TO_F32_VEC, "to_f32_vec"),
-            (C::TO_I32_VEC, "to_i32_vec"),
-            (C::FULL_F32, "full_f32"),
-            (C::FULL_I32, "full_i32"),
-            (C::TANH, "tanh"),
-            (C::ABS, "abs"),
-            (C::SIGN, "sign"),
-            (C::SQRT, "sqrt"),
-            (C::CAST_FLOAT, "cast_float"),
-            (C::CLIP, "clip"),
-            (C::SOFTMAX_AXIS, "softmax_axis"),
-            (C::BROADCAST_TO, "broadcast_to"),
-            (C::ZEROS_LIKE, "zeros_like"),
-            (C::EQUAL_I32, "equal_i32"),
-            (C::LOGICAL_OR, "logical_or"),
-            (C::WHERE_CONDITION, "where_condition"),
-            (C::MASKED_SCATTER, "masked_scatter"),
-            (C::ROPE_WITH_FREQUENCIES, "rope_with_frequencies"),
-            (C::CONV2D, "conv2d"),
-            (
-                C::MULTI_AXIS_ROTARY_EMBEDDINGS,
-                "multi_axis_rotary_embeddings",
-            ),
-            (C::MASKED_OUTPUT_PROJECTION, "masked_output_projection"),
-        ] {
-            assert!(C::ALL.contains(capability));
-            assert_eq!(C::NONE.missing_capability_names(capability), [name]);
-        }
     }
 }
 

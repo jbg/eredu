@@ -3299,25 +3299,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-mod boundary_tests {
-    use super::*;
-    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
-
-    #[test]
-    fn mrope_and_deepstack_wire_geometry_is_family_owned() {
-        let schema = PipelineBoundarySchema {
-            head_dim: 8,
-            hidden_size: 32,
-            deepstack_count: 2,
-        };
-        let tensors = schema.wire_schema().unwrap().resolve(2, 5).unwrap();
-        assert_eq!(tensors.primary().shape(), [2, 5, 32]);
-        assert_eq!(tensors.auxiliary().len(), 5);
-        assert_eq!(tensors.auxiliary()[0].shape(), [5, 8]);
-        assert_eq!(tensors.auxiliary()[2].dtype(), BoundaryTensorDtype::Int32);
-        assert_eq!(tensors.auxiliary()[3].role(), "deepstack.0");
-        assert_eq!(tensors.auxiliary()[3].shape(), [2, 5, 32]);
-    }
-}

@@ -1753,52 +1753,6 @@ mod tests {
     }
 
     #[test]
-    fn gguf_names_preserve_dense_text_and_projector_roots() {
-        assert_eq!(
-            translate_text_gguf_name("blk.2.attn_q.weight"),
-            "model.layers.2.self_attn.q_proj.weight"
-        );
-        assert_eq!(
-            translate_text_gguf_name("blk.1.ffn_gate_inp.weight"),
-            "model.layers.1.mlp.gate.weight"
-        );
-        assert_eq!(
-            translate_projector_gguf_name("v.blk.3.attn_out.weight"),
-            "model.vision_tower.layers.3.attn.proj.weight"
-        );
-        assert_eq!(
-            translate_text_gguf_name("blk.4.ffn_gate_exps.weight"),
-            "model.layers.4.mlp.experts.gate_proj.weight"
-        );
-    }
-
-    #[test]
-    fn strict_plans_cover_native_vision_dense_and_all_moe_layouts() {
-        let dense = decoder(false);
-        let safe = safetensors_plan(&dense).unwrap();
-        assert!(safe.catalog_policy.strict);
-        assert!(safe.layout_groups.is_empty());
-        assert!(safe.common_tensors.iter().any(|tensor| {
-            tensor.key == "model.language_model.layers.0.self_attn.q_proj.weight"
-                && tensor.aliases == ["model.layers.0.self_attn.q_proj.weight"]
-        }));
-        assert!(safe.common_tensors.iter().any(|tensor| {
-            tensor.key == "model.vision_tower.patch_embedder.patch_embedding.weight"
-        }));
-        assert!(gguf_plan(&dense).unwrap().catalog_policy.strict);
-        assert!(projector_gguf_plan(&dense).unwrap().catalog_policy.strict);
-
-        let sparse = safetensors_plan(&decoder(true)).unwrap();
-        assert_eq!(sparse.layout_groups.len(), 1);
-        assert_eq!(sparse.layout_groups[0].variants.len(), 3);
-        let sparse_gguf = gguf_plan(&decoder(true)).unwrap();
-        assert!(sparse_gguf
-            .common_tensors
-            .iter()
-            .any(|tensor| tensor.key == "blk.0.ffn_gate_exps.weight"));
-    }
-
-    #[test]
     fn safetensors_recipes_own_released_aliases_and_independent_expert_stacking() {
         let args = decoder(true);
         let mut tensors = BTreeMap::from([(

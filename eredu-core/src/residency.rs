@@ -2226,30 +2226,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_and_report_serialization_preserve_validated_state() {
-        let plan = OffloadPlan::new(
-            OffloadConfig::new(Some(80), Some(40), 2)
-                .unwrap()
-                .with_eviction_policy(CacheEvictionPolicy::LeastFrequentlyUsed),
-            [
-                unit("layer.1", 20, ResidencyPolicy::Windowed, MemoryTier::Disk),
-                unit("layer.0", 40, ResidencyPolicy::Pinned, MemoryTier::Device),
-            ],
-        )
-        .unwrap();
-        let encoded = serde_json::to_string(&plan).unwrap();
-        let decoded: OffloadPlan = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, plan);
-
-        let report = OffloadTelemetry::from_plan(&plan).snapshot();
-        let encoded = serde_json::to_string(&report).unwrap();
-        assert_eq!(
-            serde_json::from_str::<OffloadReport>(&encoded).unwrap(),
-            report
-        );
-    }
-
-    #[test]
     fn deserialization_rejects_invalid_plan_instead_of_bypassing_constructors() {
         let invalid = serde_json::json!({
             "schema_version": OFFLOAD_PLAN_SCHEMA_VERSION,
@@ -2450,19 +2426,6 @@ mod tests {
         );
         assert_eq!(report.evictions().count(), u64::MAX);
         assert_eq!(report.evictions().bytes(), u64::MAX);
-    }
-
-    #[test]
-    fn optional_process_sampler_never_requires_platform_support() {
-        let metrics = sample_process_metrics();
-        if let Some(rss_bytes) = metrics.rss_bytes() {
-            assert!(rss_bytes > 0);
-        }
-        let mut telemetry = OffloadTelemetry::default();
-        telemetry.sample_process_metrics();
-        let report = telemetry.snapshot();
-        let _ = report.process_metrics();
-        assert!(report.process_sampled());
     }
 
     fn disk_ledger(

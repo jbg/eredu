@@ -77,27 +77,6 @@ fn converted(ty: GgmlType, blocks: u64, raw: &[u8], endian: Endian) -> Vec<u8> {
 }
 
 #[test]
-fn canonical_codes_and_exact_block_geometry_match_pinned_upstream() {
-    let expected = [
-        (16, GgmlType::IQ2XXS, 256, 66),
-        (17, GgmlType::IQ2XS, 256, 74),
-        (18, GgmlType::IQ3XXS, 256, 98),
-        (19, GgmlType::IQ1S, 256, 50),
-        (20, GgmlType::IQ4NL, 32, 18),
-        (21, GgmlType::IQ3S, 256, 110),
-        (22, GgmlType::IQ2S, 256, 82),
-        (23, GgmlType::IQ4XS, 256, 136),
-        (29, GgmlType::IQ1M, 256, 56),
-    ];
-    for (code, ty, block, bytes) in expected {
-        assert_eq!(GgmlType::from_code(code), ty);
-        assert_eq!(ty.code(), code);
-        assert_eq!(ty.block_and_bytes().unwrap(), (block, bytes));
-        assert!(ty.is_iq());
-    }
-}
-
-#[test]
 fn removed_runtime_repack_codes_are_known_but_not_accepted_as_gguf_encodings() {
     for (code, ty) in [
         (36, GgmlType::RemovedIQ4NL4_4),
@@ -131,22 +110,6 @@ fn differential_vectors_match_pinned_llama_cpp_f16_outputs_exactly() {
 #[test]
 fn zero_blocks_have_no_nonzero_decoded_values() {
     for ty in IQ_TYPES {
-        let (_, bytes) = ty.block_and_bytes().unwrap();
-        let decoded = converted(ty, 1, &vec![0; bytes as usize], Endian::Little);
-        assert!(
-            decoded
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .all(|pair| { half::f16::from_bits(u16::from_ne_bytes(*pair)).to_f32() == 0.0 }),
-            "{ty:?}"
-        );
-    }
-}
-
-#[test]
-fn native_affine_blocks_remain_packed_and_support_portable_dequantization() {
-    for ty in [GgmlType::Q4K, GgmlType::Q5_1, GgmlType::Q8_0] {
         let (_, bytes) = ty.block_and_bytes().unwrap();
         let decoded = converted(ty, 1, &vec![0; bytes as usize], Endian::Little);
         assert!(

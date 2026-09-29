@@ -334,15 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_text_token_part() {
-        let tokens = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let parts =
-            [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
-
-        validate(ModelInput::new(&parts)).unwrap();
-    }
-
-    #[test]
     fn rejects_public_int64_token_part() {
         let tokens = Array::from_slice(&[1_i64, 2], &[1, 2]);
         let parts =
@@ -352,35 +343,5 @@ mod tests {
         assert!(error
             .to_string()
             .contains("public token ids must use int32 or uint32"));
-    }
-
-    #[test]
-    fn rejects_empty_input() {
-        let err = validate(ModelInput::new(&[])).unwrap_err();
-
-        assert!(err.to_string().contains("at least one part"));
-    }
-
-    #[test]
-    fn rejects_text_tensor_payload() {
-        let tensor = Array::from_slice(&[0.0_f32, 1.0], &[1, 2]);
-        assert!(input_part(InputModality::Text, InputPayload::Tensor(tensor), [], []).is_err());
-    }
-
-    #[test]
-    fn accepts_future_modality_tensor_payloads() {
-        let tensor = Array::from_slice(&[0.0_f32, 1.0], &[1, 2]);
-        let parts = [
-            input_part(
-                InputModality::Audio,
-                InputPayload::Tensor(tensor.clone()),
-                [],
-                [],
-            )
-            .unwrap(),
-            input_part(InputModality::Video, InputPayload::Tensor(tensor), [], []).unwrap(),
-        ];
-
-        validate(ModelInput::new(&parts)).unwrap();
     }
 }

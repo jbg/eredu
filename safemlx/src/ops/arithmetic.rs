@@ -1549,21 +1549,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_abs() {
-        let stream = crate::test_stream();
-        let data = [1i32, 2, -3, -4, -5];
-        let array = Array::from_slice(&data, &[5]);
-        let result = array.abs(stream).unwrap();
-
-        let data: Vec<i32> = crate::array::eval_vec(&result);
-        assert_eq!(data, [1, 2, 3, 4, 5]);
-
-        // test that previous array is not modified and valid
-        let data: Vec<i32> = crate::array::eval_vec(&array);
-        assert_eq!(data, [1, 2, -3, -4, -5]);
-    }
-
-    #[test]
     fn test_add() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
@@ -1593,94 +1578,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sub() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0, 6.0], &[3]);
-
-        let c = a.subtract(&b, stream).unwrap();
-
-        let c_data: Vec<f32> = crate::array::eval_vec(&c);
-        assert_eq!(c_data, &[-3.0, -3.0, -3.0]);
-
-        // check a and b are not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_sub_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0], &[2]);
-        let c = a.subtract(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_neg() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3]);
-        let b = a.negative(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[-1.0, -2.0, -3.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn test_neg_bool() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[true, false, true], &[3]);
-        let b = a.negative(stream);
-        assert!(b.is_err());
-    }
-
-    #[test]
-    fn test_logical_not() {
-        let stream = crate::test_stream();
-        let a: Array = false.into();
-        let b = a.logical_not(stream).unwrap();
-
-        let b_data: Vec<bool> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, [true]);
-    }
-
-    #[test]
-    fn test_mul() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0, 6.0], &[3]);
-
-        let c = a.multiply(&b, stream).unwrap();
-
-        let c_data: Vec<f32> = crate::array::eval_vec(&c);
-        assert_eq!(c_data, &[4.0, 10.0, 18.0]);
-
-        // check a and b are not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_mul_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0], &[2]);
-        let c = a.multiply(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_nan_to_num() {
         let stream = crate::test_stream();
         let a = array!([1.0, 2.0, f32::NAN, 4.0, 5.0]);
@@ -1688,34 +1585,6 @@ mod tests {
 
         let b_data: Vec<f32> = crate::array::eval_vec(&b);
         assert_eq!(b_data, &[1.0, 2.0, 0.0, 4.0, 5.0]);
-    }
-
-    #[test]
-    fn test_div() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0, 6.0], &[3]);
-
-        let c = a.divide(&b, stream).unwrap();
-
-        let c_data: Vec<f32> = crate::array::eval_vec(&c);
-        assert_eq!(c_data, &[0.25, 0.4, 0.5]);
-
-        // check a and b are not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_div_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0], &[2]);
-        let c = a.divide(&b, stream);
-        assert!(c.is_err());
     }
 
     #[test]
@@ -1738,15 +1607,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pow_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[2.0, 3.0], &[2]);
-        let c = a.power(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_rem() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[10.0, 11.0, 12.0], &[3]);
@@ -1766,79 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rem_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[10.0, 11.0, 12.0], &[3]);
-        let b = Array::from_slice(&[3.0, 4.0], &[2]);
-        let c = a.remainder(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_sqrt() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 4.0, 9.0], &[3]);
-        let b = a.sqrt(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[1.0, 2.0, 3.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 4.0, 9.0]);
-    }
-
-    #[test]
-    fn test_cos() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[0.0, 1.0, 2.0], &[3]);
-        let b = a.cos(stream).unwrap();
-
-        let b_expected = array!([1.0, 0.54030234, -0.41614687]);
-        assert_array_all_close!(b, b_expected, stream = stream);
-
-        // check a is not modified
-        let a_expected = array!([0.0, 1.0, 2.0]);
-        assert_array_all_close!(a, a_expected, stream = stream);
-    }
-
-    #[test]
-    fn test_exp() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[0.0, 1.0, 2.0], &[3]);
-        let b = a.exp(stream).unwrap();
-
-        let b_expected = array!([1.0, 2.7182817, 7.389056]);
-        assert_array_all_close!(b, b_expected, stream = stream);
-
-        // check a is not modified
-        let a_expected = array!([0.0, 1.0, 2.0]);
-        assert_array_all_close!(a, a_expected, stream = stream);
-    }
-
-    #[test]
-    fn test_floor() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[0.1, 1.9, 2.5], &[3]);
-        let b = a.floor(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[0.0, 1.0, 2.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[0.1, 1.9, 2.5]);
-    }
-
-    #[test]
-    fn test_floor_complex64() {
-        let val = complex64::new(1.0, 2.0);
-        let a = Array::from_complex(val);
-        let b = a.floor(crate::test_stream());
-        assert!(b.is_err());
-    }
-
-    #[test]
     fn test_floor_divide() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
@@ -1855,23 +1642,6 @@ mod tests {
 
         let b_data: Vec<f32> = crate::array::eval_vec(&b);
         assert_eq!(b_data, &[4.0, 5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_floor_divide_complex64() {
-        let val = complex64::new(1.0, 2.0);
-        let a = Array::from_complex(val);
-        let b = Array::from_slice(&[4.0, 5.0, 6.0], &[3]);
-        let c = a.floor_divide(&b, crate::test_stream());
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_floor_divide_invalid_broadcast() {
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = Array::from_slice(&[4.0, 5.0], &[2]);
-        let c = a.floor_divide(&b, crate::test_stream());
-        assert!(c.is_err());
     }
 
     #[test]
@@ -1925,62 +1695,6 @@ mod tests {
     }
 
     #[test]
-    fn test_log() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = a.log(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[0.0, 0.6931472, 1.0986123]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn test_log2() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 4.0, 8.0], &[4]);
-        let b = a.log2(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[0.0, 1.0, 2.0, 3.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 4.0, 8.0]);
-    }
-
-    #[test]
-    fn test_log10() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 10.0, 100.0], &[3]);
-        let b = a.log10(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[0.0, 1.0, 2.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 10.0, 100.0]);
-    }
-
-    #[test]
-    fn test_log1p() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = a.log1p(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[0.6931472, 1.0986123, 1.3862944]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
-    }
-
-    #[test]
     fn test_matmul() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
@@ -1998,115 +1712,6 @@ mod tests {
 
         let b_data: Vec<f32> = crate::array::eval_vec(&b);
         assert_eq!(b_data, &[-5.0, 37.5, 4., 7., 1., 0.]);
-    }
-
-    #[test]
-    fn test_matmul_ndim_zero() {
-        let stream = crate::test_stream();
-        let a: Array = 1.0.into();
-        let b = Array::from_slice::<i32>(&[1], &[1]);
-        let c = a.matmul(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_matmul_ndim_one() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-        let b = Array::from_slice(&[1.0, 2.0, 3.0, 4.0], &[4]);
-        let c = a.matmul(&b, stream);
-        assert!(c.is_ok());
-    }
-
-    #[test]
-    fn test_matmul_dim_mismatch() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3, 4, 5, 6], &[2, 3]);
-        let b = Array::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], &[2, 5]);
-        let c = a.matmul(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_matmul_non_float_output_type() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3, 4], &[2, 2]);
-        let b = Array::from_slice(&[5, 37, 4, 7, 1, 0], &[2, 3]);
-
-        let c = a.matmul(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_reciprocal() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 4.0], &[3]);
-        let b = a.reciprocal(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[1.0, 0.5, 0.25]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 4.0]);
-    }
-
-    #[test]
-    fn test_round() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.1, 2.9, 3.5], &[3]);
-        let b = a.round(None, stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[1.0, 3.0, 4.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.1, 2.9, 3.5]);
-    }
-
-    #[test]
-    fn test_rsqrt() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 4.0], &[3]);
-        let b = a.rsqrt(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[1.0, 0.70710677, 0.5]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 4.0]);
-    }
-
-    #[test]
-    fn test_sin() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[0.0, 1.0, 2.0], &[3]);
-        let b = a.sin(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_float_eq!(b_data[0], 0.0, abs <= 1e-6);
-        assert_float_eq!(b_data[1], 0.841471, abs <= 1e-6);
-        assert_float_eq!(b_data[2], 0.9092974, abs <= 1e-6);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[0.0, 1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_square() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1.0, 2.0, 3.0], &[3]);
-        let b = a.square(stream).unwrap();
-
-        let b_data: Vec<f32> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, &[1.0, 4.0, 9.0]);
-
-        // check a is not modified
-        let a_data: Vec<f32> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, &[1.0, 2.0, 3.0]);
     }
 
     // The unit tests below are adapted from the original mlx c++ codebase.

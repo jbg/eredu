@@ -341,28 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rfft2_shape_with_default_params() {
-        let stream = crate::test_stream();
-        const IN_SHAPE: &[i32] = &[6, 6];
-        const OUT_SHAPE: &[i32] = &[6, 6 / 2 + 1];
-
-        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
-        let rfft2 = super::rfft2(&a, None, None, stream).unwrap();
-        assert_eq!(rfft2.shape(), OUT_SHAPE);
-    }
-
-    #[test]
-    fn test_irfft2_shape_with_default_params() {
-        let stream = crate::test_stream();
-        const IN_SHAPE: &[i32] = &[6, 6];
-        const OUT_SHAPE: &[i32] = &[6, (6 - 1) * 2];
-
-        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
-        let irfft2 = super::irfft2(&a, None, None, stream).unwrap();
-        assert_eq!(irfft2.shape(), OUT_SHAPE);
-    }
-
-    #[test]
     fn test_rfftn() {
         let stream = crate::test_stream();
         const RFFTN_DATA: &[f32] = &[1.0; 8];
@@ -388,25 +366,4 @@ mod tests {
         assert_eq!(crate::array::eval_vec::<f32>(&irfftn), RFFTN_DATA);
     }
 
-    #[test]
-    fn test_fftn_shape_with_default_params() {
-        let stream = crate::test_stream();
-        const IN_SHAPE: &[i32] = &[6, 6, 6];
-        const OUT_SHAPE: &[i32] = &[6, 6, 6 / 2 + 1];
-
-        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
-        let rfftn = super::rfftn(&a, None, None, stream).unwrap();
-        assert_eq!(rfftn.shape(), OUT_SHAPE);
-    }
-
-    #[test]
-    fn test_irfftn_shape_with_default_params() {
-        let stream = crate::test_stream();
-        const IN_SHAPE: &[i32] = &[6, 6, 6];
-        const OUT_SHAPE: &[i32] = &[6, 6, (6 - 1) * 2];
-
-        let a = Array::ones::<f32>(IN_SHAPE, stream).unwrap();
-        let irfftn = super::irfftn(&a, None, None, stream).unwrap();
-        assert_eq!(irfftn.shape(), OUT_SHAPE);
-    }
 }

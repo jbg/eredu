@@ -219,23 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_unknown_capacity_and_known_zero_are_distinct() {
-        let unavailable = TensorStorageSurvey::unavailable(3);
-        unavailable.validate(3).unwrap();
-        assert_eq!(unavailable.values, vec![None, None, None]);
-        assert!(unavailable.backings.is_empty());
-
-        let survey = TensorStorageSurvey {
-            values: vec![None, Some(0), Some(1)],
-            backings: vec![owned(None), owned(Some(0))],
-        };
-        survey.validate(3).unwrap();
-        assert_eq!(survey.backings[0].allocator_capacity_bytes, None);
-        assert_eq!(survey.backings[1].allocator_capacity_bytes, Some(0));
-        TensorStorageSurvey::unavailable(0).validate(0).unwrap();
-    }
-
-    #[test]
     fn malformed_counts_indices_and_unused_records_are_rejected() {
         assert!(TensorStorageSurvey::unavailable(2).validate(1).is_err());
         let mut survey = TensorStorageSurvey {

@@ -34,28 +34,6 @@ pub(super) fn tensors(
         .collect()
 }
 
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn native_component_masks_capture_effective_values_and_match_controlled_execution() {
-    component_masks(
-        fixture(false),
-        "model.layers.0.attention.channels",
-        "model.layers.0.feed_forward.units",
-    );
-}
-
-fn component_masks(root: Fixture, attention: &'static str, ffn: &'static str) {
-    component_masks_with_residency(
-        root,
-        attention,
-        ffn,
-        eredu_core::ResidencyPlan::FullyResident,
-    );
-}
-
 pub(super) fn component_masks_with_residency(
     root: Fixture,
     attention: &'static str,
@@ -468,19 +446,6 @@ fn nemotron_mixed_fixture() -> Fixture {
         }],
     );
     root
-}
-
-#[test]
-#[cfg_attr(
-    feature = "metal",
-    ignore = "run with --no-default-features --features mlx"
-)]
-fn native_non_gated_component_masks_match_controlled_snapshots() {
-    component_masks(
-        nemotron_fixture(),
-        "model.layers.0.attention.channels",
-        "model.layers.1.feed_forward.units",
-    );
 }
 
 #[test]

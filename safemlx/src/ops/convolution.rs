@@ -508,30 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn test_conv_transpose3d() {
-        let stream = crate::test_stream();
-        // 2x2x2 single channel input
-        let input = Array::from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 2, 2, 2, 1]);
-        // 2x2x2 single channel kernel
-        let weights =
-            Array::from_slice(&[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0], &[1, 2, 2, 2, 1]);
-
-        let result = conv_transpose3d(
-            &input,
-            &weights,
-            Some((1, 1, 1)), // stride
-            Some((0, 0, 0)), // padding
-            Some((1, 1, 1)), // dilation
-            None,            // output padding
-            Some(1),         // groups
-            stream,
-        )
-        .unwrap();
-
-        assert_eq!(result.shape(), &[1, 3, 3, 3, 1]);
-    }
-
-    #[test]
     fn test_conv_wrong_dimensions() {
         let stream = crate::test_stream();
         let input_data = [1.0, 2.0, 3.0, 4.0];

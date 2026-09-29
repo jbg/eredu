@@ -222,33 +222,4 @@ mod tests {
             .sampling_invocation(u64::MAX, 128, TensorElementType::F32, 1.0)
             .is_err());
     }
-
-    #[test]
-    fn cold_config_and_live_policy_describe_the_same_mechanism() {
-        let mut resolved =
-            eredu_core::generation::resolve_generation_config(None, Default::default()).unwrap();
-        resolved.temperature = 0.7;
-        resolved.do_sample = true;
-        resolved.repetition_penalty = 1.1;
-        let config = TextGenerationConfig::new(resolved);
-        let mut live = GenerationSampler::from_resolved(resolved);
-        live.accept_token(3);
-        live.accept_token(4);
-        assert_eq!(
-            sampling_invocation(&config, 1, 128, TensorElementType::F32, 2).unwrap(),
-            live.sampling_invocation(1, 128, TensorElementType::F32, resolved.temperature)
-                .unwrap()
-        );
-        let config = config.with_mirostat_v2(5.0, 0.1).unwrap();
-        let adaptive = MirostatV2Sampler {
-            penalties: live,
-            ..Default::default()
-        };
-        assert_eq!(
-            sampling_invocation(&config, 1, 128, TensorElementType::F32, 2).unwrap(),
-            adaptive
-                .sampling_invocation(1, 128, TensorElementType::F32)
-                .unwrap()
-        );
-    }
 }

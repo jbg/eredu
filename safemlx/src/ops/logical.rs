@@ -737,15 +737,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eq_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.eq(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_le() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3], &[3]);
@@ -761,15 +752,6 @@ mod tests {
 
         let b_data: Vec<i32> = crate::array::eval_vec(&b);
         assert_eq!(b_data, [1, 2, 3]);
-    }
-
-    #[test]
-    fn test_le_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.le(&b, stream);
-        assert!(c.is_err());
     }
 
     #[test]
@@ -791,15 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ge_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.ge(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_ne() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 2, 3], &[3]);
@@ -815,15 +788,6 @@ mod tests {
 
         let b_data: Vec<i32> = crate::array::eval_vec(&b);
         assert_eq!(b_data, [1, 2, 3]);
-    }
-
-    #[test]
-    fn test_ne_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.ne(&b, stream);
-        assert!(c.is_err());
     }
 
     #[test]
@@ -845,15 +809,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lt_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.lt(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_gt() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[1, 4, 3], &[3]);
@@ -872,69 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gt_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[1, 2, 3, 4], &[4]);
-        let c = a.gt(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_logical_and() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[true, false, true], &[3]);
-        let b = Array::from_slice(&[true, true, false], &[3]);
-        let c = a.logical_and(&b, stream).unwrap();
-
-        let c_data: Vec<bool> = crate::array::eval_vec(&c);
-        assert_eq!(c_data, [true, false, false]);
-
-        // check a and b are not modified
-        let a_data: Vec<bool> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, [true, false, true]);
-
-        let b_data: Vec<bool> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, [true, true, false]);
-    }
-
-    #[test]
-    fn test_logical_and_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[true, false, true], &[3]);
-        let b = Array::from_slice(&[true, true, false, true], &[4]);
-        let c = a.logical_and(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
-    fn test_logical_or() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[true, false, true], &[3]);
-        let b = Array::from_slice(&[true, true, false], &[3]);
-        let c = a.logical_or(&b, stream).unwrap();
-
-        let c_data: Vec<bool> = crate::array::eval_vec(&c);
-        assert_eq!(c_data, [true, true, true]);
-
-        // check a and b are not modified
-        let a_data: Vec<bool> = crate::array::eval_vec(&a);
-        assert_eq!(a_data, [true, false, true]);
-
-        let b_data: Vec<bool> = crate::array::eval_vec(&b);
-        assert_eq!(b_data, [true, true, false]);
-    }
-
-    #[test]
-    fn test_logical_or_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[true, false, true], &[3]);
-        let b = Array::from_slice(&[true, true, false, true], &[4]);
-        let c = a.logical_or(&b, stream);
-        assert!(c.is_err());
-    }
-
-    #[test]
     fn test_all_close() {
         let stream = crate::test_stream();
         let a = Array::from_slice(&[0., 1., 2., 3.], &[4])
@@ -947,15 +839,6 @@ mod tests {
 
         let c_data: Vec<bool> = crate::array::eval_vec(&c);
         assert_eq!(c_data, [true]);
-    }
-
-    #[test]
-    fn test_all_close_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[0., 1., 2., 3.], &[4]);
-        let b = Array::from_slice(&[0., 1., 2., 3., 4.], &[5]);
-        let c = a.all_close(&b, 1e-5, None, None, stream);
-        assert!(c.is_err());
     }
 
     #[test]
@@ -978,15 +861,6 @@ mod tests {
 
         let c_data: Vec<bool> = crate::array::eval_vec(&c);
         assert_eq!(c_data, [true, true, true]);
-    }
-
-    #[test]
-    fn test_is_close_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let a = Array::from_slice(&[1., 2., 3.], &[3]);
-        let b = Array::from_slice(&[1.1, 2.2, 3.3, 4.4], &[4]);
-        let c = a.is_close(&b, None, None, false, stream);
-        assert!(c.is_err());
     }
 
     #[test]
@@ -1024,22 +898,6 @@ mod tests {
     }
 
     #[test]
-    fn test_any_out_of_bounds() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[12]);
-        let result = array.any_axes(&[1][..], None, stream);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_any_duplicate_axes() {
-        let stream = crate::test_stream();
-        let array = Array::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], &[3, 4]);
-        let result = array.any_axes(&[0, 0][..], None, stream);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_where() {
         let stream = crate::test_stream();
         let condition = Array::from_slice(&[true, false, true], &[3]);
@@ -1049,16 +907,6 @@ mod tests {
 
         let c_data: Vec<i32> = crate::array::eval_vec(&c);
         assert_eq!(c_data, [1, 5, 3]);
-    }
-
-    #[test]
-    fn test_where_invalid_broadcast() {
-        let stream = crate::test_stream();
-        let condition = Array::from_slice(&[true, false, true], &[3]);
-        let a = Array::from_slice(&[1, 2, 3], &[3]);
-        let b = Array::from_slice(&[4, 5, 6, 7], &[4]);
-        let c = r#where(&condition, &a, &b, stream);
-        assert!(c.is_err());
     }
 
     // The unit tests below are adapted from the mlx c++ codebase

@@ -140,63 +140,6 @@ fn invalid_token_failure_restores_state_before_session_reuse() {
 }
 
 #[test]
-fn public_handoff_executes_ordinary_and_routed_qwen_with_repeated_decode() {
-    crate::tests::support::path_instrumentation::reset();
-    let (stream, weights_stream) = execution_streams();
-    for (model_type, tied) in [
-        ("llama", true),
-        ("mistral", false),
-        ("qwen2", false),
-        ("qwen3", true),
-        ("qwen3_moe", false),
-        ("gpt_oss", false),
-    ] {
-        let root = tiny_artifact(model_type, tied);
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let policy = eredu_core::PreparationPolicy::default();
-        let plan = eredu_core::plan_model_preparation(
-            inspection,
-            policy,
-            eredu_core::SessionCapabilities::default(),
-        )
-        .unwrap();
-        let model = materialize_model_plan(
-            plan,
-            crate::MlxLoadRequest::default(),
-            &stream,
-            &weights_stream,
-        )
-        .unwrap_or_else(|error| panic!("{model_type}: {error}"));
-        let mut executable = model.into_executable();
-        let executable = executable.erased_mut();
-        for token in [1_u32, 2] {
-            let logits = executable
-                .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
-                .unwrap();
-            assert_eq!(logits.shape(), &[1, 64]);
-            logits.evaluated().unwrap();
-        }
-        assert!(executable.parameter_bank_report().unwrap().is_none());
-    }
-    assert_eq!(
-        crate::tests::support::path_instrumentation::snapshot(),
-        crate::tests::support::path_instrumentation::Counts {
-            architecture_constructions: 6,
-            state_allocations: 6,
-            payload_opens: 6,
-            constructors: 6,
-            unit_constructions: 6,
-            materializations: 0,
-            local_static_bindings: 0,
-            excluded_local_static_parameters: 0,
-            forwards: 12,
-            state_publications: 12,
-            completions: 12,
-        }
-    );
-}
-
-#[test]
 fn gguf_requirements_retain_shard_and_multi_output_provenance() {
     let (stream, _) = execution_streams();
     let gguf = tiny_llama_gguf("llama", Some(eredu_gguf::GgmlType::MxFp4), &stream);

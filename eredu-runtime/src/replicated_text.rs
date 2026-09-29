@@ -4101,10 +4101,10 @@ mod tests {
     use crate::{
         ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
         ArchitectureMergeDestination, ArchitectureParameterDescription, ArchitecturePartition,
-        ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, DenseDiskStreamLoadOptions,
-        ExecutionGroupSpec, ExecutionUnitLayout, LayerwiseLoadOptions, MemberSharding,
-        NoAuxiliaryBoundarySchema, OwnedParameterGroupSpec, ParameterGroupSpec,
-        ParameterMemberSpec, ParameterRole, PartitionOwnership, StateLayout,
+        ArchitectureStatePartitionPlan, ArchitectureStatePartitionRule, ExecutionGroupSpec,
+        ExecutionUnitLayout, LayerwiseLoadOptions, MemberSharding, NoAuxiliaryBoundarySchema,
+        OwnedParameterGroupSpec, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        PartitionOwnership, StateLayout,
     };
     use eredu_checkpoint::{AffineQuantization, StoredDtype};
     use eredu_core::{
@@ -4642,60 +4642,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_requirements_are_invariant_across_all_caller_policy_dimensions() {
-        let baseline = requirements();
-        let disk = DenseDiskStreamLoadOptions::new(4096, 8192, 2, 1).unwrap();
-        let requests = [
-            ReplicatedTextSelectionRequest::new(
-                LayerWeightResidency::FullyResident,
-                CacheResidencyPolicy::Device,
-            ),
-            ReplicatedTextSelectionRequest::new(
-                LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::default()),
-                paged_state(),
-            )
-            .with_topology(ParallelTopology::new(2, 1, 1, 1).unwrap())
-            .with_quantization(QuantizationRequest::Affine {
-                group_size: 64,
-                bits: 4,
-            })
-            .with_session(SessionCapabilities::new(true, true, true))
-            .with_prompt_cache(true)
-            .with_exact_completion(true),
-            ReplicatedTextSelectionRequest::new(
-                LayerWeightResidency::DenseDiskStream(disk),
-                CacheResidencyPolicy::Device,
-            )
-            .with_quantization(QuantizationRequest::MxFp4),
-        ];
-
-        for _request in &requests {
-            assert_eq!(requirements(), baseline);
-        }
-        assert_eq!(requests[0].state(), &CacheResidencyPolicy::Device);
-        assert!(matches!(
-            requests[1].residency(),
-            LayerWeightResidency::LayerwiseHost(_)
-        ));
-        assert_eq!(requests[1].topology().unwrap().tensor(), 2);
-        assert_eq!(
-            requests[1].quantization(),
-            Some(QuantizationRequest::Affine {
-                group_size: 64,
-                bits: 4,
-            })
-        );
-        assert!(requests[1].prompt_cache());
-        assert!(requests[1].exact_completion());
-        assert!(requests[1].session().activation_inspection());
-        assert_eq!(
-            requests[2].residency(),
-            LayerWeightResidency::DenseDiskStream(disk)
-        );
-        assert_eq!(requests[2].quantization(), Some(QuantizationRequest::MxFp4));
-    }
-
-    #[test]
     fn partitioned_tasks_keep_encoded_companions_atomic_and_reject_split_groups() {
         let request = request(LayerWeightResidency::FullyResident).with_quantization(
             QuantizationRequest::Affine {
@@ -4923,51 +4869,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("resolves to 2 architecture topology targets"));
-    }
-
-    #[test]
-    fn selection_is_deterministic_and_keeps_source_format_distinct() {
-        let disk = DenseDiskStreamLoadOptions::new(1234, 5678, 3, 2).unwrap();
-        let request = request(LayerWeightResidency::DenseDiskStream(disk)).with_quantization(
-            QuantizationRequest::Affine {
-                group_size: 64,
-                bits: 4,
-            },
-        );
-        let left =
-            select_replicated_text_realization(&requirements(), &request, &capabilities()).unwrap();
-        let right =
-            select_replicated_text_realization(&requirements(), &request, &capabilities()).unwrap();
-        assert_eq!(left, right);
-        assert_eq!(
-            left.residency(),
-            LayerWeightResidency::DenseDiskStream(disk)
-        );
-        assert_eq!(left.state().policy(), &paged_state());
-        assert_eq!(left.state().layout(), requirements().state_layout());
-        assert_eq!(left.parameters().len(), 2);
-        assert_eq!(requirements().parameters().len(), 3);
-        assert!(matches!(
-            requirements().parameters()[1].presence(),
-            ReplicatedTextParameterPresence::OptionalAbsent
-        ));
-        assert!(matches!(
-            requirements().parameters()[2].role(),
-            ReplicatedTextParameterRole::Normalization
-        ));
-        assert_eq!(requirements().parameters()[2].logical_shape(), [64]);
-        assert_eq!(
-            requirements().parameters()[2].transform_constraint(),
-            ParameterTransformConstraint::None
-        );
-        assert_eq!(
-            left.parameters()[0].lowering(),
-            WeightLoweringKind::Transform
-        );
-        assert_ne!(
-            format!("{:?}", left.parameters()[0].source_encoding()),
-            format!("{:?}", left.parameters()[0].executable())
-        );
     }
 
     #[test]

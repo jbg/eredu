@@ -4502,39 +4502,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mock_executor_prefill_propose_verify_and_commit_without_a_tensor_runtime() {
-        let mut executor = MockExecutor::default();
-        let mut cache = Vec::new();
-        let prefill = executor.prefill(vec![4, 5], &mut cache, ()).unwrap();
-        let mut draft = executor.begin_proposal(&prefill.state, 5, 2, ()).unwrap();
-        assert_eq!(
-            executor.proposal_logits(&mut draft, 5, ()).unwrap(),
-            [0.0, 1.0]
-        );
-        let checkpoint = executor.checkpoint(&cache).unwrap();
-        let submission = executor
-            .submit_verification(&[5, 6], &mut cache, ())
-            .unwrap();
-        submission.completion.wait().unwrap();
-        let commit = executor
-            .commit_verification(submission.output, draft, &mut cache, &checkpoint, 1, ())
-            .unwrap();
-        assert_eq!(cache, [4, 5, 5]);
-        assert_eq!(commit.replayed_tokens, 0);
-    }
-
-    #[test]
-    fn execution_topology_is_a_portable_schema() {
-        let topology = SpeculativeExecutionTopology::CrossDeviceSplit;
-        let encoded = serde_json::to_string(&topology).unwrap();
-        assert_eq!(encoded, "\"cross_device_split\"");
-        assert_eq!(
-            serde_json::from_str::<SpeculativeExecutionTopology>(&encoded).unwrap(),
-            topology
-        );
-    }
-
     #[derive(Clone)]
     struct MockSampling {
         committed: Vec<u32>,

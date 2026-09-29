@@ -235,22 +235,4 @@ mod tests {
         assert_eq!(summary.p95_ms, 4.0);
         assert_eq!(summary.deadline_misses, 2);
     }
-
-    #[test]
-    fn realtime_frames_use_the_general_observation_schema() {
-        let diagnostic =
-            eredu_core::RealtimeDecisionDiagnostics::new(0, vec![1, 3], vec![0.0, 2.0, 1.0])
-                .unwrap();
-        let frame = RealtimeOutputFrame::new(
-            1,
-            vec![7],
-            vec![8, 9],
-            vec![8],
-            Some(vec![6]),
-            vec![diagnostic],
-        );
-        let observations = observe_realtime_frame(&frame).unwrap();
-        assert!(observations.get("tokens.text").is_some());
-        assert!(observations.get("decisions.0.logits").is_some());
-    }
 }

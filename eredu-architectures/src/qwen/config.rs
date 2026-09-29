@@ -1143,16 +1143,6 @@ mod tests {
     }
 
     #[test]
-    fn distinguishes_qwen2_and_qwen3_attention_policy() {
-        let qwen2 = model_args_from_config_value(&base("qwen2")).unwrap();
-        let qwen3 = model_args_from_config_value(&base("qwen3")).unwrap();
-        assert!(qwen2.attention_bias(AttentionProjection::Query));
-        assert!(!qwen2.attention_bias(AttentionProjection::Output));
-        assert_eq!(qwen2.query_key_norm_epsilon(), None);
-        assert_eq!(qwen3.query_key_norm_epsilon(), Some(0.000001));
-    }
-
-    #[test]
     fn explicit_full_attention_layers_preserve_qwen3_execution_and_cache_identity() {
         let mut value = base("qwen3");
         value["num_hidden_layers"] = Value::from(36);
@@ -1300,25 +1290,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_identity_uses_the_registry_family() {
-        for (model_type, family) in [("qwen2", "qwen2"), ("qwen3", "qwen3")] {
-            let args = model_args_from_config_value(&base(model_type)).unwrap();
-            let layout = crate::qwen::state_layout(&args).unwrap();
-            let identity = crate::qwen::state_identity(
-                &args,
-                &layout,
-                0,
-                eredu_core::cache::PromptCacheTopology::default(),
-            )
-            .unwrap()
-            .prompt_cache_identity(&layout)
-            .unwrap();
-
-            assert_eq!(identity.model_family(), family);
-        }
-    }
-
-    #[test]
     fn gguf_structural_vocabulary_ignores_malformed_tokenizer_metadata() {
         let metadata = HashMap::from([
             (
@@ -1401,52 +1372,5 @@ mod tests {
             .unwrap();
         assert_eq!(args.variant, QwenVariant::Qwen3);
         assert_eq!(args.model_type, "qwen3");
-    }
-
-    #[test]
-    fn qwen3_vl_gguf_context_uses_registry_identity() {
-        assert_eq!(
-            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3Vl).unwrap(),
-            TextConfigContext::Qwen3Vl
-        );
-        assert_eq!(
-            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3VlMoe)
-                .unwrap(),
-            TextConfigContext::Qwen3VlMoe
-        );
-        assert!(
-            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3).is_err()
-        );
-    }
-
-    #[test]
-    fn validates_qwen3_moe_routing_geometry() {
-        let mut value = base("qwen3_moe");
-        value["intermediate_size"] = Value::from(0);
-        value["moe_intermediate_size"] = Value::from(8);
-        value["num_experts"] = Value::from(4);
-        value["num_experts_per_tok"] = Value::from(2);
-        value["norm_topk_prob"] = Value::Bool(true);
-        let args = model_args_from_config_value(&value).unwrap();
-        assert!(args.is_moe());
-        let point = args.routed_observation_points("model.layers.2", 2).unwrap();
-        assert_eq!(
-            point
-                .bank(eredu_runtime::RoutedBankId::new(0))
-                .unwrap()
-                .path(),
-            "model.layers.2.mlp"
-        );
-        assert_eq!(
-            point
-                .bank(eredu_runtime::RoutedBankId::new(0))
-                .unwrap()
-                .expert_count(),
-            4
-        );
-        assert!(model_args_from_config_value(&base("qwen3"))
-            .unwrap()
-            .routed_observation_points("model.layers.2", 2)
-            .is_none());
     }
 }

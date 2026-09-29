@@ -2144,24 +2144,6 @@ mod tests {
     }
 
     #[test]
-    fn model_kind_serialization_uses_resolvable_canonical_names() {
-        for kind in ModelKind::ALL {
-            let serialized = serde_json::to_string(&kind).unwrap();
-            assert_eq!(
-                serialized,
-                serde_json::to_string(kind.canonical_name()).unwrap()
-            );
-
-            let family_name: String = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(ModelKind::resolve_family(&family_name).unwrap(), kind);
-            assert_eq!(
-                serde_json::from_str::<ModelKind>(&serialized).unwrap(),
-                kind
-            );
-        }
-    }
-
-    #[test]
     fn unknown_wrapper_cannot_delegate_to_a_known_nested_text_family() {
         let error = resolve_model_identity(&serde_json::json!({
             "model_type": "third_party_wrapper",

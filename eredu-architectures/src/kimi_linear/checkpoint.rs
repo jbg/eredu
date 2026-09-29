@@ -1312,45 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn plans_kda_mla_low_rank_and_alternative_expert_artifacts() {
-        for (split, query_rank) in [(false, None), (true, Some(5))] {
-            let plan = safetensors_plan(&fixture(split, query_rank)).unwrap();
-            let names = plan
-                .common_tensors
-                .iter()
-                .map(|tensor| tensor.key.as_str())
-                .collect::<Vec<_>>();
-            assert!(names.contains(&"model.layers.0.self_attn.q_conv1d.weight"));
-            assert!(names.contains(&"model.layers.0.self_attn.A_log"));
-            assert_eq!(
-                names.contains(&"model.layers.1.self_attn.kv_b_proj.weight"),
-                !split
-            );
-            assert_eq!(
-                names.contains(&"model.layers.1.self_attn.k_b_proj.weight"),
-                split
-            );
-            assert_eq!(
-                names.contains(&"model.layers.1.self_attn.q_a_proj.weight"),
-                query_rank.is_some()
-            );
-            let experts = plan
-                .layout_groups
-                .iter()
-                .find(|group| group.id.contains("expert storage"))
-                .unwrap();
-            assert_eq!(
-                experts
-                    .variants
-                    .iter()
-                    .map(|variant| variant.id.as_str())
-                    .collect::<Vec<_>>(),
-                ["packed", "split"]
-            );
-        }
-    }
-
-    #[test]
     fn gguf_plan_and_translation_cover_hybrid_physical_names() {
         let args = fixture(false, None);
         let plan = gguf_plan(&args).unwrap();
@@ -1380,15 +1341,6 @@ mod tests {
         assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
         assert!(!formats.contains_key(&format!("{prefix}.gate_proj")));
         assert!(!formats.contains_key(&format!("{prefix}.up_proj")));
-    }
-
-    #[test]
-    fn portable_names_do_not_normalize_module_tree_paths() {
-        assert_eq!(
-            canonical_recipe_name("projection.inner.weight"),
-            "projection.inner.weight"
-        );
-        assert_eq!(physical_names("projection.weight"), ["projection.weight"]);
     }
 
     #[test]

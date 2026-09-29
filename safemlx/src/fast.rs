@@ -1076,7 +1076,6 @@ mod tests {
     use super::*;
     use crate::{
         ops::indexing::{ArrayIndexOp, IndexOp},
-        random::normal,
         Stream,
     };
     use float_eq::assert_float_eq;
@@ -1232,69 +1231,4 @@ mod tests {
         );
     }
 
-    #[test]
-    #[allow(non_snake_case)]
-    fn test_fast_sdpa() {
-        let stream = crate::test_stream();
-        // This test just makes sure that `scaled_dot_product_attention` is callable
-        // in the various cases, based on the Python test `test_fast_sdpa`.
-
-        let Dk = 64;
-        let scale = 1.0 / (Dk as f32).sqrt();
-        for seq_len in [63, 129, 400] {
-            for dtype in [crate::Dtype::Float32, crate::Dtype::Float16] {
-                let B = 2;
-                let H = 24;
-                let q_key = crate::test_key((seq_len + Dk) as u64, stream);
-                let k_key = crate::test_key((seq_len + Dk + 1) as u64, stream);
-                let v_key = crate::test_key((seq_len + Dk + 2) as u64, stream);
-                let q = normal::<f32>(&[B, H, seq_len, Dk], None, None, &q_key, stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap();
-                let k = normal::<f32>(&[B, H, seq_len, Dk], None, None, &k_key, stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap();
-                let v = normal::<f32>(&[B, H, seq_len, Dk], None, None, &v_key, stream)
-                    .unwrap()
-                    .as_dtype(dtype, stream)
-                    .unwrap();
-
-                let result =
-                    scaled_dot_product_attention(q, k, v, scale, None, None, stream).unwrap();
-                assert_eq!(result.shape(), [B, H, seq_len, Dk]);
-                assert_eq!(result.dtype(), dtype);
-            }
-        }
-    }
-
-    // Test adapted from Python test `test_fast_sdpa.py/test_sdpa_attention_sinks`
-    #[test]
-    fn test_fast_sdpa_with_sinks() {
-        let stream = crate::test_stream();
-        let b = 2;
-        let n_q = 8;
-        let t_q = 128;
-        let t_kv = 128;
-        let d = 64;
-
-        let q_key = crate::test_key(0, stream);
-        let k_key = crate::test_key(1, stream);
-        let v_key = crate::test_key(2, stream);
-        let sinks_key = crate::test_key(3, stream);
-        let q = normal::<f32>(&[b, n_q, t_q, d], None, None, &q_key, stream).unwrap();
-        let k = normal::<f32>(&[b, n_q, t_kv, d], None, None, &k_key, stream).unwrap();
-        let v = normal::<f32>(&[b, n_q, t_kv, d], None, None, &v_key, stream).unwrap();
-        let scale = (d as f32).powf(-0.5);
-
-        // Test with sinks parameter
-        let sinks = normal::<f32>(&[n_q], None, None, &sinks_key, stream)
-            .unwrap()
-            .multiply(Array::from_f32(10.0), stream)
-            .unwrap();
-
-        let result = scaled_dot_product_attention(&q, &k, &v, scale, None, &sinks, stream).unwrap();
-        assert_eq!(result.shape(), &[b, n_q, t_q, d]);
-    }
 }

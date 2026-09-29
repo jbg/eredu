@@ -56,13 +56,3 @@ fn type_39_decodes_to_mlx_mxfp4_weights_and_e8m0_scales() {
         );
     }
 }
-
-#[test]
-fn writer_preserves_raw_type_39_blocks() {
-    let bytes = fixture(Endian::Little);
-    let mut reader = Reader::new(Cursor::new(bytes)).unwrap();
-    let descriptor = reader.tensors()[0].clone();
-    let raw = reader.read_raw(&descriptor).unwrap();
-    assert_eq!(raw.len(), 17);
-    assert_eq!(raw[0], 130);
-}

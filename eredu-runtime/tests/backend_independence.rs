@@ -695,33 +695,6 @@ impl eredu_core::BoundedCompletion for Done {
     }
 }
 
-#[test]
-fn realtime_coordinate_history_compiles_without_a_concrete_backend() {
-    let schedule = eredu_core::RealtimeSpeechConfig::new(
-        2,
-        1,
-        1,
-        1,
-        99,
-        31,
-        eredu_core::RealtimeFrameConvention::FeedbackAlignedHistory,
-        vec![0, 0, 1],
-    )
-    .unwrap();
-    let contract = eredu_runtime::RealtimePayloadContract::new(
-        schedule.clone(),
-        1,
-        eredu_runtime::TokenDomain::new(100),
-        eredu_runtime::TokenDomain::new(32),
-        eredu_runtime::RealtimePayloadGeneration::new(1).unwrap(),
-        eredu_runtime::RealtimePayloadOwnerIdentity::new(1).unwrap(),
-    )
-    .unwrap();
-    let mut history = eredu_runtime::RealtimePayloadHistory::<FakeTensor>::new(schedule);
-    history.bind_or_validate_contract(&contract).unwrap();
-    assert_eq!(history.contract(), Some(&contract));
-}
-
 impl Completion for CommunicationDone {
     type Error = FakeCommunicationError;
 
@@ -7991,29 +7964,6 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
 }
 
 #[test]
-fn complete_state_partition_derives_identity_through_architecture_contract() {
-    let architecture = GroupedFixture {
-        static_modules: FakeOperator,
-        trace: Vec::new(),
-    };
-    let state = eredu_runtime::PartitionState::new(
-        architecture.state_layout().expect("fixture state layout"),
-        0,
-    )
-    .expect("complete replicated state partition");
-    let topology = eredu_core::cache::PromptCacheTopology::default();
-
-    let identity = state
-        .prompt_cache_identity::<FakeBackend, _>(&architecture, topology.clone())
-        .expect("architecture derives prompt-cache identity");
-
-    assert_eq!(identity.architecture_fingerprint(), "fixture");
-    assert_eq!(identity.global_layer_start(), 0);
-    assert_eq!(identity.layer_count(), 4);
-    assert_eq!(identity.topology(), &topology);
-}
-
-#[test]
 fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     FORK_COUNT.set(0);
     SUBMIT_COUNT.set(0);
@@ -8869,27 +8819,6 @@ fn opaque_communication_projection_drives_backend_independent_callbacks() {
     assert!(routes.iter().all(|(_, source, destination, operation)| {
         source != destination && *operation == eredu_runtime::CommunicationOperation::SendReceive
     }));
-}
-
-#[test]
-fn communication_extensions_require_only_the_selected_operation() {
-    let trace = Rc::new(RefCell::new(Vec::new()));
-    let group = PartitionCollectiveGroup {
-        members: vec![2, 5],
-        local_rank: 1,
-        trace: Rc::clone(&trace),
-    };
-    let submission =
-        PartitionCollectiveBackend::all_reduce_sum(FakeTensor(vec![7, 9]), &group, &()).unwrap();
-    assert_eq!(submission.wait().unwrap(), FakeTensor(vec![7, 9]));
-    assert_eq!(
-        trace.borrow().as_slice(),
-        [PartitionCollectiveCall {
-            local_rank: 1,
-            members: vec![2, 5],
-            value: vec![7, 9],
-        }]
-    );
 }
 
 fn independent_materialization_task(

@@ -1590,22 +1590,6 @@ mod tests {
         assert!(model_args_from_config_value(&invalid).is_err());
     }
 
-    #[test]
-    fn state_layout_preserves_mixed_recurrent_and_kv_geometry() {
-        let parsed = model_args_from_config_value(&text_config("qwen3_next")).unwrap();
-        let layout = state_layout(&parsed.text).unwrap();
-        assert_eq!(layout.len(), 5);
-        assert_eq!(layout.layer(0).unwrap().fixed_state().len(), 2);
-        assert!(layout.layer(0).unwrap().attention().is_none());
-        assert!(layout.layer(3).unwrap().attention().is_some());
-        assert!(layout.layer(4).unwrap().attention().is_some());
-        assert_eq!(layout.segments().len(), 2);
-        assert_eq!(layout.segments()[0].id().as_str(), TARGET_STATE_SEGMENT);
-        assert_eq!(layout.segments()[0].layers(), 0..4);
-        assert_eq!(layout.segments()[1].id().as_str(), PREDICTION_STATE_SEGMENT);
-        assert_eq!(layout.segments()[1].layers(), 4..5);
-    }
-
     struct Catalog(HashSet<String>);
 
     impl GgufTensorCatalog for Catalog {

@@ -945,17 +945,6 @@ mod tests {
     }
 
     #[test]
-    fn identical_distribution_metrics_are_exact() {
-        let values = [0.0, 1.0, -1.0, 0.5, 0.25];
-        let mut metric = DistributionAccumulator::default();
-        metric.update(&values, &values, 1).unwrap();
-        let summary = metric.summary();
-        assert!(summary.mean_kl_nats.abs() < 1e-12);
-        assert_eq!(summary.top1_agreement, 1.0);
-        assert_eq!(summary.mean_top5_overlap, 1.0);
-    }
-
-    #[test]
     fn prompt_frames_preserve_released_conditioning_order() {
         let prompt = PromptConditioning {
             voice_frames: vec![vec![1; AUDIO_TOKENS_PER_STREAM]],

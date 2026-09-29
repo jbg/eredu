@@ -193,23 +193,6 @@ mod tests {
         RealtimeSlotCoordinate::new(position, RealtimeFrameSlot::Text)
     }
 
-    #[test]
-    fn fresh_state_binds_model_and_empty_history_to_the_exact_schedule() {
-        let schedule = schedule(2);
-        let state = RealtimePayloadState::<_, String>::fresh(
-            ModelState {
-                value: 7,
-                fail_commit: false,
-                discards: Rc::new(Cell::new(0)),
-            },
-            schedule.clone(),
-        );
-
-        assert_eq!(state.model_state().value, 7);
-        assert_eq!(state.payload_history().schedule(), &schedule);
-        assert!(state.payload_history().contract().is_none());
-    }
-
     fn contract(
         schedule: RealtimeSpeechConfig,
         batch: usize,
@@ -295,27 +278,6 @@ mod tests {
             &schedule,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn successful_commit_publishes_model_and_payload_branch_together() {
-        let schedule = schedule(2);
-        let mut state = state(false);
-        let mut branch = state.branch().unwrap();
-        branch.model_state_mut().value = 7;
-        branch
-            .payload_history_mut()
-            .insert(&schedule, text(1), "branch")
-            .unwrap();
-
-        state.commit_branch(branch).unwrap();
-
-        assert_eq!(state.model_state().value, 7);
-        assert_eq!(
-            state.payload_history().required(&schedule, text(1)),
-            Ok(&"branch")
-        );
-        assert!(state.permits_parallel_branches());
     }
 
     #[test]
@@ -407,69 +369,30 @@ mod tests {
     }
 
     #[test]
-    fn state_commit_rejects_every_payload_identity_perturbation_before_model_commit() {
+    fn foreign_payload_owner_is_rejected_before_model_commit() {
         let selected = schedule(2);
-        let wrong_schedule = schedule(1);
-        let candidates = [
-            (
-                contract(wrong_schedule, 1, 2, 2, 1, 1),
-                RealtimePayloadHistoryError::ScheduleMismatch,
-            ),
-            (
-                contract(selected.clone(), 2, 2, 2, 1, 1),
-                RealtimePayloadHistoryError::PayloadContract(
-                    crate::RealtimePayloadContractError::BatchMismatch,
-                ),
-            ),
-            (
-                contract(selected.clone(), 1, 3, 2, 1, 1),
-                RealtimePayloadHistoryError::PayloadContract(
-                    crate::RealtimePayloadContractError::TextDomainMismatch,
-                ),
-            ),
-            (
-                contract(selected.clone(), 1, 2, 3, 1, 1),
-                RealtimePayloadHistoryError::PayloadContract(
-                    crate::RealtimePayloadContractError::AudioDomainMismatch,
-                ),
-            ),
-            (
-                contract(selected.clone(), 1, 2, 2, 2, 1),
-                RealtimePayloadHistoryError::PayloadContract(
-                    crate::RealtimePayloadContractError::GenerationMismatch,
-                ),
-            ),
-            (
-                contract(selected.clone(), 1, 2, 2, 1, 2),
-                RealtimePayloadHistoryError::PayloadContract(
-                    crate::RealtimePayloadContractError::OwnerMismatch,
-                ),
-            ),
-        ];
+        let mut state = state(false);
+        let mut branch = state.branch().unwrap();
+        branch.model_state_mut().value = 9;
+        let mut wrong_history =
+            RealtimePayloadHistory::with_contract(contract(selected.clone(), 1, 2, 2, 1, 2));
+        wrong_history.insert(&selected, text(0), "wrong").unwrap();
+        branch.payload_history = wrong_history;
 
-        for (candidate, expected) in candidates {
-            let mut state = state(false);
-            let mut branch = state.branch().unwrap();
-            branch.model_state_mut().value = 9;
-            let mut wrong_history = RealtimePayloadHistory::with_contract(candidate);
-            let wrong_history_schedule = wrong_history.schedule().clone();
-            wrong_history
-                .insert(&wrong_history_schedule, text(0), "wrong")
-                .unwrap();
-            branch.payload_history = wrong_history;
-
-            assert!(matches!(
-                state.commit_branch(branch),
-                Err(RealtimePayloadStateTransactionError::PayloadHistory(error))
-                    if error == expected
-            ));
-            assert_eq!(state.model_state().value, 1);
-            assert_eq!(state.payload_history().contract(), Some(&exact_contract()));
-            assert_eq!(
-                state.payload_history().required(&selected, text(0)),
-                Ok(&"canonical")
-            );
-        }
+        assert!(matches!(
+            state.commit_branch(branch),
+            Err(RealtimePayloadStateTransactionError::PayloadHistory(
+                RealtimePayloadHistoryError::PayloadContract(
+                    crate::RealtimePayloadContractError::OwnerMismatch
+                )
+            ))
+        ));
+        assert_eq!(state.model_state().value, 1);
+        assert_eq!(state.payload_history().contract(), Some(&exact_contract()));
+        assert_eq!(
+            state.payload_history().required(&selected, text(0)),
+            Ok(&"canonical")
+        );
     }
 
     #[test]

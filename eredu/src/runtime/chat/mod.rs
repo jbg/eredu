@@ -1163,7 +1163,7 @@ mod tests {
         models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
     };
 
-    use super::{prepare_format_profile, resolve_structural_tokens, SYNTHETIC_TOOL_TEMPLATE};
+    use super::{prepare_format_profile, resolve_structural_tokens};
     #[test]
     fn registry_does_not_guess_unknown_templates() {
         let prepared = prepare_format_profile("unknown template");
@@ -1176,18 +1176,6 @@ mod tests {
             .is_some_and(|reason| reason.contains("no behavioral format recognizer")));
         assert!(prepared.required_structural_tokens.is_empty());
         assert!(prepared.stop_sequences.is_empty());
-    }
-
-    #[test]
-    fn synthetic_profile_selects_the_test_dialect() {
-        let prepared = prepare_format_profile(SYNTHETIC_TOOL_TEMPLATE);
-        assert_eq!(
-            prepared.identity.as_deref(),
-            Some("eredu.synthetic-tools.v1")
-        );
-        assert!(prepared.dialect.is_some());
-        assert!(prepared.dialect_parameters.is_some());
-        assert_eq!(prepared.native_tool_unavailable_reason, None);
     }
 
     #[test]

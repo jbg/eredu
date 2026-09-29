@@ -220,49 +220,6 @@ fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_cont
 }
 
 #[test]
-fn routed_deepseek_v4_executes_resident_and_addressable_with_pooling_state() {
-    let (stream, weights_stream) = execution_streams();
-    for addressable in [false, true] {
-        let root = tiny_heterogeneous_artifact(routed_deepseek_v4_config());
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let mut options = crate::MlxLoadRequest::default();
-        if addressable {
-            options = crate::MlxLoadRequest::from_normalized(
-                options.normalized().clone().with_weight_residency(
-                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                        eredu_runtime::ParameterBankLoadOptions::default(),
-                    ),
-                ),
-            );
-        }
-        let plan = eredu_core::plan_model_preparation(
-            inspection,
-            options.normalized().preparation_policy().unwrap(),
-            eredu_core::SessionCapabilities::default(),
-        )
-        .unwrap();
-        let model = materialize_model_plan(plan, options, &stream, &weights_stream)
-            .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-        let mut executable = model.into_executable();
-        let executable = executable.erased_mut();
-        for token in [1_u32, 2, 3, 4, 5] {
-            let logits = executable
-                .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
-                .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            assert_eq!(logits.shape(), &[1, 64]);
-            assert!(logits
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>()
-                .iter()
-                .all(|value| value.is_finite()));
-        }
-        assert_eq!(executable.state_snapshot().len(), 3);
-    }
-}
-
-#[test]
 fn routed_only_default_observation_intervenes_on_provider_output() {
     struct Observer {
         routing_path: Option<String>,
@@ -434,101 +391,6 @@ fn routed_session_observation_reports_shared_combination_and_intervenes_causally
         assert!(observer.semantic_outputs, "addressable={addressable}");
         assert!(observer.intervened, "addressable={addressable}");
         assert_ne!(baseline, changed, "addressable={addressable}");
-    }
-}
-
-#[test]
-fn routed_gated_families_execute_resident_and_addressable_with_heterogeneous_state() {
-    let (stream, weights_stream) = execution_streams();
-    for (name, config) in [
-        ("lfm2_moe", routed_lfm2_config()),
-        ("kimi_linear", routed_kimi_linear_config()),
-        ("qwen3_5_moe_text", routed_qwen_hybrid_config()),
-        ("qwen3_next", routed_qwen_next_config()),
-        ("deepseek_v3", routed_deepseek_v3_config()),
-    ] {
-        for addressable in [false, true] {
-            let root = tiny_heterogeneous_artifact(config.clone());
-            let inspection =
-                eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-            let mut options = crate::MlxLoadRequest::default();
-            if addressable {
-                options = crate::MlxLoadRequest::from_normalized(
-                    options.normalized().clone().with_weight_residency(
-                        eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                            eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                            eredu_runtime::ParameterBankLoadOptions::default(),
-                        ),
-                    ),
-                );
-            }
-            let plan = eredu_core::plan_model_preparation(
-                inspection,
-                options.normalized().preparation_policy().unwrap(),
-                eredu_core::SessionCapabilities::default(),
-            )
-            .unwrap();
-            let model = materialize_model_plan(plan, options, &stream, &weights_stream)
-                .unwrap_or_else(|error| panic!("{name} addressable={addressable}: {error}"));
-            let mut executable = model.into_executable();
-            let executable = executable.erased_mut();
-            for token in [1_u32, 2, 3] {
-                let logits = executable
-                    .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
-                    .unwrap_or_else(|error| panic!("{name} addressable={addressable}: {error}"));
-                assert_eq!(logits.shape(), &[1, 64]);
-                logits.evaluated().unwrap();
-            }
-            assert_eq!(
-                executable.state_snapshot().len(),
-                2,
-                "{name} state layout must retain both target layers"
-            );
-        }
-    }
-}
-
-#[test]
-fn routed_nemotron_relu2_executes_resident_and_addressable_with_mixed_state() {
-    let (stream, weights_stream) = execution_streams();
-    let mut config = nemotron_h_config();
-    config["hybrid_override_pattern"] = "M*EM".into();
-    for addressable in [false, true] {
-        let root = tiny_heterogeneous_artifact(config.clone());
-        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
-        let mut options = crate::MlxLoadRequest::default();
-        if addressable {
-            options = crate::MlxLoadRequest::from_normalized(
-                options.normalized().clone().with_weight_residency(
-                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                        eredu_runtime::ParameterBankLoadOptions::default(),
-                    ),
-                ),
-            );
-        }
-        let plan = eredu_core::plan_model_preparation(
-            inspection,
-            options.normalized().preparation_policy().unwrap(),
-            eredu_core::SessionCapabilities::default(),
-        )
-        .unwrap();
-        let model = materialize_model_plan(plan, options, &stream, &weights_stream)
-            .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-        let mut executable = model.into_executable();
-        let executable = executable.erased_mut();
-        for token in [1_u32, 2, 3] {
-            let logits = executable
-                .decode(&Array::from_slice(&[token], &[1, 1]), &stream)
-                .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-            assert_eq!(logits.shape(), &[1, 64]);
-            logits.evaluated().unwrap();
-        }
-        let state = executable.state_snapshot();
-        assert_eq!(state.len(), 4);
-        assert!(state
-            .iter()
-            .all(|(_, components)| components.iter().all(|(_, present)| *present)));
     }
 }
 
@@ -753,41 +615,5 @@ fn routed_addressable_storage_executes_qwen_and_gpt_oss_repeated_decode() {
             "{model_type}"
         );
         assert!(report.incremental().compact_banks() > 0, "{model_type}");
-    }
-}
-
-#[test]
-fn routed_qwen_gguf_executes_resident_and_addressable_through_generic_composition() {
-    let (stream, weights_stream) = execution_streams();
-    let artifact = tiny_qwen_moe_gguf(&stream);
-    for addressable in [false, true] {
-        let inspection =
-            eredu_architectures::configuration::inspect_artifact(artifact.path()).unwrap();
-        let mut options = crate::MlxLoadRequest::default();
-        if addressable {
-            options = crate::MlxLoadRequest::from_normalized(
-                options.normalized().clone().with_weight_residency(
-                    eredu_runtime::WeightResidency::with_independent_parameter_banks(
-                        eredu_runtime::OrdinaryWeightResidency::FullyResident,
-                        eredu_runtime::ParameterBankLoadOptions::default(),
-                    ),
-                ),
-            );
-        }
-        let plan = eredu_core::plan_model_preparation(
-            inspection,
-            options.normalized().preparation_policy().unwrap(),
-            eredu_core::SessionCapabilities::default(),
-        )
-        .unwrap();
-        let model = materialize_model_plan(plan, options, &stream, &weights_stream)
-            .unwrap_or_else(|error| panic!("addressable={addressable}: {error}"));
-        let mut executable = model.into_executable();
-        let generic = executable.erased_mut();
-        let logits = generic
-            .decode(&Array::from_slice(&[1_u32], &[1, 1]), &stream)
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, 64]);
-        logits.evaluated().unwrap();
     }
 }

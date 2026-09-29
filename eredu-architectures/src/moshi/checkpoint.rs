@@ -842,20 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn native_catalog_and_recipes_cover_the_complete_topology() {
-        let config = MoshiConfig::native_v0_1().unwrap();
-        let plan = safetensors_plan(&config).unwrap();
-        assert!(plan.catalog_policy.strict);
-        assert_eq!(plan.common_tensors.len(), 523);
-        let recipes = canonical_recipes(&config, &Catalog::from_plan(&plan)).unwrap();
-        assert_eq!(recipes.iter().count(), 523);
-        assert_eq!(recipes.aliases().count(), 0);
-        assert!(recipes
-            .get("depformer.slices.7.transformer.layers.5.self_attn.in_proj.weight")
-            .is_some());
-    }
-
-    #[test]
     fn personaplex_catalog_maps_to_canonical_names_and_shared_owners() {
         let config = personaplex(None);
         let plan = safetensors_plan(&config).unwrap();

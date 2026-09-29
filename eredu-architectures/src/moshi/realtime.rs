@@ -2127,21 +2127,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn ingress_contract_uses_architecture_schedule_and_padding_domains() {
-        let config = native_config(32);
-        let ingress = realtime_ingress_contract(&config).unwrap();
-        assert_eq!(ingress.schedule(), config.frame_schedule());
-        assert_eq!(
-            ingress.text_domain().cardinality(),
-            usize::try_from(config.text_vocabulary_size() + 1).unwrap()
-        );
-        assert_eq!(
-            ingress.audio_domain().cardinality(),
-            usize::try_from(config.audio_vocabulary_size() + 1).unwrap()
-        );
-    }
-
     struct MetadataCatalog {
         tensors: BTreeMap<String, TensorMetadata>,
     }

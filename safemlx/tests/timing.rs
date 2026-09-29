@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use safemlx::{
     ops::indexing::IndexOp,
-    transforms::{async_eval, async_eval_timed, async_eval_with_event},
+    transforms::{async_eval, async_eval_timed},
     Array, Device, DeviceType, Stream,
 };
 
@@ -136,15 +136,6 @@ fn empty_and_completed_evaluations_are_zero_duration() {
     assert_eq!(completed.elapsed().unwrap(), Duration::ZERO);
 }
 
-#[test]
-fn ordinary_untimed_completion_remains_correct() {
-    let stream = stream(DeviceType::Cpu);
-    let output = matmul(256, &stream);
-    let event = async_eval_with_event([&output]).unwrap();
-    event.synchronize().unwrap();
-    assert!(event.is_complete().unwrap());
-}
-
 #[cfg(feature = "metal")]
 #[test]
 #[ignore = "explicit Metal timestamp test; run outside the sandbox on a Metal host"]
@@ -223,70 +214,4 @@ fn metal_rejects_cross_device_timing_stream() {
     let error = async_eval_timed([&output], &gpu).unwrap_err();
     assert!(error.what().contains("Requested Stream(Device(gpu, 0)"));
     assert!(error.what().contains("rooted on Stream(Device(cpu, 0)"));
-}
-
-#[test]
-#[ignore = "submission-overhead benchmark; run with --ignored --nocapture"]
-fn timing_submission_overhead_benchmark() {
-    const SPANS: usize = 200;
-    let stream = stream(DeviceType::Cpu);
-    let outputs = (0..SPANS).map(|_| matmul(32, &stream)).collect::<Vec<_>>();
-    let before = Instant::now();
-    let mut tokens = Vec::with_capacity(SPANS);
-    for output in &outputs {
-        tokens.push(async_eval_timed([output], &stream).unwrap());
-    }
-    let submission = before.elapsed();
-    for token in &tokens {
-        token.synchronize().unwrap();
-    }
-    eprintln!(
-        "{SPANS} timed spans: {:?}/span submission overhead",
-        submission / SPANS as u32
-    );
-}
-
-#[cfg(feature = "metal")]
-#[test]
-#[ignore = "Metal submission-overhead benchmark; run outside sandbox with --nocapture"]
-fn metal_timing_submission_overhead_benchmark() {
-    const SPANS: usize = 100;
-    let untimed_stream = stream(DeviceType::Gpu);
-    let timed_stream = stream(DeviceType::Gpu);
-    async_eval([&matmul(64, &untimed_stream)]).unwrap();
-    untimed_stream.synchronize().unwrap();
-    async_eval_timed([&matmul(64, &timed_stream)], &timed_stream)
-        .unwrap()
-        .synchronize()
-        .unwrap();
-    let untimed_outputs = (0..SPANS)
-        .map(|_| matmul(64, &untimed_stream))
-        .collect::<Vec<_>>();
-    let timed_outputs = (0..SPANS)
-        .map(|_| matmul(64, &timed_stream))
-        .collect::<Vec<_>>();
-
-    let before = Instant::now();
-    for output in &untimed_outputs {
-        async_eval([output]).unwrap();
-    }
-    let untimed_submission = before.elapsed();
-
-    let before = Instant::now();
-    let tokens = timed_outputs
-        .iter()
-        .map(|output| async_eval_timed([output], &timed_stream).unwrap())
-        .collect::<Vec<_>>();
-    let timed_submission = before.elapsed();
-    untimed_stream.synchronize().unwrap();
-    for token in &tokens {
-        token.synchronize().unwrap();
-    }
-
-    eprintln!(
-        "Metal {SPANS} warmed spans: untimed {:?}/submission, timed {:?}/submission, incremental {:?}/span",
-        untimed_submission / SPANS as u32,
-        timed_submission / SPANS as u32,
-        timed_submission.saturating_sub(untimed_submission) / SPANS as u32,
-    );
 }

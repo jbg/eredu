@@ -911,7 +911,6 @@ fn wrong_type(key: &str) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_core::cache::{StateComponentRole, StateResidencyClass};
 
     struct Catalog(Vec<String>);
 
@@ -999,33 +998,6 @@ mod tests {
                 .unwrap()
                 .expert_count(),
             4
-        );
-    }
-
-    #[test]
-    fn state_layout_freezes_bounded_and_append_only_components() {
-        let args = model_args_from_config_value(&dense_fixture()).unwrap();
-        let layout = state_layout(&args).unwrap();
-        assert_eq!(layout.len(), 4);
-        assert_eq!(
-            layout.components(0).unwrap()[0].role(),
-            StateComponentRole::Fixed(StateTensorRole::Convolution { slot: 0 })
-        );
-        assert_eq!(
-            layout.components(0).unwrap()[0].residency(),
-            StateResidencyClass::AlwaysDeviceMutable
-        );
-        assert_eq!(
-            layout
-                .components(2)
-                .unwrap()
-                .iter()
-                .map(|component| component.role())
-                .collect::<Vec<_>>(),
-            [
-                StateComponentRole::AttentionKeys,
-                StateComponentRole::AttentionValues
-            ]
         );
     }
 

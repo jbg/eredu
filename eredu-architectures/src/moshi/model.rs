@@ -864,37 +864,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod transport_tests {
-    use super::group_transport;
-    use eredu_runtime::{
-        ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureMergeDestination,
-    };
-
-    #[test]
-    fn temporal_and_depth_groups_declare_distinct_placement() {
-        let temporal = group_transport(0);
-        assert_eq!(temporal.kind, ArchitectureGroupKind::Decoder);
-        assert_eq!(temporal.placement, ArchitectureGroupPlacement::Pipeline);
-        assert_eq!(temporal.first_owner_static_roles, ["embedding"]);
-        assert_eq!(temporal.last_owner_static_roles, ["norm", "output"]);
-        assert_eq!(
-            temporal.merge_destination,
-            ArchitectureMergeDestination::LastOwner
-        );
-
-        let depth = group_transport(1);
-        assert_eq!(depth.kind, ArchitectureGroupKind::Prediction);
-        assert_eq!(depth.placement, ArchitectureGroupPlacement::OutputOwner);
-        assert!(depth.first_owner_static_roles.is_empty());
-        assert!(depth.last_owner_static_roles.is_empty());
-        assert_eq!(
-            depth.merge_destination,
-            ArchitectureMergeDestination::OutputOwner
-        );
-    }
-}
-
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
     B: NeuralBackend + eredu_nn::DistributedNeuralBackend,

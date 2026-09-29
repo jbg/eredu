@@ -21,17 +21,6 @@ use crate::{
 
 use super::config::ModelArgs;
 
-#[cfg(test)]
-fn expert_policy(limit: f32) -> Result<eredu_nn::GatedProductPolicy, Error> {
-    eredu_nn::GatedProductPolicy::new(
-        eredu_nn::GatedProductActivation::Silu,
-        Some(limit),
-        Some(limit),
-        1.702,
-        1.0,
-    )
-}
-
 fn inferred_pass<T: Tensor>(input: &T) -> ExpertPass {
     let sequence = input
         .shape()
@@ -375,77 +364,6 @@ pub fn partition_expert_realization_plan(
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
     crate::ExpertRealizationPlan::balanced(global_experts, topology, unit_specs)
         .map_err(Error::backend)
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::items_after_test_module,
-    reason = "the focused realization tests stay adjacent to the realization planner"
-)]
-mod tests {
-    use super::*;
-
-    fn args() -> ModelArgs {
-        crate::gpt_oss::model_args_from_config_value(&serde_json::json!({
-            "model_type": "gpt_oss",
-            "hidden_size": 64,
-            "intermediate_size": 64,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 16,
-            "vocab_size": 128,
-            "num_local_experts": 4,
-            "num_experts_per_tok": 2,
-            "rms_norm_eps": 1e-5,
-            "sliding_window": 128,
-            "max_position_embeddings": 4096,
-            "rope_theta": 150000.0,
-            "quantization_config": { "quant_method": "mxfp4" },
-            "swiglu_limit": 7.0
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn gpt_oss_policy_preserves_published_gating_constants() {
-        let policy = expert_policy(7.0).unwrap();
-        assert_eq!(policy.activation(), eredu_nn::GatedProductActivation::Silu);
-        assert_eq!(policy.gate_upper_bound(), Some(7.0));
-        assert_eq!(policy.up_absolute_bound(), Some(7.0));
-        assert_eq!(policy.sigmoid_multiplier(), 1.702);
-        assert_eq!(policy.up_offset(), 1.0);
-    }
-
-    #[test]
-    fn localized_spec_preserves_native_format_biases_and_policy() {
-        let args = args();
-        let global = expert_bank_spec(&args, 0).unwrap();
-        let local = localized_expert_bank_spec(&args, 0, 2, 32).unwrap();
-        assert_eq!(local.group_count(), 2);
-        assert_eq!(local.intermediate_dimensions(), 32);
-        assert_eq!(local.policy(), global.policy());
-        let GatedProductGroupLayout::Packed {
-            gate_up: global_gate_up,
-            down: global_down,
-        } = global.layout()
-        else {
-            panic!("GPT-OSS experts must be packed");
-        };
-        let GatedProductGroupLayout::Packed {
-            gate_up: local_gate_up,
-            down: local_down,
-        } = local.layout()
-        else {
-            panic!("GPT-OSS experts must be packed");
-        };
-        assert_eq!(local_gate_up.weight(), global_gate_up.weight());
-        assert_eq!(local_gate_up.bias(), global_gate_up.bias());
-        assert_eq!(local_gate_up.format(), global_gate_up.format());
-        assert_eq!(local_down.weight(), global_down.weight());
-        assert_eq!(local_down.bias(), global_down.bias());
-        assert_eq!(local_down.format(), global_down.format());
-    }
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>

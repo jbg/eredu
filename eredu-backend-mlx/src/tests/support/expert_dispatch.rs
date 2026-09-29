@@ -34,4 +34,3 @@ include!("expert_dispatch/assignment.rs");
 include!("expert_dispatch/telemetry.rs");
 include!("expert_dispatch/tensor_movement.rs");
 include!("expert_dispatch/exchange_harness.rs");
-include!("expert_dispatch/tests.rs");

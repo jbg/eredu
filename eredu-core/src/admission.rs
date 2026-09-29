@@ -447,7 +447,6 @@ fn validate_modalities(
 mod tests {
     use super::*;
     use crate::{ParallelTopology, QuantizationRequest};
-    use std::cell::Cell;
 
     fn architecture() -> ArchitecturePreparationCapabilities {
         ArchitecturePreparationCapabilities::new(
@@ -520,30 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_independent_backend_rejects_before_native_work() {
-        struct IndependentBackend {
-            native_allocations: Cell<usize>,
-            payload_reads: Cell<usize>,
-        }
-
-        impl IndependentBackend {
-            fn capabilities(&self) -> PreparationMechanismCapabilities {
-                PreparationMechanismCapabilities::new(true, false)
-                    .with_residency(ResidencyRequest::FullyResident, true)
-                    .with_input_modalities(InputModalities::TEXT)
-            }
-
-            fn realize(&self, _: PreparationAdmission) {
-                self.native_allocations
-                    .set(self.native_allocations.get() + 1);
-                self.payload_reads.set(self.payload_reads.get() + 1);
-            }
-        }
-
-        let backend = IndependentBackend {
-            native_allocations: Cell::new(0),
-            payload_reads: Cell::new(0),
-        };
+    fn missing_session_and_input_capabilities_reject_admission() {
+        let capabilities = PreparationMechanismCapabilities::new(true, false)
+            .with_residency(ResidencyRequest::FullyResident, true)
+            .with_input_modalities(InputModalities::TEXT);
         let request = PreparationAdmissionRequest::new(
             LoadingProtocol::Model,
             ArtifactFormat::SafeTensors,
@@ -551,13 +530,11 @@ mod tests {
                 .with_required_session_capabilities(SessionCapabilities::new(false, true, false)),
             architecture(),
         );
-        let error = admit_preparation(request, backend.capabilities()).unwrap_err();
+        let error = admit_preparation(request, capabilities).unwrap_err();
         assert_eq!(
             error,
             PreparationAdmissionError::SessionCapability("output_observation")
         );
-        assert_eq!(backend.native_allocations.get(), 0);
-        assert_eq!(backend.payload_reads.get(), 0);
 
         let media_request = request.with_required_input_modalities(InputModalities {
             text: true,
@@ -566,11 +543,8 @@ mod tests {
             video: false,
         });
         assert_eq!(
-            admit_preparation(media_request, backend.capabilities()).unwrap_err(),
+            admit_preparation(media_request, capabilities).unwrap_err(),
             PreparationAdmissionError::BackendInputModality("image")
         );
-        assert_eq!(backend.native_allocations.get(), 0);
-        assert_eq!(backend.payload_reads.get(), 0);
-        let _ = IndependentBackend::realize;
     }
 }

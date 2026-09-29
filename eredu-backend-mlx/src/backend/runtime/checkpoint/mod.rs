@@ -28,5 +28,3 @@ pub mod quantization;
 pub mod recipe;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
-#[cfg(test)]
-pub(crate) mod test_support;

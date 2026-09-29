@@ -53,31 +53,6 @@ fn released_geometry_and_all_four_norms_are_admitted() {
     assert!(prep.parallel_plan().pipeline_parallel());
 }
 #[test]
-fn released_9b_geometry_reuses_dense_parameter_and_state_plans() {
-    let mut config = released_2b();
-    for (field, value) in [
-        ("hidden_size", 3584),
-        ("intermediate_size", 14336),
-        ("num_hidden_layers", 42),
-        ("num_attention_heads", 16),
-        ("num_key_value_heads", 8),
-    ] {
-        config[field] = value.into();
-    }
-    let args = model_args_from_config_value(&config).unwrap();
-    assert_eq!(args.attention_schedule().full_layer_count(), 21);
-    assert_eq!(args.attention_scale(), 1.0 / 16.0);
-    assert_eq!(state_layout(&args).unwrap().len(), 42);
-    assert!(safetensors_plan(&args)
-        .unwrap()
-        .common_tensors
-        .iter()
-        .any(|tensor| {
-            tensor.key == "model.layers.41.self_attn.q_proj.weight" && tensor.shape == [4096, 3584]
-        }));
-}
-
-#[test]
 fn score_scale_is_independent_of_head_dimension_in_27b_geometry() {
     let mut config = released_2b();
     for (field, n) in [

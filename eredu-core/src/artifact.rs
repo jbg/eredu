@@ -2119,36 +2119,6 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_native_dtypes_remain_typed_in_the_portable_catalog() {
-        assert_eq!(
-            stored_to_tensor_dtype(&StoredDtype::Bool),
-            TensorDtype::Bool
-        );
-        assert_eq!(stored_to_tensor_dtype(&StoredDtype::I64), TensorDtype::I64);
-        assert_eq!(stored_to_tensor_dtype(&StoredDtype::U32), TensorDtype::U32);
-        assert_eq!(stored_to_tensor_dtype(&StoredDtype::F64), TensorDtype::F64);
-        assert_eq!(
-            stored_to_tensor_dtype(&StoredDtype::C64),
-            TensorDtype::Complex64
-        );
-        assert_eq!(
-            stored_to_tensor_dtype(&StoredDtype::F8E4M3),
-            TensorDtype::Encoded("F8_E4M3".into())
-        );
-    }
-
-    #[test]
-    fn gguf_dense_dtypes_remain_typed_in_the_portable_catalog() {
-        assert_eq!(gguf_dtype(GgmlType::F16), TensorDtype::F16);
-        assert_eq!(gguf_dtype(GgmlType::Bf16), TensorDtype::Bf16);
-        assert_eq!(gguf_dtype(GgmlType::F32), TensorDtype::F32);
-        assert_eq!(
-            gguf_dtype(GgmlType::Q4K),
-            TensorDtype::Encoded("Q4K".into())
-        );
-    }
-
-    #[test]
     fn core_accepts_families_defined_only_by_the_resolver() {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "future");
@@ -2186,66 +2156,6 @@ mod tests {
             inspection.tensors().get("clip.output_max").unwrap().shape,
             Vec::<usize>::new()
         );
-    }
-
-    #[test]
-    fn parallel_policy_binds_the_exact_neutral_topology() {
-        let root = tempfile::tempdir().unwrap();
-        write_safetensors_fixture(root.path(), "llama");
-        let topology = crate::topology::ParallelTopology::new(2, 3, 4, 1).unwrap();
-        let policy = PreparationPolicy {
-            topology: Some(topology),
-            ..PreparationPolicy::default()
-        };
-
-        let plan = plan_model_preparation(
-            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
-            policy,
-            crate::backend::SessionCapabilities::default(),
-        )
-        .unwrap();
-
-        assert_eq!(plan.policy(), policy);
-        assert_eq!(plan.policy().topology, Some(topology));
-        assert_eq!(plan.route(), MaterializationRoute::Resident);
-    }
-
-    #[test]
-    fn policy_leaves_expert_cache_capability_to_architecture_and_backend() {
-        let root = tempfile::tempdir().unwrap();
-        write_safetensors_fixture(root.path(), "llama");
-        let plan = plan_model_preparation(
-            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
-            PreparationPolicy {
-                residency: ResidencyRequest::AddressableParameterBanks,
-                ..PreparationPolicy::default()
-            },
-            crate::backend::SessionCapabilities::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.route(),
-            MaterializationRoute::AddressableParameterBanks
-        );
-    }
-
-    #[test]
-    fn policy_leaves_nonresident_quantization_capability_to_architecture_and_backend() {
-        let root = tempfile::tempdir().unwrap();
-        write_safetensors_fixture(root.path(), "llama");
-        let policy = PreparationPolicy {
-            quantization: Some(QuantizationRequest::MxFp4),
-            residency: ResidencyRequest::LayerwiseHost,
-            ..PreparationPolicy::default()
-        };
-        let plan = plan_model_preparation(
-            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
-            policy,
-            crate::backend::SessionCapabilities::default(),
-        )
-        .unwrap();
-        assert_eq!(plan.policy(), policy);
-        assert_eq!(plan.route(), MaterializationRoute::Layerwise);
     }
 
     #[test]

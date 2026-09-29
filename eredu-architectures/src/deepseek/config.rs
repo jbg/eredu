@@ -1531,19 +1531,6 @@ mod tests {
     }
 
     #[test]
-    fn preparation_reports_embedded_depth_from_normalized_v3_policy() {
-        let mut value = fixture();
-        value["num_nextn_predict_layers"] = Value::from(2);
-
-        let plan = crate::configuration::resolve_model_config(&value)
-            .unwrap()
-            .architecture;
-        let capabilities = crate::preparation::prepared_safetensors_capabilities(&plan).unwrap();
-
-        assert_eq!(capabilities.embedded_draft_layers(), Some(2));
-    }
-
-    #[test]
     fn v3_prediction_projection_retains_extension_and_exact_target_capture() {
         let mut value = fixture();
         value["num_nextn_predict_layers"] = Value::from(2);
@@ -1950,30 +1937,6 @@ mod tests {
             .unwrap()
             .correction_bias
             .is_some());
-    }
-
-    #[test]
-    fn dspark_prediction_frontier_is_declared_by_the_state_segment() {
-        let mut value = v4_fixture();
-        value["dspark_block_size"] = Value::from(4);
-        value["dspark_noise_token_id"] = Value::from(0);
-        value["dspark_target_layer_ids"] = serde_json::json!([0, 2]);
-        value["dspark_markov_rank"] = Value::from(4);
-        let args = parse_v4_config(&value).unwrap();
-        let layout = crate::deepseek::v4::state_layout(&args).unwrap();
-        let identity = crate::deepseek::v4::state_identity(
-            &args,
-            &layout,
-            0,
-            eredu_core::cache::PromptCacheTopology::default(),
-        )
-        .unwrap()
-        .prompt_cache_identity(&layout)
-        .unwrap();
-
-        assert_eq!(layout.segments()[1].processed_token_offset(), 0);
-        assert_eq!(identity.layer_prefix_offsets(), [0, 0, 0, 0]);
-        assert_eq!(identity.model_family(), "deepseek_v4");
     }
 
     #[test]

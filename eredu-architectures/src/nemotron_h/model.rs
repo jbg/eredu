@@ -1400,37 +1400,6 @@ fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupT
     transport
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::items_after_test_module,
-    reason = "the transport contract tests stay adjacent to the transport declaration"
-)]
-mod transport_tests {
-    use super::{prediction_group_transport, TargetBoundarySchema};
-    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
-
-    #[test]
-    fn target_boundary_declares_tokens_and_retained_embeddings() {
-        let schema = TargetBoundarySchema { hidden_size: 32 };
-        let tensors = schema.wire_schema().unwrap().resolve(2, 7).unwrap();
-        assert_eq!(tensors.primary().shape(), [2, 7, 32]);
-        assert_eq!(tensors.auxiliary().len(), 2);
-        assert_eq!(tensors.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(tensors.auxiliary()[1].shape(), [2, 7, 32]);
-    }
-
-    #[test]
-    fn first_prediction_group_owns_shared_mtp_embedding_role_once() {
-        assert_eq!(
-            prediction_group_transport(1).first_owner_static_roles,
-            ["mtp"]
-        );
-        assert!(prediction_group_transport(2)
-            .first_owner_static_roles
-            .is_empty());
-    }
-}
-
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,

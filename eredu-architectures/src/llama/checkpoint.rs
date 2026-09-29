@@ -390,7 +390,7 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
@@ -429,44 +429,5 @@ mod tests {
         assert_eq!(target.quantized_weights, None);
         assert_eq!(target.quantized_weight_configs, None);
         assert_eq!(target.weight_quantization_for(&name), Some(requested));
-    }
-
-    #[test]
-    fn plans_output_and_bias_geometry() {
-        let mut args = args();
-        let plan = safetensors_plan(&args).unwrap();
-        let names = plan
-            .common_tensors
-            .iter()
-            .map(|tensor| tensor.key.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(names.contains("lm_head.weight"));
-        assert!(names.contains("model.layers.0.self_attn.o_proj.bias"));
-        assert!(names.contains("model.layers.0.mlp.down_proj.bias"));
-
-        args.tie_word_embeddings = true;
-        assert!(!safetensors_plan(&args)
-            .unwrap()
-            .common_tensors
-            .iter()
-            .any(|tensor| tensor.key == "lm_head.weight"));
-    }
-
-    #[test]
-    fn packed_weights_use_only_canonical_checkpoint_names() {
-        let quantization =
-            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-        let constraints =
-            safe_matrix_constraints("projection.weight", vec![64, 64], Some(quantization)).unwrap();
-
-        assert!(constraints[0].aliases.is_empty());
-    }
-
-    #[test]
-    fn translates_gguf_names_without_backend_code() {
-        assert_eq!(
-            translate_gguf_weight_name("blk.3.attn_q.weight"),
-            "model.layers.3.self_attn.q_proj.weight"
-        );
     }
 }

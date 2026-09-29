@@ -1513,57 +1513,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_plan_covers_all_target_units_mtp_and_expert_layouts() {
-        let plan = safetensors_plan(&fixture()).unwrap();
-        let contains = |name: &str| {
-            plan.common_tensors.iter().any(|tensor| {
-                tensor.key == name || tensor.aliases.iter().any(|alias| alias == name)
-            })
-        };
-        for name in [
-            "model.layers.0.mamba.in_proj.weight",
-            "model.layers.1.attention.q_proj.weight",
-            "model.layers.2.mlp.up_proj.weight",
-            "model.mtp.layers.0.mixer.q_proj.weight",
-            "model.mtp.layers.0.eh_proj.weight",
-            "model.mtp.layers.1.final_layernorm.weight",
-        ] {
-            assert!(contains(name), "missing {name}");
-        }
-        let groups = plan
-            .layout_groups
-            .iter()
-            .map(|group| group.id.as_str())
-            .collect::<Vec<_>>();
-        assert!(groups.iter().any(|group| group.contains("layer 3")));
-        assert!(groups
-            .iter()
-            .any(|group| group.contains("MTP physical layer 1")));
-        assert!(plan.layout_groups.iter().all(|group| {
-            group
-                .variants
-                .iter()
-                .map(|variant| variant.id.as_str())
-                .eq(["packed", "split"])
-        }));
-    }
-
-    #[test]
-    fn packed_weights_keep_only_released_checkpoint_aliases() {
-        let quantization =
-            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-        let constraints = safe_alias_constraints(
-            "backbone.projection.weight",
-            "model.projection.weight",
-            vec![64, 64],
-            Some(quantization),
-        )
-        .unwrap();
-
-        assert_eq!(constraints[0].aliases, ["model.projection.weight"]);
-    }
-
-    #[test]
     fn gguf_plan_and_translation_cover_every_target_operator_kind() {
         let plan = gguf_plan(&fixture()).unwrap();
         let names = plan

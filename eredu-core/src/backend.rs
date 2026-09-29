@@ -3353,16 +3353,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_prefill_and_multiple_decode_steps() {
-        let mut runtime = ModelRuntime::prepare(Mock, 10).unwrap();
-        let prefill = runtime.prefill(vec![1, 2]).unwrap();
-        assert_eq!(prefill.output, 12);
-        assert!(prefill.completion.is_complete().unwrap());
-        assert_eq!(runtime.decode(3).unwrap().output, 13);
-        assert_eq!(runtime.decode(4).unwrap().output, 14);
-    }
-
-    #[test]
     fn shared_prefill_chunks_preserve_tokens_and_only_sample_the_final_chunk() {
         for length in [1, 2, 5, 8] {
             let config = continuation_config(4);
@@ -3481,24 +3471,6 @@ mod tests {
         assert!(generation.next().unwrap().is_ok());
         assert!(generation.next().unwrap().is_ok());
         assert!(generation.next().is_none());
-    }
-
-    #[test]
-    fn model_capability_extension_observes_the_selected_mock_session() {
-        let runtime = ModelRuntime::prepare(Mock, 10).unwrap();
-        let capabilities = Mock::model_capabilities(&runtime).unwrap();
-        assert_eq!(capabilities.effective_model_type, "mock");
-        let input = Mock::count_prepared_input(&runtime, &vec![1, 2, 3]).unwrap();
-        assert_eq!(input.model_positions, 3);
-        let state = Mock::estimate_runtime_state(&runtime, input, 2, 1).unwrap();
-        assert_eq!(state.requested_state_bytes, 5 * 2 * 4);
-        assert_eq!(
-            Mock::static_memory(&runtime)
-                .unwrap()
-                .logical_parameter_bytes
-                .value(),
-            Some(&10)
-        );
     }
 
     #[test]

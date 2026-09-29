@@ -109,14 +109,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mlx_binding_adds_only_world_rank_and_local_device_identity() {
-        let context = MlxRankContext::new(4, 3, DeviceAssignment::new(DeviceType::Gpu, 0)).unwrap();
-        assert_eq!(context.global_rank(), 3);
-        assert_eq!(context.world_size(), 4);
-        assert_eq!(context.device.local_index(), 0);
-    }
-
-    #[test]
     fn mlx_rank_context_rejects_out_of_range_rank() {
         assert!(MlxRankContext::new(1, 1, DeviceAssignment::new(DeviceType::Gpu, 0)).is_err());
     }

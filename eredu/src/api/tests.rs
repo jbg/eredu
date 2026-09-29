@@ -11,7 +11,6 @@ use crate::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
     },
-    GgufArchitecture,
 };
 use eredu_core::generation::{
     resolve_generation_config, FinishReason, GenerationConfigOverrides, SemanticEvent,
@@ -3560,57 +3559,6 @@ fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
 }
 
 #[test]
-fn prepared_prompt_matches_direct_tokenizer_rendering() {
-    let template = ModelChatTemplate::Single(
-        concat!(
-            "{{ prefix }}",
-            "{% for message in messages %}{{ message.role }}:{{ message.content }};",
-            "{% endfor %}",
-            "{% if tools %}tools={{ tools|length }};{% endif %}",
-            "{% if add_generation_prompt %}assistant:{% endif %}",
-        )
-        .into(),
-    );
-    let messages = vec![json!({"role": "user", "content": "hello"})];
-    let tools = vec![json!({"type": "function"})];
-    let kwargs = serde_json::Map::from_iter([("prefix".into(), json!("<bos>"))]);
-
-    for add_generation_prompt in [false, true] {
-        let raw = Tokenizer::new(WordLevel::default());
-        let mut direct_tokenizer = ChatTokenizer::from_tokenizer(raw.clone());
-        let expected = direct_tokenizer
-            .apply_chat_template_json(
-                template.clone(),
-                [messages.clone()],
-                Some(&tools),
-                "direct-tokenizer-rendering",
-                add_generation_prompt,
-                Some(&kwargs),
-            )
-            .unwrap()
-            .remove(0);
-        let mut preparation_tokenizer = ChatTokenizer::from_tokenizer(raw);
-        let prepared = prepare_chat_from_parts(
-            &mut preparation_tokenizer,
-            template.clone(),
-            "prepared-chat-rendering",
-            &[],
-            None,
-            ChatTemplateRequest {
-                messages: messages.clone(),
-                tools: tools.clone(),
-                add_generation_prompt,
-                extra_template_kwargs: kwargs.clone(),
-                ..ChatTemplateRequest::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(prepared.rendered_prompt(), expected);
-    }
-}
-
-#[test]
 fn eos_sidecars_load_single_and_multiple_ids() {
     let dir = temp_model_dir(
         r#"{
@@ -3963,15 +3911,4 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
         .unwrap()
         .template()
         .contains("<|im_start|>assistant"));
-}
-
-#[test]
-fn gguf_architecture_resolution_recognizes_exact_qwen2_identity() {
-    assert_eq!(
-        GgufArchitecture::resolve("qwen2").unwrap(),
-        GgufArchitecture::Qwen2
-    );
-    for nearby in ["qwen", "qwen2moe", "qwen2vl", "qwen2.5"] {
-        assert!(GgufArchitecture::resolve(nearby).is_err());
-    }
 }

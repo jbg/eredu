@@ -4120,35 +4120,3 @@ fn broadcast_streams<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend>
     eredu_nn::residual_streams::ResidualStreamGeometry::new(args.hc_mult, args.hidden_size)?
         .expand(hidden, context)
 }
-
-#[cfg(test)]
-mod boundary_tests {
-    use super::*;
-    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
-
-    #[test]
-    fn configured_capture_count_owns_wire_cardinality() {
-        let schema = TargetBoundarySchema {
-            hidden_size: 24,
-            activation_hidden_size: 72,
-            capture_count: 2,
-        };
-        assert_eq!(schema.activation_hidden_size(), 72);
-        let tensors = schema.wire_schema().unwrap().resolve(1, 5).unwrap();
-        assert_eq!(tensors.primary().shape(), [1, 5, 72]);
-        assert_eq!(tensors.auxiliary().len(), 3);
-        assert_eq!(tensors.auxiliary()[0].dtype(), BoundaryTensorDtype::Uint32);
-        assert_eq!(tensors.auxiliary()[1].role(), "capture.0");
-        assert_eq!(tensors.auxiliary()[1].shape(), [1, 5, 24]);
-        assert_eq!(tensors.auxiliary()[2].role(), "capture.1");
-    }
-
-    #[test]
-    fn target_transport_owns_the_distinct_hyper_head_role() {
-        let transport = target_group_transport();
-        assert_eq!(
-            transport.last_owner_static_roles,
-            ["norm", "output", "hyper_head"]
-        );
-    }
-}

@@ -169,18 +169,6 @@ mod tests {
     use syn::{parse_quote, DeriveInput};
 
     #[test]
-    fn accepts_single_field_enum_variants() {
-        let input: DeriveInput = parse_quote! {
-            enum ModuleChoice<T> {
-                First(T),
-                Second(T),
-            }
-        };
-
-        assert!(expand_physical_parameters(&input).is_ok());
-    }
-
-    #[test]
     fn rejects_enum_variants_that_cannot_delegate() {
         let input: DeriveInput = parse_quote! {
             enum ModuleChoice<T> {

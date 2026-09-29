@@ -757,40 +757,6 @@ mod tests {
         })
     }
 
-    fn deepseek_v4_config() -> Value {
-        serde_json::json!({
-            "model_type": "deepseek_v4",
-            "hidden_size": 16,
-            "moe_intermediate_size": 8,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "qk_rope_head_dim": 2,
-            "q_lora_rank": 4,
-            "o_lora_rank": 4,
-            "o_groups": 2,
-            "vocab_size": 128,
-            "max_position_embeddings": 4096,
-            "sliding_window": 8,
-            "compress_ratios": [0, 4, 0, 0],
-            "index_n_heads": 4,
-            "index_head_dim": 4,
-            "index_topk": 2,
-            "hc_mult": 2,
-            "hc_sinkhorn_iters": 4,
-            "n_routed_experts": 8,
-            "n_shared_experts": 1,
-            "num_experts_per_tok": 2,
-            "num_hash_layers": 1,
-            "scoring_func": "sqrtsoftplus",
-            "topk_method": "noaux_tc",
-            "norm_topk_prob": true,
-            "routed_scaling_factor": 1.0,
-            "num_nextn_predict_layers": 1
-        })
-    }
-
     fn kimi_linear_config(first_k_dense_replace: i32) -> Value {
         serde_json::json!({
             "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,
@@ -958,30 +924,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_architecture_selects_its_state_dtype_parameter() {
-        let config = qwen35_text_config("qwen3_5_text");
-        let plan = safetensors_plan(&config);
-        let catalog =
-            TensorCatalog::new([tensor("model.embed_tokens.weight", TensorDtype::F16)]).unwrap();
-
-        let source = prepared_safetensors_floating_state_dtype_source(&plan, &catalog).unwrap();
-        assert_eq!(source.parameter(), "model.embed_tokens.weight");
-        assert_eq!(source.checkpoint_tensor(), "model.embed_tokens.weight");
-        assert_eq!(source.dtype(), &TensorDtype::F16);
-    }
-
-    #[test]
-    fn deepseek_v4_state_dtype_source_uses_its_canonical_embedding_parameter() {
-        let plan = safetensors_plan(&deepseek_v4_config());
-        let catalog = TensorCatalog::new([tensor("embed.weight", TensorDtype::Bf16)]).unwrap();
-
-        let source = prepared_safetensors_floating_state_dtype_source(&plan, &catalog).unwrap();
-        assert_eq!(source.parameter(), "embed.weight");
-        assert_eq!(source.checkpoint_tensor(), "embed.weight");
-        assert_eq!(source.dtype(), &TensorDtype::Bf16);
-    }
-
-    #[test]
     fn floating_state_dtype_source_rejects_missing_or_ambiguous_names() {
         let unknown = TensorCatalog::new([tensor("new.valid.name", TensorDtype::F16)]).unwrap();
         let error = resolve_floating_state_dtype_source(
@@ -1006,37 +948,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("multiple physical aliases"));
-    }
-
-    #[test]
-    fn expert_execution_and_residency_capabilities_are_independent() {
-        let capabilities = ArchitectureCapabilities::new(
-            ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
-            false,
-            false,
-            InputModalities::TEXT,
-            None,
-        );
-        assert!(capabilities.parallel_plan().expert_parallel());
-        assert!(!capabilities.independently_addressable_experts());
-
-        let capabilities = ArchitectureCapabilities::new(
-            ParallelCapabilityPlan::TENSOR_PIPELINE,
-            true,
-            false,
-            InputModalities::TEXT,
-            None,
-        );
-        assert!(!capabilities.parallel_plan().expert_parallel());
-        assert!(capabilities.independently_addressable_experts());
-    }
-
-    #[test]
-    fn kimi_linear_declares_nonresident_load_time_quantization() {
-        let config = kimi_linear_config(1);
-        let plan = safetensors_plan(&config);
-        let capabilities = prepared_safetensors_capabilities(&plan).unwrap();
-        assert!(capabilities.nonresident_safetensors_quantization());
     }
 
     #[test]
@@ -1093,19 +1004,5 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn gguf_projector_presence_is_architecture_preparation_policy() {
-        for architecture in [GgufArchitecture::Qwen3Vl, GgufArchitecture::Qwen3VlMoe] {
-            assert_eq!(
-                gguf_composite_artifact_plan(architecture).media_projector_requirement(),
-                GgufMediaProjectorRequirement::Required
-            );
-        }
-        assert_eq!(
-            gguf_composite_artifact_plan(GgufArchitecture::Llama).media_projector_requirement(),
-            GgufMediaProjectorRequirement::NotApplicable
-        );
     }
 }

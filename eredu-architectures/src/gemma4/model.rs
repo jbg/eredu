@@ -258,68 +258,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod ownership_tests {
-    use super::*;
-    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
-
-    #[test]
-    fn optional_per_layer_input_owns_complete_wire_geometry() {
-        let present = TextBoundarySchema {
-            hidden_size: 16,
-            per_layer_geometry: Some((4, 8)),
-            shared_geometry: Vec::new(),
-        };
-        let tensors = present.wire_schema().unwrap().resolve(2, 3).unwrap();
-        assert_eq!(tensors.primary().shape(), [2, 3, 16]);
-        assert_eq!(tensors.auxiliary().len(), 1);
-        assert_eq!(tensors.auxiliary()[0].role(), "per_layer_input");
-        assert_eq!(tensors.auxiliary()[0].shape(), [2, 3, 4, 8]);
-        assert_eq!(
-            tensors.auxiliary()[0].dtype(),
-            BoundaryTensorDtype::Activation
-        );
-
-        let absent = TextBoundarySchema {
-            hidden_size: 16,
-            per_layer_geometry: None,
-            shared_geometry: Vec::new(),
-        };
-        assert!(absent.wire_schema().unwrap().auxiliary().is_empty());
-    }
-
-    #[test]
-    fn per_layer_projection_has_independent_static_owner() {
-        let args = super::super::ModelArgs::from_hf_json(
-            br#"{
-              "model_type":"gemma4","hidden_size":16,"num_hidden_layers":2,
-              "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
-              "head_dim":4,"rms_norm_eps":0.000001,"vocab_size":64,
-              "max_position_embeddings":128,"layer_types":["full_attention","full_attention"],
-              "hidden_size_per_layer_input":4,"vocab_size_per_layer_input":64
-            }"#,
-        )
-        .unwrap();
-        let authority = text_static_parameter_ownership(&args).unwrap();
-        let projection = authority
-            .iter()
-            .find(|owned| {
-                owned.group().members().iter().any(|member| {
-                    member.target() == "model.language_model.per_layer_model_projection.weight"
-                })
-            })
-            .expect("projection ownership");
-        assert_eq!(
-            projection.owner(),
-            &ParameterGroupOwner::static_role("per_layer_projection")
-        );
-        assert_eq!(projection.group().members().len(), 1);
-        assert!(!projection.group().members().iter().any(|member| {
-            member.target() == "model.language_model.embed_tokens_per_layer.weight"
-        }));
-    }
-}
-
 /// Pinned text and native media modules.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]

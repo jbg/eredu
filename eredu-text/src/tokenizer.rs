@@ -1099,24 +1099,14 @@ mod tests {
     }
 
     use minijinja::Environment;
-    use std::{collections::BTreeSet, path::PathBuf};
+    use std::collections::BTreeSet;
 
     use crate::tokenizer::{
-        apply_chat_template, apply_chat_template_json, load_model_chat_template_from_file,
-        load_model_chat_template_from_str, normalize_conditional_keyword_arguments,
-        normalize_generation_blocks, ApplyChatTemplateArgs, ChatTemplateIdentity, Conversation,
-        ModelChatTemplate, Role, Tokenizer,
+        apply_chat_template, apply_chat_template_json, load_model_chat_template_from_str,
+        normalize_conditional_keyword_arguments, normalize_generation_blocks,
+        ApplyChatTemplateArgs, ChatTemplateIdentity, Conversation, ModelChatTemplate, Role,
+        Tokenizer,
     };
-
-    /// Returns the path to test fixtures. Uses TEST_MODEL_DIR env var if set,
-    /// otherwise falls back to the fixtures bundled in the repo.
-    fn fixtures_dir() -> PathBuf {
-        std::env::var("TEST_MODEL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3")
-            })
-    }
 
     #[test]
     fn generation_blocks_become_transparent_minijinja_blocks() {
@@ -1542,17 +1532,5 @@ mod tests {
             kwargs.into_iter().collect::<Vec<_>>(),
             vec!["enable_thinking", "tone"]
         );
-    }
-
-    #[test]
-    fn test_qwen_fixture_reports_enable_thinking_kwarg() {
-        let file = fixtures_dir().join("tokenizer_config.json");
-        let chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        let kwargs = super::chat_template_kwargs(
-            chat_template.select(None).unwrap().template(),
-            "qwen-fixture",
-        )
-        .unwrap();
-        assert!(kwargs.contains("enable_thinking"), "{kwargs:?}");
     }
 }

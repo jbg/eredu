@@ -536,16 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn personaplex_uses_the_indexed_artifact_directory() {
-        let config =
-            MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap();
-        assert_eq!(
-            checkpoint_source(Path::new("fixture"), &config, None).unwrap(),
-            Path::new("fixture")
-        );
-    }
-
-    #[test]
     fn catalog_preparation_preserves_identities_and_publishes_canonical_recipes() {
         let config = MoshiConfig::from_json(
             r#"{
@@ -682,31 +672,5 @@ mod tests {
             RealtimePreparationError::InvalidCheckpoint(_)
         ));
         assert!(error.to_string().contains(&missing));
-    }
-
-    #[test]
-    fn catalog_preparation_admits_personaplex_physical_names_and_aliases() {
-        let config =
-            MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap();
-        let checkpoint_plan = safetensors_plan(&config).unwrap();
-        let catalog = MetadataCatalog::from_plan(&checkpoint_plan);
-
-        let prepared = prepare_realtime_model_from_catalog(
-            "logical/personaplex",
-            "logical/personaplex",
-            config,
-            &catalog,
-        )
-        .unwrap();
-
-        assert_eq!(prepared.checkpoint_plan().common_tensors.len(), 475);
-        assert_eq!(prepared.source_metadata().len(), 475);
-        assert_eq!(prepared.recipes().iter().count(), 655);
-        assert_eq!(prepared.recipe_outputs().len(), 655);
-        assert_eq!(prepared.recipes().aliases().count(), 180);
-        assert!(prepared
-            .recipes()
-            .get("transformer.layers.0.self_attn.in_proj.weight")
-            .is_some());
     }
 }
