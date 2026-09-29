@@ -152,9 +152,9 @@ impl SafetensorsCatalog for SafetensorsHeaderCatalog {
 ///
 /// Discovery parses an optional Hugging Face index exactly once, requires its
 /// tensor map to exactly match the referenced shard headers, and resolves every
-/// payload beneath the checkpoint access root. Snapshot payload symlinks may
-/// target the sibling repository `blobs` directory, but no path may escape that
-/// repository.
+/// payload beneath the checkpoint access roots. Snapshot payload symlinks may
+/// target repository-local blobs or the enclosing model cache's shared `blobs`
+/// directory. Other paths outside the checkpoint repository are rejected.
 #[derive(Debug, Clone)]
 pub struct SafetensorsShards {
     payload_paths: Vec<PathBuf>,
@@ -208,10 +208,10 @@ impl SafetensorsShards {
     }
 
     fn discover_directory(root: &Path) -> Result<Self, SafetensorsShardError> {
-        let access_root = canonical_checkpoint_access_root(root)?;
+        let access_roots = checkpoint_access_roots(root)?;
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
-            let payload = admit_payload(&root.join("model.safetensors"), &access_root)?;
+            let payload = admit_payload(&root.join("model.safetensors"), &access_roots)?;
             return Self {
                 payload_paths: vec![payload.clone()],
                 logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
@@ -250,7 +250,7 @@ impl SafetensorsShards {
                 PathBuf::clone(payload)
             } else {
                 let member = validate_relative_shard_path(Path::new(&relative))?;
-                let payload = admit_payload(&root.join(member), &access_root)?;
+                let payload = admit_payload(&root.join(member), &access_roots)?;
                 payload_paths.insert(payload.clone());
                 logical_payload_paths.insert(relative, payload.clone());
                 payload
@@ -588,9 +588,9 @@ fn validate_relative_shard_path(path: &Path) -> Result<&Path, SafetensorsShardEr
     Ok(path)
 }
 
-fn admit_payload(path: &Path, access_root: &Path) -> Result<PathBuf, SafetensorsShardError> {
+fn admit_payload(path: &Path, access_roots: &[PathBuf]) -> Result<PathBuf, SafetensorsShardError> {
     let canonical = canonicalize(path)?;
-    if !canonical.starts_with(access_root) {
+    if !access_roots.iter().any(|root| canonical.starts_with(root)) {
         return Err(SafetensorsShardError::UnsafeShardPath {
             path: path.to_path_buf(),
         });
@@ -598,21 +598,34 @@ fn admit_payload(path: &Path, access_root: &Path) -> Result<PathBuf, Safetensors
     Ok(canonical)
 }
 
-fn canonical_checkpoint_access_root(path: &Path) -> Result<PathBuf, SafetensorsShardError> {
+fn checkpoint_access_roots(path: &Path) -> Result<Vec<PathBuf>, SafetensorsShardError> {
     let canonical_root = canonicalize(path)?;
     let Some(snapshots) = canonical_root.parent() else {
-        return Ok(canonical_root);
+        return Ok(vec![canonical_root]);
     };
     if snapshots.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
-        return Ok(canonical_root);
+        return Ok(vec![canonical_root]);
     }
     let Some(repository_root) = snapshots.parent() else {
-        return Ok(canonical_root);
+        return Ok(vec![canonical_root]);
     };
-    if !repository_root.join("blobs").is_dir() {
-        return Ok(canonical_root);
+    let mut roots = vec![if repository_root.join("blobs").is_dir() {
+        repository_root.to_path_buf()
+    } else {
+        canonical_root.clone()
+    }];
+    if repository_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("models--"))
+    {
+        if let Some(cache_root) = repository_root.parent() {
+            // Keep this boundary beneath the canonical cache root. Resolving a
+            // symlink at `blobs` must not authorize an unrelated directory.
+            roots.push(cache_root.join("blobs"));
+        }
     }
-    canonicalize(repository_root)
+    Ok(roots)
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf, SafetensorsShardError> {
@@ -975,6 +988,73 @@ mod tests {
             shards.logical_payload_paths(),
             &BTreeMap::from([("weights".into(), blob.canonicalize().unwrap())])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_accepts_indexed_snapshot_symlinks_into_shared_blobs() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = cache.path().join("models--owner--model/snapshots/revision");
+        let blobs = cache.path().join("blobs/92");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(&blobs).unwrap();
+        let blob = blobs.join("92c258");
+        write_shard(&blob, "weight");
+        symlink(
+            "../../../blobs/92/92c258",
+            snapshot.join("part.safetensors"),
+        )
+        .unwrap();
+        write_index(&snapshot, r#"{"weight_map":{"weight":"part.safetensors"}}"#);
+
+        let shards = SafetensorsShards::discover(&snapshot).unwrap();
+        assert_eq!(shards.payload_paths(), [blob.canonicalize().unwrap()]);
+        assert_eq!(
+            shards.logical_payload_paths(),
+            &BTreeMap::from([("part.safetensors".into(), blob.canonicalize().unwrap())])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_snapshot_symlinks_outside_shared_blob_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = cache.path().join("models--owner--model/snapshots/revision");
+        let blobs = cache.path().join("blobs");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir(&blobs).unwrap();
+        write_index(&snapshot, r#"{"weight_map":{"weight":"part.safetensors"}}"#);
+        let member = snapshot.join("part.safetensors");
+        let unrelated = cache.path().join("unrelated.safetensors");
+        write_shard(&unrelated, "weight");
+        let other_repository = cache.path().join("models--other--model");
+        std::fs::create_dir(&other_repository).unwrap();
+        let other_payload = other_repository.join("payload");
+        write_shard(&other_payload, "weight");
+        symlink(&unrelated, blobs.join("escaped")).unwrap();
+
+        for target in [&unrelated, &other_payload, &blobs.join("escaped")] {
+            symlink(target, &member).unwrap();
+            assert!(matches!(
+                SafetensorsShards::discover(&snapshot),
+                Err(SafetensorsShardError::UnsafeShardPath { .. })
+            ));
+            std::fs::remove_file(&member).unwrap();
+        }
+
+        // Redirecting the shared directory itself cannot expand admission.
+        std::fs::remove_file(blobs.join("escaped")).unwrap();
+        std::fs::remove_dir(&blobs).unwrap();
+        symlink(&other_repository, &blobs).unwrap();
+        symlink("../../../blobs/payload", &member).unwrap();
+        assert!(matches!(
+            SafetensorsShards::discover(&snapshot),
+            Err(SafetensorsShardError::UnsafeShardPath { .. })
+        ));
     }
 }
 

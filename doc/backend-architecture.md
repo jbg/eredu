@@ -788,6 +788,13 @@ Source-store binding checks provenance once per shared task for that handoff;
 unchanged member recipes reuse their inferred metadata, while transformed recipes
 require new inference.
 
+SafeTensors shard-path admission belongs to `eredu-checkpoint`. Model-cache
+snapshots admit payload symlinks into repository-local blobs and the enclosing
+cache's shared `blobs` directory. The shared store does not authorize unrelated
+cache files or other repositories; symlink targets must remain within an admitted
+root after canonicalization, including links through the shared blob directory.
+Index members remain relative paths without parent traversal.
+
 SafeTensors admission resolves each distinct shard member once and retains one
 checked header, exact index membership, file identity, and tensor catalog per
 physical shard. Cloned admissions, core inspection, prepared stores, and bounded
