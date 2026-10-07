@@ -542,6 +542,7 @@ dependencies = [
  "eredu-core",
  "eredu-evaluation",
  "eredu-gguf",
+ "eredu-media",
  "eredu-nn",
  "eredu-runtime",
  "eredu-text",
@@ -560,12 +561,14 @@ name = "eredu-architectures"
 version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
+ "eredu-codec",
  "eredu-core",
  "eredu-evaluation",
  "eredu-gguf",
  "eredu-media",
  "eredu-nn",
  "eredu-runtime",
+ "eredu-text",
  "half",
  "libtest-mimic",
  "safetensors",
@@ -589,6 +592,7 @@ dependencies = [
  "eredu-core",
  "eredu-evaluation",
  "eredu-gguf",
+ "eredu-media",
  "eredu-nn",
  "eredu-runtime",
  "eredu-text",
@@ -656,6 +660,7 @@ name = "eredu-codec"
 version = "0.5.0"
 dependencies = [
  "eredu-checkpoint",
+ "eredu-core",
  "eredu-nn",
  "eredu-runtime",
  "serde_json",
@@ -721,8 +726,10 @@ name = "eredu-media"
 version = "0.4.0"
 dependencies = [
  "eredu-core",
+ "eredu-evaluation",
  "image",
  "rustfft",
+ "serde_json",
  "thiserror",
 ]
 
@@ -752,6 +759,8 @@ dependencies = [
  "eredu-core",
  "eredu-gguf",
  "eredu-nn",
+ "rand",
+ "rand_chacha",
  "safetensors",
  "serde",
  "serde_json",

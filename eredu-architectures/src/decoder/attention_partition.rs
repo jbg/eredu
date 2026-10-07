@@ -274,7 +274,7 @@ mod tests {
                 } else {
                     vec![32, 17, 32]
                 };
-                let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+                let layout = eredu_runtime::derive_partitioned_local_layout(
                     &description,
                     rank,
                 )

@@ -33,8 +33,8 @@ use eredu_core::{
     artifact::{fingerprint_filesystem_artifact, ArtifactFile},
     scheduler::{RequestId, RequestStatus, SchedulerLimits, SemanticStateTransaction},
     Completion, CompletionCancellationMode, ParallelRankTopology, ParallelTopology,
-    QuantizationRequest, RealtimeInputFrame, RealtimeSampling, SessionCapabilities, TokenFilter,
-    MODEL_LOGITS_OBSERVATION_PATH,
+    QuantizationRequest, RealtimeChannelId, RealtimeFrameScheduleState, RealtimeInputFrame,
+    RealtimeSampling, SessionCapabilities, TokenFilter, MODEL_LOGITS_OBSERVATION_PATH,
 };
 use eredu_nn::{
     AttentionCache, AttentionMask, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator,
@@ -50,11 +50,11 @@ use eredu_runtime::{
     bind_materialized_unit, construct_realtime_model, execute_realtime_frame, materialize_bindings,
     ActivationObserver, CacheResidencyPolicy, CommunicationCompletionCapabilities,
     CommunicationCompletionPolicy, CompletedRealtimeFrame, DeviceState, ExecutionResidency,
-    LayerWeightResidency, LayeredArchitecture, MaterializedRealtimeInput, MaterializedUnit,
-    ParameterBackend, ParameterGroupOwner, PenaltyConfig, PipelineActivationDtype,
-    RealizedRealtimePolicy, RealizedRealtimeState, RealtimeArchitectureIdentity,
-    RealtimeCompletionCreationError, RealtimeFrameCompletionMechanism,
-    RealtimeFrameTensorMechanisms, RealtimeGenerationState, RealtimeHostTokenMaterializer,
+    LayerWeightResidency, LayeredArchitecture, MaterializedUnit, ParameterBackend,
+    ParameterGroupOwner, PenaltyConfig, PipelineActivationDtype, RealizedRealtimePolicy,
+    RealizedRealtimeState, RealtimeArchitectureIdentity, RealtimeCompletionCreationError,
+    RealtimeCompletionMechanism, RealtimeFrameResources, RealtimeFrameTensorMechanisms,
+    RealtimeGenerationState, RealtimeHostFrameMaterializer, RealtimeHostTokenMaterializer,
     RealtimeIdentity, RealtimeLayerwiseRuntime, RealtimeMaterializationTask, RealtimeMechanism,
     RealtimeMechanismCapabilities, RealtimeModelConstructionMechanisms,
     RealtimeModelSessionIdentity, RealtimeObservationRequirements, RealtimePayloadContract,
@@ -66,6 +66,9 @@ use eredu_runtime::{
 };
 
 include!("support/reference_backend.rs");
+
+#[path = "support/voicechat_construction.rs"]
+mod voicechat_construction;
 
 /// Exact header catalog whose payload path is deliberately unavailable.
 ///
@@ -191,6 +194,8 @@ impl Clone for ReferenceCompletion {
 type ReferenceState = DeviceState<ReferenceBackend, ReferenceCache>;
 type ReferenceGeneration = RealtimeGenerationState<
     RealtimePayloadState<TransactionalReferenceState, ReferenceTensor>,
+    RealtimeFrameScheduleState,
+    RealtimeSampling,
     ReferenceSampler,
     i32,
     ReferenceCompletion,
@@ -265,33 +270,31 @@ impl RealtimeHostTokenMaterializer for ReferenceFrameTensorMechanisms {
     }
 }
 
+impl RealtimeHostFrameMaterializer for ReferenceFrameTensorMechanisms {
+    fn materialize_f32(
+        &mut self,
+        _values: &[f32],
+        shape: &[usize],
+    ) -> Result<Self::Tensor, Self::Error> {
+        // This construction harness represents geometry only. Numerical mixed
+        // channel preservation is checked by the runtime's value-carrying mock.
+        Ok(ReferenceTensor(
+            shape
+                .iter()
+                .map(|&dimension| i32::try_from(dimension).expect("tiny frame dimensions fit i32"))
+                .collect(),
+        ))
+    }
+}
+
 impl RealtimeFrameTensorMechanisms for ReferenceFrameTensorMechanisms {
     type Tensor = ReferenceTensor;
     type Error = Infallible;
-
-    fn column(
-        &mut self,
-        matrix: &Self::Tensor,
-        _column: usize,
-    ) -> Result<Self::Tensor, Self::Error> {
-        Ok(ReferenceTensor(vec![matrix.0[0], 1]))
-    }
 
     fn filled_column(&mut self, _token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
         Ok(ReferenceTensor(vec![
             i32::try_from(batch).expect("tiny frame batch fits i32"),
             1,
-        ]))
-    }
-
-    fn stack_columns(
-        &mut self,
-        columns: &[Self::Tensor],
-        batch: usize,
-    ) -> Result<Self::Tensor, Self::Error> {
-        Ok(ReferenceTensor(vec![
-            i32::try_from(batch).expect("tiny frame batch fits i32"),
-            i32::try_from(columns.len()).expect("tiny frame columns fit i32"),
         ]))
     }
 }
@@ -333,10 +336,13 @@ impl ActivationObserver<ReferenceTensor, Error> for ReferenceRealtimeObserver {
 }
 
 impl<T>
-    RealtimeFrameCompletionMechanism<
-        ReferenceTensor,
-        T,
-        (ReferenceTensor, moshi::ForwardContext<ReferenceTensor>),
+    RealtimeCompletionMechanism<
+        RealtimeFrameResources<
+            '_,
+            ReferenceTensor,
+            T,
+            (ReferenceTensor, moshi::ForwardContext<ReferenceTensor>),
+        >,
     > for ReferenceFrameCompletionMechanism
 {
     type Completion = ReferenceCompletion;
@@ -344,13 +350,17 @@ impl<T>
 
     fn complete(
         &mut self,
-        _input: MaterializedRealtimeInput<ReferenceTensor>,
-        output: &CompletedRealtimeFrame<ReferenceTensor, ReferenceTensor>,
-        _model_state: &T,
-        _payload_history: &RealtimePayloadHistory<ReferenceTensor>,
-        execution: Option<(ReferenceTensor, moshi::ForwardContext<ReferenceTensor>)>,
+        resources: RealtimeFrameResources<
+            '_,
+            ReferenceTensor,
+            T,
+            (ReferenceTensor, moshi::ForwardContext<ReferenceTensor>),
+        >,
     ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>
     {
+        let RealtimeFrameResources {
+            output, execution, ..
+        } = resources;
         self.calls += 1;
         let completion = if let Some((text_logits, forward)) = execution {
             self.retained_calls += 1;
@@ -363,10 +373,15 @@ impl<T>
                 ])
             );
             assert_eq!(forward.text_logits(), Some(&text_logits));
-            ReferenceBackend::submit(&(), [output.text(), output.sampled_audio(), &text_logits])
-                .expect("reference submission is infallible")
+            ReferenceBackend::submit(
+                &(),
+                output
+                    .retained_payloads()
+                    .chain(std::iter::once(&text_logits)),
+            )
+            .expect("reference submission is infallible")
         } else {
-            ReferenceBackend::submit(&(), [output.text(), output.sampled_audio()])
+            ReferenceBackend::submit(&(), output.retained_payloads())
                 .expect("reference submission is infallible")
         };
         Ok(completion)
@@ -674,7 +689,7 @@ struct IndependentAuthorityResources {
     route_callbacks: Cell<usize>,
     bound_value_trace: RefCell<Vec<i32>>,
     causal_value: i32,
-    executed_outputs: RefCell<Vec<(ReferenceTensor, ReferenceTensor)>>,
+    executed_outputs: RefCell<Vec<Vec<(RealtimeChannelId, ReferenceTensor)>>>,
     group_resources: RefCell<Vec<MockCommunicationResource>>,
     route_resources: RefCell<Vec<MockCommunicationResource>>,
     omit_route_resources: bool,
@@ -700,7 +715,7 @@ struct IndependentRealizedSession {
     report: eredu_core::ModelInspectionReport,
     scheduler_capabilities: eredu_core::scheduler::SchedulerCapabilities,
     scheduler_report: eredu_core::scheduler::SchedulerReport,
-    executed_outputs: Vec<(ReferenceTensor, ReferenceTensor)>,
+    executed_outputs: Vec<Vec<(RealtimeChannelId, ReferenceTensor)>>,
 }
 
 impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for ConstructionVisitor {
@@ -788,20 +803,27 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         let schedule = self.ingress.schedule().clone();
         let payload_state = RealtimePayloadState::new(
             TransactionalReferenceState(state),
-            RealtimePayloadHistory::new(schedule.clone()),
-            &schedule,
+            RealtimePayloadHistory::new(self.ingress.channels().clone()),
+            self.ingress.channels(),
         )
         .map_err(|error| error.to_string())?;
         let sampling = RealtimeSampling::new(1.0, 1.0, 7).map_err(|error| error.to_string())?;
-        let generation =
-            RealtimeGenerationState::<_, ReferenceSampler, i32, ReferenceCompletion>::new(
-                payload_state,
-                schedule.clone(),
-                sampling,
-                vec![ReferenceSampler; schedule.depth_audio_codebooks() + 1],
-                Some(i32::try_from(sampling.seed()).expect("reference seed fits i32")),
-            )
-            .map_err(|error| error.to_string())?;
+        let generation = RealtimeGenerationState::<
+            _,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            ReferenceSampler,
+            i32,
+            ReferenceCompletion,
+        >::new(
+            payload_state,
+            moshi::realtime_generation_contract(&schedule),
+            RealtimeFrameScheduleState::new(schedule.clone()),
+            sampling,
+            vec![ReferenceSampler; schedule.depth_audio_codebooks() + 1],
+            Some(i32::try_from(sampling.seed()).expect("reference seed fits i32")),
+        )
+        .map_err(|error| error.to_string())?;
         let initial_offset = generation.model_state().model_state().attention_offset();
         let mut executor = moshi::MoshiPreparedRealtimeFrameExecutor::new(execution);
         let mut host = ReferenceFrameTensorMechanisms;
@@ -819,9 +841,15 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             expected_text_frames: authority_value,
             ..ReferenceFrameCompletionMechanism::default()
         };
-        type ReferenceOutput = SubmittedRealtimeFrame<ReferenceTensor, ReferenceCompletion>;
+        type ReferenceOutput = SubmittedRealtimeFrame<
+            CompletedRealtimeFrame<ReferenceTensor, ReferenceTensor>,
+            ReferenceCompletion,
+        >;
         type ReferenceSessions = RealtimeSessionScheduler<
+            RealtimeInputFrame,
             RealtimePayloadState<TransactionalReferenceState, ReferenceTensor>,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
             ReferenceSampler,
             i32,
             ReferenceCompletion,
@@ -903,10 +931,10 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             sessions
                 .run_local_turn(Instant::now(), |_, frame, branch| {
                     let payload_contract = branch
-                        .payload_contract(&self.ingress)
+                        .payload_contract()
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                     let output =
-                        execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _>(
+                        execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _, _>(
                             &self.ingress,
                             &payload_contract,
                             frame,
@@ -920,19 +948,36 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
                         )
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                     if let Some(authority) = &self.inspection_authority {
-                        authority.resources.executed_outputs.borrow_mut().push((
-                            output.frame().text().clone(),
-                            output.frame().sampled_audio().clone(),
-                        ));
+                        authority.resources.executed_outputs.borrow_mut().push(
+                            output
+                                .frame()
+                                .values()
+                                .iter()
+                                .map(|value| (value.channel(), value.payload().clone()))
+                                .collect(),
+                        );
                     }
                     if !output.frame().diagnostics().is_empty() {
-                        assert_eq!(output.frame().text(), &ReferenceTensor(vec![1, 1]));
+                        assert_eq!(output.frame().batch(), 1);
+                        assert_eq!(output.frame().channels(), self.ingress.channels());
+                        // Moshi publishes each text/depth categorical decision
+                        // with its declared identity and one column per row.
+                        for channel in 0..=schedule.depth_audio_codebooks() {
+                            let value = output
+                                .frame()
+                                .values()
+                                .iter()
+                                .find(|value| value.channel() == RealtimeChannelId::new(channel))
+                                .expect("every ordered decision has a retained channel value");
+                            // ReferenceTensor keeps causal sample provenance after
+                            // its dimensions; Tensor::shape excludes that marker.
+                            assert_eq!(value.payload().shape(), &[1, 1]);
+                        }
                         assert_eq!(
-                            output.frame().sampled_audio(),
-                            &ReferenceTensor(vec![
-                                1,
-                                i32::try_from(schedule.generated_audio_codebooks()).unwrap(),
-                            ])
+                            output.frame().decision_channels(),
+                            &(0..=schedule.depth_audio_codebooks())
+                                .map(RealtimeChannelId::new)
+                                .collect::<Vec<_>>()
                         );
                         assert_eq!(
                             output.frame().diagnostics().len(),
@@ -989,9 +1034,9 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
         sessions
             .run_local_turn(Instant::now(), |_, frame, branch| {
                 let payload_contract = branch
-                    .payload_contract(&self.ingress)
+                    .payload_contract()
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _>(
+                execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _, _>(
                     &self.ingress,
                     &payload_contract,
                     frame,
@@ -1132,20 +1177,27 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
         let schedule = self.ingress.schedule().clone();
         let payload_state = RealtimePayloadState::new(
             TransactionalReferenceState(state),
-            RealtimePayloadHistory::new(schedule.clone()),
-            &schedule,
+            RealtimePayloadHistory::new(self.ingress.channels().clone()),
+            self.ingress.channels(),
         )
         .map_err(|error| error.to_string())?;
         let sampling = RealtimeSampling::new(1.0, 1.0, 7).map_err(|error| error.to_string())?;
-        let generation =
-            RealtimeGenerationState::<_, ReferenceSampler, i32, ReferenceCompletion>::new(
-                payload_state,
-                schedule.clone(),
-                sampling,
-                vec![ReferenceSampler; schedule.depth_audio_codebooks() + 1],
-                Some(7),
-            )
-            .map_err(|error| error.to_string())?;
+        let generation = RealtimeGenerationState::<
+            _,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            ReferenceSampler,
+            i32,
+            ReferenceCompletion,
+        >::new(
+            payload_state,
+            moshi::realtime_generation_contract(&schedule),
+            RealtimeFrameScheduleState::new(schedule.clone()),
+            sampling,
+            vec![ReferenceSampler; schedule.depth_audio_codebooks() + 1],
+            Some(7),
+        )
+        .map_err(|error| error.to_string())?;
         let initial_offset = generation.model_state().model_state().attention_offset();
         let observation_paths = Rc::clone(&self.observer.paths);
         let observed_values = Rc::clone(&self.observer.values);
@@ -1161,10 +1213,8 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
         };
         if expects_failure {
             let payload_contract = RealtimePayloadContract::new(
-                schedule.clone(),
+                self.ingress.channels().clone(),
                 1,
-                self.ingress.text_domain(),
-                self.ingress.audio_domain(),
                 RealtimePayloadGeneration::new(1).unwrap(),
                 RealtimePayloadOwnerIdentity::new(1).unwrap(),
             )
@@ -1173,7 +1223,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
                 .with_diagnostics();
             let mut branch = generation.branch().map_err(|error| error.to_string())?;
             clear_reference_trace();
-            let result = execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _>(
+            let result = execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _, _>(
                 &self.ingress,
                 &payload_contract,
                 &frame,
@@ -1203,9 +1253,15 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
                 request_status: RequestStatus::Failed,
             });
         }
-        type ReferenceOutput = SubmittedRealtimeFrame<ReferenceTensor, ReferenceCompletion>;
+        type ReferenceOutput = SubmittedRealtimeFrame<
+            CompletedRealtimeFrame<ReferenceTensor, ReferenceTensor>,
+            ReferenceCompletion,
+        >;
         type ReferenceSessions = RealtimeSessionScheduler<
+            RealtimeInputFrame,
             RealtimePayloadState<TransactionalReferenceState, ReferenceTensor>,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
             ReferenceSampler,
             i32,
             ReferenceCompletion,
@@ -1231,9 +1287,9 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
         clear_reference_trace();
         let _ = sessions.run_local_turn(Instant::now(), |_, frame, branch| {
             let payload_contract = branch
-                .payload_contract(&self.ingress)
+                .payload_contract()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _>(
+            execute_realtime_frame::<ReferenceBackend, _, _, _, _, _, _, _, _, _>(
                 &self.ingress,
                 &payload_contract,
                 frame,
@@ -1442,7 +1498,7 @@ fn selected(
     store: &Arc<MetadataCheckpointSource>,
     request: MoshiRealtimeRequest,
 ) -> moshi::PreparedMoshiRealtime {
-    let preparation = moshi::prepare_realtime_model_from_catalog(
+    let preparation = moshi::prepare_moshi_from_catalog(
         "reference/header-artifact",
         "reference/header-checkpoint.safetensors",
         config.clone(),
@@ -2355,6 +2411,12 @@ impl BoundedIndependentAdapter {
             alternative_summary.random_after_forced
         );
         assert_eq!(alternative_realized.executed_outputs.len(), 2);
+        // Per-channel publication retains the sampled causal provenance. A
+        // different materialized parameter changes output, not merely RNG state.
+        assert_ne!(
+            realized.executed_outputs,
+            alternative_realized.executed_outputs
+        );
         assert_eq!(alternative_realized.report, admitted_report);
         assert!(alternative_resources.construction_uses.get() > 0);
         assert_eq!(

@@ -387,14 +387,7 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
     }
 
     fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
-        let decoded = self
-            .decoder
-            .tokenizer
-            .decode(&self.decoder.ids, self.decoder.skip_special_tokens)
-            .map_err(TextDecoderError::Tokenizer)?;
-        if decoded.len() > self.decoder.prefix.len() {
-            return Err(TextDecoderError::IncompleteByteSequence);
-        }
+        self.decoder.finish()?;
         Ok(Vec::new())
     }
 }

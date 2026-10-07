@@ -23,3 +23,7 @@ thiserror.workspace = true
 # The resize-buffer bound in image.rs tracks this exact implementation.
 image = { version = "=0.25.10", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
+
+[dev-dependencies]
+eredu-evaluation.workspace = true
+serde_json.workspace = true

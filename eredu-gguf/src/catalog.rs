@@ -1,5 +1,5 @@
 use crate::convert::{
-    affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
+    ConversionKind, affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes,
 };
 use crate::{
     ConvertedTensor, DenseDtype, DenseTensorSpan, DenseTensorSpanPlan, Endian, Error, Limits,
@@ -385,24 +385,7 @@ impl Checkpoint {
                     "explicit quantized representation requires a quantized tensor",
                 ));
             }
-            tensor.outputs = vec![LogicalTensorLayout {
-                name: tensor.descriptor.name.clone(),
-                shape: match representation {
-                    QuantizedTensorRepresentation::Encoded => iquant_packed_shape(
-                        &tensor.descriptor.row_major_shape(),
-                        tensor.descriptor.ggml_type,
-                    )?,
-                    QuantizedTensorRepresentation::DecodedF32 => {
-                        tensor.descriptor.row_major_shape()
-                    }
-                },
-                dtype: match representation {
-                    QuantizedTensorRepresentation::Encoded => LogicalDtype::U8,
-                    QuantizedTensorRepresentation::DecodedF32 => LogicalDtype::F32,
-                },
-            }];
-            tensor.affine = None;
-            tensor.representation = Some(representation);
+            *tensor = explicit_quantized_tensor(&tensor.descriptor, representation)?;
         }
         if let Some(name) = remaining.first() {
             return Err(Error::tensor(
@@ -419,10 +402,28 @@ impl Checkpoint {
     }
 
     pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_catalog(path.as_ref(), limits, None)
+    }
+
+    /// Opens a checkpoint with one explicit representation for every quantized
+    /// tensor, before assigning any converted output names or companion layouts.
+    /// Dense tensors retain their stored scalar representation and logical shape.
+    pub fn open_with_representation(
+        path: impl AsRef<Path>,
+        limits: Limits,
+        representation: QuantizedTensorRepresentation,
+    ) -> Result<Self> {
+        Self::open_catalog(path.as_ref(), limits, Some(representation))
+    }
+
+    fn open_catalog(
+        path: &Path,
+        limits: Limits,
+        representation: Option<QuantizedTensorRepresentation>,
+    ) -> Result<Self> {
         validate_extension(path)?;
         let first = open_reader(path, limits.clone())?;
-        Self::assemble(path, first, limits.clone(), true, |path| {
+        Self::assemble(path, first, limits.clone(), true, representation, |path| {
             if !path.is_file() {
                 return Err(shard_error(format!(
                     "missing GGUF shard {:?}",
@@ -436,6 +437,24 @@ impl Checkpoint {
     /// Validates a complete shard set without filesystem or payload access.
     /// Full lengths are caller-supplied provenance, not payload integrity proofs.
     pub fn from_headers(headers: &[CheckpointHeader], limits: Limits) -> Result<Self> {
+        Self::headers_catalog(headers, limits, None)
+    }
+
+    /// Admits supplied headers with an explicit representation for all quantized
+    /// tensors. This preserves metadata-only authority: no payload path is opened.
+    pub fn from_headers_with_representation(
+        headers: &[CheckpointHeader],
+        limits: Limits,
+        representation: QuantizedTensorRepresentation,
+    ) -> Result<Self> {
+        Self::headers_catalog(headers, limits, Some(representation))
+    }
+
+    fn headers_catalog(
+        headers: &[CheckpointHeader],
+        limits: Limits,
+        representation: Option<QuantizedTensorRepresentation>,
+    ) -> Result<Self> {
         let mut members = BTreeMap::new();
         for header in headers {
             let path = Path::new(&header.member);
@@ -464,13 +483,20 @@ impl Checkpoint {
             ));
         }
         let mut consumed = 1;
-        let result = Self::assemble(path, first_reader, limits.clone(), false, |path| {
-            consumed += 1;
-            members
-                .get(path)
-                .ok_or_else(|| shard_error(format!("missing GGUF member {}", path.display())))?
-                .reader(limits.clone())
-        })?;
+        let result = Self::assemble(
+            path,
+            first_reader,
+            limits.clone(),
+            false,
+            representation,
+            |path| {
+                consumed += 1;
+                members
+                    .get(path)
+                    .ok_or_else(|| shard_error(format!("missing GGUF member {}", path.display())))?
+                    .reader(limits.clone())
+            },
+        )?;
         if consumed != headers.len() {
             return Err(shard_error("unexpected GGUF members"));
         }
@@ -482,12 +508,13 @@ impl Checkpoint {
         first: Reader<R>,
         limits: Limits,
         payload_access: bool,
+        representation: Option<QuantizedTensorRepresentation>,
         mut read: impl FnMut(&Path) -> Result<Reader<R>>,
     ) -> Result<Self> {
         let metadata = first.metadata().clone();
         let split_count = split_value(&metadata, SPLIT_COUNT)?.unwrap_or(0);
         if split_count <= 1 {
-            let tensors = catalog_tensors(first.tensors(), first.endian())?;
+            let tensors = catalog_tensors(first.tensors(), first.endian(), representation)?;
             if let Some(split_no) = split_value(&metadata, SPLIT_NO)? {
                 if split_no != 0 {
                     return Err(shard_error(format!(
@@ -532,7 +559,7 @@ impl Checkpoint {
         let paths = shard_paths(path, split_count)?;
         let mut shards = Vec::with_capacity(split_count);
         let mut names = HashMap::<String, PathBuf>::new();
-        let first_tensors = catalog_tensors(first.tensors(), first.endian())?;
+        let first_tensors = catalog_tensors(first.tensors(), first.endian(), representation)?;
         for tensor in &first_tensors {
             names.insert(tensor.descriptor.name.clone(), path.to_path_buf());
         }
@@ -572,7 +599,7 @@ impl Checkpoint {
                 )));
             }
 
-            let tensors = catalog_tensors(reader.tensors(), reader.endian())?;
+            let tensors = catalog_tensors(reader.tensors(), reader.endian(), representation)?;
             for tensor in &tensors {
                 let source = tensor.descriptor.name.clone();
                 if let Some(previous) = names.insert(source.clone(), shard_path.clone()) {
@@ -985,15 +1012,36 @@ fn validate_reopened_shard(
     }
 }
 
-fn catalog_tensors(descriptors: &[TensorDescriptor], endian: Endian) -> Result<Vec<CatalogTensor>> {
+fn catalog_tensors(
+    descriptors: &[TensorDescriptor],
+    endian: Endian,
+    representation: Option<QuantizedTensorRepresentation>,
+) -> Result<Vec<CatalogTensor>> {
     descriptors
         .iter()
-        .map(|descriptor| catalog_tensor(descriptor, endian))
+        .map(|descriptor| catalog_tensor(descriptor, endian, representation))
         .collect()
 }
 
-fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<CatalogTensor> {
+fn catalog_tensor(
+    descriptor: &TensorDescriptor,
+    endian: Endian,
+    representation: Option<QuantizedTensorRepresentation>,
+) -> Result<CatalogTensor> {
     let kind = conversion_kind(descriptor.ggml_type, endian)?;
+    if let Some(representation) = representation {
+        if !matches!(kind, ConversionKind::Dense(_)) {
+            return explicit_quantized_tensor(descriptor, representation);
+        }
+    }
+    // Affine and MXFP4 companions use the conventional `.weight` namespace.
+    // Quantized buffers outside that convention retain their physical identity
+    // as one dense output, decoded only when a bounded payload is requested.
+    if matches!(kind, ConversionKind::Affine { .. } | ConversionKind::MxFp4)
+        && !descriptor.name.ends_with(".weight")
+    {
+        return explicit_quantized_tensor(descriptor, QuantizedTensorRepresentation::DecodedF32);
+    }
     if let ConversionKind::IQuant = kind {
         return Ok(CatalogTensor {
             descriptor: descriptor.clone(),
@@ -1074,6 +1122,31 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
         outputs,
         affine: Some((bits, group_size)),
         representation: None,
+    })
+}
+
+fn explicit_quantized_tensor(
+    descriptor: &TensorDescriptor,
+    representation: QuantizedTensorRepresentation,
+) -> Result<CatalogTensor> {
+    let (shape, dtype) = match representation {
+        QuantizedTensorRepresentation::Encoded => (
+            iquant_packed_shape(&descriptor.row_major_shape(), descriptor.ggml_type)?,
+            LogicalDtype::U8,
+        ),
+        QuantizedTensorRepresentation::DecodedF32 => {
+            (descriptor.row_major_shape(), LogicalDtype::F32)
+        }
+    };
+    Ok(CatalogTensor {
+        descriptor: descriptor.clone(),
+        outputs: vec![LogicalTensorLayout {
+            name: descriptor.name.clone(),
+            shape,
+            dtype,
+        }],
+        affine: None,
+        representation: Some(representation),
     })
 }
 

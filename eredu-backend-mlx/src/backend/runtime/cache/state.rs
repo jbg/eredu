@@ -68,3 +68,6 @@ mod hybrid;
 #[cfg(test)]
 pub(crate) use hybrid::numeric_fixture_values;
 pub use hybrid::{MlxAppendStream, MlxHybridLayerState, MlxHybridState};
+
+mod joint;
+pub use joint::{JointCopyLimits, JointStateError, MlxJointState, MlxJointStateBranch};

@@ -691,6 +691,7 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
             media(g, "vision");
         }
         SafetensorsModelConfig::Moshi(c) => moshi(g, c),
+        SafetensorsModelConfig::VoiceChat(c) => super::voicechat::describe(g, c),
         SafetensorsModelConfig::Gemma2(_)
         | SafetensorsModelConfig::Llama(_)
         | SafetensorsModelConfig::Qwen(_)
@@ -706,6 +707,7 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::Lfm2(c) => lfm2(g, c),
         GgufModelConfig::KimiLinear(c) => kimi(g, c),
         GgufModelConfig::NemotronH(c) => nemotron(g, c),
+        GgufModelConfig::VoiceChat(c) => super::voicechat::describe(g, c),
         GgufModelConfig::DeepSeekV3(c) => deepseek_v3(g, c),
         GgufModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
         GgufModelConfig::Gemma4(c) => gemma(g, c),
@@ -1844,7 +1846,11 @@ fn qwen4_exp(g: &mut Builder, c: &crate::qwen4_exp::config::Config) {
                     positional_encoding: Some(PositionalEncoding::Rotary),
                     ..Default::default()
                 });
-                qwen4_state(g, &op, "Full K/V history, completed index summaries, positions and partial micro-block");
+                qwen4_state(
+                    g,
+                    &op,
+                    "Full K/V history, completed index summaries, positions and partial micro-block",
+                );
             }
             input = residual;
         }

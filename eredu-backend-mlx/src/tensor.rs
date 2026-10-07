@@ -575,13 +575,76 @@ impl Tensor for MlxTensor {
         keep_dims: bool,
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        backend(argmin_axis!(
+        let indices = backend(argmin_axis!(
             value.as_array(),
             axis,
             keep_dims = keep_dims,
             stream = context
+        ))?;
+        // Native argmin emits U32; the source axis has I32 extent, so this
+        // exact integer conversion cannot overflow for any selected index.
+        tensor(indices.as_dtype(Dtype::Int32, context))
+    }
+
+    fn rfft(&self, length: i32, axis: i32, context: &Self::Context) -> Result<(Self, Self), Error> {
+        let geometry =
+            eredu_nn::operation_geometry::RealFftGeometry::new(self.shape(), length, axis)?;
+        if self.as_array().dtype() != Dtype::Float32 {
+            return Err(Error::backend("forward real FFT requires F32 input"));
+        }
+        let spectrum = backend(safemlx::fft::rfft(
+            self.as_array(),
+            geometry.length(),
+            geometry.axis(),
+            context,
+        ))?;
+        Ok((
+            tensor(spectrum.real(context))?,
+            tensor(spectrum.imag(context))?,
         ))
-        .map(MlxTensor::from_array)
+    }
+
+    fn irfft(
+        real: &Self,
+        imaginary: &Self,
+        length: i32,
+        axis: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let geometry = eredu_nn::operation_geometry::InverseRealFftGeometry::new(
+            real.shape(),
+            imaginary.shape(),
+            length,
+            axis,
+        )?;
+        if real.as_array().dtype() != Dtype::Float32
+            || imaginary.as_array().dtype() != Dtype::Float32
+        {
+            return Err(Error::backend(
+                "inverse real FFT requires F32 spectral components",
+            ));
+        }
+        let imaginary = backend(imaginary.as_array().multiply(
+            Array::from_complex(safemlx::complex64::new(0.0, 1.0)),
+            context,
+        ))?;
+        let spectrum = backend(real.as_array().add(imaginary, context))?;
+        tensor(safemlx::fft::irfft(
+            &spectrum,
+            geometry.length(),
+            geometry.axis(),
+            context,
+        ))
+    }
+
+    fn sin_cos(&self, context: &Self::Context) -> Result<(Self, Self), Error> {
+        if self.as_array().dtype() != Dtype::Float32 {
+            return Err(Error::backend("sine/cosine requires F32 input"));
+        }
+        Ok((
+            tensor(self.as_array().sin(context))?,
+            tensor(self.as_array().cos(context))?,
+        ))
     }
 
     fn pad(

@@ -11,41 +11,143 @@ use crate::{
 use eredu_core::BackendFailure;
 use eredu_core::{
     scheduler::SemanticStateTransaction, Completion, RealtimeFrameScheduleState,
-    RealtimeInputFrame, RealtimeSampling, RealtimeScheduleError, RealtimeSpeechConfig,
+    RealtimeScheduleError, RealtimeSpeechConfig,
 };
 use std::marker::PhantomData;
+
+mod snapshot;
+pub use snapshot::RealtimeSnapshotError;
+
+/// Cloneable architecture-owned temporal policy, separate from native model state.
+/// Cloning must preserve an independent unpublished logical state. Successor
+/// validation is read-only and completes before any model-state publication.
+pub trait RealtimeScheduleState: Clone {
+    /// Complete immutable policy identity, including geometry and timing semantics.
+    type Identity: Clone + Eq;
+    /// Portable semantic failure retaining its original typed source.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Exact normalized policy identity.
+    fn identity(&self) -> &Self::Identity;
+    /// Validates a proposed successor without modifying either state.
+    fn validate_successor(&self, next: &Self) -> Result<(), Self::Error>;
+}
+
+impl RealtimeScheduleState for RealtimeFrameScheduleState {
+    type Identity = RealtimeSpeechConfig;
+    type Error = RealtimeScheduleError;
+    fn identity(&self) -> &Self::Identity {
+        self.schedule()
+    }
+    fn validate_successor(&self, next: &Self) -> Result<(), Self::Error> {
+        self.validate_schedule(next.schedule())
+    }
+}
+
+/// Exact scheduling identity and independently declared categorical sampler bank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeGenerationContract<I> {
+    identity: I,
+    sampler_count: usize,
+}
+impl<I> RealtimeGenerationContract<I> {
+    /// Declares a fixed sampler count; dense-only transitions may declare zero.
+    pub const fn new(identity: I, sampler_count: usize) -> Self {
+        Self {
+            identity,
+            sampler_count,
+        }
+    }
+    /// Complete selected schedule identity.
+    pub const fn identity(&self) -> &I {
+        &self.identity
+    }
+    /// Number of retained categorical sampler states.
+    pub const fn sampler_count(&self) -> usize {
+        self.sampler_count
+    }
+}
 
 /// Canonical composite state for realtime model generation.
 ///
 /// `C` is the exact completion type returned by a concrete
 /// [`SubmissionBackend`]. It is carried at the type level so a branch cannot
 /// be published using an unrelated completion kind.
-#[derive(Debug)]
-pub struct RealtimeGenerationState<M, S, R, C> {
+pub struct RealtimeGenerationState<M, Q: RealtimeScheduleState, P, S, R, C> {
     model_state: M,
-    schedule_state: RealtimeFrameScheduleState,
-    sampling: RealtimeSampling,
+    contract: RealtimeGenerationContract<Q::Identity>,
+    schedule_state: Q,
+    sampling: P,
     samplers: Vec<S>,
     random_state: Option<R>,
+    revision: u64,
     completion: PhantomData<fn() -> C>,
 }
 
 /// Unpublished branch of every mutable component in one realtime transition.
-#[derive(Debug)]
-pub struct RealtimeGenerationBranch<MB, S, R, C> {
+pub struct RealtimeGenerationBranch<MB, Q: RealtimeScheduleState, P, S, R, C> {
     model_state: MB,
-    schedule_state: RealtimeFrameScheduleState,
-    sampling: RealtimeSampling,
+    contract: RealtimeGenerationContract<Q::Identity>,
+    schedule_state: Q,
+    sampling: P,
     samplers: Vec<S>,
     random_state: Option<R>,
+    base_revision: u64,
     completion: Option<C>,
+}
+
+impl<M, Q, P, S, R, C> std::fmt::Debug for RealtimeGenerationState<M, Q, P, S, R, C>
+where
+    M: std::fmt::Debug,
+    Q: RealtimeScheduleState + std::fmt::Debug,
+    Q::Identity: std::fmt::Debug,
+    P: std::fmt::Debug,
+    S: std::fmt::Debug,
+    R: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeGenerationState")
+            .field("model_state", &self.model_state)
+            .field("contract", &self.contract)
+            .field("schedule_state", &self.schedule_state)
+            .field("sampling", &self.sampling)
+            .field("samplers", &self.samplers)
+            .field("random_state", &self.random_state)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+impl<MB, Q, P, S, R, C> std::fmt::Debug for RealtimeGenerationBranch<MB, Q, P, S, R, C>
+where
+    MB: std::fmt::Debug,
+    Q: RealtimeScheduleState + std::fmt::Debug,
+    Q::Identity: std::fmt::Debug,
+    P: std::fmt::Debug,
+    S: std::fmt::Debug,
+    R: std::fmt::Debug,
+    C: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeGenerationBranch")
+            .field("model_state", &self.model_state)
+            .field("contract", &self.contract)
+            .field("schedule_state", &self.schedule_state)
+            .field("sampling", &self.sampling)
+            .field("samplers", &self.samplers)
+            .field("random_state", &self.random_state)
+            .field("base_revision", &self.base_revision)
+            .field("completion", &self.completion)
+            .finish()
+    }
 }
 
 /// Additive execution contract for architectures that consume realtime frames.
 ///
 /// The causal-text base model contract remains unchanged. Realtime composition
 /// implements this extension only when frame ingress is part of execution.
-pub trait RealtimeFrameTransition<MB, S, R, C> {
+pub trait RealtimeFrameTransition<MB, Q: RealtimeScheduleState, P, S, R, C> {
+    /// Architecture-owned ingress, including explicit timing or non-audio substeps.
+    type Input;
     /// Output causally produced by one frame transition.
     type Output;
     /// Architecture or mechanism failure before publication.
@@ -55,8 +157,8 @@ pub trait RealtimeFrameTransition<MB, S, R, C> {
     /// and returns the exact completion associated with the submitted work.
     fn execute(
         &mut self,
-        frame: &RealtimeInputFrame,
-        branch: &mut RealtimeGenerationBranch<MB, S, R, C>,
+        frame: &Self::Input,
+        branch: &mut RealtimeGenerationBranch<MB, Q, P, S, R, C>,
     ) -> Result<(Self::Output, C), Self::Error>;
 }
 
@@ -84,6 +186,17 @@ pub enum RealtimeCompletionAttachmentError {
     AlreadyAttached,
 }
 
+/// Rejection or failure of an atomic operation on unpublished randomness.
+#[derive(Debug, thiserror::Error)]
+pub enum RealtimeRandomStateTransactionError<E> {
+    /// Submitted work cannot acquire further random decisions.
+    #[error("realtime random operation requires a branch without submission completion")]
+    Submitted,
+    /// The operation failed; its proposed random state is discarded.
+    #[error(transparent)]
+    Operation(E),
+}
+
 /// Invalid composite branch construction or publication.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -91,13 +204,30 @@ pub enum RealtimeGenerationTransactionError {
     /// The model/cache transaction could not branch or publish.
     #[error("realtime model-state transaction failed: {0}")]
     Model(#[source] BackendFailure),
-    /// The portable delayed-frame schedule identity did not match.
-    #[error(transparent)]
-    Schedule(#[from] RealtimeScheduleError),
-    /// Sampler count must equal text plus every depth-codebook decision.
+    /// Architecture-owned successor validation failed before publication.
+    #[error("realtime schedule successor validation failed: {0}")]
+    Schedule(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A state does not match its selected exact schedule identity.
+    #[error("realtime schedule identity does not match its generation contract")]
+    IdentityMismatch,
+    /// A branch carries a different immutable generation contract.
+    #[error("realtime generation branch contract differs from canonical state")]
+    ContractMismatch,
+    /// Another publication or sampling replacement invalidated the branch.
+    #[error("realtime branch revision {actual} is stale; canonical revision is {expected}")]
+    StaleRevision {
+        /// Current canonical revision.
+        expected: u64,
+        /// Revision from which the branch was created.
+        actual: u64,
+    },
+    /// No further publication revision is representable.
+    #[error("realtime generation revision exhausted")]
+    RevisionExhausted,
+    /// Sampler count must equal the retained explicit contract.
     #[error("realtime generation requires {expected} sampler states, received {actual}")]
     SamplerCardinality {
-        /// Required text-plus-depth prediction count.
+        /// Required categorical sampler count.
         expected: usize,
         /// Supplied sampler-state count.
         actual: usize,
@@ -113,52 +243,46 @@ pub enum RealtimeGenerationTransactionError {
     Completion(#[source] BackendFailure),
 }
 
-impl<M, S, R, C> RealtimeGenerationState<M, S, R, C>
+impl<M, Q, P, S, R, C> RealtimeGenerationState<M, Q, P, S, R, C>
 where
     M: SemanticStateTransaction,
+    Q: RealtimeScheduleState,
     M::Error: Send + Sync + 'static,
     C: Completion,
 {
-    /// Creates canonical state bound to one exact normalized schedule.
+    /// Adopts initialized scheduling state under an explicit immutable contract.
+    /// Identity and sampler cardinality are checked before retaining any state.
     pub fn new(
         model_state: M,
-        schedule: RealtimeSpeechConfig,
-        sampling: RealtimeSampling,
+        contract: RealtimeGenerationContract<Q::Identity>,
+        schedule_state: Q,
+        sampling: P,
         samplers: Vec<S>,
         random_state: Option<R>,
     ) -> Result<Self, RealtimeGenerationTransactionError> {
-        Self::from_parts(
-            model_state,
-            &schedule,
-            RealtimeFrameScheduleState::new(schedule.clone()),
-            sampling,
-            samplers,
-            random_state,
-        )
-    }
-
-    /// Validates and adopts an existing portable schedule state.
-    ///
-    /// This constructor is useful when resuming in-memory state: the state must
-    /// carry the same complete schedule identity, not merely equal dimensions.
-    pub fn from_parts(
-        model_state: M,
-        schedule: &RealtimeSpeechConfig,
-        schedule_state: RealtimeFrameScheduleState,
-        sampling: RealtimeSampling,
-        samplers: Vec<S>,
-        random_state: Option<R>,
-    ) -> Result<Self, RealtimeGenerationTransactionError> {
-        schedule_state.validate_schedule(schedule)?;
-        validate_sampler_cardinality(schedule, samplers.len())?;
+        if schedule_state.identity() != contract.identity() {
+            return Err(RealtimeGenerationTransactionError::IdentityMismatch);
+        }
+        validate_sampler_cardinality(contract.sampler_count(), samplers.len())?;
         Ok(Self {
             model_state,
+            contract,
             schedule_state,
             sampling,
             samplers,
             random_state,
+            revision: 0,
             completion: PhantomData,
         })
+    }
+
+    /// Immutable scheduling and categorical-state contract.
+    pub const fn contract(&self) -> &RealtimeGenerationContract<Q::Identity> {
+        &self.contract
+    }
+    /// Canonical publication revision, including idle sampling replacements.
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Borrows canonical model/cache state.
@@ -166,17 +290,17 @@ where
         &self.model_state
     }
 
-    /// Borrows canonical delayed-frame state.
-    pub const fn schedule_state(&self) -> &RealtimeFrameScheduleState {
+    /// Borrows canonical architecture schedule state.
+    pub const fn schedule_state(&self) -> &Q {
         &self.schedule_state
     }
 
     /// Returns the exact portable sampling policy paired with sampler and RNG state.
-    pub const fn sampling(&self) -> RealtimeSampling {
-        self.sampling
+    pub const fn sampling(&self) -> &P {
+        &self.sampling
     }
 
-    /// Borrows canonical sampler states in text-plus-depth order.
+    /// Borrows canonical sampler states in contract-declared decision order.
     pub fn samplers(&self) -> &[S] {
         &self.samplers
     }
@@ -189,14 +313,19 @@ where
     /// Atomically replaces portable controls, sampler state, and randomness while idle.
     pub fn replace_sampling(
         &mut self,
-        sampling: RealtimeSampling,
+        sampling: P,
         samplers: Vec<S>,
         random_state: Option<R>,
     ) -> Result<(), RealtimeGenerationTransactionError> {
-        validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())?;
+        validate_sampler_cardinality(self.contract.sampler_count(), samplers.len())?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(RealtimeGenerationTransactionError::RevisionExhausted)?;
         self.sampling = sampling;
         self.samplers = samplers;
         self.random_state = random_state;
+        self.revision = revision;
         Ok(())
     }
 
@@ -204,13 +333,14 @@ where
     /// component only after its exact completion succeeds.
     pub fn execute_frame_transition<T>(
         &mut self,
-        frame: &RealtimeInputFrame,
+        frame: &T::Input,
         transition: &mut T,
     ) -> Result<T::Output, RealtimeFrameExecutionError>
     where
+        P: Clone,
         S: Clone,
         R: Clone,
-        T: RealtimeFrameTransition<M::Branch, S, R, C>,
+        T: RealtimeFrameTransition<M::Branch, Q, P, S, R, C>,
         T::Error: std::error::Error + Send + Sync + 'static,
     {
         let mut branch = SemanticStateTransaction::branch(self)
@@ -244,10 +374,11 @@ where
     /// rather than architecture-owned or family-specific completion metadata.
     pub fn commit_submission_branch<B>(
         &mut self,
-        branch: RealtimeGenerationBranch<M::Branch, S, R, C>,
+        branch: RealtimeGenerationBranch<M::Branch, Q, P, S, R, C>,
     ) -> Result<(), RealtimeGenerationTransactionError>
     where
         B: SubmissionBackend<Completion = C>,
+        P: Clone,
         S: Clone,
         R: Clone,
     {
@@ -255,7 +386,11 @@ where
     }
 }
 
-impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
+impl<MB, Q: RealtimeScheduleState, P, S, R, C> RealtimeGenerationBranch<MB, Q, P, S, R, C> {
+    /// Immutable contract retained with this unpublished branch.
+    pub const fn contract(&self) -> &RealtimeGenerationContract<Q::Identity> {
+        &self.contract
+    }
     /// Borrows the transition-local model/cache state.
     pub const fn model_state(&self) -> &MB {
         &self.model_state
@@ -266,18 +401,18 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
         &mut self.model_state
     }
 
-    /// Borrows the transition-local delayed-frame state.
-    pub const fn schedule_state(&self) -> &RealtimeFrameScheduleState {
+    /// Borrows the transition-local architecture schedule state.
+    pub const fn schedule_state(&self) -> &Q {
         &self.schedule_state
     }
 
     /// Returns branch-local portable sampling controls.
-    pub const fn sampling(&self) -> RealtimeSampling {
-        self.sampling
+    pub const fn sampling(&self) -> &P {
+        &self.sampling
     }
 
-    /// Mutably borrows the transition-local delayed-frame state.
-    pub fn schedule_state_mut(&mut self) -> &mut RealtimeFrameScheduleState {
+    /// Mutably borrows the transition-local architecture schedule state.
+    pub fn schedule_state_mut(&mut self) -> &mut Q {
         &mut self.schedule_state
     }
 
@@ -285,13 +420,23 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
     ///
     /// Full-frame executors use this split to advance the schedule against the
     /// same unpublished model branch without shortening either transaction.
-    pub fn state_parts_mut(&mut self) -> (&mut MB, &mut RealtimeFrameScheduleState) {
+    pub fn state_parts_mut(&mut self) -> (&mut MB, &mut Q) {
         (&mut self.model_state, &mut self.schedule_state)
     }
 
-    /// Borrows transition-local sampler states in text-plus-depth order.
+    /// Borrows transition-local sampler states in contract-declared decision order.
     pub fn samplers(&self) -> &[S] {
         &self.samplers
+    }
+
+    /// Mutably borrows sampler policies within this unpublished branch.
+    ///
+    /// Architectures can record effective feedback after adopting a completed
+    /// decision driver, before subsequent dense draws use its advanced random
+    /// state. The slice preserves the contract's sampler count. Discarding the
+    /// branch discards these policy updates with its other tentative state.
+    pub fn samplers_mut(&mut self) -> &mut [S] {
+        &mut self.samplers
     }
 
     /// Borrows transition-local backend random state.
@@ -302,6 +447,57 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
     /// Returns whether this branch already represents one submitted transition.
     pub const fn has_submission_completion(&self) -> bool {
         self.completion.is_some()
+    }
+
+    /// Proposes an operation over a clone of this branch's random stream and
+    /// adopts that stream only after the entire operation succeeds. This permits
+    /// coupled draws and their dependent neural work to share one rollback
+    /// boundary. It does not establish native completion: failed work still
+    /// requires the enclosing submission owner's exact completion handling.
+    pub fn with_random_state_transaction<T, E>(
+        &mut self,
+        operation: impl FnOnce(&mut Option<R>) -> Result<T, E>,
+    ) -> Result<T, RealtimeRandomStateTransactionError<E>>
+    where
+        R: Clone,
+    {
+        if self.has_submission_completion() {
+            return Err(RealtimeRandomStateTransactionError::Submitted);
+        }
+        let mut candidate = self.random_state.clone();
+        let output =
+            operation(&mut candidate).map_err(RealtimeRandomStateTransactionError::Operation)?;
+        self.random_state = candidate;
+        Ok(output)
+    }
+
+    /// Draws uniforms from this unpublished branch's retained stream without a
+    /// categorical decision. Dense-only contracts require no sampler states.
+    /// Validation or synchronous draw failure leaves branch randomness unchanged.
+    pub fn draw_uniform<B>(
+        &mut self,
+        shape: &[i32],
+        context: &B::Context,
+    ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>>
+    where
+        B: crate::DenseSamplingBackend<RandomState = R>,
+        R: Clone,
+    {
+        crate::dense_sampling::draw_uniform::<B>(&mut self.random_state, shape, context)
+    }
+
+    /// Draws standard normals using the same branch-local stream and publication
+    /// boundary as categorical decisions. No synthetic decision is introduced.
+    pub fn draw_standard_normal<B>(
+        &mut self,
+        shape: &[i32],
+        context: &B::Context,
+    ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>>
+    where
+        B: crate::DenseSamplingBackend<RandomState = R>,
+        R: Clone,
+    {
+        crate::dense_sampling::draw_standard_normal::<B>(&mut self.random_state, shape, context)
     }
 
     /// Attaches the one exact completion returned by backend submission.
@@ -358,15 +554,17 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
     }
 }
 
-impl<M, S, R, C> SemanticStateTransaction for RealtimeGenerationState<M, S, R, C>
+impl<M, Q, P, S, R, C> SemanticStateTransaction for RealtimeGenerationState<M, Q, P, S, R, C>
 where
     M: SemanticStateTransaction,
+    Q: RealtimeScheduleState,
     M::Error: Send + Sync + 'static,
+    P: Clone,
     S: Clone,
     R: Clone,
     C: Completion,
 {
-    type Branch = RealtimeGenerationBranch<M::Branch, S, R, C>;
+    type Branch = RealtimeGenerationBranch<M::Branch, Q, P, S, R, C>;
     type Error = RealtimeGenerationTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
@@ -375,10 +573,12 @@ where
                 .model_state
                 .branch()
                 .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?,
-            schedule_state: self.schedule_state.branch()?,
-            sampling: self.sampling,
+            contract: self.contract.clone(),
+            schedule_state: self.schedule_state.clone(),
+            sampling: self.sampling.clone(),
             samplers: self.samplers.clone(),
             random_state: self.random_state.clone(),
+            base_revision: self.revision,
             completion: None,
         })
     }
@@ -386,10 +586,12 @@ where
     fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
         let RealtimeGenerationBranch {
             model_state,
+            contract,
             schedule_state,
             sampling,
             samplers,
             random_state,
+            base_revision,
             completion,
         } = branch;
 
@@ -418,25 +620,44 @@ where
                 Self::Error::Completion(BackendFailure::from_error(error)),
             ));
         }
-        if let Err(error) = self
-            .schedule_state
-            .validate_schedule(schedule_state.schedule())
-        {
-            return Err(rollback(model_state, error.into()));
+        if base_revision != self.revision {
+            return Err(rollback(
+                model_state,
+                Self::Error::StaleRevision {
+                    expected: self.revision,
+                    actual: base_revision,
+                },
+            ));
+        }
+        if contract != self.contract {
+            return Err(rollback(model_state, Self::Error::ContractMismatch));
+        }
+        if schedule_state.identity() != self.contract.identity() {
+            return Err(rollback(model_state, Self::Error::IdentityMismatch));
+        }
+        if let Err(error) = self.schedule_state.validate_successor(&schedule_state) {
+            return Err(rollback(
+                model_state,
+                Self::Error::Schedule(Box::new(error)),
+            ));
         }
         if let Err(error) =
-            validate_sampler_cardinality(self.schedule_state.schedule(), samplers.len())
+            validate_sampler_cardinality(self.contract.sampler_count(), samplers.len())
         {
             return Err(rollback(model_state, error));
         }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return Err(rollback(model_state, Self::Error::RevisionExhausted));
+        };
 
         self.model_state
             .commit_branch(model_state)
             .map_err(|error| Self::Error::Model(BackendFailure::from_error(error)))?;
-        self.schedule_state.commit_branch(schedule_state)?;
+        self.schedule_state = schedule_state;
         self.sampling = sampling;
         self.samplers = samplers;
         self.random_state = random_state;
+        self.revision = revision;
         Ok(())
     }
 
@@ -461,15 +682,9 @@ where
 }
 
 fn validate_sampler_cardinality(
-    schedule: &RealtimeSpeechConfig,
+    expected: usize,
     actual: usize,
 ) -> Result<(), RealtimeGenerationTransactionError> {
-    let expected = schedule.depth_audio_codebooks().checked_add(1).ok_or(
-        RealtimeGenerationTransactionError::SamplerCardinality {
-            expected: usize::MAX,
-            actual,
-        },
-    )?;
     if actual != expected {
         return Err(RealtimeGenerationTransactionError::SamplerCardinality { expected, actual });
     }
@@ -482,7 +697,7 @@ mod tests {
     use crate::{PenaltyConfig, PredictionDirective};
     use eredu_core::{
         scheduler::SemanticStateTransaction, RealtimeFrameConvention, RealtimeFrameForcing,
-        RealtimeInputFrame, TokenFilter,
+        RealtimeInputFrame, RealtimeSampling, TokenFilter,
     };
     use std::{cell::Cell, convert::Infallible, fmt, rc::Rc};
 
@@ -683,6 +898,34 @@ mod tests {
         }
     }
 
+    // Draws return their mock stream position, so lifecycle assertions observe
+    // exact consumption without asserting any real distribution's numerics.
+    impl crate::DenseSamplingBackend for Backend {
+        fn uniform_f32(shape: &[i32], random: &mut i32, _: &()) -> Result<i32, String> {
+            *random += shape.iter().product::<i32>();
+            Ok(*random)
+        }
+        fn standard_normal_f32(shape: &[i32], random: &mut i32, _: &()) -> Result<i32, String> {
+            *random += 100 * shape.iter().product::<i32>();
+            if shape == [13] {
+                return Err("injected draw failure after candidate mutation".into());
+            }
+            Ok(*random)
+        }
+        fn dense_shape(_: &i32) -> &[i32] {
+            &[1]
+        }
+        fn gumbel_max(
+            _: &i32,
+            _: &i32,
+            _: crate::GumbelTruncation,
+            _: f32,
+            _: &(),
+        ) -> Result<i32, String> {
+            Err("this lifecycle backend does not select Gumbel categories".into())
+        }
+    }
+
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct StatefulSampler(i32);
 
@@ -702,7 +945,14 @@ mod tests {
         }
     }
 
-    type State = RealtimeGenerationState<ModelState, StatefulSampler, i32, MockCompletion>;
+    type State = RealtimeGenerationState<
+        ModelState,
+        RealtimeFrameScheduleState,
+        RealtimeSampling,
+        StatefulSampler,
+        i32,
+        MockCompletion,
+    >;
 
     fn schedule() -> RealtimeSpeechConfig {
         RealtimeSpeechConfig::new(
@@ -724,7 +974,8 @@ mod tests {
                 model_step: 1,
                 cache_offset: 2,
             },
-            schedule(),
+            RealtimeGenerationContract::new(schedule(), 2),
+            RealtimeFrameScheduleState::new(schedule()),
             RealtimeSampling::greedy(),
             vec![StatefulSampler(0), StatefulSampler(5)],
             Some(7),
@@ -734,7 +985,14 @@ mod tests {
 
     fn mutate_every_component(
         frame: &RealtimeInputFrame,
-        branch: &mut RealtimeGenerationBranch<ModelState, StatefulSampler, i32, MockCompletion>,
+        branch: &mut RealtimeGenerationBranch<
+            ModelState,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            StatefulSampler,
+            i32,
+            MockCompletion,
+        >,
     ) {
         branch.model_state_mut().model_step = frame.input_audio_tokens()[0];
         branch.model_state_mut().cache_offset = frame.forced_text_tokens().unwrap()[0];
@@ -771,14 +1029,31 @@ mod tests {
         waits: Rc<Cell<usize>>,
     }
 
-    impl RealtimeFrameTransition<ModelState, StatefulSampler, i32, MockCompletion> for FrameTransition {
+    impl
+        RealtimeFrameTransition<
+            ModelState,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            StatefulSampler,
+            i32,
+            MockCompletion,
+        > for FrameTransition
+    {
+        type Input = RealtimeInputFrame;
         type Output = i32;
         type Error = Infallible;
 
         fn execute(
             &mut self,
             frame: &RealtimeInputFrame,
-            branch: &mut RealtimeGenerationBranch<ModelState, StatefulSampler, i32, MockCompletion>,
+            branch: &mut RealtimeGenerationBranch<
+                ModelState,
+                RealtimeFrameScheduleState,
+                RealtimeSampling,
+                StatefulSampler,
+                i32,
+                MockCompletion,
+            >,
         ) -> Result<(Self::Output, MockCompletion), Self::Error> {
             mutate_every_component(frame, branch);
             let output = branch.model_state.model_step + branch.model_state.cache_offset;
@@ -923,12 +1198,19 @@ mod tests {
             }
         }
 
-        type TrackingState =
-            RealtimeGenerationState<TrackingModel, StatefulSampler, i32, MockCompletion>;
+        type TrackingState = RealtimeGenerationState<
+            TrackingModel,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            StatefulSampler,
+            i32,
+            MockCompletion,
+        >;
         let rollbacks = Rc::new(Cell::new(0));
         let mut state = TrackingState::new(
             TrackingModel(rollbacks.clone()),
-            schedule(),
+            RealtimeGenerationContract::new(schedule(), 2),
+            RealtimeFrameScheduleState::new(schedule()),
             RealtimeSampling::greedy(),
             vec![StatefulSampler(0), StatefulSampler(0)],
             None,
@@ -937,9 +1219,17 @@ mod tests {
 
         struct FailingTransition;
 
-        impl RealtimeFrameTransition<TrackingModel, StatefulSampler, i32, MockCompletion>
-            for FailingTransition
+        impl
+            RealtimeFrameTransition<
+                TrackingModel,
+                RealtimeFrameScheduleState,
+                RealtimeSampling,
+                StatefulSampler,
+                i32,
+                MockCompletion,
+            > for FailingTransition
         {
+            type Input = RealtimeInputFrame;
             type Output = ();
             type Error = ModelError;
 
@@ -948,6 +1238,8 @@ mod tests {
                 _frame: &RealtimeInputFrame,
                 _branch: &mut RealtimeGenerationBranch<
                     TrackingModel,
+                    RealtimeFrameScheduleState,
+                    RealtimeSampling,
                     StatefulSampler,
                     i32,
                     MockCompletion,
@@ -1007,20 +1299,18 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            State::from_parts(
+            State::new(
                 ModelState {
                     model_step: 1,
                     cache_offset: 2,
                 },
-                &schedule(),
+                RealtimeGenerationContract::new(schedule(), 2),
                 RealtimeFrameScheduleState::new(other),
                 RealtimeSampling::greedy(),
                 vec![StatefulSampler(0), StatefulSampler(0)],
                 Some(0),
             ),
-            Err(RealtimeGenerationTransactionError::Schedule(
-                RealtimeScheduleError::ScheduleMismatch
-            ))
+            Err(RealtimeGenerationTransactionError::IdentityMismatch)
         ));
         assert!(matches!(
             State::new(
@@ -1028,7 +1318,8 @@ mod tests {
                     model_step: 1,
                     cache_offset: 2,
                 },
-                schedule(),
+                RealtimeGenerationContract::new(schedule(), 2),
+                RealtimeFrameScheduleState::new(schedule()),
                 RealtimeSampling::greedy(),
                 vec![StatefulSampler(0)],
                 Some(0),
@@ -1168,7 +1459,7 @@ mod tests {
                 actual: 1
             })
         ));
-        assert_eq!(state.sampling(), RealtimeSampling::greedy());
+        assert_eq!(state.sampling(), &RealtimeSampling::greedy());
         assert_eq!(state.samplers(), [StatefulSampler(0), StatefulSampler(5)]);
         assert_eq!(state.random_state(), Some(&7));
 
@@ -1179,9 +1470,367 @@ mod tests {
                 Some(11),
             )
             .unwrap();
-        assert_eq!(state.sampling(), sampling);
+        assert_eq!(state.sampling(), &sampling);
         assert_eq!(state.samplers(), [StatefulSampler(9), StatefulSampler(10)]);
         assert_eq!(state.random_state(), Some(&11));
-        assert_eq!(state.branch().unwrap().sampling(), sampling);
+        assert_eq!(state.branch().unwrap().sampling(), &sampling);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ClockIdentity {
+        samples_per_frame: usize,
+        tool_limit: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct IndependentClocks {
+        identity: ClockIdentity,
+        audio: u64,
+        model: u64,
+        tool: u64,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("invalid independent clock transition")]
+    struct ClockError;
+
+    impl RealtimeScheduleState for IndependentClocks {
+        type Identity = ClockIdentity;
+        type Error = ClockError;
+        fn identity(&self) -> &Self::Identity {
+            &self.identity
+        }
+        fn validate_successor(&self, next: &Self) -> Result<(), ClockError> {
+            let audio_step = next.audio == self.audio + 1 && next.tool == self.tool;
+            let tool_step = next.audio == self.audio && next.tool == self.tool + 1;
+            if next.model != self.model + 1
+                || !(audio_step || tool_step)
+                || next.tool > self.identity.tool_limit
+            {
+                return Err(ClockError);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OpaqueSampling(String);
+
+    #[derive(Debug, Clone)]
+    struct CountedModel {
+        value: i32,
+        commits: Rc<Cell<usize>>,
+        discards: Rc<Cell<usize>>,
+    }
+    impl SemanticStateTransaction for CountedModel {
+        type Branch = Self;
+        type Error = Infallible;
+        fn branch(&self) -> Result<Self, Self::Error> {
+            Ok(self.clone())
+        }
+        fn commit_branch(&mut self, next: Self) -> Result<(), Self::Error> {
+            self.commits.set(self.commits.get() + 1);
+            *self = next;
+            Ok(())
+        }
+        fn discard_branch(branch: Self) -> Result<(), Self::Error> {
+            branch.discards.set(branch.discards.get() + 1);
+            Ok(())
+        }
+    }
+    type ClockState = RealtimeGenerationState<
+        CountedModel,
+        IndependentClocks,
+        OpaqueSampling,
+        StatefulSampler,
+        i32,
+        MockCompletion,
+    >;
+    type ClockBranch = RealtimeGenerationBranch<
+        CountedModel,
+        IndependentClocks,
+        OpaqueSampling,
+        StatefulSampler,
+        i32,
+        MockCompletion,
+    >;
+
+    fn clock_state() -> ClockState {
+        let identity = ClockIdentity {
+            samples_per_frame: 1280,
+            tool_limit: 16,
+        };
+        ClockState::new(
+            CountedModel {
+                value: 0,
+                commits: Rc::new(Cell::new(0)),
+                discards: Rc::new(Cell::new(0)),
+            },
+            RealtimeGenerationContract::new(identity.clone(), 1),
+            IndependentClocks {
+                identity,
+                audio: 0,
+                model: 0,
+                tool: 0,
+            },
+            OpaqueSampling("initial".into()),
+            vec![StatefulSampler(0)],
+            Some(3),
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClockInput {
+        Audio,
+        Tool,
+    }
+    struct ClockTransition;
+    impl
+        RealtimeFrameTransition<
+            CountedModel,
+            IndependentClocks,
+            OpaqueSampling,
+            StatefulSampler,
+            i32,
+            MockCompletion,
+        > for ClockTransition
+    {
+        type Input = ClockInput;
+        type Output = (i32, u64, u64, u64);
+        type Error = Infallible;
+        fn execute(
+            &mut self,
+            input: &ClockInput,
+            branch: &mut ClockBranch,
+        ) -> Result<(Self::Output, MockCompletion), Infallible> {
+            let clock = branch.schedule_state_mut();
+            clock.model += 1;
+            let logits = match input {
+                ClockInput::Audio => {
+                    clock.audio += 1;
+                    10
+                }
+                ClockInput::Tool => {
+                    clock.tool += 1;
+                    20
+                }
+            };
+            let plan =
+                SequentialDecisionPlan::new([PredictionDirective::Sample], false, false).unwrap();
+            let mut driver = branch.decision_driver::<Backend>(plan, vec![1.0]).unwrap();
+            let token = driver
+                .resolve(0, &logits, crate::TokenDomain::new(100), &())
+                .unwrap();
+            branch.adopt_decision_driver(driver).unwrap();
+            branch.model_state_mut().value = token;
+            let clock = branch.schedule_state();
+            Ok((
+                (token, clock.audio, clock.model, clock.tool),
+                MockCompletion::new(CompletionOutcome::Success).0,
+            ))
+        }
+    }
+    fn prepare_clock(state: &ClockState, input: ClockInput) -> (ClockBranch, (i32, u64, u64, u64)) {
+        let mut branch = state.branch().unwrap();
+        let (output, completion) = ClockTransition.execute(&input, &mut branch).unwrap();
+        branch.attach_submission_completion(completion).unwrap();
+        (branch, output)
+    }
+
+    #[test]
+    fn generic_clock_transition_matches_direct_and_controlled_execution() {
+        let mut direct = clock_state();
+        let mut controlled = clock_state();
+        let mut direct_outputs = Vec::new();
+        let mut controlled_outputs = Vec::new();
+        for input in [
+            ClockInput::Audio,
+            ClockInput::Tool,
+            ClockInput::Tool,
+            ClockInput::Audio,
+        ] {
+            direct_outputs.push(
+                direct
+                    .execute_frame_transition(&input, &mut ClockTransition)
+                    .unwrap(),
+            );
+            let (branch, output) = prepare_clock(&controlled, input);
+            controlled.commit_branch(branch).unwrap();
+            controlled_outputs.push(output);
+        }
+        assert_eq!(direct_outputs, controlled_outputs);
+        assert_eq!(
+            direct_outputs
+                .iter()
+                .map(|(_, audio, model, tool)| (*audio, *model, *tool))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, 0), (1, 2, 1), (1, 3, 2), (2, 4, 2)]
+        );
+        assert_eq!(direct.schedule_state(), controlled.schedule_state());
+        assert_eq!(direct.samplers(), controlled.samplers());
+        assert_eq!(direct.random_state(), controlled.random_state());
+        assert_eq!(direct.model_state().commits.get(), 4);
+        assert_eq!(controlled.model_state().commits.get(), 4);
+        assert_eq!(direct.revision(), 4);
+    }
+
+    #[test]
+    fn stale_schedule_branches_and_sampling_reseeds_reject_before_model_commit() {
+        let mut state = clock_state();
+        let (current, _) = prepare_clock(&state, ClockInput::Audio);
+        let (stale, _) = prepare_clock(&state, ClockInput::Tool);
+        state.commit_branch(current).unwrap();
+        assert!(matches!(
+            state.commit_branch(stale),
+            Err(RealtimeGenerationTransactionError::StaleRevision {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(state.model_state().commits.get(), 1);
+        assert_eq!(state.schedule_state().tool, 0);
+
+        let (before_reseed, _) = prepare_clock(&state, ClockInput::Tool);
+        state
+            .replace_sampling(
+                OpaqueSampling("reseeded".into()),
+                vec![StatefulSampler(9)],
+                Some(17),
+            )
+            .unwrap();
+        assert!(matches!(
+            state.commit_branch(before_reseed),
+            Err(RealtimeGenerationTransactionError::StaleRevision {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert_eq!(state.model_state().commits.get(), 1);
+        assert_eq!(state.model_state().discards.get(), 2);
+        assert_eq!(state.schedule_state().audio, 1);
+        assert_eq!(state.schedule_state().model, 1);
+        assert_eq!(state.schedule_state().tool, 0);
+        assert_eq!(state.sampling(), &OpaqueSampling("reseeded".into()));
+        assert_eq!(state.samplers(), &[StatefulSampler(9)]);
+        assert_eq!(state.random_state(), Some(&17));
+    }
+
+    #[test]
+    fn generic_successor_failure_and_revision_exhaustion_leave_canonical_state_unchanged() {
+        let mut state = clock_state();
+        let (mut invalid, _) = prepare_clock(&state, ClockInput::Tool);
+        invalid.schedule_state_mut().audio = 1;
+        let error = state.commit_branch(invalid).unwrap_err();
+        assert!(
+            matches!(&error, RealtimeGenerationTransactionError::Schedule(source) if source.is::<ClockError>())
+        );
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .is::<ClockError>());
+        assert_eq!(state.model_state().commits.get(), 0);
+        assert_eq!(
+            (
+                state.schedule_state().audio,
+                state.schedule_state().model,
+                state.schedule_state().tool
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(state.samplers(), &[StatefulSampler(0)]);
+        assert_eq!(state.random_state(), Some(&3));
+        assert_eq!(state.revision(), 0);
+
+        state.revision = u64::MAX;
+        let (overflow, _) = prepare_clock(&state, ClockInput::Audio);
+        assert!(matches!(
+            state.commit_branch(overflow),
+            Err(RealtimeGenerationTransactionError::RevisionExhausted)
+        ));
+        assert!(matches!(
+            state.replace_sampling(
+                OpaqueSampling("overflow".into()),
+                vec![StatefulSampler(7)],
+                Some(9)
+            ),
+            Err(RealtimeGenerationTransactionError::RevisionExhausted)
+        ));
+        assert_eq!(state.model_state().commits.get(), 0);
+        assert_eq!(state.sampling(), &OpaqueSampling("initial".into()));
+        assert_eq!(state.samplers(), &[StatefulSampler(0)]);
+        assert_eq!(state.random_state(), Some(&3));
+    }
+
+    #[test]
+    fn dense_only_branch_draws_commit_or_discard_rng_without_categorical_samplers() {
+        type DenseState = RealtimeGenerationState<
+            CountedModel,
+            IndependentClocks,
+            OpaqueSampling,
+            (),
+            i32,
+            MockCompletion,
+        >;
+        let identity = ClockIdentity {
+            samples_per_frame: 1280,
+            tool_limit: 16,
+        };
+        let mut state = DenseState::new(
+            CountedModel {
+                value: 0,
+                commits: Rc::new(Cell::new(0)),
+                discards: Rc::new(Cell::new(0)),
+            },
+            RealtimeGenerationContract::new(identity.clone(), 0),
+            IndependentClocks {
+                identity,
+                audio: 0,
+                model: 0,
+                tool: 0,
+            },
+            OpaqueSampling("dense-only".into()),
+            vec![],
+            Some(3),
+        )
+        .unwrap();
+        let mut candidate = state.branch().unwrap();
+        assert_eq!(candidate.draw_uniform::<Backend>(&[2], &()).unwrap(), 5);
+        assert_eq!(
+            candidate
+                .draw_standard_normal::<Backend>(&[1], &())
+                .unwrap(),
+            105
+        );
+        assert!(candidate.samplers().is_empty());
+        assert_eq!(state.random_state(), Some(&3));
+        candidate.schedule_state_mut().model = 1;
+        candidate.schedule_state_mut().audio = 1;
+        candidate
+            .attach_submission_completion(MockCompletion::new(CompletionOutcome::Success).0)
+            .unwrap();
+        state.commit_branch(candidate).unwrap();
+        assert_eq!(state.random_state(), Some(&105));
+        assert_eq!(state.model_state().commits.get(), 1);
+
+        let mut discarded = state.branch().unwrap();
+        assert_eq!(
+            discarded
+                .draw_standard_normal::<Backend>(&[2], &())
+                .unwrap(),
+            305
+        );
+        DenseState::discard_branch(discarded).unwrap();
+        assert_eq!(state.random_state(), Some(&105));
+
+        let mut failed = state.branch().unwrap();
+        assert_eq!(failed.draw_uniform::<Backend>(&[1], &()).unwrap(), 106);
+        assert!(matches!(failed.draw_standard_normal::<Backend>(&[13], &()),
+            Err(crate::DenseSamplingError::Backend(error)) if error == "injected draw failure after candidate mutation"));
+        assert_eq!(failed.random_state(), Some(&106));
+        DenseState::discard_branch(failed).unwrap();
+        assert_eq!(state.random_state(), Some(&105));
+        assert_eq!(state.model_state().commits.get(), 1);
+        assert_eq!(state.model_state().discards.get(), 2);
+        assert!(state.samplers().is_empty());
     }
 }

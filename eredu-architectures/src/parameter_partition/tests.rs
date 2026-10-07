@@ -559,7 +559,7 @@ fn prepared_prediction_parameter_maps_preserve_tp_shards_and_pp_ep_replicas() {
     let layouts = (0..2)
         .map(|rank| {
             Arc::new(
-                crate::partitioned_execution::derive_partitioned_local_layout(
+                eredu_runtime::derive_partitioned_local_layout(
                     &parameters,
                     ParallelRankTopology::new(tensor, rank).unwrap(),
                 )

@@ -290,8 +290,8 @@ where
 
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
-        _index: usize,
-        _address: ExecutionUnitAddress,
+        index: usize,
+        address: ExecutionUnitAddress,
         mut lease: Self::Lease,
         output: &'a MlxTensor,
         state_values: StateValues,
@@ -311,6 +311,22 @@ where
         )?;
         lease.submitted(event)?;
         self.pending.push_back(lease);
+        if self.dense.is_some()
+            && self
+                .layout
+                .group_range(address.group())
+                .is_some_and(|range| index.checked_add(1) == Some(range.end))
+        {
+            // Device budgets cover one group window, not the sum of successive
+            // groups. Establish every consumer's exact completion before
+            // releasing this group's transfers and host/device protections.
+            self.drain()?;
+            let dense = self.dense.as_mut().expect("active dense group");
+            dense.windows[address.group()].take();
+            if let Some(group) = dense.groups[address.group()].take() {
+                group.complete()?;
+            }
+        }
         Ok(())
     }
 

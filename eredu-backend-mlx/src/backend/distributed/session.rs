@@ -176,6 +176,42 @@ impl MlxDistributedSession {
         ),
         Error,
     > {
+        let sampling = self
+            .communicators
+            .communication_group(sampling_group)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "selected sampling group {} was not realized",
+                    sampling_group.value()
+                ))
+            })?;
+        let (communication, parallel, stream) =
+            self.into_component_communication(manifest, tensor_group)?;
+        Ok((communication, parallel, sampling, stream))
+    }
+
+    /// Consumes exact selected groups/routes without requiring a sampling channel.
+    /// Non-generative components share the same bounded completion and poison
+    /// authority as the ordinary distributed session.
+    pub(crate) fn into_component_communication(
+        self,
+        manifest: eredu_runtime::CommunicationManifest,
+        tensor_group: Option<CollectiveGroupId>,
+    ) -> Result<
+        (
+            eredu_runtime::PartitionCommunication<
+                crate::backend::nn::shared::MlxNeuralBackend,
+                Group,
+                crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+                crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+            >,
+            Option<Group>,
+            Stream,
+        ),
+        Error,
+    > {
+        self.validate_selected_manifest(&manifest)?;
         let parallel = tensor_group
             .map(|tensor_group| {
                 self.communicators
@@ -189,16 +225,6 @@ impl MlxDistributedSession {
                     })
             })
             .transpose()?;
-        let sampling = self
-            .communicators
-            .communication_group(sampling_group)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Parallel(format!(
-                    "selected sampling group {} was not realized",
-                    sampling_group.value()
-                ))
-            })?;
         let Self {
             manifest: _,
             communicators,
@@ -217,7 +243,7 @@ impl MlxDistributedSession {
             authority,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok((communication, parallel, sampling, stream))
+        Ok((communication, parallel, stream))
     }
 
     #[cfg(test)]

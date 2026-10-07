@@ -17,6 +17,8 @@ eredu-gguf.workspace = true
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

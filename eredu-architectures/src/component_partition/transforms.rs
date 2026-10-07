@@ -400,7 +400,7 @@ mod tests {
         for rank in 0..topology.world_size() {
             let rank = ParallelRankTopology::new(topology, rank).unwrap();
             let layout =
-                crate::partitioned_execution::derive_partitioned_local_layout(&parameters, rank)
+                eredu_runtime::derive_partitioned_local_layout(&parameters, rank)
                     .unwrap();
             let owns = |name: &str| {
                 let owner = parameters
@@ -498,7 +498,7 @@ mod tests {
         let (descriptor, parameters) = fixture();
         let topology = ParallelTopology::new(2, 2, 2, 1).unwrap();
         let local = Arc::new(
-            crate::partitioned_execution::derive_partitioned_local_layout(
+            eredu_runtime::derive_partitioned_local_layout(
                 &parameters,
                 ParallelRankTopology::new(topology, 0).unwrap(),
             )

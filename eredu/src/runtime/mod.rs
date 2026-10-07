@@ -3,3 +3,4 @@
 /// Chat preparation, output dialects, and constrained decoding.
 pub mod chat;
 pub(crate) mod generation;
+pub(crate) mod voicechat;

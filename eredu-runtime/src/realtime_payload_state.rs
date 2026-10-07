@@ -1,6 +1,6 @@
 //! Atomic model-state and delayed-payload-history transactions.
 
-use eredu_core::{scheduler::SemanticStateTransaction, RealtimeSpeechConfig};
+use eredu_core::{scheduler::SemanticStateTransaction, RealtimeChannelLayout};
 
 use crate::{RealtimePayloadHistory, RealtimePayloadHistoryError};
 
@@ -17,7 +17,7 @@ impl<M, P> RealtimePayloadState<M, P> {
     /// This is the canonical request-local initialization path. Architecture and
     /// facade composition can assemble neutral realtime state without asking a
     /// concrete backend to understand delayed-frame semantics.
-    pub fn fresh(model_state: M, schedule: RealtimeSpeechConfig) -> Self {
+    pub fn fresh(model_state: M, schedule: RealtimeChannelLayout) -> Self {
         Self {
             model_state,
             payload_history: RealtimePayloadHistory::new(schedule),
@@ -28,7 +28,7 @@ impl<M, P> RealtimePayloadState<M, P> {
     pub fn new(
         model_state: M,
         payload_history: RealtimePayloadHistory<P>,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
     ) -> Result<Self, RealtimePayloadHistoryError> {
         payload_history.validate_schedule(schedule)?;
         Ok(Self {
@@ -165,47 +165,65 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use eredu_core::{
-        scheduler::SemanticStateTransaction, RealtimeFrameConvention, RealtimeFrameSlot,
+        scheduler::SemanticStateTransaction, RealtimeChannelId, RealtimeFrameConvention,
         RealtimeSlotCoordinate,
     };
 
     use super::*;
+    use crate::RealtimeIngressContract;
     use crate::{
         RealtimePayloadContract, RealtimePayloadGeneration, RealtimePayloadOwnerIdentity,
         TokenDomain,
     };
+    use eredu_core::RealtimeSpeechConfig;
 
-    fn schedule(text_delay: usize) -> RealtimeSpeechConfig {
-        RealtimeSpeechConfig::new(
-            2,
-            1,
-            1,
-            1,
-            0,
-            1,
-            RealtimeFrameConvention::FeedbackAlignedHistory,
-            vec![text_delay, 0, 1],
+    fn schedule(text_delay: usize) -> RealtimeChannelLayout {
+        RealtimeIngressContract::new(
+            RealtimeSpeechConfig::new(
+                2,
+                1,
+                1,
+                1,
+                0,
+                1,
+                RealtimeFrameConvention::FeedbackAlignedHistory,
+                vec![text_delay, 0, 1],
+            )
+            .unwrap(),
+            TokenDomain::new(2),
+            TokenDomain::new(2),
         )
         .unwrap()
+        .channels()
+        .clone()
     }
 
     fn text(position: usize) -> RealtimeSlotCoordinate {
-        RealtimeSlotCoordinate::new(position, RealtimeFrameSlot::Text)
+        RealtimeSlotCoordinate::new(position, RealtimeChannelId::new(0))
     }
 
     fn contract(
-        schedule: RealtimeSpeechConfig,
+        schedule: RealtimeChannelLayout,
         batch: usize,
         text_domain: usize,
         audio_domain: usize,
         generation: u64,
         owner: u64,
     ) -> RealtimePayloadContract {
+        let mut channels = schedule.channels().to_vec();
+        for channel in &mut channels {
+            channel.payload = eredu_core::RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: if channel.id.index() == 0 {
+                    text_domain
+                } else {
+                    audio_domain
+                },
+            };
+        }
         RealtimePayloadContract::new(
-            schedule,
+            RealtimeChannelLayout::new(schedule.policy().into(), channels).unwrap(),
             batch,
-            TokenDomain::new(text_domain),
-            TokenDomain::new(audio_domain),
             RealtimePayloadGeneration::new(generation).unwrap(),
             RealtimePayloadOwnerIdentity::new(owner).unwrap(),
         )

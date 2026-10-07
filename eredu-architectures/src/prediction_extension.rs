@@ -4619,7 +4619,7 @@ where
                 crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
             let parameters = crate::deepseek::parallel::v3_parameter_description(&target_args)
                 .map_err(|error| invalid(error.to_string()))?;
-            let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let layout = eredu_runtime::derive_partitioned_local_layout(
                 &parameters,
                 tensor_rank,
             )
@@ -4735,7 +4735,7 @@ where
                 crate::deepseek::v4_with_checkpoint_formats(args, formats).map_err(invalid)?;
             let parameters = crate::deepseek::parallel::v4_parameter_description(&target_args)
                 .map_err(|error| invalid(error.to_string()))?;
-            let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let layout = eredu_runtime::derive_partitioned_local_layout(
                 &parameters,
                 tensor_rank,
             )
@@ -4906,7 +4906,7 @@ where
                 crate::inkling::LayeredModel::<B>::new(target_args.clone(), execution_context)
                     .and_then(|model| model.parameter_description(execution_context))
                     .map_err(|error| invalid(error.to_string()))?;
-            let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let layout = eredu_runtime::derive_partitioned_local_layout(
                 &parameters,
                 tensor_rank,
             )
@@ -4960,7 +4960,7 @@ where
                     .and_then(|model| model.parameter_description(source_context))
             }
             .map_err(|error| invalid(error.to_string()))?;
-            let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let layout = eredu_runtime::derive_partitioned_local_layout(
                 &description,
                 tensor_rank,
             )
@@ -5068,7 +5068,7 @@ where
                     .map_err(|error| invalid(error.to_string()))?
                     .parameter_description(execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
-            let layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let layout = eredu_runtime::derive_partitioned_local_layout(
                 &description,
                 tensor_rank,
             )

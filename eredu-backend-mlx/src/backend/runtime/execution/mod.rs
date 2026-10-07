@@ -5,3 +5,5 @@ pub mod generic;
 pub mod inspection;
 /// Generic architecture adapters and host-backed layerwise execution.
 pub mod layerwise;
+/// Native binding and exact completion for selected component pipelines.
+pub(crate) mod pipeline;

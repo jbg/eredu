@@ -1,6 +1,6 @@
-use super::{completion::submission_failure, MlxRealtimeCompletion};
+use super::{completion::submission_failure, MlxRealtimeSubmissionScope};
 use crate::backend::{
-    nn::tensor::{validate_token_domain, TokenValidationScope},
+    nn::tensor::validate_token_domain,
     submission_recovery::{self, Probe, Recovery, Retention, Status},
 };
 use eredu_core::backend::Completion;
@@ -107,14 +107,14 @@ fn pending_without_a_failure_is_not_a_release_proof() {
 #[test]
 fn completed_invalid_token_scope_fails_readiness_before_publication() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let scope = TokenValidationScope::begin().unwrap();
+    let scope = MlxRealtimeSubmissionScope::begin(None).unwrap();
     let tokens =
         validate_token_domain(&Array::from_slice(&[5_u32], &[1]), 5, None, &stream).unwrap();
-    let validations = scope.finish();
-    let expected_retained = 1 + validations.arrays().count();
-    let completion = MlxRealtimeCompletion::submit_retained(vec![tokens], validations).unwrap();
+    let completion = scope
+        .finish(vec![tokens])
+        .unwrap_or_else(|_| panic!("submission failed"));
 
-    assert_eq!(completion.retained_resources(), expected_retained);
+    assert_eq!(completion.retained_resources(), 2);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let readiness_error = loop {
         match completion.is_complete() {

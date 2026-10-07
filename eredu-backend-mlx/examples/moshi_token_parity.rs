@@ -42,7 +42,12 @@ fn main() -> anyhow::Result<()> {
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = gpu.stream();
     let fixture = Array::load_safetensors(&fixture_path, cpu.stream())?;
-    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+    let preparation = match eredu_architectures::realtime::prepare_realtime_model(
+        &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(&model_dir),
+    )? {
+        eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => preparation,
+        _ => anyhow::bail!("expected a Moshi-family realtime artifact"),
+    };
     let backend = MlxRealtimeExecutionContext::new(stream, cpu.stream());
     let model = realtime_support::load(
         &backend,

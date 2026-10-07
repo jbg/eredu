@@ -90,8 +90,8 @@ fn lfm2_prepared_transforms_retain_source_layout_across_residency_and_parallelis
                             let target = family::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
                             let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
                             let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                            let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
-                            let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();
+                            let source = eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
+                            let encoded = eredu_runtime::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();
                             // Numeric operators retain unpacked values, with the same
                             // semantic cuts selected for the encoded target.
                             let mut layout = eredu_runtime::derive_transform_source_layout(&source, &encoded).unwrap();

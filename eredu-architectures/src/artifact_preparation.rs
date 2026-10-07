@@ -3,7 +3,7 @@ use eredu_checkpoint::{
     store::{CompositeCheckpointSource, RestrictedCheckpointSource, SharedCheckpointSource},
     validation::ResolvedCheckpointPlan,
 };
-use eredu_core::{artifact::ArtifactError, checkpoint::TensorCatalog, GgufCompanionRole};
+use eredu_core::{artifact::ArtifactError, GgufCompanionRole};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -17,7 +17,7 @@ pub enum PhysicalArtifactPreparation {
     /// Exact admitted SafeTensors headers, shard identities and chosen aliases.
     Safetensors {
         /// Admitted physical tensor headers.
-        tensors: TensorCatalog,
+        catalog: BTreeMap<String, eredu_checkpoint::store::TensorMetadata>,
         /// Retained shard file identities.
         shards: eredu_checkpoint::safetensors::SafetensorsShards,
         /// Exact chosen alias and layout resolution.
@@ -51,15 +51,16 @@ impl PhysicalArtifactPreparation {
         match self {
             Self::MetadataOnly { .. } => Err(ArtifactError::MetadataOnly),
             Self::Safetensors {
-                tensors,
+                catalog,
                 shards,
                 resolution,
-            } => eredu_core::artifact::open_prepared_safetensors_artifact(
-                tensors,
+            } => eredu_checkpoint::store::open_prepared_safetensors_source(
                 shards.clone(),
+                catalog.clone(),
                 resolution.clone(),
                 cache,
-            ),
+            )
+            .map_err(Into::into),
             Self::Gguf {
                 checkpoint,
                 mapping,
@@ -90,6 +91,8 @@ pub enum ArtifactSourceRole {
     Prediction,
     /// Image/video tower and projector parameters.
     Vision,
+    /// Architecture-owned component independent of its physical container.
+    Component(&'static str),
 }
 
 /// Immutable physical opening authority and exact logical source projections.
@@ -174,7 +177,7 @@ pub(crate) fn source_declarations(
                     PhysicalArtifactPreparation::MetadataOnly { resolution }
                 } else {
                     PhysicalArtifactPreparation::Safetensors {
-                        tensors: inspection.tensors().clone(),
+                        catalog: eredu_core::artifact::prepared_safetensors_metadata(inspection.tensors()).map_err(|e| invalid(e.to_string()))?,
                         shards: inspection.safetensors_shards().ok_or_else(|| invalid("SafeTensors artifact has no admitted shards".into()))?.clone(),
                         resolution,
                     }

@@ -278,19 +278,23 @@ fn encoded_catalog_projection_controls_selected_full_and_iterator_materializatio
                 };
                 assert_eq!(full.data, raw);
             }
-            assert!(original
-                .clone()
-                .into_tensor_representation(
-                    ["missing".into()],
-                    eredu_gguf::QuantizedTensorRepresentation::Encoded
-                )
-                .is_err());
-            assert!(original
-                .into_tensor_representation(
-                    ["other".into()],
-                    eredu_gguf::QuantizedTensorRepresentation::Encoded
-                )
-                .is_err());
+            assert!(
+                original
+                    .clone()
+                    .into_tensor_representation(
+                        ["missing".into()],
+                        eredu_gguf::QuantizedTensorRepresentation::Encoded
+                    )
+                    .is_err()
+            );
+            assert!(
+                original
+                    .into_tensor_representation(
+                        ["other".into()],
+                        eredu_gguf::QuantizedTensorRepresentation::Encoded
+                    )
+                    .is_err()
+            );
         }
     }
 }
@@ -458,4 +462,112 @@ fn decoded_catalog_view_preserves_exact_blocks_and_bounds_expanded_allocations()
         };
         assert_eq!(full.data, expected.repeat(4));
     }
+}
+
+#[test]
+fn default_catalog_decodes_quantized_buffers_and_preserves_linear_weights() {
+    use eredu_gguf::{CheckpointHeader, DenseDtype, Error, Limits, Reader};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("quantized-buffer.gguf");
+    let mut block = half(0.5, Endian::Little).to_vec();
+    block.extend((0..16).map(|i| i | ((15 - i) << 4)));
+    let data = block.repeat(8);
+    Writer::default()
+        .write(
+            std::fs::File::create(&path).unwrap(),
+            &BTreeMap::new(),
+            &[
+                TensorInput {
+                    name: "position_bias",
+                    dimensions: &[32, 2, 4],
+                    ggml_type: GgmlType::Q4_0,
+                    data: &data,
+                },
+                TensorInput {
+                    name: "matrix.weight",
+                    dimensions: &[32, 8],
+                    ggml_type: GgmlType::Q4_0,
+                    data: &data,
+                },
+            ],
+        )
+        .unwrap();
+    let limits = Limits {
+        max_allocation_bytes: 256,
+        ..Default::default()
+    };
+    let checkpoint = Checkpoint::open_with_limits(&path, limits.clone()).unwrap();
+    let matrix = checkpoint
+        .tensors()
+        .find(|tensor| tensor.descriptor().name == "matrix.weight")
+        .unwrap();
+    assert_eq!(matrix.affine(), Some((4, 32)));
+    assert_eq!(matrix.outputs().len(), 3);
+    let tensor = checkpoint.tensors().next().unwrap();
+    assert_eq!(tensor.outputs()[0].shape, [4, 2, 32]);
+    assert_eq!(tensor.outputs()[0].name, "position_bias");
+    assert_eq!(tensor.outputs()[0].dtype, LogicalDtype::F32);
+    assert!(tensor.affine().is_none());
+    let selected = checkpoint
+        .materializer()
+        .converted_tensor_selected(
+            "position_bias",
+            &TensorSelection::Range {
+                axis: 0,
+                start: 2,
+                end: 3,
+            },
+        )
+        .unwrap();
+    let ConvertedTensor::Dense(selected) = selected.into_converted() else {
+        panic!("decoded tensor")
+    };
+    assert_eq!(selected.dtype, DenseDtype::F32);
+    assert_eq!(selected.shape, [1, 2, 32]);
+    let expected: Vec<_> = (0..64)
+        .map(|i| ((if i % 32 < 16 { i % 16 } else { 15 - i % 16 }) as f32 - 8.) * 0.5)
+        .flat_map(f32::to_ne_bytes)
+        .collect();
+    assert_eq!(selected.data, expected);
+    let error = checkpoint
+        .materializer()
+        .converted_tensor("position_bias")
+        .unwrap_err();
+    let error = match error {
+        Error::Shard { source, .. } => *source,
+        other => other,
+    };
+    assert!(
+        matches!(
+            error,
+            Error::Limit {
+                actual: 1024,
+                limit: 256,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    let reader = Reader::new(std::io::Cursor::new(&bytes)).unwrap();
+    let offset = reader.tensors()[0].data_offset as usize;
+    let file_len = bytes.len() as u64;
+    bytes.truncate(offset);
+    let headers = [CheckpointHeader {
+        member: "quantized-buffer.gguf".into(),
+        bytes,
+        file_len,
+    }];
+    let supplied = Checkpoint::from_headers(&headers, limits).unwrap();
+    assert_eq!(supplied.tensors().next().unwrap(), tensor);
+    directory.close().unwrap();
+    assert!(
+        supplied
+            .materializer()
+            .converted_tensor("position_bias")
+            .unwrap_err()
+            .to_string()
+            .contains("no payload admission")
+    );
 }

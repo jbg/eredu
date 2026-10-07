@@ -207,7 +207,7 @@ fn gemma2_actual_payload_tp_pp_and_combined_match_replicated() {
                     let inspection = &inspection;
                     let inputs = &inputs;
                     scope.spawn(move || {
-                        use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
+                        use eredu_runtime::derive_partitioned_local_layout;
                         let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                         let plan = prepared_adapter::plan(quantization)
                             .with_topology(topology)

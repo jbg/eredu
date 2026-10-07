@@ -341,7 +341,7 @@ fn inkling_selected_provider_components_match_cold_placement_and_masked_executio
                             let discovery = sources.prepare_discovery(Default::default(), Default::default()).bind_partition_parameters(Some(Arc::new(parameters.clone()))).unwrap();
                             let retained = discovery.component_partition_layouts(64).unwrap().unwrap();
                             let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                            let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
+                            let layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
                             let mut context = NumericContext::with_partition(layout, rank, world);
                             context.bind_checkpoint_values = true;
                             let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
@@ -426,7 +426,7 @@ fn inkling_selected_shared_provider_failure_rejects_every_replica_before_commit(
                     let sources = partitioned_adapter::prepare_with_timeout(inspection, topology, rank, false, std::time::Duration::from_secs(10)).unwrap();
                     let discovery = sources.prepare_discovery(Default::default(), Default::default()).bind_partition_parameters(Some(Arc::new(parameters.clone()))).unwrap();
                     let retained = discovery.component_partition_layouts(64).unwrap().unwrap();
-                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
+                    let layout = eredu_runtime::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
                     let mut context = NumericContext::with_partition(layout, rank, world);
                     context.bind_checkpoint_values = true;
                     let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
@@ -616,8 +616,8 @@ fn inkling_partition_bank_trials(
                             let target = eredu_architectures::inkling::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
                             let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
                             let topology_rank = ParallelRankTopology::new(topology, rank).unwrap();
-                            let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, topology_rank).unwrap();
-                            let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, topology_rank).unwrap();
+                            let source = eredu_runtime::derive_partitioned_local_layout(parameters, topology_rank).unwrap();
+                            let encoded = eredu_runtime::derive_partitioned_local_layout(&target_parameters, topology_rank).unwrap();
                             let mut layout = eredu_runtime::derive_transform_source_layout(&source, &encoded).unwrap();
                             for (name, companion) in encoded.tensors() {
                                 if !layout.contains(name) { layout.insert(name.to_owned(), companion.clone()); }

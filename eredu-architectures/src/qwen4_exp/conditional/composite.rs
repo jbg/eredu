@@ -143,7 +143,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
         self.modules.target.routed_tensor_reductions(unit, routed)
     }
     fn routed_tensor_vocabulary_sharded(&self) -> bool {

@@ -878,7 +878,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
         self.args
             .text
             .layer_policy(unit)
@@ -886,12 +886,10 @@ where
         let per_layer = usize::from(self.args.text.hidden_size_per_layer_input > 0);
         // Attention and the always-present dense branch reduce before routing;
         // the routed write and optional per-layer write reduce afterward.
-        Ok(
-            crate::partitioned_execution::RoutedTensorReductions::hidden(
-                if routed { 2 } else { 1 },
-                1 + per_layer,
-            ),
-        )
+        Ok(eredu_runtime::RoutedTensorReductions::hidden(
+            if routed { 2 } else { 1 },
+            1 + per_layer,
+        ))
     }
 
     fn accept_partition_boundary(

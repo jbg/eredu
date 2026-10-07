@@ -28,6 +28,10 @@ pub mod mechanism_memory;
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
 pub mod operation_geometry;
+/// Portable recurrent inference with explicitly retained hidden and cell state.
+pub mod recurrent;
+mod retained_tensors;
+pub use retained_tensors::RetainedTensorRoots;
 /// Complete residual stream geometry and portable gated mixing.
 pub mod residual_streams;
 /// Typed pre-dispatch controls for architecture-configured expert selectors.
@@ -3855,8 +3859,14 @@ impl NeuralOperatorCapabilities {
     pub const SQRT: Self = Self(1 << 42);
     /// Explicit floating-point casts with declared arithmetic boundaries.
     pub const CAST_FLOAT: Self = Self(1 << 43);
+    /// Inverse real FFT from separate F32 real and imaginary components.
+    pub const IRFFT: Self = Self(1 << 44);
+    /// Elementwise F32 sine and cosine.
+    pub const SIN_COS: Self = Self(1 << 45);
+    /// Forward real FFT returning separate F32 real and imaginary components.
+    pub const RFFT: Self = Self(1 << 46);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 44) - 1);
+    pub const ALL: Self = Self((1 << 47) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3948,6 +3958,9 @@ impl NeuralOperatorCapabilities {
             (NeuralOperatorCapabilities::SIGN, "sign"),
             (NeuralOperatorCapabilities::SQRT, "sqrt"),
             (NeuralOperatorCapabilities::CAST_FLOAT, "cast_float"),
+            (NeuralOperatorCapabilities::IRFFT, "irfft"),
+            (NeuralOperatorCapabilities::SIN_COS, "sin_cos"),
+            (NeuralOperatorCapabilities::RFFT, "rfft"),
             (NeuralOperatorCapabilities::CLIP, "clip"),
             (NeuralOperatorCapabilities::SOFTMAX_AXIS, "softmax_axis"),
             (NeuralOperatorCapabilities::BROADCAST_TO, "broadcast_to"),
@@ -5199,13 +5212,49 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         Self::sum_axis(value, axis, keep_dims, context)?
             .multiply_scalar(1.0 / width as f32, context)
     }
-    /// Reduction argmin.
+    /// Reduction argmin with exact nonnegative I32 indices. Axis extents use
+    /// I32 geometry, so every selected index is representable without a
+    /// floating-point conversion.
     fn argmin_axis(
         value: &Self,
         axis: i32,
         keep_dims: bool,
         context: &Self::Context,
     ) -> Result<Self, Error>;
+    /// Forward real FFT of a nonempty F32 tensor, returning separate F32 real
+    /// and imaginary components. The selected axis must have exactly `length`
+    /// samples; each output has `length / 2 + 1` bins along that axis.
+    /// Uses backward normalization (the forward transform is unnormalized).
+    fn rfft(&self, length: i32, axis: i32, context: &Self::Context) -> Result<(Self, Self), Error> {
+        let _ = (length, axis, context);
+        Err(Error::backend(
+            "forward real FFT is not implemented by this tensor backend",
+        ))
+    }
+    /// Inverse real FFT of a one-sided Hermitian spectrum represented by
+    /// matching F32 real and imaginary tensors. The selected axis has exactly
+    /// `length / 2 + 1` bins; the F32 output has `length` samples there.
+    /// Uses backward normalization (division by `length`). Imaginary DC and,
+    /// for even lengths, imaginary Nyquist values do not contribute.
+    fn irfft(
+        real: &Self,
+        imaginary: &Self,
+        length: i32,
+        axis: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (real, imaginary, length, axis, context);
+        Err(Error::backend(
+            "inverse real FFT is not implemented by this tensor backend",
+        ))
+    }
+    /// Elementwise sine and cosine of F32 radians, preserving shape and F32 dtype.
+    fn sin_cos(&self, context: &Self::Context) -> Result<(Self, Self), Error> {
+        let _ = context;
+        Err(Error::backend(
+            "sine/cosine is not implemented by this tensor backend",
+        ))
+    }
     /// Pads a tensor.
     fn pad(
         value: &Self,

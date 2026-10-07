@@ -18,7 +18,7 @@ use eredu_runtime::{
     ParameterTransformConstraint, ReplicatedTextParameterRequirement, ReplicatedTextStateAccess,
     StateLayout, WeightLoweringDescriptor,
 };
-use safemlx::{Device, DeviceType};
+use safemlx::{Device, DeviceType, Dtype};
 
 fn prediction_cache_manager() -> CacheResidencyManager {
     CacheResidencyManager::new(

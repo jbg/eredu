@@ -37,23 +37,29 @@ impl RealtimeHostTokenMaterializer for MlxRealtimeFrameTensorMechanisms<'_> {
     }
 }
 
-impl RealtimeFrameTensorMechanisms for MlxRealtimeFrameTensorMechanisms<'_> {
-    type Tensor = MlxTensor;
-    type Error = Error;
-
-    fn column(
+impl eredu_runtime::RealtimeHostFrameMaterializer for MlxRealtimeFrameTensorMechanisms<'_> {
+    fn materialize_f32(
         &mut self,
-        matrix: &Self::Tensor,
-        column: usize,
+        values: &[f32],
+        shape: &[usize],
     ) -> Result<Self::Tensor, Self::Error> {
-        let column = i32::try_from(column)
-            .map_err(|_| Error::Parallel("realtime tensor column exceeds i32".into()))?;
-        matrix
-            .as_array()
-            .try_index_device((.., column..column + 1), self.stream)
+        let shape = shape
+            .iter()
+            .map(|&dimension| {
+                i32::try_from(dimension)
+                    .map_err(|_| Error::Parallel("realtime tensor dimension exceeds i32".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Array::from_slice(values, &shape)
+            .copy(self.stream)
             .map(MlxTensor::from_array)
             .map_err(Into::into)
     }
+}
+
+impl RealtimeFrameTensorMechanisms for MlxRealtimeFrameTensorMechanisms<'_> {
+    type Tensor = MlxTensor;
+    type Error = Error;
 
     fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
         let batch = i32::try_from(batch)
@@ -62,34 +68,15 @@ impl RealtimeFrameTensorMechanisms for MlxRealtimeFrameTensorMechanisms<'_> {
             .map(MlxTensor::from_array)
             .map_err(Into::into)
     }
-
-    fn stack_columns(
-        &mut self,
-        columns: &[Self::Tensor],
-        batch: usize,
-    ) -> Result<Self::Tensor, Self::Error> {
-        if columns.is_empty() {
-            let batch = i32::try_from(batch)
-                .map_err(|_| Error::Parallel("realtime tensor batch exceeds i32".into()))?;
-            return Array::zeros::<i32>(&[batch, 0], self.stream)
-                .map(MlxTensor::from_array)
-                .map_err(Into::into);
-        }
-        let columns = columns.iter().map(MlxTensor::as_array).collect::<Vec<_>>();
-        stack_axis(&columns, 1, self.stream)?
-            .squeeze_axes(&[-1], self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
-    }
 }
 
 /// Exact MLX completion creation for one shared-coordinator Moshi frame.
-pub struct MlxRealtimeFrameCompletionMechanism {
+pub struct MlxRealtimeCompletionMechanism {
     token_validations: Option<TokenValidationScope>,
-    execution_resources: Option<Arc<neutral_moshi::SelectedRealtimeResources>>,
+    execution_resources: Option<Arc<dyn MlxRealtimeExecutionResources>>,
 }
 
-impl MlxRealtimeFrameCompletionMechanism {
+impl MlxRealtimeCompletionMechanism {
     /// Starts the one token-validation scope owned by this frame submission.
     pub fn begin() -> Result<Self, Error> {
         TokenValidationScope::begin()
@@ -101,7 +88,7 @@ impl MlxRealtimeFrameCompletionMechanism {
     }
 
     fn begin_for_execution(
-        resources: Arc<neutral_moshi::SelectedRealtimeResources>,
+        resources: Arc<dyn MlxRealtimeExecutionResources>,
     ) -> Result<Self, Error> {
         Self::begin().map(|mut mechanism| {
             mechanism.execution_resources = Some(resources);
@@ -111,14 +98,17 @@ impl MlxRealtimeFrameCompletionMechanism {
 }
 
 impl<T>
-    RealtimeFrameCompletionMechanism<
-        MlxTensor,
-        T,
-        (
+    RealtimeCompletionMechanism<
+        RealtimeFrameResources<
+            '_,
             MlxTensor,
-            eredu_architectures::moshi::ForwardContext<MlxTensor>,
-        ),
-    > for MlxRealtimeFrameCompletionMechanism
+            T,
+            (
+                MlxTensor,
+                eredu_architectures::moshi::ForwardContext<MlxTensor>,
+            ),
+        >,
+    > for MlxRealtimeCompletionMechanism
 where
     T: Deref<Target = MlxKeyValueState>,
 {
@@ -127,31 +117,38 @@ where
 
     fn complete(
         &mut self,
-        input: MaterializedRealtimeInput<MlxTensor>,
-        output: &CompletedRealtimeFrame<MlxTensor, MlxTensor>,
-        model_state: &T,
-        payload_history: &RealtimePayloadHistory<MlxTensor>,
-        execution: Option<(
+        resources: RealtimeFrameResources<
+            '_,
             MlxTensor,
-            eredu_architectures::moshi::ForwardContext<MlxTensor>,
-        )>,
+            T,
+            (
+                MlxTensor,
+                eredu_architectures::moshi::ForwardContext<MlxTensor>,
+            ),
+        >,
     ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>
     {
+        let RealtimeFrameResources {
+            input,
+            output,
+            model_state,
+            payload_history,
+            execution,
+        } = resources;
         let token_validations = self.token_validations.take().ok_or_else(|| {
             RealtimeCompletionCreationError::before_submission(Error::Parallel(
                 "MLX realtime completion scope was already consumed".into(),
             ))
         })?;
-        let (_, _, input_audio, forced_audio, forced_text, _, _) = input.into_parts();
-        let mut retained = vec![input_audio.into_array()];
-        retained.extend(forced_audio.map(MlxTensor::into_array));
-        retained.extend(forced_text.map(MlxTensor::into_array));
-        retained.extend([
-            output.text().as_array().clone(),
-            output.decision_audio().as_array().clone(),
-            output.sampled_audio().as_array().clone(),
-        ]);
-        retained.extend(output.aligned_audio().map(|value| value.as_array().clone()));
+        let mut retained = input
+            .retained_payloads()
+            .map(|value| value.as_array().clone())
+            .collect::<Vec<_>>();
+        retained.extend(
+            output
+                .retained_payloads()
+                .map(|value| value.as_array().clone()),
+        );
         retained.extend(
             output
                 .diagnostics()
@@ -242,15 +239,15 @@ pub(super) fn submit_scheduled_realtime_frame(
         .validate(frame)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let payload_contract = branch
-        .payload_contract(&ingress)
+        .payload_contract()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     model.executor_mut().with_submission(|model| {
         let mut host = MlxRealtimeFrameTensorMechanisms::new(stream);
         let mut tensors = MlxRealtimeFrameTensorMechanisms::new(stream);
         let mut completion =
-            MlxRealtimeFrameCompletionMechanism::begin_for_execution(model.completion_resources())?;
+            MlxRealtimeCompletionMechanism::begin_for_execution(model.completion_resources())?;
         let mut executor = MlxSelectedRealtimeFrameExecutor { model };
-        let submitted = execute_realtime_frame::<MlxSamplingBackend, _, _, _, _, _, _, _, _>(
+        let submitted = execute_realtime_frame::<MlxSamplingBackend, _, _, _, _, _, _, _, _, _>(
             &ingress,
             &payload_contract,
             frame,
@@ -262,10 +259,16 @@ pub(super) fn submit_scheduled_realtime_frame(
             &mut completion,
             stream,
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+        .map_err(|error| match error {
+            eredu_runtime::RealtimeFrameCoordinatorError::Completion(error)
+            | eredu_runtime::RealtimeFrameCoordinatorError::CompletionAfterSubmission(error) => {
+                error
+            }
+            other => Error::Parallel(other.to_string()),
+        })?;
         Ok(PrepublicationRealtimeFrame::new(
             submitted,
-            MlxRealtimeHostObserver::new(stream),
+            MlxRealtimeHostObserver::new(stream, &ingress),
         ))
     })
 }

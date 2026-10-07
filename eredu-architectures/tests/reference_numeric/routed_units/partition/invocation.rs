@@ -228,7 +228,7 @@ fn prepared_gated_and_relu2_idle_ep_owners_finish_before_reverse_exchange_on_fai
                             let retained = placement::layouts(&sources, description);
                             placement::verify(&retained, &descriptor);
                             let ownership = retained.rank(rank).unwrap().routed_observation(&descriptor.routed_components[0].activation).unwrap().ownership().unwrap().clone();
-                            let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(description, rank_topology).unwrap();
+                            let layout = eredu_runtime::derive_partitioned_local_layout(description, rank_topology).unwrap();
                             let mut context = NumericContext::with_partition(layout, rank, world.clone());
                             context.bind_checkpoint_values = true;
                             let mut executable = partitioned_adapter::routed(sources, &context, Arc::new(AtomicUsize::new(0)), None).unwrap();
@@ -251,7 +251,7 @@ fn prepared_gated_and_relu2_idle_ep_owners_finish_before_reverse_exchange_on_fai
                                 Some([None, Some("source-active"), Some("source-idle"), Some("collector")].into_iter().enumerate().map(|(case, capture_fault)| {
                                     let (model_world, capture_world) = &capture_worlds[case];
                                     let sources = partitioned_adapter::prepare_plan(inspection, &plan, rank, std::time::Duration::from_secs(10)).unwrap();
-                                    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(description, rank_topology).unwrap();
+                                    let layout = eredu_runtime::derive_partitioned_local_layout(description, rank_topology).unwrap();
                                     let mut context = NumericContext::with_partition(layout, rank, model_world.clone());
                                     context.bind_checkpoint_values = true;
                                     let mut model = partitioned_adapter::routed(sources, &context, Arc::new(AtomicUsize::new(0)), None).unwrap();

@@ -65,8 +65,31 @@ pub(super) fn tojson(value: &Value, args: Rest<Value>, kwargs: Kwargs) -> Result
     };
     let value = serde_json::to_value(value).map_err(serialization_error)?;
     let mut output = String::new();
-    format.write_value(&mut output, &value, 0);
+    format
+        .write_value(&mut output, &value, 0)
+        .expect("writing to a String cannot fail");
     Ok(Value::from_safe_string(output))
+}
+
+/// Writes JSON with Python's default comma/colon spacing and float formatting.
+///
+/// `ensure_ascii` escapes non-ASCII characters as UTF-16 code units; `sort_keys`
+/// orders object keys at every depth. No HTML escaping is applied. A bounded
+/// writer can stop serialization without first allocating the complete output.
+pub fn write_python_json(
+    value: &JsonValue,
+    output: &mut impl Write,
+    ensure_ascii: bool,
+    sort_keys: bool,
+) -> std::fmt::Result {
+    JsonFormat {
+        ensure_ascii,
+        sort_keys,
+        indent: None,
+        item_separator: ", ".into(),
+        key_separator: ": ".into(),
+    }
+    .write_value(output, value, 0)
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -86,7 +109,12 @@ struct JsonFormat {
 }
 
 impl JsonFormat {
-    fn write_value(&self, output: &mut String, value: &JsonValue, depth: usize) {
+    fn write_value(
+        &self,
+        output: &mut impl Write,
+        value: &JsonValue,
+        depth: usize,
+    ) -> std::fmt::Result {
         match value {
             JsonValue::Array(values) => self.write_container(
                 output,
@@ -94,7 +122,7 @@ impl JsonFormat {
                 '[',
                 ']',
                 values.iter().map(|value| (None, value)),
-            ),
+            )?,
             JsonValue::Object(values) => {
                 let mut entries = values.iter().collect::<Vec<_>>();
                 if self.sort_keys {
@@ -108,9 +136,9 @@ impl JsonFormat {
                     entries
                         .into_iter()
                         .map(|(key, value)| (Some(key.as_str()), value)),
-                );
+                )?;
             }
-            JsonValue::String(value) => self.write_string(output, value),
+            JsonValue::String(value) => self.write_string(output, value)?,
             JsonValue::Number(value) if value.is_f64() => {
                 // Rust's shortest round-trip float rendering uses the same
                 // fixed/scientific thresholds as Python. Python includes the
@@ -118,66 +146,73 @@ impl JsonFormat {
                 let value = format!("{:?}", value.as_f64().unwrap());
                 if let Some((mantissa, exponent)) = value.split_once('e') {
                     let exponent: i32 = exponent.parse().expect("float exponent is an integer");
-                    write!(output, "{mantissa}e{exponent:+03}").unwrap();
+                    write!(output, "{mantissa}e{exponent:+03}")?;
                 } else {
-                    output.push_str(&value);
+                    output.write_str(&value)?;
                 }
             }
-            _ => output.push_str(&value.to_string()),
+            _ => output.write_str(&value.to_string())?,
         }
+        Ok(())
     }
 
     fn write_container<'a>(
         &self,
-        output: &mut String,
+        output: &mut impl Write,
         depth: usize,
         open: char,
         close: char,
         entries: impl Iterator<Item = (Option<&'a str>, &'a JsonValue)>,
-    ) {
-        output.push(open);
+    ) -> std::fmt::Result {
+        output.write_char(open)?;
         let mut nonempty = false;
         for (key, value) in entries {
             if nonempty {
-                output.push_str(&self.item_separator);
+                output.write_str(&self.item_separator)?;
             }
-            self.newline(output, depth + 1);
+            self.newline(output, depth + 1)?;
             if let Some(key) = key {
-                self.write_string(output, key);
-                output.push_str(&self.key_separator);
+                self.write_string(output, key)?;
+                output.write_str(&self.key_separator)?;
             }
-            self.write_value(output, value, depth + 1);
+            self.write_value(output, value, depth + 1)?;
             nonempty = true;
         }
         if nonempty {
-            self.newline(output, depth);
+            self.newline(output, depth)?;
         }
-        output.push(close);
+        output.write_char(close)
     }
 
-    fn newline(&self, output: &mut String, depth: usize) {
+    fn newline(&self, output: &mut impl Write, depth: usize) -> std::fmt::Result {
         if let Some(indent) = &self.indent {
-            output.push('\n');
+            output.write_char('\n')?;
             for _ in 0..depth {
-                output.push_str(indent);
+                output.write_str(indent)?;
             }
         }
+        Ok(())
     }
 
-    fn write_string(&self, output: &mut String, value: &str) {
-        let encoded = serde_json::to_string(value).expect("strings serialize as JSON");
-        if !self.ensure_ascii {
-            output.push_str(&encoded);
-            return;
-        }
-        for character in encoded.chars() {
-            if character < '\u{7f}' {
-                output.push(character);
-            } else {
-                for code in character.encode_utf16(&mut [0; 2]) {
-                    write!(output, "\\u{code:04x}").unwrap();
+    fn write_string(&self, output: &mut impl Write, value: &str) -> std::fmt::Result {
+        output.write_char('"')?;
+        for character in value.chars() {
+            match character {
+                '"' => output.write_str("\\\"")?,
+                '\\' => output.write_str("\\\\")?,
+                '\u{08}' => output.write_str("\\b")?,
+                '\u{0c}' => output.write_str("\\f")?,
+                '\n' => output.write_str("\\n")?,
+                '\r' => output.write_str("\\r")?,
+                '\t' => output.write_str("\\t")?,
+                value if value < '\u{20}' || (self.ensure_ascii && value >= '\u{7f}') => {
+                    for code in value.encode_utf16(&mut [0; 2]) {
+                        write!(output, "\\u{code:04x}")?;
+                    }
                 }
+                value => output.write_char(value)?,
             }
         }
+        output.write_char('"')
     }
 }

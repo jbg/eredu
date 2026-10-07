@@ -541,17 +541,28 @@ pub enum TensorOperation {
 /// Declarative GGUF physical encoding constraint.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum GgufTypeConstraint {
+    /// One exact stored scalar or quantized representation.
+    Exact(GgufType),
+    /// An explicit set of representations admitted by the architecture.
+    OneOf(Vec<GgufType>),
     OperationClass(TensorOperation),
 }
 
 impl GgufTypeConstraint {
     pub fn accepts(&self, actual: GgufType) -> bool {
         match self {
+            Self::Exact(expected) => actual == *expected,
+            Self::OneOf(encodings) => encodings.contains(&actual),
             Self::OperationClass(operation) => gguf_encoding_supported(*operation, actual),
         }
     }
 
-    fn normalize(&mut self) {}
+    fn normalize(&mut self) {
+        if let Self::OneOf(encodings) = self {
+            encodings.sort_by_key(|encoding| encoding.code());
+            encodings.dedup();
+        }
+    }
 }
 
 /// Generic mapping from a numerical operation to accepted GGUF encodings.
@@ -792,7 +803,7 @@ impl PhysicalConstraint for GgufTensorConstraint {
         self.alternate_shapes.retain(|shape| shape != &self.shape);
     }
     fn has_empty_encoding_set(&self) -> bool {
-        false
+        matches!(&self.encoding, GgufTypeConstraint::OneOf(encodings) if encodings.is_empty())
     }
 }
 

@@ -445,8 +445,8 @@ where
         &self,
         _unit: usize,
         _routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
-        Ok(crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1))
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
+        Ok(eredu_runtime::RoutedTensorReductions::hidden(1, 1))
     }
 
     /// Whether primary token embedding and final vocabulary use TP collectives.

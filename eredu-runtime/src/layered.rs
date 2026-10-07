@@ -94,6 +94,8 @@ pub struct LayeredForwardState<T, C> {
 /// Architecture-authored semantic kind for one transport-visible execution group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ArchitectureGroupKind {
+    /// A required recurrent stack over supplied dense input, independent of text decoding.
+    Recurrent,
     /// Primary text decoding.
     Decoder,
     /// Embedded prediction after the primary decoder output.
@@ -102,6 +104,8 @@ pub enum ArchitectureGroupKind {
     VisionEncoder,
     /// Audio encoding.
     AudioEncoder,
+    /// Streaming audio decoding with independently owned codec state.
+    AudioDecoder,
     /// Learned modality projection.
     Projector,
     /// Learned or structural modality merge.
@@ -131,9 +135,9 @@ impl<'a> LayeredPipelineSchedule<'a> {
     ///
     /// Each contract pairs a group's semantic kind with its declared request
     /// optionality. `request_group_active` is called only for optional encoder
-    /// roots. Mandatory encoders, decoder ingress, and finalization always run;
-    /// structural merge activity is derived from dependency activity; and
-    /// prediction is a later phase.
+    /// roots. Mandatory encoders, recurrent stacks, decoder ingress, and
+    /// finalization always run; structural merge activity is derived from
+    /// dependency activity; and prediction is a later phase.
     pub fn try_new<E>(
         graph: &'a ExecutionGraph,
         group_contracts: impl IntoIterator<Item = (ArchitectureGroupKind, bool)>,
@@ -174,9 +178,10 @@ impl<'a> LayeredPipelineSchedule<'a> {
                     .expect("validated execution order contains a known group")
                     .iter()
                     .any(|&dependency| active[dependency]),
-                ArchitectureGroupKind::ModalityFinalization | ArchitectureGroupKind::Decoder => {
-                    true
-                }
+                ArchitectureGroupKind::ModalityFinalization
+                | ArchitectureGroupKind::Decoder
+                | ArchitectureGroupKind::AudioDecoder
+                | ArchitectureGroupKind::Recurrent => true,
                 ArchitectureGroupKind::Prediction => false,
             };
         }
@@ -344,6 +349,56 @@ pub enum LayeredUnitAction {
     SkipRemainingGroup,
 }
 
+/// Local parallel-traversal boundaries that can fail before a later collective.
+/// A coordination hook agrees success before traversal enters the next phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayeredLocalPhase {
+    /// Graph, executor, ingress and initial submission preparation.
+    Initialization,
+    /// Parameter-policy transaction admission.
+    PolicyBegin,
+    /// Dependency ordering and architecture group ingress.
+    GroupIngress {
+        /// Architecture execution-group index.
+        group: usize,
+    },
+    /// Observation or unit-selection hook before acquisition.
+    BeforeUnit {
+        /// Architecture execution-group index.
+        group: usize,
+        /// Group-local learned-unit index.
+        index: usize,
+    },
+    /// Learned-unit construction and parameter acquisition.
+    Acquisition {
+        /// Architecture execution-group index.
+        group: usize,
+        /// Group-local learned-unit index.
+        index: usize,
+    },
+    /// Neural unit execution, before observation and lease completion.
+    UnitExecution {
+        /// Architecture execution-group index.
+        group: usize,
+        /// Group-local learned-unit index.
+        index: usize,
+    },
+    /// Observation and parameter-lease completion.
+    UnitCompletion {
+        /// Architecture execution-group index.
+        group: usize,
+        /// Group-local learned-unit index.
+        index: usize,
+    },
+    /// Architecture group finalization and output submission.
+    GroupCompletion {
+        /// Architecture execution-group index.
+        group: usize,
+    },
+    /// Final readout, ordering and policy completion.
+    Finish,
+}
+
 /// Statically dispatched hook shared by resident and bounded layered traversal.
 ///
 /// The hook can observe unit/group outputs and can omit only a complete group
@@ -353,6 +408,20 @@ pub trait LayeredTraversalHook<B, C, E>
 where
     B: NeuralBackend,
 {
+    /// Agrees a local result before parallel traversal continues. Called on both
+    /// success and failure; an acquired lease stays owned until this returns.
+    /// Collective-bearing architecture/backend operations must separately fence
+    /// their own local setup before entering a collective. Serial traversal does
+    /// not invoke this hook. The default performs no communication.
+    fn local_phase(
+        &mut self,
+        _phase: LayeredLocalPhase,
+        _success: bool,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
     /// Whether architecture-owned input, internal unit and readout observation is enabled.
     fn observes_activations(&self) -> bool {
         false
@@ -463,6 +532,18 @@ where
     L: LayeredTraversalHook<B, C, E>,
     R: LayeredTraversalHook<B, C, E>,
 {
+    fn local_phase(
+        &mut self,
+        phase: LayeredLocalPhase,
+        success: bool,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        let left = self.left.local_phase(phase, success, context);
+        let right = self
+            .right
+            .local_phase(phase, success && left.is_ok(), context);
+        left.and(right)
+    }
     fn observes_activations(&self) -> bool {
         self.left.observes_activations() || self.right.observes_activations()
     }
@@ -553,6 +634,27 @@ where
     ) -> Result<(), E> {
         self.left.after_group(group, value, forward, context)?;
         self.right.after_group(group, value, forward, context)
+    }
+}
+
+fn agree_layered_local<B, C, E, P, T, H>(
+    local: Result<T, LayerwiseRuntimeError<E, P>>,
+    hook: &mut H,
+    phase: LayeredLocalPhase,
+    context: &<B::Tensor as eredu_nn::Tensor>::Context,
+) -> Result<T, LayerwiseRuntimeError<E, P>>
+where
+    B: NeuralBackend,
+    E: std::fmt::Display,
+    P: std::fmt::Display,
+    H: LayeredTraversalHook<B, C, E> + ?Sized,
+{
+    let agreement = hook
+        .local_phase(phase, local.is_ok(), context)
+        .map_err(LayerwiseRuntimeError::Architecture);
+    match local {
+        Err(error) => Err(error),
+        Ok(value) => agreement.map(|()| value),
     }
 }
 
@@ -1645,6 +1747,32 @@ where
     }
 }
 
+/// Invalid adoption of already constructed units into a resident runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum ResidentUnitsError<E> {
+    /// Architecture graph or unit declarations failed before adoption.
+    #[error("resident architecture declaration failed: {0}")]
+    Architecture(#[source] E),
+    /// Supplied groups differ from the declared execution graph.
+    #[error("resident unit group count {actual} differs from declared {expected}")]
+    GroupCount {
+        /// Declared group count.
+        expected: usize,
+        /// Supplied group count.
+        actual: usize,
+    },
+    /// One supplied group has the wrong number of units.
+    #[error("resident group {group} has {actual} units, expected {expected}")]
+    UnitCount {
+        /// Architecture group index.
+        group: usize,
+        /// Declared unit count.
+        expected: usize,
+        /// Supplied unit count.
+        actual: usize,
+    },
+}
+
 /// Fully resident runtime using the same lifecycle as bounded execution.
 pub struct ResidentRuntime<A, B, S>
 where
@@ -1664,6 +1792,42 @@ where
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
 {
+    /// Adopts exact ordered, already constructed units without allocating replacements.
+    /// Unit identities and bindings remain architecture/caller-owned; graph shape
+    /// is validated before the runtime can execute any supplied module.
+    pub fn from_units(
+        architecture: A,
+        units: Vec<Vec<A::Unit>>,
+    ) -> Result<Self, ResidentUnitsError<A::Error>> {
+        let graph = architecture
+            .execution_graph()
+            .map_err(ResidentUnitsError::Architecture)?;
+        if units.len() != graph.groups().len() {
+            return Err(ResidentUnitsError::GroupCount {
+                expected: graph.groups().len(),
+                actual: units.len(),
+            });
+        }
+        for (group, supplied) in units.iter().enumerate() {
+            let expected = architecture
+                .group_unit_count(group)
+                .map_err(ResidentUnitsError::Architecture)?;
+            if supplied.len() != expected {
+                return Err(ResidentUnitsError::UnitCount {
+                    group,
+                    expected,
+                    actual: supplied.len(),
+                });
+            }
+        }
+        Ok(Self {
+            architecture,
+            graph,
+            units,
+            backend: std::marker::PhantomData,
+        })
+    }
+
     /// Builds every execution unit once and keeps it resident.
     pub fn new(
         architecture: A,
@@ -1723,8 +1887,64 @@ where
     where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
+        self.forward_with_traversal_hook_for_state::<S, H>(input, state, context, hook)
+    }
+
+    /// Invokes the same resident units with a caller-borrowed compatible state owner.
+    /// Parameters and their ownership remain in this runtime even on failure.
+    /// Both architecture implementations must declare the same parameter graph
+    /// and unit order; only the mutable state realization differs.
+    pub fn forward_with_state<'a, S2>(
+        &mut self,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, <A as LayeredArchitecture<B, S>>::Error>
+    where
+        S2: RuntimeState<B>,
+        A: LayeredArchitecture<
+            B,
+            S2,
+            Unit = <A as LayeredArchitecture<B, S>>::Unit,
+            Error = <A as LayeredArchitecture<B, S>>::Error,
+        >,
+    {
+        self.forward_with_traversal_hook_for_state(
+            input,
+            state,
+            context,
+            &mut NoopLayeredTraversalHook,
+        )
+        .map(|(output, _)| output)
+    }
+
+    fn forward_with_traversal_hook_for_state<'a, S2, H>(
+        &mut self,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+    ) -> Result<
+        (B::Tensor, <A as LayeredArchitecture<B, S2>>::ForwardContext),
+        <A as LayeredArchitecture<B, S2>>::Error,
+    >
+    where
+        S2: RuntimeState<B>,
+        A: LayeredArchitecture<
+            B,
+            S2,
+            Unit = <A as LayeredArchitecture<B, S>>::Unit,
+            Error = <A as LayeredArchitecture<B, S>>::Error,
+        >,
+        H: LayeredTraversalHook<
+                B,
+                <A as LayeredArchitecture<B, S2>>::ForwardContext,
+                <A as LayeredArchitecture<B, S2>>::Error,
+            > + ?Sized,
+    {
         let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_observed(
+            <A as LayeredArchitecture<B, S2>>::begin_forward_observed(
+                &mut self.architecture,
                 input,
                 state,
                 context,
@@ -1734,7 +1954,12 @@ where
                 },
             )
         } else {
-            self.architecture.begin_forward(input, state, context)
+            <A as LayeredArchitecture<B, S2>>::begin_forward(
+                &mut self.architecture,
+                input,
+                state,
+                context,
+            )
         }?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -1753,7 +1978,8 @@ where
                 })
                 .collect::<Vec<_>>();
             let dependency_refs = dependencies.iter().collect::<Vec<_>>();
-            let mut hidden = self.architecture.begin_execution_group(
+            let mut hidden = <A as LayeredArchitecture<B, S2>>::begin_execution_group(
+                &mut self.architecture,
                 group,
                 &initial,
                 &dependency_refs,
@@ -1768,10 +1994,11 @@ where
             {
                 outputs[dependency] = None;
             }
-            if self
-                .architecture
-                .should_execute_group(group, &forward_context)
-            {
+            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+                &self.architecture,
+                group,
+                &forward_context,
+            ) {
                 let unit_count = self.units[group].len();
                 for (index, unit) in self.units[group].iter_mut().enumerate() {
                     if hook.before_unit(
@@ -1786,7 +2013,8 @@ where
                         break;
                     }
                     hidden = if hook.observes_activations() {
-                        self.architecture.forward_unit_observed(
+                        <A as LayeredArchitecture<B, S2>>::forward_unit_observed(
+                            &mut self.architecture,
                             group,
                             index,
                             unit,
@@ -1800,7 +2028,8 @@ where
                             },
                         )
                     } else {
-                        self.architecture.forward_unit(
+                        <A as LayeredArchitecture<B, S2>>::forward_unit(
+                            &mut self.architecture,
                             group,
                             index,
                             unit,
@@ -1813,7 +2042,8 @@ where
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, context)?;
                 }
             }
-            hidden = self.architecture.complete_execution_group(
+            hidden = <A as LayeredArchitecture<B, S2>>::complete_execution_group(
+                &mut self.architecture,
                 group,
                 &hidden,
                 state,
@@ -1830,7 +2060,8 @@ where
             .take()
             .expect("validated graph output completed");
         let output = if hook.observes_activations() {
-            self.architecture.finish_forward_observed(
+            <A as LayeredArchitecture<B, S2>>::finish_forward_observed(
+                &mut self.architecture,
                 &hidden,
                 state,
                 &forward_context,
@@ -1841,8 +2072,13 @@ where
                 },
             )
         } else {
-            self.architecture
-                .finish_forward(&hidden, state, &forward_context, context)
+            <A as LayeredArchitecture<B, S2>>::finish_forward(
+                &mut self.architecture,
+                &hidden,
+                state,
+                &forward_context,
+                context,
+            )
         }?;
         Ok((output, forward_context))
     }
@@ -2790,36 +3026,88 @@ where
         )
     }
 
-    fn forward_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+    /// Runs the existing bounded traversal against a caller-borrowed compatible
+    /// state owner, preserving the same unit provider and completion lifecycle.
+    /// Both architecture implementations must declare the same parameter graph
+    /// and unit order; only the mutable state realization differs.
+    pub fn forward_with_state<'a, S2>(
         &mut self,
-        input: A::Input<'a>,
-        state: &mut S,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<<A as LayeredArchitecture<B, S>>::Error, P::Error>>
+    where
+        S2: RuntimeState<B>,
+        A: LayeredArchitecture<
+            B,
+            S2,
+            Unit = <A as LayeredArchitecture<B, S>>::Unit,
+            Error = <A as LayeredArchitecture<B, S>>::Error,
+        >,
+    {
+        self.forward_with_unit_executor_and_traversal_hook_impl(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                <A as LayeredArchitecture<B, S2>>::forward_unit(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    context,
+                )
+            },
+            &mut NoopLayeredTraversalHook,
+            false,
+        )
+        .map(|(output, _)| output)
+    }
+
+    fn forward_with_unit_executor_and_traversal_hook_impl<'a, S2, E, H>(
+        &mut self,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         mut execute: E,
         hook: &mut H,
         observe_unit_internals: bool,
-    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    ) -> Result<
+        (B::Tensor, <A as LayeredArchitecture<B, S2>>::ForwardContext),
+        LayerwiseRuntimeError<<A as LayeredArchitecture<B, S2>>::Error, P::Error>,
+    >
     where
+        S2: RuntimeState<B>,
+        A: LayeredArchitecture<
+            B,
+            S2,
+            Unit = <A as LayeredArchitecture<B, S>>::Unit,
+            Error = <A as LayeredArchitecture<B, S>>::Error,
+        >,
         E: FnMut(
             &mut A,
             usize,
             usize,
-            &mut A::Unit,
+            &mut <A as LayeredArchitecture<B, S2>>::Unit,
             &B::Tensor,
-            &mut S,
-            &mut A::ForwardContext,
+            &mut S2,
+            &mut <A as LayeredArchitecture<B, S2>>::ForwardContext,
             &<B::Tensor as eredu_nn::Tensor>::Context,
-        ) -> Result<B::Tensor, A::Error>,
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+        ) -> Result<B::Tensor, <A as LayeredArchitecture<B, S2>>::Error>,
+        H: LayeredTraversalHook<
+                B,
+                <A as LayeredArchitecture<B, S2>>::ForwardContext,
+                <A as LayeredArchitecture<B, S2>>::Error,
+            > + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
+        let graph = <A as LayeredArchitecture<B, S2>>::execution_graph(&self.architecture)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         let counts = (0..graph.groups().len())
             .map(|group| {
-                self.architecture
-                    .group_unit_count(group)
+                <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
                     .map_err(LayerwiseRuntimeError::Architecture)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2835,7 +3123,8 @@ where
             .as_ref()
             .expect("layered runtime initialized its executor cache");
         let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_observed(
+            <A as LayeredArchitecture<B, S2>>::begin_forward_observed(
+                &mut self.architecture,
                 input,
                 state,
                 context,
@@ -2845,7 +3134,12 @@ where
                 },
             )
         } else {
-            self.architecture.begin_forward(input, state, context)
+            <A as LayeredArchitecture<B, S2>>::begin_forward(
+                &mut self.architecture,
+                input,
+                state,
+                context,
+            )
         }
         .map_err(LayerwiseRuntimeError::Architecture)?;
         let initial_completion = (graph.groups().len() > 1)
@@ -2892,17 +3186,16 @@ where
                 })
                 .collect::<Vec<_>>();
             let dependency_refs = dependencies.iter().collect::<Vec<_>>();
-            let mut hidden = self
-                .architecture
-                .begin_execution_group(
-                    group,
-                    &initial,
-                    &dependency_refs,
-                    state,
-                    &mut forward_context,
-                    executor,
-                )
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+            let mut hidden = <A as LayeredArchitecture<B, S2>>::begin_execution_group(
+                &mut self.architecture,
+                group,
+                &initial,
+                &dependency_refs,
+                state,
+                &mut forward_context,
+                executor,
+            )
+            .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
@@ -2911,10 +3204,11 @@ where
             {
                 outputs[dependency] = None;
             }
-            if self
-                .architecture
-                .should_execute_group(group, &forward_context)
-            {
+            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+                &self.architecture,
+                group,
+                &forward_context,
+            ) {
                 let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
@@ -2942,7 +3236,12 @@ where
                         .expect("group-local unit has a stable policy address");
                     let lease = policy
                         .acquire(ordinal, address, |executor| {
-                            self.architecture.build_unit(group, index, executor)
+                            <A as LayeredArchitecture<B, S2>>::build_unit(
+                                &self.architecture,
+                                group,
+                                index,
+                                executor,
+                            )
                         })
                         .map_err(|error| match error {
                             LayerwiseAcquireError::Architecture(error) => {
@@ -2953,7 +3252,8 @@ where
                             }
                         })?;
                     hidden = if observe_unit_internals && hook.observes_activations() {
-                        self.architecture.forward_unit_observed(
+                        <A as LayeredArchitecture<B, S2>>::forward_unit_observed(
+                            &mut self.architecture,
                             group,
                             index,
                             lease,
@@ -2982,28 +3282,38 @@ where
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut state_values = Vec::new();
-                    for state_ordinal in self
-                        .architecture
-                        .retained_state_ordinals(group, index, ordinal)
-                    {
+                    for state_ordinal in <A as LayeredArchitecture<B, S2>>::retained_state_ordinals(
+                        &self.architecture,
+                        group,
+                        index,
+                        ordinal,
+                    ) {
                         state_values.extend(
                             state
                                 .retained_values(state_ordinal, address.with_index(state_ordinal))
                                 .map_err(LayerwiseRuntimeError::State)?,
                         );
                     }
-                    let context_values =
-                        self.architecture
-                            .retained_context_values(&forward_context, group, index);
+                    let context_values = <A as LayeredArchitecture<B, S2>>::retained_context_values(
+                        &self.architecture,
+                        &forward_context,
+                        group,
+                        index,
+                    );
                     policy
                         .complete(&hidden, state_values.into_iter(), context_values)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
-            hidden = self
-                .architecture
-                .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+            hidden = <A as LayeredArchitecture<B, S2>>::complete_execution_group(
+                &mut self.architecture,
+                group,
+                &hidden,
+                state,
+                &mut forward_context,
+                executor,
+            )
+            .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
@@ -3030,10 +3340,16 @@ where
                 .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         }
         let output = if self.last_text_output_only {
-            self.architecture
-                .finish_text_forward(&hidden, state, &forward_context, context)
+            <A as LayeredArchitecture<B, S2>>::finish_text_forward(
+                &mut self.architecture,
+                &hidden,
+                state,
+                &forward_context,
+                context,
+            )
         } else if hook.observes_activations() {
-            self.architecture.finish_forward_observed(
+            <A as LayeredArchitecture<B, S2>>::finish_forward_observed(
+                &mut self.architecture,
                 &hidden,
                 state,
                 &forward_context,
@@ -3044,8 +3360,13 @@ where
                 },
             )
         } else {
-            self.architecture
-                .finish_forward(&hidden, state, &forward_context, context)
+            <A as LayeredArchitecture<B, S2>>::finish_forward(
+                &mut self.architecture,
+                &hidden,
+                state,
+                &forward_context,
+                context,
+            )
         }
         .map_err(LayerwiseRuntimeError::Architecture)?;
         policy
@@ -3463,75 +3784,146 @@ where
         )
     }
 
-    fn forward_parallel_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+    /// Runs the shared parallel traversal against a caller-borrowed compatible
+    /// state owner. Parameter units, leases, observations and completion use the
+    /// same lifecycle as `forward_parallel`; only the mutable state borrow differs.
+    pub fn forward_parallel_with_state<'a, S2>(
         &mut self,
-        input: A::Input<'a>,
-        state: &mut S,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<<A as LayeredArchitecture<B, S>>::Error, P::Error>>
+    where
+        S2: RuntimeState<B>,
+        A: ParallelLayeredArchitecture<B, S2>
+            + LayeredArchitecture<
+                B,
+                S2,
+                Unit = <A as LayeredArchitecture<B, S>>::Unit,
+                Error = <A as LayeredArchitecture<B, S>>::Error,
+            >,
+    {
+        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                <A as ParallelLayeredArchitecture<B, S2>>::forward_unit_parallel(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    parallel,
+                    context,
+                )
+            },
+            &mut NoopLayeredTraversalHook,
+            false,
+        )
+        .map(|(output, _)| output)
+    }
+
+    fn forward_parallel_with_unit_executor_and_traversal_hook_impl<'a, S2, E, H>(
+        &mut self,
+        input: <A as LayeredArchitecture<B, S2>>::Input<'a>,
+        state: &mut S2,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         mut execute: E,
         hook: &mut H,
         observe_unit_internals: bool,
-    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    ) -> Result<
+        (B::Tensor, <A as LayeredArchitecture<B, S2>>::ForwardContext),
+        LayerwiseRuntimeError<<A as LayeredArchitecture<B, S2>>::Error, P::Error>,
+    >
     where
-        A: ParallelLayeredArchitecture<B, S>,
+        S2: RuntimeState<B>,
+        A: ParallelLayeredArchitecture<B, S2>
+            + LayeredArchitecture<
+                B,
+                S2,
+                Unit = <A as LayeredArchitecture<B, S>>::Unit,
+                Error = <A as LayeredArchitecture<B, S>>::Error,
+            >,
         E: FnMut(
             &mut A,
             usize,
             usize,
-            &mut A::Unit,
+            &mut <A as LayeredArchitecture<B, S2>>::Unit,
             &B::Tensor,
-            &mut S,
-            &mut A::ForwardContext,
+            &mut S2,
+            &mut <A as LayeredArchitecture<B, S2>>::ForwardContext,
             &B::ParallelContext,
             &<B::Tensor as eredu_nn::Tensor>::Context,
-        ) -> Result<B::Tensor, A::Error>,
-        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+        ) -> Result<B::Tensor, <A as LayeredArchitecture<B, S2>>::Error>,
+        H: LayeredTraversalHook<
+                B,
+                <A as LayeredArchitecture<B, S2>>::ForwardContext,
+                <A as LayeredArchitecture<B, S2>>::Error,
+            > + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
+        let initialized = (|| {
+            let graph = <A as LayeredArchitecture<B, S2>>::execution_graph(&self.architecture)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            let counts = (0..graph.groups().len())
+                .map(|group| {
+                    <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
+                        .map_err(LayerwiseRuntimeError::Architecture)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let layout = ExecutionUnitLayout::new(&graph, counts)?;
+            if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+                self.executors = Some(
+                    B::fork_executors(context, graph.groups().len())
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                );
+            }
+            let forward = if hook.observes_activations() {
+                <A as ParallelLayeredArchitecture<B, S2>>::begin_forward_parallel_observed(
+                    &mut self.architecture,
+                    input,
+                    state,
+                    parallel,
+                    context,
+                    &mut TraversalActivationObserver {
+                        hook,
+                        types: std::marker::PhantomData,
+                    },
+                )
+            } else {
+                <A as ParallelLayeredArchitecture<B, S2>>::begin_forward_parallel(
+                    &mut self.architecture,
+                    input,
+                    state,
+                    parallel,
+                    context,
+                )
+            }
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                self.architecture
-                    .group_unit_count(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
-            self.executors = Some(
-                B::fork_executors(context, graph.groups().len())
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-            );
-        }
+            let initial_completion = (graph.groups().len() > 1)
+                .then(|| B::submit(context, [&forward.hidden]))
+                .transpose()
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            Ok((graph, layout, forward, initial_completion))
+        })();
+        let (graph, layout, forward, initial_completion) = agree_layered_local(
+            initialized,
+            hook,
+            LayeredLocalPhase::Initialization,
+            context,
+        )?;
         let executors = self
             .executors
             .as_ref()
             .expect("layered runtime initialized its executor cache");
-        let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_parallel_observed(
-                input,
-                state,
-                parallel,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
-        } else {
-            self.architecture
-                .begin_forward_parallel(input, state, parallel, context)
-        }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
-        let initial_completion = (graph.groups().len() > 1)
-            .then(|| B::submit(context, [&forward.hidden]))
-            .transpose()
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
-            .map_err(LayerwiseRuntimeError::Policy)?;
+        let begun = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
+            .map_err(LayerwiseRuntimeError::Policy);
+        let mut policy = agree_layered_local(begun, hook, LayeredLocalPhase::PolicyBegin, context)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
         let mut schedule = ExecutionGroupSchedule::new(&graph);
@@ -3540,66 +3932,77 @@ where
             (0..graph.groups().len()).map(|_| None).collect();
         for &group in graph.execution_order() {
             let executor = std::borrow::Borrow::borrow(&executors[group]);
-            let group_dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group");
-            if group_dependencies.is_empty() {
-                if let Some(completion) = &initial_completion {
-                    B::order_after(completion, executor)
-                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            let ingress = (|| {
+                let group_dependencies = schedule
+                    .dependencies(group)
+                    .expect("validated execution order contains a known group");
+                if group_dependencies.is_empty() {
+                    if let Some(completion) = &initial_completion {
+                        B::order_after(completion, executor).map_err(|error| {
+                            LayerwiseRuntimeError::Submission(error.to_string())
+                        })?;
+                    }
                 }
-            }
-            for &dependency in group_dependencies {
-                B::order_after(
-                    completions[dependency]
-                        .as_ref()
-                        .expect("topological dependency has a completion"),
-                    executor,
-                )
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-            }
-            let dependencies = schedule
-                .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
-            let mut hidden = self
-                .architecture
-                .begin_execution_group_parallel(
-                    group,
-                    &initial,
-                    &dependency_refs,
-                    state,
-                    &mut forward_context,
-                    parallel,
-                    executor,
-                )
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
+                for &dependency in group_dependencies {
+                    B::order_after(
+                        completions[dependency]
+                            .as_ref()
+                            .expect("topological dependency has a completion"),
+                        executor,
+                    )
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                }
+                let dependencies = schedule
+                    .dependencies(group)
+                    .expect("validated execution order contains a known group")
+                    .iter()
+                    .map(|&dependency| {
+                        outputs[dependency]
+                            .as_ref()
+                            .expect("topological dependency has completed")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+                let mut hidden =
+                    <A as ParallelLayeredArchitecture<B, S2>>::begin_execution_group_parallel(
+                        &mut self.architecture,
+                        group,
+                        &initial,
+                        &dependency_refs,
+                        state,
+                        &mut forward_context,
+                        parallel,
+                        executor,
+                    )
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                Ok(hidden)
+            })();
+            let mut hidden = agree_layered_local(
+                ingress,
+                hook,
+                LayeredLocalPhase::GroupIngress { group },
+                executor,
+            )?;
             for dependency in schedule
                 .started(group)
                 .expect("topological execution starts only ready groups")
             {
                 outputs[dependency] = None;
             }
-            if self
-                .architecture
-                .should_execute_group(group, &forward_context)
-            {
+            if <A as LayeredArchitecture<B, S2>>::should_execute_group(
+                &self.architecture,
+                group,
+                &forward_context,
+            ) {
                 let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
                     .len();
                 for index in 0..unit_count {
-                    if hook
+                    let action = hook
                         .before_unit(
                             group,
                             index,
@@ -3608,8 +4011,13 @@ where
                             &mut forward_context,
                             executor,
                         )
-                        .map_err(LayerwiseRuntimeError::Architecture)?
-                        == LayeredUnitAction::SkipRemainingGroup
+                        .map_err(LayerwiseRuntimeError::Architecture);
+                    if agree_layered_local(
+                        action,
+                        hook,
+                        LayeredLocalPhase::BeforeUnit { group, index },
+                        executor,
+                    )? == LayeredUnitAction::SkipRemainingGroup
                     {
                         break;
                     }
@@ -3619,9 +4027,14 @@ where
                     let address = layout
                         .address(ordinal)
                         .expect("group-local unit has a stable policy address");
-                    let lease = policy
+                    let acquired = policy
                         .acquire(ordinal, address, |executor| {
-                            self.architecture.build_unit(group, index, executor)
+                            <A as LayeredArchitecture<B, S2>>::build_unit(
+                                &self.architecture,
+                                group,
+                                index,
+                                executor,
+                            )
                         })
                         .map_err(|error| match error {
                             LayerwiseAcquireError::Architecture(error) => {
@@ -3630,9 +4043,16 @@ where
                             LayerwiseAcquireError::Policy(error) => {
                                 LayerwiseRuntimeError::Policy(error)
                             }
-                        })?;
-                    hidden = if observe_unit_internals && hook.observes_activations() {
-                        self.architecture.forward_unit_parallel_observed(
+                        });
+                    let lease = agree_layered_local(
+                        acquired,
+                        hook,
+                        LayeredLocalPhase::Acquisition { group, index },
+                        executor,
+                    )?;
+                    let computed = if observe_unit_internals && hook.observes_activations() {
+                        <A as ParallelLayeredArchitecture<B, S2>>::forward_unit_parallel_observed(
+                            &mut self.architecture,
                             group,
                             index,
                             lease,
@@ -3659,89 +4079,130 @@ where
                             executor,
                         )
                     }
-                    .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
-                        .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let mut state_values = Vec::new();
-                    for state_ordinal in self
-                        .architecture
-                        .retained_state_ordinals(group, index, ordinal)
-                    {
-                        state_values.extend(
-                            state
-                                .retained_values(state_ordinal, address.with_index(state_ordinal))
-                                .map_err(LayerwiseRuntimeError::State)?,
-                        );
-                    }
-                    let context_values =
-                        self.architecture
-                            .retained_context_values(&forward_context, group, index);
-                    policy
-                        .complete(&hidden, state_values.into_iter(), context_values)
-                        .map_err(LayerwiseRuntimeError::Policy)?;
+                    .map_err(LayerwiseRuntimeError::Architecture);
+                    hidden = agree_layered_local(
+                        computed,
+                        hook,
+                        LayeredLocalPhase::UnitExecution { group, index },
+                        executor,
+                    )?;
+                    let executed = (|| {
+                        hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
+                            .map_err(LayerwiseRuntimeError::Architecture)?;
+                        let mut state_values = Vec::new();
+                        for state_ordinal in
+                            <A as LayeredArchitecture<B, S2>>::retained_state_ordinals(
+                                &self.architecture,
+                                group,
+                                index,
+                                ordinal,
+                            )
+                        {
+                            state_values.extend(
+                                state
+                                    .retained_values(
+                                        state_ordinal,
+                                        address.with_index(state_ordinal),
+                                    )
+                                    .map_err(LayerwiseRuntimeError::State)?,
+                            );
+                        }
+                        let context_values =
+                            <A as LayeredArchitecture<B, S2>>::retained_context_values(
+                                &self.architecture,
+                                &forward_context,
+                                group,
+                                index,
+                            );
+                        policy
+                            .complete(&hidden, state_values.into_iter(), context_values)
+                            .map_err(LayerwiseRuntimeError::Policy)?;
+                        Ok(())
+                    })();
+                    agree_layered_local(
+                        executed,
+                        hook,
+                        LayeredLocalPhase::UnitCompletion { group, index },
+                        executor,
+                    )?;
                 }
             }
-            hidden = self
-                .architecture
-                .complete_execution_group_parallel(
-                    group,
-                    &hidden,
-                    state,
-                    &mut forward_context,
-                    parallel,
-                    executor,
-                )
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            hook.after_group(group, &mut hidden, &mut forward_context, executor)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            outputs[group] = Some(hidden);
-            if graph.groups().len() > 1 {
-                completions[group] = Some(
-                    B::submit(
+            let completed = (|| {
+                hidden =
+                    <A as ParallelLayeredArchitecture<B, S2>>::complete_execution_group_parallel(
+                        &mut self.architecture,
+                        group,
+                        &hidden,
+                        state,
+                        &mut forward_context,
+                        parallel,
                         executor,
-                        [outputs[group]
-                            .as_ref()
-                            .expect("group output was stored before submission")],
                     )
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-                );
-            }
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                hook.after_group(group, &mut hidden, &mut forward_context, executor)
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                outputs[group] = Some(hidden);
+                if graph.groups().len() > 1 {
+                    completions[group] = Some(
+                        B::submit(
+                            executor,
+                            [outputs[group]
+                                .as_ref()
+                                .expect("group output was stored before submission")],
+                        )
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                    );
+                }
+                Ok(())
+            })();
+            agree_layered_local(
+                completed,
+                hook,
+                LayeredLocalPhase::GroupCompletion { group },
+                executor,
+            )?;
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
         }
-        let hidden = outputs[graph.output()]
-            .take()
-            .expect("validated graph output completed");
-        if let Some(completion) = &completions[graph.output()] {
-            B::order_after(completion, context)
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        }
-        let output = if hook.observes_activations() {
-            self.architecture.finish_forward_parallel_observed(
-                &hidden,
-                state,
-                &forward_context,
-                parallel,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
-        } else {
-            self.architecture.finish_forward_parallel(
-                &hidden,
-                state,
-                &forward_context,
-                parallel,
-                context,
-            )
-        }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
-        policy
-            .finish(&output)
-            .map_err(LayerwiseRuntimeError::Policy)?;
+        let finished = (|| {
+            let hidden = outputs[graph.output()]
+                .take()
+                .expect("validated graph output completed");
+            if let Some(completion) = &completions[graph.output()] {
+                B::order_after(completion, context)
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            }
+            let output = if hook.observes_activations() {
+                <A as ParallelLayeredArchitecture<B, S2>>::finish_forward_parallel_observed(
+                    &mut self.architecture,
+                    &hidden,
+                    state,
+                    &forward_context,
+                    parallel,
+                    context,
+                    &mut TraversalActivationObserver {
+                        hook,
+                        types: std::marker::PhantomData,
+                    },
+                )
+            } else {
+                <A as ParallelLayeredArchitecture<B, S2>>::finish_forward_parallel(
+                    &mut self.architecture,
+                    &hidden,
+                    state,
+                    &forward_context,
+                    parallel,
+                    context,
+                )
+            }
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+            policy
+                .finish(&output)
+                .map_err(LayerwiseRuntimeError::Policy)?;
+            Ok(output)
+        })();
+        let output = agree_layered_local(finished, hook, LayeredLocalPhase::Finish, context)?;
         Ok((output, forward_context))
     }
 }

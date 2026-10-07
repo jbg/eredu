@@ -13,8 +13,8 @@ impl<B: GroupedNeuralBackend + DistributedNeuralBackend> TargetModel<B> {
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Error> {
-        use crate::partitioned_execution::{
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
+        use eredu_runtime::{
             RoutedTensorDimension as Dimension, RoutedTensorReduction as Reduction,
             RoutedTensorReductions,
         };
@@ -272,13 +272,13 @@ where
     }
 }
 
-impl<B, S> crate::partitioned_execution::TextPartitionArchitecture<B, S> for TargetModel<B>
+impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for TargetModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + RuntimeAppendStreams<B>,
 {
-    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
+    fn partition_input_dimensions(&self, input: &Self::Input<'_>) -> Result<(i32, i32), Error> {
         if input.batch <= 0 || input.tokens <= 0 {
             return Err(Error::backend(
                 "target partition requires positive input dimensions",
@@ -287,12 +287,12 @@ where
         Ok((input.batch, input.tokens))
     }
 
-    fn begin_text_partition<'a, O>(
+    fn begin_pipeline_partition<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(B::Tensor, RequestBoundary<B::Tensor>)>,
         state: &mut S,
-        expected: &StateLayout,
+        expected: Option<&StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
@@ -301,6 +301,9 @@ where
     where
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
+        let expected = expected.ok_or_else(|| {
+            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
+        })?;
         self.validate_partition_entry(state, expected, first_state_ordinal, parallel)?;
         match incoming {
             Some((hidden, boundary)) => {
@@ -328,7 +331,7 @@ where
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
         self.routed_tensor_reductions(unit, routed)
     }
 }

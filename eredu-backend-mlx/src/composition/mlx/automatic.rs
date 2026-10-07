@@ -14,12 +14,12 @@ use eredu_core::{
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
-    capability::available_memory, inspection::MlxInspectionOptions,
-    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter, MlxBackend, MlxLoadRequest,
+    capability::available_memory, inspection::MlxInspectionOptions, speculative::MlxDrafter,
+    MlxBackend, MlxLoadRequest,
 };
 use crate::{
     backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
+    backend::{MlxAcceleratorFamily, MlxDeviceIdentity},
 };
 use eredu_runtime::selected_text_bounded_requirement;
 
@@ -71,38 +71,6 @@ impl MlxBackendFactory {
         .map(MlxLoadRequest::from_normalized)
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))
     }
-}
-
-/// Selects and materializes one single-device realtime execution route.
-///
-/// Architecture inspection and exact capability selection complete before
-/// this function realizes a native device or creates execution and weight
-/// streams. The returned context exposes mechanism operations only; the model
-/// remains in its architecture-owned selected wrapper.
-pub fn create_realtime_execution(
-    preparation: eredu_architectures::moshi::RealtimePreparationPlan,
-    device: &DevicePlan,
-    options: MlxLoadRequest,
-) -> Result<
-    (
-        MlxRealtimeExecutionContext,
-        eredu_architectures::moshi::MoshiRealtimeExecution<
-            crate::composition::moshi::MlxRealtimeExecution,
-        >,
-    ),
-    Error,
-> {
-    let selected =
-        MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)?;
-    #[cfg(test)]
-    crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
-    let realized =
-        mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
-    let stream = Stream::try_new_with_device(&realized.device)?;
-    let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))?;
-    let context = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
-    let execution = context.materialize_realtime_execution(selected)?;
-    Ok((context, execution))
 }
 
 /// Discovers hardware facts visible to the MLX adapter.

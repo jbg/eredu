@@ -26,6 +26,13 @@ pub(crate) fn f32_pointwise(
         }
         let size = i32::try_from(input.size())
             .map_err(|_| Exception::custom("pointwise size overflow"))?;
+        // MLX declares zero-dimensional custom-kernel inputs as scalar references.
+        // Keep pointer indexing and the same rounded equation for every shape;
+        // the output configuration retains the caller's original scalar shape.
+        let scalar_input = (input.ndim() == 0)
+            .then(|| input.reshape(&[1], stream))
+            .transpose()?;
+        let kernel_input = scalar_input.as_ref().unwrap_or(input);
         let config = CustomKernelConfig::new()
             .with_template_arg_int("SIZE", size)
             .with_template_arg_int("OP", operation as i32)
@@ -38,7 +45,7 @@ pub(crate) fn f32_pointwise(
                     "uint i=thread_position_in_grid.x; if(i>=SIZE) return; float x=input[i]; float denominator=1.0f+stable_exp_f32(-x); output[i]=(OP==1 ? 1.0f : x)/denominator;",
                     include_str!("exp_f32.metal"),true,false)?);
             }
-            cell.borrow().as_ref().expect("pointwise kernel initialized").apply_device([input],&config,stream)
+            cell.borrow().as_ref().expect("pointwise kernel initialized").apply_device([kernel_input],&config,stream)
         })?;
         Ok(output.pop())
     }
@@ -53,6 +60,28 @@ pub(crate) fn f32_pointwise(
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType, Dtype};
+    #[test]
+    fn native_pointwise_scalar_and_singleton_preserve_shape_and_rounding() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        for shape in [&[][..], &[1], &[1, 1], &[2], &[]] {
+            let count = shape.iter().map(|&extent| extent as usize).product();
+            let input = Array::from_slice(&vec![-2.0_f32; count], shape);
+            for (operation, expected) in [
+                (Pointwise::Sigmoid, 0.11920292_f32),
+                (Pointwise::Silu, -0.23840584_f32),
+            ] {
+                let output = f32_pointwise(&input, operation, &stream).unwrap().unwrap();
+                assert_eq!(output.shape(), shape);
+                assert!(output
+                    .into_evaluated()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .iter()
+                    .all(|&value| value == expected));
+            }
+        }
+    }
+
     #[test]
     fn native_sigmoid_and_coefficients_match_independent_rounding() {
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));

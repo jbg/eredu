@@ -61,7 +61,9 @@ impl InspectedPredictionSource {
             .ok_or_else(|| invalid("prediction companion has no retained SafeTensors shards"))?;
         Ok(
             crate::artifact_preparation::PhysicalArtifactPreparation::Safetensors {
-                tensors: self.inspection.tensors().clone(),
+                catalog: eredu_core::artifact::prepared_safetensors_metadata(
+                    self.inspection.tensors(),
+                )?,
                 shards: shards.clone(),
                 resolution: self.header_plan().resolution().clone(),
             },

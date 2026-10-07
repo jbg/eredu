@@ -2033,7 +2033,10 @@ impl CommunicationCapabilities {
         Ok(())
     }
 
-    fn validate_requirement(
+    /// Checks one exact operation, dtype, payload bound and completion requirement.
+    /// This performs no native allocation or communication; callers retain ownership
+    /// of group membership and the selected bounded completion policy.
+    pub fn validate_requirement(
         &self,
         requirement: &CommunicationOperationRequirement,
     ) -> Result<(), CommunicationCapabilityError> {

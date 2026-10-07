@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn mlx_pipeline_allocator_preserves_exact_u32_and_i32_boundary_roles() {
-    use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+    use eredu_runtime::PartitionTensorAllocator;
 
     let (stream, _) = execution_streams();
     for (source, logical, expected) in [
@@ -40,7 +40,7 @@ fn mlx_pipeline_allocator_preserves_exact_u32_and_i32_boundary_roles() {
 
 #[test]
 fn mlx_pipeline_allocator_rejects_nonfloating_source_before_wire_submission() {
-    use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+    use eredu_runtime::PartitionTensorAllocator;
 
     let (stream, _) = execution_streams();
     let source = MlxTensor::from_array(Array::from_slice(&[1_i32], &[1, 1, 1]));
@@ -57,7 +57,7 @@ fn mlx_pipeline_allocator_rejects_nonfloating_source_before_wire_submission() {
 
 #[test]
 fn mlx_pipeline_allocator_converts_f16_and_bf16_sources_to_exact_f32_wire_values() {
-    use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+    use eredu_runtime::PartitionTensorAllocator;
 
     let (stream, _) = execution_streams();
     let expected = [1.5_f32, -2.0, 0.25];
@@ -404,7 +404,7 @@ fn prediction_target_forks_preserve_kv_and_compressed_paging_sessions() {
 
 #[test]
 fn mlx_pipeline_fp32_auxiliary_precision_is_independent_of_bf16_activation_wire() {
-    use eredu_architectures::partitioned_execution::PartitionTensorAllocator;
+    use eredu_runtime::PartitionTensorAllocator;
     let (stream, _) = execution_streams();
     let values = [0.6001234f32, 0.8001234, -0.3001234, 0.1001234];
     let tensor = MlxTensor::from_array(Array::from_slice(&values, &[1, 2, 2]));

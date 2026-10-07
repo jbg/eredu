@@ -151,6 +151,48 @@ impl ExecutionUnitLayout {
         })
     }
 
+    /// Selects canonical unit addresses without rebasing their group or unit indices.
+    /// Storage ordinals and group ranges are compacted to the selected units.
+    /// Input must follow this layout's order and may not duplicate or add addresses.
+    pub fn select(
+        &self,
+        addresses: impl IntoIterator<Item = ExecutionUnitAddress>,
+    ) -> Result<Self, ExecutionUnitLayoutError> {
+        let mut selected = Vec::new();
+        let mut previous = None;
+        for address in addresses {
+            let ordinal = self.ordinal(address.group(), address.index()).ok_or(
+                ExecutionUnitLayoutError::UnknownSelectedAddress {
+                    group: address.group(),
+                    index: address.index(),
+                },
+            )?;
+            if previous.is_some_and(|previous| ordinal <= previous) {
+                return Err(ExecutionUnitLayoutError::NonCanonicalSelection);
+            }
+            previous = Some(ordinal);
+            selected.push(address);
+        }
+        let mut start = 0;
+        let group_ranges = (0..self.group_count())
+            .map(|group| {
+                let end = start
+                    + selected[start..]
+                        .iter()
+                        .take_while(|address| address.group() == group)
+                        .count();
+                let range = start..end;
+                start = end;
+                range
+            })
+            .collect();
+        Ok(Self {
+            group_ids: self.group_ids.clone(),
+            group_ranges,
+            addresses: selected,
+        })
+    }
+
     /// Returns the total number of execution units in group-major order.
     pub fn len(&self) -> usize {
         self.addresses.len()
@@ -184,7 +226,15 @@ impl ExecutionUnitLayout {
     /// Resolves one architecture address to its flat residency-unit slot.
     pub fn ordinal(&self, group: usize, index: usize) -> Option<usize> {
         let range = self.group_ranges.get(group)?;
-        (index < range.len()).then_some(range.start + index)
+        // Ordinary complete layouts retain constant-time lookup; selected layouts
+        // preserve canonical indices and resolve only within their local group.
+        if index < range.len() && self.addresses[range.start + index].index() == index {
+            return Some(range.start + index);
+        }
+        self.addresses[range.clone()]
+            .binary_search_by_key(&index, |address| address.index())
+            .ok()
+            .map(|local| range.start + local)
     }
 }
 
@@ -204,6 +254,17 @@ pub enum ExecutionUnitLayoutError {
     /// The total number of units exceeded the addressable range.
     #[error("execution-unit count overflowed usize")]
     UnitCountOverflow,
+    /// A selected address is not present in the source layout.
+    #[error("selected execution group {group} unit {index} is absent from the source layout")]
+    UnknownSelectedAddress {
+        /// Architecture group index.
+        group: usize,
+        /// Canonical group-local unit index.
+        index: usize,
+    },
+    /// Selected addresses repeat or change canonical traversal order.
+    #[error("selected execution units must be unique and in canonical order")]
+    NonCanonicalSelection,
 }
 
 impl ExecutionGraph {
@@ -702,6 +763,32 @@ mod tests {
         assert_eq!(layout.address(3).unwrap().index(), 1);
         assert_eq!(layout.ordinal(1, 2), Some(4));
         assert_eq!(layout.ordinal(0, 2), None);
+    }
+
+    #[test]
+    fn selected_unit_layout_preserves_canonical_addresses_and_local_storage() {
+        let graph = ExecutionGraph::chain(["input", "blocks", "norm"]).unwrap();
+        let full = ExecutionUnitLayout::new(&graph, [1, 4, 1]).unwrap();
+        let addresses = [
+            full.address(3).unwrap(),
+            full.address(4).unwrap(),
+            full.address(5).unwrap(),
+        ];
+        let selected = full.select(addresses).unwrap();
+        assert_eq!(selected.group_range(0), Some(0..0));
+        assert_eq!(selected.group_range(1), Some(0..2));
+        assert_eq!(selected.group_range(2), Some(2..3));
+        for (ordinal, address) in addresses.into_iter().enumerate() {
+            assert_eq!(selected.address(ordinal), Some(address));
+            assert_eq!(
+                selected.ordinal(address.group(), address.index()),
+                Some(ordinal)
+            );
+        }
+        assert_eq!(selected.ordinal(1, 0), None);
+        assert!(selected.select([full.address(1).unwrap()]).is_err());
+        assert!(full.select([addresses[1], addresses[0]]).is_err());
+        assert!(full.select([addresses[0], addresses[0]]).is_err());
     }
 
     #[test]

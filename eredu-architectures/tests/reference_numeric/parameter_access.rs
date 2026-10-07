@@ -245,7 +245,7 @@ fn prepared_partition_parameter_loans_and_replacements_match_independent_executi
                             let plan = prepared_adapter::plan(None).with_topology(topology).with_residency(residency);
                             let sources = partitioned_adapter::prepare_plan(inspection, &plan, rank, std::time::Duration::from_secs(10)).unwrap();
                             let discovery = sources.prepare_discovery(Default::default(), Default::default()).bind_partition_parameters(Some(Arc::new(parameters.clone()))).unwrap();
-                            let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, topology_rank).unwrap();
+                            let layout = eredu_runtime::derive_partitioned_local_layout(parameters, topology_rank).unwrap();
                             let mut context = NumericContext::with_partition(layout, rank, world);
                             context.bind_checkpoint_values = true;
                             let mut executable = partitioned_adapter::dense(sources, &context).unwrap();

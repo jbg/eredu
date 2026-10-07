@@ -19,11 +19,13 @@ audio = ["eredu-media/audio"]
 
 [dependencies]
 eredu-checkpoint.workspace = true
+eredu-codec.workspace = true
 eredu-core.workspace = true
 eredu-gguf.workspace = true
 eredu-nn.workspace = true
 eredu-runtime.workspace = true
 eredu-media.workspace = true
+eredu-text = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

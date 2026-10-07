@@ -189,7 +189,7 @@ impl RoutedPartitionedProductionVisitor<NumericBackend, State> for Binding {
         _: SharedCheckpointSource,
     ) -> Result<Self::Output, Error>
     where
-        A: TextPartitionArchitecture<NumericBackend, State>
+        A: PipelinePartitionArchitecture<NumericBackend, State>
             + ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
             + ParallelRoutedLayeredArchitecture<NumericBackend, State>
             + 'static,
@@ -209,7 +209,7 @@ impl RoutedPartitionedProductionVisitor<NumericBackend, State> for Binding {
         _: PredictionBinding,
     ) -> Result<Self::Output, DenseDecoderPartitionedDispatchError<Error>>
     where
-        A: TextPartitionArchitecture<NumericBackend, State>
+        A: PipelinePartitionArchitecture<NumericBackend, State>
             + ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
             + ParallelRoutedLayeredArchitecture<NumericBackend, State>
             + 'static,

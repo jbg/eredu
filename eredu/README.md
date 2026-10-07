@@ -56,7 +56,7 @@ and falls back to CPU in CPU-only MLX builds. Pass `LocalDevice::Cpu` or
 `LocalDevice::Accelerator(index)` to `local_device_plan` when an application
 needs an explicit device.
 
-Model-family architecture modules remain owned by `eredu-architectures`.
+Model-family architecture modules are owned by `eredu-architectures`.
 Reusable MLX tensors, operators, caches, streams, and family composition live
 in `eredu-backend-mlx`. Application clients import the backend factory from that
 crate and use the generic facade types in `eredu::api`.
@@ -112,13 +112,13 @@ Inspect `prepared.text_generation_support()` for admission: native tool
 declarations and required calls are rejected, and explicit thinking requires
 `allow_unparsed_reasoning`. Emulated tools can use ordinary prompt text.
 
-Realtime speech uses `eredu::api::realtime::PreparedRealtimeModel<M>` and
-`eredu_runtime::RealtimeSessionScheduler`. For MLX,
-`eredu_backend_mlx::create_realtime_execution` loads an architecture-prepared
-model and returns its context and execution mechanism. The runtime scheduler
-accepts portable host frames and commits completed transitions before host
-output is delivered. Released sessions use the generic `ReleasedRealtimeSession`
-type.
+Realtime models use `eredu::api::realtime::prepare_realtime_model` for shared
+Moshi/PersonaPlex and VoiceChat artifact discovery and retained preparation.
+`prepare_mlx_realtime` checks the requested categorical or PCM protocol and selects
+resources before native allocation; `PreparedMlxRealtime::load` binds that exact
+selection. Categorical execution uses `RealtimeSessionScheduler`; PCM speech
+returns a bound session with controlled advancement and an iterator over the same
+scheduler. Completed transitions commit before host output is delivered.
 
 ## Cargo features
 

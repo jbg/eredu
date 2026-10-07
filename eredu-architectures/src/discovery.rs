@@ -7,6 +7,7 @@ use eredu_core::*;
 mod components;
 mod families;
 mod routed_components;
+mod voicechat;
 
 pub(crate) const OPAQUE_PREDICTION_DESCRIPTION: &str =
     "Embedded prediction is represented as an opaque component";

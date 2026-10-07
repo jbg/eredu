@@ -10,6 +10,7 @@ pub struct MlxResidentPolicy<U> {
     pub(super) unit_ids: Vec<OffloadUnitId>,
     pub(super) layout: ExecutionUnitLayout,
     pub(super) window_depth: usize,
+    pub(super) _static_leases: OrdinaryRetirement<Vec<ResidentUnitLease>>,
     pub(super) _transfer: ResidentTransfer,
 }
 
@@ -60,7 +61,7 @@ impl<U> MlxResidentPolicy<U> {
 
     /// Returns the number of pinned static-weight leases.
     pub fn static_lease_count(&self) -> usize {
-        1
+        self._static_leases.len()
     }
 
     fn execution_group(&self, group: usize) -> Result<ResidentLayerGroup, Error> {
@@ -84,6 +85,11 @@ impl<U> MlxResidentPolicy<U> {
     /// Returns residency reports for every semantic execution group.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
         (0..self.layout.group_count())
+            .filter(|&group| {
+                self.layout
+                    .group_range(group)
+                    .is_some_and(|range| !range.is_empty())
+            })
             .map(|group| {
                 self.execution_group(group)?
                     .report(&self.residency)
@@ -178,13 +184,18 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
     fn acquire<E, BF>(
         &mut self,
         index: usize,
-        _address: eredu_runtime::ExecutionUnitAddress,
+        address: eredu_runtime::ExecutionUnitAddress,
         _build: BF,
         _stream: &Stream,
     ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
     where
         BF: FnOnce(&Stream) -> Result<U, E>,
     {
+        if self.layout.address(index) != Some(address) {
+            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
+                "resident unit address differs from the selected canonical layout".into(),
+            )));
+        }
         let count = self.units.len();
         let unit = self
             .units

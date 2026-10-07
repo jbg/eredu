@@ -1621,13 +1621,16 @@ where
     }
 }
 
-impl<B, S> crate::partitioned_execution::TextPartitionArchitecture<B, S> for LayeredModel<B>
+impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for LayeredModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+    fn partition_input_dimensions(
+        &self,
+        input: &Self::Input<'_>,
+    ) -> Result<(i32, i32), Self::Error> {
         match input {
             EmbeddedInput::Target { tokens, .. } => Ok((tokens.dim(0), tokens.dim(1))),
             _ => Err(eredu_nn::Error::backend(
@@ -1636,7 +1639,7 @@ where
         }
     }
 
-    fn begin_text_partition<'a, O>(
+    fn begin_pipeline_partition<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(
@@ -1644,7 +1647,7 @@ where
             <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
         )>,
         state: &mut S,
-        expected: &eredu_runtime::StateLayout,
+        expected: Option<&eredu_runtime::StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -1653,6 +1656,9 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
+        let expected = expected.ok_or_else(|| {
+            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
+        })?;
         let (tokens, mask) = match input {
             EmbeddedInput::Target { tokens, mask } => (tokens, mask),
             _ => {

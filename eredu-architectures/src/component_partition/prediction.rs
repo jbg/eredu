@@ -723,7 +723,7 @@ mod tests {
         ] {
             let topology = ParallelTopology::new(tensor, pipeline, expert, 1).unwrap();
             let local = Arc::new(
-                crate::partitioned_execution::derive_partitioned_local_layout(
+                eredu_runtime::derive_partitioned_local_layout(
                     &parameters,
                     ParallelRankTopology::new(ParallelTopology::new(tensor, 1, 1, 1).unwrap(), 0)
                         .unwrap(),
@@ -895,7 +895,7 @@ mod tests {
         ] {
             let topology = ParallelTopology::new(tensor, pipeline, expert, 1).unwrap();
             let local = Arc::new(
-                crate::partitioned_execution::derive_partitioned_local_layout(
+                eredu_runtime::derive_partitioned_local_layout(
                     &parameters,
                     ParallelRankTopology::new(ParallelTopology::new(tensor, 1, 1, 1).unwrap(), 0)
                         .unwrap(),
@@ -1079,7 +1079,7 @@ mod tests {
         for (tensor, pipeline, expert) in [(1, 2, 2), (2, 1, 2), (2, 2, 2)] {
             let topology = ParallelTopology::new(tensor, pipeline, expert, 1).unwrap();
             let local = Arc::new(
-                crate::partitioned_execution::derive_partitioned_local_layout(
+                eredu_runtime::derive_partitioned_local_layout(
                     &parameters,
                     ParallelRankTopology::new(ParallelTopology::new(tensor, 1, 1, 1).unwrap(), 0)
                         .unwrap(),

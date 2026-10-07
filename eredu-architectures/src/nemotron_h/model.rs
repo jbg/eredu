@@ -15,6 +15,7 @@ use eredu_runtime::{
 use super::{
     state_layout, static_parallel_parameter_groups, unit_parallel_parameter_groups, Block,
     EmbeddedInput, ForwardMode, LocalGeometry, ModelArgs, Operator, PredictionUnit, RetainedValues,
+    TargetReadout,
 };
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
 
@@ -118,6 +119,7 @@ pub struct ForwardContext<T> {
     embedded: T,
     mask: Option<T>,
     mode: ForwardMode,
+    readout: TargetReadout,
     target_capture: Option<T>,
     draft_logits: Option<T>,
 }
@@ -134,12 +136,14 @@ impl<T> ForwardContext<T> {
 pub struct TargetBoundary<T> {
     tokens: T,
     embedded: T,
+    readout: T,
 }
 
 /// Family-owned wire schema for immutable target context.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TargetBoundarySchema {
     hidden_size: i32,
+    signed_tokens: bool,
 }
 
 impl TargetBoundarySchema {
@@ -147,14 +151,76 @@ impl TargetBoundarySchema {
     pub const fn from_args(args: &ModelArgs) -> Self {
         Self {
             hidden_size: args.hidden_size,
+            signed_tokens: false,
         }
     }
+
+    /// Selects signed token storage for supplied-embedding producers.
+    ///
+    /// The exact wire schema includes this dtype and rejects disagreement between
+    /// ranks; ordinary tokenizer-driven pipelines retain unsigned token storage.
+    pub const fn with_signed_tokens(mut self) -> Self {
+        self.signed_tokens = true;
+        self
+    }
+
+    /// Width of both the activation and retained input embedding.
+    pub const fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    /// Validates explicit ingress against its selected wire geometry and token dtype.
+    pub fn validate_input<T: Tensor>(
+        &self,
+        tokens: &T,
+        embedded: &T,
+    ) -> Result<(), TargetBoundaryInputError> {
+        let shape = tokens.shape();
+        if shape.len() != 2
+            || shape.iter().any(|&n| n <= 0)
+            || embedded.shape() != [shape[0], shape[1], self.hidden_size]
+        {
+            return Err(TargetBoundaryInputError::Geometry);
+        }
+        let expected = if self.signed_tokens {
+            eredu_nn::TensorElementType::I32
+        } else {
+            eredu_nn::TensorElementType::U32
+        };
+        if tokens.element_type() != Some(expected) {
+            return Err(TargetBoundaryInputError::TokenType {
+                expected,
+                actual: tokens.element_type(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Supplied pipeline ingress does not match the exact retained target wire schema.
+#[derive(Debug, thiserror::Error)]
+pub enum TargetBoundaryInputError {
+    /// Token or embedding geometry differs from the selected boundary.
+    #[error("Nemotron-H boundary requires matching nonempty [batch, sequence] tokens and [batch, sequence, hidden] embeddings")]
+    Geometry,
+    /// Token storage differs from the wire schema's integer representation.
+    #[error("Nemotron-H boundary token dtype {actual:?} differs from {expected:?}")]
+    TokenType {
+        /// Exact integer dtype declared by this boundary.
+        expected: eredu_nn::TensorElementType,
+        /// Tensor-reported dtype, absent if the backend cannot establish it.
+        actual: Option<eredu_nn::TensorElementType>,
+    },
 }
 
 impl<T> TargetBoundary<T> {
     /// Creates the typed target boundary in canonical wire order.
-    pub const fn new(tokens: T, embedded: T) -> Self {
-        Self { tokens, embedded }
+    pub const fn new(tokens: T, embedded: T, readout: T) -> Self {
+        Self {
+            tokens,
+            embedded,
+            readout,
+        }
     }
 
     /// Borrows original target token ids.
@@ -167,16 +233,21 @@ impl<T> TargetBoundary<T> {
         &self.embedded
     }
 
+    /// Exact I32[1] target readout control transported with this invocation.
+    pub const fn readout(&self) -> &T {
+        &self.readout
+    }
+
     /// Decomposes the boundary without cloning backend tensors.
-    pub fn into_parts(self) -> (T, T) {
-        (self.tokens, self.embedded)
+    pub fn into_parts(self) -> (T, T, T) {
+        (self.tokens, self.embedded, self.readout)
     }
 }
 
 impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
     type Boundary<T> = TargetBoundary<T>;
 
-    const IDENTITY: &'static str = "nemotron_h.target";
+    const IDENTITY: &'static str = "nemotron_h.target.v2";
 
     fn primary_tensor_spec(&self) -> eredu_runtime::BoundaryTensorSpec {
         eredu_runtime::BoundaryTensorSpec::primary_activation(self.hidden_size)
@@ -188,13 +259,18 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
             eredu_runtime::BoundaryTensorSpec::new(
                 "tokens",
                 [Dim::Batch, Dim::Sequence],
-                Dtype::Uint32,
+                if self.signed_tokens {
+                    Dtype::Int32
+                } else {
+                    Dtype::Uint32
+                },
             ),
             eredu_runtime::BoundaryTensorSpec::new(
                 "embedded",
                 [Dim::Batch, Dim::Sequence, Dim::Fixed(self.hidden_size)],
                 Dtype::Activation,
             ),
+            eredu_runtime::BoundaryTensorSpec::new("readout", [Dim::Fixed(1)], Dtype::Int32),
         ]
     }
 
@@ -208,6 +284,7 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
         Ok(vec![
             eredu_runtime::ArchitectureBoundaryValue::new("tokens", boundary.tokens)?,
             eredu_runtime::ArchitectureBoundaryValue::new("embedded", boundary.embedded)?,
+            eredu_runtime::ArchitectureBoundaryValue::new("readout", boundary.readout)?,
         ])
     }
 
@@ -219,7 +296,12 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
         let mut tensors = tensors.into_iter();
         let tokens = tensors.next().expect("validated target tokens");
         let embedded = tensors.next().expect("validated target embeddings");
-        Ok(TargetBoundary { tokens, embedded })
+        let readout = tensors.next().expect("validated target readout");
+        Ok(TargetBoundary {
+            tokens,
+            embedded,
+            readout,
+        })
     }
 }
 
@@ -413,7 +495,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
         let embedding_name = "model.embeddings.weight";
         StaticModuleSpec {
-            normalization_groups: None,
+            // One full-width group keeps reduction and learned scale in F32.
+            normalization_groups: Some(1),
             embedding_weight: embedding_name.into(),
             normalization_weight: "model.norm_f.weight".into(),
             head_weight: "lm_head.weight".into(),
@@ -687,17 +770,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
-        let (tokens, embedded, hidden) = match input {
+        let (tokens, embedded, hidden, readout) = match input {
             TargetPartitionInput::Tokens(tokens) => {
                 let embedded = self.static_modules.embeddings.forward(tokens, context)?;
-                (tokens.clone(), embedded.clone(), embedded)
+                (
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded,
+                    TargetReadout::Logits.encode::<B::Tensor>(context)?,
+                )
             }
             TargetPartitionInput::Hidden { hidden, boundary } => {
-                let (tokens, embedded) = boundary.into_parts();
-                (tokens, embedded, hidden)
+                let (tokens, embedded, readout) = boundary.into_parts();
+                (tokens, embedded, hidden, readout)
             }
         };
-        let forward = self.begin_embedded_target_at(
+        let selected_readout = TargetReadout::decode(&readout, context)?;
+        let mut forward = self.begin_embedded_target_at(
             &tokens,
             hidden,
             mask,
@@ -706,7 +795,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             first_state_ordinal,
             context,
         )?;
-        Ok((forward, TargetBoundary::new(tokens, embedded)))
+        forward.context.readout = selected_readout;
+        Ok((forward, TargetBoundary::new(tokens, embedded, readout)))
     }
 
     /// Tensor-parallel target-partition entry with input-rank vocabulary lookup.
@@ -731,7 +821,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
-        let (tokens, embedded, hidden) = match input {
+        let (tokens, embedded, hidden, readout) = match input {
             TargetPartitionInput::Tokens(tokens) => {
                 let embedded = B::vocabulary_parallel_lookup(
                     &mut self.static_modules.embeddings,
@@ -740,14 +830,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     parallel,
                     context,
                 )?;
-                (tokens.clone(), embedded.clone(), embedded)
+                (
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded,
+                    TargetReadout::Logits.encode::<B::Tensor>(context)?,
+                )
             }
             TargetPartitionInput::Hidden { hidden, boundary } => {
-                let (tokens, embedded) = boundary.into_parts();
-                (tokens, embedded, hidden)
+                let (tokens, embedded, readout) = boundary.into_parts();
+                (tokens, embedded, hidden, readout)
             }
         };
-        let forward = self.begin_embedded_target_at(
+        let selected_readout = TargetReadout::decode(&readout, context)?;
+        let mut forward = self.begin_embedded_target_at(
             &tokens,
             hidden,
             mask,
@@ -756,7 +852,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             first_state_ordinal,
             context,
         )?;
-        Ok((forward, TargetBoundary::new(tokens, embedded)))
+        forward.context.readout = selected_readout;
+        Ok((forward, TargetBoundary::new(tokens, embedded, readout)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,6 +871,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
+        super::mtp::validate_target_embeddings(tokens, &hidden, self.args.hidden_size)?;
         if state.layout() != expected {
             return Err(Error::backend(format!(
                 "Nemotron-H runtime state layout {:?} does not match architecture layout {expected:?}",
@@ -802,6 +900,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 embedded: hidden,
                 mask,
                 mode: ForwardMode::Target,
+                readout: TargetReadout::Logits,
                 target_capture: None,
                 draft_logits: None,
             },
@@ -860,6 +959,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 embedded,
                 mask,
                 mode: ForwardMode::Draft(depth),
+                readout: TargetReadout::Logits,
                 target_capture: None,
                 draft_logits: None,
             },
@@ -1159,8 +1259,29 @@ where
         if state.layout() != &expected {
             return Err(Error::backend(format!("Nemotron-H runtime state layout {:?} does not match architecture layout {expected:?}", state.layout())));
         }
+        let input = match input {
+            EmbeddedInput::TargetEmbedded {
+                tokens,
+                embedded,
+                mask,
+                readout,
+            } => {
+                let mut forward = self.begin_embedded_target(
+                    tokens,
+                    embedded.clone(),
+                    mask,
+                    state,
+                    &expected,
+                    context,
+                )?;
+                forward.context.readout = readout;
+                return Ok(forward);
+            }
+            input => input,
+        };
         let (tokens, supplied_hidden, supplied_mask, mode) = match input {
             EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::TargetEmbedded { .. } => unreachable!("supplied target handled above"),
             EmbeddedInput::Draft {
                 tokens,
                 hidden,
@@ -1206,6 +1327,7 @@ where
                 embedded,
                 mask,
                 mode,
+                readout: TargetReadout::Logits,
                 target_capture: None,
                 draft_logits: None,
             },
@@ -1341,6 +1463,9 @@ where
         match forward.mode {
             ForwardMode::Target => {
                 let hidden = self.static_modules.boundary.norm.forward(hidden, context)?;
+                if forward.readout == TargetReadout::NormalizedHidden {
+                    return Ok(hidden);
+                }
                 match &mut self.static_modules.lm_head {
                     Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
                     None => self.static_modules.embeddings.as_linear(&hidden, context),
@@ -1366,11 +1491,18 @@ where
     {
         if matches!(forward.mode, ForwardMode::Target) {
             let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
-            self.static_modules.finish_instrumented(
-                hidden,
-                context,
-                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
-            )
+            let mut instrumentation =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
+            if forward.readout == TargetReadout::NormalizedHidden {
+                instrumentation.normalize_readout(
+                    hidden,
+                    &mut self.static_modules.boundary.norm,
+                    context,
+                )
+            } else {
+                self.static_modules
+                    .finish_instrumented(hidden, context, &mut instrumentation)
+            }
         } else {
             self.finish_forward(hidden, state, forward, context)
         }
@@ -1432,6 +1564,23 @@ where
                 )?;
                 self.begin_embedded_target(tokens, embedded, mask, state, &expected, context)
             }
+            EmbeddedInput::TargetEmbedded {
+                tokens,
+                embedded,
+                mask,
+                readout,
+            } => {
+                let mut forward = self.begin_embedded_target(
+                    tokens,
+                    embedded.clone(),
+                    mask,
+                    state,
+                    &expected,
+                    context,
+                )?;
+                forward.context.readout = readout;
+                Ok(forward)
+            }
             EmbeddedInput::Draft {
                 tokens,
                 hidden,
@@ -1492,6 +1641,10 @@ where
             ForwardMode::Target => self.static_modules.boundary.norm.forward(hidden, context)?,
             ForwardMode::Draft(_) => hidden.clone(),
         };
+        if forward.mode == ForwardMode::Target && forward.readout == TargetReadout::NormalizedHidden
+        {
+            return Ok(hidden);
+        }
         match &mut self.static_modules.lm_head {
             Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
             None => B::vocabulary_parallel_embedding_project(
@@ -1501,6 +1654,44 @@ where
                 context,
             ),
         }
+    }
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if forward.mode != ForwardMode::Target {
+            return self.finish_forward_parallel(hidden, state, forward, parallel, context);
+        }
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Nemotron-H model was not built with rank-local geometry",
+            ));
+        }
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation =
+            crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
+        let normalized = instrumentation.normalize_readout(
+            hidden,
+            &mut self.static_modules.boundary.norm,
+            context,
+        )?;
+        if forward.readout == TargetReadout::NormalizedHidden {
+            return Ok(normalized);
+        }
+        self.static_modules.project_instrumented(
+            &normalized,
+            Some(parallel),
+            context,
+            &mut instrumentation,
+        )
     }
 }
 
@@ -1588,8 +1779,39 @@ where
         } else {
             Ok(LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
-                auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
+                auxiliary: TargetBoundary::new(
+                    forward.tokens.clone(),
+                    forward.embedded.clone(),
+                    forward.readout.encode::<B::Tensor>(context)?,
+                ),
             })
         }
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, owns_output, parallel, context);
+        }
+        let output = match parallel {
+            Some(parallel) => self.finish_forward_parallel_observed(
+                hidden, state, forward, parallel, context, observer,
+            )?,
+            None => self.finish_forward_observed(hidden, state, forward, context, observer)?,
+        };
+        Ok(LayeredPartitionOutput::Final {
+            output,
+            retained: Some(hidden.clone()),
+        })
     }
 }

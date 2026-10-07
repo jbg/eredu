@@ -12,19 +12,32 @@ use eredu_core::{
     scheduler::{
         RequestId, RequestStatus, Scheduler, SchedulerCapabilities, SchedulerError,
         SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
-        TransitionOutput, WorkId,
+        TransitionOutput, WorkDescriptor, WorkId,
     },
-    BoundedCompletionWait, Completion, ParallelTopology, RealtimeInputFrame, RealtimeSampling,
-    RealtimeSpeechConfig,
+    BoundedCompletionWait, Completion, ParallelTopology, RealtimeInputFrame,
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CommunicationCompletionPolicy, LayerWeightResidency, RealtimeGenerationBranch,
-    RealtimeGenerationState, RealtimeGenerationTransactionError, RealtimeIdentity,
-    RealtimeIngressContract, RealtimePayloadContract, RealtimePayloadGeneration,
-    RealtimePayloadOwnerIdentity, SelectedRealtimeRealization,
+    CommunicationCompletionPolicy, LayerWeightResidency, RealtimeFrameContract,
+    RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
+    RealtimeIdentity, RealtimePayloadContract, RealtimePayloadContractError,
+    RealtimePayloadGeneration, RealtimePayloadOwnerIdentity, RealtimeScheduleDescriptor,
+    RealtimeScheduleState, SelectedRealtimeRealization,
 };
+
+/// Admission metadata required by the shared realtime session scheduler.
+/// Architecture-specific input payloads retain their own types and work descriptors.
+pub trait RealtimeSessionInput {
+    /// Positive batch size participating in this transition.
+    fn batch(&self) -> usize;
+}
+
+impl RealtimeSessionInput for RealtimeInputFrame {
+    fn batch(&self) -> usize {
+        self.batch()
+    }
+}
 
 static NEXT_REALTIME_INCARNATION: AtomicU64 = AtomicU64::new(1);
 
@@ -35,8 +48,7 @@ pub struct RealtimeModelSessionIdentity {
     architecture: RealtimeIdentity,
     source: RealtimeIdentity,
     execution: RealtimeIdentity,
-    schedule_identity: RealtimeIdentity,
-    schedule: RealtimeSpeechConfig,
+    frame: RealtimeFrameContract,
     state_layout: RealtimeIdentity,
     topology_policy: RealtimeIdentity,
     topology: ParallelTopology,
@@ -53,8 +65,7 @@ impl RealtimeModelSessionIdentity {
             architecture: selected.requirements().architecture().clone(),
             source: selected.source().clone(),
             execution: selected.execution().clone(),
-            schedule_identity: selected.requirements().speech_schedule_identity().clone(),
-            schedule: selected.requirements().speech_schedule().clone(),
+            frame: selected.requirements().frame_contract().clone(),
             state_layout: selected.requirements().state_layout_identity().clone(),
             topology_policy: selected.requirements().topology().identity().clone(),
             topology: selected.topology(),
@@ -70,8 +81,7 @@ impl RealtimeModelSessionIdentity {
         architecture: RealtimeIdentity,
         source: RealtimeIdentity,
         execution: RealtimeIdentity,
-        schedule_identity: RealtimeIdentity,
-        schedule: RealtimeSpeechConfig,
+        frame: RealtimeFrameContract,
         state_layout: RealtimeIdentity,
         topology_policy: RealtimeIdentity,
         topology: ParallelTopology,
@@ -84,8 +94,7 @@ impl RealtimeModelSessionIdentity {
             architecture,
             source,
             execution,
-            schedule_identity,
-            schedule,
+            frame,
             state_layout,
             topology_policy,
             topology,
@@ -95,9 +104,9 @@ impl RealtimeModelSessionIdentity {
         }
     }
 
-    /// Exact portable schedule selected for this model.
-    pub const fn schedule(&self) -> &RealtimeSpeechConfig {
-        &self.schedule
+    /// Exact portable frame policy, channels and sampler bank selected for this model.
+    pub const fn frame_contract(&self) -> &RealtimeFrameContract {
+        &self.frame
     }
 
     /// Exact selected execution topology.
@@ -116,12 +125,13 @@ impl RealtimeModelSessionIdentity {
     }
 
     fn distributed_consensus_identity(&self) -> [u32; 8] {
+        // State-layout identity may include a local tensor-parallel rank. Exact
+        // local identity remains checked by selection and release/resume.
         let mut digest = Sha256::new();
         for identity in [
             &self.architecture,
             &self.source,
             &self.execution,
-            &self.schedule_identity,
             &self.topology_policy,
         ] {
             let bytes = identity.as_str().as_bytes();
@@ -132,8 +142,16 @@ impl RealtimeModelSessionIdentity {
             );
             digest.update(bytes);
         }
+        let frame_descriptor = self.frame.consensus_descriptor();
+        digest.update(
+            u64::try_from(frame_descriptor.len())
+                .expect("frame descriptor length fits u64")
+                .to_le_bytes(),
+        );
+        for word in frame_descriptor {
+            digest.update(word.to_le_bytes());
+        }
         for value in [
-            format!("{:?}", self.schedule),
             format!("{:?}", self.topology),
             format!("{:?}", self.residency),
             format!("{:?}", self.completion),
@@ -204,16 +222,16 @@ impl RealtimeHistoryGeneration {
 }
 
 /// Canonical state for one fair-scheduler realtime request.
-pub struct RealtimeSessionState<M, S, R, C> {
+pub struct RealtimeSessionState<M, Q: RealtimeScheduleState, P, S, R, C> {
     model: RealtimeModelSessionIdentity,
     owner: RealtimeModelOwnerIdentity,
     incarnation: RealtimeSessionIncarnation,
     history_generation: RealtimeHistoryGeneration,
     committed_batch: Option<NonZeroUsize>,
-    generation: RealtimeGenerationState<M, S, R, C>,
+    generation: RealtimeGenerationState<M, Q, P, S, R, C>,
 }
 
-impl<M, S, R, C> RealtimeSessionState<M, S, R, C> {
+impl<M, Q: RealtimeScheduleState, P, S, R, C> RealtimeSessionState<M, Q, P, S, R, C> {
     /// Exact selected model identity.
     pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         &self.model
@@ -242,49 +260,43 @@ impl<M, S, R, C> RealtimeSessionState<M, S, R, C> {
     /// Derives the exact payload contract for the committed session batch.
     pub fn payload_contract(
         &self,
-        ingress: &RealtimeIngressContract,
     ) -> Result<RealtimePayloadContract, RealtimeSessionExecutionError> {
-        if ingress.schedule() != self.model.schedule() {
-            return Err(RealtimeSessionExecutionError::IngressScheduleMismatch);
-        }
         let batch = self
             .committed_batch
             .ok_or(RealtimeSessionExecutionError::BatchNotAdmitted)?;
-        Ok(RealtimePayloadContract::new(
-            ingress.schedule().clone(),
+        RealtimePayloadContract::new(
+            self.model.frame_contract().channels().clone(),
             batch.get(),
-            ingress.text_domain(),
-            ingress.audio_domain(),
             RealtimePayloadGeneration::new(self.history_generation.value())
                 .expect("scheduler history generations are nonzero"),
             RealtimePayloadOwnerIdentity::new(self.incarnation.value())
                 .expect("scheduler session incarnations are nonzero"),
         )
-        .expect("scheduler-admitted payload contract has a positive batch"))
+        .map_err(RealtimeSessionExecutionError::BatchGeometry)
     }
 
     /// Canonical atomic generation state.
-    pub const fn generation(&self) -> &RealtimeGenerationState<M, S, R, C> {
+    pub const fn generation(&self) -> &RealtimeGenerationState<M, Q, P, S, R, C> {
         &self.generation
     }
 
     /// Mutably borrows generation state while the scheduler proves the request idle.
-    pub fn generation_mut(&mut self) -> &mut RealtimeGenerationState<M, S, R, C> {
+    pub fn generation_mut(&mut self) -> &mut RealtimeGenerationState<M, Q, P, S, R, C> {
         &mut self.generation
     }
 }
 
 /// Unpublished realtime session branch owned by the core scheduler.
-pub struct RealtimeSessionBranch<MB, S, R, C> {
+pub struct RealtimeSessionBranch<MB, Q: RealtimeScheduleState, P, S, R, C> {
     model: RealtimeModelSessionIdentity,
     owner: RealtimeModelOwnerIdentity,
     incarnation: RealtimeSessionIncarnation,
     history_generation: RealtimeHistoryGeneration,
     committed_batch: Option<NonZeroUsize>,
-    generation: RealtimeGenerationBranch<MB, S, R, C>,
+    generation: RealtimeGenerationBranch<MB, Q, P, S, R, C>,
 }
 
-impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
+impl<MB, Q: RealtimeScheduleState, P, S, R, C> RealtimeSessionBranch<MB, Q, P, S, R, C> {
     /// Exact selected model identity.
     pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         &self.model
@@ -313,34 +325,38 @@ impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
     /// Derives the exact payload contract after scheduler batch admission.
     pub fn payload_contract(
         &self,
-        ingress: &RealtimeIngressContract,
     ) -> Result<RealtimePayloadContract, RealtimeSessionExecutionError> {
-        if ingress.schedule() != self.model.schedule() {
-            return Err(RealtimeSessionExecutionError::IngressScheduleMismatch);
-        }
         let batch = self
             .committed_batch
             .ok_or(RealtimeSessionExecutionError::BatchNotAdmitted)?;
-        Ok(RealtimePayloadContract::new(
-            ingress.schedule().clone(),
+        RealtimePayloadContract::new(
+            self.model.frame_contract().channels().clone(),
             batch.get(),
-            ingress.text_domain(),
-            ingress.audio_domain(),
             RealtimePayloadGeneration::new(self.history_generation.value())
                 .expect("scheduler history generations are nonzero"),
             RealtimePayloadOwnerIdentity::new(self.incarnation.value())
                 .expect("scheduler session incarnations are nonzero"),
         )
-        .expect("scheduler-admitted payload contract has a positive batch"))
+        .map_err(RealtimeSessionExecutionError::BatchGeometry)
     }
 
     /// Unpublished generation branch passed to the injected executor.
-    pub fn generation_mut(&mut self) -> &mut RealtimeGenerationBranch<MB, S, R, C> {
+    pub fn generation_mut(&mut self) -> &mut RealtimeGenerationBranch<MB, Q, P, S, R, C> {
         &mut self.generation
     }
 
     fn admit_batch(&mut self, batch: usize) -> Result<(), RealtimeSessionExecutionError> {
         let batch = NonZeroUsize::new(batch).ok_or(RealtimeSessionExecutionError::EmptyBatch)?;
+        for channel in self.model.frame_contract().channels().channels() {
+            if channel.payload.elements(batch.get()).is_none() {
+                return Err(RealtimeSessionExecutionError::BatchGeometry(
+                    RealtimePayloadContractError::GeometryOverflow {
+                        channel: channel.id,
+                        batch: batch.get(),
+                    },
+                ));
+            }
+        }
         match self.committed_batch {
             Some(committed) if committed != batch => Err(RealtimeSessionExecutionError::Batch {
                 committed: committed.get(),
@@ -355,15 +371,17 @@ impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
     }
 }
 
-impl<M, S, R, C> SemanticStateTransaction for RealtimeSessionState<M, S, R, C>
+impl<M, Q: RealtimeScheduleState, P, S, R, C> SemanticStateTransaction
+    for RealtimeSessionState<M, Q, P, S, R, C>
 where
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
+    P: Clone,
     S: Clone,
     R: Clone,
     C: Completion,
 {
-    type Branch = RealtimeSessionBranch<M::Branch, S, R, C>;
+    type Branch = RealtimeSessionBranch<M::Branch, Q, P, S, R, C>;
     type Error = RealtimeSessionTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
@@ -403,7 +421,7 @@ where
     }
 
     fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
-        RealtimeGenerationState::<M, S, R, C>::discard_branch(branch.generation)
+        RealtimeGenerationState::<M, Q, P, S, R, C>::discard_branch(branch.generation)
             .map_err(RealtimeSessionTransactionError::Generation)
     }
 
@@ -413,11 +431,11 @@ where
 }
 
 /// Released canonical state which can resume only under the exact model identity.
-pub struct ReleasedRealtimeSession<M, S, R, C> {
-    state: RealtimeSessionState<M, S, R, C>,
+pub struct ReleasedRealtimeSession<M, Q: RealtimeScheduleState, P, S, R, C> {
+    state: RealtimeSessionState<M, Q, P, S, R, C>,
 }
 
-impl<M, S, R, C> ReleasedRealtimeSession<M, S, R, C> {
+impl<M, Q: RealtimeScheduleState, P, S, R, C> ReleasedRealtimeSession<M, Q, P, S, R, C> {
     /// Exact selected model identity required for resumption.
     pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         self.state.model_identity()
@@ -435,23 +453,31 @@ impl<M, S, R, C> ReleasedRealtimeSession<M, S, R, C> {
 }
 
 /// Singular fair scheduler for one exact selected realtime model.
-pub struct RealtimeSessionScheduler<M, S, R, C, O>
+pub struct RealtimeSessionScheduler<I, M, Q, P, S, R, C, O>
 where
+    I: RealtimeSessionInput,
+    Q: RealtimeScheduleState,
+    Q::Identity: RealtimeScheduleDescriptor,
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
+    P: Clone,
     S: Clone,
     R: Clone,
     C: Completion,
     O: TransitionOutput,
 {
     model: RealtimeModelSessionIdentity,
-    scheduler: Scheduler<RealtimeInputFrame, RealtimeSessionState<M, S, R, C>, O>,
+    scheduler: Scheduler<I, RealtimeSessionState<M, Q, P, S, R, C>, O>,
 }
 
-impl<M, S, R, C, O> RealtimeSessionScheduler<M, S, R, C, O>
+impl<I, M, Q, P, S, R, C, O> RealtimeSessionScheduler<I, M, Q, P, S, R, C, O>
 where
+    I: RealtimeSessionInput,
+    Q: RealtimeScheduleState,
+    Q::Identity: RealtimeScheduleDescriptor,
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
+    P: Clone,
     S: Clone,
     R: Clone,
     C: Completion,
@@ -477,10 +503,18 @@ where
     pub fn register(
         &mut self,
         request: RequestId,
-        generation: RealtimeGenerationState<M, S, R, C>,
+        generation: RealtimeGenerationState<M, Q, P, S, R, C>,
     ) -> Result<RealtimeSessionIncarnation, RealtimeSessionError> {
-        if generation.schedule_state().schedule() != self.model.schedule() {
+        if generation.schedule_state().identity() != generation.contract().identity()
+            || generation.contract().identity().schedule_descriptor()
+                != self.model.frame_contract().policy_descriptor()
+        {
             return Err(RealtimeSessionError::ScheduleMismatch);
+        }
+        let expected = self.model.frame_contract().sampler_count();
+        let actual = generation.contract().sampler_count();
+        if actual != expected {
+            return Err(RealtimeSessionError::SamplerCardinality { expected, actual });
         }
         self.scheduler.validate_registration(request)?;
         let incarnation = allocate_incarnation()?;
@@ -501,7 +535,7 @@ where
     pub fn resume(
         &mut self,
         request: RequestId,
-        released: &mut Option<ReleasedRealtimeSession<M, S, R, C>>,
+        released: &mut Option<ReleasedRealtimeSession<M, Q, P, S, R, C>>,
     ) -> Result<(), RealtimeSessionError> {
         let state = released
             .as_ref()
@@ -520,11 +554,7 @@ where
     }
 
     /// Enqueues one portable frame on the singular fair path.
-    pub fn enqueue(
-        &mut self,
-        request: RequestId,
-        frame: RealtimeInputFrame,
-    ) -> Result<WorkId, SchedulerError> {
+    pub fn enqueue(&mut self, request: RequestId, frame: I) -> Result<WorkId, SchedulerError> {
         self.scheduler.enqueue(request, frame)
     }
 
@@ -532,7 +562,7 @@ where
     pub fn enqueue_with_deadline(
         &mut self,
         request: RequestId,
-        frame: RealtimeInputFrame,
+        frame: I,
         deadline: Option<Instant>,
     ) -> Result<WorkId, SchedulerError> {
         self.scheduler
@@ -543,7 +573,7 @@ where
     pub fn enqueue_batch(
         &mut self,
         request: RequestId,
-        frames: Vec<RealtimeInputFrame>,
+        frames: Vec<I>,
     ) -> Result<Vec<WorkId>, SchedulerError> {
         self.scheduler.enqueue_batch(request, frames)
     }
@@ -554,11 +584,12 @@ where
         now: Instant,
         mut execute: impl FnMut(
             WorkId,
-            &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &I,
+            &mut RealtimeSessionBranch<M::Branch, Q, P, S, R, C>,
         ) -> Result<O, E>,
-    ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
+    ) -> Result<SchedulerProgress<I, O>, SchedulerError>
     where
+        I: WorkDescriptor,
         E: std::error::Error,
     {
         self.ensure_local_topology()?;
@@ -577,11 +608,12 @@ where
         maximum_frames: usize,
         mut execute: impl FnMut(
             WorkId,
-            &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &I,
+            &mut RealtimeSessionBranch<M::Branch, Q, P, S, R, C>,
         ) -> Result<O, E>,
-    ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
+    ) -> Result<SchedulerProgress<I, O>, SchedulerError>
     where
+        I: WorkDescriptor,
         E: std::error::Error,
     {
         self.ensure_local_topology()?;
@@ -607,11 +639,12 @@ where
         now: Instant,
         mut execute: impl FnMut(
             WorkId,
-            &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &I,
+            &mut RealtimeSessionBranch<M::Branch, Q, P, S, R, C>,
         ) -> Result<O, E>,
-    ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
+    ) -> Result<SchedulerProgress<I, O>, SchedulerError>
     where
+        I: WorkDescriptor,
         T: BoundedConsensusTransport,
         <T::Completion as Completion>::Error: std::fmt::Display,
         E: std::error::Error,
@@ -662,8 +695,8 @@ where
     pub fn replace_sampling<E: std::error::Error + Send + Sync + 'static>(
         &mut self,
         request: RequestId,
-        sampling: RealtimeSampling,
-        realize: impl FnOnce(RealtimeSampling) -> Result<(Vec<S>, Option<R>), E>,
+        sampling: P,
+        realize: impl FnOnce(&P) -> Result<(Vec<S>, Option<R>), E>,
     ) -> Result<(), RealtimeSamplingUpdateError> {
         if self.scheduler.queued_for_request(request) != 0 {
             return Err(RealtimeSamplingReplacementError::QueuedWork);
@@ -672,7 +705,7 @@ where
             .scheduler
             .request_state_mut(request)
             .map_err(RealtimeSamplingReplacementError::Scheduler)?;
-        let (samplers, random) = realize(sampling).map_err(|error| {
+        let (samplers, random) = realize(&sampling).map_err(|error| {
             RealtimeSamplingReplacementError::Realization(BackendFailure::from_error(error))
         })?;
         state
@@ -695,7 +728,7 @@ where
     pub fn release(
         &mut self,
         request: RequestId,
-    ) -> Result<ReleasedRealtimeSession<M, S, R, C>, SchedulerError> {
+    ) -> Result<ReleasedRealtimeSession<M, Q, P, S, R, C>, SchedulerError> {
         self.scheduler
             .release(request)
             .map(|state| ReleasedRealtimeSession { state })
@@ -717,7 +750,10 @@ where
     }
 
     /// Immutable canonical session state, when active.
-    pub fn request_state(&self, request: RequestId) -> Option<&RealtimeSessionState<M, S, R, C>> {
+    pub fn request_state(
+        &self,
+        request: RequestId,
+    ) -> Option<&RealtimeSessionState<M, Q, P, S, R, C>> {
         self.scheduler.request_state(request)
     }
 
@@ -754,6 +790,14 @@ pub enum RealtimeSessionError {
     /// Generation schedule differs from the exact selected model schedule.
     #[error("realtime generation schedule differs from selected model identity")]
     ScheduleMismatch,
+    /// Generic generation declared a decision count different from the selected frame contract.
+    #[error("realtime session requires {expected} sampler states, generation declared {actual}")]
+    SamplerCardinality {
+        /// Selected sampler-bank cardinality.
+        expected: usize,
+        /// Count declared by the supplied generation contract.
+        actual: usize,
+    },
     /// Released state belongs to another exact selected model.
     #[error("released realtime session model identity does not match")]
     ModelIdentityMismatch,
@@ -763,9 +807,12 @@ pub enum RealtimeSessionError {
 }
 
 /// Batch admission failure before an injected frame executor is called.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeSessionExecutionError {
+    /// Selected channel geometry cannot represent the submitted batch.
+    #[error(transparent)]
+    BatchGeometry(RealtimePayloadContractError),
     /// Payload-contract derivation was attempted before scheduler batch admission.
     #[error("realtime session frame batch has not been admitted")]
     BatchNotAdmitted,
@@ -780,9 +827,6 @@ pub enum RealtimeSessionExecutionError {
         /// Batch carried by the rejected frame.
         submitted: usize,
     },
-    /// Frame ingress schedule differs from the exact selected session schedule.
-    #[error("realtime ingress schedule differs from selected session schedule")]
-    IngressScheduleMismatch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -835,11 +879,12 @@ mod tests {
         consensus::{BoundedConsensusTransport, ConsensusTransport},
         scheduler::{RequestStatus, TransitionOutput},
         BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
-        CompletionCancellationMode, RealtimeFrameConvention, Submission,
+        CompletionCancellationMode, RealtimeFrameConvention, RealtimeFrameScheduleState,
+        RealtimeSampling, RealtimeSpeechConfig, Submission,
     };
 
     use super::*;
-    use crate::TokenDomain;
+    use crate::{RealtimeGenerationContract, RealtimeIngressContract, TokenDomain};
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct ModelState(usize);
@@ -905,7 +950,16 @@ mod tests {
         }
     }
 
-    type Sessions = RealtimeSessionScheduler<ModelState, (), (), MockCompletion, MockOutput>;
+    type Sessions = RealtimeSessionScheduler<
+        RealtimeInputFrame,
+        ModelState,
+        RealtimeFrameScheduleState,
+        RealtimeSampling,
+        (),
+        (),
+        MockCompletion,
+        MockOutput,
+    >;
 
     fn schedule() -> RealtimeSpeechConfig {
         RealtimeSpeechConfig::new(
@@ -934,8 +988,13 @@ mod tests {
             id("architecture"),
             id("source"),
             id("execution"),
-            id("schedule"),
-            schedule(),
+            RealtimeFrameContract::new(
+                id("schedule"),
+                schedule().schedule_descriptor(),
+                ingress().channels().clone(),
+                2,
+            )
+            .unwrap(),
             id("state"),
             id("topology"),
             topology,
@@ -1037,10 +1096,18 @@ mod tests {
         }
     }
 
-    fn generation() -> RealtimeGenerationState<ModelState, (), (), MockCompletion> {
+    fn generation() -> RealtimeGenerationState<
+        ModelState,
+        RealtimeFrameScheduleState,
+        RealtimeSampling,
+        (),
+        (),
+        MockCompletion,
+    > {
         RealtimeGenerationState::new(
             ModelState(0),
-            schedule(),
+            RealtimeGenerationContract::new(schedule(), schedule().depth_audio_codebooks() + 1),
+            RealtimeFrameScheduleState::new(schedule()),
             RealtimeSampling::greedy(),
             vec![(), ()],
             None,
@@ -1064,7 +1131,14 @@ mod tests {
     fn execute_immediately(
         _id: WorkId,
         _frame: &RealtimeInputFrame,
-        branch: &mut RealtimeSessionBranch<ModelState, (), (), MockCompletion>,
+        branch: &mut RealtimeSessionBranch<
+            ModelState,
+            RealtimeFrameScheduleState,
+            RealtimeSampling,
+            (),
+            (),
+            MockCompletion,
+        >,
     ) -> Result<MockOutput, Infallible> {
         branch.generation_mut().model_state_mut().0 += 1;
         let completion = MockCompletion(Rc::new(Cell::new(true)));
@@ -1073,6 +1147,30 @@ mod tests {
             .attach_submission_completion(completion.clone())
             .unwrap();
         Ok(MockOutput { completion })
+    }
+
+    #[test]
+    fn registration_rejects_generation_decision_count_before_admitting_request() {
+        let mut sessions = Sessions::new(identity("a"), limits(1)).unwrap();
+        let request = RequestId::new(101);
+        let wrong_count = RealtimeGenerationState::new(
+            ModelState(0),
+            RealtimeGenerationContract::new(schedule(), 3),
+            RealtimeFrameScheduleState::new(schedule()),
+            RealtimeSampling::greedy(),
+            vec![(), (), ()],
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            sessions.register(request, wrong_count),
+            Err(RealtimeSessionError::SamplerCardinality {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        sessions.register(request, generation()).unwrap();
+        assert!(sessions.request_state(request).is_some());
     }
 
     #[test]
@@ -1220,7 +1318,7 @@ mod tests {
 
         sessions
             .run_local_turn(Instant::now(), |id, submitted, branch| {
-                let contract = branch.payload_contract(&ingress()).unwrap();
+                let contract = branch.payload_contract().unwrap();
                 assert_eq!(contract.batch().get(), 2);
                 assert_eq!(contract.owner().value(), incarnation.value());
                 assert_eq!(
@@ -1375,5 +1473,419 @@ mod tests {
             .run_local_turn(Instant::now(), execute_immediately)
             .unwrap();
         assert_eq!(sessions.report().abandoned_in_flight_work, 0);
+    }
+    #[derive(Debug, Clone, Copy)]
+    enum ClockAction {
+        Audio,
+        Tool,
+        Reminder,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ClockInput {
+        action: ClockAction,
+        batch: usize,
+    }
+
+    impl RealtimeSessionInput for ClockInput {
+        fn batch(&self) -> usize {
+            self.batch
+        }
+    }
+
+    impl WorkDescriptor for ClockInput {
+        type Error = Infallible;
+        fn encode_descriptor(&self, words: &mut Vec<u32>) -> Result<(), Infallible> {
+            words.push(match self.action {
+                ClockAction::Audio => 11,
+                ClockAction::Tool => 17,
+                ClockAction::Reminder => 23,
+            });
+            let batch = self.batch as u64;
+            words.extend([batch as u32, (batch >> 32) as u32]);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct ClockPolicy;
+
+    impl RealtimeScheduleDescriptor for ClockPolicy {
+        fn schedule_descriptor(&self) -> Vec<u32> {
+            vec![0x434c4f43, 1]
+        }
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct Clocks {
+        policy: ClockPolicy,
+        // Audio, model, tool, and speech clocks can advance independently.
+        ticks: [usize; 4],
+    }
+
+    impl RealtimeScheduleState for Clocks {
+        type Identity = ClockPolicy;
+        type Error = ModelError;
+        fn identity(&self) -> &ClockPolicy {
+            &self.policy
+        }
+        fn validate_successor(&self, next: &Self) -> Result<(), ModelError> {
+            let step = std::array::from_fn(|i| next.ticks[i].checked_sub(self.ticks[i]));
+            if matches!(
+                step,
+                [Some(1), Some(1), Some(0), Some(1)]
+                    | [Some(0), Some(1), Some(1), Some(1)]
+                    | [Some(0), Some(0), Some(0), Some(1)]
+            ) {
+                Ok(())
+            } else {
+                Err(ModelError)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TerminalCompletion(bool);
+
+    impl Completion for TerminalCompletion {
+        type Error = CompletionError;
+        fn is_complete(&self) -> Result<bool, CompletionError> {
+            Ok(true)
+        }
+        fn wait(&self) -> Result<(), CompletionError> {
+            self.0.then_some(()).ok_or(CompletionError)
+        }
+    }
+
+    type ClockSessions = RealtimeSessionScheduler<
+        ClockInput,
+        ModelState,
+        Clocks,
+        String,
+        (),
+        (),
+        TerminalCompletion,
+        MockOutput,
+    >;
+    type ClockBranch =
+        RealtimeSessionBranch<ModelState, Clocks, String, (), (), TerminalCompletion>;
+
+    fn clock_model(topology: ParallelTopology) -> RealtimeModelSessionIdentity {
+        use eredu_core::{
+            RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelId,
+            RealtimeChannelLayout, RealtimeChannelPayload,
+        };
+        let mut model = identity_with_topology("clocks", topology);
+        model.frame = RealtimeFrameContract::new(
+            RealtimeIdentity::new("independent-clocks").unwrap(),
+            ClockPolicy.schedule_descriptor(),
+            RealtimeChannelLayout::new(
+                "clock-channels".into(),
+                vec![RealtimeChannelDeclaration {
+                    id: RealtimeChannelId::new(41),
+                    payload: RealtimeChannelPayload::Dense { shape: vec![2] },
+                    cadence: RealtimeChannelCadence {
+                        period: 1,
+                        phase: 0,
+                    },
+                    delay: 0,
+                    feedback: vec![],
+                }],
+            )
+            .unwrap(),
+            1,
+        )
+        .unwrap();
+        model
+    }
+
+    fn clock_generation(
+    ) -> RealtimeGenerationState<ModelState, Clocks, String, (), (), TerminalCompletion> {
+        RealtimeGenerationState::new(
+            ModelState(0),
+            RealtimeGenerationContract::new(ClockPolicy, 1),
+            Clocks {
+                policy: ClockPolicy,
+                ticks: [0; 4],
+            },
+            "initial".into(),
+            vec![()],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn execute_clock(
+        _: WorkId,
+        input: &ClockInput,
+        branch: &mut ClockBranch,
+    ) -> Result<MockOutput, Infallible> {
+        let increment = match input.action {
+            ClockAction::Audio => [1, 1, 0, 1],
+            ClockAction::Tool => [0, 1, 1, 1],
+            ClockAction::Reminder => [0, 0, 0, 1],
+        };
+        let generation = branch.generation_mut();
+        for (tick, step) in generation
+            .schedule_state_mut()
+            .ticks
+            .iter_mut()
+            .zip(increment)
+        {
+            *tick += step;
+        }
+        generation.model_state_mut().0 += 1;
+        generation
+            .attach_submission_completion(TerminalCompletion(true))
+            .unwrap();
+        Ok(MockOutput {
+            completion: MockCompletion(Rc::new(Cell::new(true))),
+        })
+    }
+
+    #[test]
+    fn generic_session_controlled_and_uninterrupted_clocks_preserve_lifecycle() {
+        let model = clock_model(ParallelTopology::new(1, 1, 1, 1).unwrap());
+        let request = RequestId::new(110);
+        let mut ordinary = ClockSessions::new(model.clone(), limits(1)).unwrap();
+        let mut controlled = ClockSessions::new(model, limits(1)).unwrap();
+        ordinary.register(request, clock_generation()).unwrap();
+        controlled.register(request, clock_generation()).unwrap();
+        let actions = [
+            ClockAction::Audio,
+            ClockAction::Tool,
+            ClockAction::Reminder,
+            ClockAction::Audio,
+        ];
+        ordinary
+            .enqueue_batch(
+                request,
+                actions
+                    .iter()
+                    .map(|&action| ClockInput { action, batch: 1 })
+                    .collect(),
+            )
+            .unwrap();
+        let expected = [[1, 1, 0, 1], [1, 2, 1, 2], [1, 2, 1, 3], [2, 3, 1, 4]];
+        for (index, (action, ticks)) in actions.into_iter().zip(expected).enumerate() {
+            controlled
+                .enqueue(request, ClockInput { action, batch: 1 })
+                .unwrap();
+            assert_eq!(
+                ordinary
+                    .run_local_turn(Instant::now(), execute_clock)
+                    .unwrap()
+                    .committed
+                    .len(),
+                1
+            );
+            assert_eq!(
+                controlled
+                    .run_local_bounded(Instant::now(), 1, execute_clock)
+                    .unwrap()
+                    .committed
+                    .len(),
+                1
+            );
+            for sessions in [&ordinary, &controlled] {
+                let state = sessions.request_state(request).unwrap();
+                assert_eq!(state.generation().schedule_state().ticks, ticks);
+                assert_eq!(state.generation().model_state().0, index + 1);
+                assert_eq!(
+                    state.payload_contract().unwrap().schedule(),
+                    sessions.model_identity().frame_contract().channels()
+                );
+            }
+            if index == 1 {
+                let incarnation = controlled.request_state(request).unwrap().incarnation();
+                let mut released = Some(controlled.release(request).unwrap());
+                controlled.resume(request, &mut released).unwrap();
+                assert_eq!(
+                    controlled.request_state(request).unwrap().incarnation(),
+                    incarnation
+                );
+            }
+        }
+        controlled
+            .replace_sampling(request, "replacement".into(), |policy| {
+                assert_eq!(policy, "replacement");
+                Ok::<_, Infallible>((vec![()], None))
+            })
+            .unwrap();
+        assert_eq!(
+            controlled
+                .request_state(request)
+                .unwrap()
+                .generation()
+                .sampling(),
+            "replacement"
+        );
+        controlled
+            .enqueue(
+                request,
+                ClockInput {
+                    action: ClockAction::Tool,
+                    batch: 1,
+                },
+            )
+            .unwrap();
+        controlled.cancel(request).unwrap();
+        let progress = controlled
+            .run_local_turn(
+                Instant::now(),
+                |_, _, _| -> Result<MockOutput, Infallible> {
+                    panic!("cancelled tool transition must not execute")
+                },
+            )
+            .unwrap();
+        assert!(progress.committed.is_empty());
+        assert_eq!(
+            controlled.request_status(request),
+            Some(RequestStatus::Cancelled)
+        );
+
+        // A terminal native failure cannot publish candidate clock or model state.
+        let failed = RequestId::new(111);
+        controlled.register(failed, clock_generation()).unwrap();
+        controlled
+            .enqueue(
+                failed,
+                ClockInput {
+                    action: ClockAction::Reminder,
+                    batch: 1,
+                },
+            )
+            .unwrap();
+        let progress = controlled
+            .run_local_turn(Instant::now(), |_, _, branch| {
+                branch.generation_mut().schedule_state_mut().ticks[3] += 1;
+                branch.generation_mut().model_state_mut().0 = 99;
+                branch
+                    .generation_mut()
+                    .attach_submission_completion(TerminalCompletion(false))
+                    .unwrap();
+                Ok::<_, Infallible>(MockOutput {
+                    completion: MockCompletion(Rc::new(Cell::new(true))),
+                })
+            })
+            .unwrap();
+        assert!(progress.committed.is_empty());
+        assert_eq!(progress.failed.len(), 1);
+        assert_eq!(
+            controlled.request_status(failed),
+            Some(RequestStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn registration_compares_canonical_policy_even_when_labels_and_channels_match() {
+        let model = clock_model(ParallelTopology::new(1, 1, 1, 1).unwrap());
+        let mut mismatched = model.clone();
+        let mut descriptor = model.frame_contract().policy_descriptor().to_vec();
+        descriptor[1] = 2;
+        mismatched.frame = RealtimeFrameContract::new(
+            model.frame_contract().policy_identity().clone(),
+            descriptor,
+            model.frame_contract().channels().clone(),
+            model.frame_contract().sampler_count(),
+        )
+        .unwrap();
+        let request = RequestId::new(114);
+        let mut rejected = ClockSessions::new(mismatched, limits(1)).unwrap();
+        assert!(matches!(
+            rejected.register(request, clock_generation()),
+            Err(RealtimeSessionError::ScheduleMismatch)
+        ));
+        assert!(rejected.request_state(request).is_none());
+        assert!(rejected.request_status(request).is_none());
+        let mut accepted = ClockSessions::new(model, limits(1)).unwrap();
+        accepted.register(request, clock_generation()).unwrap();
+        assert!(accepted.request_state(request).is_some());
+    }
+
+    #[test]
+    fn dense_batch_overflow_is_typed_and_rejected_before_execution() {
+        let mut sessions = ClockSessions::new(
+            clock_model(ParallelTopology::new(1, 1, 1, 1).unwrap()),
+            limits(1),
+        )
+        .unwrap();
+        let request = RequestId::new(112);
+        sessions.register(request, clock_generation()).unwrap();
+        let mut branch = sessions.request_state(request).unwrap().branch().unwrap();
+        assert!(matches!(
+            branch.admit_batch(usize::MAX),
+            Err(RealtimeSessionExecutionError::BatchGeometry(
+                RealtimePayloadContractError::GeometryOverflow {
+                    batch: usize::MAX,
+                    ..
+                }
+            ))
+        ));
+        assert!(branch.committed_batch().is_none());
+        sessions
+            .enqueue(
+                request,
+                ClockInput {
+                    action: ClockAction::Audio,
+                    batch: usize::MAX,
+                },
+            )
+            .unwrap();
+        let error = sessions
+            .run_local_turn(
+                Instant::now(),
+                |_, _, _| -> Result<MockOutput, Infallible> {
+                    panic!("overflowing dense batch must not execute")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::Submission(_)));
+        assert_eq!(
+            sessions.request_status(request),
+            Some(RequestStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn generic_distributed_descriptor_disagreement_precedes_execution() {
+        let model = clock_model(ParallelTopology::new(2, 1, 1, 1).unwrap());
+        let mut peer = model.clone();
+        peer.rank = 1;
+        peer.state_layout = RealtimeIdentity::new("peer-rank-local-state-layout").unwrap();
+        assert_ne!(model, peer);
+        assert_eq!(
+            model.distributed_consensus_identity(),
+            peer.distributed_consensus_identity()
+        );
+        let mut sessions = ClockSessions::new(model, limits(1)).unwrap();
+        let request = RequestId::new(113);
+        sessions.register(request, clock_generation()).unwrap();
+        sessions
+            .enqueue(
+                request,
+                ClockInput {
+                    action: ClockAction::Tool,
+                    batch: 1,
+                },
+            )
+            .unwrap();
+        let error = sessions
+            .run_distributed_turn(
+                123,
+                &DisagreeingTransport::schedule(),
+                Instant::now(),
+                |_, _, _| -> Result<MockOutput, Infallible> {
+                    panic!("rank disagreement must precede a tool transition")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::Consensus(_)));
+        assert_eq!(sessions.report().completed_work, 0);
+        assert!(sessions.request_state(request).is_none());
+        assert_eq!(
+            sessions.request_status(request),
+            Some(RequestStatus::Failed)
+        );
     }
 }

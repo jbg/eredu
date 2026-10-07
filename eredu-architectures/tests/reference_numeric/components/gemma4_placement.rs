@@ -370,7 +370,7 @@ fn run_placements(
                                 let sources=partitioned_adapter::prepare_plan_with_banks_and_sequence_maximum(inspection,plan,rank,std::time::Duration::from_secs(30),
                                     independent.then(||ParameterBankLoadOptions::new(eredu_core::residency::OffloadConfig::new(Some(bank_budget),Some(1<<20),1).unwrap(),bank_budget,bank_budget).unwrap()),maximum_sequence).unwrap();
                                 let component_layout=sources.selected().execution().component_partition_layout(descriptor,parameters).unwrap().unwrap();
-                                let layout=eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters,ParallelRankTopology::new(topology,rank).unwrap()).unwrap();
+                                let layout=eredu_runtime::derive_partitioned_local_layout(parameters,ParallelRankTopology::new(topology,rank).unwrap()).unwrap();
                                 let mut context=NumericContext::with_partition(layout,rank,world); context.bind_checkpoint_values=true; context.cache_owned_attention=true;
                                 reset_reference_stage_evidence("SafeTensors");
                                 let mut executable=partitioned_adapter::composite(sources,&context).unwrap();
@@ -779,8 +779,8 @@ fn gemma4_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 let target = gemma4::LayeredModel::<NumericBackend>::new(target_args,&NumericContext::default()).unwrap();
                                 let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
                                 let rank_topology = ParallelRankTopology::new(topology,rank).unwrap();
-                                let source = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters,rank_topology).unwrap();
-                                let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters,rank_topology).unwrap();
+                                let source = eredu_runtime::derive_partitioned_local_layout(parameters,rank_topology).unwrap();
+                                let encoded = eredu_runtime::derive_partitioned_local_layout(&target_parameters,rank_topology).unwrap();
                                 let mut layout = eredu_runtime::derive_transform_source_layout(&source, &encoded).unwrap();
                                 for (name,companion) in encoded.tensors() { if !layout.contains(name) { layout.insert(name.to_owned(),companion.clone()); } }
                                 let mut context = NumericContext::with_partition(layout,rank,world);

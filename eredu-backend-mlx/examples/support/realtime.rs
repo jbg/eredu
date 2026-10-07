@@ -34,15 +34,21 @@ fn driver_error(error: impl std::fmt::Display) -> DriverError {
 }
 
 pub type Scheduler = RealtimeSessionScheduler<
+    RealtimeInputFrame,
     eredu_runtime::RealtimePayloadState<
         eredu_backend_mlx::backend::runtime::cache::state::MlxKeyValueState,
         eredu_backend_mlx::MlxTensor,
     >,
+    eredu_core::RealtimeFrameScheduleState,
+    RealtimeSampling,
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
     eredu_runtime::PrepublicationRealtimeFrame<
-        eredu_backend_mlx::MlxTensor,
+        eredu_runtime::CompletedRealtimeFrame<
+            eredu_backend_mlx::MlxTensor,
+            eredu_backend_mlx::MlxTensor,
+        >,
         MlxRealtimeCompletion,
         MlxRealtimeHostObserver,
     >,
@@ -50,7 +56,7 @@ pub type Scheduler = RealtimeSessionScheduler<
 
 pub fn load(
     backend: &MlxRealtimeExecutionContext,
-    preparation: eredu_architectures::moshi::RealtimePreparationPlan,
+    preparation: eredu_architectures::moshi::MoshiPreparationPlan,
     options: eredu_backend_mlx::MlxLoadRequest,
 ) -> Result<PreparedRealtime, DriverError> {
     let selected =
@@ -79,7 +85,10 @@ pub fn scheduler(
         backend
             .new_realtime_model_state(model)
             .map_err(driver_error)?,
-        schedule.clone(),
+        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
+            .map_err(driver_error)?
+            .channels()
+            .clone(),
     );
     let random = backend
         .realize_random_state(sampling.is_stochastic().then_some(sampling.seed()))
@@ -87,8 +96,15 @@ pub fn scheduler(
     scheduler
         .register(
             request,
-            RealtimeGenerationState::new(model_state, schedule, sampling, samplers, random)
-                .map_err(driver_error)?,
+            RealtimeGenerationState::new(
+                model_state,
+                eredu_architectures::moshi::realtime_generation_contract(&schedule),
+                eredu_core::RealtimeFrameScheduleState::new(schedule),
+                sampling,
+                samplers,
+                random,
+            )
+            .map_err(driver_error)?,
         )
         .map_err(driver_error)?;
     Ok(scheduler)

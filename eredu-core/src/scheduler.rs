@@ -616,7 +616,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
             let slice = queued.work.execution_slice_size();
             if slice == 0 || slice > self.limits.execution_slice {
-                self.fail_before_submission(queued.id);
+                self.fail_before_submission(queued.id, now);
                 return Err(SchedulerError::Descriptor(format!(
                     "work {:?} execution slice {slice} exceeds configured bound {}",
                     queued.id, self.limits.execution_slice
@@ -624,7 +624,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
             let mut descriptor = Vec::new();
             if let Err(error) = queued.work.encode_descriptor(&mut descriptor) {
-                self.fail_before_submission(queued.id);
+                self.fail_before_submission(queued.id, now);
                 return Err(SchedulerError::Descriptor(error.to_string()));
             }
             let branch = match self
@@ -636,7 +636,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             {
                 Ok(branch) => branch,
                 Err(error) => {
-                    self.fail_before_submission(queued.id);
+                    self.fail_before_submission(queued.id, now);
                     return Err(SchedulerError::State(error.to_string()));
                 }
             };
@@ -688,7 +688,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     self.lifecycle.insert(id, WorkLifecycle::Failed);
                     self.failed_work = self.failed_work.saturating_add(1);
                     self.accepted_work = self.accepted_work.saturating_sub(1);
-                    self.fail_request(id.request());
+                    self.fail_request(id.request(), now);
                     let message = discard.map_or_else(
                         || error.to_string(),
                         |discard| format!("{error}; branch discard also failed: {discard}"),
@@ -735,7 +735,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                         self.failed_work = self.failed_work.saturating_add(1);
                     }
                     self.accepted_work = self.accepted_work.saturating_sub(1);
-                    self.fail_request(id.request());
+                    self.fail_request(id.request(), now);
                     progress.failed.push((
                         id,
                         SchedulerError::Completion(discard.map_or_else(
@@ -969,7 +969,14 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
 
     /// Cancels a request, retaining submitted resources until exact completion.
     pub fn cancel(&mut self, request: RequestId) -> Result<(), SchedulerError> {
-        self.cancel_internal(request, CancellationCause::Explicit, Instant::now())
+        self.cancel_at(request, Instant::now())
+    }
+
+    /// Cancels at the caller's recorded time, retaining submitted resources until
+    /// exact completion. Use the same timeline for subsequent completion polls so
+    /// cancellation-to-release telemetry is reproducible during controlled replay.
+    pub fn cancel_at(&mut self, request: RequestId, now: Instant) -> Result<(), SchedulerError> {
+        self.cancel_internal(request, CancellationCause::Explicit, now)
     }
 
     /// Releases an idle request and returns its canonical state.
@@ -1150,7 +1157,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     self.lifecycle.insert(submitted.id, WorkLifecycle::Failed);
                     self.failed_work = self.failed_work.saturating_add(1);
                     self.accepted_work = self.accepted_work.saturating_sub(1);
-                    self.fail_request(submitted.id.request());
+                    self.fail_request(submitted.id.request(), now);
                     progress
                         .failed
                         .push((submitted.id, SchedulerError::State(error.to_string())));
@@ -1168,7 +1175,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 let discard = S::discard_branch(submitted.branch).err();
                 self.lifecycle.insert(submitted.id, WorkLifecycle::Failed);
                 self.accepted_work = self.accepted_work.saturating_sub(1);
-                self.fail_request(submitted.id.request());
+                self.fail_request(submitted.id.request(), now);
                 progress.failed.push((
                     submitted.id,
                     SchedulerError::DistributedCompletion(discard.map_or_else(
@@ -1475,14 +1482,14 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 .count()
     }
 
-    fn fail_before_submission(&mut self, id: WorkId) {
+    fn fail_before_submission(&mut self, id: WorkId, now: Instant) {
         self.lifecycle.insert(id, WorkLifecycle::Failed);
         self.failed_work = self.failed_work.saturating_add(1);
         self.accepted_work = self.accepted_work.saturating_sub(1);
-        self.fail_request(id.request());
+        self.fail_request(id.request(), now);
     }
 
-    fn fail_request(&mut self, request: RequestId) {
+    fn fail_request(&mut self, request: RequestId, now: Instant) {
         let Some(entry) = self.requests.remove(&request) else {
             return;
         };
@@ -1497,9 +1504,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         self.discarded_work = self.discarded_work.saturating_add(discarded as u64);
         for work in &mut self.submitted {
             if work.id.request() == request && matches!(work.disposition, Disposition::Publish) {
-                work.disposition = Disposition::Abandon {
-                    cancelled_at: Instant::now(),
-                };
+                work.disposition = Disposition::Abandon { cancelled_at: now };
                 self.lifecycle.insert(work.id, WorkLifecycle::Abandoned);
             }
         }
@@ -1825,20 +1830,23 @@ mod tests {
     #[test]
     fn cancellation_retains_submitted_resources_until_completion() {
         let done = Rc::new(Cell::new(false));
+        let started = Instant::now();
+        let cancelled = started + Duration::from_millis(80);
+        let retired = cancelled + Duration::from_millis(240);
         let mut scheduler = scheduler();
         let request = RequestId::new(2);
         scheduler.register(request, State::default()).unwrap();
         let id = scheduler.enqueue(request, 1).unwrap();
-        scheduler.prepare_bounded(1, Instant::now()).unwrap();
+        scheduler.prepare_bounded(1, started).unwrap();
         scheduler
-            .submit_prepared(Instant::now(), |_, _, _| {
+            .submit_prepared(started, |_, _, _| {
                 Ok::<_, Infallible>(Output {
                     complete: done.clone(),
                     fail: false,
                 })
             })
             .unwrap();
-        scheduler.cancel(request).unwrap();
+        scheduler.cancel_at(request, cancelled).unwrap();
         assert_eq!(scheduler.work_lifecycle(id), Some(WorkLifecycle::Abandoned));
         assert_eq!(scheduler.report().abandoned_retained_resources, 2);
         assert_eq!(
@@ -1846,9 +1854,17 @@ mod tests {
             Some(RequestStatus::Cancelled)
         );
         done.set(true);
-        scheduler.poll_completions(Instant::now());
+        scheduler.poll_completions(retired);
         assert_eq!(scheduler.report().current_in_flight_work, 0);
         assert_eq!(scheduler.report().abandoned_released_work, 1);
+        assert_eq!(
+            scheduler.report().last_cancellation_to_release_ns,
+            Some(Duration::from_millis(240).as_nanos())
+        );
+        assert_eq!(
+            scheduler.report().max_cancellation_to_release_ns,
+            Some(Duration::from_millis(240).as_nanos())
+        );
     }
 
     #[test]
@@ -1916,21 +1932,47 @@ mod tests {
 
     #[test]
     fn submission_failure_marks_work_and_request_failed() {
-        let mut scheduler = scheduler();
+        let started = Instant::now();
+        let submitted = started + Duration::from_millis(80);
+        let retired = submitted + Duration::from_millis(240);
+        let done = Rc::new(Cell::new(false));
+        let limits = SchedulerLimits::with_execution_bounds(1, 2, 2, 2, 2, 1).unwrap();
+        let mut scheduler = Scheduler::new(limits).unwrap();
         let request = RequestId::new(4);
         scheduler.register(request, State::default()).unwrap();
-        let id = scheduler.enqueue(request, 1).unwrap();
-        scheduler.prepare_bounded(1, Instant::now()).unwrap();
+        let ids = scheduler.enqueue_batch(request, vec![1, 2]).unwrap();
+        scheduler.prepare_bounded(2, started).unwrap();
         let error = scheduler
-            .submit_prepared(Instant::now(), |_, _, _| {
-                Err::<Output, _>(std::io::Error::other("mock submit"))
+            .submit_prepared(submitted, |id, _, _| {
+                if id.sequence() == 0 {
+                    Ok(Output {
+                        complete: done.clone(),
+                        fail: false,
+                    })
+                } else {
+                    Err(std::io::Error::other("mock submit"))
+                }
             })
             .unwrap_err();
         assert!(matches!(error, SchedulerError::Submission(_)));
-        assert_eq!(scheduler.work_lifecycle(id), Some(WorkLifecycle::Failed));
+        assert_eq!(
+            scheduler.work_lifecycle(ids[1]),
+            Some(WorkLifecycle::Failed)
+        );
+        assert_eq!(
+            scheduler.work_lifecycle(ids[0]),
+            Some(WorkLifecycle::Abandoned)
+        );
         assert_eq!(
             scheduler.request_status(request),
             Some(RequestStatus::Failed)
+        );
+        done.set(true);
+        assert!(scheduler.poll_completions(retired).committed.is_empty());
+        assert_eq!(scheduler.report().current_in_flight_work, 0);
+        assert_eq!(
+            scheduler.report().last_cancellation_to_release_ns,
+            Some(Duration::from_millis(240).as_nanos())
         );
     }
 

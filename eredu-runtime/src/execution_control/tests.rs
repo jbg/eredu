@@ -171,3 +171,43 @@ fn unavailable_or_overflowing_estimates_fail_before_reservation() {
     assert_eq!(budget.usage(), before);
     drop(saved);
 }
+
+#[test]
+fn fork_growth_is_bounded_and_survives_all_state_handles_until_native_retirement() {
+    let budget = SnapshotBudget::new(SnapshotLimits {
+        max_snapshots: 0,
+        max_branches: 1,
+        retained_bytes: 60,
+        cumulative_copy_bytes: 40,
+    });
+    let lease = budget
+        .reserve(
+            SnapshotResourceKind::Branch,
+            Some(SnapshotEstimate {
+                retained_bytes: 40,
+                copy_bytes: 40,
+            }),
+        )
+        .unwrap();
+    let first = SnapshotRetainedGrowth::new(&lease, 10);
+    let second = SnapshotRetainedGrowth::new(&lease, 20);
+    let native_retirement = lease.clone();
+    first.admit(25).unwrap();
+    first.clone().admit(12).unwrap();
+    assert_eq!(budget.usage().retained_bytes, 55);
+    assert_eq!(
+        second.admit(26),
+        Err(ExecutionControlError::Limit("retained bytes"))
+    );
+    assert_eq!(budget.usage().retained_bytes, 55);
+    second.admit(25).unwrap();
+    assert_eq!(budget.usage().retained_bytes, 60);
+    assert_eq!(budget.usage().cumulative_copy_bytes, 40);
+    drop((lease, first, second));
+    assert_eq!(budget.usage().branches, 1);
+    assert_eq!(native_retirement.retained_bytes(), 60);
+    drop(native_retirement);
+    assert_eq!(budget.usage().retained_bytes, 0);
+    assert_eq!(budget.usage().branches, 0);
+    assert_eq!(budget.usage().cumulative_copy_bytes, 40);
+}

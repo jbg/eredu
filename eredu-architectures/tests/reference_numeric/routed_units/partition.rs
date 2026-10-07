@@ -469,7 +469,7 @@ fn verify_partitions(
                         let retained = placement::layouts(&sources, description);
                         assert_eq!(&retained, reference_layouts, "all cold ranks agree on the actual selected placement");
                         placement::verify(&retained, descriptor);
-                        let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(description,rank_topology).unwrap();
+                        let layout = eredu_runtime::derive_partitioned_local_layout(description,rank_topology).unwrap();
                         let mut context = NumericContext::with_partition(layout,rank,world);
                         context.bind_checkpoint_values = true;
                         let mut executable = partitioned_adapter::routed(sources,&context,Arc::new(AtomicUsize::new(0)),None).unwrap();

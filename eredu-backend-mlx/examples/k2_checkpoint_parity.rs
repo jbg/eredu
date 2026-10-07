@@ -364,7 +364,8 @@ fn main() -> anyhow::Result<()> {
             }
             anyhow::bail!("diagnostic layer capture completed; full-logit validation was not run");
         }
-        hidden = NormalizationOperator::forward(&mut static_modules.norm, &hidden, &stream)?;
+        hidden =
+            NormalizationOperator::forward(&mut static_modules.boundary.norm, &hidden, &stream)?;
         let logits = match &mut static_modules.lm_head {
             Some(head) => head.forward(&hidden, &stream)?,
             None => static_modules.embeddings.as_linear(&hidden, &stream)?,

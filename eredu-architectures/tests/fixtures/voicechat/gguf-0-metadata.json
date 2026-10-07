@@ -1,0 +1,19 @@
+{
+  "general.architecture": "clip",
+  "general.type": "mmproj",
+  "general.name": "NemotronLabs VoiceChat 11B perception",
+  "general.description": "FastConformer perception encoder from the NVIDIA NemotronLabs VoiceChat 11B GGUF. 24 layers, d_model 1024, causal, projected to the 4480-wide STT LLM embedding space.",
+  "clip.has_audio_encoder": true,
+  "clip.projector_type": "voicechat",
+  "clip.audio.embedding_length": 1024,
+  "clip.audio.feed_forward_length": 4096,
+  "clip.audio.block_count": 24,
+  "clip.audio.attention.head_count": 8,
+  "clip.audio.projection_dim": 4480,
+  "clip.audio.attention.layer_norm_epsilon": 9.999999747378752e-06,
+  "clip.audio.num_mel_bins": 128,
+  "clip.audio.subsampling_factor": 8,
+  "clip.audio.conv_kernel_size": 9,
+  "clip.audio.window_size": 70,
+  "general.file_type": 2
+}

@@ -141,7 +141,7 @@ fn run_tensor_rank(
             &local_target.parameter_description(&context).unwrap(),
         )
         .unwrap();
-    let mut layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+    let mut layout = eredu_runtime::derive_partitioned_local_layout(
         parameters,
         rank_topology,
     )
@@ -391,7 +391,7 @@ fn conditional_pp_decoder_boundaries_preserve_media_ids_and_cached_text_after_in
     )
     .unwrap();
     let parameters = global.parameter_description(&context).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+    let layout = eredu_runtime::derive_partitioned_local_layout(
         &parameters,
         ParallelRankTopology::new(ParallelTopology::new(1, 2, 1, 1).unwrap(), 0).unwrap(),
     )

@@ -67,6 +67,9 @@ impl eredu_nn::Tensor for ReferenceTensor {
     fn full_i32(_: i32, shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
+    fn sin_cos(&self, _: &()) -> Result<(Self, Self), Error> {
+        Ok((self.clone(), self.clone()))
+    }
     fn add(&self, _: &Self, _: &()) -> Result<Self, Error> {
         Ok(self.clone())
     }

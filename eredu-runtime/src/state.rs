@@ -67,6 +67,7 @@ impl ArchitectureStatePartitionRule {
 ///
 /// Resolution validates that the rules cover the supplied [`StateLayout`]
 /// exactly once and that unit-aligned ranges match their execution groups.
+/// An empty plan selects no state only when every layout entry is `NoState`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ArchitectureStatePartitionPlan {
     rules: Vec<ArchitectureStatePartitionRule>,
@@ -90,8 +91,8 @@ impl ArchitectureStatePartitionPlan {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ArchitectureStatePartitionError {
-    /// The plan contains no placement rules.
-    #[error("architecture state partition plan must contain at least one rule")]
+    /// The plan contains no rules for an architecture with mutable state.
+    #[error("a stateful architecture partition plan must contain at least one rule")]
     EmptyPlan,
     /// A rule selected no state layers.
     #[error("architecture state partition rule has empty range {start}..{end}")]

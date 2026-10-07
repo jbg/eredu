@@ -168,7 +168,7 @@ fn composite_independent_banks_preserve_media_writes_and_cached_decode() {
                                     independent.then(|| ParameterBankLoadOptions::new(
                                         eredu_core::residency::OffloadConfig::new(Some(bank_budget), Some(1 << 20), 1).unwrap(), bank_budget, bank_budget).unwrap()),
                                 ).unwrap();
-                                let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
+                                let layout = eredu_runtime::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
                                 let mut context = NumericContext::with_partition(layout, rank, world);
                                 context.bind_checkpoint_values = true;
                                 reset_reference_stage_evidence("SafeTensors");

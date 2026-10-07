@@ -3,13 +3,15 @@
 use std::collections::BTreeMap;
 
 use eredu_core::{
-    RealtimeForcedSource, RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition,
-    RealtimeScheduleError, RealtimeSpeechConfig, RealtimeTargetSource, RealtimeTemporalSource,
+    RealtimeChannelId, RealtimeForcedSource, RealtimeFrameForcing, RealtimeFrameScheduleState,
+    RealtimeFrameTransition, RealtimeScheduleError, RealtimeSpeechConfig, RealtimeTargetSource,
+    RealtimeTemporalSource,
 };
 
 use crate::{
-    MaterializedRealtimeInput, PredictionDirective, RealtimePayloadHistory,
-    RealtimePayloadHistoryError,
+    CompletedRealtimeFrame, MaterializedRealtimeInput, PredictionDirective,
+    RealtimeCompletedFrameError, RealtimeFrameChannel, RealtimeIngressContract,
+    RealtimePayloadHistory, RealtimePayloadHistoryError,
 };
 
 /// Narrow tensor mechanisms needed to populate and resolve scheduled slots.
@@ -19,24 +21,14 @@ pub trait RealtimeFrameTensorMechanisms {
     /// Mechanism failure.
     type Error;
 
-    /// Selects one token column while retaining the batch and singleton axes.
-    fn column(&mut self, matrix: &Self::Tensor, column: usize)
-        -> Result<Self::Tensor, Self::Error>;
-
     /// Creates one batch-by-one column containing an architecture-selected token.
     fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error>;
-
-    /// Stacks batch-by-one columns into one batch-by-column matrix.
-    fn stack_columns(
-        &mut self,
-        columns: &[Self::Tensor],
-        batch: usize,
-    ) -> Result<Self::Tensor, Self::Error>;
 }
 
 /// Fully resolved temporal inputs and ordered target directives for one step.
 pub struct PreparedRealtimeFrame<T> {
     schedule: RealtimeSpeechConfig,
+    channels: eredu_core::RealtimeChannelLayout,
     transition: RealtimeFrameTransition,
     temporal: Vec<T>,
     directives: Vec<PredictionDirective<T>>,
@@ -75,6 +67,7 @@ impl<T> PreparedRealtimeFrame<T> {
         self,
     ) -> (
         RealtimeSpeechConfig,
+        eredu_core::RealtimeChannelLayout,
         RealtimeFrameTransition,
         Vec<T>,
         Vec<PredictionDirective<T>>,
@@ -83,58 +76,12 @@ impl<T> PreparedRealtimeFrame<T> {
     ) {
         (
             self.schedule,
+            self.channels,
             self.transition,
             self.temporal,
             self.directives,
             self.batch,
             self.retain_diagnostics,
-        )
-    }
-}
-
-/// Opaque output tensors produced by one completely interpreted frame.
-pub struct CompletedRealtimeFrame<T, D> {
-    text: T,
-    decision_audio: T,
-    sampled_audio: T,
-    aligned_audio: Option<T>,
-    diagnostics: Vec<D>,
-}
-
-impl<T, D> CompletedRealtimeFrame<T, D> {
-    /// Returns one text-token column.
-    pub const fn text(&self) -> &T {
-        &self.text
-    }
-
-    /// Returns every depth decision in codebook order.
-    pub const fn decision_audio(&self) -> &T {
-        &self.decision_audio
-    }
-
-    /// Returns generated-audio decisions in generated-codebook order.
-    pub const fn sampled_audio(&self) -> &T {
-        &self.sampled_audio
-    }
-
-    /// Returns delay-aligned generated audio when the schedule exposes it.
-    pub const fn aligned_audio(&self) -> Option<&T> {
-        self.aligned_audio.as_ref()
-    }
-
-    /// Returns ordered per-decision diagnostics.
-    pub fn diagnostics(&self) -> &[D] {
-        &self.diagnostics
-    }
-
-    /// Consumes every opaque output and diagnostic.
-    pub fn into_parts(self) -> (T, T, T, Option<T>, Vec<D>) {
-        (
-            self.text,
-            self.decision_audio,
-            self.sampled_audio,
-            self.aligned_audio,
-            self.diagnostics,
         )
     }
 }
@@ -151,11 +98,11 @@ pub fn complete_realtime_frame<M, D>(
 where
     M: RealtimeFrameTensorMechanisms,
 {
-    history
-        .validate_schedule(schedule)
-        .map_err(RealtimeFrameInterpretationError::History)?;
-    let (prepared_schedule, transition, _, directives, batch, retain_diagnostics) =
+    let (prepared_schedule, channels, transition, _, directives, batch, retain_diagnostics) =
         prepared.into_parts();
+    history
+        .validate_schedule(&channels)
+        .map_err(RealtimeFrameInterpretationError::History)?;
     if &prepared_schedule != schedule {
         return Err(RealtimeFrameInterpretationError::PreparedScheduleMismatch);
     }
@@ -178,20 +125,23 @@ where
         let padding = mechanisms
             .filled_column(schedule.audio_padding_token(), batch)
             .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        let sampled_columns = vec![padding; schedule.generated_audio_codebooks()];
-        let sampled_audio = mechanisms
-            .stack_columns(&sampled_columns, batch)
-            .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        let decision_audio = mechanisms
-            .stack_columns(&[], batch)
-            .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        return Ok(CompletedRealtimeFrame {
+        let mut values = vec![RealtimeFrameChannel::new(
+            RealtimeChannelId::new(0),
+            None,
             text,
-            decision_audio,
-            sampled_audio,
-            aligned_audio: None,
+        )];
+        values.extend((1..=schedule.generated_audio_codebooks()).map(|index| {
+            RealtimeFrameChannel::new(RealtimeChannelId::new(index), None, padding.clone())
+        }));
+        return CompletedRealtimeFrame::new(
+            channels,
+            batch,
+            values,
+            Vec::new(),
+            Vec::new(),
             diagnostics,
-        });
+        )
+        .map_err(RealtimeFrameInterpretationError::Completed);
     }
     if decisions.len() != directives.len() {
         return Err(RealtimeFrameInterpretationError::DecisionCount {
@@ -204,20 +154,6 @@ where
         return Err(RealtimeFrameInterpretationError::DiagnosticCount {
             expected: expected_diagnostics,
             actual: diagnostics.len(),
-        });
-    }
-    let text = decisions
-        .first()
-        .cloned()
-        .ok_or(RealtimeFrameInterpretationError::MissingTextDecision)?;
-    let generated = schedule.generated_audio_codebooks();
-    let generated_end = 1usize
-        .checked_add(generated)
-        .ok_or(RealtimeFrameInterpretationError::DecisionCountOverflow { generated })?;
-    if generated_end > decisions.len() {
-        return Err(RealtimeFrameInterpretationError::DecisionCount {
-            expected: generated_end,
-            actual: decisions.len(),
         });
     }
 
@@ -233,40 +169,50 @@ where
         })
         .collect::<Vec<_>>();
     history_branch
-        .overwrite_many(schedule, resolved_targets)
+        .overwrite_many(&channels, resolved_targets)
         .map_err(RealtimeFrameInterpretationError::History)?;
 
-    let decision_audio = mechanisms
-        .stack_columns(&decisions[1..], batch)
-        .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-    let sampled_audio = mechanisms
-        .stack_columns(&decisions[1..generated_end], batch)
-        .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-    let aligned_audio = transition
-        .output()
-        .map(|coordinates| {
-            let columns = history_branch
-                .resolve_required(schedule, coordinates.iter().copied())
-                .map_err(RealtimeFrameInterpretationError::History)?
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            mechanisms
-                .stack_columns(&columns, batch)
-                .map_err(RealtimeFrameInterpretationError::Mechanism)
+    let values = transition
+        .targets()
+        .iter()
+        .zip(decisions)
+        .map(|(target, payload)| {
+            RealtimeFrameChannel::new(target.slot(), target.coordinate(), payload)
         })
-        .transpose()?;
+        .collect();
+    let decision_channels = transition
+        .targets()
+        .iter()
+        .map(|target| target.slot())
+        .collect();
+    let aligned = transition
+        .output()
+        .unwrap_or_default()
+        .iter()
+        .map(|&coordinate| {
+            history_branch
+                .required(&channels, coordinate)
+                .cloned()
+                .map(|payload| {
+                    RealtimeFrameChannel::new(coordinate.slot(), Some(coordinate), payload)
+                })
+                .map_err(RealtimeFrameInterpretationError::History)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let completed = CompletedRealtimeFrame::new(
+        channels.clone(),
+        batch,
+        values,
+        aligned,
+        decision_channels,
+        diagnostics,
+    )
+    .map_err(RealtimeFrameInterpretationError::Completed)?;
     history_branch
-        .prune_for_next_frontier(schedule, transition.next_frontier())
+        .prune_for_next_frontier(&channels, transition.next_frontier())
         .map_err(RealtimeFrameInterpretationError::History)?;
     *history = history_branch;
-    Ok(CompletedRealtimeFrame {
-        text,
-        decision_audio,
-        sampled_audio,
-        aligned_audio,
-        diagnostics,
-    })
+    Ok(completed)
 }
 
 /// Advances one neutral schedule and resolves all pre-model opaque payloads.
@@ -274,7 +220,7 @@ where
 /// Schedule and history publication is atomic. Sampled target values are
 /// recorded later, after the ordered model decision driver completes.
 pub fn prepare_realtime_frame<M>(
-    schedule: &RealtimeSpeechConfig,
+    contract: &RealtimeIngressContract,
     schedule_state: &mut RealtimeFrameScheduleState,
     history: &mut RealtimePayloadHistory<M::Tensor>,
     input: &MaterializedRealtimeInput<M::Tensor>,
@@ -283,32 +229,68 @@ pub fn prepare_realtime_frame<M>(
 where
     M: RealtimeFrameTensorMechanisms,
 {
-    if input.schedule() != schedule {
+    if input.channels() != contract.channels() {
         return Err(RealtimeFrameInterpretationError::InputScheduleMismatch);
     }
+    let schedule = contract.schedule();
+    for &(slot, _) in input.inputs() {
+        if slot.index() <= schedule.generated_audio_codebooks()
+            || slot.index() > schedule.total_audio_codebooks()
+        {
+            return Err(RealtimeFrameInterpretationError::InputRole {
+                slot,
+                role: "ordinary input",
+            });
+        }
+    }
+    for &(slot, _) in input.forced_values() {
+        if slot.index() > schedule.generated_audio_codebooks() {
+            return Err(RealtimeFrameInterpretationError::InputRole {
+                slot,
+                role: "forced output",
+            });
+        }
+    }
+    for index in schedule.generated_audio_codebooks() + 1..=schedule.total_audio_codebooks() {
+        let slot = RealtimeChannelId::new(index);
+        if input.input(slot).is_none() {
+            return Err(RealtimeFrameInterpretationError::MissingInputPayload { slot });
+        }
+    }
+    let channels = input.channels();
     schedule_state
         .validate_schedule(schedule)
         .map_err(RealtimeFrameInterpretationError::Schedule)?;
     history
-        .validate_schedule(schedule)
+        .validate_schedule(channels)
         .map_err(RealtimeFrameInterpretationError::History)?;
     let mut schedule_branch = schedule_state.clone();
     let mut history_branch = history.clone();
     let transition = schedule_branch
-        .advance(schedule, input.forcing())
+        .advance(
+            schedule,
+            &RealtimeFrameForcing::new(
+                input.forced(RealtimeChannelId::new(0)).is_some(),
+                (1..=schedule.generated_audio_codebooks())
+                    .map(|index| input.forced(RealtimeChannelId::new(index)).is_some())
+                    .collect(),
+            ),
+        )
         .map_err(RealtimeFrameInterpretationError::Schedule)?;
 
     let mut insertions = BTreeMap::new();
-    for (column, coordinate) in transition.input_placements().iter().copied().enumerate() {
-        let payload = mechanisms
-            .column(input.input_audio(), column)
-            .map_err(RealtimeFrameInterpretationError::Mechanism)?;
+    for coordinate in transition.input_placements().iter().copied() {
+        let payload = input.input(coordinate.slot()).cloned().ok_or(
+            RealtimeFrameInterpretationError::MissingInputPayload {
+                slot: coordinate.slot(),
+            },
+        )?;
         insertions.insert(coordinate, payload);
     }
     for coordinate in transition.forced_placements().iter().copied() {
         insertions.insert(
             coordinate,
-            forced_payload(input, coordinate.slot(), mechanisms)?,
+            forced_payload::<_, M::Error>(input, coordinate.slot())?,
         );
     }
     for coordinate in transition.warmup_padding().iter().copied() {
@@ -318,7 +300,7 @@ where
         insertions.insert(coordinate, payload);
     }
     history_branch
-        .overwrite_many(schedule, insertions)
+        .overwrite_many(channels, insertions)
         .map_err(RealtimeFrameInterpretationError::History)?;
 
     let temporal = transition
@@ -329,7 +311,7 @@ where
                 .filled_column(padding_token(schedule, *slot)?, input.batch())
                 .map_err(RealtimeFrameInterpretationError::Mechanism),
             RealtimeTemporalSource::Occupied { coordinate, .. } => history_branch
-                .required(schedule, *coordinate)
+                .required(channels, *coordinate)
                 .cloned()
                 .map_err(RealtimeFrameInterpretationError::History),
             _ => Err(RealtimeFrameInterpretationError::UnsupportedTemporalSource),
@@ -341,14 +323,14 @@ where
         .map(|target| match target.source() {
             RealtimeTargetSource::Sampled => Ok(PredictionDirective::Sample),
             RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput) => {
-                forced_payload(input, target.slot(), mechanisms).map(PredictionDirective::Force)
+                forced_payload::<_, M::Error>(input, target.slot()).map(PredictionDirective::Force)
             }
             RealtimeTargetSource::Forced(RealtimeForcedSource::Retained) => target
                 .coordinate()
                 .ok_or(RealtimeFrameInterpretationError::MissingTargetCoordinate)
                 .and_then(|coordinate| {
                     history_branch
-                        .required(schedule, coordinate)
+                        .required(channels, coordinate)
                         .cloned()
                         .map_err(RealtimeFrameInterpretationError::History)
                 })
@@ -358,7 +340,7 @@ where
                 .ok_or(RealtimeFrameInterpretationError::MissingTargetCoordinate)
                 .and_then(|coordinate| {
                     history_branch
-                        .required(schedule, coordinate)
+                        .required(channels, coordinate)
                         .cloned()
                         .map_err(RealtimeFrameInterpretationError::History)
                 })
@@ -371,6 +353,7 @@ where
     *history = history_branch;
     Ok(PreparedRealtimeFrame {
         schedule: schedule.clone(),
+        channels: channels.clone(),
         transition,
         temporal,
         directives,
@@ -379,40 +362,23 @@ where
     })
 }
 
-fn forced_payload<M>(
-    input: &MaterializedRealtimeInput<M::Tensor>,
-    slot: RealtimeFrameSlot,
-    mechanisms: &mut M,
-) -> Result<M::Tensor, RealtimeFrameInterpretationError<M::Error>>
-where
-    M: RealtimeFrameTensorMechanisms,
-{
-    match slot {
-        RealtimeFrameSlot::Text => input
-            .forced_text()
-            .cloned()
-            .ok_or(RealtimeFrameInterpretationError::MissingForcedPayload { slot }),
-        RealtimeFrameSlot::Audio(codebook) => mechanisms
-            .column(
-                input
-                    .forced_audio()
-                    .ok_or(RealtimeFrameInterpretationError::MissingForcedPayload { slot })?,
-                codebook,
-            )
-            .map_err(RealtimeFrameInterpretationError::Mechanism),
-        _ => Err(RealtimeFrameInterpretationError::UnsupportedSlot { slot }),
-    }
+fn forced_payload<T: Clone, E>(
+    input: &MaterializedRealtimeInput<T>,
+    slot: RealtimeChannelId,
+) -> Result<T, RealtimeFrameInterpretationError<E>> {
+    input
+        .forced(slot)
+        .cloned()
+        .ok_or(RealtimeFrameInterpretationError::MissingForcedPayload { slot })
 }
 
 fn padding_token<E>(
     schedule: &RealtimeSpeechConfig,
-    slot: RealtimeFrameSlot,
+    slot: RealtimeChannelId,
 ) -> Result<i32, RealtimeFrameInterpretationError<E>> {
-    match slot {
-        RealtimeFrameSlot::Text => Ok(schedule.text_padding_token()),
-        RealtimeFrameSlot::Audio(codebook) if codebook < schedule.total_audio_codebooks() => {
-            Ok(schedule.audio_padding_token())
-        }
+    match slot.index() {
+        0 => Ok(schedule.text_padding_token()),
+        index if index <= schedule.total_audio_codebooks() => Ok(schedule.audio_padding_token()),
         _ => Err(RealtimeFrameInterpretationError::UnsupportedSlot { slot }),
     }
 }
@@ -440,7 +406,21 @@ pub enum RealtimeFrameInterpretationError<E> {
     #[error("realtime forced slot {slot:?} has no payload")]
     MissingForcedPayload {
         /// Missing forced slot.
-        slot: RealtimeFrameSlot,
+        slot: RealtimeChannelId,
+    },
+    /// A required live channel has no materialized input payload.
+    #[error("realtime input slot {slot:?} has no payload")]
+    MissingInputPayload {
+        /// Missing ordinary input channel.
+        slot: RealtimeChannelId,
+    },
+    /// A supplied input role is not part of this categorical schedule.
+    #[error("realtime channel {slot:?} cannot be supplied as {role}")]
+    InputRole {
+        /// Channel with the invalid role.
+        slot: RealtimeChannelId,
+        /// Required scheduling role.
+        role: &'static str,
     },
     /// An existing target did not retain its required coordinate.
     #[error("realtime existing target has no coordinate")]
@@ -453,15 +433,9 @@ pub enum RealtimeFrameInterpretationError<E> {
         /// Actual decision count.
         actual: usize,
     },
-    /// Generated decision cardinality overflowed its text prefix.
-    #[error("realtime generated decision count {generated} overflowed")]
-    DecisionCountOverflow {
-        /// Generated-audio decision count.
-        generated: usize,
-    },
-    /// A model-required transition did not return its leading text decision.
-    #[error("realtime model returned no text decision")]
-    MissingTextDecision,
+    /// Completed output attribution disagrees with the declared channel contract.
+    #[error(transparent)]
+    Completed(RealtimeCompletedFrameError),
     /// Diagnostic retention did not match the exact ordered decision count.
     #[error("realtime model returned {actual} diagnostics, expected {expected}")]
     DiagnosticCount {
@@ -480,7 +454,7 @@ pub enum RealtimeFrameInterpretationError<E> {
     #[error("unsupported realtime frame slot {slot:?}")]
     UnsupportedSlot {
         /// Unsupported slot.
-        slot: RealtimeFrameSlot,
+        slot: RealtimeChannelId,
     },
 }
 
@@ -531,43 +505,11 @@ mod tests {
         type Tensor = Matrix;
         type Error = Infallible;
 
-        fn column(
-            &mut self,
-            matrix: &Self::Tensor,
-            column: usize,
-        ) -> Result<Self::Tensor, Self::Error> {
-            self.calls += 1;
-            Ok(Matrix {
-                values: matrix
-                    .values
-                    .chunks_exact(matrix.shape[1])
-                    .map(|row| row[column])
-                    .collect(),
-                shape: [matrix.shape[0], 1],
-            })
-        }
-
         fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
             self.calls += 1;
             Ok(Matrix {
                 values: vec![token; batch],
                 shape: [batch, 1],
-            })
-        }
-
-        fn stack_columns(
-            &mut self,
-            columns: &[Self::Tensor],
-            batch: usize,
-        ) -> Result<Self::Tensor, Self::Error> {
-            self.calls += 1;
-            let mut values = Vec::with_capacity(batch * columns.len());
-            for row in 0..batch {
-                values.extend(columns.iter().map(|column| column.values[row]));
-            }
-            Ok(Matrix {
-                values,
-                shape: [batch, columns.len()],
             })
         }
     }
@@ -576,13 +518,23 @@ mod tests {
         RealtimeSpeechConfig::new(2, 1, 1, 1, 9, 8, convention, vec![0, 0, 1]).unwrap()
     }
 
+    fn ingress(schedule: &RealtimeSpeechConfig) -> RealtimeIngressContract {
+        RealtimeIngressContract::new(schedule.clone(), TokenDomain::new(10), TokenDomain::new(9))
+            .unwrap()
+    }
+
     fn payload_history(schedule: &RealtimeSpeechConfig) -> RealtimePayloadHistory<Matrix> {
         RealtimePayloadHistory::with_contract(
             RealtimePayloadContract::new(
-                schedule.clone(),
+                RealtimeIngressContract::new(
+                    schedule.clone(),
+                    TokenDomain::new(10),
+                    TokenDomain::new(9),
+                )
+                .unwrap()
+                .channels()
+                .clone(),
                 1,
-                TokenDomain::new(10),
-                TokenDomain::new(9),
                 RealtimePayloadGeneration::new(1).unwrap(),
                 RealtimePayloadOwnerIdentity::new(1).unwrap(),
             )
@@ -632,7 +584,7 @@ mod tests {
         let input = input(&schedule, &mut mechanisms);
 
         let first = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &input,
@@ -651,8 +603,8 @@ mod tests {
         assert_eq!(
             history
                 .required(
-                    &schedule,
-                    RealtimeSlotCoordinate::new(0, RealtimeFrameSlot::Audio(1))
+                    history.schedule(),
+                    RealtimeSlotCoordinate::new(0, RealtimeChannelId::new(2))
                 )
                 .unwrap()
                 .values,
@@ -667,15 +619,24 @@ mod tests {
             &mut mechanisms,
         )
         .unwrap();
-        assert_eq!(completed.text().values, vec![3]);
-        assert_eq!(completed.decision_audio().values, vec![6]);
-        assert_eq!(completed.sampled_audio().values, vec![6]);
-        assert!(completed.aligned_audio().is_none());
+        assert_eq!(
+            completed.value(RealtimeChannelId::new(0)).unwrap().values,
+            vec![3]
+        );
+        assert_eq!(
+            completed.decision_channels(),
+            &[RealtimeChannelId::new(0), RealtimeChannelId::new(1)]
+        );
+        assert_eq!(
+            completed.value(RealtimeChannelId::new(1)).unwrap().values,
+            vec![6]
+        );
+        assert!(completed.aligned().is_empty());
         assert_eq!(
             history
                 .required(
-                    &schedule,
-                    RealtimeSlotCoordinate::new(0, RealtimeFrameSlot::Audio(0))
+                    history.schedule(),
+                    RealtimeSlotCoordinate::new(0, RealtimeChannelId::new(1))
                 )
                 .unwrap()
                 .values,
@@ -691,7 +652,7 @@ mod tests {
         let mut mechanisms = Mechanisms::default();
         let input = input(&schedule, &mut mechanisms);
         let prepared = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &input,
@@ -702,7 +663,7 @@ mod tests {
         assert!(prepared.temporal().is_empty());
         assert!(prepared.directives().is_empty());
         assert_eq!(
-            schedule_state.occupancy(RealtimeSlotCoordinate::new(0, RealtimeFrameSlot::Text)),
+            schedule_state.occupancy(RealtimeSlotCoordinate::new(0, RealtimeChannelId::new(0))),
             Some(RealtimeSlotOccupancy::Padding)
         );
         assert_eq!(history.len(), 4);
@@ -715,9 +676,15 @@ mod tests {
             &mut mechanisms,
         )
         .unwrap();
-        assert_eq!(completed.text().values, vec![9]);
-        assert!(completed.decision_audio().values.is_empty());
-        assert_eq!(completed.sampled_audio().values, vec![8]);
+        assert_eq!(
+            completed.value(RealtimeChannelId::new(0)).unwrap().values,
+            vec![9]
+        );
+        assert!(completed.decision_channels().is_empty());
+        assert_eq!(
+            completed.value(RealtimeChannelId::new(1)).unwrap().values,
+            vec![8]
+        );
     }
 
     #[test]
@@ -743,7 +710,7 @@ mod tests {
             &mut mechanisms,
         );
         let initialization = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &initialization_input,
@@ -768,7 +735,7 @@ mod tests {
             &mut mechanisms,
         );
         let forced = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &second_input,
@@ -792,7 +759,7 @@ mod tests {
             &mut mechanisms,
         )
         .unwrap();
-        assert!(forced_completed.aligned_audio().is_none());
+        assert!(forced_completed.aligned().is_empty());
 
         let next_input = materialize_input(
             &schedule,
@@ -800,7 +767,7 @@ mod tests {
             &mut mechanisms,
         );
         let next = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &next_input,
@@ -831,8 +798,18 @@ mod tests {
             &mut mechanisms,
         )
         .unwrap();
-        assert_eq!(next_completed.aligned_audio().unwrap().values, vec![6]);
-        assert_eq!(next_completed.sampled_audio().values, vec![6]);
+        assert_eq!(
+            next_completed.aligned()[0].channel(),
+            RealtimeChannelId::new(1)
+        );
+        assert_eq!(next_completed.aligned()[0].payload().values, vec![6]);
+        assert_eq!(
+            next_completed
+                .value(RealtimeChannelId::new(1))
+                .unwrap()
+                .values,
+            vec![6]
+        );
     }
 
     #[test]
@@ -850,7 +827,7 @@ mod tests {
             &mut mechanisms,
         );
         let first = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &first_input,
@@ -873,7 +850,7 @@ mod tests {
             &mut mechanisms,
         );
         let second = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &second_input,
@@ -897,12 +874,16 @@ mod tests {
             &mut mechanisms,
         )
         .unwrap();
-        assert_eq!(second_completed.aligned_audio().unwrap().values, vec![5]);
+        assert_eq!(
+            second_completed.aligned()[0].channel(),
+            RealtimeChannelId::new(1)
+        );
+        assert_eq!(second_completed.aligned()[0].payload().values, vec![5]);
         assert_eq!(
             history
                 .required(
-                    &schedule,
-                    RealtimeSlotCoordinate::new(1, RealtimeFrameSlot::Text),
+                    history.schedule(),
+                    RealtimeSlotCoordinate::new(1, RealtimeChannelId::new(0)),
                 )
                 .unwrap()
                 .values,
@@ -911,8 +892,8 @@ mod tests {
         assert_eq!(
             history
                 .required(
-                    &schedule,
-                    RealtimeSlotCoordinate::new(1, RealtimeFrameSlot::Audio(0)),
+                    history.schedule(),
+                    RealtimeSlotCoordinate::new(1, RealtimeChannelId::new(1)),
                 )
                 .unwrap()
                 .values,
@@ -935,7 +916,7 @@ mod tests {
         let mut history = payload_history(&attempted_schedule);
 
         let result = prepare_realtime_frame(
-            &attempted_schedule,
+            &ingress(&attempted_schedule),
             &mut schedule_state,
             &mut history,
             &input,
@@ -949,6 +930,77 @@ mod tests {
         assert_eq!(mechanisms.calls, calls_before_prepare);
         assert_eq!(schedule_state.frontier(), 0);
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn channel_roles_are_checked_before_warmup_and_payloads_resolve_by_identity() {
+        let schedule = RealtimeSpeechConfig::new(
+            3,
+            2,
+            1,
+            3,
+            9,
+            8,
+            RealtimeFrameConvention::AbsoluteDelayedSlots,
+            vec![0, 0, 0, 0],
+        )
+        .unwrap();
+        let contract = ingress(&schedule);
+        let mut state = RealtimeFrameScheduleState::new(schedule.clone());
+        let mut history = payload_history(&schedule);
+        let mut mechanisms = Mechanisms::default();
+        let entry = |id, value| (RealtimeChannelId::new(id), column(value));
+        for (ordinary, forced) in [
+            (vec![entry(2, 4)], vec![]),
+            (vec![entry(2, 4), entry(3, 7), entry(1, 6)], vec![]),
+            (vec![entry(2, 4), entry(3, 7)], vec![entry(2, 6)]),
+        ] {
+            let input = MaterializedRealtimeInput::new(
+                contract.channels().clone(),
+                1,
+                ordinary,
+                forced,
+                false,
+            )
+            .unwrap();
+            assert!(prepare_realtime_frame(
+                &contract,
+                &mut state,
+                &mut history,
+                &input,
+                &mut mechanisms
+            )
+            .is_err());
+            assert_eq!(mechanisms.calls, 0);
+            assert_eq!(state.frontier(), 0);
+            assert!(history.is_empty());
+        }
+        let input = MaterializedRealtimeInput::new(
+            contract.channels().clone(),
+            1,
+            vec![entry(3, 7), entry(2, 4)],
+            vec![entry(1, 6), entry(0, 3)],
+            false,
+        )
+        .unwrap();
+        let warmup =
+            prepare_realtime_frame(&contract, &mut state, &mut history, &input, &mut mechanisms)
+                .unwrap();
+        assert!(!warmup.transition().model_call_required());
+        let prepared =
+            prepare_realtime_frame(&contract, &mut state, &mut history, &input, &mut mechanisms)
+                .unwrap();
+        let forced = prepared
+            .directives()
+            .iter()
+            .map(|directive| match directive {
+                PredictionDirective::Force(value) => value.values[0],
+                PredictionDirective::Sample => {
+                    panic!("all four target channels have supplied values")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(forced, [3, 6, 4, 7]);
     }
 
     #[test]
@@ -974,7 +1026,7 @@ mod tests {
         );
 
         let prepared = prepare_realtime_frame(
-            &schedule,
+            &ingress(&schedule),
             &mut schedule_state,
             &mut history,
             &input,

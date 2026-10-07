@@ -35,7 +35,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::{AudioTokenizer, AudioTokenizerConfig, Error};
+use crate::{
+    streaming::{
+        Conv1dSpec, ConvTranspose1dSpec, StreamableConv1d, StreamableConvTranspose1d, TransposeTail,
+    },
+    AudioTokenizer, AudioTokenizerConfig, Error,
+};
 
 const EPSILON: f32 = 1e-5;
 
@@ -204,22 +209,24 @@ impl<T: Tensor> Mimi<T> {
             quantizer: SplitResidualVectorQuantizer::unloaded(&config, context)?,
             encoder: SeaNetEncoder::unloaded(context)?,
             encoder_transformer: MimiTransformer::unloaded(context)?,
-            downsample: StreamableConv1d::unloaded_with_pad_mode(
-                config.latent_dim,
-                config.latent_dim,
-                4,
-                2,
-                false,
-                PadMode::Edge,
+            downsample: StreamableConv1d::unloaded(
+                Conv1dSpec {
+                    bias: false,
+                    pad_mode: PadMode::Edge,
+                    ..Conv1dSpec::causal(config.latent_dim, config.latent_dim, 4, 2)
+                },
                 context,
             )?,
             upsample: StreamableConvTranspose1d::unloaded(
-                config.latent_dim,
-                config.latent_dim,
-                4,
-                2,
-                config.latent_dim,
-                false,
+                ConvTranspose1dSpec {
+                    input_channels: config.latent_dim,
+                    output_channels: config.latent_dim,
+                    kernel_size: 4,
+                    stride: 2,
+                    groups: config.latent_dim,
+                    bias: false,
+                    tail: TransposeTail::Trim,
+                },
                 context,
             )?,
             decoder_transformer: MimiTransformer::unloaded(context)?,
@@ -1268,9 +1275,9 @@ impl<T: Tensor> SeaNetEncoder<T> {
             channels *= 2;
         }
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(1, 64, 7, 1, context)?,
+            init_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(1, 64, 7, 1), context)?,
             layers,
-            final_conv1d: StreamableConv1d::unloaded(1024, 512, 3, 1, context)?,
+            final_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(1024, 512, 3, 1), context)?,
         })
     }
 
@@ -1324,10 +1331,7 @@ impl<T: Tensor> EncoderLayer<T> {
         Ok(Self {
             residuals: vec![SeaNetResnetBlock::unloaded(in_channels, context)?],
             downsample: StreamableConv1d::unloaded(
-                in_channels,
-                out_channels,
-                ratio * 2,
-                ratio,
+                Conv1dSpec::causal(in_channels, out_channels, ratio * 2, ratio),
                 context,
             )?,
         })
@@ -1740,9 +1744,9 @@ impl<T: Tensor> SeaNetDecoder<T> {
             channels = out_channels;
         }
         Ok(Self {
-            init_conv1d: StreamableConv1d::unloaded(512, 1024, 7, 1, context)?,
+            init_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(512, 1024, 7, 1), context)?,
             layers,
-            final_conv1d: StreamableConv1d::unloaded(64, 1, 3, 1, context)?,
+            final_conv1d: StreamableConv1d::unloaded(Conv1dSpec::causal(64, 1, 3, 1), context)?,
         })
     }
 
@@ -1791,12 +1795,15 @@ impl<T: Tensor> DecoderLayer<T> {
     ) -> Result<Self, Error> {
         Ok(Self {
             upsample: StreamableConvTranspose1d::unloaded(
-                in_channels,
-                out_channels,
-                ratio * 2,
-                ratio,
-                1,
-                true,
+                ConvTranspose1dSpec {
+                    input_channels: in_channels,
+                    output_channels: out_channels,
+                    kernel_size: ratio * 2,
+                    stride: ratio,
+                    groups: 1,
+                    bias: true,
+                    tail: TransposeTail::Trim,
+                },
                 context,
             )?,
             residuals: vec![SeaNetResnetBlock::unloaded(out_channels, context)?],
@@ -1836,8 +1843,14 @@ impl<T: Tensor> SeaNetResnetBlock<T> {
     fn unloaded(channels: i32, context: &T::Context) -> Result<Self, Error> {
         Ok(Self {
             block: vec![
-                StreamableConv1d::unloaded(channels, channels / 2, 3, 1, context)?,
-                StreamableConv1d::unloaded(channels / 2, channels, 1, 1, context)?,
+                StreamableConv1d::unloaded(
+                    Conv1dSpec::causal(channels, channels / 2, 3, 1),
+                    context,
+                )?,
+                StreamableConv1d::unloaded(
+                    Conv1dSpec::causal(channels / 2, channels, 1, 1),
+                    context,
+                )?,
             ],
         })
     }
@@ -1867,271 +1880,6 @@ impl<T: Tensor> SeaNetResnetBlock<T> {
         }
         Ok(y.add(x, context)?)
     }
-}
-
-#[derive(Debug, Clone)]
-struct StreamableConv1d<T: Tensor> {
-    weight: Parameter<T>,
-    bias: Option<Parameter<T>>,
-    stride: i32,
-    dilation: i32,
-    groups: i32,
-    pad_mode: PadMode,
-    state_prev_xs: Option<T>,
-    left_pad_applied: bool,
-}
-
-impl<T: Tensor> StreamableConv1d<T> {
-    fn unloaded(
-        in_channels: i32,
-        out_channels: i32,
-        kernel_size: i32,
-        stride: i32,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
-        Self::unloaded_with_pad_mode(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            true,
-            PadMode::Constant,
-            context,
-        )
-    }
-
-    fn unloaded_with_pad_mode(
-        in_channels: i32,
-        out_channels: i32,
-        kernel_size: i32,
-        stride: i32,
-        bias: bool,
-        pad_mode: PadMode,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            weight: unloaded_parameter(&[out_channels, kernel_size, in_channels], context)?,
-            bias: bias
-                .then(|| unloaded_parameter(&[out_channels], context))
-                .transpose()?,
-            stride,
-            dilation: 1,
-            groups: 1,
-            pad_mode,
-            state_prev_xs: None,
-            left_pad_applied: false,
-        })
-    }
-
-    fn forward(&mut self, x: &T, context: &T::Context) -> Result<T, Error> {
-        let kernel_size = self.weight.as_ref().dim(1);
-        let effective_kernel = (kernel_size - 1) * self.dilation + 1;
-        let padding_total = effective_kernel - self.stride;
-        let extra_padding =
-            extra_padding_for_conv1d(x.dim(2), effective_kernel, self.stride, padding_total);
-        let x = pad_bct(x, padding_total, extra_padding, self.pad_mode, context)?;
-        let x = x.swap_axes(1, 2, context)?;
-        let mut y = T::conv1d(
-            &x,
-            self.weight.as_ref(),
-            self.stride,
-            0,
-            self.dilation,
-            self.groups,
-            context,
-        )?;
-        if let Some(bias) = &self.bias {
-            y = y.add(bias.as_ref(), context)?;
-        }
-        Ok(y.swap_axes(1, 2, context)?)
-    }
-
-    fn reset_state(&mut self) {
-        self.state_prev_xs = None;
-        self.left_pad_applied = false;
-    }
-
-    fn step(&mut self, x: &T, context: &T::Context) -> Result<Option<T>, Error> {
-        let kernel_size = self.weight.as_ref().dim(1);
-        let effective_kernel = (kernel_size - 1) * self.dilation + 1;
-        let padding_total = effective_kernel - self.stride;
-        let x = if self.left_pad_applied {
-            x.clone()
-        } else {
-            self.left_pad_applied = true;
-            pad_bct(x, padding_total, 0, self.pad_mode, context)?
-        };
-        let x = match self.state_prev_xs.take() {
-            Some(prev) => T::concatenate(&[prev, x], 2, context)?,
-            None => x,
-        };
-        let seq_len = x.dim(2);
-        let num_frames = (seq_len + self.stride).saturating_sub(effective_kernel) / self.stride;
-        if num_frames <= 0 {
-            self.state_prev_xs = Some(x);
-            return Ok(None);
-        }
-        let offset = num_frames * self.stride;
-        self.state_prev_xs = Some(x.index(
-            &[Index::Full, Index::Full, Index::Range(offset, seq_len)],
-            context,
-        )?);
-        let in_len = (num_frames - 1) * self.stride + effective_kernel;
-        let x = x.index(
-            &[Index::Full, Index::Full, Index::Range(0, in_len)],
-            context,
-        )?;
-        self.forward_unpadded(&x, context).map(Some)
-    }
-
-    fn forward_unpadded(&mut self, x: &T, context: &T::Context) -> Result<T, Error> {
-        let x = x.swap_axes(1, 2, context)?;
-        let mut y = T::conv1d(
-            &x,
-            self.weight.as_ref(),
-            self.stride,
-            0,
-            self.dilation,
-            self.groups,
-            context,
-        )?;
-        if let Some(bias) = &self.bias {
-            y = y.add(bias.as_ref(), context)?;
-        }
-        Ok(y.swap_axes(1, 2, context)?)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct StreamableConvTranspose1d<T: Tensor> {
-    weight: Parameter<T>,
-    bias: Option<Parameter<T>>,
-    kernel_size: i32,
-    stride: i32,
-    groups: i32,
-    state_prev_ys: Option<T>,
-}
-
-impl<T: Tensor> StreamableConvTranspose1d<T> {
-    fn unloaded(
-        in_channels: i32,
-        out_channels: i32,
-        kernel_size: i32,
-        stride: i32,
-        groups: i32,
-        bias: bool,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            weight: unloaded_parameter(
-                &[out_channels, kernel_size, in_channels / groups],
-                context,
-            )?,
-            bias: bias
-                .then(|| unloaded_parameter(&[out_channels], context))
-                .transpose()?,
-            kernel_size,
-            stride,
-            groups,
-            state_prev_ys: None,
-        })
-    }
-
-    fn forward(&mut self, x: &T, context: &T::Context) -> Result<T, Error> {
-        let y = self.forward_untrimmed(x, context)?;
-        let padding_total = self.kernel_size.saturating_sub(self.stride);
-        unpad_bct(&y, 0, padding_total, context)
-    }
-
-    fn reset_state(&mut self) {
-        self.state_prev_ys = None;
-    }
-
-    fn step(&mut self, x: &T, context: &T::Context) -> Result<T, Error> {
-        let y = self.forward_untrimmed(x, context)?;
-        let out_len = y.dim(2);
-        let y = match self.state_prev_ys.take() {
-            None => y,
-            Some(prev) => {
-                let prev_len = prev.dim(2);
-                let prev = match &self.bias {
-                    None => prev,
-                    Some(bias) => prev.subtract(
-                        &bias
-                            .as_ref()
-                            .reshape(&[1, bias.as_ref().dim(0), 1], context)?,
-                        context,
-                    )?,
-                };
-                let y1 = y
-                    .index(
-                        &[Index::Full, Index::Full, Index::Range(0, prev_len)],
-                        context,
-                    )?
-                    .add(&prev, context)?;
-                let y2 = y.index(
-                    &[Index::Full, Index::Full, Index::Range(prev_len, out_len)],
-                    context,
-                )?;
-                T::concatenate(&[y1, y2], 2, context)?
-            }
-        };
-        let invalid_steps = self.kernel_size - self.stride;
-        let split = out_len - invalid_steps;
-        let out = y.index(&[Index::Full, Index::Full, Index::Range(0, split)], context)?;
-        self.state_prev_ys = Some(y.index(
-            &[Index::Full, Index::Full, Index::Range(split, out_len)],
-            context,
-        )?);
-        Ok(out)
-    }
-
-    fn forward_untrimmed(&mut self, x: &T, context: &T::Context) -> Result<T, Error> {
-        let x = x.swap_axes(1, 2, context)?;
-        let mut y = T::conv_transpose1d(
-            &x,
-            self.weight.as_ref(),
-            self.stride,
-            0,
-            1,
-            0,
-            self.groups,
-            context,
-        )?;
-        if let Some(bias) = &self.bias {
-            y = y.add(bias.as_ref(), context)?;
-        }
-        Ok(y.swap_axes(1, 2, context)?)
-    }
-}
-
-fn extra_padding_for_conv1d(len: i32, kernel_size: i32, stride: i32, padding_total: i32) -> i32 {
-    let n_frames = (len + padding_total - kernel_size) as f64 / stride as f64 + 1.0;
-    let ideal_len = ((n_frames.ceil() as i32 - 1) * stride + kernel_size) - padding_total;
-    ideal_len.saturating_sub(len)
-}
-
-fn pad_bct<T: Tensor>(
-    x: &T,
-    left: i32,
-    right: i32,
-    mode: PadMode,
-    context: &T::Context,
-) -> Result<T, Error> {
-    Ok(T::pad(x, &[(0, 0), (0, 0), (left, right)], mode, context)?)
-}
-
-fn unpad_bct<T: Tensor>(x: &T, left: i32, right: i32, context: &T::Context) -> Result<T, Error> {
-    let len = x.dim(2);
-    if len < left + right {
-        return Err(Error::InvalidShape(format!(
-            "cannot unpad Mimi tensor of length {len} by {left}+{right}"
-        )));
-    }
-    Ok(x.index(
-        &[Index::Full, Index::Full, Index::Range(left, len - right)],
-        context,
-    )?)
 }
 
 /// Split residual vector quantizer used by Mimi.
@@ -2664,8 +2412,8 @@ module_parameters!(DecoderLayer {
     residuals,
 });
 module_parameters!(SeaNetResnetBlock { block });
-module_parameters!(StreamableConv1d { weight, bias });
-module_parameters!(StreamableConvTranspose1d { weight, bias });
+structured_leaf_parameters!(StreamableConv1d<T>);
+structured_leaf_parameters!(StreamableConvTranspose1d<T>);
 module_parameters!(SplitResidualVectorQuantizer {
     rvq_first,
     rvq_rest,

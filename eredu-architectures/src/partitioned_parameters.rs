@@ -37,24 +37,6 @@ where
     }
 }
 
-impl<A, B, S, P, F, U> LayeredParameterOwner<B, S> for PipelinePartitionExecutor<A, B, S, P, F, U>
-where
-    B: eredu_runtime::SubmissionBackend<
-            Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
-        > + eredu_runtime::CommunicationBackend,
-    S: eredu_runtime::RuntimeState<B>,
-    A: TextPartitionArchitecture<B, S>,
-    P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    F: PartitionTensorAllocator<B>,
-    B::ParallelContext: Sized,
-{
-    type Architecture = A;
-    type Policy = P;
-    fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
-        Some((&mut self.architecture, &mut self.policy))
-    }
-}
-
 impl<A, B, S, P, F, U> LayeredParameterOwner<B, S> for CompositePartitionExecutor<A, B, S, P, F, U>
 where
     B: eredu_runtime::SubmissionBackend<

@@ -67,7 +67,7 @@ fn prediction_rank_resources_count_tensor_shards_and_pipeline_expert_replicas() 
             )
             .unwrap();
             let layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                eredu_runtime::derive_partitioned_local_layout(
                     &parameters,
                     tensor_topology,
                 )

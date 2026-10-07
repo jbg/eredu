@@ -1,21 +1,21 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_checkpoint::{
+    StoredDtype,
     recipe::{AtomicRecipeSet, RecipeCatalog},
     schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
     store::{StoreError, TensorMetadata},
     validation::{
-        resolve_safetensors_plan, CatalogTensorMetadata, CheckpointValidation,
-        ResolvedCheckpointPlan, SafetensorsCatalog, StrictLoadFailure,
+        CatalogTensorMetadata, CheckpointValidation, ResolvedCheckpointPlan, SafetensorsCatalog,
+        StrictLoadFailure, resolve_safetensors_plan,
     },
-    StoredDtype,
 };
 use eredu_core::{
-    artifact::ArtifactError,
-    checkpoint::{TensorCatalog, TensorDtype},
     ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
     LoadingProtocol, ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
     ValidatedGguf,
+    artifact::ArtifactError,
+    checkpoint::{TensorCatalog, TensorDtype},
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -232,6 +232,8 @@ pub enum ModelKind {
     NemotronH,
     /// Moshi-family realtime speech architecture, including PersonaPlex.
     Moshi,
+    /// NemotronLabs VoiceChat coupled realtime speech architecture.
+    VoiceChat,
     /// Qwen2/Qwen2.5 dense decoder.
     Qwen2,
     /// Qwen3 dense or MoE decoder.
@@ -269,7 +271,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::Gemma4,
@@ -284,6 +286,7 @@ impl ModelKind {
         Self::Lfm2,
         Self::NemotronH,
         Self::Moshi,
+        Self::VoiceChat,
         Self::Qwen2,
         Self::Qwen3,
         Self::Qwen3Next,
@@ -310,6 +313,7 @@ impl ModelKind {
             Self::Lfm2 => "lfm2",
             Self::NemotronH => "nemotron_h",
             Self::Moshi => "moshi",
+            Self::VoiceChat => "nemotron_voicechat",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Next => "qwen3_next",
@@ -323,7 +327,7 @@ impl ModelKind {
     /// Neutral loader protocol required by this family.
     pub const fn loading_protocol(self) -> LoadingProtocol {
         match self {
-            Self::Moshi => LoadingProtocol::Realtime,
+            Self::Moshi | Self::VoiceChat => LoadingProtocol::Realtime,
             _ => LoadingProtocol::Model,
         }
     }
@@ -360,6 +364,7 @@ impl ModelKind {
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
             "moshi" | "personaplex" => Ok(Self::Moshi),
+            "nemotron_voicechat" => Ok(Self::VoiceChat),
             "qwen2" => Ok(Self::Qwen2),
             "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
             "qwen3_next" => Ok(Self::Qwen3Next),
@@ -408,6 +413,8 @@ pub enum GgufArchitecture {
     NemotronH,
     /// `nemotron_h_moe`.
     NemotronHMoe,
+    /// Complete `nemotron_voicechat` speech container.
+    VoiceChat,
     /// `qwen2`.
     Qwen2,
     /// `qwen3`.
@@ -448,6 +455,7 @@ impl GgufArchitecture {
             "lfm2moe" => Ok(Self::Lfm2Moe),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_h_moe" => Ok(Self::NemotronHMoe),
+            "nemotron_voicechat" => Ok(Self::VoiceChat),
             "qwen2" => Ok(Self::Qwen2),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3moe" => Ok(Self::Qwen3Moe),
@@ -477,6 +485,7 @@ impl GgufArchitecture {
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
+            Self::VoiceChat => ModelKind::VoiceChat,
             Self::Qwen2 => ModelKind::Qwen2,
             Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
             Self::Qwen3Vl => ModelKind::Qwen3Vl,
@@ -506,6 +515,7 @@ impl GgufArchitecture {
             Self::Lfm2Moe => "lfm2moe",
             Self::NemotronH => "nemotron_h",
             Self::NemotronHMoe => "nemotron_h_moe",
+            Self::VoiceChat => "nemotron_voicechat",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3moe",
@@ -630,6 +640,20 @@ pub struct ResolvedModelIdentity {
 /// Resolves compatible family aliases and nested wrappers without parsing
 /// family geometry.
 pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelIdentity, ArtifactError> {
+    // The released NeMo document has no top-level Hugging Face model_type.
+    // Identify its data contract, never its inert Python _target_ strings.
+    if json.get("model_type").is_none()
+        && json.pointer("/model/stt/model").is_some()
+        && json.pointer("/model/speech_generation/model").is_some()
+        && json.get("data").is_some()
+    {
+        let name = ModelKind::VoiceChat.canonical_name().to_owned();
+        return Ok(ResolvedModelIdentity {
+            kind: ModelKind::VoiceChat,
+            model_type: name.clone(),
+            effective_model_type: name,
+        });
+    }
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
     let kind = ModelKind::resolve_model_type(&metadata.model_type)?;
     let effective_model_type = effective_model_type(&metadata, kind)?;
@@ -691,6 +715,8 @@ pub enum SafetensorsModelConfig {
     NemotronH(crate::nemotron_h::ModelArgs),
     /// Moshi-family realtime geometry.
     Moshi(crate::moshi::MoshiConfig),
+    /// Complete coupled realtime speech geometry.
+    VoiceChat(crate::voicechat::config::VoiceChatConfig),
     /// Qwen2/Qwen3 family geometry.
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
@@ -744,6 +770,8 @@ pub enum GgufModelConfig {
     MuseGlimmer(crate::muse_glimmer::DecoderConfig),
     /// Nemotron-H family geometry.
     NemotronH(crate::nemotron_h::ModelArgs),
+    /// Complete coupled realtime speech geometry.
+    VoiceChat(crate::voicechat::config::VoiceChatConfig),
     /// Qwen2/Qwen3 family geometry, including Qwen3-VL text checkpoints.
     Qwen(crate::qwen::ModelArgs),
     /// Qwen hybrid-family geometry.
@@ -763,7 +791,11 @@ impl SafetensorsModelConfig {
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
             Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
-            Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::Moshi(_) => false,
+            Self::Gemma2(_)
+            | Self::Llama(_)
+            | Self::Nanbeige(_)
+            | Self::Moshi(_)
+            | Self::VoiceChat(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
@@ -787,7 +819,7 @@ impl GgufModelConfig {
             Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Lfm2(args) => args.num_experts > 0,
-            Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) => false,
+            Self::Gemma2(_) | Self::Llama(_) | Self::Nanbeige(_) | Self::VoiceChat(_) => false,
             Self::MuseGlimmer(args) => args.num_experts > 0,
             Self::NemotronH(args) => args.n_routed_experts > 0,
             Self::Qwen(args) => args.num_experts > 0,
@@ -1427,6 +1459,9 @@ fn resolve_safetensors_architecture(
         ModelKind::NemotronH => crate::nemotron_h::model_args_from_config_value(json)
             .map(SafetensorsModelConfig::NemotronH)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::VoiceChat => crate::voicechat::config::VoiceChatConfig::from_value(json)
+            .map(SafetensorsModelConfig::VoiceChat)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::Moshi => crate::moshi::MoshiConfig::from_config_value(Some(json))
             .map(SafetensorsModelConfig::Moshi)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1485,6 +1520,10 @@ fn resolve_safetensors_architecture(
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::VoiceChat(args) => {
+            crate::voicechat::checkpoint::safetensors_plan(args)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::Moshi(args) => crate::moshi::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::K2Horizon(args) => crate::k2_horizon::safetensors_plan(args)
@@ -1734,27 +1773,37 @@ mod tests {
             .target_capture()
             .instantiate([vec![1, 3, 16]])
             .unwrap();
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![3, 3, 16]])
-            .is_err());
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![1, 9, 16]])
-            .is_err());
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![1, 3, 15]])
-            .is_err());
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![0, 3, 16]])
-            .is_err());
-        assert!(contract
-            .requirements()
-            .mechanisms()
-            .mechanisms()
-            .contains(&eredu_runtime::SpeculativeMechanism::GroupedNeuralOperations));
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![3, 3, 16]])
+                .is_err()
+        );
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![1, 9, 16]])
+                .is_err()
+        );
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![1, 3, 15]])
+                .is_err()
+        );
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![0, 3, 16]])
+                .is_err()
+        );
+        assert!(
+            contract
+                .requirements()
+                .mechanisms()
+                .mechanisms()
+                .contains(&eredu_runtime::SpeculativeMechanism::GroupedNeuralOperations)
+        );
         let mechanisms = eredu_runtime::SpeculativeMechanismCapabilities::new(
             contract
                 .requirements()
@@ -1772,6 +1821,91 @@ mod tests {
         assert_eq!(
             selected.requirements().strategy().identity(),
             contract.requirements().strategy().identity()
+        );
+    }
+
+    #[test]
+    fn voicechat_nested_configuration_and_pinned_headers_use_generic_discovery() {
+        use eredu_core::artifact::{
+            ArtifactMetadata, CheckpointMetadata, MetadataProvenance, SafetensorsHeader,
+        };
+        let mut json: Value = serde_json::from_str(include_str!(
+            "voicechat/fixtures/official-inference-config.json"
+        ))
+        .unwrap();
+        assert!(json.get("model_type").is_none());
+        json["model"]["stt"]["model"]["perception"]["encoder"]["_target_"] =
+            Value::String("inert.user.supplied.Class".into());
+        let resolved = resolve_model_config(&json).unwrap();
+        assert_eq!(resolved.kind, ModelKind::VoiceChat);
+        assert_eq!(resolved.kind.loading_protocol(), LoadingProtocol::Realtime);
+        let header = include_bytes!("../tests/fixtures/voicechat/official-header.json");
+        let tensors: Value = serde_json::from_slice(header).unwrap();
+        let payload = tensors
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(|tensor| tensor["data_offsets"][1].as_u64())
+            .max()
+            .unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        let mut metadata = ArtifactMetadata {
+            provenance: MetadataProvenance {
+                source: "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B".into(),
+                revision: crate::voicechat::config::CHECKPOINT_REVISION.into(),
+            },
+            checkpoint: CheckpointMetadata::SafeTensors {
+                config: serde_json::to_vec(&json).unwrap(),
+                index: None,
+                headers: vec![SafetensorsHeader {
+                    member: "model.safetensors".into(),
+                    bytes,
+                    file_len: payload + header.len() as u64 + 8,
+                }],
+            },
+            sidecars: BTreeMap::new(),
+        };
+        let inspected =
+            eredu_core::artifact::inspect_artifact_metadata(&metadata, &MODEL_CONFIGURATIONS)
+                .unwrap();
+        assert_eq!(
+            inspected.architecture_plan().model_kind(),
+            ModelKind::VoiceChat
+        );
+        assert!(
+            inspected
+                .architecture_plan()
+                .safetensors_architecture()
+                .unwrap()
+                .checkpoint_resolution()
+                .is_some()
+        );
+        let graph = inspected.architecture_plan().architecture_descriptor();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "perception.encoder" && edge.to == "transcription.joint")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "backbone" && edge.to == "function")
+        );
+        assert!(graph.edges.iter().any(|edge| edge.from == "codec.quantizer"
+            && edge.to == "tts.backbone"
+            && edge.kind == eredu_core::ArchitectureEdgeKind::State));
+        // A recognizable NeMo envelope still has to pass all released geometry checks.
+        json["model"]["stt"]["model"]["perception"]["encoder"]["d_model"] = Value::from(8);
+        let CheckpointMetadata::SafeTensors { config, .. } = &mut metadata.checkpoint else {
+            unreachable!()
+        };
+        *config = serde_json::to_vec(&json).unwrap();
+        assert!(
+            eredu_core::artifact::inspect_artifact_metadata(&metadata, &MODEL_CONFIGURATIONS)
+                .is_err()
         );
     }
 
@@ -1809,11 +1943,12 @@ mod tests {
 
         assert_eq!(plan.model_kind(), ModelKind::Moshi);
         assert!(plan.moshi_recipes().is_some());
-        assert!(plan
-            .moshi_recipes()
-            .unwrap()
-            .get("transformer.layers.0.self_attn.in_proj.weight")
-            .is_some());
+        assert!(
+            plan.moshi_recipes()
+                .unwrap()
+                .get("transformer.layers.0.self_attn.in_proj.weight")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1977,11 +2112,13 @@ mod tests {
                 resolved_plan.clone(),
             )
             .unwrap();
-        assert!(admitted
-            .safetensors_architecture()
-            .unwrap()
-            .checkpoint_resolution()
-            .is_some());
+        assert!(
+            admitted
+                .safetensors_architecture()
+                .unwrap()
+                .checkpoint_resolution()
+                .is_some()
+        );
 
         let error = MODEL_CONFIGURATIONS
             .artifact_plan(
@@ -2060,14 +2197,18 @@ mod tests {
             Some(config.attention.heads as usize)
         );
         for &layer in &config.ngram.layers {
-            assert!(graph
-                .node(&format!("decoder.layers.{layer}.lexical.table"))
-                .is_some());
+            assert!(
+                graph
+                    .node(&format!("decoder.layers.{layer}.lexical.table"))
+                    .is_some()
+            );
         }
         let mut architecture = resolved.architecture;
-        assert!(architecture
-            .admit_catalog(&TensorCatalog::new(Vec::new()).unwrap())
-            .is_err());
+        assert!(
+            architecture
+                .admit_catalog(&TensorCatalog::new(Vec::new()).unwrap())
+                .is_err()
+        );
         assert!(architecture.qwen4_exp_target_plan().is_none());
 
         let mut mismatched = json.clone();
@@ -2147,9 +2288,11 @@ mod tests {
                 .unwrap();
             integer.dtype = TensorDtype::F32;
             let mut rejected = resolve_model_config(&json).unwrap().architecture;
-            assert!(rejected
-                .admit_catalog(&TensorCatalog::new(malformed).unwrap())
-                .is_err());
+            assert!(
+                rejected
+                    .admit_catalog(&TensorCatalog::new(malformed).unwrap())
+                    .is_err()
+            );
             assert!(rejected.qwen4_exp_target_plan().is_none());
         }
     }
@@ -2238,9 +2381,11 @@ mod tests {
             gguf_companion_requirements(GgufArchitecture::Gemma4).unwrap(),
             vec![optional_dense]
         );
-        assert!(gguf_companion_requirements(GgufArchitecture::Llama)
-            .unwrap()
-            .is_empty());
+        assert!(
+            gguf_companion_requirements(GgufArchitecture::Llama)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

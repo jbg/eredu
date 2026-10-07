@@ -319,8 +319,8 @@ fn point_to_point_worker() {
         .unwrap(),
         CommunicationOperationRequirement::tensors(
             CommunicationOperation::Broadcast,
-            [TensorDtype::F32],
-            CommunicationTensorLimits::new(1, 1, 2, None).unwrap(),
+            [TensorDtype::F32, TensorDtype::I32],
+            CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
             true,
         )
         .unwrap(),
@@ -424,6 +424,41 @@ fn point_to_point_worker() {
         published.as_array().evaluated().unwrap().as_slice::<f32>(),
         &[3.0]
     );
+    let control = [i32::MIN, i32::MAX, 16_777_217, -16_777_217];
+    let input = Array::from_slice(
+        if rank == 1 {
+            &control
+        } else {
+            &[7, -9, 11, -13]
+        },
+        &[4],
+    );
+    let integer = <MlxNeuralBackend as BroadcastBackend>::broadcast(
+        MlxTensor::from_array(input),
+        1,
+        session_group,
+        &stream,
+    )
+    .unwrap();
+    assert_eq!(integer.completion.retained_arrays(), 3);
+    assert_eq!(integer.completion.retained_groups(), 1);
+    assert_eq!(integer.completion.retained_streams(), 1);
+    let integer = integer.wait().unwrap();
+    assert_eq!(integer.as_array().dtype(), safemlx::Dtype::Int32);
+    assert_eq!(
+        integer.as_array().evaluated().unwrap().as_slice::<i32>(),
+        &control
+    );
+    super::group::reset_native_collective_submissions();
+    let wrong_contract = <MlxNeuralBackend as BroadcastBackend>::broadcast(
+        MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
+        1,
+        count_group,
+        &stream,
+    )
+    .expect_err("integer publication cannot substitute another group's gather contract");
+    assert!(wrong_contract.what().contains("does not select operation"));
+    assert_eq!(super::group::native_collective_submissions(), 0);
     let wrong_dtype = framed_values(
         vec![MlxTensor::from_array(Array::from_slice(&[1_i64], &[1]))],
         vec![(TensorDtype::I64, vec![1])],
@@ -516,6 +551,7 @@ fn point_to_point_worker() {
     assert_eq!(commit.retained_groups(), 1);
     assert_eq!(commit.retained_streams(), 1);
     commit.wait().unwrap();
+    vocabulary::local_setup_failures(&native, &stream);
 }
 
 #[test]
@@ -770,3 +806,5 @@ mod routes;
 mod status;
 
 mod ordered_wave;
+
+mod vocabulary;

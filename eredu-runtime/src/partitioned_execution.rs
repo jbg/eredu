@@ -1538,7 +1538,8 @@ impl PartitionedExecutionPlan {
         })
     }
 
-    fn validate_manifest(
+    /// Checks selected route and publication authority without realizing native resources.
+    pub fn validate_manifest(
         &self,
         manifest: &CommunicationManifest,
     ) -> Result<(), PartitionExecutionError> {
@@ -1628,7 +1629,8 @@ impl PartitionedExecutionPlan {
         Ok(())
     }
 
-    fn validate_exact_commit_agreement(
+    /// Checks the exact all-rank failure/commit operation before native realization.
+    pub fn validate_exact_commit_agreement(
         &self,
         manifest: &CommunicationManifest,
     ) -> Result<(), PartitionExecutionError> {
@@ -1646,6 +1648,21 @@ impl PartitionedExecutionPlan {
     /// Rank-local execution drivers in architecture-group order.
     pub fn drivers(&self) -> &[Option<LayeredPartitionDriver>] {
         &self.drivers
+    }
+
+    /// Canonical architecture graph retained by this execution selection.
+    pub fn graph(&self) -> &ExecutionGraph {
+        &self.graph
+    }
+
+    /// Declared group semantics and request optionality in canonical order.
+    pub fn group_contracts(&self) -> &[(ArchitectureGroupKind, bool)] {
+        &self.group_contracts
+    }
+
+    /// Selected activation transport precision.
+    pub const fn wire_contract(&self) -> PipelineWireContract {
+        self.wire
     }
 
     /// Architecture-selected point-to-point boundary routes.
@@ -2182,9 +2199,20 @@ where
         epoch: DistributedCommitEpoch,
         executor: &B::Executor,
     ) -> DistributedCommitOutcome {
+        // Epoch allocation belongs to the enclosing session; every participant
+        // must nevertheless agree the exact epoch attached to this decision.
         match communication.agree_success(
             true,
-            None,
+            Some([
+                u64::from_le_bytes(*b"EREDUCMT"),
+                1,
+                epoch.value(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]),
             group,
             DistributedExecutionPhase::Commit,
             executor,
@@ -2404,6 +2432,11 @@ where
             bounded_policy,
             marker: PhantomData,
         })
+    }
+
+    /// Borrows the installed executor for architecture-owned state operations.
+    pub const fn executor(&self) -> &E {
+        &self.executor
     }
 
     fn agree_phase(

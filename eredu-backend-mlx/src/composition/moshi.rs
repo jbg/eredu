@@ -23,6 +23,8 @@ use eredu_runtime::{
 };
 use safemlx::Stream;
 
+use crate::composition::mlx::realtime::MlxRealtimeExecutionResources;
+
 use crate::backend::{
     error::Error,
     nn::shared::MlxNeuralBackend,
@@ -553,11 +555,13 @@ struct RealtimeResourcePayload {
     poisoned: Rc<Cell<bool>>,
 }
 
-impl SelectedRealtimeResources {
-    pub(crate) fn poison(&self) {
+impl MlxRealtimeExecutionResources for SelectedRealtimeResources {
+    fn poison(&self) {
         self.inner.poisoned.set(true);
     }
+}
 
+impl SelectedRealtimeResources {
     fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {
         crate::backend::validate_native_execution_target(
             &self.inner.stream.get_device()?,
@@ -686,8 +690,8 @@ impl MlxRealtimeExecution {
     }
 
     /// Clones exact store, stream, and collective ownership into a completion.
-    pub(crate) fn completion_resources(&self) -> Arc<SelectedRealtimeResources> {
-        Arc::clone(&self.payload.resources)
+    pub(crate) fn completion_resources(&self) -> Arc<dyn MlxRealtimeExecutionResources> {
+        self.payload.resources.clone()
     }
 
     pub(crate) fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {

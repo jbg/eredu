@@ -565,7 +565,7 @@ fn prepared_conditional_components_with_tying(independent: bool, tied: bool) {
                                 let rank_topology =
                                     ParallelRankTopology::new(topology, rank).unwrap();
                                 let layout =
-                                    eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology)
+                                    eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology)
                                         .unwrap();
                                 let mut context = NumericContext::with_partition(layout, rank, world);
                                 context.bind_checkpoint_values = true;

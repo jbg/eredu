@@ -10,8 +10,8 @@ fn k2_mixed_encoding_partitions_construct_independent_shared_widths_and_reconstr
     use eredu_architectures::decoder::{
         BlockFactory, DecoderProjectionOperator, TensorParallelProjectionOperator,
     };
-    use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
     use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat};
+    use eredu_runtime::derive_partitioned_local_layout;
     for routed_encoded in [true, false] {
         for shared_count in [1, 2] {
             let mut config = fixture()["mova"]["config"].clone();
@@ -123,8 +123,8 @@ fn k2_mixed_encoding_partitions_construct_independent_shared_widths_and_reconstr
 
 #[test]
 fn k2_partial_fp8_blocks_load_whole_and_reject_unaligned_rank_slices() {
-    use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
     use eredu_core::{ParallelRankTopology, ParallelTopology};
+    use eredu_runtime::derive_partitioned_local_layout;
     let mut config = fixture()["dense"]["config"].clone();
     config["hidden_size"] = 130.into();
     config["intermediate_size"] = 130.into();
@@ -362,31 +362,55 @@ fn k2_dense_prepared_payload_tp_pp_combined_and_bounded_match_four_decode_steps(
             ] {
                 let world = Arc::new(NumericPartitionWorld::default());
                 let actual = std::thread::scope(|scope| {
-                    let threads = (0..topology.world_size()).map(|rank| {
-                        let world = Arc::clone(&world);
-                        let args = &args;
-                        let inspection = &inspection;
-                        let inputs = &inputs;
-                        let residency = residency.clone();
-                        scope.spawn(move || {
-                            use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
-                            let plan = prepared_adapter::plan(None).with_topology(topology).with_residency(residency);
-                            let sources = partitioned_adapter::prepare_plan(inspection, &plan, rank,
-                                std::time::Duration::from_secs(10)).unwrap();
-                            let description = decoder::dense_parameter_description(args).unwrap();
-                            let layout = derive_partitioned_local_layout(&description,
-                                ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
-                            let mut context = NumericContext::with_partition(layout, rank, world);
-                            context.bind_checkpoint_values = true;
-                            let mut executable = partitioned_adapter::dense(sources, &context).unwrap();
-                            let output = inputs.iter().enumerate().map(|(step, input)|
-                                executable.forward(input, step == 0).unwrap()).collect::<Vec<_>>();
-                            assert!(executable.positions().unwrap().iter().all(|p| *p == 7));
-                            executable.reset().unwrap();
-                            assert_tensor_exact(&executable.forward(&inputs[0], true).unwrap(), &output[0], "K2 partition reset");
-                            output
+                    let threads = (0..topology.world_size())
+                        .map(|rank| {
+                            let world = Arc::clone(&world);
+                            let args = &args;
+                            let inspection = &inspection;
+                            let inputs = &inputs;
+                            let residency = residency.clone();
+                            scope.spawn(move || {
+                                use eredu_runtime::derive_partitioned_local_layout;
+                                let plan = prepared_adapter::plan(None)
+                                    .with_topology(topology)
+                                    .with_residency(residency);
+                                let sources = partitioned_adapter::prepare_plan(
+                                    inspection,
+                                    &plan,
+                                    rank,
+                                    std::time::Duration::from_secs(10),
+                                )
+                                .unwrap();
+                                let description =
+                                    decoder::dense_parameter_description(args).unwrap();
+                                let layout = derive_partitioned_local_layout(
+                                    &description,
+                                    ParallelRankTopology::new(topology, rank).unwrap(),
+                                )
+                                .unwrap();
+                                let mut context =
+                                    NumericContext::with_partition(layout, rank, world);
+                                context.bind_checkpoint_values = true;
+                                let mut executable =
+                                    partitioned_adapter::dense(sources, &context).unwrap();
+                                let output = inputs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(step, input)| {
+                                        executable.forward(input, step == 0).unwrap()
+                                    })
+                                    .collect::<Vec<_>>();
+                                assert!(executable.positions().unwrap().iter().all(|p| *p == 7));
+                                executable.reset().unwrap();
+                                assert_tensor_exact(
+                                    &executable.forward(&inputs[0], true).unwrap(),
+                                    &output[0],
+                                    "K2 partition reset",
+                                );
+                                output
+                            })
                         })
-                    }).collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
                     threads
                         .into_iter()
                         .map(|thread| thread.join().unwrap())
@@ -773,11 +797,7 @@ fn k2_pipeline_cuts_before_and_after_dense_to_mova_transition_match_cached_refer
     let description = model.parameter_description(&context).unwrap();
     let topology = ParallelTopology::new(1, 2, 1, 1).unwrap();
     let rank = ParallelRankTopology::new(topology, 0).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &description,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
     let context = NumericContext::with_local_layout(layout.clone());
     for cut in [1, 2] {
         let mut stages = [0..cut, cut..3]
@@ -1101,11 +1121,7 @@ fn k2_mova_collective_waves_keep_bank_order_ownership_and_value_output_width() {
         for ordinal in 0..topology.world_size() {
             let rank = ParallelRankTopology::new(topology, ordinal).unwrap();
             let layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-                    &description,
-                    rank,
-                )
-                .unwrap();
+                eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
             let banks = family::expert_realization_plans(&args, rank, Some(&layout)).unwrap();
             assert_eq!(
                 banks[&family::ExpertBank::FeedForward.id()].global_group_count(),
@@ -1118,21 +1134,18 @@ fn k2_mova_collective_waves_keep_bank_order_ownership_and_value_output_width() {
             let mut blocks = vec![vec![RoutedExpertUnitWave::ordinary(
                 0,
                 8,
-                eredu_architectures::partitioned_execution::RoutedTensorReductions::hidden(1, 1),
+                eredu_runtime::RoutedTensorReductions::hidden(1, 1),
             )]];
             for layer in 1..3 {
                 blocks.push(
                     args.routed_bank_order(layer)
                         .into_iter()
                         .map(|bank| {
-                            RoutedExpertUnitWave::routed(
-                                bank,
-                                layer,
-                                &owner,
-                                &banks[&bank],
-                                2,
-                                { let (before, after) = args.routed_bank_tensor_reductions(layer, bank).unwrap(); eredu_architectures::partitioned_execution::RoutedTensorReductions::hidden(before, after) },
-                            )
+                            RoutedExpertUnitWave::routed(bank, layer, &owner, &banks[&bank], 2, {
+                                let (before, after) =
+                                    args.routed_bank_tensor_reductions(layer, bank).unwrap();
+                                eredu_runtime::RoutedTensorReductions::hidden(before, after)
+                            })
                             .unwrap()
                         })
                         .collect(),
@@ -1231,7 +1244,7 @@ fn k2_routed_prepared_payload_tp_pp_ep_and_bounded_match_four_decode_steps() {
                             let sources = partitioned_adapter::prepare_plan_with_banks(inspection, &plan, rank, std::time::Duration::from_secs(10), bank_options).unwrap_or_else(|e| panic!("{name} {topology:?} {residency:?} prepare rank {rank}: {e}"));
                             let context = NumericContext::default();
                             let description = family::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap().parameter_description(&context).unwrap();
-                            let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&description, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
+                            let layout = eredu_runtime::derive_partitioned_local_layout(&description, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
                             let mut context = NumericContext::with_partition(layout, rank, world); context.bind_checkpoint_values = true;
                             reset_reference_stage_evidence("SafeTensors");
                             let mut executable = partitioned_adapter::routed(sources, &context, Arc::new(AtomicUsize::new(0)), None).unwrap_or_else(|e| panic!("{name} {topology:?} {residency:?} construct rank {rank}: {e}"));

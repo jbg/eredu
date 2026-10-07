@@ -1,7 +1,12 @@
 //! MLX realization of neutral distributed execution plans.
 
+/// Native realization of portable boundary tensors.
+pub(crate) mod boundary;
+
 /// MLX ownership for submitted distributed work.
 pub mod completion;
+/// Shared bounded agreement and owner publication resources.
+pub mod coordinator;
 mod group;
 pub(crate) use group::independent_status_members;
 /// Native tensor-parallel execution contexts.

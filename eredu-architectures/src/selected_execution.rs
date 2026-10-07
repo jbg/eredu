@@ -68,15 +68,12 @@ impl SelectedQwen4Construction {
         if conditional {
             // Vision follows the shared head/merger partition rules. Target physical
             // ranges above retain GQA replicas, fused recurrent order and companions.
-            let vision = crate::partitioned_execution::local_layout_groups(
+            let vision = eredu_runtime::derive_partitioned_group_layout(
                 parameters
                     .groups()
                     .iter()
                     .filter(|group| group.logical_name().starts_with("model.visual.")),
-                rank.tensor_parallel_rank(),
-                rank.tensor_parallel_size(),
-                rank.expert_parallel_rank(),
-                rank.expert_parallel_size(),
+                rank,
             )?;
             for (name, tensor) in vision.tensors() {
                 layout.insert(name.to_owned(), tensor.clone());
@@ -990,7 +987,7 @@ impl SelectedExecution {
             return Ok(None);
         };
         let layout =
-            crate::partitioned_execution::derive_partitioned_local_layout(parameters, rank)?;
+            eredu_runtime::derive_partitioned_local_layout(parameters, rank)?;
         let (routed, independent) = self.bank_parameter_targets();
         fn size<R, Q>(
             selected: &SelectedPartitionedAdmission<R, Q>,
@@ -1040,7 +1037,7 @@ impl SelectedExecution {
         if !auxiliary.is_empty() {
             let prediction_rank = crate::prediction_extension::tensor_rank(rank)
                 .map_err(|error| error.to_string())?;
-            let prediction_layout = crate::partitioned_execution::derive_partitioned_local_layout(
+            let prediction_layout = eredu_runtime::derive_partitioned_local_layout(
                 parameters,
                 prediction_rank,
             )?;

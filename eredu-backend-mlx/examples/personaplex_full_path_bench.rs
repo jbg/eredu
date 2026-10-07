@@ -49,7 +49,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights_stream = weights_ctx.stream();
 
     let load_start = Instant::now();
-    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+    let preparation = match eredu_architectures::realtime::prepare_realtime_model(
+        &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(&model_dir),
+    )? {
+        eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => preparation,
+        _ => return Err("expected a Moshi-family realtime artifact".into()),
+    };
     let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
     let mut model = realtime_support::load(
         &backend,

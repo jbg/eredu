@@ -28,6 +28,79 @@ ownership. Arbitrary disconnected low-level Ring memberships remain explicitly
 unsupported for independent status: their world-participation wave would require
 inactive pipeline peers to enter a separate coordinated protocol.
 
+Realtime retained payloads participate in the same unpublished model-state branch.
+Their exact identity includes the declared channel layout, positive batch,
+session owner and history generation. A branch with changed geometry, cadence,
+feedback or owner fails before model-state publication. Dense and categorical
+payloads share this retention contract; cloning history does not publish output
+or establish native completion. Moshi and PersonaPlex keep their existing
+categorical frame advancement and completion-gated publication.
+
+The shared realtime generation transaction accepts architecture-owned schedule
+state, sampling controls and transition inputs. Schedule policy may retain
+separate audio, model and tool progress; the transaction imposes no common frame
+clock. Exact contract identity, sampler cardinality and schedule successor checks
+precede model publication. Every commit and idle sampling replacement advances
+a revision, invalidating older branches before they can replace canonical state.
+The ordinary transition helper and explicit branch advancement use the same
+completion boundary. Selected realtime sessions retain a neutral frame contract
+and accept architecture-owned input, schedule and sampling types through the
+same scheduler. The exact policy descriptor and sampler count are checked at
+registration. Release/resume preserves the selected contract, independent clocks
+and session incarnation; sampling realization borrows the requested controls and
+replaces them only while the request is idle. Local and distributed advancement
+use the same batch admission and completion rules.
+Unpublished branches can draw uniforms and standard normals without categorical
+decisions. These draws share the decision driver's retained stream and become
+canonical only when the entire transition commits.
+
+VoiceChat's agent sampler retains effective feedback after function/turn overrides.
+Raw selection runs first, including any categorical RNG draw. The branch adopts
+the decision driver before accepting effective feedback and drawing speech noise;
+commit publishes their state together. Neutral conformance verifies rejection
+without completion, deterministic replay and stale-fork rejection. Session
+snapshots compose this sampling state with the other conversation state.
+
+The channel handoff selects raw agent/function tokens before applying explicit
+overrides. Tool speech can use acknowledgment text while effective agent feedback
+remains PAD. A function-selection failure after an agent draw leaves branch RNG
+and history unchanged; native completion handling still belongs to the enclosing
+submission owner. Neutral tests compare committed effective feedback through the
+next cached backbone call, including retained recurrent and attention state.
+
+Optional `ReplicatedChannelDecisions` coordinates that same channel handoff with
+one recorded request/turn/invocation identity. Admission agrees head geometry,
+domain, perception evidence, sampling policy and effective history. The designated
+owner alone samples and resolves overrides; followers validate its raw and
+effective IDs and execute a forced decision without RNG. Phase failures preserve
+the pre-call RNG and history, including failures after owner selection or local
+publication decoding. The completed driver and prospective history are validated
+before final agreement and adopted together afterward. Authority is consumed on
+admission even when work fails; replay uses fresh authority with an unpublished
+branch. This object owns neither native completion nor session snapshots and
+does not authorize replaying delivered tool calls or audio.
+
+Realtime materialized inputs retain channel-keyed ordinary values and selected
+overrides with their exact layout and batch. Mixed host admission validates both
+groups before copying either. Partial categorical forcing copies only selected
+columns; unselected sentinel entries never become native inputs. The categorical
+interpreter checks the retained ingress contract and complete input roles before
+advancing its unpublished schedule or payload history. A materialization failure
+does not establish native completion; the submission owner still handles any
+work already accepted by the backend.
+
+Completed realtime outputs retain typed channel identities and coordinates for
+both current and delay-aligned values. Dense frames and categorical decisions
+use the same exact-completion and prepublication observer boundary. Host
+validation checks declared geometry, categorical domains and finite dense values;
+an observation failure discards the scheduler branch and exposes no output.
+Moshi's portable projection assembles its public codec frame after validation.
+Typed component outputs use `submit_realtime_output` and the same prepublication
+observer. A failure after submission attaches its exact quarantine completion to
+the branch; a duplicate attachment rejects before invoking native submission.
+The VoiceChat facade composes this publication boundary with session advancement,
+variable-length transcription events and conversational snapshots.
+
 ## Prompt prefill
 
 Ordinary and controlled generation share prompt chunking in the core driver.
@@ -1320,3 +1393,1025 @@ or resource acquisition. Detached native submission reports describe at most 64 
 and 256 allocation records on the calling thread; truncation, borrowed queues, active
 reaping and uncovered owners remain explicit. Empty or partial observations do not
 authorize reclamation or budget refunds. Native completion ownership governs release.
+
+Realtime discovery and loading preserve the controlled session boundary.
+`api::realtime::prepare_realtime_model` discovers the architecture and retains exact
+component sources, pinned assets and source guards. `prepare_mlx_realtime` admits
+`RealtimeLoadOptions::Speech` for PCM conversations or `Categorical` for
+Moshi/PersonaPlex frames before native binding. A protocol mismatch fails before
+native resources are created. The consuming `PreparedMlxRealtime::load` accepts
+execution contexts, with no replacement sources or host policy, and returns the
+selected bound execution. Speech loading registers the existing session and queues
+prefill; neural work starts only when that session advances. The same session
+provides PCM ingress, tool waits, committed output, snapshots, restore and forks.
+The [VoiceChat validation contract](voicechat-validation.md) distinguishes artifact
+admission, executable-session conformance and independent numerical parity.
+
+The portable `VoiceChatToolChannel` accepts effective function tokens only after
+their shared transition commits. Callers capture its `VoiceChatTurnIdentity`
+before admitting work and pass that identity with the committed observation;
+interruption invalidates earlier observations and outstanding result tickets.
+Complete schema-validated semantic tool events appear together at EOTC. Payload
+token, decoded-byte and call limits return typed errors without clearing retained
+input or publishing partial calls. External applications execute the calls.
+Submitting a matching result prepares bounded ASCII tokens without adding markers.
+`response_policy` only peeks at the next forced function token; the cursor advances
+when that exact token commits, so failed candidate execution consumes no response.
+After supplied tokens are exhausted, unforced tool decoding retains the pending
+ticket until the model commits EOTR. Committed observations within a turn must
+arrive exactly once and in order; the turn stamp does not deduplicate callbacks.
+Rejected results and mismatched feedback preserve the pending state. Delivered
+events and external tool effects are not undone by interruption. The enclosing
+session driver retires interrupted neural work, records timing and composes
+these host policies with turn-taking and session snapshot/restore.
+
+`VoiceChatToolWait` consumes explicit monotonic timestamps for tool waiting.
+An initial selected reminder finishes even if the external result is ready;
+unstarted generic reminders are skipped once a result arrives. At most two
+distinct generic selections have one-second gaps by default. The fifteen-second
+final timeout starts after the last selected phrase finishes playback, with
+portable duration overrides. Native completion of EOS returns a playback receipt;
+it does not start the timer. The application records the matching presentation
+completion through `finish_playback`. Offline execution supplies the equivalent
+recorded presentation frontier without sleeping.
+
+Each reminder admission retains an identity until shared native work commits or
+is safely discarded. Repeated advancement returns that same receipt. Re-admission
+after discard has a fresh identity even at the same timestamp; duplicate or
+interrupted commits cannot advance the phrase cursor. A result arriving during
+admitted speech does not replace that work. Waiting for playback or a timer leaves
+perception-only work available. Timeout submits a prepared response through the
+existing function channel and rejects later external results; natural EOTR still
+ends response decoding. Results submitted before timeout advancement win at the
+same recorded timestamp. These host-policy transitions use the shared neural
+execution path and participate in session snapshots.
+
+`VoiceChatTurnTaking` separates first-prediction RNNT evidence from label-loop
+termination. Perception-only work advances acoustic counters; tool decisions
+advance generated-position history without inventing audio frames. Prompt prefill
+is absent from generated-position history. The pure live resolver receives the
+current RNNT evidence and sampled tokens before effective feedback reaches TTS.
+Failed, abandoned or repeated resolution changes neither host state nor events.
+Step-aware admission checks acoustic and generated-position limits before native
+submission, including perception-only and fresh/retained tool paths. Reminder and
+drain work remain admissible when those unrelated budgets are exhausted.
+After shared publication, `observe_committed` checks the captured admission,
+invocation and predecessor frontiers, then adopts the same deterministic policy
+successor. Duplicate, mismatched and interrupted observations fail without adoption.
+Committed RNNT barge-in emits EOS and advances the existing tool-channel identity.
+During active tool work, fresh perception reaching the consecutive nonblank
+threshold interrupts serialization, waiting or response injection. The same
+commit clears the wait and substitutes EOS/PAD neural feedback; perception-only
+interruption adds no model position. Dropped or rejected candidates preserve the
+original feedback, tool ticket and wait. Late results fail their original ticket
+validation, including when a newer turn is already running.
+Before accepting another live frame, interruption drains the retained projected
+features through `ReplayAudio` work in the same scheduler. Replay advances only
+backbone positions and effective PAD history; its audio and RNNT frontiers,
+transcription, speech and random state remain unchanged. No hidden clock is read.
+The first replay establishes EOS/PAD feedback for both automatic and explicit
+interruption, and subsequent replay uses PAD/PAD. Dropped candidates retain the
+same next frame for retry. Queued features and the replay cursor are included in
+snapshots and forks; capacity exhaustion is typed. Normal completion of tool work
+resumes live audio and releases its unreplayed queue.
+Explicit interruption invalidates tool waits and responses while preserving
+already committed acoustic/model progress.
+
+The composed `VoiceChatConversation` stages those observers together before
+neural publication. An admitted transition attaches to the shared prepublication
+gate; it validates the architecture output, full tool payload and reserved
+publication capacity before the scheduler commits. A malformed EOTC cannot adopt
+otherwise valid turn evidence. Reminder cursor advancement is part of the same
+candidate; its receipt must match the actual spoken token retained by architecture
+execution and validated by host observation. `VoiceChatPublicationState` pairs
+the private staged successor with the ordinary neural semantic branch. Its commit
+adopts host state and enqueues output immediately after successful neural commit;
+applications cannot independently extract or commit the staged host successor.
+Failed mapping, failed neural commit, cancellation and discarded candidates leave
+canonical conversation state unchanged.
+
+This owner permits one outstanding admission and returns `Busy` for external
+results, interruption, wait advancement or another admission until that work is
+committed or discarded. Applications retain rejected submissions and retry them;
+no audio or result is silently dropped. Recorded timing controls wait and
+playback policy. The session retains this admission with its shared scheduler
+and includes the conversation state in snapshots.
+
+Before enqueueing an invocation, applications reserve a publication permit from
+the canonical publication owner and retain it with queued work. Queue exhaustion
+therefore rejects admission without failing the active scheduler request. The
+branch consumes the permit before native submission. Reservations remain charged
+through completion and cancellation retirement; commit replaces them with exact
+queued payload charges. An independent receiver delivers each queued publication
+once and releases its charge, including after the scheduler removes a cancelled
+or failed request. Queue slots are preallocated and charge validation precedes
+neural commit, so host adoption and enqueueing add no fallible post-commit work.
+Dropped scheduler progress does not discard committed speech or tool calls.
+
+Agent-text and RNNT transcription deltas share this publication boundary and
+have independent byte allowances in each permit and the aggregate queue. Failed
+observation, insufficient text capacity and failed neural commit consume neither
+decoder carry nor text. Tokenizer lookbehind is explicitly bounded and copied
+with the host candidate; split UTF-8 sequences remain private until complete.
+RNNT whitespace trimming retains only a bounded trailing suffix, including across
+perception-only frames during tool waits. Interruption resets unfinished agent
+text without rewinding the acoustic transcript. Drain checks agent byte completion
+and finalizes RNNT trimming. The containing architecture frame attributes agent
+text to its model/audio frontier and transcription to the source frame's sample
+interval; these timestamps do not claim word-level acoustic alignment.
+
+The optional PCM ingress port accepts arbitrary chunks while a branch is pending;
+it does not mutate the scheduler's canonical frontend. Applications reserve an
+input receipt before enqueueing fresh-audio work and pass it with the output
+permit to `admit_input`. Live, perception-only and fresh-tool invocations consume
+one input frame. Reminder, retained-tool and silence-tool invocations retain queued
+speech. The frame remains capacity-charged until semantic commit. Completion or
+policy failure leaves all accepted PCM available for retry, including chunks
+submitted after the failed frame was reserved.
+
+Finish is explicit. A final partial frame transfers only original samples and
+then closes the branch frontend with padding enabled; its transcription retains
+the original `valid_samples`. Empty input, or finish declared after the last full
+frame was reserved, uses a finish-only receipt on Drain without advancing audio
+time. Drain rejects unread or unfinished ingress. Cancellation or request removal
+closes the external sender; the existing scheduler still controls retirement of
+an outstanding input receipt. Accepted PCM is not consumed by cancellation.
+The publication owner's `prepare_prefill` and `prepare_next` methods combine that
+port with transactional invocation selection. Returned `VoiceChatWork` holds an
+exclusive conversation admission before scheduler enqueue; native submission
+consumes it once through `work.admit`. The adapter attaches the resulting admission
+to its ordinary prepublication gate. Dropping queued work releases both permits
+and the host admission without consuming PCM or changing committed policy.
+
+`work.submit` combines that admission and attachment with portable invocation
+assembly. It passes prepared speaker conditioning and silence features to the
+ordinary architecture executor, checks prompt counts before admission, and uses
+the selected live/tool/reminder rendering policy. It returns owned
+`VoiceChatSubmittedWork`, whose completion error is always `BackendFailure` and
+whose gate retains exact native completion and one-shot host validation. The MLX
+binding delegates to this same method. A synchronous submission error still
+requires ordinary branch discard and native recovery; an observation failure
+does not authorize early release of submitted resources.
+
+`VoiceChatAdvance` supplies recorded time and tool-audio policy.
+The default tool-audio input comes from `PreparedSilenceConditioning`: one second
+of zero PCM through fresh full perception, retaining its first projected frame.
+Preparing this input does not consume live PCM, initialize RNNT, advance model
+positions or draw random values. The native preparation method establishes exact
+completion before the embedding is borrowed through `VoiceChatExecutionInputs`.
+Only accepted work advances the committed timing frontier; blocked or discarded
+attempts do not trigger timeouts or advance reminder cursors. Prefill must commit
+before automatic selection. Active function serialization and response injection
+default to prepared silence conditioning, alternating with queued perception/RNNT.
+The explicit real-audio policy uses fresh or retained features, with silence before
+the first encoder frame; pending external results admit perception-only work.
+The selected initial/started reminder finishes
+before early responses are injected. A due reminder alternates with available
+perception work, with at least 80 ms between committed reminder tokens. Playback
+completion remains an explicit application event. Drain never bypasses tool work,
+unread input or an uncommitted finish policy. It is selected automatically once
+the declared input and continuation finish and pending tool work resolves.
+
+`VoiceChatSession::start` registers prepared state and queues prefill without
+executing native work. `advance` submits at most one invocation; completion of
+pending work returns before selecting its successor. `poll` retires work without
+submission. The `drive` iterator repeatedly calls this same advancement with
+caller-recorded ticks, without sleeping or reading a clock. Exhausting ticks leaves
+pending work owned by the session. Input and output handles remain independent.
+
+`BoundVoiceChatSession` retains the execution mechanism and those endpoints.
+Its `advance` and recorded-tick iterators call the ordinary session driver;
+`drive_with_endpoints` allows bounded output draining and PCM submission between
+yields. A shared mechanism's pending work causes `Busy` before admission, preserving
+queued work and permitting retry at the same recorded timestamp. Polling the
+current session can retire its own completion before this availability check.
+`session_mut` exposes the existing snapshot, restore and host-policy operations.
+`fork_with_executor` explicitly binds compatible prepared resources to the ordinary
+accounted fork; selected MLX sessions provide `fork_shared` for the same model.
+
+The independently selected TTS tensor-parallel component borrows caller-owned
+local cache branches through `forward_parallel_with_state`. It shares the ordinary
+unit leases, retained-value completion and error cleanup. This component entry
+point does not establish a distributed VoiceChat session or authorize independent
+sampling and turn advancement on each rank; the public bound loader remains a
+single-device composition.
+
+The TTS partition contract keeps each stage's cache slice caller-owned and
+transports the original causal position or character key visibility with hidden
+states. Final normalization owns no cache. Partition entry and completion use the
+shared layered partition driver; auxiliary boundary tensors retain their declared
+scalar types independently of activation transport precision.
+`LayerwisePartitionRuntime` borrows the same unpublished state across all groups
+of a local stage, including blocks followed by normalization. A failed later unit
+aborts provider work and leaves the candidate state with its caller for discard;
+it does not publish or rewind canonical state. Native stage adapters share this
+path under resident, host-layerwise and disk-streamed policies.
+
+The cross-process TTS component binds an architecture-validated partition,
+manifest and execution plan to the existing distributed graph driver. Each rank
+supplies an owned candidate cache vector, recorded invocation descriptor and
+commit epoch. Owned and borrowed cache adapters execute the same equations;
+normalization-only stages retain no cache, and compound block/normalization
+stages retain one forward context across local group callbacks. Shared transport
+moves the typed boundary and the shared publisher broadcasts the selected output.
+Execution-phase agreement prevents a failed component execution from reaching
+output broadcast; bounded completion retains native resources until their
+disposition is established. The adapter returns a
+`DistributedCommitOutcome`; callers adopt the candidate and expose output only
+for `Committed`. Final agreement compares exact integer epoch IDs across ranks;
+the enclosing scheduler retains authority for issuing those epochs. Failed
+candidate state is discarded, and poisoned communication
+or a noncommitted outcome requires recovery before runtime reuse.
+
+This component path does not select independent RNG decisions, turn policy or
+tool execution on individual ranks. The full coupled VoiceChat graph and public
+bound session loader remain single-device compositions; distributed conversational
+commit, snapshots and externally delivered speech are not established by the
+component's commit agreement.
+
+The `voicechat_wav` example advances this bound session with recorded timestamps,
+retries bounded PCM submission and drains committed publications to WAV/JSONL.
+Pending native completion holds time fixed. Live frames advance the input clock;
+tool serialization retains its independent substeps. Scripted tool results bind
+to committed batch tickets and are discarded after interruption or stale-result
+rejection. After WAV EOF the application submits bounded silence while committed
+tool work remains active. `VoiceChatSession::has_tool_work` observes committed
+call serialization, waiting and response decoding through EOTR, without exposing
+unpublished changes. Completing or interrupting tool work resets the example's
+configured response tail; ordinary live frames consume that tail before input
+closes and the ordinary drain runs. The JSONL stream records synthetic input
+separately from WAV source samples. This application policy does not change the
+public input sender's explicit finite finish contract. A step limit reports
+exhaustion instead of resetting state.
+
+`VoiceChatStartOptions::{acknowledgement, initial_reminder}` use
+`VoiceChatPhrasePolicy::{Disabled, Fixed(text), Streaming { seed }}`. Streaming
+selection uses the released 20-phrase acknowledgement pool and ten-phrase initial
+reminder pool, each with an independent retained host RNG. Preparation admits all
+BOS/text/PAD-tail/EOS sequences against the text limits. The unpublished SOTC
+successor selects both phrases; only committing that successor advances canonical
+generators. Rejection and discard leave the next choices unchanged. Snapshots and
+forks preserve buffered randomness, selected indices and cursors, with shared
+pool storage charged to each retained owner. Host streams are independent of
+neural sampling and read no clock or OS entropy.
+
+Function-call collection sends acknowledgement tokens to TTS independently of PAD
+agent feedback. Each committed Tool invocation consumes one token; interleaved
+perception and failed or discarded work consume none. Collection end or
+interruption clears its unconsumed suffix. Response injection does not replay it.
+The initial reminder remains selected through EOTC. A per-call
+`VoiceChatInitialReminder::Configured` uses that choice; `Disabled` suppresses it
+and `Text` supplies an explicit override. An early result stays queued until the
+initial phrase and its recorded playback finish. Interruption or EOTR clears the
+selection. These semantics apply to controlled advancement and the ordinary
+iterator over the same session.
+
+Retained startup validates host options and prompt framing before native work.
+The native binding prepares Aria/silence under completion ownership, initializes
+selected joint caches and RNG, then queues prefill without executing it. Startup
+assets and parameter providers remain outside snapshot state; snapshots retain all
+mutable generation, conversation and delivery state through the existing owners.
+
+Session operations require nondecreasing recorded time, including blocked or
+capacity-rejected attempts; only committed work advances the conversation's policy
+frontier. Cancellation and failure retirement use supplied scheduler timestamps.
+Host interruption, response submission and playback updates require a settled
+invocation boundary and return typed `Busy` while work is outstanding. Queue
+capacity rejection preserves input and permits retry after output delivery.
+Committed terminal drain closes ingress and finishes the request; committed events
+remain deliverable after finish or cancellation. Native and neural-commit failures
+retain their original source through the portable session error.
+
+`VoiceChatInputSender::finish(PcmFinishPolicy)` closes PCM admission and declares
+final-frame handling plus an explicit finite silence suffix. VoiceChat accepts
+zero padding or complete-frame enforcement. Each synthetic frame uses ordinary
+advancement, completion, publication budgets and cancellation; it carries
+`PcmFrameSource::Continuation` with zero original samples. Source-sample counts
+exclude this suffix while frame timestamps include it. Repeating the same finish
+policy is idempotent; changing it is rejected. Snapshots and forks preserve the
+remaining suffix without allocating the entire zero waveform. Finite continuation
+does not guarantee TTS EOS for an arbitrary response. The retained-session loader supplies prepared state to this same
+construction path.
+
+For example, two seconds of continuation at the declared 80 ms cadence uses:
+
+```rust,ignore
+use eredu::api::realtime::{FinalPcmFrame, PcmFinishPolicy};
+
+input.finish(PcmFinishPolicy {
+    final_frame: FinalPcmFrame::ZeroPad,
+    trailing_silence_frames: 25,
+})?;
+// Continue advancing with recorded timestamps until the session finishes.
+```
+
+The selected RNNT rules use first-user speech confirmation independently from an
+agent greeting, a bounded prior-token window and frozen speech density while the
+agent speaks. Main-loop PAD gating reads prior committed speech counters, leaving
+generated waveform separate from next-step feedback. Active tool work suppresses
+RNNT BOS/EOS overrides, matching the pinned wrapper. Automatic RNNT cancellation
+inside tool waits uses the same sustained-speech threshold and committed
+interruption transition. Session snapshots retain the host counters and histories.
+
+The VoiceChat RNNT component returns candidate state for explicit encoder-frame
+advancement, retaining recurrent values, hypothesis and frame identity. Repeated
+advancement, restored continuation and forks share the same bounded label loop.
+A capacity failure discards tentative recurrent updates. The coupled speech
+transaction retains RNNT candidates through completion and publishes them with
+the matching conversation state.
+
+RNNT resident, host-layerwise and disk-streamed providers use those same
+transitions. Priming and token updates lease only embedding and recurrent units;
+joint evaluation leases its projections, retaining the encoder projection once
+per frame. Unit completion protects replacement hidden/cell tensors before a
+parameter lease can be released. A failed later unit leaves the borrowed parent
+unchanged, and preflight rejects invalid input and hypothesis bounds before
+acquisition. Changing residency does not advance audio time or establish a new
+commit boundary.
+
+The RNNT coordinated component entry point consumes explicit request, turn and
+invocation identities. Ranks agree the parent frame frontier, complete hypothesis,
+geometry and limits before acquisition. One designated participant chooses every
+greedy symbol; all replicas consume the same completed integer broadcast. Phase
+agreements fence mismatched control and local failures before another neural
+phase. Returned recurrent/hypothesis state remains an unpublished candidate;
+replay from an unchanged parent uses the same greedy transition. This component
+coordination does not select a distributed coupled session or publish transcript
+events independently of its enclosing scheduler.
+
+The predictor pipeline advances one explicitly identified recurrent step through
+stage-local LSTM layers. Its immutable parent includes only the selected global
+layer range and the final prediction readout. Boundaries validate both the layer
+cut and the complete 64-bit step; token substeps do not advance audio time.
+The native entry point appends that step to the caller's seven-word descriptor
+for agreement across every pipeline and tensor rank before learned execution.
+The shared pipeline owns transport, failure agreement and completion under the
+caller-supplied commit epoch. The returned branch is adopted only for a committed
+outcome. Snapshot copies retain local hidden/cell tensors and the published row,
+without duplicating the final owner's hidden tensor or copying remote cells.
+This component entry point does not assign epochs, choose symbols, publish
+transcripts or schedule a complete speech session.
+
+The pipeline RNNT frame driver supplies predictor invocations from an explicit
+caller-owned `RnntPipelineCursor` and delegates symbol decisions to the existing
+coordinated greedy loop. It reserves two priming slots for an unprimed parent plus
+the configured symbol bound, or just the symbol bound for a cached parent.
+The reservation advances step/epoch frontiers even on later failure, disagreement
+or early blank; insufficient capacity and arithmetic overflow reject before any
+predictor submission. Replaying a conversational snapshot uses fresh authority
+from the same cursor. The cursor is neither cloned nor stored in `RnntState`.
+Internal committed readouts remain candidate state until the enclosing frame
+commits, and aborted or indeterminate predictor outcomes cannot enter the joint
+network. This driver does not publish host transcript events or advance live audio
+for token-only predictor substeps.
+
+The paired perception/RNNT pipeline transition reserves the RNNT frame before
+perception parameter reads, and checks the same acoustic frontier in both parent
+states. One perception execution returns both feature branches. An aborted or
+indeterminate perception outcome cannot enter RNNT; a later RNNT failure discards
+the entire paired candidate without refunding its recurrent reservation. The
+caller supplies a fresh perception epoch and retains the RNNT cursor outside
+snapshots. Snapshot and fork copy only the selected stage's caches, retained
+prediction and transcript. Internal component commits do not publish transcript
+events or install either state into the enclosing session.
+
+PCM advancement uses one `InputExecution` contract for ordinary and stage-local
+input caches. The same coupled state transaction owns frontend carry and that
+selected cache type. A borrowed pipeline input adapter receives explicit request,
+turn, invocation and perception-epoch identity plus the caller's recurrent cursor.
+It remains usable across incomplete PCM submissions without spending either
+authority. A ready attempt consumes its perception epoch even if later preparation
+or execution fails; replay uses a fresh adapter. Ranks agree availability and host
+feature content before input tensor creation, preventing one rank from returning
+for more PCM while another enters perception. Finish padding and continuation
+silence retain the same sample attribution and host drain policy as ordinary input.
+Readiness checks still use bounded communication authority; snapshots do not refund
+those agreement resources.
+
+VoiceChat frontend advancement consumes at most one 1,280-sample cadence frame
+into a candidate PCM/mel state. Input chunks may cross arbitrary frame boundaries;
+full queues return backpressure without consuming the rejected input. Finishing
+either requires a complete cadence frame or explicitly pads the last frame,
+retaining its actual sample count. This host drain does not imply TTS/codec drain.
+The perception transition returns both feature branches and new per-layer caches
+without modifying its parent. Audio and encoded-frame clocks remain distinct from
+RNNT token-only updates. Component fixtures compare whole and segmented execution,
+retry, retained snapshots and forks; no component clone establishes native session
+lease, completion, event-delivery or external tool-execution ownership.
+
+Perception uses the same architecture-owned subsampling, Conformer and projection
+units under resident and bounded parameter providers. Each invocation starts from
+an independent candidate over the borrowed parent caches. A failed acquisition,
+neural operation or unit completion cannot install intermediate Conformer state
+or advance the parent's frame frontier. The shared layerwise guard retains each
+unit through its exact completion, including candidate attention/convolution
+roots and the raw encoder capture used by RNNT. `invoke_with_context` returns that
+capture with the projected output from the same traversal; transcription never
+requires a second encoder pass. Startup silence uses the same provider path with
+fresh caches and does not advance the live frontend or RNNT.
+
+MLX perception construction consumes cold restricted per-unit bindings and the
+existing resident, host-layerwise or disk-streamed policy. These choices alter
+parameter residency without changing frame admission, candidate-cache ownership
+or the enclosing scheduler's publication boundary. `ResidentRuntime::from_units`
+also accepts previously bound units after validating their graph counts, so
+resident assembly preserves the original parameter objects. Perception residency
+alone does not establish full speech-stack residency or distributed conversation
+commit.
+
+Tensor-parallel perception uses the same candidate transition and shared unit
+completion. Attention and both feed-forward outputs are reduced before updating
+full-width residuals or producing successor caches. Each rank retains the entire
+normalized-input and convolution history, with the same frame frontier; local
+projection geometry does not shrink this state reservation. A selected partition
+requires its matching communicator before execution. The enclosing owner still
+coordinates rank failures and commits the coupled conversation; component output
+alone does not establish that distributed publication boundary.
+
+Perception pipeline candidates retain canonical block ranges and component
+ownership, including the distinction between stateless subsampling and projection
+stages. Branch construction and ingress reject state belonging to another stage.
+Each boundary's exact frame frontier must match the receiving candidate before
+local units execute. The sequence dimension reflects subsampling and overlap
+removal. All stages advance the candidate's encoded-frame frontier only when
+their local transition finishes; no boundary advances live audio or tool time.
+The shared distributed driver publishes both feature branches from one encoder
+invocation and establishes native completion before returning its commit outcome.
+Failed candidates are discarded, and externally visible publication remains the
+enclosing session's responsibility.
+
+Shared pipeline traversal uses architecture-declared shapes for each directed
+boundary and for final output. Intermediate sequence lengths and channel order
+may differ from request ingress. The driver retains request dimensions, checks
+resolved schemas before receive allocation, and uses one declared publication
+shape on all ranks. The output owner validates its result inside final-stage
+execution, so the existing failure agreement rejects a shape mismatch on every
+rank before publication. These geometry hooks preserve the existing parameter-lease,
+failure-agreement and commit lifecycle; they do not advance conversational time
+or select a codec pipeline for a session.
+
+Nemotron-H supplied-embedding target requests select vocabulary logits or normalized
+hidden values through the same resident/layerwise/partitioned drivers. The readout
+choice travels as validated I32 control data in pipeline boundary version 2;
+malformed shape, dtype or value is rejected. Hidden readout skips vocabulary
+projection while preserving normalized-readout observations. VoiceChat's agent
+and function heads can consume that result independently; neither projection
+advances model caches. The enclosing VoiceChat transaction owns conversational
+commit, and external applications execute published tool calls.
+
+The generic function-head provider participates in that same coupled readout for
+ordinary and controlled invocation. A shared dual-head method uses the retained
+normalized tensor once for each vocabulary projection; it neither reruns Nemotron
+nor advances its state. Shape, width and floating-dtype preflight precede head
+acquisition. The function graph has one learned unit and no pinned static head;
+bounded execution retains its input and logits until exact unit completion.
+Provider errors retain their original source through `BackendFailure` and follow
+the enclosing invocation's completion/discard boundary. Publication and tool-call
+commit belong to the enclosing session transaction.
+
+The dedicated prepared head selects dense F32 execution and charges conversion
+storage, independently of the admitted representation retained by existing
+ordinary unit construction. Tensor-parallel providers validate exact vocabulary
+ownership against communicator rank and degree before acquisition and gather
+complete logits through the shared traversal. Input and gathered output remain
+completion roots until the head lease is released. Projection consumes no RNG and
+does not advance a model or conversation frontier. Native TP construction retains
+bounded failure authority and validates the declared vocabulary-gather capacity.
+Guarded head invocation agrees input metadata before acquisition, uses shared
+traversal agreements around provider work, and agrees leased-unit identity before
+projection. The backend guards its local multiplication before gathering. A
+failed participant prevents peers from crossing those boundaries; acquired leases
+follow ordinary abort/completion handling. Logical rejection permits a fresh
+provider retry, while transport failures remain governed by the retained
+communication authority. These component calls do not establish distributed
+conversational commitment. The retained speech-provider driver validates summed finite
+parameter-pool allowances and conservative materialization reserves before any
+binding callback, including RNNT's selected independent parameter pool. It assembles the
+same learned components consumed by `execution`; input carry, neural branches,
+RNG and undelivered events retain their existing owners. Failed construction
+returns no aggregate, and native completion protects binding cleanup.
+
+The native coupled adapter adopts independently selected speech providers and the
+selected Nemotron layer runtime in the same completion owner. Complete parameter
+admission combines backbone device/host allowances and loading reservations with
+the independent speech pools before binding. Resident, host-layerwise and
+disk-streamed backbone blocks use the same prefill and cached invocation. The retained report remains inspectable
+after adoption. It covers logical parameter tiers and loading scratch, excluding live
+state, activation/spectral workspaces and source caches. Provider selection does not
+create a session scheduler, change snapshot ownership or establish native distributed
+validation. Nemotron embedding, final normalization and agent-head statics remain
+pinned and are included in the selected backbone device allowance.
+
+EAR-TTS RVQ refinement returns a new partial-code state for each active slot.
+Its ordinary generation helper repeats that same transition. Parent states
+remain unchanged after failed draws or neural operations; cloning a partial
+frame preserves its next slot, assigned prefix and PAD suffix. Sampled refinement
+uses the shared realtime branch's retained RNG for uniform and Gaussian draws.
+Canonical RNG adoption remains at the ordinary completion/commit boundary.
+Zero-depth iteration slots request no draws. This component-level replay does
+not capture Gemma guidance caches, codec overlap or externally delivered speech.
+
+The EAR-TTS causal transformer accepts existing attention-cache branches supplied
+by its execution owner. Layer frontiers, sliding retention policy and positional
+capacity are checked before any append. A failure after a neural submission
+requires the existing runtime's completion/rollback handling; this component does
+not turn a polling failure into completion. Conditional and unconditional lanes
+occupy distinct batch rows in every layer cache. Character encoding is an
+independent masked batch without recurrent state. These component calls do not
+establish a complete conversational snapshot or tool-wait driver.
+
+Resident and bounded TTS transformer providers execute the same block and
+final-normalization units. The shared runtime borrows the supplied cache branch
+for one call without moving its parameter owner or creating another scheduler.
+Unit completion retains exact K/V roots and masks before releasing leased weights.
+Both guidance rows travel in those same cache tensors. A late acquisition or
+neural failure may leave the unpublished branch partly advanced; the enclosing
+transaction discards that branch and retains completion ownership before retry.
+It does not rewind or replace the canonical parent inside the component call.
+Character encoding uses the same provider contract with explicit stateless input.
+The generator, sampling and coupled speech paths accept these providers, so
+controlled advancement and ordinary repeated advancement share their equations
+and commit boundary. Component residency alone does not establish a full
+speech-stack residency schedule or native distributed execution.
+
+MoG prediction and selected-component evaluation share the existing parameter
+traversal through `MogExecution`. Prediction executes residual blocks and the small
+normalization/logits head; selected evaluation leases only the component bank with
+explicit mixture IDs and Gaussian draws. It does not rerun prediction, append an
+attention position or advance refinement/RNG state. The forward context retains
+guided hidden values, decisions, draws and all moment outputs until each unit's
+submission is safe. Malformed draw geometry is rejected before acquisition;
+provider and neural failures use the ordinary traversal's completion handling.
+
+Resident, host-layerwise and disk-streamed MoG providers enter the same generator,
+RVQ refinement, speech sampling and coupled execution paths. Parameter residency
+therefore changes neither explicit iteration selection nor the enclosing candidate
+and RNG commit boundary. Retained predictions and partial refinement frames contain
+values rather than parameter leases and can resume through the selected provider.
+Tensor-parallel MoG execution uses the same traversal and explicit request modes.
+Residual MLP reductions precede post-normalization; selected low-rank contractions
+are reduced before adding replicated residual and noise terms. Every participant
+consumes the same supplied mixture IDs and Gaussian draws; no rank chooses new
+random values. The retained layout is checked against the communicator before
+acquisition, and guided hidden, decisions, draws and moments remain completion
+roots while the selected lease is live. A complete speech-graph residency schedule,
+coupled distributed commitment and released-checkpoint session parity remain
+outside this component support.
+
+TTS RVQ feedback uses the same resident or bounded unit traversal through
+`RvqExecution`. Code sums and residual quantization acquire the canonical stacked
+bank; embedded feedback additionally acquires the shared projection. Ingress and
+refinement use that same provider. Refinement candidates retain code values and
+schedule position independently of parameter leases. Failure while loading or
+executing the bank after sampling leaves the supplied frame unchanged; the
+enclosing shared random-state transaction restores its candidate draws. Retry
+uses the same slot without appending a causal attention position.
+
+Tensor-parallel RVQ providers validate coherent bank/projection ownership against
+the communicator before acquisition. Per-rank latent distance contributions are
+summed before each code decision, preserving global first-index ties. Each active
+slot starts from its supplied fresh latent; previous prefix codes are retained,
+not subtracted from that sample. Local residuals stay within the invocation and
+only the complete replicated code candidate escapes it. Depth sums and embedded
+feedback return full-width results through shared completion. These component
+calls retain the enclosing transition's candidate and RNG ownership; they do not
+establish coupled distributed conversational commitment.
+
+Learned TTS conditioning uses three independently leased units for character
+parameters, ingress and gated fusion. `ConditioningExecution` runs character
+lookup and pooling/flags around the selected character transformer, and runs
+ingress after RVQ feedback has completed. No conditioning lease spans those other
+providers. Empty character selections skip lookup, transformer and pooling.
+Both guidance lanes remain completion roots. Conditioning and fusion finish
+before the causal transformer advances the supplied cache branch; an acquisition
+failure there leaves its attention position unchanged and permits retry through
+the ordinary candidate/commit path. These component providers do not add another
+session scheduler or random-state owner.
+
+
+Tensor-parallel conditioning preserves those lease and completion boundaries.
+Character lookup and pooling each return a full-width tensor before the next
+provider runs; ingress returns both complete guidance lanes. Fusion reconstructs
+its projected features before the global normalization. Exact communicator
+rank/size is checked before unit acquisition. The selected parallel provider
+implements the same `ConditioningExecution` contract without a separate session
+scheduler or mutable conversational state.
+
+EAR neural decoding uses `DecoderExecution` for resident and bounded providers.
+Each upsampling, ConvNeXt and output-projection unit consumes an unpublished
+candidate, with exact convolution carry retained through unit completion. A late
+acquisition or computation failure leaves the parent decoder state reusable.
+`AudioDecoder` composes that candidate with spectral overlap before returning
+PCM and replacement state; replay and fork use the same transition. Neural finish
+loads no parameters, and spectral drain emits retained overlap without another
+code frame. Codec quantization and lookup likewise lease selected codebook depths
+through shared traversal. Temporary residuals and code decisions remain private
+to an invocation; late acquisition or numerical failures leave the input reusable
+for retry. Codebooks are shared with fixed-Aria startup encoding, and drain
+performs no quantizer invocation. The finite encoder also uses independently
+leased learned units. These component providers do not establish a complete
+conversational residency schedule.
+
+
+
+Tensor-parallel EAR neural decoding keeps the same immutable parent and candidate
+state transition. Each rank retains the declared full depthwise convolution carry;
+partitioned projections finish their collective before a unit completes. A late
+failure discards the candidate, leaving the parent available for replay or fork.
+Geometry-only neural finish and spectral drain acquire no learned parameters.
+The selected decoder uses the same waveform driver and does not advance its own
+audio frontier or conversational policy.
+
+Tensor-parallel quantization retains local residuals and replicated code decisions
+inside the same invocation. Score collectives precede each code selection; the
+final selected unit retains all full-width result tensors through completion.
+Only requested depths acquire parameters. Decode likewise reconstructs its
+ordered mean sum before publication. Communicator mismatch fails before provider
+acquisition, and failed candidates do not change the caller's input. These
+component operations do not advance conversational policy or own random state.
+
+MoG and TTS RVQ tensor-parallel providers use retained failure authority during
+the same ordinary layered traversal. They agree invocation policy and refinement
+position before acquisition, agree each local lease result, and check prepared
+projection or score contributions before entering a reduction. Asymmetric local
+failures return on all participants without changing the parent refinement state.
+A repaired invocation can use the retained parent after its owner establishes
+safe completion. Mixture IDs and Gaussian draws remain explicit caller inputs;
+these provider agreements do not allocate randomness or commit speech output.
+
+The composed TTS generator uses that same cache contract. `begin_frame` runs one
+causal invocation against unpublished branches and returns the two guidance
+hidden lanes plus an all-PAD refinement candidate. `advance_frame` proposes one
+active iteration; `generate_frame` repeats that exact transition. Retrying or
+forking a retained refinement frame never appends another attention position.
+The frame's model position counts Gemma positions, independently of live PCM
+time and tool substeps. A complete conversational snapshot must retain the
+associated attention branch and candidate RNG together with the partial frame.
+Caller-supplied draw callbacks retain responsibility for their own RNG rollback.
+Selected causal execution validates local state ownership and its explicit
+position, including pipeline stages with no attention slots. Replaying copied
+state preserves this position and requires fresh invocation authority. A causal
+pipeline adapter admits one scheduler-issued epoch; it never allocates epochs or
+clones the transaction's mutable caches. Character conditioning uses its own
+selected provider. Failures before causal submission require the enclosing
+distributed owner to agree preparation outcomes before any rank enters the
+pipeline. The adapter's component agreement does not coordinate turn policy or
+random decisions for the whole conversation.
+`advance_sampled_frame` and `generate_sampled_frame` instead wrap the requested
+slot or remaining slots in one branch RNG transaction. Synchronous draw or
+dependent MoG/RVQ failure preserves both the parent frame and pre-call RNG,
+including when earlier slots in the same call succeeded. Each active slot draws
+uniforms followed by Gaussian noise even when noise scale is zero. Complete
+generation consumes no draws; submitted branches reject further sampling.
+This rollback does not refund other budgets or establish native completion.
+Deferred native failures still require the enclosing submission owner's
+completion handling before canonical publication or resource release.
+
+Sampled generator and speech operations accept optional
+`SpeechSamplingCoordination` over retained replicated communication. Its recorded
+request, turn and invocation identity is agreed with the operation mode, geometry,
+policy and active slot before dependent work. Only the designated owner consumes
+RNG; followers receive mixture IDs and Gaussian values. Phase disagreement and
+synchronous peer failure reject the candidate, and final agreement occurs before
+the RNG transaction adopts its state. Rendering gates output preparation before
+codec execution. Authority is consumed even on failure; retry or snapshot replay
+uses fresh authority with an unpublished branch. Authority is not snapshot state
+and cannot undo delivered audio. Internal collective providers still own their
+local failure gates, and native completion remains the enclosing owner's duty.
+
+TTS EOS input substitution uses the nested speech-generation configuration.
+Output-feedback EOS substitution is a distinct top-level streaming policy;
+the pinned checkpoint alone does not enable it. The main speech path preserves
+raw generated waveform codes before changing next-step feedback. Output policy
+explicitly chooses whether a silence decision also changes rendered
+audio. PAD permissions remain per-row facade decisions, and codec control
+replacement operates on individual codebook entries.
+
+Streaming EAR decoder pipelines branch only the convolution caches owned by
+their stage. Stage identity includes the decoder geometry, namespace and global
+unit range; restore or replay validates that identity before learned execution.
+Budgeted snapshot copying retains that identity, local layout metadata and only
+the owned carry, forwarding the reservation to each tensor copy.
+Boundary request metadata preserves the original latent geometry across
+upsampling. Native completion retains local candidate carry and published
+spectra through the shared distributed transaction. Only a committed candidate
+replaces the parent. Neural finish clears local carry without learned reads;
+it emits no artificial tail and leaves overlap-add drain to spectral execution.
+These component operations do not advance conversational turn policy.
+
+The waveform pipeline surrounds codebook lookup, neural traversal and spectral
+reconstruction with participant agreement. It returns one unpublished candidate
+containing the local convolution state, spectral overlap and frame/sample clocks.
+Step and drain use explicit invocation identity and one-use authority; retry and
+snapshot replay require fresh authority. Copying waveform state does not refund
+communication resources. Drain releases local convolution carry and emits the
+retained overlap without loading codebooks or advancing generated-code frames.
+The ordinary and pipeline providers implement the same waveform execution contract
+used by speech refinement and the coupled transaction.
+Tensor-parallel codebook providers retain their cohort authority and agree on
+acquisition and local computation success before reductions. The enclosing
+waveform agreement handles component failure after those internal gates; it
+does not replace them or refund their communication budgets.
+Guarded native reductions complete before subsequent control agreements. A
+deadline preserves the existing native completion quarantine instead of releasing
+the reduction's resources or treating a polling failure as completion.
+
+Fixed-Aria preparation encodes a bounded finite silent carrier once and retains
+immutable prompt inputs for independent prefill branches. Carrier samples and
+batch positions have explicit capacity limits; expansion reuses the encoded
+single row. The finite encoder has no mutable streaming cache. Resident and
+bounded providers run the same finite traversal; input rejection precedes weight
+acquisition, and a late failure leaves no encoder carry to reset. The final
+layout conversion completes with the last learned unit before borrowed
+codebook quantization begins. Tensor-parallel encoding uses this same traversal:
+each projection or downsampler reconstructs global channels, and residual-block
+reduction precedes replicated bias addition. Actual rank and retained parameter
+placement are validated before acquisition. Failed finite encoding starts no
+quantizer work; replay needs no convolution-state reset. Preparation does
+not allocate a persistent state range for encoder pipeline stages. Each stage
+retains its global unit interval; boundary metadata validates the completed cut
+and original spectral request before execution. The shared distributed driver
+publishes latents after the final frame-major conversion, completes native roots,
+and returns the recorded epoch's commit outcome. Only a committed result can
+enter subsequent quantization or prompt publication. Preparation does
+not admit a session or establish native completion: retries after submission
+still require the execution owner's completion handling. Prompt positions count
+model warmup and do not advance the live-audio frontier.
+
+VoiceChat invocation plans retain independent component progress under the shared
+generation transaction. A plan checks capacity before component work and validates
+observed frontend, perception, RNNT, backbone, guidance and codec progress before
+adopting its candidate schedule. A plan from an earlier boundary cannot replace
+a later schedule. Tool steps using cached audio leave the input frontier unchanged;
+reminders also leave Nemotron unchanged. The first backbone decode uses PAD
+feedback even after prompt prefill or earlier perception-only work. Explicit drain
+closes the schedule, including an empty codec stream; text EOS is a speech-policy
+input rather than a session-close operation. Session snapshots retain this
+schedule alongside conversation, publication and native execution state.
+
+PCM input composition retains preprocessing carry and paired perception/RNNT
+caches as one candidate. Arbitrary input chunks are admitted into the bounded
+host queue; advancement consumes at most one 80 ms frame. Retrying a failed
+perception or transcription operation begins from the unchanged host and neural
+parent. Explicit final padding preserves the count of actual source samples.
+
+Speech composition retains feedback codes and the selected codec carry separately from the
+owner's attention-cache and RNG branch. Beginning a frame advances the causal
+transformer once; explicit refinement and uninterrupted refinement share the
+same transition. Rendering requires a complete refinement and matching component
+policy, then returns waveform and feedback as an unpublished candidate. Codec
+finish does not advance TTS positions. A failure after attention or random work
+still requires the owner's completion and rollback handling; these components
+do not independently commit caches or authorize replay of delivered audio.
+`render_sampled_frame` extends the branch-local RNG rollback boundary through
+feedback and waveform rendering. Failure after all refinement draws preserves
+the pre-call RNG and predecessor codec carry. A completed retained frame can be
+rendered without another random draw or causal-cache append.
+
+VoiceChat output assembly binds its observed receipt, sparse channel payloads
+and host projection to one admitted invocation. Every channel uses the invocation
+coordinate, while PCM retains an independent absolute emitted-sample offset and
+22.05 kHz rate. Tool and reminder invocations therefore emit PCM without advancing
+live-input time. Drain emits only the declared nonempty codec tail; an unused
+codec emits no tail. Host validation rejects malformed or nonfinite payloads,
+misattributed coordinates and disagreement between native and retained decision
+IDs before publication. The session combines these validated frames with
+semantic tool events at the shared commit boundary.
+
+The coupled VoiceChat component executor consumes the same unpublished generation
+branch for ordinary and controlled advancement. Its model state delegates both
+Nemotron and TTS caches to one neural transaction, then adopts host input,
+perception/RNNT, speech/codec and feedback candidates after the joint commit.
+Input readiness includes explicitly padded final PCM and is checked without
+feature extraction. `NeedsInput` leaves an unclaimed candidate reusable.
+Once neural execution starts, the candidate accepts no further invocation;
+an error requires exact completion and discard, and retry starts from a fresh
+canonical branch. This prevents a late character/codec failure from retaining
+earlier perception, backbone or sampling progress in a local retry. Native
+submission lifetime remains the enclosing owner's responsibility on every path.
+
+The released-checkpoint Metal WAV run uses public `BoundVoiceChatSession`
+advancement through this same driver: eight prompt positions, 396 audio frames,
+404 backbone positions and terminal drain. Committed waveform offsets cover
+698,552 samples, including the eight-sample codec tail, and a finished event
+follows drain. [Recorded execution evidence](voicechat-validation.md#released-checkpoint-single-device-execution)
+covers ordinary single-device publication. A separate pinned tool run commits the
+complete call batch, processes nine perception frames during an 800 ms recorded
+wait, accepts the matching ticket, resumes live speech with the scripted result
+and drains. Tool-only steps preserve the audio frontier; perception-only steps
+preserve the backbone frontier. An overlapping-input run with a three-frame
+threshold commits interruption during a silent tool wait, rejects its delayed
+result as stale, and drains. Its 103 replay invocations advance the backbone
+without advancing audio time or repeating transcription. The resumed model
+answers the new question with “The sky is blue.” These runs do
+not establish released-weight restore/fork, active-reminder interruption, timeout
+or distributed-session parity.
+
+The coupled transition accepts a selected `BackboneExecution` provider and its
+caller-owned state. Ordinary and TP providers share the existing layered runtime,
+and both agent and function projections consume one normalized hidden result.
+The function head selects its own provider and communicator. Preflight and final
+schedule observation ask the backbone provider to validate its actual frontier;
+the coupled driver does not inspect or require remote cache slots. The compact
+two-rank conformance path compares cached live/tool work, reminders and drain
+with ordinary execution, including clocks, shared carry and bounded layer leases.
+This equation-level coverage does not establish native distributed conversation
+submission or completion.
+
+The selected TP backbone optionally agrees fused ingress before entering shared
+layered traversal. Channel admission compares prompt/audio operation identity,
+exact prompt policy and IDs or dense/categorical geometry and dtype, and fusion
+weights. Local prompt construction and each vocabulary lookup are followed by an
+agreement before the next lookup or fused output is used. Failure at these
+boundaries returns the original local source and prevents backbone cache or
+provider advancement. The enclosing native completion owner still retains any
+submitted lookup resources. Later block preparation and collectives require
+their own coordination; ingress agreement does not establish that guarantee.
+
+Shared MLX row-parallel projections use the selected group's retained authority to
+agree local projection/observer errors, reduction admission and output/bias metadata
+before reducing. Uneven input shards remain valid. Bias is added once after bounded
+reduction completion, followed by local-result agreement. A rejected preparation can
+retry with the same authority; a transport failure retains its existing completion
+ownership. These operator gates do not cover preceding normalization, recurrent or
+attention preparation, and do not provide distributed panic recovery.
+
+An optional `ExecutionCoordination` drives owner selection through this same
+coupled transition. Its recorded request, turn and invocation identity is
+separate from model snapshots. Admission consumes the authority even when local
+preflight fails; exact descriptor agreement precedes branch claim and learned
+work. The descriptor includes schedule policy, expected and predecessor counters,
+feedback, invocation kind, prompt IDs and masks, tensor geometry and speech output
+policy. Followers validate their common execution state but need no RNG and do
+not call the conversational resolver. Channel and speech authorities borrow the
+same retained coordinator in sequence, preserving the existing sampling drivers
+and their RNG transactions.
+
+Component agreements prevent a local preparation or component failure from
+silently advancing peers to the next component. Output assembly is agreed before
+the candidate schedule is adopted. A failed nested authority fences the coupled
+authority without issuing a recovery collective. Retry uses fresh authority and,
+after execution has started, a fresh unpublished branch; exact native completion
+and discard remain the enclosing owner's responsibility. Agreement never commits
+speech, tool events or neural caches.
+
+This behavior applies to replicated ordinary providers. The component gates do
+not make unguarded internal TP collectives safe: providers must agree their own
+fallible preparation before entering those collectives. The native cold loader
+selects ordinary execution, so this authority does not establish a
+native distributed conversation session.
+
+MLX supplies a joint hybrid/key-value transaction owner for these cache families.
+It admits one isolated candidate at a time, charges bounded copy work before
+copying, and validates owner identity, generation and layout before atomically
+adopting both states. Discard does not refund cumulative copy usage. Copy
+completion is established before exposing the candidate; subsequent model
+submission and publication still belong to the shared enclosing completion
+owner. The separate `IsolatedStateCopy` mechanism releases source execution
+admission after completing an independent copy. `IsolatedStateSnapshot` retains
+that copy under the original `SnapshotBudget`; restoring makes a provisional
+independent copy before atomic installation. Failed attempts consume copy
+allowance, and unresolved native recovery retains logical storage reservations.
+MLX's isolated joint owners share cumulative copy accounting across descendants.
+Neither this component snapshot nor a copied cache owner represents a public
+VoiceChat session snapshot or fork: conversation, external ingress, queued
+publications and external-delivery history require facade composition.
+
+The shared realtime generation owner implements isolated snapshot composition when
+its model supplies `IsolatedStateCopy` and its schedule, identity, controls,
+samplers and RNG supply explicit `SnapshotValue` copies. Native copies finish
+before adoption. A failed model restore cannot replace any temporal or sampling
+value, and successful restore increments the live publication revision instead of
+reusing the saved one. Snapshot reservations include dynamic sampler history and
+native RNG storage; copy failures retain the original concrete error source and
+never refund copying. VoiceChat schedule/history and the MLX two-word key implement
+these value contracts. Native CPU checks compare restored draws and model caches
+under those policies without claiming a complete conversation snapshot.
+
+VoiceChat's architecture state also supplies complete component copies: internal
+PCM/mel carry, perception caches, retained RNNT hypotheses/LSTM state, TTS feedback,
+codec convolution/overlap state and retained audio. `IsolatedStateSnapshot` can
+capture the low-level MLX generation owner at a completed boundary. Replaying from
+that saved model boundary includes final partial PCM and codec drain. The saved
+owner retains copied mutable values and shares immutable processing tables/policy.
+It has no authority to rewind externally delivered audio or tool execution.
+
+`VoiceChatSession::snapshot` composes these model copies with independent host
+conversation state, PCM ingress, undelivered publications and recorded time under
+the shared `SnapshotBudget`. `enable_snapshots` configures limits exactly once;
+`snapshot_usage` reports retained storage and cumulative copy work. The source
+remains runnable after capture. Tool collection/injection, RNNT/agent text carry, turn histories, reminder receipts and
+explicit wait timers are retained. Diagnostics require `SnapshotValue`; the shared
+runtime supplies exact copies for `RealtimeDecisionDiagnostics` without refunding
+observation budgets. Immutable tokenizer/schema resources keep their shared
+preparation lifetime; mutable carry and retained response/phrase/vocabulary data
+are charged separately.
+
+Capture and restore require an active idle session after prefill has committed.
+Restore rejects snapshots from another owner, newly accepted PCM or finish,
+outputs delivered since capture, and accepted external tool/wait/playback or
+interruption actions. These typed rejections prevent replaying externally executed
+tools or delivered speech and prevent silently discarding accepted input. They
+occur before copy admission. Recorded time rewinds only on successful restore;
+scheduler telemetry, publication revisions and cumulative copy allowances do not.
+Terminal sessions have released their canonical state and reject restoration.
+`VoiceChatSession::fork(request)` copies the current idle frontier into a new
+session using the same scheduler implementation, without prompt replay. It returns
+independent PCM/output endpoints and source-to-child mappings for any pending tool
+ticket or playback receipt. Already delivered events are absent from the child's
+queue; inherited undelivered tool events use the new request identity. Original
+receipts cannot directly change the child, and applications decide whether to
+apply an already executing tool's result to both continuations. No tool executes
+inside this operation.
+
+All descendants share the original snapshot budget and native cumulative copy
+accounting. `max_branches` bounds retained child states; dropping or cancelling a
+session does not refund its branch slot while its endpoints or unresolved native
+work retain copied resources. Delivered payload ownership transfers to the
+application. Restore preserves the child's live retention lease. A shared lineage
+rejects previously admitted request IDs, including failed copy attempts, and keeps
+bounded metadata reservations for those identities. Independently constructed
+sessions still require caller-unique request IDs. Longer child tool IDs must fit
+both invocation and aggregate queue bounds before copying. Source and child can
+advance independently; each native executor retains its existing submission
+admission, so sharing one executor requires serialized submissions.
+
+Fork retention also admits growth of the child's committed state. PCM ingress
+reserves its configured capacity at creation. Conversation updates, queued output
+(including diagnostic payloads) and completed neural candidates admit their full
+logical size before installation. Shared high-water charges survive restore,
+delivery and failed subsequent transitions, and remain owned by native retirement
+holders of the same lease. A retention-limit error commits neither the oversized
+neural candidate nor its audio consumption or publication. These retained-state
+charges are separate from temporary execution workspace and snapshot copying.
+
+Input submission and output delivery are fenced through snapshot estimation,
+copying and native installation, including callbacks from custom copy mechanisms.
+`try_pop_output` reports `SnapshotBusy`; `pop_output` reports no available output
+while fenced. All host storage is copied before the sole fallible neural install.
+Only then are existing sender/receiver contents replaced, so failed restore
+preserves live queues, policy and time. Retired diagnostic destructors run after
+host installation; any new audio they admit remains queued.
+
+Cold generation preparation checks the released BOS/EOS/PAD identities and
+admitted capacity for mandatory speech startup. It initializes the existing
+generation owner at the unprefilled boundary with PAD/PAD feedback and empty
+effective-token history. Random state is explicit and required even when agent
+sampling is greedy, because speech generation remains stochastic. Input carry
+and the initialized joint neural owner enter the same canonical state. Cache
+initialization checks the exact selected layouts before allocation. Transaction
+support is guaranteed by the shared selector; initialization does not select or
+advertise complete session capabilities.
+
+The low-level MLX coupled adapter enters shared native recovery before executing
+equations, including eager RNNT and sampling work. Architecture preflight occurs
+first; `NeedsInput` submits nothing and leaves the candidate reusable. An equation
+error or unwind attaches failed completion, poisons execution and prevents
+publication. Recovery retains component tensors, model resources, paging owners
+and joint copy admission independently of the discarded candidate. Successful
+output uses the same prepublication wrapper and architecture host observer as
+portable execution. A caller releases the completed frame and completion handles
+before requesting the next candidate; safe native retirement releases admission.
+The facade session supplies public advancement and conversational policy around
+this adapter.
+Compact MLX CPU conformance compares explicit branch advancement with the ordinary
+shared scheduler across prefill, live audio, perception-only waiting, retained-audio
+tool speech, reminders and drain. Output, component caches, both TTS guidance rows
+and RNG agree at each committed boundary. The test includes partial PCM and a
+retryable `NeedsInput` boundary. This component-level check does not establish
+released-checkpoint numerical parity.
+
+VoiceChat's host observer produces owned speech and transcription only after the
+shared prepublication wrapper verifies exact completion. It checks source-frame
+presence, coordinates and unpadded sample counts against the same schedule
+receipt as the output channels. The scheduler commits matching cache, feedback
+and RNG state only after observation succeeds; rejected PCM, attribution or host
+conversion cannot publish a candidate. Cancellation retains submitted work until
+completion and returns no delivered output. This observation boundary does not
+authorize replay of already delivered speech or external tool execution.
+
+Backbone composition accepts an unpublished Nemotron state and performs one
+ordinary resident, bounded or collective invocation for both output heads.
+Failure during either readout still leaves completion and branch disposal with
+the enclosing transaction. Prepared pipeline ingress retains the normalized
+readout directive and validates the declared token representation.
+
+Schedule receipt observation reads the actual component frontiers. Declared
+stateless Nemotron slots do not constrain the token position; all selected
+stateful slots must agree. Retained speech state must agree with every TTS cache,
+and codec frame/sample counts come from codec carry. Receipt validation does not
+authorize publication, substitute for cache/RNG ownership, or aggregate remote
+rank state. The enclosing session owns registration, scheduling and publication.
+
+EAR waveform decoding returns neural and spectral carry together as an
+unpublished candidate. Arbitrary nonempty code chunks use the same transition;
+cloning its parameter-free state preserves both histories and their frontiers.
+Finish consumes no new code frame, drains spectral overlap, releases carry and
+rejects subsequent input. Finishing an empty stream yields no audio; repeated
+finish yields no additional samples. The released decoder emits 1,764 samples
+per code frame, with eight samples of startup delay and an eight-sample flush
+tail. Offline and streaming boundary normalization differ in the pinned
+implementation. A caller must use the chosen mode's declared timing and cannot
+discard the streaming prefix or tail without accounting for it. Codec candidate
+state does not own native completion, previously published audio or the complete
+VoiceChat session commit boundary.

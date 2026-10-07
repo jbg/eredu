@@ -6,23 +6,71 @@
 //! facade namespace for composing those semantics with reference, mock, or
 //! selected native mechanisms.
 
-pub use eredu_architectures::moshi::{
-    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
-    prepare_realtime_model_from_catalog, prepare_selected_moshi_realtime_source,
-    select_inspected_moshi_realtime, InspectedMoshiRealtime, MoshiRealtimeRequest,
-    MoshiRealtimeSourceError, MoshiWeightLoweringSummary, PreparedMoshiRealtime,
-    PreparedMoshiRealtimeSource, RealtimePreparationPlan,
+pub use crate::runtime::voicechat::{
+    BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatPhrase, PreparedVoiceChatPrompt,
+    PreparedVoiceChatSession, PreparedVoiceChatSessionParts, PreparedVoiceChatToolResponse,
+    VoiceChatAdvance, VoiceChatAgentText, VoiceChatBlocked, VoiceChatConversation,
+    VoiceChatConversationError, VoiceChatConversationOutput, VoiceChatDecodeError,
+    VoiceChatDecodeLimits, VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatExecutor,
+    VoiceChatFork, VoiceChatInitialReminder, VoiceChatInputConfig, VoiceChatInputError,
+    VoiceChatInputPermit, VoiceChatInputSender, VoiceChatInputStatus, VoiceChatLoadingError,
+    VoiceChatPhrasePolicy, VoiceChatPreparation, VoiceChatPublicationAdmission,
+    VoiceChatPublicationBranch, VoiceChatPublicationCapacity, VoiceChatPublicationError,
+    VoiceChatPublicationLimits, VoiceChatPublicationPermit, VoiceChatPublicationReceiver,
+    VoiceChatPublicationState, VoiceChatPublicationUsage, VoiceChatReminderPlayback,
+    VoiceChatReminderStep, VoiceChatSession, VoiceChatSessionConfig, VoiceChatSessionError,
+    VoiceChatSessionFailure, VoiceChatSessionProgress, VoiceChatSessionSnapshot,
+    VoiceChatSessionStatus, VoiceChatSnapshotError, VoiceChatSpeechOptions, VoiceChatStartOptions,
+    VoiceChatSubmittedWork, VoiceChatTextError, VoiceChatTextKind, VoiceChatTextLimits,
+    VoiceChatTextPreparation, VoiceChatToolAudioPolicy, VoiceChatToolBatch, VoiceChatToolChannel,
+    VoiceChatToolError, VoiceChatToolLimits, VoiceChatToolTicket, VoiceChatToolWait,
+    VoiceChatToolWaitAction, VoiceChatToolWaitError, VoiceChatToolWaitMessages,
+    VoiceChatToolWaitPolicy, VoiceChatTranscriptionText, VoiceChatTurnAdmission,
+    VoiceChatTurnError, VoiceChatTurnEvent, VoiceChatTurnIdentity, VoiceChatTurnLimits,
+    VoiceChatTurnPolicy, VoiceChatTurnResolver, VoiceChatTurnTaking, VoiceChatWork,
+    VoiceChatWorkKind,
 };
+
+mod loading;
+pub use loading::{RealtimeLoadOptions, SpeechSessionOptions};
+#[cfg(feature = "mlx")]
+mod selected;
+#[cfg(feature = "mlx")]
+pub use crate::runtime::voicechat::{
+    submit_mlx_voicechat, MlxVoiceChatExecutor, MlxVoiceChatSession, VoiceChatStartError,
+};
+#[cfg(feature = "mlx")]
+pub use selected::{
+    prepare_mlx_realtime, LoadedMlxRealtime, PreparedMlxRealtime, RealtimeLoadError,
+};
+
+pub use eredu_architectures::realtime::{
+    prepare_realtime_model, PreparedRealtimeArtifact, RealtimeArtifactRequest,
+    RealtimeArtifactSource, RealtimeAssetDirectories, RealtimePreparationError,
+};
+
+pub use eredu_architectures::voicechat::silence::{
+    PreparedSilenceConditioning, SilenceConditioningError,
+};
+pub use eredu_architectures::voicechat::transcription::{RnntTextDecoder, RnntTextError};
+pub use eredu_media::audio::streaming::{FinalPcmFrame, PcmFinishPolicy, PcmFrameSource};
+
 pub use eredu_core::{
+    execution_control::{SnapshotLimits, SnapshotUsage},
     scheduler::{
         RequestId, RequestStatus, SchedulerCapabilities, SchedulerLimits, SchedulerReport,
     },
-    RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling, RealtimeSpeechConfig,
-    SessionCapabilities,
+    RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelError,
+    RealtimeChannelFeedback, RealtimeChannelId, RealtimeChannelLayout, RealtimeChannelPayload,
+    RealtimeFrameScheduleState, RealtimeInputFrame, RealtimeOutputFrame, RealtimeSampling,
+    RealtimeSpeechConfig, SessionCapabilities,
 };
 pub use eredu_runtime::{
-    RealtimeGenerationState, RealtimeModelSessionIdentity, RealtimeSessionScheduler,
-    ReleasedRealtimeSession,
+    RealtimeChannelIngressError, RealtimeChannelValues, RealtimeFrameContract,
+    RealtimeFrameContractError, RealtimeGenerationContract, RealtimeGenerationState,
+    RealtimeModelSessionIdentity, RealtimeScheduleDescriptor, RealtimeScheduleState,
+    RealtimeSessionInput, RealtimeSessionScheduler, ReleasedRealtimeSession,
+    ValidatedRealtimeChannels,
 };
 
 /// A backend-neutral prepared realtime model bound to one authoritative

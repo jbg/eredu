@@ -4,7 +4,7 @@ use crate::backend::error::Error;
 use eredu_core::residency::AllocatorMemoryMetrics;
 
 pub use crate::composition::mlx::automatic::{
-    create_realtime_execution, discover_hardware, parameter_bank_telemetry, MlxBackendFactory,
+    discover_hardware, parameter_bank_telemetry, MlxBackendFactory,
 };
 pub use crate::composition::mlx::speculative::SpeculativeComponentTimingGuard;
 

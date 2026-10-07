@@ -63,6 +63,7 @@ eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
 eredu-runtime.workspace = true
 eredu-architectures.workspace = true
+eredu-codec.workspace = true
 eredu-gguf.workspace = true
 safemlx = { workspace = true, default-features = false, features = ["safetensors"] }
 eredu-backend-mlx-macros.workspace = true
@@ -79,7 +80,7 @@ ref-cast = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eredu-evaluation.workspace = true
-eredu-codec.workspace = true
+eredu-media = { workspace = true, default-features = false }
 eredu-text = { workspace = true, default-features = false }
 tempfile.workspace = true
 float_eq = "1"

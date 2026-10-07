@@ -182,11 +182,11 @@ fn verify_v3_partition_transforms(sparse: bool, independent_banks: bool) {
                     let expected = &expected.outputs;
                     let tokens = &tokens;
                     scope.spawn(move || {
-                        let mut layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        let mut layout = eredu_runtime::derive_partitioned_local_layout(
                             parameters,
                             ParallelRankTopology::new(topology, rank).unwrap(),
                         ).unwrap();
-                        let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                        let encoded = eredu_runtime::derive_partitioned_local_layout(
                             target_parameters, ParallelRankTopology::new(topology, rank).unwrap(),
                         ).unwrap();
                         for (name, companion) in encoded.tensors() {

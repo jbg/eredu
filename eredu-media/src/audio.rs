@@ -1,5 +1,8 @@
 //! Shared PCM validation and log-mel feature extraction.
 
+pub mod streaming;
+pub mod wav;
+
 #[cfg(feature = "audio")]
 use rustfft::{num_complex::Complex32, FftPlanner};
 
@@ -306,7 +309,13 @@ fn extract_leading_slaney_log_mel_enabled(
     }
     padded[config.leading_zeros..waveform_end].copy_from_slice(waveform.samples);
 
-    let filters = slaney_mel_filters(config);
+    let filters = slaney_mel_filters(
+        config.sample_rate,
+        config.fft_length,
+        config.mel_bins,
+        config.min_frequency,
+        config.max_frequency,
+    );
     let frequency_bins = config.fft_length / 2 + 1;
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(config.fft_length);
@@ -365,7 +374,13 @@ fn htk_mel_filters(config: &LogMelConfig) -> Vec<f32> {
 }
 
 #[cfg(feature = "audio")]
-fn slaney_mel_filters(config: &LeadingSlaneyLogMelConfig) -> Vec<f32> {
+fn slaney_mel_filters(
+    sample_rate: u32,
+    fft_length: usize,
+    mel_bins: usize,
+    min_frequency: f32,
+    max_frequency: f32,
+) -> Vec<f32> {
     let hz_to_mel = |hz: f64| {
         if hz < 1_000.0 {
             hz / (200.0 / 3.0)
@@ -380,19 +395,19 @@ fn slaney_mel_filters(config: &LeadingSlaneyLogMelConfig) -> Vec<f32> {
             1_000.0 * ((mel - 15.0) * (6.4f64.ln() / 27.0)).exp()
         }
     };
-    let mel_min = hz_to_mel(config.min_frequency as f64);
-    let mel_max = hz_to_mel(config.max_frequency as f64);
-    let edges = (0..config.mel_bins + 2)
+    let mel_min = hz_to_mel(min_frequency as f64);
+    let mel_max = hz_to_mel(max_frequency as f64);
+    let edges = (0..mel_bins + 2)
         .map(|index| {
-            mel_to_hz(mel_min + (mel_max - mel_min) * index as f64 / (config.mel_bins + 1) as f64)
+            mel_to_hz(mel_min + (mel_max - mel_min) * index as f64 / (mel_bins + 1) as f64)
         })
         .collect::<Vec<_>>();
-    let frequency_bins = config.fft_length / 2 + 1;
-    let mut filters = vec![0.0f32; config.mel_bins * frequency_bins];
-    for mel in 0..config.mel_bins {
+    let frequency_bins = fft_length / 2 + 1;
+    let mut filters = vec![0.0f32; mel_bins * frequency_bins];
+    for mel in 0..mel_bins {
         let normalization = 2.0 / (edges[mel + 2] - edges[mel]);
         for frequency in 0..frequency_bins {
-            let hz = config.sample_rate as f64 * frequency as f64 / config.fft_length as f64;
+            let hz = sample_rate as f64 * frequency as f64 / fft_length as f64;
             let lower = (hz - edges[mel]) / (edges[mel + 1] - edges[mel]);
             let upper = (edges[mel + 2] - hz) / (edges[mel + 2] - edges[mel + 1]);
             filters[mel * frequency_bins + frequency] =

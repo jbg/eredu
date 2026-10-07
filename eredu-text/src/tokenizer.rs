@@ -15,6 +15,8 @@ use crate::error::Error;
 
 mod json;
 
+pub use json::write_python_json;
+
 const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
 const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
 

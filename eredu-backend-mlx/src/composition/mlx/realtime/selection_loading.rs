@@ -59,7 +59,7 @@ impl MlxRealtimeExecutionContext {
     /// `collectives_supported` reports static route capability; an actual group
     /// is realized only later while materializing an already selected topology.
     pub fn select_realtime_execution(
-        preparation: RealtimePreparationPlan,
+        preparation: MoshiPreparationPlan,
         options: &MlxLoadRequest,
         collectives_supported: bool,
     ) -> Result<MlxPreparedRealtimeExecution, Error> {
@@ -136,7 +136,7 @@ fn materialize_realtime_model(
 }
 
 fn select_realtime_model(
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     options: &MlxLoadRequest,
     collectives_supported: bool,
 ) -> Result<MlxPreparedRealtimeExecution, Error> {

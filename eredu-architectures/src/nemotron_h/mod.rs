@@ -29,7 +29,7 @@ pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe}
 pub use model::{
     ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema, TargetPartitionInput, Unit,
 };
-pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues};
+pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues, TargetReadout};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
     partition_local_geometry, partition_local_routed_geometry, partitioned_state_layout,

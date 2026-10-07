@@ -396,7 +396,13 @@ fn mlx_manifest_capabilities_admit_publication_but_fail_closed_on_unsupported_dt
             vec![0, 1],
             Some(0),
             CommunicationGroupRequirements::new([
-                communication_requirement(CommunicationOperation::Broadcast),
+                CommunicationOperationRequirement::tensors(
+                    CommunicationOperation::Broadcast,
+                    [TensorDtype::F32, TensorDtype::I32],
+                    CommunicationTensorLimits::new(1, 1, 4, None).unwrap(),
+                    true,
+                )
+                .unwrap(),
                 CommunicationOperationRequirement::barrier(true),
                 CommunicationOperationRequirement::failure_agreement(true),
             ])
@@ -421,7 +427,7 @@ fn mlx_manifest_capabilities_admit_publication_but_fail_closed_on_unsupported_dt
             Some(0),
             CommunicationGroupRequirements::new([CommunicationOperationRequirement::tensors(
                 CommunicationOperation::Broadcast,
-                [TensorDtype::I32],
+                [TensorDtype::U32],
                 CommunicationTensorLimits::new(1, 1, 1, None).unwrap(),
                 true,
             )
@@ -435,8 +441,8 @@ fn mlx_manifest_capabilities_admit_publication_but_fail_closed_on_unsupported_dt
     .with_completion_policy(completion_policy());
     let error = mlx_communication_capabilities()
         .validate_manifest(&unsupported)
-        .expect_err("integer broadcast must be rejected");
-    assert!(error.to_string().contains("I32"));
+        .expect_err("unadvertised integer broadcast must be rejected");
+    assert!(error.to_string().contains("U32"));
 }
 
 #[test]

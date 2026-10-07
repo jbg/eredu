@@ -2,7 +2,6 @@
 
 use std::{
     collections::BTreeMap,
-    fs::File,
     path::{Component, Path, PathBuf},
 };
 
@@ -26,7 +25,7 @@ use super::{canonical_recipes, safetensors_plan, CheckpointLayout, MoshiConfig, 
 /// source, the resolved strict checkpoint contract, and canonical binding
 /// recipes before a concrete backend is selected.
 #[derive(Debug, Clone)]
-pub struct RealtimePreparationPlan {
+pub struct MoshiPreparationPlan {
     artifact_root: PathBuf,
     checkpoint_source: PathBuf,
     config: MoshiConfig,
@@ -39,7 +38,7 @@ pub struct RealtimePreparationPlan {
     metadata_contract_identity: String,
 }
 
-impl RealtimePreparationPlan {
+impl MoshiPreparationPlan {
     /// Submitted artifact directory used to name and identify source files.
     pub fn artifact_root(&self) -> &Path {
         &self.artifact_root
@@ -101,8 +100,8 @@ impl RealtimePreparationPlan {
     }
 
     /// Consumes the preparation into a named materialization artifact.
-    pub fn into_artifact(self) -> RealtimePreparationArtifact {
-        RealtimePreparationArtifact {
+    pub fn into_artifact(self) -> MoshiPreparationArtifact {
+        MoshiPreparationArtifact {
             artifact_root: Some(self.artifact_root),
             checkpoint_source: Some(self.checkpoint_source),
             config: Some(self.config),
@@ -118,7 +117,7 @@ impl RealtimePreparationPlan {
 }
 
 /// Named consuming artifact for realtime materialization inputs.
-pub struct RealtimePreparationArtifact {
+pub struct MoshiPreparationArtifact {
     artifact_root: Option<PathBuf>,
     checkpoint_source: Option<PathBuf>,
     config: Option<MoshiConfig>,
@@ -131,7 +130,7 @@ pub struct RealtimePreparationArtifact {
     metadata_contract_identity: Option<String>,
 }
 
-impl RealtimePreparationArtifact {
+impl MoshiPreparationArtifact {
     /// Takes the submitted artifact root exactly once.
     pub fn take_artifact_root(&mut self) -> PathBuf {
         self.artifact_root
@@ -192,28 +191,31 @@ impl RealtimePreparationArtifact {
 ///
 /// This reads configuration and SafeTensors metadata only. Tensor payloads are
 /// left untouched for the selected backend to materialize.
-pub fn prepare_realtime_model(
+pub(crate) fn prepare_artifact(
     artifact: impl AsRef<Path>,
-) -> Result<RealtimePreparationPlan, RealtimePreparationError> {
-    let artifact_root = artifact.as_ref();
-    if !artifact_root.is_dir() {
-        return Err(RealtimePreparationError::InvalidArtifact(format!(
-            "Moshi artifact must be a directory, got {}",
-            artifact_root.display()
-        )));
-    }
-    let config_path = artifact_root.join("config.json");
-    let config_value = if config_path.exists() {
-        Some(serde_json::from_reader(File::open(&config_path)?)?)
+    config_value: Option<&Value>,
+) -> Result<MoshiPreparationPlan, MoshiPreparationError> {
+    let artifact = artifact.as_ref();
+    let artifact_root = if artifact.is_dir() {
+        artifact
+    } else if artifact.is_file() {
+        artifact.parent().unwrap_or(Path::new("."))
     } else {
-        None
+        return Err(MoshiPreparationError::InvalidArtifact(format!(
+            "Moshi artifact must be an existing directory or SafeTensors file, got {}",
+            artifact.display()
+        )));
     };
-    let config = MoshiConfig::from_config_value(config_value.as_ref())?;
-    let checkpoint_source = checkpoint_source(artifact_root, &config, config_value.as_ref())?;
+    let config = MoshiConfig::from_config_value(config_value)?;
+    let checkpoint_source = if artifact.is_file() {
+        artifact.to_owned()
+    } else {
+        checkpoint_source(artifact_root, &config, config_value)?
+    };
     let catalog = SafetensorsMetadataCatalog::discover(&checkpoint_source)?;
     let admitted_shards = catalog.admitted_shards();
     let mut preparation =
-        prepare_realtime_model_from_catalog(artifact_root, &checkpoint_source, config, &catalog)?;
+        prepare_moshi_from_catalog(artifact_root, &checkpoint_source, config, &catalog)?;
     preparation.admitted_shards = Some(admitted_shards);
     Ok(preparation)
 }
@@ -224,31 +226,31 @@ pub fn prepare_realtime_model(
 /// artifact identities. The catalog is used only for strict SafeTensors schema
 /// admission and canonical recipe publication; this function has no tensor
 /// payload-reading capability.
-pub fn prepare_realtime_model_from_catalog<C>(
+pub fn prepare_moshi_from_catalog<C>(
     artifact_root: impl AsRef<Path>,
     checkpoint_source: impl AsRef<Path>,
     config: MoshiConfig,
     catalog: &C,
-) -> Result<RealtimePreparationPlan, RealtimePreparationError>
+) -> Result<MoshiPreparationPlan, MoshiPreparationError>
 where
     C: SafetensorsCatalog + RecipeCatalog + ?Sized,
 {
     let checkpoint_plan =
-        safetensors_plan(&config).map_err(RealtimePreparationError::InvalidArchitecture)?;
+        safetensors_plan(&config).map_err(MoshiPreparationError::InvalidArchitecture)?;
     let admitted =
         admit_checkpoint(&config, &checkpoint_plan, catalog).map_err(|error| match error {
             CheckpointPreparationError::Schema(validation) => {
-                RealtimePreparationError::InvalidCheckpoint(format!("{validation:?}"))
+                MoshiPreparationError::InvalidCheckpoint(format!("{validation:?}"))
             }
             CheckpointPreparationError::Metadata(error) => {
-                RealtimePreparationError::InvalidCheckpoint(error)
+                MoshiPreparationError::InvalidCheckpoint(error)
             }
             CheckpointPreparationError::Recipes(error) => {
-                RealtimePreparationError::InvalidArchitecture(error)
+                MoshiPreparationError::InvalidArchitecture(error)
             }
         })?;
     let metadata_contract_identity = metadata_contract_identity(&config, &admitted);
-    Ok(RealtimePreparationPlan {
+    Ok(MoshiPreparationPlan {
         artifact_root: artifact_root.as_ref().to_owned(),
         checkpoint_source: checkpoint_source.as_ref().to_owned(),
         config,
@@ -399,7 +401,7 @@ fn checkpoint_source(
     artifact_root: &Path,
     config: &MoshiConfig,
     value: Option<&Value>,
-) -> Result<PathBuf, RealtimePreparationError> {
+) -> Result<PathBuf, MoshiPreparationError> {
     if artifact_root.join("model.safetensors.index.json").exists()
         || config.checkpoint_layout() == CheckpointLayout::PersonaPlexPytorch
     {
@@ -414,7 +416,7 @@ fn checkpoint_source(
     if name.components().count() != 1
         || !matches!(name.components().next(), Some(Component::Normal(_)))
     {
-        return Err(RealtimePreparationError::InvalidArtifact(format!(
+        return Err(MoshiPreparationError::InvalidArtifact(format!(
             "Moshi artifact filename must be a single relative component, got {name:?}"
         )));
     }
@@ -423,7 +425,7 @@ fn checkpoint_source(
 
 /// Failure while architecture code inspects a realtime artifact.
 #[derive(Debug, thiserror::Error)]
-pub enum RealtimePreparationError {
+pub enum MoshiPreparationError {
     /// The submitted directory or filename policy is invalid.
     #[error("invalid Moshi artifact: {0}")]
     InvalidArtifact(String),
@@ -560,7 +562,7 @@ mod tests {
             .unwrap()
             .backing_shard = None;
 
-        let prepared = prepare_realtime_model_from_catalog(
+        let prepared = prepare_moshi_from_catalog(
             "logical/artifact",
             "logical/checkpoint.safetensors",
             config.clone(),
@@ -620,7 +622,7 @@ mod tests {
         );
         assert!(prepared.metadata_contract_identity().starts_with("sha256:"));
         assert_eq!(prepared.metadata_contract_identity().len(), 71);
-        let relocated = prepare_realtime_model_from_catalog(
+        let relocated = prepare_moshi_from_catalog(
             "another/artifact/root",
             "another/checkpoint/location.safetensors",
             config,
@@ -659,7 +661,7 @@ mod tests {
         let missing = checkpoint_plan.common_tensors[0].key.clone();
         catalog.tensors.remove(&missing);
 
-        let error = prepare_realtime_model_from_catalog(
+        let error = prepare_moshi_from_catalog(
             "logical/artifact",
             "logical/checkpoint.safetensors",
             config,
@@ -667,10 +669,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            RealtimePreparationError::InvalidCheckpoint(_)
-        ));
+        assert!(matches!(error, MoshiPreparationError::InvalidCheckpoint(_)));
         assert!(error.to_string().contains(&missing));
     }
 }

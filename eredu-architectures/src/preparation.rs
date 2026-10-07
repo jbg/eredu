@@ -3,8 +3,8 @@
 use std::fmt::Display;
 
 use eredu_checkpoint::schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan};
-use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 use eredu_core::InputModalities;
+use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 #[cfg(test)]
 use serde_json::Value;
 
@@ -143,6 +143,16 @@ pub const fn gguf_composite_artifact_plan(
     use GgufMediaProjectorRequirement::{NotApplicable, Optional, Required};
 
     let (model_modalities, projector_modalities, projector_requirement) = match architecture {
+        GgufArchitecture::VoiceChat => (
+            InputModalities {
+                text: true,
+                image: false,
+                audio: true,
+                video: false,
+            },
+            None,
+            NotApplicable,
+        ),
         GgufArchitecture::Inkling => (
             InputModalities::TEXT,
             Some(InputModalities {
@@ -373,9 +383,9 @@ pub fn prepared_safetensors_floating_state_dtype_source(
         SafetensorsModelConfig::QwenVl(args) => {
             format!("{}.embed_tokens.weight", args.text.parameter_root)
         }
-        SafetensorsModelConfig::Moshi(_) => {
+        SafetensorsModelConfig::Moshi(_) | SafetensorsModelConfig::VoiceChat(_) => {
             return Err(invalid(
-                "Moshi floating-state dtype belongs to the realtime loader contract",
+                "Realtime floating-state dtype belongs to the realtime loader contract",
             ));
         }
         SafetensorsModelConfig::DeepSeekV4(_) => "embed.weight".into(),
@@ -400,6 +410,11 @@ pub fn prepared_gguf_floating_state_dtype_source(
     use crate::configuration::GgufModelConfig;
 
     let parameter = match architecture.model() {
+        GgufModelConfig::VoiceChat(_) => {
+            return Err(invalid(
+                "Realtime floating-state dtype belongs to the realtime loader contract",
+            ));
+        }
         GgufModelConfig::DeepSeekV3(_)
         | GgufModelConfig::DeepSeekV4(_)
         | GgufModelConfig::Gemma4(_)
@@ -582,6 +597,17 @@ pub fn prepared_safetensors_capabilities(
                     0,
                 )
             }
+            SafetensorsModelConfig::VoiceChat(_) => (
+                ParallelCapabilityPlan::default(),
+                false,
+                InputModalities {
+                    text: true,
+                    image: false,
+                    audio: true,
+                    video: false,
+                },
+                0,
+            ),
             SafetensorsModelConfig::Moshi(_) => (
                 ParallelCapabilityPlan::TENSOR_ONLY,
                 false,
@@ -594,8 +620,10 @@ pub fn prepared_safetensors_capabilities(
                 0,
             ),
         };
-    let nonresident_safetensors_quantization =
-        !matches!(architecture.model(), SafetensorsModelConfig::Moshi(_));
+    let nonresident_safetensors_quantization = !matches!(
+        architecture.model(),
+        SafetensorsModelConfig::Moshi(_) | SafetensorsModelConfig::VoiceChat(_)
+    );
     Ok(ArchitectureCapabilities::new(
         parallel,
         independently_addressable_experts,
@@ -637,12 +665,17 @@ pub fn prepared_gguf_capabilities(
         GgufModelConfig::Qwen(args) => args.is_moe(),
         GgufModelConfig::QwenHybrid(args) => args.text.is_moe(),
         GgufModelConfig::Qwen4Exp(_) => true,
+        GgufModelConfig::VoiceChat(_) => false,
         GgufModelConfig::Gemma2(_) | GgufModelConfig::Llama(_) | GgufModelConfig::Nanbeige(_) => {
             false
         }
     };
     ArchitectureCapabilities::new(
-        routed_parallel(routed),
+        if architecture == GgufArchitecture::VoiceChat {
+            ParallelCapabilityPlan::default()
+        } else {
+            routed_parallel(routed)
+        },
         routed,
         false,
         gguf_composite_artifact_plan(architecture)
@@ -675,14 +708,16 @@ mod tests {
     fn gguf_dtype_source_plan() -> GgufCheckpointPlan {
         GgufCheckpointPlan::new(
             "test GGUF architecture",
-            vec![eredu_checkpoint::schema::GgufTensorConstraint::required(
-                "token_embd.weight",
-                vec![32, 16],
-                eredu_checkpoint::schema::GgufTypeConstraint::OperationClass(
-                    eredu_checkpoint::schema::TensorOperation::Matrix,
-                ),
-            )
-            .with_aliases(["released_token_embd.weight"])],
+            vec![
+                eredu_checkpoint::schema::GgufTensorConstraint::required(
+                    "token_embd.weight",
+                    vec![32, 16],
+                    eredu_checkpoint::schema::GgufTypeConstraint::OperationClass(
+                        eredu_checkpoint::schema::TensorOperation::Matrix,
+                    ),
+                )
+                .with_aliases(["released_token_embd.weight"]),
+            ],
             Vec::new(),
             eredu_checkpoint::schema::CatalogPolicy::strict(),
         )
@@ -932,9 +967,11 @@ mod tests {
             &unknown,
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("did not find floating-state dtype source"));
+        assert!(
+            error
+                .to_string()
+                .contains("did not find floating-state dtype source")
+        );
 
         let ambiguous = TensorCatalog::new([
             tensor("released.embedding.weight", TensorDtype::F16),

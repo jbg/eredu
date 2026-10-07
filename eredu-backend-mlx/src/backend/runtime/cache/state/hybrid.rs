@@ -627,6 +627,27 @@ pub struct MlxHybridState {
 }
 
 impl MlxHybridState {
+    pub(super) fn has_same_snapshot_layout(&self, other: &Self) -> bool {
+        self.layout == other.layout
+            && self.global_layer_start == other.global_layer_start
+            && self.layers.len() == other.layers.len()
+            && self.layers.iter().zip(&other.layers).all(|(a, b)| {
+                std::mem::discriminant(&a.attention) == std::mem::discriminant(&b.attention)
+                    && match (&a.attention, &b.attention) {
+                        (
+                            Some(MlxHybridAttentionState::KeyValue(a)),
+                            Some(MlxHybridAttentionState::KeyValue(b)),
+                        ) => std::mem::discriminant(a) == std::mem::discriminant(b),
+                        (
+                            Some(MlxHybridAttentionState::Compressed(_)),
+                            Some(MlxHybridAttentionState::Compressed(_)),
+                        )
+                        | (None, None) => true,
+                        _ => false,
+                    }
+            })
+    }
+
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.layers
             .iter()

@@ -44,7 +44,11 @@ pub struct Group {
     pub(super) logical: Option<LogicalSubgroup>,
     pub(super) contract: Option<ManifestGroupContract>,
     pub(super) completion: Option<CommunicationCompletionPolicy>,
+    local_phase: Option<Rc<LocalPhaseAgreement>>,
 }
+
+type LocalPhaseAgreement =
+    dyn Fn([u64; 8], bool, &Stream) -> std::result::Result<bool, eredu_core::BackendFailure>;
 
 #[derive(Debug, Clone)]
 pub(super) struct ManifestGroupContract {
@@ -75,6 +79,32 @@ impl Group {
             logical: None,
             contract: None,
             completion: None,
+            local_phase: None,
+        }
+    }
+
+    /// Installs the selected communicator's retained failure authority on this clone.
+    pub(crate) fn with_local_phase_agreement(mut self, agreement: Rc<LocalPhaseAgreement>) -> Self {
+        self.local_phase = Some(agreement);
+        self
+    }
+
+    /// Whether data collectives share transport with retained local-phase agreement.
+    pub(crate) fn has_local_phase_agreement(&self) -> bool {
+        self.local_phase.is_some()
+    }
+
+    /// Agrees local preparation before any peer enters a dependent data collective.
+    /// Legacy groups without a retained authority preserve their ordinary behavior.
+    pub(crate) fn agree_local_phase(
+        &self,
+        descriptor: [u64; 8],
+        success: bool,
+        context: &Stream,
+    ) -> std::result::Result<bool, eredu_core::BackendFailure> {
+        match &self.local_phase {
+            Some(agreement) => agreement(descriptor, success, context),
+            None => Ok(success),
         }
     }
 
@@ -196,6 +226,7 @@ impl Group {
             logical: None,
             contract: None,
             completion: self.completion,
+            local_phase: None,
         })
     }
 
@@ -243,6 +274,7 @@ impl Group {
             }),
             contract: None,
             completion: self.completion,
+            local_phase: None,
         })
     }
 

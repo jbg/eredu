@@ -846,7 +846,7 @@ where
         let requirements = selected.requirements();
         let expected = RealtimeArchitectureConstructionIdentity::new(
             requirements.architecture().clone(),
-            requirements.speech_schedule_identity().clone(),
+            requirements.frame_contract().policy_identity().clone(),
             requirements.state_layout_identity().clone(),
         );
         if actual != expected {

@@ -47,30 +47,45 @@ where
     ) -> Result<Self::Retained, Self::Error>;
 }
 
-/// Narrow exact-completion mechanism for a fully interpreted frame.
+/// Native exact-completion mechanism consuming a typed resource bundle.
 ///
-/// The mechanism may retain output, history, and model-state native resources,
-/// but it cannot inspect portable frame source/target semantics.
-pub trait RealtimeFrameCompletionMechanism<T, M, R> {
+/// The caller supplies all resources whose lifetime crosses submission. The
+/// mechanism records completion without interpreting architecture channels or
+/// advancing portable state. Bundles may contain mixed component outputs.
+pub trait RealtimeCompletionMechanism<R> {
     /// Exact completion object attached to the generation branch.
     type Completion;
     /// Native submission or retention failure.
     type Error;
 
-    /// Submits or records all work required by the completed unpublished frame.
+    /// Submits or records work while retaining every possibly live resource.
     fn complete(
         &mut self,
-        input: MaterializedRealtimeInput<T>,
-        output: &CompletedRealtimeFrame<T, T>,
-        model_state: &M,
-        payload_history: &RealtimePayloadHistory<T>,
-        execution: Option<R>,
+        resources: R,
     ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>;
 
     /// Reports the exact number of resources explicitly owned by a completion.
     fn retained_resources(&self, _completion: &Self::Completion) -> usize {
         0
     }
+}
+
+/// Resources submitted by the ordered categorical frame interpreter.
+///
+/// Other architecture coordinators use their own typed bundles with
+/// [`RealtimeCompletionMechanism`]. Borrowed resources must be retained by the
+/// completion before this bundle is released.
+pub struct RealtimeFrameResources<'a, T, M, R> {
+    /// Materialized ingress retained through completion.
+    pub input: MaterializedRealtimeInput<T>,
+    /// Validated output channels and diagnostics.
+    pub output: &'a CompletedRealtimeFrame<T, T>,
+    /// Unpublished model/cache state.
+    pub model_state: &'a M,
+    /// Delayed payload history associated with the candidate transition.
+    pub payload_history: &'a RealtimePayloadHistory<T>,
+    /// Additional architecture execution resources.
+    pub execution: Option<R>,
 }
 
 /// Failure before completion creation or after native work already began.
@@ -98,16 +113,72 @@ impl<C, E> RealtimeCompletionCreationError<C, E> {
     }
 }
 
+/// Submission failure which preserves exact quarantine ownership in the branch.
+#[derive(Debug, thiserror::Error)]
+pub enum RealtimeOutputSubmissionError<E> {
+    /// No work escaped the completion operation.
+    #[error("realtime completion failed before submission")]
+    BeforeSubmission(#[source] E),
+    /// Work began; its completion is attached to the unpublished branch.
+    #[error("realtime completion failed after submission")]
+    AfterSubmission(#[source] E),
+    /// A submission was already attached; the submit callback is not invoked.
+    #[error(transparent)]
+    Attachment(RealtimeCompletionAttachmentError),
+}
+
+/// Packages an architecture output with exact completion for the shared scheduler.
+///
+/// The callback retains native input, cache and output resources before returning
+/// an exact completion and resource count. A failure after submission attaches
+/// its quarantine completion to the same branch. This does not publish state or
+/// acquire another scheduler lease. Host validation remains the observer's duty.
+pub fn submit_realtime_output<M, Q, P, S, R, C, O, E>(
+    branch: &mut RealtimeGenerationBranch<M, Q, P, S, R, C>,
+    output: O,
+    submit: impl FnOnce(&M, &O) -> Result<(C, usize), RealtimeCompletionCreationError<C, E>>,
+) -> Result<SubmittedRealtimeFrame<O, C>, RealtimeOutputSubmissionError<E>>
+where
+    Q: crate::RealtimeScheduleState,
+    C: Clone,
+{
+    if branch.has_submission_completion() {
+        return Err(RealtimeOutputSubmissionError::Attachment(
+            RealtimeCompletionAttachmentError::AlreadyAttached,
+        ));
+    }
+    let (completion, retained_resources) = match submit(branch.model_state(), &output) {
+        Ok(result) => result,
+        Err(RealtimeCompletionCreationError::BeforeSubmission(error)) => {
+            return Err(RealtimeOutputSubmissionError::BeforeSubmission(error))
+        }
+        Err(RealtimeCompletionCreationError::AfterSubmission { error, completion }) => {
+            branch
+                .attach_submission_completion(completion)
+                .map_err(RealtimeOutputSubmissionError::Attachment)?;
+            return Err(RealtimeOutputSubmissionError::AfterSubmission(error));
+        }
+    };
+    branch
+        .attach_submission_completion(completion.clone())
+        .map_err(RealtimeOutputSubmissionError::Attachment)?;
+    Ok(SubmittedRealtimeFrame {
+        frame: output,
+        completion,
+        retained_resources,
+    })
+}
+
 /// One completed native frame paired with the exact completion tracked by the scheduler.
 pub struct SubmittedRealtimeFrame<T, C> {
-    frame: CompletedRealtimeFrame<T, T>,
+    frame: T,
     completion: C,
     retained_resources: usize,
 }
 
 impl<T, C> SubmittedRealtimeFrame<T, C> {
     /// Returns native output values before portable host observation.
-    pub const fn frame(&self) -> &CompletedRealtimeFrame<T, T> {
+    pub const fn frame(&self) -> &T {
         &self.frame
     }
 
@@ -117,7 +188,7 @@ impl<T, C> SubmittedRealtimeFrame<T, C> {
     }
 
     /// Consumes the scheduler output into native frame values and exact completion.
-    pub fn into_parts(self) -> (CompletedRealtimeFrame<T, T>, C) {
+    pub fn into_parts(self) -> (T, C) {
         (self.frame, self.completion)
     }
 }
@@ -149,10 +220,7 @@ pub trait RealtimeFrameHostObserver<T> {
     type Error: std::error::Error + 'static;
 
     /// Observes one exactly completed native frame.
-    fn observe(
-        &mut self,
-        frame: &CompletedRealtimeFrame<T, T>,
-    ) -> Result<Self::Output, Self::Error>;
+    fn observe(&mut self, frame: &T) -> Result<Self::Output, Self::Error>;
 }
 
 enum HostObservationState<H: RealtimeFrameHostObserver<T>, T> {
@@ -199,6 +267,109 @@ where
             HostObservationState::Failed(error) => {
                 Err(RealtimeHostOutputUnavailable::Observation(error))
             }
+        }
+    }
+
+    /// Adds host policy validation before this transition can publish its state.
+    ///
+    /// The mapping runs exactly once after successful host observation, and its
+    /// failure follows the scheduler's ordinary failed-transition path. A gate
+    /// already observed successfully is mapped immediately; a failed gate keeps
+    /// its original failure without invoking the mapping. Native output and exact
+    /// completion resources stay retained by the returned gate in every case.
+    pub fn map_host_output<F, O, E>(
+        self,
+        map: F,
+    ) -> PrepublicationRealtimeFrame<T, C, MappedRealtimeFrameHostObserver<H, F>>
+    where
+        F: FnOnce(H::Output) -> Result<O, E>,
+        E: std::error::Error + 'static,
+    {
+        let observation = match self.observation.into_inner() {
+            HostObservationState::Pending(observer) => {
+                HostObservationState::Pending(MappedRealtimeFrameHostObserver {
+                    observer,
+                    map: Some(map),
+                })
+            }
+            HostObservationState::Ready(output) => match map(output) {
+                Ok(output) => HostObservationState::Ready(output),
+                Err(error) => HostObservationState::Failed(Arc::new(
+                    RealtimeHostOutputMappingError::Mapping(error),
+                )),
+            },
+            HostObservationState::Failed(error) => HostObservationState::Failed(Arc::new(
+                RealtimeHostOutputMappingError::Observation(error),
+            )),
+        };
+        PrepublicationRealtimeFrame {
+            submitted: self.submitted,
+            observation: RefCell::new(observation),
+        }
+    }
+}
+
+/// Composed host observer returned by
+/// [`PrepublicationRealtimeFrame::map_host_output`]. Its one-shot mapping sees
+/// only host values; execution and native lifetime ownership remain unchanged.
+pub struct MappedRealtimeFrameHostObserver<H, F> {
+    observer: H,
+    map: Option<F>,
+}
+
+impl<T, H, F, O, E> RealtimeFrameHostObserver<T> for MappedRealtimeFrameHostObserver<H, F>
+where
+    H: RealtimeFrameHostObserver<T>,
+    F: FnOnce(H::Output) -> Result<O, E>,
+    E: std::error::Error + 'static,
+{
+    type Output = O;
+    type Error = RealtimeHostOutputMappingError<H::Error, E>;
+
+    fn observe(&mut self, frame: &T) -> Result<Self::Output, Self::Error> {
+        let output = self
+            .observer
+            .observe(frame)
+            .map_err(|error| RealtimeHostOutputMappingError::Observation(Arc::new(error)))?;
+        self.map
+            .take()
+            .expect("prepublication observers run only once")(output)
+        .map_err(RealtimeHostOutputMappingError::Mapping)
+    }
+}
+
+/// Original host observation or subsequent host-policy rejection, preserving
+/// the original error as its source in either case.
+#[derive(Debug)]
+pub enum RealtimeHostOutputMappingError<O, M> {
+    /// Native-to-host observation failed before the mapping ran.
+    Observation(Arc<O>),
+    /// Host-policy validation rejected the observed candidate.
+    Mapping(M),
+}
+
+impl<O: std::fmt::Display, M: std::fmt::Display> std::fmt::Display
+    for RealtimeHostOutputMappingError<O, M>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Observation(error) => {
+                write!(formatter, "realtime host observation failed: {error}")
+            }
+            Self::Mapping(error) => {
+                write!(formatter, "realtime host output mapping failed: {error}")
+            }
+        }
+    }
+}
+
+impl<O: std::error::Error + 'static, M: std::error::Error + 'static> std::error::Error
+    for RealtimeHostOutputMappingError<O, M>
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(error) => Some(error.as_ref()),
+            Self::Mapping(error) => Some(error),
         }
     }
 }
@@ -383,11 +554,18 @@ impl RealtimeDecisionExecution {
 /// on any returned error the caller **must discard the entire branch**; the fair
 /// scheduler's submission path already enforces that rule.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn execute_realtime_frame<B, S, M, T, C, H, F, E, K>(
+pub fn execute_realtime_frame<B, S, M, T, C, H, F, E, K, KE>(
     contract: &RealtimeIngressContract,
     payload_contract: &RealtimePayloadContract,
     frame: &RealtimeInputFrame,
-    branch: &mut RealtimeGenerationBranch<RealtimePayloadBranch<M, T>, S, B::RandomState, C>,
+    branch: &mut RealtimeGenerationBranch<
+        RealtimePayloadBranch<M, T>,
+        eredu_core::RealtimeFrameScheduleState,
+        eredu_core::RealtimeSampling,
+        S,
+        B::RandomState,
+        C,
+    >,
     decisions: &RealtimeDecisionExecution,
     host_materializer: &mut H,
     tensor_mechanisms: &mut F,
@@ -395,8 +573,8 @@ pub fn execute_realtime_frame<B, S, M, T, C, H, F, E, K>(
     completion_mechanism: &mut K,
     context: &B::Context,
 ) -> Result<
-    SubmittedRealtimeFrame<T, C>,
-    RealtimeFrameCoordinatorError<H::Error, F::Error, E::Error, B::Error, K::Error>,
+    SubmittedRealtimeFrame<CompletedRealtimeFrame<T, T>, C>,
+    RealtimeFrameCoordinatorError<H::Error, F::Error, E::Error, B::Error, KE>,
 >
 where
     B: SamplingBackend<Token = T, Logits = T>,
@@ -407,7 +585,11 @@ where
     H: RealtimeHostTokenMaterializer<Tensor = T>,
     F: RealtimeFrameTensorMechanisms<Tensor = T>,
     E: PreparedRealtimeFrameExecutor<B, S, M>,
-    K: RealtimeFrameCompletionMechanism<T, M, E::Retained, Completion = C>,
+    K: for<'a> RealtimeCompletionMechanism<
+        RealtimeFrameResources<'a, T, M, E::Retained>,
+        Completion = C,
+        Error = KE,
+    >,
 {
     if branch.has_submission_completion() {
         return Err(RealtimeFrameCoordinatorError::CompletionAttachment(
@@ -422,7 +604,12 @@ where
                 RealtimeFrameInterpretationError::Schedule(error),
             )
         })?;
-    if payload_contract.schedule() != contract.schedule() {
+    if branch.contract().identity() != contract.schedule()
+        || branch.contract().sampler_count() != contract.schedule().depth_audio_codebooks() + 1
+    {
+        return Err(RealtimeFrameCoordinatorError::GenerationContractMismatch);
+    }
+    if payload_contract.schedule() != contract.channels() {
         return Err(RealtimeFrameCoordinatorError::PayloadContract(
             RealtimePayloadContractError::ScheduleMismatch,
         ));
@@ -430,16 +617,6 @@ where
     if payload_contract.batch().get() != frame.batch() {
         return Err(RealtimeFrameCoordinatorError::PayloadContract(
             RealtimePayloadContractError::BatchMismatch,
-        ));
-    }
-    if payload_contract.text_domain() != contract.text_domain() {
-        return Err(RealtimeFrameCoordinatorError::PayloadContract(
-            RealtimePayloadContractError::TextDomainMismatch,
-        ));
-    }
-    if payload_contract.audio_domain() != contract.audio_domain() {
-        return Err(RealtimeFrameCoordinatorError::PayloadContract(
-            RealtimePayloadContractError::AudioDomainMismatch,
         ));
     }
     let mut payload_history = branch.model_state().payload_history().clone();
@@ -460,7 +637,7 @@ where
     let schedule = contract.schedule();
     let mut schedule_state = branch.schedule_state().clone();
     let prepared = prepare_realtime_frame(
-        schedule,
+        contract,
         &mut schedule_state,
         &mut payload_history,
         &input,
@@ -534,44 +711,41 @@ where
         )
     };
 
-    let completion = match completion_mechanism.complete(
-        input,
-        &completed,
-        branch.model_state_mut().model_state(),
-        &payload_history,
-        execution_retained,
-    ) {
-        Ok(completion) => completion,
-        Err(RealtimeCompletionCreationError::BeforeSubmission(error)) => {
-            return Err(RealtimeFrameCoordinatorError::Completion(error));
+    let submitted = submit_realtime_output(branch, completed, |model, output| {
+        let completion = completion_mechanism.complete(RealtimeFrameResources {
+            input,
+            output,
+            model_state: model.model_state(),
+            payload_history: &payload_history,
+            execution: execution_retained,
+        })?;
+        let retained_resources = completion_mechanism.retained_resources(&completion);
+        Ok((completion, retained_resources))
+    })
+    .map_err(|error| match error {
+        RealtimeOutputSubmissionError::BeforeSubmission(error) => {
+            RealtimeFrameCoordinatorError::Completion(error)
         }
-        Err(RealtimeCompletionCreationError::AfterSubmission { error, completion }) => {
-            branch
-                .attach_submission_completion(completion)
-                .map_err(RealtimeFrameCoordinatorError::CompletionAttachment)?;
-            return Err(RealtimeFrameCoordinatorError::CompletionAfterSubmission(
-                error,
-            ));
+        RealtimeOutputSubmissionError::AfterSubmission(error) => {
+            RealtimeFrameCoordinatorError::CompletionAfterSubmission(error)
         }
-    };
-    let retained_resources = completion_mechanism.retained_resources(&completion);
+        RealtimeOutputSubmissionError::Attachment(error) => {
+            RealtimeFrameCoordinatorError::CompletionAttachment(error)
+        }
+    })?;
 
     *branch.schedule_state_mut() = schedule_state;
     *branch.model_state_mut().payload_history_mut() = payload_history;
-    branch
-        .attach_submission_completion(completion.clone())
-        .map_err(RealtimeFrameCoordinatorError::CompletionAttachment)?;
-    Ok(SubmittedRealtimeFrame {
-        frame: completed,
-        completion,
-        retained_resources,
-    })
+    Ok(submitted)
 }
 
 /// Failure while coordinating an unpublished complete realtime frame.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeFrameCoordinatorError<H, F, E, B, K> {
+    /// The branch's admitted schedule identity or decision count differs.
+    #[error("realtime generation contract differs from the selected frame policy")]
+    GenerationContractMismatch,
     /// Session payload identity did not match ingress or accepted batch.
     #[error(transparent)]
     PayloadContract(RealtimePayloadContractError),
@@ -595,10 +769,10 @@ pub enum RealtimeFrameCoordinatorError<H, F, E, B, K> {
     Model(E),
     /// Exact completion creation or resource retention failed.
     #[error("realtime exact completion creation failed")]
-    Completion(K),
+    Completion(#[source] K),
     /// Native completion creation failed after work began; the branch owns quarantine evidence.
     #[error("realtime exact completion creation failed after native submission")]
-    CompletionAfterSubmission(K),
+    CompletionAfterSubmission(#[source] K),
     /// The caller supplied a branch which already represented a submission.
     #[error(transparent)]
     CompletionAttachment(RealtimeCompletionAttachmentError),
@@ -655,41 +829,11 @@ mod tests {
         type Tensor = Matrix;
         type Error = MechanismError;
 
-        fn column(
-            &mut self,
-            matrix: &Self::Tensor,
-            column: usize,
-        ) -> Result<Self::Tensor, Self::Error> {
-            self.calls += 1;
-            let columns = matrix.shape[1];
-            Ok(Matrix {
-                values: (0..matrix.shape[0])
-                    .map(|row| matrix.values[row * columns + column])
-                    .collect(),
-                shape: [matrix.shape[0], 1],
-            })
-        }
-
         fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
             self.calls += 1;
             Ok(Matrix {
                 values: vec![token; batch],
                 shape: [batch, 1],
-            })
-        }
-
-        fn stack_columns(
-            &mut self,
-            columns: &[Self::Tensor],
-            batch: usize,
-        ) -> Result<Self::Tensor, Self::Error> {
-            self.calls += 1;
-            let values = (0..batch)
-                .flat_map(|row| columns.iter().map(move |column| column.values[row]))
-                .collect();
-            Ok(Matrix {
-                values,
-                shape: [batch, columns.len()],
             })
         }
     }
@@ -942,19 +1086,18 @@ mod tests {
         waits: Rc<Cell<usize>>,
     }
 
-    impl RealtimeFrameCompletionMechanism<Matrix, ModelState, Matrix> for CompletionMechanism {
+    impl RealtimeCompletionMechanism<RealtimeFrameResources<'_, Matrix, ModelState, Matrix>>
+        for CompletionMechanism
+    {
         type Completion = TestCompletion;
         type Error = CompletionError;
 
         fn complete(
             &mut self,
-            _input: MaterializedRealtimeInput<Matrix>,
-            _output: &CompletedRealtimeFrame<Matrix, Matrix>,
-            _model_state: &ModelState,
-            _payload_history: &RealtimePayloadHistory<Matrix>,
-            execution: Option<Matrix>,
+            resources: RealtimeFrameResources<'_, Matrix, ModelState, Matrix>,
         ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>
         {
+            let execution = resources.execution;
             self.calls += 1;
             if let Some(execution) = execution {
                 self.retained_calls += 1;
@@ -1006,7 +1149,7 @@ mod tests {
         fail: bool,
     }
 
-    impl RealtimeFrameHostObserver<Matrix> for Observer {
+    impl RealtimeFrameHostObserver<CompletedRealtimeFrame<Matrix, Matrix>> for Observer {
         type Output = Vec<i32>;
         type Error = ObservationError;
 
@@ -1018,7 +1161,11 @@ mod tests {
             if self.fail {
                 Err(ObservationError)
             } else {
-                Ok(frame.text().values.clone())
+                Ok(frame
+                    .value(eredu_core::RealtimeChannelId::new(0))
+                    .unwrap()
+                    .values
+                    .clone())
             }
         }
     }
@@ -1052,6 +1199,8 @@ mod tests {
 
     type Generation = RealtimeGenerationState<
         RealtimePayloadState<ModelState, Matrix>,
+        eredu_core::RealtimeFrameScheduleState,
+        eredu_core::RealtimeSampling,
         TestSampler,
         usize,
         TestCompletion,
@@ -1067,13 +1216,17 @@ mod tests {
                 executions: 0,
                 discards,
             },
-            RealtimePayloadHistory::new(schedule.clone()),
-            schedule,
+            RealtimePayloadHistory::new(contract(schedule).channels().clone()),
+            contract(schedule).channels(),
         )
         .unwrap();
         Generation::new(
             payload,
-            schedule.clone(),
+            crate::RealtimeGenerationContract::new(
+                schedule.clone(),
+                schedule.depth_audio_codebooks() + 1,
+            ),
+            eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
             eredu_core::RealtimeSampling::greedy(),
             vec![TestSampler, TestSampler],
             Some(0),
@@ -1088,10 +1241,15 @@ mod tests {
 
     fn payload_contract(schedule: &RealtimeSpeechConfig) -> RealtimePayloadContract {
         RealtimePayloadContract::new(
-            schedule.clone(),
+            RealtimeIngressContract::new(
+                schedule.clone(),
+                TokenDomain::new(10),
+                TokenDomain::new(9),
+            )
+            .unwrap()
+            .channels()
+            .clone(),
             1,
-            TokenDomain::new(10),
-            TokenDomain::new(9),
             RealtimePayloadGeneration::new(1).unwrap(),
             RealtimePayloadOwnerIdentity::new(1).unwrap(),
         )
@@ -1104,7 +1262,9 @@ mod tests {
             .with_partially_forced_generated_audio(vec![5], vec![false])
     }
 
-    fn submitted_test_frame<C>(completion: C) -> SubmittedRealtimeFrame<Matrix, C> {
+    fn submitted_test_frame<C>(
+        completion: C,
+    ) -> SubmittedRealtimeFrame<CompletedRealtimeFrame<Matrix, Matrix>, C> {
         let schedule = schedule(RealtimeFrameConvention::FeedbackAlignedHistory);
         let state = state(&schedule, Rc::new(Cell::new(0)));
         let mut branch = state.branch().unwrap();
@@ -1115,7 +1275,7 @@ mod tests {
             calls: 0,
         };
         let mut completion_mechanism = CompletionMechanism::default();
-        let submitted = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+        let submitted = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
             &contract(&schedule),
             &payload_contract(&schedule),
             &frame(),
@@ -1154,7 +1314,7 @@ mod tests {
         };
         let mut completion = CompletionMechanism::default();
 
-        let output = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+        let output = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
             &contract(&schedule),
             &payload_contract(&schedule),
             &frame(),
@@ -1168,8 +1328,22 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.frame().text().values, vec![3]);
-        assert_eq!(output.frame().sampled_audio().values, vec![6]);
+        assert_eq!(
+            output
+                .frame()
+                .value(eredu_core::RealtimeChannelId::new(0))
+                .unwrap()
+                .values,
+            vec![3]
+        );
+        assert_eq!(
+            output
+                .frame()
+                .value(eredu_core::RealtimeChannelId::new(1))
+                .unwrap()
+                .values,
+            vec![6]
+        );
         assert_eq!(executor.calls, 1);
         assert_eq!(completion.calls, 1);
         assert_eq!(completion.retained_calls, 1);
@@ -1199,7 +1373,7 @@ mod tests {
         let mut completion = CompletionMechanism::default();
 
         assert!(matches!(
-            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
                 &contract(&schedule),
                 &payload_contract(&schedule),
                 &frame(),
@@ -1218,6 +1392,38 @@ mod tests {
         assert!(state.model_state().payload_history().is_empty());
         assert_eq!(completion.calls, 0);
 
+        Generation::discard_branch(branch).unwrap();
+        assert_eq!(discards.get(), 1);
+    }
+
+    #[test]
+    fn output_submission_failure_before_work_does_not_attach_completion() {
+        let schedule = schedule(RealtimeFrameConvention::FeedbackAlignedHistory);
+        let discards = Rc::new(Cell::new(0));
+        let state = state(&schedule, discards.clone());
+        let mut branch = state.branch().unwrap();
+        let output = (vec![0.25_f32, -0.5], vec!["transcription".to_owned()]);
+        let mut submissions = 0;
+        let error = match submit_realtime_output(&mut branch, output, |_, output| {
+            submissions += 1;
+            assert_eq!(output.0, [0.25, -0.5]);
+            Err(RealtimeCompletionCreationError::before_submission(
+                CompletionError,
+            ))
+        }) {
+            Ok(_) => panic!("failed submission produced an output"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RealtimeOutputSubmissionError::BeforeSubmission(CompletionError)
+        ));
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .is::<CompletionError>());
+        assert_eq!(submissions, 1);
+        assert!(!branch.has_submission_completion());
+        assert_eq!(state.schedule_state().frontier(), 0);
         Generation::discard_branch(branch).unwrap();
         assert_eq!(discards.get(), 1);
     }
@@ -1242,7 +1448,7 @@ mod tests {
         };
 
         assert!(matches!(
-            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
                 &contract(&schedule),
                 &payload_contract(&schedule),
                 &frame(),
@@ -1282,7 +1488,7 @@ mod tests {
         };
         let mut completion = CompletionMechanism::default();
 
-        let output = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+        let output = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
             &contract(&schedule),
             &payload_contract(&schedule),
             &frame(),
@@ -1299,7 +1505,14 @@ mod tests {
         assert_eq!(executor.calls, 0);
         assert_eq!(completion.calls, 1);
         assert_eq!(completion.retained_calls, 0);
-        assert_eq!(output.frame().text().values, vec![9]);
+        assert_eq!(
+            output
+                .frame()
+                .value(eredu_core::RealtimeChannelId::new(0))
+                .unwrap()
+                .values,
+            vec![9]
+        );
         assert_eq!(branch.schedule_state().frontier(), 1);
     }
 
@@ -1320,7 +1533,7 @@ mod tests {
         let mut completion = CompletionMechanism::default();
 
         assert!(matches!(
-            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
                 &contract(&active_schedule),
                 &payload_contract(&active_schedule),
                 &frame(),
@@ -1344,7 +1557,7 @@ mod tests {
         let mut branch = state.branch().unwrap();
         let mismatched = schedule(RealtimeFrameConvention::AbsoluteDelayedSlots);
         assert!(matches!(
-            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
                 &contract(&mismatched),
                 &payload_contract(&mismatched),
                 &frame(),
@@ -1364,6 +1577,49 @@ mod tests {
         assert_eq!(tensors.calls, 0);
         assert_eq!(executor.calls, 0);
         assert_eq!(completion.calls, 0);
+    }
+
+    #[test]
+    fn categorical_executor_rejects_a_different_decision_contract_before_materialization() {
+        let schedule = schedule(RealtimeFrameConvention::FeedbackAlignedHistory);
+        let original = state(&schedule, Rc::new(Cell::new(0)));
+        let wrong_count = Generation::new(
+            original.model_state().clone(),
+            crate::RealtimeGenerationContract::new(schedule.clone(), 1),
+            eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
+            eredu_core::RealtimeSampling::greedy(),
+            vec![TestSampler],
+            None,
+        )
+        .unwrap();
+        let mut branch = wrong_count.branch().unwrap();
+        let mut host = Mechanisms::default();
+        let mut tensors = Mechanisms::default();
+        let mut executor = Executor {
+            fail: false,
+            calls: 0,
+        };
+        let mut completion = CompletionMechanism::default();
+        assert!(matches!(
+            execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _, _>(
+                &contract(&schedule),
+                &payload_contract(&schedule),
+                &frame(),
+                &mut branch,
+                &RealtimeDecisionExecution::new(true),
+                &mut host,
+                &mut tensors,
+                &mut executor,
+                &mut completion,
+                &(),
+            ),
+            Err(RealtimeFrameCoordinatorError::GenerationContractMismatch)
+        ));
+        assert_eq!(host.calls, 0);
+        assert_eq!(tensors.calls, 0);
+        assert_eq!(executor.calls, 0);
+        assert_eq!(completion.calls, 0);
+        assert_eq!(branch.schedule_state().frontier(), 0);
     }
 
     #[test]
@@ -1526,5 +1782,271 @@ mod tests {
         assert_eq!(observer_calls.get(), 1);
         let (_, _, transition) = progress.committed.pop().unwrap();
         assert_eq!(transition.into_host_output().unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn host_output_mapping_preserves_pending_ready_and_failed_observations() {
+        for initial in ["pending", "ready", "failed"] {
+            let ready = Rc::new(Cell::new(initial != "pending"));
+            let waits = Rc::new(Cell::new(0));
+            let retained_completion = Rc::downgrade(&waits);
+            let observer_calls = Rc::new(Cell::new(0));
+            let mapper_calls = Rc::new(Cell::new(0));
+            let transition = PrepublicationRealtimeFrame::new(
+                submitted_test_frame(ControlledCompletion {
+                    ready: ready.clone(),
+                    fail_wait: false,
+                    waits,
+                }),
+                Observer {
+                    calls: observer_calls.clone(),
+                    fail: initial == "failed",
+                },
+            );
+            if initial != "pending" {
+                assert_eq!(transition.is_complete().is_ok(), initial == "ready");
+            }
+            let mapped_calls = mapper_calls.clone();
+            let mapped = transition.map_host_output(move |values| {
+                mapped_calls.set(mapped_calls.get() + 1);
+                Ok::<_, ObservationError>(values[0] + 10)
+            });
+            if initial == "pending" {
+                assert!(!mapped.is_complete().unwrap());
+                assert_eq!(mapper_calls.get(), 0);
+                ready.set(true);
+            }
+            if initial == "failed" {
+                let first = mapped.is_complete().unwrap_err();
+                let second = mapped.is_complete().unwrap_err();
+                assert_eq!(first.to_string(), second.to_string());
+                assert_eq!(mapper_calls.get(), 0);
+                assert!(std::error::Error::source(&first)
+                    .and_then(std::error::Error::source)
+                    .is_some_and(|source| source.is::<ObservationError>()));
+                assert!(retained_completion.upgrade().is_some());
+                drop(mapped);
+            } else {
+                assert!(mapped.is_complete().unwrap());
+                assert!(mapped.is_complete().unwrap());
+                assert_eq!(mapper_calls.get(), 1);
+                assert!(retained_completion.upgrade().is_some());
+                assert_eq!(mapped.into_host_output().unwrap(), 13);
+            }
+            assert_eq!(observer_calls.get(), 1);
+            assert!(retained_completion.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn host_output_mapping_failure_prevents_scheduler_publication() {
+        let request = RequestId::new(9);
+        let published = Rc::new(Cell::new(0));
+        let discards = Rc::new(Cell::new(0));
+        let mapper_calls = Rc::new(Cell::new(0));
+        let mut scheduler = Scheduler::new(SchedulerLimits::new(1, 1).unwrap()).unwrap();
+        scheduler
+            .register(
+                request,
+                PublicationState {
+                    value: 0,
+                    published: published.clone(),
+                    discards: discards.clone(),
+                },
+            )
+            .unwrap();
+        scheduler.enqueue(request, frame()).unwrap();
+        let progress = scheduler
+            .run_local_turn(Instant::now(), |_, _, branch| {
+                branch.value += 1;
+                let calls = mapper_calls.clone();
+                let output = PrepublicationRealtimeFrame::new(
+                    submitted_test_frame(TestCompletion::default()),
+                    Observer {
+                        calls: Rc::new(Cell::new(0)),
+                        fail: false,
+                    },
+                )
+                .map_host_output(move |values| {
+                    assert_eq!(values, vec![3]);
+                    calls.set(calls.get() + 1);
+                    Err::<(), _>(ObservationError)
+                });
+                assert!(output.is_complete().is_err());
+                assert!(output.is_complete().is_err());
+                Ok::<_, Infallible>(output)
+            })
+            .unwrap();
+        assert!(progress.committed.is_empty());
+        assert_eq!(progress.failed.len(), 1);
+        assert_eq!(published.get(), 0);
+        assert_eq!(discards.get(), 1);
+        assert_eq!(mapper_calls.get(), 1);
+    }
+
+    #[test]
+    fn mixed_channel_output_preserves_coordinates_and_gates_commit_on_host_validation() {
+        use crate::{
+            validate_completed_realtime_host_frame, RealtimeChannelIngressError,
+            RealtimeFrameChannel, RealtimeHostChannelValues,
+        };
+        use eredu_core::{
+            RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelId,
+            RealtimeChannelLayout, RealtimeChannelPayload, RealtimeSlotCoordinate,
+        };
+
+        struct MixedObserver(Rc<Cell<usize>>);
+        impl
+            RealtimeFrameHostObserver<
+                CompletedRealtimeFrame<RealtimeHostChannelValues, RealtimeHostChannelValues>,
+            > for MixedObserver
+        {
+            type Output =
+                CompletedRealtimeFrame<RealtimeHostChannelValues, RealtimeHostChannelValues>;
+            type Error = RealtimeChannelIngressError;
+            fn observe(&mut self, frame: &Self::Output) -> Result<Self::Output, Self::Error> {
+                self.0.set(self.0.get() + 1);
+                validate_completed_realtime_host_frame(frame)?;
+                Ok(frame.clone())
+            }
+        }
+        let category = RealtimeChannelId::new(7);
+        let pcm = RealtimeChannelId::new(42);
+        let layout = RealtimeChannelLayout::new(
+            "mixed-output".into(),
+            vec![
+                RealtimeChannelDeclaration {
+                    id: category,
+                    payload: RealtimeChannelPayload::Categorical {
+                        width: 1,
+                        cardinality: 10,
+                    },
+                    cadence: RealtimeChannelCadence {
+                        period: 1,
+                        phase: 0,
+                    },
+                    delay: 0,
+                    feedback: vec![],
+                },
+                RealtimeChannelDeclaration {
+                    id: pcm,
+                    payload: RealtimeChannelPayload::Dense { shape: vec![2] },
+                    cadence: RealtimeChannelCadence {
+                        period: 1,
+                        phase: 0,
+                    },
+                    delay: 1,
+                    feedback: vec![],
+                },
+            ],
+        )
+        .unwrap();
+
+        for invalid in [true, false] {
+            let published = Rc::new(Cell::new(0));
+            let discards = Rc::new(Cell::new(0));
+            let calls = Rc::new(Cell::new(0));
+            let waits = Rc::new(Cell::new(0));
+            let ready = Rc::new(Cell::new(false));
+            let mut scheduler = Scheduler::new(SchedulerLimits::new(1, 1).unwrap()).unwrap();
+            let request = RequestId::new(42);
+            scheduler
+                .register(
+                    request,
+                    PublicationState {
+                        value: 0,
+                        published: published.clone(),
+                        discards: discards.clone(),
+                    },
+                )
+                .unwrap();
+            scheduler
+                .enqueue(request, RealtimeInputFrame::new(2, vec![0, 0]))
+                .unwrap();
+            let output = CompletedRealtimeFrame::new(
+                layout.clone(),
+                2,
+                vec![
+                    RealtimeFrameChannel::new(
+                        category,
+                        Some(RealtimeSlotCoordinate::new(3, category)),
+                        RealtimeHostChannelValues::Categorical(vec![3, 8]),
+                    ),
+                    RealtimeFrameChannel::new(
+                        pcm,
+                        Some(RealtimeSlotCoordinate::new(3, pcm)),
+                        RealtimeHostChannelValues::Dense(vec![0.25, -0.5, 0.75, 1.0]),
+                    ),
+                ],
+                vec![RealtimeFrameChannel::new(
+                    pcm,
+                    Some(RealtimeSlotCoordinate::new(2, pcm)),
+                    RealtimeHostChannelValues::Dense(vec![
+                        if invalid { f32::NAN } else { 0.125 },
+                        -0.25,
+                        0.5,
+                        -1.0,
+                    ]),
+                )],
+                vec![category],
+                vec![],
+            )
+            .unwrap();
+            let transition = PrepublicationRealtimeFrame::new(
+                SubmittedRealtimeFrame {
+                    frame: output,
+                    completion: ControlledCompletion {
+                        ready: ready.clone(),
+                        fail_wait: false,
+                        waits: waits.clone(),
+                    },
+                    retained_resources: 3,
+                },
+                MixedObserver(calls.clone()),
+            );
+            assert!(!transition.is_complete().unwrap());
+            assert_eq!(calls.get(), 0);
+            assert_eq!(waits.get(), 0);
+            ready.set(true);
+            let mut transition = Some(transition);
+            let mut progress = scheduler
+                .run_local_turn(Instant::now(), |_, _, branch| {
+                    branch.value += 1;
+                    Ok::<_, Infallible>(transition.take().unwrap())
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(waits.get(), 1);
+            if invalid {
+                assert!(progress.committed.is_empty());
+                assert_eq!(progress.failed.len(), 1);
+                assert_eq!(published.get(), 0);
+                assert_eq!(discards.get(), 1);
+            } else {
+                assert!(progress.failed.is_empty());
+                assert_eq!(published.get(), 1);
+                assert_eq!(discards.get(), 0);
+                let (_, _, transition) = progress.committed.pop().unwrap();
+                let host = transition.into_host_output().unwrap();
+                assert_eq!(
+                    host.value(category),
+                    Some(&RealtimeHostChannelValues::Categorical(vec![3, 8]))
+                );
+                assert_eq!(
+                    host.value(pcm),
+                    Some(&RealtimeHostChannelValues::Dense(vec![
+                        0.25, -0.5, 0.75, 1.0
+                    ]))
+                );
+                assert_eq!(
+                    host.aligned()[0].coordinate(),
+                    Some(RealtimeSlotCoordinate::new(2, pcm))
+                );
+                assert_eq!(
+                    host.aligned()[0].payload(),
+                    &RealtimeHostChannelValues::Dense(vec![0.125, -0.25, 0.5, -1.0])
+                );
+            }
+        }
     }
 }

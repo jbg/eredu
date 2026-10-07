@@ -269,13 +269,26 @@ pub(crate) fn all_sum_for(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    let started = std::time::Instant::now();
     let _setup = group.begin_bounded_setup()?;
+    let completion = if group.has_local_phase_agreement() {
+        Some(group.completion_policy().ok_or_else(|| {
+            Exception::custom("guarded data collective requires bounded completion")
+        })?)
+    } else {
+        None
+    };
     group.validate_tensor(operation, input, false)?;
     group.validate_expected_output(operation, input.dtype(), input.ndim(), input.size())?;
     if let Some(setup) = &_setup {
         setup.check()?;
     }
     let output = all_sum_unchecked(input, group, stream.as_ref())?;
+    if let Some(policy) = completion {
+        // A lazy data collective must not race the next status exchange over
+        // the same native transport, even when its consumer graph is unsubmitted.
+        super::status::complete_output(&output, group, stream.as_ref(), policy, started)?;
+    }
     group.validate_tensor(operation, &output, true)?;
     if output.shape() != input.shape() {
         return Err(Exception::custom(format!(

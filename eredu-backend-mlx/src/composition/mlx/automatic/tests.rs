@@ -67,31 +67,6 @@ fn malformed_plan_reports_portable_invalidity_before_native_work() {
 }
 
 #[test]
-fn realtime_capability_rejection_precedes_device_and_stream_realization() {
-    crate::tests::support::path_instrumentation::reset();
-    let directory = tempfile::tempdir().expect("tiny realtime artifact directory");
-    super::super::realtime::tests::write_tiny_native_artifact(directory.path(), None);
-    let preparation = eredu_architectures::moshi::prepare_realtime_model(directory.path())
-        .expect("tiny realtime artifact is valid");
-    let device = DevicePlan::new("mlx", "gpu:0").expect("portable device name is valid");
-    let options = MlxLoadRequest::from_normalized(
-        eredu_runtime::NormalizedLoadRequest::default().with_required_session_capabilities(
-            eredu_core::SessionCapabilities::default().with_activation_inspection(true),
-        ),
-    );
-
-    let error = match create_realtime_execution(preparation, &device, options) {
-        Ok(_) => panic!("unsupported activation observation must reject selection"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("activation inspection"));
-    assert_eq!(
-        crate::tests::support::path_instrumentation::target_native_resource_realization_attempts(),
-        0
-    );
-}
-
-#[test]
 fn mlx_discovery_always_reports_cpu() {
     let profile = discover_hardware();
     assert!(profile.backends.iter().any(|backend| {

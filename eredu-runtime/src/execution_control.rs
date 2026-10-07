@@ -1,12 +1,20 @@
 //! Shared completed-token lifecycle and non-rewindable snapshot reservations.
 
 use eredu_core::{execution_control::*, generation::FinishReason};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 mod choice;
+mod isolated;
 mod sampling;
 mod snapshot;
 pub use choice::{TokenChoiceController, TokenChoiceError};
+pub use isolated::{
+    snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateError,
+    IsolatedStateFork, IsolatedStateSnapshot, SnapshotValue,
+};
 pub use sampling::{
     apply_prepared_sampling_override, apply_sampling_override, validate_sampling_override,
     SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
@@ -282,7 +290,7 @@ impl SnapshotBudget {
             lease: Rc::new(ReservationLease {
                 budget: self.clone(),
                 kind,
-                retained_bytes: estimate.retained_bytes,
+                retained_bytes: Cell::new(estimate.retained_bytes),
             }),
         })
     }
@@ -299,14 +307,68 @@ pub struct SnapshotReservation {
 impl SnapshotReservation {
     /// Logical storage charged while any handle to this exact object is retained.
     pub fn retained_bytes(&self) -> u64 {
-        self.lease.retained_bytes
+        self.lease.retained_bytes.get()
+    }
+
+    fn retain_additional(&self, bytes: u64) -> Result<(), ExecutionControlError> {
+        let mut state = self.lease.budget.0.borrow_mut();
+        let retained = self
+            .lease
+            .retained_bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or(ExecutionControlError::Overflow)?;
+        let total = state
+            .usage
+            .retained_bytes
+            .checked_add(bytes)
+            .ok_or(ExecutionControlError::Overflow)?;
+        if total > state.limits.retained_bytes {
+            return Err(ExecutionControlError::Limit("retained bytes"));
+        }
+        state.usage.retained_bytes = total;
+        self.lease.retained_bytes.set(retained);
+        Ok(())
+    }
+}
+
+/// High-water retention admission for one independently growing region of a child.
+///
+/// The initial estimate is already included in the supplied reservation. Admit a
+/// prospective larger logical value before installing it. Failed admissions leave
+/// accounting unchanged; successful admissions remain charged until every native,
+/// recovery and host holder of the shared reservation has released it. Ordinary
+/// execution growth does not consume the separate snapshot-copy allowance.
+#[derive(Clone)]
+pub struct SnapshotRetainedGrowth {
+    retention: SnapshotReservation,
+    admitted: Rc<Cell<u64>>,
+}
+
+impl SnapshotRetainedGrowth {
+    /// Attaches one region whose initial storage was included in copy admission.
+    pub fn new(retention: &SnapshotReservation, initial_bytes: u64) -> Self {
+        Self {
+            retention: retention.clone(),
+            admitted: Rc::new(Cell::new(initial_bytes)),
+        }
+    }
+
+    /// Admits a candidate before retaining it as committed child state.
+    pub fn admit(&self, bytes: u64) -> Result<(), ExecutionControlError> {
+        if bytes > self.admitted.get() {
+            self.retention
+                .retain_additional(bytes - self.admitted.get())?;
+            self.admitted.set(bytes);
+        }
+        Ok(())
     }
 }
 
 struct ReservationLease {
     budget: SnapshotBudget,
     kind: SnapshotResourceKind,
-    retained_bytes: u64,
+    retained_bytes: Cell<u64>,
 }
 
 impl Drop for ReservationLease {
@@ -314,7 +376,7 @@ impl Drop for ReservationLease {
         let mut state = self.budget.0.borrow_mut();
         state.usage.snapshots -= u64::from(self.kind == SnapshotResourceKind::Snapshot);
         state.usage.branches -= u64::from(self.kind == SnapshotResourceKind::Branch);
-        state.usage.retained_bytes -= self.retained_bytes;
+        state.usage.retained_bytes -= self.retained_bytes.get();
     }
 }
 

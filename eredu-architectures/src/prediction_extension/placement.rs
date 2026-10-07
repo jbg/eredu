@@ -105,7 +105,7 @@ impl PreparedPredictionPlacement {
                 .map_err(|error| error.to_string());
         }
         let tensor = tensor_rank(topology).map_err(|error| error.to_string())?;
-        crate::partitioned_execution::derive_partitioned_local_layout(parameters, tensor)
+        eredu_runtime::derive_partitioned_local_layout(parameters, tensor)
             .map(|layout| Some(Arc::new(layout)))
     }
 }

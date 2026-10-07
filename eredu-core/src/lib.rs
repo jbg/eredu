@@ -51,6 +51,8 @@ pub mod media;
 pub mod observation;
 /// Backend-generic realtime token-session execution and scheduling.
 pub mod realtime;
+/// Typed categorical and dense realtime channel declarations.
+pub mod realtime_channels;
 /// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
 /// Neutral resource identities, placement, payload and allocation-capacity bounds.
@@ -156,9 +158,14 @@ pub use observation::{
     MODEL_LOGITS_OBSERVATION_PATH, PROCESSOR_OUTPUT_OBSERVATION_PATH,
     VISION_PROJECTOR_OUTPUT_OBSERVATION_PATH,
 };
+pub use realtime_channels::{
+    RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelError,
+    RealtimeChannelFeedback, RealtimeChannelId, RealtimeChannelLayout, RealtimeChannelPayload,
+};
+
 pub use realtime::{
     RealtimeConfigError, RealtimeDecisionDiagnostics, RealtimeError, RealtimeForcedSource,
-    RealtimeFrameConvention, RealtimeFrameForcing, RealtimeFrameScheduleState, RealtimeFrameSlot,
+    RealtimeFrameConvention, RealtimeFrameForcing, RealtimeFrameScheduleState,
     RealtimeFrameTransition, RealtimeInputDescriptorError, RealtimeInputFrame, RealtimeOutputFrame,
     RealtimeSampling, RealtimeScheduleError, RealtimeSlotCoordinate, RealtimeSlotOccupancy,
     RealtimeSpeechConfig, RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource,

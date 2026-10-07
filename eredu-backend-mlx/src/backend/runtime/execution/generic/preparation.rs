@@ -97,7 +97,6 @@ where
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
 
-    let static_id = OffloadUnitId::new("model.static")?;
     let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
     let static_bytes = binding_bytes(&static_bindings)?;
     let static_parameters = static_bindings
@@ -109,13 +108,21 @@ where
             .iter()
             .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
     );
-    definitions.push(OffloadUnit::new(static_id.clone(), static_bindings)?);
-    specs.push(OffloadUnitSpec::new(
-        static_id.clone(),
-        static_bytes,
-        ResidencyPolicy::Pinned,
-        MemoryTier::Device,
-    )?);
+    // Some architectures place every learned parameter in execution units.
+    // An empty static role has no storage identity or residency lease.
+    let static_id = if static_bindings.is_empty() {
+        None
+    } else {
+        let id = OffloadUnitId::new("model.static")?;
+        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
+        specs.push(OffloadUnitSpec::new(
+            id.clone(),
+            static_bytes,
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+        )?);
+        Some(id)
+    };
 
     let mut unit_ids = Vec::with_capacity(unit_count);
     let mut unit_bytes = Vec::with_capacity(unit_count);
@@ -215,12 +222,16 @@ where
         residency_stream,
     )?;
     residency.initialize()?;
-    let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
-    populate_selected_parameterized(
-        architecture.static_modules_mut(),
-        &static_lease,
-        &static_parameters,
-    )?;
+    let mut static_leases = Vec::new();
+    if let Some(id) = static_id {
+        let lease = residency.acquire(&id, MemoryTier::Device)?;
+        populate_selected_parameterized(
+            architecture.static_modules_mut(),
+            &lease,
+            &static_parameters,
+        )?;
+        static_leases.push(lease);
+    }
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
@@ -241,17 +252,23 @@ where
                 layer_parameter_bytes,
                 maximum_host_bytes,
                 static_bytes,
-                (0..layout.group_count()).map(|group| {
-                    let range = layout
-                        .group_range(group)
-                        .expect("validated layout covers every execution group");
-                    let id = layout
-                        .group_id(group)
-                        .expect("validated layout names every execution group")
-                        .as_str()
-                        .to_owned();
-                    (id, unit_ids[range].to_vec())
-                }),
+                (0..layout.group_count())
+                    .filter(|&group| {
+                        layout
+                            .group_range(group)
+                            .is_some_and(|range| !range.is_empty())
+                    })
+                    .map(|group| {
+                        let range = layout
+                            .group_range(group)
+                            .expect("validated layout covers every execution group");
+                        let id = layout
+                            .group_id(group)
+                            .expect("validated layout names every execution group")
+                            .as_str()
+                            .to_owned();
+                        (id, unit_ids[range].to_vec())
+                    }),
             )
             .map(Arc::new)
         })
@@ -263,7 +280,7 @@ where
         layout,
         depth,
         populator,
-        vec![static_lease],
+        static_leases,
         dense_controller,
         options.sample_backend_memory(),
         options.sample_process_memory(),
@@ -311,6 +328,48 @@ where
     )
 }
 
+/// Builds a policy over exact selected canonical addresses and their prepared bindings.
+/// Local storage ordinals remain compact while architecture unit indices and
+/// group identities retain their original meaning across pipeline cuts.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_layerwise_policy_from_addressed_bindings<A, S, P, I>(
+    store: SharedCheckpointSource,
+    architecture: &mut A,
+    populator: P,
+    state: std::marker::PhantomData<S>,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    static_bindings: Vec<WeightBinding>,
+    units: Vec<(ExecutionUnitAddress, Vec<WeightBinding>)>,
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
+where
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Unit: 'static,
+    S: RuntimeState<MlxNeuralBackend>,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
+    I: Fn(&str) -> bool,
+{
+    let layout = architecture_execution_layout::<A, S>(architecture)?
+        .select(units.iter().map(|(address, _)| *address))
+        .map_err(|error| Error::Other(Box::new(error)))?;
+    prepare_layerwise_policy_from_bindings(
+        store,
+        architecture,
+        populator,
+        state,
+        options,
+        stream,
+        weights_stream,
+        ignored,
+        layout,
+        static_bindings,
+        units.into_iter().map(|(_, bindings)| bindings).collect(),
+    )
+}
+
 /// Builds one shared residency policy over ordinary and supplementary modules,
 /// retaining the exact prepared source associated with each supplementary owner.
 #[allow(clippy::too_many_arguments)]
@@ -351,7 +410,6 @@ where
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
 
-    let static_id = OffloadUnitId::new("model.static")?;
     let static_bytes = binding_bytes(&static_bindings)?;
     let static_parameters = static_bindings
         .iter()
@@ -362,13 +420,21 @@ where
             .iter()
             .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
     );
-    definitions.push(OffloadUnit::new(static_id.clone(), static_bindings)?);
-    specs.push(OffloadUnitSpec::new(
-        static_id.clone(),
-        static_bytes,
-        ResidencyPolicy::Pinned,
-        MemoryTier::Device,
-    )?);
+    // Some architectures place every learned parameter in execution units.
+    // An empty static role has no storage identity or residency lease.
+    let static_id = if static_bindings.is_empty() {
+        None
+    } else {
+        let id = OffloadUnitId::new("model.static")?;
+        definitions.push(OffloadUnit::new(id.clone(), static_bindings)?);
+        specs.push(OffloadUnitSpec::new(
+            id.clone(),
+            static_bytes,
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+        )?);
+        Some(id)
+    };
 
     let mut unit_ids = Vec::with_capacity(unit_count);
     let mut unit_bytes = Vec::with_capacity(unit_count);
@@ -510,12 +576,16 @@ where
         residency_stream,
     )?;
     residency.initialize()?;
-    let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
-    populate_selected_parameterized(
-        architecture.static_modules_mut(),
-        &static_lease,
-        &static_parameters,
-    )?;
+    let mut static_leases = Vec::new();
+    if let Some(id) = static_id {
+        let lease = residency.acquire(&id, MemoryTier::Device)?;
+        populate_selected_parameterized(
+            architecture.static_modules_mut(),
+            &lease,
+            &static_parameters,
+        )?;
+        static_leases.push(lease);
+    }
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
@@ -536,17 +606,23 @@ where
                 layer_parameter_bytes,
                 maximum_host_bytes,
                 static_bytes,
-                (0..layout.group_count()).map(|group| {
-                    let range = layout
-                        .group_range(group)
-                        .expect("validated layout covers every execution group");
-                    let id = layout
-                        .group_id(group)
-                        .expect("validated layout names every execution group")
-                        .as_str()
-                        .to_owned();
-                    (id, unit_ids[range].to_vec())
-                }),
+                (0..layout.group_count())
+                    .filter(|&group| {
+                        layout
+                            .group_range(group)
+                            .is_some_and(|range| !range.is_empty())
+                    })
+                    .map(|group| {
+                        let range = layout
+                            .group_range(group)
+                            .expect("validated layout covers every execution group");
+                        let id = layout
+                            .group_id(group)
+                            .expect("validated layout names every execution group")
+                            .as_str()
+                            .to_owned();
+                        (id, unit_ids[range].to_vec())
+                    }),
             )
             .map(Arc::new)
         })
@@ -558,7 +634,7 @@ where
         layout,
         depth,
         populator,
-        vec![static_lease],
+        static_leases,
         dense_controller,
         options.sample_backend_memory(),
         options.sample_process_memory(),

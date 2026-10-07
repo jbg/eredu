@@ -8,12 +8,14 @@ use std::{
 };
 
 use eredu::api::realtime::{
-    inspect_moshi_realtime, prepare_realtime_model_from_catalog, select_inspected_moshi_realtime,
-    MoshiRealtimeRequest, PreparedRealtimeModel, RealtimeGenerationState, RealtimeInputFrame,
+    PreparedRealtimeModel, RealtimeFrameScheduleState, RealtimeGenerationState, RealtimeInputFrame,
     RealtimeOutputFrame, RealtimeSampling, RealtimeSessionScheduler, RequestId, SchedulerLimits,
     SessionCapabilities,
 };
-use eredu_architectures::moshi::{self, MoshiConfig};
+use eredu_architectures::moshi::{
+    self, inspect_moshi_realtime, prepare_moshi_from_catalog, select_inspected_moshi_realtime,
+    MoshiConfig, MoshiRealtimeRequest,
+};
 use eredu_checkpoint::{
     recipe::RecipeCatalog,
     schema::StoredDtypeConstraint,
@@ -240,7 +242,7 @@ impl TransitionOutput for ReferenceOutput {
 fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms() {
     let config = config();
     let catalog = HeaderCatalog::for_config(&config);
-    let preparation = prepare_realtime_model_from_catalog(
+    let preparation = prepare_moshi_from_catalog(
         "reference-artifact",
         "reference-checkpoint.safetensors",
         config,
@@ -251,7 +253,7 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
     let capabilities = capabilities(inspected.requirements());
     let selected = select_inspected_moshi_realtime(inspected, &capabilities);
     let prepared = selected.unwrap();
-    let speech = prepared.selected().requirements().speech_schedule().clone();
+    let speech = prepared.execution_config().frame_schedule().clone();
     let model = PreparedRealtimeModel::new(
         "reference-mechanism",
         prepared.selected(),
@@ -260,9 +262,17 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
     assert_eq!(model.mechanism(), &"reference-mechanism");
     assert!(model.session_capabilities().persistent_cache());
 
-    let generation = RealtimeGenerationState::<ReferenceState, (), (), Ready>::new(
+    let generation = RealtimeGenerationState::<
+        ReferenceState,
+        RealtimeFrameScheduleState,
+        RealtimeSampling,
+        (),
+        (),
+        Ready,
+    >::new(
         ReferenceState(0),
-        speech,
+        moshi::realtime_generation_contract(&speech),
+        RealtimeFrameScheduleState::new(speech),
         RealtimeSampling::greedy(),
         vec![(), ()],
         None,
@@ -315,5 +325,39 @@ fn no_default_facade_selects_runs_and_resumes_realtime_with_reference_mechanisms
             .model_state()
             .0,
         1
+    );
+}
+
+#[cfg(feature = "mlx")]
+#[test]
+fn shared_realtime_loader_rejects_unavailable_observation_before_source_binding() {
+    use eredu::api::realtime::{
+        prepare_mlx_realtime, PreparedRealtimeArtifact, RealtimeLoadOptions,
+    };
+    let config = config();
+    let catalog = HeaderCatalog::for_config(&config);
+    // No filesystem source exists. Required capability selection must fail before
+    // source binding, and this API accepts no device or stream to allocate.
+    let artifact = PreparedRealtimeArtifact::Moshi(
+        prepare_moshi_from_catalog(
+            "absent-artifact",
+            "absent-model.safetensors",
+            config,
+            &catalog,
+        )
+        .unwrap(),
+    );
+    let options = RealtimeLoadOptions::Categorical(
+        eredu_runtime::NormalizedLoadRequest::default().with_required_session_capabilities(
+            SessionCapabilities::default().with_activation_inspection(true),
+        ),
+    );
+    let error = match prepare_mlx_realtime(&artifact, &options) {
+        Ok(_) => panic!("unavailable activation inspection must fail cold selection"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("activation inspection"),
+        "{error}"
     );
 }

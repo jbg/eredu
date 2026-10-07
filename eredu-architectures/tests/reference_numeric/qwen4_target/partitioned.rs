@@ -1,6 +1,6 @@
 //! Exact local state ownership across every lexical and mixer pipeline cut.
 use super::*;
-use eredu_architectures::partitioned_execution::TextPartitionArchitecture;
+use eredu_runtime::PipelinePartitionArchitecture;
 use eredu_runtime::*;
 
 fn slice_state(global: &State, range: std::ops::Range<usize>) -> State {
@@ -158,11 +158,11 @@ fn pipeline(
                     let saved = state.clone();
                     let mut wrong = input.input();
                     wrong.tokens += 1;
-                    let error = match model.begin_text_partition(
+                    let error = match model.begin_pipeline_partition(
                         wrong,
                         incoming.clone(),
                         state,
-                        &layout,
+                        Some(&layout),
                         0,
                         parallel,
                         &ctx,
@@ -189,11 +189,11 @@ fn pipeline(
                     session::assert_checkpoint(state, &saved);
                 }
                 let mut forward = model
-                    .begin_text_partition(
+                    .begin_pipeline_partition(
                         input.input(),
                         incoming.take(),
                         state,
-                        &layout,
+                        Some(&layout),
                         0,
                         parallel,
                         &ctx,

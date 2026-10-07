@@ -2,6 +2,101 @@
 
 use crate::Error;
 
+/// Checked geometry for an unnormalized one-sided forward real transform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealFftGeometry {
+    axis: i32,
+    length: i32,
+}
+impl RealFftGeometry {
+    /// Validates nonempty input with exactly the requested transform length.
+    pub fn new(shape: &[i32], length: i32, axis: i32) -> Result<Self, Error> {
+        let rank = i32::try_from(shape.len()).map_err(Error::backend)?;
+        let axis = if axis < 0 {
+            rank.checked_add(axis)
+        } else {
+            Some(axis)
+        }
+        .filter(|&axis| axis >= 0 && axis < rank)
+        .ok_or_else(|| Error::backend("forward real FFT axis is outside its tensor rank"))?;
+        if length <= 0 || shape.iter().any(|&n| n <= 0) || shape[axis as usize] != length {
+            return Err(Error::backend(
+                "forward real FFT requires nonempty input with exact transform length",
+            ));
+        }
+        shape
+            .iter()
+            .enumerate()
+            .try_fold(1usize, |count, (i, &n)| {
+                count
+                    .checked_mul(if i == axis as usize {
+                        length / 2 + 1
+                    } else {
+                        n
+                    } as usize)
+                    .filter(|&n| n <= isize::MAX as usize / (2 * std::mem::size_of::<f32>()))
+                    .ok_or_else(|| {
+                        Error::backend("forward real FFT output exceeds addressable storage")
+                    })
+            })?;
+        Ok(Self { axis, length })
+    }
+    /// Canonical nonnegative transform axis.
+    pub const fn axis(self) -> i32 {
+        self.axis
+    }
+    /// Exact input transform length.
+    pub const fn length(self) -> i32 {
+        self.length
+    }
+}
+
+/// Checked geometry for a one-sided inverse real Fourier transform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InverseRealFftGeometry {
+    axis: i32,
+    length: i32,
+}
+impl InverseRealFftGeometry {
+    /// Validates matching nonempty components and exact one-sided bin count.
+    pub fn new(real: &[i32], imaginary: &[i32], length: i32, axis: i32) -> Result<Self, Error> {
+        let rank = i32::try_from(real.len()).map_err(Error::backend)?;
+        let axis = if axis < 0 {
+            rank.checked_add(axis)
+        } else {
+            Some(axis)
+        }
+        .filter(|&axis| axis >= 0 && axis < rank)
+        .ok_or_else(|| Error::backend("inverse real FFT axis is outside its tensor rank"))?;
+        if length <= 0
+            || real != imaginary
+            || real.iter().any(|&n| n <= 0)
+            || real[axis as usize] != length / 2 + 1
+        {
+            return Err(Error::backend(
+                "inverse real FFT requires matching nonempty one-sided spectra",
+            ));
+        }
+        real.iter().enumerate().try_fold(1usize, |count, (i, &n)| {
+            count
+                .checked_mul(if i == axis as usize { length } else { n } as usize)
+                .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    Error::backend("inverse real FFT output extent exceeds addressable F32 storage")
+                })
+        })?;
+        Ok(Self { axis, length })
+    }
+    /// Canonical nonnegative transform axis.
+    pub const fn axis(self) -> i32 {
+        self.axis
+    }
+    /// Explicit output length, including the odd-length case.
+    pub const fn length(self) -> i32 {
+        self.length
+    }
+}
+
 /// Validated final-axis normalization geometry and scalar stability policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NormalizationGeometry {

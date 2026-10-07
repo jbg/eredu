@@ -52,7 +52,12 @@ fn main() -> anyhow::Result<()> {
     let expected_output_audio = required(&fixture, "generation.expected_output_audio")?;
     let expected_emitted_steps = required(&fixture, "generation.expected_emitted_steps")?;
 
-    let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+    let preparation = match eredu_architectures::realtime::prepare_realtime_model(
+        &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(&model_dir),
+    )? {
+        eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => preparation,
+        _ => anyhow::bail!("expected a Moshi-family realtime artifact"),
+    };
     let backend = MlxRealtimeExecutionContext::new(stream, cpu.stream());
     let model = realtime_support::load(
         &backend,

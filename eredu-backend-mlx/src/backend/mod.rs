@@ -17,6 +17,7 @@ pub mod random;
 pub mod residency;
 /// MLX-only tensor, checkpoint, execution, and residency infrastructure.
 pub mod runtime;
+pub(crate) mod snapshot;
 pub(crate) mod submission_recovery;
 /// MLX process-local device binding for composition-owned rank topology.
 pub(crate) mod topology;

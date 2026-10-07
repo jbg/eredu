@@ -93,6 +93,25 @@ impl TensorObservation {
         &self.data
     }
 
+    /// Logical host storage including owned spare capacity and inline metadata.
+    /// Allocator overhead and native workspace are outside this estimate.
+    pub fn retained_storage_bytes(&self) -> Option<u64> {
+        fn storage<T>(values: &Vec<T>) -> Option<u64> {
+            u64::try_from(values.capacity())
+                .ok()?
+                .checked_mul(std::mem::size_of::<T>() as u64)
+        }
+        let data = match &self.data {
+            TensorObservationData::F32(values) => storage(values)?,
+            TensorObservationData::I64(values) => storage(values)?,
+            TensorObservationData::U64(values) => storage(values)?,
+            TensorObservationData::Bool(values) => storage(values)?,
+        };
+        (std::mem::size_of::<Self>() as u64)
+            .checked_add(storage(&self.shape)?)?
+            .checked_add(data)
+    }
+
     /// Consumes this observation into its shape and values.
     pub fn into_parts(self) -> (Vec<usize>, TensorObservationData) {
         (self.shape, self.data)

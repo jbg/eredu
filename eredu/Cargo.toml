@@ -16,10 +16,16 @@ include = [
     "src/**",
     "tests/**",
     "examples/*.rs",
+    "examples/voicechat_wav/**",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ]
+
+[[example]]
+name = "voicechat_wav"
+path = "examples/voicechat_wav.rs"
+required-features = ["mlx", "audio"]
 
 [[example]]
 name = "architecture_discovery"
@@ -106,6 +112,10 @@ path = "examples/qwen35_moe_bench.rs"
 required-features = ["mlx"]
 
 [[test]]
+name = "voicechat_wav_driver"
+path = "tests/voicechat_wav_driver.rs"
+
+[[test]]
 name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 
@@ -177,10 +187,12 @@ workspace = true
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
 eredu-core.workspace = true
+eredu-nn.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
 eredu-runtime.workspace = true
 eredu-architectures.workspace = true
+eredu-media = { workspace = true, default-features = false }
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
@@ -192,7 +204,6 @@ llguidance = { version = "1.8.0", default-features = false, features = ["ahash",
 jsonschema = { version = "0.52.0", default-features = false }
 
 [dev-dependencies]
-eredu-nn.workspace = true
 tempfile.workspace = true
 anyhow = "1"
 eredu-checkpoint.workspace = true

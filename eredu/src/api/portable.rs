@@ -108,6 +108,39 @@ pub struct TextDecoder {
 }
 
 impl TextDecoder {
+    /// Creates independent incremental state over an immutable tokenizer.
+    pub(crate) fn from_shared_tokenizer(
+        tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
+        skip_special_tokens: bool,
+    ) -> Self {
+        Self {
+            tokenizer,
+            skip_special_tokens,
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
+    /// Checks that no incomplete tokenizer bytes remain unpublished.
+    pub(crate) fn finish(&self) -> Result<(), TextDecoderError> {
+        let decoded = self
+            .tokenizer
+            .decode(&self.ids, self.skip_special_tokens)
+            .map_err(TextDecoderError::Tokenizer)?;
+        if decoded.len() > self.prefix.len() {
+            return Err(TextDecoderError::IncompleteByteSequence);
+        }
+        Ok(())
+    }
+
+    /// Starts a separate text segment without changing its immutable tokenizer.
+    pub(crate) fn reset(&mut self) {
+        self.ids.clear();
+        self.prefix.clear();
+        self.prefix_index = 0;
+    }
+
     /// Bounds decoder retention and all text it can hand to an incremental
     /// parser during a finite generated-token run. Decoder chains may expand
     /// strings; price each stage, including empty-pattern replacements. Counting

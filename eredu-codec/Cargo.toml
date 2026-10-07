@@ -15,6 +15,7 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
+eredu-core.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
 eredu-runtime.workspace = true

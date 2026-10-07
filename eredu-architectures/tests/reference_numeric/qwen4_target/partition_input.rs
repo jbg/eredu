@@ -1,9 +1,7 @@
 //! Complete architecture input survives the generic partition executor.
 use super::*;
-use eredu_architectures::partitioned_execution::{
-    PipelinePartitionExecutor, PipelinePartitionUnitStrategy,
-};
 use eredu_runtime::*;
+use eredu_runtime::{PipelinePartitionExecutor, PipelinePartitionUnitStrategy};
 use std::borrow::Borrow;
 
 struct TargetUnits(ParameterProviders<ResidentExpertProvider, Rows>);

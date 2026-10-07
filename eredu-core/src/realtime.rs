@@ -1,5 +1,6 @@
 //! Portable realtime token frames, schedules, and facade errors.
 
+use crate::RealtimeChannelId;
 use crate::{
     observation::{ObservationError, TensorObservation, TensorObservationData},
     scheduler::{SchedulerError, SemanticStateTransaction, WorkDescriptor, WorkId},
@@ -280,35 +281,16 @@ pub enum RealtimeConfigError {
     },
 }
 
-/// Canonical stream slot in a text-plus-audio realtime schedule.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum RealtimeFrameSlot {
-    /// Text stream.
-    Text,
-    /// Zero-based temporal audio codebook.
-    Audio(usize),
-}
-
-impl RealtimeFrameSlot {
-    fn index(self) -> usize {
-        match self {
-            Self::Text => 0,
-            Self::Audio(codebook) => codebook + 1,
-        }
-    }
-}
-
-/// One absolute position in a canonical text-plus-audio slot timeline.
+/// One absolute logical position in an architecture-declared channel timeline.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RealtimeSlotCoordinate {
     position: usize,
-    slot: RealtimeFrameSlot,
+    slot: RealtimeChannelId,
 }
 
 impl RealtimeSlotCoordinate {
     /// Creates one portable delayed-slot coordinate.
-    pub const fn new(position: usize, slot: RealtimeFrameSlot) -> Self {
+    pub const fn new(position: usize, slot: RealtimeChannelId) -> Self {
         Self { position, slot }
     }
 
@@ -317,8 +299,8 @@ impl RealtimeSlotCoordinate {
         self.position
     }
 
-    /// Text or audio stream slot.
-    pub const fn slot(self) -> RealtimeFrameSlot {
+    /// Architecture-local channel identity.
+    pub const fn slot(self) -> RealtimeChannelId {
         self.slot
     }
 }
@@ -344,7 +326,7 @@ pub enum RealtimeSlotOccupancy {
 #[non_exhaustive]
 pub enum RealtimeTemporalSource {
     /// The model consumes the configured text or audio padding token.
-    Padding(RealtimeFrameSlot),
+    Padding(RealtimeChannelId),
     /// The model consumes the backend payload stored at this occupied slot.
     Occupied {
         /// Exact portable coordinate.
@@ -379,14 +361,14 @@ pub enum RealtimeTargetSource {
 /// Portable placement for one text or depth-codebook decision.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RealtimeTargetDecision {
-    slot: RealtimeFrameSlot,
+    slot: RealtimeChannelId,
     coordinate: Option<RealtimeSlotCoordinate>,
     source: RealtimeTargetSource,
 }
 
 impl RealtimeTargetDecision {
     /// Text or audio decision slot.
-    pub const fn slot(self) -> RealtimeFrameSlot {
+    pub const fn slot(self) -> RealtimeChannelId {
         self.slot
     }
 
@@ -575,7 +557,7 @@ impl RealtimeFrameScheduleState {
         let generated = schedule.generated_audio_codebooks;
         let mut input_placements = Vec::with_capacity(schedule.input_audio_codebooks);
         for codebook in generated..schedule.total_audio_codebooks {
-            let coordinate = coordinate(frontier, RealtimeFrameSlot::Audio(codebook));
+            let coordinate = coordinate(frontier, RealtimeChannelId::new(1 + codebook));
             self.occupied
                 .insert(coordinate, RealtimeSlotOccupancy::Input);
             input_placements.push(coordinate);
@@ -584,7 +566,7 @@ impl RealtimeFrameScheduleState {
         let mut forced_placements = Vec::new();
         for (codebook, forced) in forcing.generated_audio.iter().copied().enumerate() {
             if forced {
-                let coordinate = coordinate(frontier, RealtimeFrameSlot::Audio(codebook));
+                let coordinate = coordinate(frontier, RealtimeChannelId::new(1 + codebook));
                 self.occupied
                     .insert(coordinate, RealtimeSlotOccupancy::Forced);
                 forced_placements.push(coordinate);
@@ -613,7 +595,7 @@ impl RealtimeFrameScheduleState {
         let mut targets = Vec::with_capacity(1 + schedule.depth_audio_codebooks);
         let text_coordinate = frontier
             .checked_sub(schedule.text_delay())
-            .map(|position| coordinate(position, RealtimeFrameSlot::Text));
+            .map(|position| coordinate(position, RealtimeChannelId::new(0)));
         let text_source = if forcing.text {
             RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput)
         } else {
@@ -633,12 +615,12 @@ impl RealtimeFrameScheduleState {
             }
         }
         targets.push(RealtimeTargetDecision {
-            slot: RealtimeFrameSlot::Text,
+            slot: RealtimeChannelId::new(0),
             coordinate: text_coordinate,
             source: text_source,
         });
         for codebook in 0..schedule.depth_audio_codebooks {
-            let slot = RealtimeFrameSlot::Audio(codebook);
+            let slot = RealtimeChannelId::new(1 + codebook);
             if codebook < generated {
                 let target_coordinate = frontier
                     .checked_sub(schedule.audio_delays()[codebook])
@@ -704,7 +686,7 @@ impl RealtimeFrameScheduleState {
         let mut input_placements = Vec::with_capacity(schedule.input_audio_codebooks);
         for codebook in generated..schedule.total_audio_codebooks {
             let position = checked_add(frontier, schedule.audio_delays()[codebook])?;
-            let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
+            let coordinate = coordinate(position, RealtimeChannelId::new(1 + codebook));
             self.occupied
                 .insert(coordinate, RealtimeSlotOccupancy::Input);
             input_placements.push(coordinate);
@@ -713,7 +695,7 @@ impl RealtimeFrameScheduleState {
         let mut forced_placements = Vec::new();
         if forcing.text {
             let position = checked_add(frontier, schedule.text_delay())?;
-            let coordinate = coordinate(position, RealtimeFrameSlot::Text);
+            let coordinate = coordinate(position, RealtimeChannelId::new(0));
             self.occupied
                 .insert(coordinate, RealtimeSlotOccupancy::Forced);
             forced_placements.push(coordinate);
@@ -721,7 +703,7 @@ impl RealtimeFrameScheduleState {
         for (codebook, forced) in forcing.generated_audio.iter().copied().enumerate() {
             if forced {
                 let position = checked_add(frontier, schedule.audio_delays()[codebook])?;
-                let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
+                let coordinate = coordinate(position, RealtimeChannelId::new(1 + codebook));
                 self.occupied
                     .insert(coordinate, RealtimeSlotOccupancy::Forced);
                 forced_placements.push(coordinate);
@@ -754,9 +736,10 @@ impl RealtimeFrameScheduleState {
                 });
             }
             targets.reserve(1 + schedule.depth_audio_codebooks);
-            for slot in std::iter::once(RealtimeFrameSlot::Text)
-                .chain((0..schedule.depth_audio_codebooks).map(RealtimeFrameSlot::Audio))
-            {
+            for slot in std::iter::once(RealtimeChannelId::new(0)).chain(
+                (0..schedule.depth_audio_codebooks)
+                    .map(|codebook| RealtimeChannelId::new(1 + codebook)),
+            ) {
                 let coordinate = coordinate(frontier, slot);
                 let (source, occupancy) = match self.occupied.get(&coordinate).copied() {
                     Some(RealtimeSlotOccupancy::Forced) => (
@@ -783,7 +766,7 @@ impl RealtimeFrameScheduleState {
                 let coordinates = (0..generated)
                     .map(|codebook| {
                         let position = checked_add(base, schedule.audio_delays()[codebook])?;
-                        let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
+                        let coordinate = coordinate(position, RealtimeChannelId::new(1 + codebook));
                         self.required_occupancy(coordinate)?;
                         Ok(coordinate)
                     })
@@ -823,7 +806,7 @@ impl RealtimeFrameScheduleState {
     ) -> Result<Vec<RealtimeSlotCoordinate>, RealtimeScheduleError> {
         (0..self.schedule.generated_audio_codebooks)
             .map(|codebook| {
-                let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
+                let coordinate = coordinate(position, RealtimeChannelId::new(1 + codebook));
                 self.required_occupancy(coordinate)?;
                 Ok(coordinate)
             })
@@ -882,13 +865,13 @@ fn checked_add(left: usize, right: usize) -> Result<usize, RealtimeScheduleError
         .ok_or(RealtimeScheduleError::CoordinateOverflow)
 }
 
-fn coordinate(position: usize, slot: RealtimeFrameSlot) -> RealtimeSlotCoordinate {
+fn coordinate(position: usize, slot: RealtimeChannelId) -> RealtimeSlotCoordinate {
     RealtimeSlotCoordinate::new(position, slot)
 }
 
-fn slots(total_audio_codebooks: usize) -> impl Iterator<Item = RealtimeFrameSlot> {
-    std::iter::once(RealtimeFrameSlot::Text)
-        .chain((0..total_audio_codebooks).map(RealtimeFrameSlot::Audio))
+fn slots(total_audio_codebooks: usize) -> impl Iterator<Item = RealtimeChannelId> {
+    std::iter::once(RealtimeChannelId::new(0))
+        .chain((0..total_audio_codebooks).map(|codebook| RealtimeChannelId::new(1 + codebook)))
 }
 
 /// Portable sampling controls for one realtime request.
@@ -1440,11 +1423,11 @@ mod tests {
         assert_eq!(second.targets()[2].source(), RealtimeTargetSource::Sampled);
         assert!(matches!(
             second.temporal_inputs()[2],
-            RealtimeTemporalSource::Padding(RealtimeFrameSlot::Audio(1))
+            RealtimeTemporalSource::Padding(channel) if channel == RealtimeChannelId::new(2)
         ));
         assert_eq!(
             second.output().unwrap()[0],
-            RealtimeSlotCoordinate::new(0, RealtimeFrameSlot::Audio(0))
+            RealtimeSlotCoordinate::new(0, RealtimeChannelId::new(1))
         );
     }
 
@@ -1496,11 +1479,11 @@ mod tests {
         assert_eq!(second_model.output().unwrap().len(), 8);
         assert_eq!(
             second_model.output().unwrap()[0],
-            RealtimeSlotCoordinate::new(1, RealtimeFrameSlot::Audio(0))
+            RealtimeSlotCoordinate::new(1, RealtimeChannelId::new(1))
         );
         assert_eq!(
             second_model.output().unwrap()[1],
-            RealtimeSlotCoordinate::new(2, RealtimeFrameSlot::Audio(1))
+            RealtimeSlotCoordinate::new(2, RealtimeChannelId::new(2))
         );
     }
 

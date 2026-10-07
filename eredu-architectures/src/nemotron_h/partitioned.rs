@@ -13,7 +13,7 @@ use eredu_runtime::{
 
 use super::{
     EmbeddedInput, LayerPolicy, ModelArgs, PartitionLocalGeometry, RetainedValues, TargetBoundary,
-    TargetBoundarySchema,
+    TargetBoundarySchema, TargetReadout,
 };
 use crate::decoder::{ComponentInstrumentation, PartitionStaticModules};
 
@@ -23,6 +23,7 @@ pub struct PartitionedForwardContext<T> {
     embedded: T,
     mask: Option<T>,
     target_capture: Option<T>,
+    readout: TargetReadout,
 }
 
 /// Dense target-only Nemotron-H whose modules are limited to one admitted partition.
@@ -33,6 +34,7 @@ pub struct PartitionedLayeredModel<
     static_modules: PartitionStaticModules<B>,
     geometry: PartitionLocalGeometry,
     parameters: ArchitectureParameterDescription,
+    boundary: TargetBoundarySchema,
 }
 
 fn partition_static_modules<B, A>(
@@ -72,7 +74,8 @@ where
                     args.hidden_size,
                     args.layer_norm_epsilon,
                     ParameterSpec::trainable("model.norm_f.weight").map_err(Error::backend)?,
-                ),
+                )
+                .with_groups(1)?,
                 context,
             )
         })
@@ -110,10 +113,13 @@ where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     /// Constructs only the statics and target units selected by one exact partition.
-    pub fn from_partition<A>(
+    pub fn from_partition(
         args: ModelArgs,
         parameters: &ArchitectureParameterDescription,
-        partition: &eredu_runtime::ArchitecturePartition<PartitionLocalGeometry, A>,
+        partition: &eredu_runtime::ArchitecturePartition<
+            PartitionLocalGeometry,
+            TargetBoundarySchema,
+        >,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         crate::operator_requirements::require::<B>(
@@ -121,6 +127,11 @@ where
             crate::operator_requirements::NEMOTRON_H,
         )?;
         args.validate().map_err(Error::backend)?;
+        if partition.boundary_schema().hidden_size() != args.hidden_size {
+            return Err(Error::backend(
+                "Nemotron-H partition boundary width differs from its configuration",
+            ));
+        }
         if args.num_nextn_predict_layers != 0 {
             return Err(Error::backend(
                 "partitioned resident Nemotron-H does not accept embedded prediction",
@@ -170,6 +181,7 @@ where
             static_modules,
             geometry,
             parameters: parameters.clone(),
+            boundary: *partition.boundary_schema(),
         })
     }
 
@@ -254,6 +266,10 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B>,
     {
+        self.boundary
+            .validate_input(&tokens, &embedded)
+            .map_err(Error::backend_source)?;
+        super::mtp::validate_target_embeddings(&tokens, &hidden, self.args.hidden_size)?;
         if state.layout() != expected || first_state_ordinal >= expected.len() {
             return Err(Error::backend(
                 "Nemotron-H runtime state does not match its partition-local layout",
@@ -282,6 +298,7 @@ where
                 embedded,
                 mask,
                 target_capture: None,
+                readout: TargetReadout::Logits,
             },
         })
     }
@@ -289,11 +306,13 @@ where
     fn finish_local(
         &mut self,
         hidden: &B::Tensor,
+        readout: TargetReadout,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.finish_local_instrumented(
             hidden,
+            readout,
             parallel,
             context,
             &mut ComponentInstrumentation::disabled(),
@@ -303,6 +322,7 @@ where
     fn finish_local_instrumented(
         &mut self,
         hidden: &B::Tensor,
+        readout: TargetReadout,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
@@ -311,6 +331,9 @@ where
             Error::backend("Nemotron-H partition does not own final normalization")
         })?;
         let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
+        if readout == TargetReadout::NormalizedHidden {
+            return Ok(hidden);
+        }
         self.project_prediction_instrumented(&hidden, parallel, context, instrumentation)
     }
 
@@ -575,10 +598,32 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let EmbeddedInput::Target { tokens, mask } = input else {
-            return Err(Error::backend(
-                "partitioned resident Nemotron-H does not execute draft input",
-            ));
+        let (tokens, mask) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            EmbeddedInput::TargetEmbedded {
+                tokens,
+                embedded,
+                mask,
+                readout,
+            } => {
+                let mut forward = self.begin_hidden(
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded.clone(),
+                    mask,
+                    state,
+                    self.geometry.complete_state_layout(),
+                    0,
+                    context,
+                )?;
+                forward.context.readout = readout;
+                return Ok(forward);
+            }
+            EmbeddedInput::Draft { .. } => {
+                return Err(Error::backend(
+                    "partitioned resident Nemotron-H does not execute draft input",
+                ))
+            }
         };
         let embedded = self
             .static_modules
@@ -718,17 +763,17 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local(hidden, None, context)
+        self.finish_local(hidden, forward.readout, None, context)
     }
 
     fn finish_forward_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, Self::Error>
@@ -738,6 +783,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         self.finish_local_instrumented(
             hidden,
+            forward.readout,
             None,
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
@@ -777,10 +823,32 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let EmbeddedInput::Target { tokens, mask } = input else {
-            return Err(Error::backend(
-                "partitioned resident Nemotron-H does not execute draft input",
-            ));
+        let (tokens, mask) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
+            EmbeddedInput::TargetEmbedded {
+                tokens,
+                embedded,
+                mask,
+                readout,
+            } => {
+                let mut forward = self.begin_hidden(
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded.clone(),
+                    mask,
+                    state,
+                    self.geometry.complete_state_layout(),
+                    0,
+                    context,
+                )?;
+                forward.context.readout = readout;
+                return Ok(forward);
+            }
+            EmbeddedInput::Draft { .. } => {
+                return Err(Error::backend(
+                    "partitioned resident Nemotron-H does not execute draft input",
+                ))
+            }
         };
         let embedded = B::vocabulary_parallel_lookup(
             self.static_modules.embeddings.as_mut().ok_or_else(|| {
@@ -883,18 +951,18 @@ where
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.finish_local(hidden, Some(parallel), context)
+        self.finish_local(hidden, forward.readout, Some(parallel), context)
     }
 
     fn finish_forward_parallel_observed<O>(
         &mut self,
         hidden: &B::Tensor,
         _state: &mut S,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
@@ -905,6 +973,7 @@ where
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         self.finish_local_instrumented(
             hidden,
+            forward.readout,
             Some(parallel),
             context,
             &mut ComponentInstrumentation::new("readout", &mut observer),
@@ -1088,7 +1157,7 @@ where
     }
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
-        Ok(TargetBoundarySchema::from_args(&self.args))
+        Ok(self.boundary)
     }
 
     fn begin_partition<'a>(
@@ -1100,7 +1169,7 @@ where
         first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let (tokens, embedded, hidden) = match input {
+        let (tokens, embedded, hidden, readout) = match input {
             LayeredPartitionInput::Tokens(tokens) => {
                 let embedded = self
                     .static_modules
@@ -1110,14 +1179,20 @@ where
                         Error::backend("Nemotron-H partition does not own input embedding")
                     })?
                     .forward(tokens, context)?;
-                (tokens.clone(), embedded.clone(), embedded)
+                (
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded,
+                    TargetReadout::Logits.encode::<B::Tensor>(context)?,
+                )
             }
             LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                let (tokens, embedded) = auxiliary.into_parts();
-                (tokens, embedded, hidden)
+                let (tokens, embedded, readout) = auxiliary.into_parts();
+                (tokens, embedded, hidden, readout)
             }
         };
-        self.begin_hidden(
+        let selected_readout = TargetReadout::decode(&readout, context)?;
+        let mut forward = self.begin_hidden(
             tokens,
             embedded,
             hidden,
@@ -1126,7 +1201,9 @@ where
             expected,
             first_state_ordinal,
             context,
-        )
+        )?;
+        forward.context.readout = selected_readout;
+        Ok(forward)
     }
 
     fn begin_partition_parallel<'a>(
@@ -1139,7 +1216,7 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let (tokens, embedded, hidden) = match input {
+        let (tokens, embedded, hidden, readout) = match input {
             LayeredPartitionInput::Tokens(tokens) => {
                 let embedded = B::vocabulary_parallel_lookup(
                     self.static_modules.embeddings.as_mut().ok_or_else(|| {
@@ -1150,14 +1227,20 @@ where
                     parallel,
                     context,
                 )?;
-                (tokens.clone(), embedded.clone(), embedded)
+                (
+                    tokens.clone(),
+                    embedded.clone(),
+                    embedded,
+                    TargetReadout::Logits.encode::<B::Tensor>(context)?,
+                )
             }
             LayeredPartitionInput::Hidden { hidden, auxiliary } => {
-                let (tokens, embedded) = auxiliary.into_parts();
-                (tokens, embedded, hidden)
+                let (tokens, embedded, readout) = auxiliary.into_parts();
+                (tokens, embedded, hidden, readout)
             }
         };
-        self.begin_hidden(
+        let selected_readout = TargetReadout::decode(&readout, context)?;
+        let mut forward = self.begin_hidden(
             tokens,
             embedded,
             hidden,
@@ -1166,7 +1249,9 @@ where
             expected,
             first_state_ordinal,
             context,
-        )
+        )?;
+        forward.context.readout = selected_readout;
+        Ok(forward)
     }
 
     fn begin_partition_observed<'a, O>(
@@ -1221,13 +1306,17 @@ where
     > {
         if owns_output {
             Ok(eredu_runtime::LayeredPartitionOutput::Final {
-                output: self.finish_local(hidden, parallel, context)?,
+                output: self.finish_local(hidden, forward.readout, parallel, context)?,
                 retained: None,
             })
         } else {
             Ok(eredu_runtime::LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
-                auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
+                auxiliary: TargetBoundary::new(
+                    forward.tokens.clone(),
+                    forward.embedded.clone(),
+                    forward.readout.encode::<B::Tensor>(context)?,
+                ),
             })
         }
     }
@@ -1253,8 +1342,13 @@ where
         }
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
-        let output =
-            self.finish_local_instrumented(hidden, parallel, context, &mut instrumentation)?;
+        let output = self.finish_local_instrumented(
+            hidden,
+            forward.readout,
+            parallel,
+            context,
+            &mut instrumentation,
+        )?;
         Ok(eredu_runtime::LayeredPartitionOutput::Final {
             output,
             retained: None,
@@ -1273,21 +1367,25 @@ where
     }
 }
 
-impl<B, S> crate::partitioned_execution::TextPartitionArchitecture<B, S>
-    for PartitionedLayeredModel<B>
+impl<B, S> eredu_runtime::PipelinePartitionArchitecture<B, S> for PartitionedLayeredModel<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
-    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+    fn partition_input_dimensions(
+        &self,
+        input: &Self::Input<'_>,
+    ) -> Result<(i32, i32), Self::Error> {
         let tokens = match input {
-            EmbeddedInput::Target { tokens, .. } | EmbeddedInput::Draft { tokens, .. } => tokens,
+            EmbeddedInput::Target { tokens, .. }
+            | EmbeddedInput::TargetEmbedded { tokens, .. }
+            | EmbeddedInput::Draft { tokens, .. } => tokens,
         };
         Ok((tokens.dim(0), tokens.dim(1)))
     }
 
-    fn begin_text_partition<'a, O>(
+    fn begin_pipeline_partition<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(
@@ -1295,7 +1393,7 @@ where
             <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
         )>,
         state: &mut S,
-        expected: &eredu_runtime::StateLayout,
+        expected: Option<&eredu_runtime::StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -1304,15 +1402,34 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        let (tokens, mask) = match input {
-            EmbeddedInput::Target { tokens, mask } => (tokens, mask),
-            EmbeddedInput::Draft { tokens, .. } => (tokens, None),
+        let expected = expected.ok_or_else(|| {
+            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
+        })?;
+        let (tokens, mask, supplied) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, mask, None),
+            EmbeddedInput::TargetEmbedded {
+                tokens,
+                embedded,
+                mask,
+                readout,
+            } => (tokens, mask, Some((embedded, readout))),
+            EmbeddedInput::Draft { tokens, .. } => (tokens, None, None),
         };
         let input = match incoming {
             Some((hidden, auxiliary)) => {
                 eredu_runtime::LayeredPartitionInput::Hidden { hidden, auxiliary }
             }
-            None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+            None => match supplied {
+                Some((embedded, readout)) => eredu_runtime::LayeredPartitionInput::Hidden {
+                    hidden: embedded.clone(),
+                    auxiliary: TargetBoundary::new(
+                        tokens.clone(),
+                        embedded.clone(),
+                        readout.encode::<B::Tensor>(context)?,
+                    ),
+                },
+                None => eredu_runtime::LayeredPartitionInput::Tokens(tokens),
+            },
         };
         self.begin_partition_observed(
             input,
@@ -1330,11 +1447,27 @@ where
         self.args.vocab_size
     }
 
+    fn partition_output_shape(
+        &self,
+        input: &Self::Input<'_>,
+        batch: i32,
+        sequence: i32,
+    ) -> Result<Vec<i32>, Self::Error> {
+        let width = match input {
+            EmbeddedInput::TargetEmbedded {
+                readout: TargetReadout::NormalizedHidden,
+                ..
+            } => self.args.hidden_size,
+            _ => self.args.vocab_size,
+        };
+        Ok(vec![batch, sequence, width])
+    }
+
     fn partition_routed_tensor_reductions(
         &self,
         unit: usize,
         routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
         let policy = self.args.layer_schedule.get(unit).ok_or_else(|| {
             Error::backend(format!(
                 "Nemotron-H has no collective order for unit {unit}"
@@ -1345,11 +1478,9 @@ where
                 "Nemotron-H routed collective selection drifted at unit {unit}"
             )));
         }
-        Ok(
-            crate::partitioned_execution::RoutedTensorReductions::hidden(
-                0,
-                if routed { 2 } else { 1 },
-            ),
-        )
+        Ok(eredu_runtime::RoutedTensorReductions::hidden(
+            0,
+            if routed { 2 } else { 1 },
+        ))
     }
 }

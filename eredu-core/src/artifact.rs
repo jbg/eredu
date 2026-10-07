@@ -955,7 +955,22 @@ pub fn open_prepared_safetensors_artifact(
     resolution: eredu_checkpoint::validation::ResolvedCheckpointPlan,
     max_cached_shards: usize,
 ) -> Result<SharedCheckpointSource, ArtifactError> {
-    let catalog = tensors
+    let catalog = prepared_safetensors_metadata(tensors)?;
+    eredu_checkpoint::store::open_prepared_safetensors_source(
+        shards,
+        catalog,
+        resolution,
+        max_cached_shards,
+    )
+    .map_err(Into::into)
+}
+
+/// Projects an admitted portable catalog into exact SafeTensors source metadata.
+/// This performs no file discovery, payload reads, or backend allocation.
+pub fn prepared_safetensors_metadata(
+    tensors: &TensorCatalog,
+) -> Result<BTreeMap<String, TensorMetadata>, ArtifactError> {
+    tensors
         .descriptors()
         .map(|tensor| {
             let storage = tensor.storage.as_ref().ok_or_else(|| {
@@ -977,14 +992,7 @@ pub fn open_prepared_safetensors_artifact(
                 },
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, ArtifactError>>()?;
-    eredu_checkpoint::store::open_prepared_safetensors_source(
-        shards,
-        catalog,
-        resolution,
-        max_cached_shards,
-    )
-    .map_err(Into::into)
+        .collect()
 }
 
 fn tensor_dtype_to_stored(dtype: &TensorDtype) -> StoredDtype {

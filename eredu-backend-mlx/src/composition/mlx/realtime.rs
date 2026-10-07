@@ -4,31 +4,28 @@ use std::{num::NonZeroUsize, ops::Deref, sync::Arc};
 
 use eredu_architectures::moshi::{
     inspect_moshi_realtime, moshi_realtime_request_from_normalized,
-    prepare_selected_moshi_realtime_source, select_inspected_moshi_realtime,
-    MoshiRealtimeExecution, PreparedMoshiRealtimeSource, RealtimePreparationPlan,
+    prepare_selected_moshi_realtime_source, select_inspected_moshi_realtime, MoshiPreparationPlan,
+    MoshiRealtimeExecution, PreparedMoshiRealtimeSource,
 };
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding};
 use eredu_core::cache::{StateComponentPolicy, StateComponentRole};
 use eredu_core::{
     backend::Completion,
-    realtime::{RealtimeDecisionDiagnostics, RealtimeInputFrame, RealtimeOutputFrame},
+    realtime::{RealtimeInputFrame, RealtimeOutputFrame},
     CompletionCancellationMode, SessionCapabilities,
 };
 use eredu_runtime::{
     execute_realtime_frame, CommunicationCompletionCapabilities, CompletedRealtimeFrame,
-    ExecutionResidency, GenerationSampler, MaterializedRealtimeInput,
-    PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeArchitectureRequirements,
-    RealtimeCompletionCreationError, RealtimeFrameCompletionMechanism, RealtimeFrameHostObserver,
+    ExecutionResidency, GenerationSampler, PreparedRealtimeFrameExecutor,
+    PrepublicationRealtimeFrame, RealtimeArchitectureRequirements, RealtimeCompletionCreationError,
+    RealtimeCompletionMechanism, RealtimeFrameHostObserver, RealtimeFrameResources,
     RealtimeFrameTensorMechanisms, RealtimeHostTokenMaterializer, RealtimeMechanism,
     RealtimeMechanismCapabilities, RealtimeObservationRequirements, RealtimePayloadBranch,
-    RealtimePayloadHistory, RealtimeSessionBranch, StateComponentPlacement, WeightLoweringKind,
+    RealtimeSessionBranch, StateComponentPlacement, WeightLoweringKind,
 };
-use safemlx::{
-    ops::{indexing::TryIndexOp, stack_axis},
-    random,
-    transforms::async_eval_with_event,
-    Array, Dtype, Event, Stream,
-};
+#[cfg(test)]
+use safemlx::ops::{indexing::TryIndexOp, stack_axis};
+use safemlx::{random, transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::backend::runtime::distributed::Group;
 use crate::{
@@ -51,7 +48,8 @@ mod observation;
 mod selection_loading;
 
 pub use completion::MlxRealtimeCompletion;
-pub use frame_execution::{MlxRealtimeFrameCompletionMechanism, MlxRealtimeFrameTensorMechanisms};
+pub(crate) use completion::{MlxRealtimeExecutionResources, MlxRealtimeSubmissionScope};
+pub use frame_execution::{MlxRealtimeCompletionMechanism, MlxRealtimeFrameTensorMechanisms};
 pub use observation::{MlxFrameSessionBranch, MlxPrepublicationFrame, MlxRealtimeHostObserver};
 pub use selection_loading::{MlxPreparedRealtimeExecution, MlxRealtimeExecutionContext};
 

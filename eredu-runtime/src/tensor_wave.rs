@@ -31,7 +31,8 @@ pub enum RoutedTensorReduction {
 }
 
 impl RoutedTensorReduction {
-    pub(super) fn resolve(
+    /// Resolves architecture-declared axes against one concrete pipeline invocation.
+    pub fn resolve(
         &self,
         batch: i32,
         sequence: i32,

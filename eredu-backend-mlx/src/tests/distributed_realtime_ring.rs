@@ -136,15 +136,18 @@ fn push_tokens(serialized: &mut Vec<i32>, values: &[i32]) {
 }
 
 type NativeScheduler = RealtimeSessionScheduler<
+    RealtimeInputFrame,
     eredu_runtime::RealtimePayloadState<
         crate::backend::runtime::cache::state::MlxKeyValueState,
         crate::MlxTensor,
     >,
+    eredu_core::RealtimeFrameScheduleState,
+    RealtimeSampling,
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
     eredu_runtime::PrepublicationRealtimeFrame<
-        crate::MlxTensor,
+        eredu_runtime::CompletedRealtimeFrame<crate::MlxTensor, crate::MlxTensor>,
         MlxRealtimeCompletion,
         MlxRealtimeHostObserver,
     >,
@@ -170,14 +173,24 @@ fn run_forced_and_greedy_sequence(
         eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
     let model_state = RealtimePayloadState::fresh(
         backend.new_realtime_model_state(model).unwrap(),
-        schedule.clone(),
+        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
+            .unwrap()
+            .channels()
+            .clone(),
     );
     let random = backend.realize_random_state(None).unwrap();
     scheduler
         .register(
             request,
-            RealtimeGenerationState::new(model_state, schedule.clone(), sampling, samplers, random)
-                .unwrap(),
+            RealtimeGenerationState::new(
+                model_state,
+                eredu_architectures::moshi::realtime_generation_contract(&schedule),
+                eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
+                sampling,
+                samplers,
+                random,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -290,7 +303,10 @@ fn assert_schedule_disagreement_submits_nothing(
         eredu_architectures::moshi::realtime_generation_samplers(&schedule, sampling).unwrap();
     let model_state = RealtimePayloadState::fresh(
         backend.new_realtime_model_state(model).unwrap(),
-        schedule.clone(),
+        eredu_architectures::moshi::realtime_ingress_contract(model.execution_config())
+            .unwrap()
+            .channels()
+            .clone(),
     );
     let mut scheduler = NativeScheduler::new(
         eredu_runtime::RealtimeModelSessionIdentity::from_selected(model.selected()),
@@ -301,8 +317,15 @@ fn assert_schedule_disagreement_submits_nothing(
     scheduler
         .register(
             request,
-            RealtimeGenerationState::new(model_state, schedule.clone(), sampling, samplers, None)
-                .unwrap(),
+            RealtimeGenerationState::new(
+                model_state,
+                eredu_architectures::moshi::realtime_generation_contract(&schedule),
+                eredu_core::RealtimeFrameScheduleState::new(schedule.clone()),
+                sampling,
+                samplers,
+                None,
+            )
+            .unwrap(),
         )
         .unwrap();
     let mut input = vec![0; schedule.input_audio_codebooks()];
@@ -348,7 +371,18 @@ fn moshi_ring_model_parity_worker() {
     let device = DeviceAssignment::new(DeviceType::Cpu, 0);
     let replicated_options = MlxLoadRequest::default();
     let replicated_selected = MlxRealtimeExecutionContext::select_realtime_execution(
-        eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
+        eredu_architectures::realtime::prepare_realtime_model(
+            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(Path::new(
+                &fixture,
+            )),
+        )
+        .map(|artifact| match artifact {
+            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
+                preparation
+            }
+            _ => panic!("fixture must be a Moshi-family realtime artifact"),
+        })
+        .unwrap(),
         &replicated_options,
         false,
     )
@@ -368,7 +402,18 @@ fn moshi_ring_model_parity_worker() {
     )
     .unwrap();
     let parallel_selected = MlxRealtimeExecutionContext::select_realtime_execution(
-        eredu_architectures::moshi::prepare_realtime_model(Path::new(&fixture)).unwrap(),
+        eredu_architectures::realtime::prepare_realtime_model(
+            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(Path::new(
+                &fixture,
+            )),
+        )
+        .map(|artifact| match artifact {
+            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
+                preparation
+            }
+            _ => panic!("fixture must be a Moshi-family realtime artifact"),
+        })
+        .unwrap(),
         &parallel_options,
         true,
     )

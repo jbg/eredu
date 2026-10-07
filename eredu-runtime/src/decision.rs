@@ -1044,3 +1044,58 @@ mod tests {
         assert!(tail.decisions().is_empty());
     }
 }
+
+impl<B, S> SequentialDecisionDriver<B, S>
+where
+    B: crate::DenseSamplingBackend,
+    B::RandomState: Clone,
+    S: Sampler<B>,
+{
+    /// Draws uniforms from the same transition-local stream used by categorical decisions.
+    /// Validation or synchronous backend failure leaves the driver's RNG unchanged.
+    pub fn draw_uniform(
+        &mut self,
+        shape: &[i32],
+        context: &B::Context,
+    ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>> {
+        crate::dense_sampling::draw_uniform::<B>(&mut self.random, shape, context)
+    }
+
+    /// Draws standard normals, retaining the advanced stream for ordinary branch adoption.
+    pub fn draw_standard_normal(
+        &mut self,
+        shape: &[i32],
+        context: &B::Context,
+    ) -> Result<B::Logits, crate::DenseSamplingError<B::Error>> {
+        crate::dense_sampling::draw_standard_normal::<B>(&mut self.random, shape, context)
+    }
+
+    /// Draws one uniform per logit and performs supplied-draw Gumbel selection.
+    /// This is an architecture-internal categorical draw, not a committed token
+    /// decision: it does not advance the decision ordinal or sampler history.
+    pub fn sample_gumbel(
+        &mut self,
+        logits: &B::Logits,
+        truncation: crate::GumbelTruncation,
+        epsilon: f32,
+        context: &B::Context,
+    ) -> Result<B::Token, crate::DenseSamplingError<B::Error>> {
+        truncation.validate()?;
+        crate::dense_sampling::validate_gumbel_epsilon(epsilon)?;
+        let shape = B::dense_shape(logits);
+        crate::dense_sampling::validate_dense_draw_shape(shape)?;
+        if shape.is_empty() {
+            return Err(crate::DenseSamplingPolicyError::InvalidShape.into());
+        }
+        let mut candidate = self
+            .random
+            .clone()
+            .ok_or(crate::DenseSamplingError::MissingRandomState)?;
+        let uniform = B::uniform_f32(shape, &mut candidate, context)
+            .map_err(crate::DenseSamplingError::Backend)?;
+        let output = B::gumbel_max(logits, &uniform, truncation, epsilon, context)
+            .map_err(crate::DenseSamplingError::Backend)?;
+        self.random = Some(candidate);
+        Ok(output)
+    }
+}

@@ -2,14 +2,14 @@
 
 use std::{collections::BTreeSet, num::NonZeroUsize};
 
-use eredu_core::{ParallelTopology, RealtimeSpeechConfig, SessionCapabilities};
+use eredu_core::{ParallelTopology, SessionCapabilities};
 use eredu_nn::NeuralOperatorCapabilities;
 
 use crate::{
     ArchitectureParameterDescription, CacheResidencyPolicy, ExecutionGraph, ExecutionResidency,
-    ExecutionUnitLayout, LayerWeightResidency, StateComponentMechanism, StateComponentPlacement,
-    StateLayout, StateMechanismCapabilities, WeightLoweringCapability, WeightLoweringDescriptor,
-    WeightLoweringKind,
+    ExecutionUnitLayout, LayerWeightResidency, RealtimeFrameContract, StateComponentMechanism,
+    StateComponentPlacement, StateLayout, StateMechanismCapabilities, WeightLoweringCapability,
+    WeightLoweringDescriptor, WeightLoweringKind,
 };
 
 /// Exact nonempty identity used by neutral realtime contracts.
@@ -489,8 +489,7 @@ pub struct RealtimeArchitectureRequirements {
     source_parameters: ArchitectureParameterDescription,
     executions: Vec<RealtimeExecutionRequirements>,
     operators: NeuralOperatorCapabilities,
-    speech_schedule_identity: RealtimeIdentity,
-    speech_schedule: RealtimeSpeechConfig,
+    frame_contract: RealtimeFrameContract,
     state_layout_identity: RealtimeIdentity,
     state_layout: StateLayout,
     mechanisms: RealtimeMechanismRequirements,
@@ -509,8 +508,7 @@ impl RealtimeArchitectureRequirements {
         source_parameters: ArchitectureParameterDescription,
         executions: impl IntoIterator<Item = RealtimeExecutionRequirements>,
         operators: NeuralOperatorCapabilities,
-        speech_schedule_identity: RealtimeIdentity,
-        speech_schedule: RealtimeSpeechConfig,
+        frame_contract: RealtimeFrameContract,
         state_layout_identity: RealtimeIdentity,
         state_layout: StateLayout,
         mechanisms: RealtimeMechanismRequirements,
@@ -575,8 +573,7 @@ impl RealtimeArchitectureRequirements {
             source_parameters,
             executions,
             operators,
-            speech_schedule_identity,
-            speech_schedule,
+            frame_contract,
             state_layout_identity,
             state_layout,
             mechanisms,
@@ -620,14 +617,9 @@ impl RealtimeArchitectureRequirements {
         self.operators
     }
 
-    /// Returns the stable speech schedule identity.
-    pub const fn speech_schedule_identity(&self) -> &RealtimeIdentity {
-        &self.speech_schedule_identity
-    }
-
-    /// Returns exact portable speech geometry and delays.
-    pub const fn speech_schedule(&self) -> &RealtimeSpeechConfig {
-        &self.speech_schedule
+    /// Returns complete immutable frame policy, channels and sampler ownership.
+    pub const fn frame_contract(&self) -> &RealtimeFrameContract {
+        &self.frame_contract
     }
 
     /// Returns the stable state-layout identity.
@@ -1188,7 +1180,7 @@ pub fn select_realtime_realization(
             if proof.architecture != requirements.architecture {
                 issues.push(RealtimeSelectionIssue::ArchitectureIdentityMismatch);
             }
-            if proof.speech_schedule != requirements.speech_schedule_identity {
+            if &proof.speech_schedule != requirements.frame_contract.policy_identity() {
                 issues.push(RealtimeSelectionIssue::SpeechScheduleIdentityMismatch);
             }
             if proof.state_layout != requirements.state_layout_identity {
@@ -1585,10 +1577,11 @@ pub enum RealtimeContractError {
 mod tests {
     use std::{cell::Cell, convert::Infallible, num::NonZeroUsize, rc::Rc, time::Duration};
 
+    use crate::{RealtimeIngressContract, RealtimeScheduleDescriptor, TokenDomain};
     use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype};
     use eredu_core::{
         cache::LayerCachePolicy, AttentionPolicy, CompletionCancellationMode, LayerSchedule,
-        RealtimeFrameConvention,
+        RealtimeFrameConvention, RealtimeSpeechConfig,
     };
 
     use super::*;
@@ -1658,6 +1651,23 @@ mod tests {
             1,
             RealtimeFrameConvention::FeedbackAlignedHistory,
             vec![0, 1, 2, 1, 2],
+        )
+        .unwrap()
+    }
+
+    fn frame_contract() -> RealtimeFrameContract {
+        let schedule = schedule();
+        let ingress = RealtimeIngressContract::new(
+            schedule.clone(),
+            TokenDomain::new(32),
+            TokenDomain::new(16),
+        )
+        .unwrap();
+        RealtimeFrameContract::new(
+            identity("schedule-3"),
+            schedule.schedule_descriptor(),
+            ingress.channels().clone(),
+            1 + schedule.depth_audio_codebooks(),
         )
         .unwrap()
     }
@@ -1792,8 +1802,7 @@ mod tests {
             source_parameters,
             executions,
             required_operators(),
-            identity("schedule-3"),
-            schedule(),
+            frame_contract(),
             identity("state-layout-8"),
             state_layout(),
             RealtimeMechanismRequirements::new(required_mechanisms()).unwrap(),
@@ -1808,7 +1817,7 @@ mod tests {
     fn proof(requirements: &RealtimeArchitectureRequirements) -> RealtimeArchitectureProof {
         RealtimeArchitectureProof::new(
             requirements.architecture().clone(),
-            requirements.speech_schedule_identity().clone(),
+            requirements.frame_contract().policy_identity().clone(),
             requirements.state_layout_identity().clone(),
             requirements.topology().identity().clone(),
             ParallelTopology::new(2, 1, 1, 1).unwrap(),
@@ -2514,7 +2523,7 @@ mod tests {
         let requirements = requirements();
         let invalid_proof = RealtimeArchitectureProof::new(
             requirements.architecture().clone(),
-            requirements.speech_schedule_identity().clone(),
+            requirements.frame_contract().policy_identity().clone(),
             requirements.state_layout_identity().clone(),
             requirements.topology().identity().clone(),
             ParallelTopology::new(2, 2, 1, 1).unwrap(),

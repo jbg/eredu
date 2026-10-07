@@ -453,7 +453,7 @@ where
         &self,
         _unit: usize,
         _routed: bool,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Self::Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Self::Error> {
         // The tensor-parallel attention contribution precedes expert routing;
         // the routed activation contribution remains partial until its exact
         // post-exchange row reduction.
@@ -1071,8 +1071,8 @@ pub enum PipelinePartitionInput<'a, T> {
     },
 }
 
-fn qwen_vl_routed_tensor_reductions() -> crate::partitioned_execution::RoutedTensorReductions {
-    crate::partitioned_execution::RoutedTensorReductions::hidden(1, 1)
+fn qwen_vl_routed_tensor_reductions() -> eredu_runtime::RoutedTensorReductions {
+    eredu_runtime::RoutedTensorReductions::hidden(1, 1)
 }
 
 /// One neutral composite model for dense and MoE Qwen3-VL.

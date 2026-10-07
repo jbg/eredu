@@ -220,17 +220,17 @@ fn qwen4_expert_realization_rejects_equation_drift_without_mutating_model() {
 
 #[test]
 fn qwen4_expert_waves_declare_lexical_status_rows_and_replicated_vocabulary() {
-    use eredu_architectures::partitioned_execution::{
-        RoutedTensorDimension as Dimension, RoutedTensorReduction as Reduction,
-        RoutedTensorReductions, TextPartitionArchitecture,
+    use eredu_runtime::{
+        PipelinePartitionArchitecture, RoutedTensorDimension as Dimension,
+        RoutedTensorReduction as Reduction, RoutedTensorReductions,
     };
     let spec = specification();
     let ctx = NumericContext::default();
     let model = TargetModel::<NumericBackend>::new(bind_spec(spec.clone()), &ctx).unwrap();
-    assert!(!<TargetModel<NumericBackend> as TextPartitionArchitecture<NumericBackend, State>>::partition_tensor_vocabulary_sharded(&model));
+    assert!(!<TargetModel<NumericBackend> as PipelinePartitionArchitecture<NumericBackend, State>>::partition_tensor_vocabulary_sharded(&model));
     for (ordinal, unit) in spec.units.iter().enumerate() {
         let routed = matches!(unit, UnitSpec::Decoder { .. });
-        let actual = <TargetModel<NumericBackend> as TextPartitionArchitecture<
+        let actual = <TargetModel<NumericBackend> as PipelinePartitionArchitecture<
             NumericBackend,
             State,
         >>::partition_routed_tensor_reductions(&model, ordinal, routed)
@@ -253,13 +253,15 @@ fn qwen4_expert_waves_declare_lexical_status_rows_and_replicated_vocabulary() {
                     }
                 );
                 assert_eq!(table.dimensions, 2);
-                assert!(<TargetModel<NumericBackend> as TextPartitionArchitecture<
-                    NumericBackend,
-                    State,
-                >>::partition_routed_tensor_reductions(
-                    &model, ordinal, true
-                )
-                .is_err());
+                assert!(
+                    <TargetModel<NumericBackend> as PipelinePartitionArchitecture<
+                        NumericBackend,
+                        State,
+                    >>::partition_routed_tensor_reductions(
+                        &model, ordinal, true
+                    )
+                    .is_err()
+                );
             }
         }
     }

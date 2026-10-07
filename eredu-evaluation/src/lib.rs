@@ -13,6 +13,7 @@ pub mod intervention;
 mod parity;
 pub mod qwen4_exp;
 mod realtime;
+pub mod voicechat;
 
 pub use checkpoint::{
     compare_checkpoint_artifacts, CheckpointParityError, CheckpointParityOptions,

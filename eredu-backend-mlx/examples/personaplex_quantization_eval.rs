@@ -59,7 +59,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let materialization = MlxParameterMaterializationContext::new(stream, stream);
     let mut mimi = construct::<MlxNeuralBackend>(prepared, stream, &materialization)?;
     run_personaplex_quantization(&paths, &options, &mut mimi, stream, |artifact| {
-        let preparation = eredu_architectures::moshi::prepare_realtime_model(artifact)?;
+        let preparation = match eredu_architectures::realtime::prepare_realtime_model(
+            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(artifact),
+        )? {
+            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
+                preparation
+            }
+            _ => return Err("expected a Moshi-family realtime artifact".into()),
+        };
         let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
         let model = realtime_support::load(
             &backend,

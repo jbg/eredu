@@ -10,6 +10,7 @@ description = "Backend-neutral evaluation drivers for Eredu models"
 include = [
     "src/**",
     "tests/**",
+    "fixtures/**",
     "scripts/*.py",
     "doc/**",
     "README.md",

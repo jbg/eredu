@@ -23,7 +23,7 @@ pub(super) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, 
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,
@@ -86,9 +86,13 @@ where
                 let distributed = distributed.take().ok_or_else(|| {
                     Error::Parallel("routed pipeline communication was already consumed".into())
                 })?;
-                let row_status = execution.row_lookup_status_group()
-                    .map(|id| distributed.selected_group(id).cloned().ok_or_else(||
-                        Error::Parallel("selected row status group is not bound".into())))
+                let row_status = execution
+                    .row_lookup_status_group()
+                    .map(|id| {
+                        distributed.selected_group(id).cloned().ok_or_else(|| {
+                            Error::Parallel("selected row status group is not bound".into())
+                        })
+                    })
                     .transpose()?;
                 let (communication, parallel, sampling, communication_executor) = distributed
                     .into_partition_communication(
@@ -96,7 +100,16 @@ where
                         execution.communication_tensor_group(),
                         execution.sampling_group(),
                     )?;
-                let rows = row_binding.map(|rows| rows.bind(parallel.as_ref(), row_status.as_ref(), weights_stream, stream)).transpose()?;
+                let rows = row_binding
+                    .map(|rows| {
+                        rows.bind(
+                            parallel.as_ref(),
+                            row_status.as_ref(),
+                            weights_stream,
+                            stream,
+                        )
+                    })
+                    .transpose()?;
                 let parallel = execution
                     .select_parallel(parallel)
                     .map_err(Error::ArchitectureModel)?;
@@ -108,9 +121,15 @@ where
                 let movement =
                     super::super::distributed::expert::MlxExpertRouteTensorMovement::new(context);
                 let unit_strategy = execution
-                    .pipeline_unit_strategy(eredu_runtime::ParameterProviders { grouped: provider, rows }, movement)
+                    .pipeline_unit_strategy(
+                        eredu_runtime::ParameterProviders {
+                            grouped: provider,
+                            rows,
+                        },
+                        movement,
+                    )
                     .map_err(Error::ArchitectureModel)?;
-                let executor = eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new_with_unit_strategy(
+                let executor = eredu_runtime::PipelinePartitionExecutor::new_with_unit_strategy(
                     architecture,
                     execution_policy,
                     addresses,
@@ -175,10 +194,8 @@ pub(crate) fn bind_partitioned_pipeline<A, G, F>(
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
@@ -234,16 +251,15 @@ where
                     .into_partition_communication(manifest, tensor_group, session_group)?;
                 partition_communication_authority = Some(communication.authority());
                 partition_sampling_group = Some(sampling);
-                let executor =
-                    eredu_architectures::partitioned_execution::PipelinePartitionExecutor::new(
-                        architecture,
-                        execution_policy,
-                        addresses,
-                        parallel,
-                        MlxPartitionTensorAllocator,
-                        activation_dtype,
-                    )
-                    .map_err(|error| Error::Other(Box::new(error)))?;
+                let executor = eredu_runtime::PipelinePartitionExecutor::new(
+                    architecture,
+                    execution_policy,
+                    addresses,
+                    parallel,
+                    MlxPartitionTensorAllocator,
+                    activation_dtype,
+                )
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
                     execution_plan,
                     executor,

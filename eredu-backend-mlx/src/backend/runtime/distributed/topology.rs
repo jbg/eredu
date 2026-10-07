@@ -314,7 +314,15 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
         collective_requirement(CommunicationOperation::AllGatherUneven),
         variable,
         point_to_point,
-        collective_requirement(CommunicationOperation::Broadcast),
+        CommunicationOperationRequirement::tensors(
+            CommunicationOperation::Broadcast,
+            mlx_collective_dtypes()
+                .into_iter()
+                .chain([TensorDtype::I32]),
+            tensor_limits,
+            true,
+        )
+        .expect("static MLX broadcast capability is valid"),
         CommunicationOperationRequirement::barrier(true),
         CommunicationOperationRequirement::failure_agreement(true),
     ])

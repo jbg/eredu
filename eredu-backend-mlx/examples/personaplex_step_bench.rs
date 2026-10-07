@@ -45,7 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
         let mut model = realtime_support::load(
             &backend,
-            eredu_architectures::moshi::prepare_realtime_model(&model_dir)?,
+            match eredu_architectures::realtime::prepare_realtime_model(
+                &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(&model_dir),
+            )? {
+                eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
+                    preparation
+                }
+                _ => return Err("expected a Moshi-family realtime artifact".into()),
+            },
             MlxLoadRequest::from_normalized(
                 eredu_runtime::NormalizedLoadRequest::with_quantization(
                     QuantizationRequest::Affine {
@@ -62,7 +69,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         safemlx::memory::reset_peak_memory()?;
         let load_start = Instant::now();
-        let preparation = eredu_architectures::moshi::prepare_realtime_model(&model_dir)?;
+        let preparation = match eredu_architectures::realtime::prepare_realtime_model(
+            &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(&model_dir),
+        )? {
+            eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => {
+                preparation
+            }
+            _ => return Err("expected a Moshi-family realtime artifact".into()),
+        };
         let backend = MlxRealtimeExecutionContext::new(stream, weights_stream);
         let mut model = realtime_support::load(&backend, preparation, MlxLoadRequest::default())?;
         stream.synchronize()?;

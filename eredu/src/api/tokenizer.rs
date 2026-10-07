@@ -91,7 +91,7 @@ pub(super) fn load_tokenizer_for_kind(
                     .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
             }
         }
-        ModelKind::Moshi => Err(TextMetadataError::UnsupportedArchitecture(
+        ModelKind::Moshi | ModelKind::VoiceChat => Err(TextMetadataError::UnsupportedArchitecture(
             "Moshi-family models use a realtime tokenizer contract; load it outside the chat tokenizer API".into(),
         )),
         _ => Ok(Tokenizer::from_file(model_dir.join("tokenizer.json"))?),

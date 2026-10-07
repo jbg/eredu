@@ -668,6 +668,7 @@ thread_local! {
     static COMMUNICATION_COMPLETION_SCRIPT: RefCell<VecDeque<FakeCompletionOutcome>> = const { RefCell::new(VecDeque::new()) };
     static BOUNDED_COMMUNICATION_WAIT_COUNT: Cell<usize> = const { Cell::new(0) };
     static FAILURE_AGREEMENT_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAILURE_AGREEMENT_PEERS: RefCell<Option<ConcurrentCheckpointAgreement>> = const { RefCell::new(None) };
     static FAIL_NEXT_COMMUNICATION_SUBMISSION: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -824,7 +825,7 @@ impl FailureAgreementBackend for FakeBackend {
 
     fn agree_success(
         local_success: bool,
-        _: Option<[u64; 8]>,
+        descriptor: Option<[u64; 8]>,
         _: &Self::CommunicationGroup,
         _: &Self::Executor,
     ) -> Result<Submission<bool, Self::CommunicationCompletion>, Self::CommunicationError> {
@@ -833,7 +834,11 @@ impl FailureAgreementBackend for FakeBackend {
             return Err(FakeCommunicationError::Submission);
         }
         Ok(Submission {
-            output: local_success,
+            output: FAILURE_AGREEMENT_PEERS.with(|peer| {
+                peer.borrow().as_ref().map_or(local_success, |peer| {
+                    peer.agree_backend_status(local_success, descriptor)
+                })
+            }),
             completion: CommunicationDone,
         })
     }
@@ -1270,6 +1275,48 @@ fn recovery_agreement_cannot_bypass_a_healthy_communication_authority() {
         }
     ));
     assert_eq!(FAILURE_AGREEMENT_COUNT.get(), 0);
+}
+
+#[test]
+fn final_agreement_rejects_different_exact_epochs_and_allows_matching_retry() {
+    let coordinator = Arc::new(ConcurrentCheckpointCoordinator::new());
+    std::thread::scope(|scope| {
+        let workers = (0..2)
+            .map(|rank| {
+                let coordinator = Arc::clone(&coordinator);
+                scope.spawn(move || {
+                    FAILURE_AGREEMENT_PEERS.with(|peer| {
+                        *peer.borrow_mut() =
+                            Some(ConcurrentCheckpointAgreement { rank, coordinator });
+                    });
+                    let communication = route_test_communication(rank, true);
+                    // Adjacent values above Float64's exact integer range must remain distinct.
+                    let base = (1_u64 << 60) + 3;
+                    for (offset, matches) in [(0, true), (rank as u64 + 1, false), (4, true)] {
+                        let epoch = DistributedCommitEpoch::new(base + offset).unwrap();
+                        let actual = OpaqueFailureAgreement.commit(
+                            &communication,
+                            CollectiveGroupId::new(1),
+                            epoch,
+                            &(),
+                        );
+                        assert_eq!(
+                            actual,
+                            if matches {
+                                DistributedCommitOutcome::Committed(epoch)
+                            } else {
+                                DistributedCommitOutcome::Aborted(epoch)
+                            }
+                        );
+                    }
+                    FAILURE_AGREEMENT_PEERS.with(|peer| *peer.borrow_mut() = None);
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
 }
 
 #[test]
@@ -5160,6 +5207,26 @@ impl ConcurrentCheckpointCoordinator {
 struct ConcurrentCheckpointAgreement {
     rank: usize,
     coordinator: Arc<ConcurrentCheckpointCoordinator>,
+}
+
+impl ConcurrentCheckpointAgreement {
+    fn agree_backend_status(&self, local_success: bool, descriptor: Option<[u64; 8]>) -> bool {
+        self.coordinator.descriptors.lock().unwrap()[self.rank] = descriptor;
+        if !local_success {
+            self.coordinator.failed.store(true, Ordering::SeqCst);
+        }
+        self.coordinator.rendezvous.wait();
+        let agreed = {
+            let descriptors = self.coordinator.descriptors.lock().unwrap();
+            descriptors[0] == descriptors[1] && !self.coordinator.failed.load(Ordering::SeqCst)
+        };
+        self.coordinator.rendezvous.wait();
+        if self.rank == 0 {
+            self.coordinator.failed.store(false, Ordering::SeqCst);
+        }
+        self.coordinator.rendezvous.wait();
+        agreed
+    }
 }
 
 enum TestPhaseAgreement {

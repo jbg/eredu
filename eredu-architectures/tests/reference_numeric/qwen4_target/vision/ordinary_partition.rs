@@ -56,7 +56,7 @@ fn exact_layout(
         &context,
     )
     .unwrap();
-    let mut layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+    let mut layout = eredu_runtime::derive_partitioned_local_layout(
         &conditional.parameter_description(&context).unwrap(),
         rank,
     )

@@ -582,6 +582,15 @@ pub trait Config: 'static {
     fn query_key_norm_epsilon(&self) -> Option<f32> {
         None
     }
+    /// Offset added to learned per-head Q/K RMS scales.
+    fn query_key_normalization_offset(&self) -> f32 {
+        0.0
+    }
+    /// Float32 reduction and gain policy for shared per-head Q/K scales.
+    /// Per-head weight banks retain their head-count grouping.
+    fn query_key_normalization_groups(&self) -> Option<i32> {
+        None
+    }
     /// Whether projections own MLP biases.
     fn mlp_bias(&self) -> bool;
     /// Physical construction of the gate/up input projection.
@@ -604,6 +613,10 @@ pub trait Config: 'static {
     }
     /// Complete rotary-position construction specification.
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec;
+    /// Layer-specific rotary policy; families may distinguish local and global heads.
+    fn layer_rotary_spec(&self, _layer: usize, dimensions: i32) -> RotarySpec {
+        self.rotary_spec(dimensions)
+    }
     /// Whether this decoder stack applies rotary position encoding.
     fn rotary_enabled(&self) -> bool {
         true
@@ -1638,7 +1651,17 @@ impl<B: NeuralBackend> Attention<B> {
                     );
                     if config.query_key_norm_per_head_weights() {
                         spec = spec.with_groups(query_heads)?;
+                    } else {
+                        spec.groups = config.query_key_normalization_groups();
                     }
+                    spec.scale = normalization_scale(
+                        parameter_spec(
+                            config,
+                            format!("{prefix}.{}.weight", fields.attention_query_norm),
+                        )
+                        .map_err(Error::backend)?,
+                        config.query_key_normalization_offset(),
+                    );
                     B::normalization(spec, context)
                 })
                 .transpose()?,
@@ -1660,13 +1683,23 @@ impl<B: NeuralBackend> Attention<B> {
                     );
                     if config.query_key_norm_per_head_weights() {
                         spec = spec.with_groups(key_value_heads)?;
+                    } else {
+                        spec.groups = config.query_key_normalization_groups();
                     }
+                    spec.scale = normalization_scale(
+                        parameter_spec(
+                            config,
+                            format!("{prefix}.{}.weight", fields.attention_key_norm),
+                        )
+                        .map_err(Error::backend)?,
+                        config.query_key_normalization_offset(),
+                    );
                     B::normalization(spec, context)
                 })
                 .transpose()?,
             rotary: config
                 .rotary_enabled()
-                .then(|| B::rotary(config.rotary_spec(head), context))
+                .then(|| B::rotary(config.layer_rotary_spec(layer, head), context))
                 .transpose()?,
             sliding_window: policy
                 .window()
@@ -3114,6 +3147,28 @@ pub(crate) fn parameter_description(
     ordinary_value_projection: impl Fn(usize) -> bool,
     replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    parameter_description_with_vocabulary(
+        config,
+        ordinary_value_projection,
+        replacement_groups,
+        true,
+    )
+}
+
+/// Derives block and final-normalization topology for supplied-embedding execution,
+/// without declaring a vocabulary table or a language-model output head.
+pub fn embedded_parameter_description(
+    config: &impl Config,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    parameter_description_with_vocabulary(config, |_| true, |_| Ok(None), false)
+}
+
+fn parameter_description_with_vocabulary(
+    config: &impl Config,
+    ordinary_value_projection: impl Fn(usize) -> bool,
+    replacement_groups: impl Fn(usize) -> Result<Option<Vec<ParameterGroupSpec>>, ParallelPlanError>,
+    include_vocabulary: bool,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
     config
         .validate_config()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
@@ -3139,7 +3194,11 @@ pub(crate) fn parameter_description(
             .map_err(|_| ParallelPlanError::InvalidTensor(format!("decoder {name} exceeds usize")))
     };
     let hidden = dimension("hidden width", config.hidden_size())?;
-    let vocabulary = dimension("vocabulary", config.vocabulary_size())?;
+    let vocabulary = if include_vocabulary {
+        dimension("vocabulary", config.vocabulary_size())?
+    } else {
+        0
+    };
     let layers = dimension("layer count", config.num_hidden_layers())?;
     let query_heads = dimension("query-head count", config.num_attention_heads())?;
     let key_value_heads = dimension("key/value-head count", config.num_key_value_heads())?;
@@ -3168,8 +3227,9 @@ pub(crate) fn parameter_description(
     let root = config.parameter_root();
     let embedding = format!("{root}.embed_tokens.weight");
     let norm = format!("{root}.norm.weight");
-    let mut owned = vec![
-        OwnedParameterGroupSpec::new(
+    let mut owned = Vec::new();
+    if include_vocabulary {
+        owned.push(OwnedParameterGroupSpec::new(
             if config.tie_word_embeddings() {
                 ParameterGroupOwner::static_any_of(["embedding", "output"])
             } else {
@@ -3184,21 +3244,21 @@ pub(crate) fn parameter_description(
                     MemberSharding::Balanced { axis: 0 },
                 )],
             )?,
-        ),
-        OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::static_role("norm"),
-            ParameterGroupSpec::new(
-                format!("{root}.norm"),
-                ParameterRole::Replicated,
-                [eredu_runtime::ParameterMemberSpec::new(
-                    norm,
-                    vec![hidden],
-                    MemberSharding::Replicated,
-                )],
-            )?,
-        ),
-    ];
-    if !config.tie_word_embeddings() {
+        ));
+    }
+    owned.push(OwnedParameterGroupSpec::new(
+        ParameterGroupOwner::static_role("norm"),
+        ParameterGroupSpec::new(
+            format!("{root}.norm"),
+            ParameterRole::Replicated,
+            [eredu_runtime::ParameterMemberSpec::new(
+                norm,
+                vec![hidden],
+                MemberSharding::Replicated,
+            )],
+        )?,
+    ));
+    if include_vocabulary && !config.tie_word_embeddings() {
         owned.push(OwnedParameterGroupSpec::new(
             ParameterGroupOwner::static_role("output"),
             ParameterGroupSpec::new(
@@ -3643,6 +3703,21 @@ impl StaticModuleSpec {
 }
 
 impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
+    /// Projects normalized hidden values through the existing tensor-parallel head.
+    pub fn project_normalized_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.project_instrumented(
+            hidden,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
     /// Looks up rank-local vocabulary rows, reduces them, then expands the residual.
     pub fn embed_parallel(
         &mut self,
@@ -3665,28 +3740,22 @@ impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        let logits = match (&mut self.lm_head, parallel) {
-            (Some(head), Some(parallel)) => instrumentation.project_vocabulary::<B>(
+        let Some(parallel) = parallel else {
+            return self.project_normalized_instrumented(hidden, context, instrumentation);
+        };
+        let logits = match &mut self.lm_head {
+            Some(head) => instrumentation.project_vocabulary::<B>(
                 "projection_input",
                 head,
                 hidden,
                 parallel,
                 context,
             ),
-            (None, Some(parallel)) => instrumentation.project_vocabulary_embedding::<B>(
+            None => instrumentation.project_vocabulary_embedding::<B>(
                 "projection_input",
                 &mut self.embeddings,
                 hidden,
                 parallel,
-                context,
-            ),
-            (Some(head), None) => {
-                instrumentation.project::<B>("projection_input", head, hidden, None, context)
-            }
-            (None, None) => instrumentation.project_embedding(
-                "projection_input",
-                &mut self.embeddings,
-                hidden,
                 context,
             ),
         }?;
@@ -3706,6 +3775,20 @@ impl<B: eredu_nn::DistributedNeuralBackend, D: DecoderBoundary<B>> StaticModules
 }
 
 impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
+    /// Projects normalized hidden values through the existing vocabulary head.
+    /// Final normalization is not repeated; tied embeddings retain their owner.
+    pub fn project_normalized(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.project_normalized_instrumented(
+            hidden,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
     /// Applies the actual residual, normalization and affine readout boundaries.
     pub(crate) fn finish_instrumented(
         &mut self,
@@ -3714,14 +3797,23 @@ impl<B: NeuralBackend, D: DecoderBoundary<B>> StaticModules<B, D> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let hidden = self.boundary.collapse(hidden, context, instrumentation)?;
+        self.project_normalized_instrumented(&hidden, context, instrumentation)
+    }
+
+    fn project_normalized_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let logits = match &mut self.lm_head {
             Some(head) => {
-                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
+                instrumentation.project::<B>("projection_input", head, hidden, None, context)
             }
             None => instrumentation.project_embedding(
                 "projection_input",
                 &mut self.embeddings,
-                &hidden,
+                hidden,
                 context,
             ),
         }?;
@@ -5736,7 +5828,7 @@ where
     }
 }
 
-impl<B, C, P, S> crate::partitioned_execution::TextPartitionArchitecture<B, S>
+impl<B, C, P, S> eredu_runtime::PipelinePartitionArchitecture<B, S>
     for PartitionedLayeredModel<B, C, P>
 where
     B: eredu_nn::DistributedNeuralBackend,
@@ -5746,11 +5838,14 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
-    fn partition_input_dimensions(input: &Self::Input<'_>) -> Result<(i32, i32), Self::Error> {
+    fn partition_input_dimensions(
+        &self,
+        input: &Self::Input<'_>,
+    ) -> Result<(i32, i32), Self::Error> {
         Ok((input.tokens.dim(0), input.tokens.dim(1)))
     }
 
-    fn begin_text_partition<'a, O>(
+    fn begin_pipeline_partition<'a, O>(
         &mut self,
         input: Self::Input<'a>,
         incoming: Option<(
@@ -5758,7 +5853,7 @@ where
             <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
         )>,
         state: &mut S,
-        expected: &eredu_runtime::StateLayout,
+        expected: Option<&eredu_runtime::StateLayout>,
         first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -5767,6 +5862,9 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
+        let expected = expected.ok_or_else(|| {
+            eredu_nn::Error::backend("this pipeline architecture requires selected state geometry")
+        })?;
         let (tokens, mask) = (input.tokens, input.mask);
         let input = match incoming {
             Some((hidden, auxiliary)) => {
@@ -5798,12 +5896,10 @@ where
         &self,
         unit: usize,
         bank: eredu_runtime::RoutedBankId,
-    ) -> Result<crate::partitioned_execution::RoutedTensorReductions, Error> {
+    ) -> Result<eredu_runtime::RoutedTensorReductions, Error> {
         self.args
             .routed_bank_tensor_reductions(unit, bank)
-            .map(|(before, after)| {
-                crate::partitioned_execution::RoutedTensorReductions::hidden(before, after)
-            })
+            .map(|(before, after)| eredu_runtime::RoutedTensorReductions::hidden(before, after))
     }
 }
 

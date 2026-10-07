@@ -3228,7 +3228,7 @@ fn verify_prepared_component_execution_with_topologies(
                     let parameters = &parameters;
                     let residency = residency.clone();
                     scope.spawn(move || {
-                        use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
+                        use eredu_runtime::derive_partitioned_local_layout;
                         let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
                         let plan = prepared_adapter::plan(None).with_topology(topology).with_residency(residency);
                         let sources = partitioned_adapter::prepare_plan(inspection, &plan, rank, std::time::Duration::from_secs(10)).unwrap();

@@ -98,7 +98,8 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     args.layer_norm_epsilon,
                     ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
                         .map_err(Error::backend)?,
-                ),
+                )
+                .with_groups(1)?,
                 context,
             )?,
             residual_in_fp32: args.residual_in_fp32,
@@ -274,7 +275,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     args.layer_norm_epsilon,
                     ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
                         .map_err(Error::backend)?,
-                ),
+                )
+                .with_groups(1)?,
                 context,
             )?,
             residual_in_fp32: args.residual_in_fp32,

@@ -520,6 +520,7 @@ impl NeuralBackend for MlxNeuralBackend {
         .map_err(ComputeError::backend)?;
         let mut outputs = Vec::with_capacity(sequence as usize);
         let chunk = i32::try_from(input.chunk_size).unwrap_or(i32::MAX).max(1);
+        let evaluate_chunks = sequence > chunk;
         let mut chunk_start = 0;
         while chunk_start < sequence {
             let chunk_end = (chunk_start + chunk).min(sequence);
@@ -564,6 +565,14 @@ impl NeuralBackend for MlxNeuralBackend {
                 outputs.push(compute(
                     output.try_index_device((.., NewAxis, .., ..), context),
                 )?);
+            }
+            if evaluate_chunks {
+                // Complete both the recurrent carry and emitted outputs before
+                // building another chunk. Unevaluated outputs otherwise retain
+                // every intermediate recurrent state across the whole prefill.
+                compute(safemlx::transforms::eval(
+                    std::iter::once(&state).chain(outputs[chunk_start as usize..].iter()),
+                ))?;
             }
             chunk_start = chunk_end;
         }
@@ -1067,38 +1076,43 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        policy.validate()?;
-        let range = embedding
-            .vocabulary_range
-            .as_ref()
-            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let sentinel = match policy {
-            EmbeddingLookupPolicy::Strict => None,
-            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
-        };
-        let input = compute(validate_token_domain(
-            input.as_array(),
-            embedding.vocabulary,
-            sentinel,
-            context,
-        ))?;
-        let start =
-            Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
-        let end = Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
-        let valid = compute(input.ge(&start, context))?
-            .logical_and(&compute(input.lt(&end, context))?, context)
-            .map_err(ComputeError::backend)?;
-        let local = compute(input.subtract(&start, context))?;
-        let safe = compute(safemlx::ops::r#where(
-            &valid,
-            &local,
-            Array::from_int(0),
-            context,
-        ))?;
-        let value = compute(embedding.module.forward(&safe, context))?;
-        let mask = compute(valid.expand_dims(-1, context))?;
-        let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
-        let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
+        let prepared = (|| {
+            policy.validate()?;
+            let range = embedding
+                .vocabulary_range
+                .as_ref()
+                .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+            let sentinel = match policy {
+                EmbeddingLookupPolicy::Strict => None,
+                EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
+            };
+            let input = compute(validate_token_domain(
+                input.as_array(),
+                embedding.vocabulary,
+                sentinel,
+                context,
+            ))?;
+            let start =
+                Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
+            let end =
+                Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
+            let valid = compute(input.ge(&start, context))?
+                .logical_and(&compute(input.lt(&end, context))?, context)
+                .map_err(ComputeError::backend)?;
+            let local = compute(input.subtract(&start, context))?;
+            let safe = compute(safemlx::ops::r#where(
+                &valid,
+                &local,
+                Array::from_int(0),
+                context,
+            ))?;
+            let value = compute(embedding.module.forward(&safe, context))?;
+            let mask = compute(valid.expand_dims(-1, context))?;
+            let zero_value = compute(safemlx::ops::zeros_like(&value, context))?;
+            let value = compute(safemlx::ops::r#where(&mask, &value, &zero_value, context))?;
+            Ok(value)
+        })();
+        let value = agree_vocabulary_setup(parallel, 1, prepared, context)?;
         compute_tensor(crate::backend::runtime::distributed::all_sum(
             &value, parallel, context,
         ))
@@ -1122,14 +1136,18 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        let range = linear
-            .vocabulary_range
-            .clone()
-            .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
-        let widths = range
-            .balanced_peer_widths(parallel.size(), parallel.rank())
-            .map_err(ComputeError::backend)?;
-        let local = linear.forward_with_input_observer(input, context, observer)?;
+        let prepared = (|| {
+            let range = linear
+                .vocabulary_range
+                .clone()
+                .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
+            let widths = range
+                .balanced_peer_widths(parallel.size(), parallel.rank())
+                .map_err(ComputeError::backend)?;
+            let local = linear.forward_with_input_observer(input, context, observer)?;
+            Ok((local, widths))
+        })();
+        let (local, widths) = agree_vocabulary_setup(parallel, 2, prepared, context)?;
         compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
             local.as_array(),
             -1,
@@ -1157,14 +1175,18 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        let range = embedding
-            .vocabulary_range
-            .clone()
-            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let widths = range
-            .balanced_peer_widths(parallel.size(), parallel.rank())
-            .map_err(ComputeError::backend)?;
-        let local = embedding.as_linear_with_input_observer(input, context, observer)?;
+        let prepared = (|| {
+            let range = embedding
+                .vocabulary_range
+                .clone()
+                .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+            let widths = range
+                .balanced_peer_widths(parallel.size(), parallel.rank())
+                .map_err(ComputeError::backend)?;
+            let local = embedding.as_linear_with_input_observer(input, context, observer)?;
+            Ok((local, widths))
+        })();
+        let (local, widths) = agree_vocabulary_setup(parallel, 3, prepared, context)?;
         compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
             local.as_array(),
             -1,
@@ -1184,5 +1206,30 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
             parallel,
             context,
         ))
+    }
+}
+
+/// Local lazy-graph construction must finish on every participant before the
+/// dependent vocabulary collective. The retained authority owns timed-out
+/// completions and gates subsequent communication after terminal failure.
+fn agree_vocabulary_setup<T>(
+    parallel: &Group,
+    operation: u64,
+    prepared: Result<T, ComputeError>,
+    context: &Stream,
+) -> Result<T, ComputeError> {
+    let accepted = parallel
+        .agree_local_phase(
+            [0x564f434142, operation, 0, 0, 0, 0, 0, 0],
+            prepared.is_ok(),
+            context,
+        )
+        .map_err(ComputeError::backend_source)?;
+    match prepared {
+        Err(error) => Err(error),
+        Ok(value) if accepted => Ok(value),
+        Ok(_) => Err(ComputeError::backend(
+            "a vocabulary participant failed local preparation",
+        )),
     }
 }

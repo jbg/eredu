@@ -35,3 +35,7 @@ mod grouped_units;
 mod decoder_boundary;
 
 mod token_input;
+
+mod voicechat_transformer;
+
+mod voicechat_tts_generator;

@@ -12,7 +12,7 @@ use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
     LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, PadMode, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    RotaryOperator, RotaryPosition, RotarySpec, Tensor, TensorElementType,
 };
 use eredu_runtime::ParameterBackend;
 
@@ -305,6 +305,43 @@ impl NumericTensor {
 impl Tensor for NumericTensor {
     type Context = Context;
 
+    fn element_type(&self) -> Option<TensorElementType> {
+        Some(match self.data {
+            Data::I32(_) => TensorElementType::I32,
+            _ => TensorElementType::F32,
+        })
+    }
+
+    fn cast_float(&self, dtype: TensorElementType, _: &Context) -> Result<Self, Error> {
+        if dtype == TensorElementType::F32 && self.element_type() == Some(TensorElementType::F32) {
+            Ok(self.clone())
+        } else {
+            Err(Error::backend(
+                "reference tensor supports only unchanged F32 casts",
+            ))
+        }
+    }
+
+    fn broadcast_to(&self, shape: &[i32], _: &Context) -> Result<Self, Error> {
+        if self.element_type() != Some(TensorElementType::F32)
+            || shape.iter().any(|&n| n < 0)
+            || self.shape.len() > shape.len()
+            || self
+                .shape
+                .iter()
+                .zip(&shape[shape.len().saturating_sub(self.shape.len())..])
+                .any(|(&input, &output)| input != 1 && input != output)
+        {
+            return Err(Error::backend("invalid F32 reference broadcast target"));
+        }
+        Ok(Self::f32(
+            (0..elements(shape))
+                .map(|index| self.broadcast_value(&coordinates(index, shape), shape))
+                .collect(),
+            shape,
+        ))
+    }
+
     fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
         Ok(self.clone())
     }
@@ -387,6 +424,89 @@ impl Tensor for NumericTensor {
     }
     fn maximum_scalar(&self, rhs: f32, _: &Context) -> Result<Self, Error> {
         Ok(self.map(|a| a.max(rhs)))
+    }
+    fn clip(&self, minimum: &Self, maximum: &Self, _: &Context) -> Result<Self, Error> {
+        self.binary(minimum, f32::max)?.binary(maximum, f32::min)
+    }
+
+    fn sin_cos(&self, _: &Context) -> Result<(Self, Self), Error> {
+        Ok((self.map(f32::sin), self.map(f32::cos)))
+    }
+
+    fn rfft(&self, length: i32, axis: i32, _: &Context) -> Result<(Self, Self), Error> {
+        if length <= 0 || self.shape.is_empty() {
+            return Err(Error::backend("invalid numeric real FFT geometry"));
+        }
+        let axis = normalized_axis(axis, self.shape.len());
+        if axis >= self.shape.len() || self.shape[axis] != length {
+            return Err(Error::backend(
+                "real FFT axis differs from requested length",
+            ));
+        }
+        let mut shape = self.shape.clone();
+        shape[axis] = length / 2 + 1;
+        let mut real = vec![0.; elements(&shape)];
+        let mut imaginary = vec![0.; elements(&shape)];
+        // Independent unnormalized forward DFT with F64 accumulation.
+        for flat in 0..real.len() {
+            let mut coordinates = coordinates(flat, &shape);
+            let bin = coordinates[axis];
+            let mut re = 0.;
+            let mut im = 0.;
+            for sample in 0..length as usize {
+                coordinates[axis] = sample;
+                let value = f64::from(self.get_f32(flat_index(&coordinates, &self.shape)));
+                let angle = std::f64::consts::TAU * (bin * sample) as f64 / f64::from(length);
+                re += value * angle.cos();
+                im -= value * angle.sin();
+            }
+            real[flat] = re as f32;
+            imaginary[flat] = im as f32;
+        }
+        Ok((Self::f32(real, &shape), Self::f32(imaginary, &shape)))
+    }
+
+    fn irfft(
+        real: &Self,
+        imaginary: &Self,
+        length: i32,
+        axis: i32,
+        _: &Context,
+    ) -> Result<Self, Error> {
+        if length <= 0 || real.shape != imaginary.shape || real.shape.is_empty() {
+            return Err(Error::backend("invalid numeric inverse FFT geometry"));
+        }
+        let axis = normalized_axis(axis, real.shape.len());
+        if axis >= real.shape.len() || real.shape[axis] != length / 2 + 1 {
+            return Err(Error::backend(
+                "inverse FFT bin count differs from requested length",
+            ));
+        }
+        let mut shape = real.shape.clone();
+        shape[axis] = length;
+        let mut output = vec![0.; elements(&shape)];
+        // Independent scalar inverse DFT with F64 accumulation, suitable for
+        // tiny reference fixtures without linking a native FFT dependency.
+        for (flat, value) in output.iter_mut().enumerate() {
+            let mut coordinates = coordinates(flat, &shape);
+            let sample = coordinates[axis];
+            coordinates[axis] = 0;
+            let mut sum = f64::from(real.get_f32(flat_index(&coordinates, &real.shape)));
+            for bin in 1..=length as usize / 2 {
+                coordinates[axis] = bin;
+                let index = flat_index(&coordinates, &real.shape);
+                let angle = std::f64::consts::TAU * (bin * sample) as f64 / f64::from(length);
+                if length % 2 == 0 && bin == length as usize / 2 {
+                    sum += f64::from(real.get_f32(index)) * angle.cos();
+                } else {
+                    sum += 2.
+                        * (f64::from(real.get_f32(index)) * angle.cos()
+                            - f64::from(imaginary.get_f32(index)) * angle.sin());
+                }
+            }
+            *value = (sum / f64::from(length)) as f32;
+        }
+        Ok(Self::f32(output, &shape))
     }
 
     fn reshape(&self, shape: &[i32], _: &Context) -> Result<Self, Error> {
@@ -473,7 +593,7 @@ impl Tensor for NumericTensor {
         })
     }
 
-    fn index(&self, indexes: &[Index], _: &Context) -> Result<Self, Error> {
+    fn index(&self, indexes: &[Index], context: &Context) -> Result<Self, Error> {
         let mut shape = Vec::new();
         for (axis, index) in indexes.iter().enumerate() {
             match *index {
@@ -482,7 +602,7 @@ impl Tensor for NumericTensor {
                 Index::Range(a, b) => shape.push(b - a),
             }
         }
-        let values = (0..elements(&shape))
+        let offsets = (0..elements(&shape))
             .map(|flat| {
                 let output = coordinates(flat, &shape);
                 let mut cursor = 0;
@@ -502,10 +622,24 @@ impl Tensor for NumericTensor {
                         }
                     })
                     .collect::<Vec<_>>();
-                self.get_f32(flat_index(&input, &self.shape))
+                flat_index(&input, &self.shape)
             })
-            .collect();
-        Ok(Self::f32(values, &shape))
+            .collect::<Vec<_>>();
+        if matches!(self.data, Data::I32(_)) {
+            Self::from_i32_slice(
+                &offsets
+                    .iter()
+                    .map(|&index| self.get_i32(index))
+                    .collect::<Vec<_>>(),
+                &shape,
+                context,
+            )
+        } else {
+            Ok(Self::f32(
+                offsets.iter().map(|&index| self.get_f32(index)).collect(),
+                &shape,
+            ))
+        }
     }
 
     fn take_axis(&self, indexes: &Self, axis: i32, _: &Context) -> Result<Self, Error> {
@@ -522,25 +656,45 @@ impl Tensor for NumericTensor {
         Ok(Self::f32(values, &shape))
     }
 
-    fn concatenate(values: &[Self], axis: i32, _: &Context) -> Result<Self, Error> {
+    fn concatenate(values: &[Self], axis: i32, context: &Context) -> Result<Self, Error> {
         let axis = normalized_axis(axis, values[0].shape.len());
         let mut shape = values[0].shape.clone();
         shape[axis] = values.iter().map(|v| v.shape[axis]).sum();
-        let output = (0..elements(&shape))
+        let positions = (0..elements(&shape))
             .map(|flat| {
                 let mut coords = coordinates(flat, &shape);
                 let mut position = coords[axis];
-                for value in values {
+                for (index, value) in values.iter().enumerate() {
                     if position < value.shape[axis] as usize {
                         coords[axis] = position;
-                        return value.get_f32(flat_index(&coords, &value.shape));
+                        return (index, flat_index(&coords, &value.shape));
                     }
                     position -= value.shape[axis] as usize;
                 }
                 unreachable!()
             })
-            .collect();
-        Ok(Self::f32(output, &shape))
+            .collect::<Vec<_>>();
+        if values
+            .iter()
+            .all(|value| matches!(value.data, Data::I32(_)))
+        {
+            Self::from_i32_slice(
+                &positions
+                    .iter()
+                    .map(|&(value, index)| values[value].get_i32(index))
+                    .collect::<Vec<_>>(),
+                &shape,
+                context,
+            )
+        } else {
+            Ok(Self::f32(
+                positions
+                    .iter()
+                    .map(|&(value, index)| values[value].get_f32(index))
+                    .collect(),
+                &shape,
+            ))
+        }
     }
 
     fn stack(values: &[Self], axis: i32, context: &Context) -> Result<Self, Error> {
@@ -858,7 +1012,27 @@ impl Tensor for NumericTensor {
         Ok(Self::f32(output, &input.shape))
     }
     fn gelu(input: &Self, _: &Context) -> Result<Self, Error> {
-        Ok(input.map(|x| 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh())))
+        Ok(input.map(|x| {
+            let z = f64::from(x) / std::f64::consts::SQRT_2;
+            let erf = if z.abs() >= 4.0 {
+                z.signum()
+            } else {
+                // Convergent erf series; evaluate independently of the native
+                // erf-GELU kernel. Tail saturation error is below 1.55e-8.
+                let mut term = z;
+                let mut sum = term;
+                for n in 1..100 {
+                    term *= -z * z / f64::from(n);
+                    let increment = term / f64::from(2 * n + 1);
+                    sum += increment;
+                    if n > 20 && increment.abs() < 1e-16 {
+                        break;
+                    }
+                }
+                2.0 / std::f64::consts::PI.sqrt() * sum
+            };
+            (0.5 * f64::from(x) * (1.0 + erf)) as f32
+        }))
     }
     fn elu(input: &Self, alpha: f32, _: &Context) -> Result<Self, Error> {
         Ok(input.map(|x| if x >= 0.0 { x } else { alpha * (x.exp() - 1.0) }))
@@ -967,6 +1141,17 @@ impl RotaryOperator<NumericTensor> for NullOperator {
 #[derive(Clone, Copy, Debug)]
 pub struct ReferenceBackend;
 impl NeuralBackend for ReferenceBackend {
+    const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
+        eredu_nn::NeuralOperatorCapabilities::IRFFT
+            .union(eredu_nn::NeuralOperatorCapabilities::RFFT)
+            .union(eredu_nn::NeuralOperatorCapabilities::FROM_I32_SLICE)
+            .union(eredu_nn::NeuralOperatorCapabilities::SIN_COS)
+            .union(eredu_nn::NeuralOperatorCapabilities::FULL_F32)
+            .union(eredu_nn::NeuralOperatorCapabilities::CAST_FLOAT)
+            .union(eredu_nn::NeuralOperatorCapabilities::SOFTPLUS)
+            .union(eredu_nn::NeuralOperatorCapabilities::EXP)
+            .union(eredu_nn::NeuralOperatorCapabilities::CLIP)
+            .union(eredu_nn::NeuralOperatorCapabilities::BROADCAST_TO);
     type Tensor = NumericTensor;
     type Linear = NullOperator;
     type Embedding = NullOperator;
@@ -990,6 +1175,15 @@ impl NeuralBackend for ReferenceBackend {
     }
     fn silu(input: NumericTensor, _: &Context) -> Result<NumericTensor, Error> {
         Ok(input.map(|x| x / (1.0 + (-x).exp())))
+    }
+    fn exp(input: NumericTensor, _: &Context) -> Result<NumericTensor, Error> {
+        Ok(input.map(f32::exp))
+    }
+    fn softplus(input: NumericTensor, beta: f32, _: &Context) -> Result<NumericTensor, Error> {
+        Ok(input.map(|x| {
+            let scaled = x * beta;
+            (scaled.max(0.) + (-scaled.abs()).exp().ln_1p()) / beta
+        }))
     }
     fn gated_product(
         gate: NumericTensor,

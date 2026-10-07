@@ -16,13 +16,13 @@ mod qwen4_exp;
 
 use eredu_nn::{AttentionCache, AuxiliaryConvolutionState, Tensor};
 use eredu_runtime::{
-    ArchitectureParameters, ArchitecturePartition, LocalModelLayout,
-    PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask, RuntimeStateComponents,
+    derive_partitioned_local_layout, ArchitectureParameters, ArchitecturePartition,
+    LocalModelLayout, PartitionedLayeredArchitecture, ReplicatedTextMaterializationTask,
+    RuntimeStateComponents,
 };
 
 use crate::partitioned_execution::{
-    derive_partitioned_local_layout, prepare_partitioned, PreparedPartitionedAdmission,
-    SelectedPartitionedAdmission,
+    prepare_partitioned, PreparedPartitionedAdmission, SelectedPartitionedAdmission,
 };
 use crate::replicated_text::{
     composite_config, qwen_hybrid_composite_with_formats, qwen_vl_with_formats, selected_formats,
@@ -423,8 +423,7 @@ pub struct PreparedCompositeRoutedExecution {
     routes_by_unit: std::collections::BTreeMap<usize, usize>,
     owner_units: std::collections::BTreeMap<usize, usize>,
     owner_unit_count: usize,
-    tensor_reductions:
-        std::collections::BTreeMap<usize, crate::partitioned_execution::RoutedTensorReductions>,
+    tensor_reductions: std::collections::BTreeMap<usize, eredu_runtime::RoutedTensorReductions>,
     tensor_vocabulary_sharded: bool,
     hidden_width: usize,
     tensor_output_width: Option<usize>,
@@ -639,7 +638,7 @@ impl PreparedCompositeExecutorPlan {
         A: crate::composite_execution::CompositeArchitecture<B, S>
             + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
         P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-        F: crate::partitioned_execution::PartitionTensorAllocator<B>,
+        F: eredu_runtime::PartitionTensorAllocator<B>,
         B::ParallelContext: Sized,
     {
         if self.requires_independent_banks {
@@ -722,7 +721,7 @@ impl PreparedCompositeExecutorPlan {
         A: crate::composite_execution::CompositeArchitecture<B, S>
             + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
         P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-        F: crate::partitioned_execution::PartitionTensorAllocator<B>,
+        F: eredu_runtime::PartitionTensorAllocator<B>,
         B::ParallelContext: Sized,
     {
         let strategy = match self.strategy {
@@ -834,8 +833,7 @@ impl PreparedCompositeRoutedExecution {
     /// Architecture-owned TP reduction order for every decoder unit.
     pub const fn tensor_reductions(
         &self,
-    ) -> &std::collections::BTreeMap<usize, crate::partitioned_execution::RoutedTensorReductions>
-    {
+    ) -> &std::collections::BTreeMap<usize, eredu_runtime::RoutedTensorReductions> {
         &self.tensor_reductions
     }
 

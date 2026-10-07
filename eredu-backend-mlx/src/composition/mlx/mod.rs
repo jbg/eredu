@@ -12,6 +12,7 @@ mod prepared_speculative;
 mod processor;
 pub mod realtime;
 pub(crate) mod replicated_text;
+pub(crate) use replicated_text::state_capabilities;
 mod session;
 #[cfg(test)]
 pub(crate) use session::{
@@ -19,6 +20,7 @@ pub(crate) use session::{
 };
 pub mod speculative;
 pub mod structural;
+pub(crate) mod voicechat;
 
 pub use inspection::{
     inspect_model, inspect_model_preparation, inspection_mechanisms, MlxInspectionOptions,

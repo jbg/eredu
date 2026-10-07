@@ -12,5 +12,7 @@ pub mod execution;
 pub mod generation;
 /// MLX tensor inputs and processed-media conversion.
 pub mod media;
+/// Completed realtime channel observation.
+pub mod realtime;
 /// MLX weight-residency execution.
 pub mod residency;

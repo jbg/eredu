@@ -25,7 +25,9 @@ fn mxfp4_embedding_lookup_contract(device: DeviceType) {
         .map(|i| ((i * 5 + i / 32) % 16) as u32)
         .collect::<Vec<_>>();
     let packed = codes
-        .as_chunks::<8>().0.iter()
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| {
             chunk
                 .iter()
@@ -696,42 +698,82 @@ fn output_gated_group_norm_reference(device: DeviceType) {
     for activation in [Gate::Silu, Gate::Sigmoid] {
         for dtype in [Dtype::Float32, Dtype::Bfloat16] {
             for weight_dtype in [dtype, Dtype::Float32] {
-                let round = |x| if dtype == Dtype::Bfloat16 { half::bf16::from_f32(x).to_f32() } else { x };
+                let round = |x| {
+                    if dtype == Dtype::Bfloat16 {
+                        half::bf16::from_f32(x).to_f32()
+                    } else {
+                        x
+                    }
+                };
                 let mut previous = None;
                 for arithmetic in [Arithmetic::Float32, Arithmetic::RoundedNormalization] {
                     let mut expected = [0.0_f32; 4];
                     for group in 0..2 {
                         let start = group * 2;
-                        let variance = (values[start] * values[start] + values[start+1] * values[start+1]) / 2.;
+                        let variance = (values[start] * values[start]
+                            + values[start + 1] * values[start + 1])
+                            / 2.;
                         let scale = (variance + epsilon).sqrt().recip();
-                        for index in start..start+2 {
+                        for index in start..start + 2 {
                             let normalized = values[index] * scale;
                             let learned = match arithmetic {
                                 Arithmetic::Float32 => normalized * weights[index],
                                 Arithmetic::RoundedNormalization => {
                                     let learned = round(normalized) * weights[index];
-                                    if weight_dtype == dtype { round(learned) } else { learned }
+                                    if weight_dtype == dtype {
+                                        round(learned)
+                                    } else {
+                                        learned
+                                    }
                                 }
                             };
-                            let numerator = match activation { Gate::Silu => gates[index], Gate::Sigmoid => 1. };
-                            expected[index] = round(learned * (numerator / (1. + (-gates[index]).exp())));
+                            let numerator = match activation {
+                                Gate::Silu => gates[index],
+                                Gate::Sigmoid => 1.,
+                            };
+                            expected[index] =
+                                round(learned * (numerator / (1. + (-gates[index]).exp())));
                         }
                     }
-                    let tensor = |values: &[f32], shape: &[i32], dtype| MlxTensor::from_array(Array::from_slice(values,shape).as_dtype(dtype,stream).unwrap());
+                    let tensor = |values: &[f32], shape: &[i32], dtype| {
+                        MlxTensor::from_array(
+                            Array::from_slice(values, shape)
+                                .as_dtype(dtype, stream)
+                                .unwrap(),
+                        )
+                    };
                     let actual = MlxNeuralBackend::output_gated_group_rms_norm(
-                        &tensor(&values,&[1,4],dtype), &tensor(&gates,&[1,4],dtype),
-                        &tensor(&weights,&[4],weight_dtype), 2, epsilon, activation, arithmetic, stream,
-                    ).unwrap();
-                    assert_eq!(actual.as_array().dtype(),dtype);
-                    let actual = MlxTensor::from_array(actual.as_array().as_dtype(Dtype::Float32,stream).unwrap());
-                    close(&actual,&expected,if dtype == Dtype::Bfloat16 { 0. } else { 1e-5 });
-                    if let Some(previous) = previous { differed |= previous != expected; }
+                        &tensor(&values, &[1, 4], dtype),
+                        &tensor(&gates, &[1, 4], dtype),
+                        &tensor(&weights, &[4], weight_dtype),
+                        2,
+                        epsilon,
+                        activation,
+                        arithmetic,
+                        stream,
+                    )
+                    .unwrap();
+                    assert_eq!(actual.as_array().dtype(), dtype);
+                    let actual = MlxTensor::from_array(
+                        actual.as_array().as_dtype(Dtype::Float32, stream).unwrap(),
+                    );
+                    close(
+                        &actual,
+                        &expected,
+                        if dtype == Dtype::Bfloat16 { 0. } else { 1e-5 },
+                    );
+                    if let Some(previous) = previous {
+                        differed |= previous != expected;
+                    }
                     previous = Some(expected);
                 }
             }
         }
     }
-    assert!(differed, "fixture must distinguish the intermediate rounding policies");
+    assert!(
+        differed,
+        "fixture must distinguish the intermediate rounding policies"
+    );
 }
 
 #[test]
@@ -1318,33 +1360,182 @@ fn mlx_dilated_causal_convolution_matches_scalar_history() {
 
 #[test]
 fn mlx_elementwise_signed_root_preserves_zero_and_rounding_boundaries() {
-    let execution=ExecutionContext::new(Device::new(DeviceType::Cpu,0));
-    let stream=execution.stream();
-    for dtype in [Dtype::Float32,Dtype::Bfloat16] {
-        let input=MlxTensor::from_array(Array::from_slice(&[-0.0f32,0.,-1e-12,1e-12,-4.,9.],&[6]).as_dtype(dtype,stream).unwrap());
-        let output=input.abs(stream).unwrap().maximum_scalar(1e-6,stream).unwrap().sqrt(stream).unwrap().multiply(&input.sign(stream).unwrap(),stream).unwrap();
-        assert_eq!(output.as_array().dtype(),dtype);
-        let expected=Array::from_slice(&[0.0f32,0.,-0.001,0.001,-2.,3.],&[6]).as_dtype(dtype,stream).unwrap().as_dtype(Dtype::Float32,stream).unwrap().evaluated().unwrap().as_slice::<f32>().to_vec();
-        let actual=MlxTensor::from_array(output.as_array().as_dtype(Dtype::Float32,stream).unwrap());
-        close(&actual,&expected,if dtype==Dtype::Float32 {1e-8} else {1e-5});
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+        let input = MlxTensor::from_array(
+            Array::from_slice(&[-0.0f32, 0., -1e-12, 1e-12, -4., 9.], &[6])
+                .as_dtype(dtype, stream)
+                .unwrap(),
+        );
+        let output = input
+            .abs(stream)
+            .unwrap()
+            .maximum_scalar(1e-6, stream)
+            .unwrap()
+            .sqrt(stream)
+            .unwrap()
+            .multiply(&input.sign(stream).unwrap(), stream)
+            .unwrap();
+        assert_eq!(output.as_array().dtype(), dtype);
+        let expected = Array::from_slice(&[0.0f32, 0., -0.001, 0.001, -2., 3.], &[6])
+            .as_dtype(dtype, stream)
+            .unwrap()
+            .as_dtype(Dtype::Float32, stream)
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let actual =
+            MlxTensor::from_array(output.as_array().as_dtype(Dtype::Float32, stream).unwrap());
+        close(
+            &actual,
+            &expected,
+            if dtype == Dtype::Float32 { 1e-8 } else { 1e-5 },
+        );
     }
 }
 
 #[test]
 fn mlx_resident_append_stream_preserves_integer_bits_across_pages_and_checkpoints() {
-    use eredu_runtime::{AppendOnlyStream,AppendStreamSpec,AppendStreamLimits,ResidentAppendStream};
     use eredu_nn::TensorElementType;
-    let execution=ExecutionContext::new(Device::new(DeviceType::Cpu,0));let context=execution.stream();
-    let mut stream=ResidentAppendStream::<MlxTensor>::new(AppendStreamSpec {slot:3,width:2,element:TensorElementType::I32},AppendStreamLimits {entries:8,page_entries:2,read_entries:3},64,80,4096).unwrap();
-    let values=[i32::MAX,i32::MIN,16777217,-16777217,3,4,5,6];
-    stream.append(0,MlxTensor::from_i32_slice(&values[..6],&[3,2],context).unwrap(),context).unwrap();
-    let mut snapshot=stream.clone();
-    stream.append(3,MlxTensor::from_i32_slice(&values[6..],&[1,2],context).unwrap(),context).unwrap();
-    assert_eq!(snapshot.len(),3);assert_eq!(stream.len(),4);
-    assert_eq!(snapshot.read(0..3,context).unwrap().to_i32_vec(context).unwrap(),values[..6]);
-    assert_eq!(stream.read(1..4,context).unwrap().to_i32_vec(context).unwrap(),values[2..]);
-    assert!(stream.read(0..4,context).is_err());
-    assert!(stream.append(2,MlxTensor::from_i32_slice(&[7,8],&[1,2],context).unwrap(),context).is_err());
-    assert_eq!(stream.len(),4);stream.clear();assert_eq!(stream.len(),0);
-    assert_eq!(snapshot.read(0..3,context).unwrap().to_i32_vec(context).unwrap(),values[..6]);
+    use eredu_runtime::{
+        AppendOnlyStream, AppendStreamLimits, AppendStreamSpec, ResidentAppendStream,
+    };
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let context = execution.stream();
+    let mut stream = ResidentAppendStream::<MlxTensor>::new(
+        AppendStreamSpec {
+            slot: 3,
+            width: 2,
+            element: TensorElementType::I32,
+        },
+        AppendStreamLimits {
+            entries: 8,
+            page_entries: 2,
+            read_entries: 3,
+        },
+        64,
+        80,
+        4096,
+    )
+    .unwrap();
+    let values = [i32::MAX, i32::MIN, 16777217, -16777217, 3, 4, 5, 6];
+    stream
+        .append(
+            0,
+            MlxTensor::from_i32_slice(&values[..6], &[3, 2], context).unwrap(),
+            context,
+        )
+        .unwrap();
+    let mut snapshot = stream.clone();
+    stream
+        .append(
+            3,
+            MlxTensor::from_i32_slice(&values[6..], &[1, 2], context).unwrap(),
+            context,
+        )
+        .unwrap();
+    assert_eq!(snapshot.len(), 3);
+    assert_eq!(stream.len(), 4);
+    assert_eq!(
+        snapshot
+            .read(0..3, context)
+            .unwrap()
+            .to_i32_vec(context)
+            .unwrap(),
+        values[..6]
+    );
+    assert_eq!(
+        stream
+            .read(1..4, context)
+            .unwrap()
+            .to_i32_vec(context)
+            .unwrap(),
+        values[2..]
+    );
+    assert!(stream.read(0..4, context).is_err());
+    assert!(stream
+        .append(
+            2,
+            MlxTensor::from_i32_slice(&[7, 8], &[1, 2], context).unwrap(),
+            context
+        )
+        .is_err());
+    assert_eq!(stream.len(), 4);
+    stream.clear();
+    assert_eq!(stream.len(), 0);
+    assert_eq!(
+        snapshot
+            .read(0..3, context)
+            .unwrap()
+            .to_i32_vec(context)
+            .unwrap(),
+        values[..6]
+    );
+}
+
+#[test]
+fn mlx_selective_scan_chunk_boundaries_preserve_outputs_and_cached_state() {
+    use eredu_nn::SelectiveStateSpaceScanInput;
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let tensor =
+        |values: &[f32], shape: &[i32]| MlxTensor::from_array(Array::from_slice(values, shape));
+    let values = tensor(&[1.0, 2.0, -1.0, 0.5, -2.0], &[1, 5, 1, 1]);
+    let input_state = tensor(&[1.0, -0.5, 2.0, 1.0, 0.25], &[1, 5, 1, 1]);
+    let output_state = tensor(&[0.5, 1.0, -1.0, 2.0, 0.5], &[1, 5, 1, 1]);
+    let time_step = tensor(&[0.0; 5], &[1, 5, 1]);
+    let zero = tensor(&[0.0], &[1]);
+    let skip = tensor(&[0.25], &[1]);
+    let initial = tensor(&[2.0], &[1, 1, 1, 1]);
+    let cached_value = tensor(&[3.0], &[1, 1, 1, 1]);
+    let cached_input = tensor(&[0.5], &[1, 1, 1, 1]);
+    let cached_output = tensor(&[-2.0], &[1, 1, 1, 1]);
+    let cached_time = tensor(&[0.0], &[1, 1, 1]);
+    for chunk_size in [2, 8] {
+        let result = MlxNeuralBackend::selective_state_space_scan(
+            SelectiveStateSpaceScanInput {
+                values: &values,
+                input_state: &input_state,
+                output_state: &output_state,
+                time_step: &time_step,
+                time_step_bias: &zero,
+                transition_log: &zero,
+                skip: &skip,
+                initial_state: Some(&initial),
+                time_step_floor: 0.0001,
+                chunk_size,
+            },
+            stream,
+        )
+        .unwrap();
+        // Independent scalar recurrence: s = s/2 + ln(2)*b*x,
+        // y = c*s + x/4. The partial final chunk must retain its last state.
+        close(
+            &result.output,
+            &[1.09657359, 0.65342641, 1.05958116, -0.49143398, -0.75034104],
+            1e-6,
+        );
+        close(&result.state, &[-0.50068208], 1e-6);
+        let cached = MlxNeuralBackend::selective_state_space_scan(
+            SelectiveStateSpaceScanInput {
+                values: &cached_value,
+                input_state: &cached_input,
+                output_state: &cached_output,
+                time_step: &cached_time,
+                time_step_bias: &zero,
+                transition_log: &zero,
+                skip: &skip,
+                initial_state: Some(&result.state),
+                time_step_floor: 0.0001,
+                chunk_size,
+            },
+            stream,
+        )
+        .unwrap();
+        close(&cached.output, &[-0.82875946], 1e-6);
+        close(&cached.state, &[0.78937973], 1e-6);
+    }
 }

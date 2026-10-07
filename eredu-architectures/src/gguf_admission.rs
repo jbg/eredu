@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use eredu_checkpoint::validation::{validate_gguf_plan, CheckpointValidation};
+use eredu_checkpoint::validation::{CheckpointValidation, validate_gguf_plan};
 use eredu_gguf::{Checkpoint, MetadataValue};
 
 use crate::{
-    configuration::{GgufArchitecturePlan, GgufModelConfig},
     GgufArchitecture,
+    configuration::{GgufArchitecturePlan, GgufModelConfig},
 };
 
 pub(crate) fn resolve(
@@ -29,6 +29,7 @@ fn canonical_tensor_mapping(
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
         GgufModelConfig::Qwen4Exp(plan) => return Ok(plan.text_plan().mapping().to_vec()),
+        GgufModelConfig::VoiceChat(_) => checkpoint.translated_outputs(str::to_owned),
         GgufModelConfig::DeepSeekV3(_) => {
             checkpoint.translated_outputs(crate::deepseek::translate_v3_gguf_weight_name)
         }
@@ -134,6 +135,15 @@ fn resolve_family(
         }
     }
     match architecture {
+        GgufArchitecture::VoiceChat => {
+            use crate::voicechat::checkpoint::{
+                GgufLayout, config_from_gguf_metadata, gguf_plan, validate_gguf_metadata,
+            };
+            let config = config_from_gguf_metadata(checkpoint.metadata())?;
+            validate_gguf_metadata(&config, GgufLayout::Complete, checkpoint.metadata())?;
+            let plan = gguf_plan(&config, GgufLayout::Complete)?;
+            Ok((GgufModelConfig::VoiceChat(config), plan, None))
+        }
         GgufArchitecture::Qwen4Exp => {
             let header = crate::qwen4_exp::prepared::GgufTargetPlan::prepare(checkpoint)
                 .map_err(|error| error.to_string())?;

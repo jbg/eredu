@@ -157,16 +157,16 @@ mod tests {
             .with_partition_layout(rank, layout.clone())
             .unwrap();
         assert_eq!(
-            super::super::derive_partitioned_local_layout(&description, rank).unwrap(),
+            eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap(),
             layout
         );
-        assert!(super::super::derive_partitioned_local_layout(
+        assert!(eredu_runtime::derive_partitioned_local_layout(
             &description,
             eredu_core::ParallelRankTopology::new(topology, 0).unwrap()
         )
         .unwrap_err()
         .contains("projection onto rank 0 is not implemented"));
-        let tensor = super::super::retained_partition_layout(&description, rank)
+        let tensor = eredu_runtime::retained_partition_layout(&description, rank)
             .unwrap()
             .unwrap()
             .tensor("keys.weight")

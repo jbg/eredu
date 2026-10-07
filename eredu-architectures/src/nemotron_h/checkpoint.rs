@@ -81,58 +81,65 @@ pub fn normalized_checkpoint_keys(
     store: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
     args: &ModelArgs,
 ) -> Result<BTreeMap<String, String>, String> {
-    let mtp = args.mtp_policies().map_err(|error| error.to_string())?;
     let mut normalized = BTreeMap::new();
     for raw in store.source_keys() {
-        let runtime = if let Some(rest) = raw.strip_prefix("backbone.embeddings.") {
-            format!("model.embeddings.{rest}")
-        } else if let Some(rest) = raw.strip_prefix("backbone.norm_f.") {
-            format!("model.norm_f.{rest}")
-        } else if let Some(rest) = raw.strip_prefix("backbone.layers.") {
-            let (layer_text, suffix) = rest
-                .split_once('.')
-                .ok_or_else(|| format!("invalid Nemotron-H checkpoint key {raw:?}"))?;
-            let layer = layer_text
-                .parse::<usize>()
-                .map_err(|error| format!("invalid Nemotron-H layer in {raw:?}: {error}"))?;
-            if let Some(suffix) = suffix.strip_prefix("mixer.") {
-                let field = match args.layer_schedule.get(layer) {
-                    Some(LayerPolicy::Mamba) => "mamba",
-                    Some(LayerPolicy::SelfAttention(_)) => "attention",
-                    Some(LayerPolicy::DenseMlp) => "mlp",
-                    Some(LayerPolicy::SparseMoe) => "moe",
-                    None => {
-                        return Err(format!(
-                            "checkpoint layer {layer} is outside Nemotron-H schedule"
-                        ))
-                    }
-                };
-                format!("model.layers.{layer}.{field}.{suffix}")
-            } else {
-                format!("model.layers.{layer}.{suffix}")
-            }
-        } else if let Some(rest) = raw
-            .strip_prefix("mtp.layers.")
-            .or_else(|| raw.strip_prefix("model.mtp.layers."))
-        {
-            let (layer_text, suffix) = rest
-                .split_once('.')
-                .ok_or_else(|| format!("invalid Nemotron-H MTP checkpoint key {raw:?}"))?;
-            let physical = layer_text
-                .parse::<usize>()
-                .map_err(|error| format!("invalid Nemotron-H MTP layer in {raw:?}: {error}"))?;
-            if physical >= mtp.len() {
-                return Err(format!(
-                    "checkpoint MTP layer {physical} is outside Nemotron-H schedule"
-                ));
-            }
-            format!("model.mtp.layers.{physical}.{suffix}")
-        } else {
-            raw.clone()
-        };
-        normalized.insert(runtime, raw);
+        normalized.insert(normalized_parameter_key(&raw, args)?, raw);
     }
     Ok(normalized)
+}
+
+/// Resolves one released checkpoint identity through the selected Nemotron-H schedule.
+///
+/// This only names parameters; numerical storage transforms remain recipe-owned.
+pub fn normalized_parameter_key(raw: &str, args: &ModelArgs) -> Result<String, String> {
+    let mtp = args.mtp_policies().map_err(|error| error.to_string())?;
+    let runtime = if let Some(rest) = raw.strip_prefix("backbone.embeddings.") {
+        format!("model.embeddings.{rest}")
+    } else if let Some(rest) = raw.strip_prefix("backbone.norm_f.") {
+        format!("model.norm_f.{rest}")
+    } else if let Some(rest) = raw.strip_prefix("backbone.layers.") {
+        let (layer_text, suffix) = rest
+            .split_once('.')
+            .ok_or_else(|| format!("invalid Nemotron-H checkpoint key {raw:?}"))?;
+        let layer = layer_text
+            .parse::<usize>()
+            .map_err(|error| format!("invalid Nemotron-H layer in {raw:?}: {error}"))?;
+        if let Some(suffix) = suffix.strip_prefix("mixer.") {
+            let field = match args.layer_schedule.get(layer) {
+                Some(LayerPolicy::Mamba) => "mamba",
+                Some(LayerPolicy::SelfAttention(_)) => "attention",
+                Some(LayerPolicy::DenseMlp) => "mlp",
+                Some(LayerPolicy::SparseMoe) => "moe",
+                None => {
+                    return Err(format!(
+                        "checkpoint layer {layer} is outside Nemotron-H schedule"
+                    ))
+                }
+            };
+            format!("model.layers.{layer}.{field}.{suffix}")
+        } else {
+            format!("model.layers.{layer}.{suffix}")
+        }
+    } else if let Some(rest) = raw
+        .strip_prefix("mtp.layers.")
+        .or_else(|| raw.strip_prefix("model.mtp.layers."))
+    {
+        let (layer_text, suffix) = rest
+            .split_once('.')
+            .ok_or_else(|| format!("invalid Nemotron-H MTP checkpoint key {raw:?}"))?;
+        let physical = layer_text
+            .parse::<usize>()
+            .map_err(|error| format!("invalid Nemotron-H MTP layer in {raw:?}: {error}"))?;
+        if physical >= mtp.len() {
+            return Err(format!(
+                "checkpoint MTP layer {physical} is outside Nemotron-H schedule"
+            ));
+        }
+        format!("model.mtp.layers.{physical}.{suffix}")
+    } else {
+        raw.to_owned()
+    };
+    Ok(runtime)
 }
 
 /// Returns canonical recipes for selected Nemotron-H static modules.

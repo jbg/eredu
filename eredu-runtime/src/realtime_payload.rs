@@ -5,9 +5,9 @@ use std::{
     num::NonZeroUsize,
 };
 
-use eredu_core::{RealtimeFrameSlot, RealtimeSlotCoordinate, RealtimeSpeechConfig};
+use eredu_core::{RealtimeChannelId, RealtimeChannelLayout, RealtimeSlotCoordinate};
 
-use crate::generation::TokenDomain;
+use eredu_core::RealtimeChannelPayload;
 
 /// Process-local identity of the canonical session state owning payload tensors.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -52,53 +52,45 @@ impl RealtimePayloadGeneration {
 /// Exact semantic identity carried by every realtime coordinate payload.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RealtimePayloadContract {
-    schedule: RealtimeSpeechConfig,
+    schedule: RealtimeChannelLayout,
     batch: NonZeroUsize,
-    text_domain: TokenDomain,
-    audio_domain: TokenDomain,
     generation: RealtimePayloadGeneration,
     owner: RealtimePayloadOwnerIdentity,
 }
 
 impl RealtimePayloadContract {
-    /// Creates a contract bound to one schedule, batch, token geometry, generation, and owner.
+    /// Creates a contract bound to one schedule, batch, payload geometry, generation, and owner.
     pub fn new(
-        schedule: RealtimeSpeechConfig,
+        schedule: RealtimeChannelLayout,
         batch: usize,
-        text_domain: TokenDomain,
-        audio_domain: TokenDomain,
         generation: RealtimePayloadGeneration,
         owner: RealtimePayloadOwnerIdentity,
     ) -> Result<Self, RealtimePayloadContractError> {
         let batch = NonZeroUsize::new(batch).ok_or(RealtimePayloadContractError::EmptyBatch)?;
+        for channel in schedule.channels() {
+            if channel.payload.elements(batch.get()).is_none() {
+                return Err(RealtimePayloadContractError::GeometryOverflow {
+                    channel: channel.id,
+                    batch: batch.get(),
+                });
+            }
+        }
         Ok(Self {
             schedule,
             batch,
-            text_domain,
-            audio_domain,
             generation,
             owner,
         })
     }
 
-    /// Returns the exact normalized speech schedule.
-    pub const fn schedule(&self) -> &RealtimeSpeechConfig {
+    /// Returns the exact normalized channel layout.
+    pub const fn schedule(&self) -> &RealtimeChannelLayout {
         &self.schedule
     }
 
     /// Returns the positive batch cardinality.
     pub const fn batch(&self) -> NonZeroUsize {
         self.batch
-    }
-
-    /// Returns the admitted text-token domain.
-    pub const fn text_domain(&self) -> TokenDomain {
-        self.text_domain
-    }
-
-    /// Returns the admitted audio-token domain shared by every audio slot.
-    pub const fn audio_domain(&self) -> TokenDomain {
-        self.audio_domain
     }
 
     /// Returns the request or session generation identity.
@@ -111,23 +103,15 @@ impl RealtimePayloadContract {
         self.owner
     }
 
-    /// Resolves the token domain selected by one admitted text or audio slot.
-    pub fn slot_domain(
+    /// Resolves exact categorical or dense geometry for an admitted channel.
+    pub fn slot_geometry(
         &self,
-        slot: RealtimeFrameSlot,
-    ) -> Result<TokenDomain, RealtimePayloadContractError> {
-        match slot {
-            RealtimeFrameSlot::Text => Ok(self.text_domain),
-            RealtimeFrameSlot::Audio(codebook)
-                if codebook < self.schedule.total_audio_codebooks() =>
-            {
-                Ok(self.audio_domain)
-            }
-            _ => Err(RealtimePayloadContractError::InvalidSlot {
-                slot,
-                total_audio_codebooks: self.schedule.total_audio_codebooks(),
-            }),
-        }
+        slot: RealtimeChannelId,
+    ) -> Result<&RealtimeChannelPayload, RealtimePayloadContractError> {
+        self.schedule
+            .channel(slot)
+            .map(|channel| &channel.payload)
+            .ok_or(RealtimePayloadContractError::InvalidSlot { slot })
     }
 
     /// Validates another contract against every exact semantic identity field.
@@ -137,12 +121,6 @@ impl RealtimePayloadContract {
         }
         if self.batch != contract.batch {
             return Err(RealtimePayloadContractError::BatchMismatch);
-        }
-        if self.text_domain != contract.text_domain {
-            return Err(RealtimePayloadContractError::TextDomainMismatch);
-        }
-        if self.audio_domain != contract.audio_domain {
-            return Err(RealtimePayloadContractError::AudioDomainMismatch);
         }
         if self.generation != contract.generation {
             return Err(RealtimePayloadContractError::GenerationMismatch);
@@ -159,22 +137,20 @@ impl RealtimePayloadContract {
 pub struct RealtimePayloadEnvelope<P> {
     contract: RealtimePayloadContract,
     coordinate: RealtimeSlotCoordinate,
-    domain: TokenDomain,
     payload: P,
 }
 
 impl<P> RealtimePayloadEnvelope<P> {
-    /// Binds a payload to one admitted coordinate and its contract-derived token domain.
+    /// Binds a payload to one admitted coordinate and its contract-derived payload geometry.
     pub fn new(
         contract: RealtimePayloadContract,
         coordinate: RealtimeSlotCoordinate,
         payload: P,
     ) -> Result<Self, RealtimePayloadContractError> {
-        let domain = contract.slot_domain(coordinate.slot())?;
+        contract.slot_geometry(coordinate.slot())?;
         Ok(Self {
             contract,
             coordinate,
-            domain,
             payload,
         })
     }
@@ -189,9 +165,11 @@ impl<P> RealtimePayloadEnvelope<P> {
         self.coordinate
     }
 
-    /// Returns the token domain derived from the coordinate slot and contract.
-    pub const fn domain(&self) -> TokenDomain {
-        self.domain
+    /// Returns the exact declared geometry retained with this coordinate.
+    pub fn geometry(&self) -> &RealtimeChannelPayload {
+        self.contract
+            .slot_geometry(self.coordinate.slot())
+            .expect("envelope channel was validated")
     }
 
     /// Returns the opaque payload.
@@ -209,23 +187,13 @@ impl<P> RealtimePayloadEnvelope<P> {
         if self.coordinate != coordinate {
             return Err(RealtimePayloadContractError::CoordinateMismatch);
         }
-        let domain = contract.slot_domain(coordinate.slot())?;
-        if self.domain != domain {
-            return Err(RealtimePayloadContractError::SlotDomainMismatch);
-        }
+        contract.slot_geometry(coordinate.slot())?;
         Ok(())
     }
 
-    /// Consumes the envelope into its contract, coordinate, derived domain, and payload.
-    pub fn into_parts(
-        self,
-    ) -> (
-        RealtimePayloadContract,
-        RealtimeSlotCoordinate,
-        TokenDomain,
-        P,
-    ) {
-        (self.contract, self.coordinate, self.domain, self.payload)
+    /// Consumes the envelope into its contract, coordinate, and payload.
+    pub fn into_parts(self) -> (RealtimePayloadContract, RealtimeSlotCoordinate, P) {
+        (self.contract, self.coordinate, self.payload)
     }
 }
 
@@ -236,18 +204,20 @@ pub enum RealtimePayloadContractError {
     /// A payload contract cannot represent an empty batch.
     #[error("realtime payload contract batch is empty")]
     EmptyBatch,
-    /// The normalized speech schedule differs.
+    /// Batch expansion exceeds representable payload geometry.
+    #[error("realtime channel {channel:?} geometry overflows for batch {batch}")]
+    GeometryOverflow {
+        /// Affected channel.
+        channel: RealtimeChannelId,
+        /// Requested batch cardinality.
+        batch: usize,
+    },
+    /// The normalized channel layout differs.
     #[error("realtime payload contract schedule does not match")]
     ScheduleMismatch,
     /// The positive batch cardinality differs.
     #[error("realtime payload contract batch does not match")]
     BatchMismatch,
-    /// The text-token domain differs.
-    #[error("realtime payload contract text-token domain does not match")]
-    TextDomainMismatch,
-    /// The audio-token domain differs.
-    #[error("realtime payload contract audio-token domain does not match")]
-    AudioDomainMismatch,
     /// The request or session generation identity differs.
     #[error("realtime payload contract generation does not match")]
     GenerationMismatch,
@@ -257,25 +227,18 @@ pub enum RealtimePayloadContractError {
     /// The delayed-frame coordinate differs.
     #[error("realtime payload coordinate does not match")]
     CoordinateMismatch,
-    /// The retained slot domain differs from the contract-derived domain.
-    #[error("realtime payload slot token domain does not match")]
-    SlotDomainMismatch,
-    /// A coordinate does not name text or an admitted audio codebook.
-    #[error(
-        "realtime payload slot {slot:?} is outside text plus {total_audio_codebooks} audio codebooks"
-    )]
+    /// A coordinate names an undeclared channel.
+    #[error("realtime payload channel {slot:?} is not declared")]
     InvalidSlot {
-        /// Invalid schedule slot.
-        slot: RealtimeFrameSlot,
-        /// Admitted audio-codebook count.
-        total_audio_codebooks: usize,
+        /// Unknown channel.
+        slot: RealtimeChannelId,
     },
 }
 
-/// Payloads retained at exact text/audio coordinates for one speech schedule.
+/// Payloads retained at exact channel coordinates for one declared layout.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RealtimePayloadHistory<P> {
-    schedule: RealtimeSpeechConfig,
+    schedule: RealtimeChannelLayout,
     contract: Option<RealtimePayloadContract>,
     payloads: BTreeMap<RealtimeSlotCoordinate, RealtimePayloadEnvelope<P>>,
 }
@@ -286,7 +249,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// A payload contract must be bound before any coordinate payload can be
     /// published. This unbound form exists because session batch is not known
     /// until the first frame is accepted.
-    pub fn new(schedule: RealtimeSpeechConfig) -> Self {
+    pub fn new(schedule: RealtimeChannelLayout) -> Self {
         Self {
             schedule,
             contract: None,
@@ -304,7 +267,7 @@ impl<P> RealtimePayloadHistory<P> {
     }
 
     /// Returns the exact normalized schedule bound to this history.
-    pub const fn schedule(&self) -> &RealtimeSpeechConfig {
+    pub const fn schedule(&self) -> &RealtimeChannelLayout {
         &self.schedule
     }
 
@@ -362,7 +325,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Rejects handoff to any materially different normalized schedule.
     pub fn validate_schedule(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
     ) -> Result<(), RealtimePayloadHistoryError> {
         if &self.schedule == schedule {
             Ok(())
@@ -377,9 +340,9 @@ impl<P> RealtimePayloadHistory<P> {
     /// prediction-target meaning to the resulting slot.
     pub fn delayed_coordinate(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         base_position: usize,
-        slot: RealtimeFrameSlot,
+        slot: RealtimeChannelId,
     ) -> Result<RealtimeSlotCoordinate, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
         let delay = self.slot_delay(slot)?;
@@ -395,7 +358,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Inserts one payload at one exact validated coordinate.
     pub fn insert(
         &mut self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         coordinate: RealtimeSlotCoordinate,
         payload: P,
     ) -> Result<(), RealtimePayloadHistoryError> {
@@ -405,9 +368,9 @@ impl<P> RealtimePayloadHistory<P> {
     /// Calculates one delayed coordinate and inserts its payload atomically.
     pub fn insert_delayed(
         &mut self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         base_position: usize,
-        slot: RealtimeFrameSlot,
+        slot: RealtimeChannelId,
         payload: P,
     ) -> Result<RealtimeSlotCoordinate, RealtimePayloadHistoryError> {
         let coordinate = self.delayed_coordinate(schedule, base_position, slot)?;
@@ -420,7 +383,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Invalid slots and duplicates are detected before any payload is visible.
     pub fn insert_many(
         &mut self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         payloads: impl IntoIterator<Item = (RealtimeSlotCoordinate, P)>,
     ) -> Result<(), RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
@@ -458,7 +421,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// duplicate producers still fail closed.
     pub fn overwrite_many(
         &mut self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         payloads: impl IntoIterator<Item = (RealtimeSlotCoordinate, P)>,
     ) -> Result<(), RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
@@ -486,7 +449,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Returns a payload at one exact validated coordinate, when present.
     pub fn get(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         coordinate: RealtimeSlotCoordinate,
     ) -> Result<Option<&P>, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
@@ -500,7 +463,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Returns the typed envelope at one exact validated coordinate, when present.
     pub fn envelope(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         coordinate: RealtimeSlotCoordinate,
     ) -> Result<Option<&RealtimePayloadEnvelope<P>>, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
@@ -511,7 +474,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Resolves one required payload or fails with its exact missing coordinate.
     pub fn required(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         coordinate: RealtimeSlotCoordinate,
     ) -> Result<&P, RealtimePayloadHistoryError> {
         self.get(schedule, coordinate)?
@@ -521,7 +484,7 @@ impl<P> RealtimePayloadHistory<P> {
     /// Resolves required coordinates in caller order, retaining duplicate reads.
     pub fn resolve_required(
         &self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         coordinates: impl IntoIterator<Item = RealtimeSlotCoordinate>,
     ) -> Result<Vec<&P>, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
@@ -533,20 +496,20 @@ impl<P> RealtimePayloadHistory<P> {
 
     /// Prunes coordinates older than the deterministic delayed-history window.
     ///
-    /// For next frontier `n` and maximum delay `d`, positions before
-    /// `n - (d + 2)` are removed. The additional position retains the oldest
+    /// For next frontier `n` and declared delay-plus-feedback lookback `d`,
+    /// positions before `n - (d + 1)` are removed. The additional position retains the oldest
     /// payload referenced by the just-submitted transition until its completion
     /// has captured [`Self::retained_values`]. Warm-up clamps the minimum
     /// position to zero. The return value is the number of payloads removed.
     pub fn prune_for_next_frontier(
         &mut self,
-        schedule: &RealtimeSpeechConfig,
+        schedule: &RealtimeChannelLayout,
         next_frontier: usize,
     ) -> Result<usize, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
-        let retained_positions = schedule.max_delay().checked_add(2).ok_or(
+        let retained_positions = schedule.retention_lookback().checked_add(1).ok_or(
             RealtimePayloadHistoryError::RetentionWindowOverflow {
-                max_delay: schedule.max_delay(),
+                max_delay: schedule.retention_lookback(),
             },
         )?;
         let minimum = next_frontier.saturating_sub(retained_positions);
@@ -580,22 +543,11 @@ impl<P> RealtimePayloadHistory<P> {
         self.slot_delay(coordinate.slot()).map(|_| ())
     }
 
-    fn slot_delay(&self, slot: RealtimeFrameSlot) -> Result<usize, RealtimePayloadHistoryError> {
-        match slot {
-            RealtimeFrameSlot::Text => Ok(self.schedule.text_delay()),
-            RealtimeFrameSlot::Audio(codebook) => {
-                self.schedule.audio_delays().get(codebook).copied().ok_or(
-                    RealtimePayloadHistoryError::InvalidSlot {
-                        slot,
-                        total_audio_codebooks: self.schedule.total_audio_codebooks(),
-                    },
-                )
-            }
-            _ => Err(RealtimePayloadHistoryError::InvalidSlot {
-                slot,
-                total_audio_codebooks: self.schedule.total_audio_codebooks(),
-            }),
-        }
+    fn slot_delay(&self, slot: RealtimeChannelId) -> Result<usize, RealtimePayloadHistoryError> {
+        self.schedule
+            .channel(slot)
+            .map(|channel| channel.delay)
+            .ok_or(RealtimePayloadHistoryError::InvalidSlot { slot })
     }
 }
 
@@ -612,15 +564,11 @@ pub enum RealtimePayloadHistoryError {
     /// The caller supplied a materially different normalized schedule.
     #[error("realtime payload history does not match the normalized schedule")]
     ScheduleMismatch,
-    /// A coordinate does not name text or an admitted audio codebook.
-    #[error(
-        "realtime payload slot {slot:?} is outside text plus {total_audio_codebooks} audio codebooks"
-    )]
+    /// A coordinate names an undeclared channel.
+    #[error("realtime payload channel {slot:?} is not declared")]
     InvalidSlot {
-        /// Invalid schedule slot.
-        slot: RealtimeFrameSlot,
-        /// Admitted audio-codebook count.
-        total_audio_codebooks: usize,
+        /// Unknown channel.
+        slot: RealtimeChannelId,
     },
     /// A coordinate already has a payload in the current or pending publication.
     #[error("realtime coordinate {coordinate:?} already contains a payload")]
@@ -652,41 +600,58 @@ pub enum RealtimePayloadHistoryError {
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::RealtimeFrameConvention;
+    use crate::{RealtimeIngressContract, TokenDomain};
+    use eredu_core::{RealtimeFrameConvention, RealtimeSpeechConfig};
 
     use super::*;
 
-    fn schedule() -> RealtimeSpeechConfig {
-        RealtimeSpeechConfig::new(
-            2,
-            1,
-            1,
-            1,
-            0,
-            1,
-            RealtimeFrameConvention::FeedbackAlignedHistory,
-            vec![2, 0, 3],
+    fn schedule() -> RealtimeChannelLayout {
+        RealtimeIngressContract::new(
+            RealtimeSpeechConfig::new(
+                2,
+                1,
+                1,
+                1,
+                0,
+                1,
+                RealtimeFrameConvention::FeedbackAlignedHistory,
+                vec![2, 0, 3],
+            )
+            .unwrap(),
+            TokenDomain::new(32),
+            TokenDomain::new(16),
         )
         .unwrap()
+        .channels()
+        .clone()
     }
 
-    fn coordinate(position: usize, slot: RealtimeFrameSlot) -> RealtimeSlotCoordinate {
+    fn coordinate(position: usize, slot: RealtimeChannelId) -> RealtimeSlotCoordinate {
         RealtimeSlotCoordinate::new(position, slot)
     }
 
     fn payload_contract(
-        schedule: RealtimeSpeechConfig,
+        schedule: RealtimeChannelLayout,
         batch: usize,
         text_domain: TokenDomain,
         audio_domain: TokenDomain,
         generation: u64,
         owner: u64,
     ) -> RealtimePayloadContract {
+        let mut channels = schedule.channels().to_vec();
+        for channel in &mut channels {
+            channel.payload = RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: if channel.id.index() == 0 {
+                    text_domain.cardinality()
+                } else {
+                    audio_domain.cardinality()
+                },
+            };
+        }
         RealtimePayloadContract::new(
-            schedule,
+            RealtimeChannelLayout::new(schedule.policy().into(), channels).unwrap(),
             batch,
-            text_domain,
-            audio_domain,
             RealtimePayloadGeneration::new(generation).unwrap(),
             RealtimePayloadOwnerIdentity::new(owner).unwrap(),
         )
@@ -714,10 +679,8 @@ mod tests {
             RealtimePayloadContract::new(
                 schedule(),
                 0,
-                TokenDomain::new(32),
-                TokenDomain::new(16),
                 RealtimePayloadGeneration::new(7).unwrap(),
-                RealtimePayloadOwnerIdentity::new(3).unwrap(),
+                RealtimePayloadOwnerIdentity::new(3).unwrap()
             ),
             Err(RealtimePayloadContractError::EmptyBatch)
         );
@@ -727,8 +690,6 @@ mod tests {
         let contract = exact_payload_contract();
         assert_eq!(contract.schedule(), &schedule());
         assert_eq!(contract.batch().get(), 2);
-        assert_eq!(contract.text_domain(), TokenDomain::new(32));
-        assert_eq!(contract.audio_domain(), TokenDomain::new(16));
         assert_eq!(contract.generation().value(), 7);
         assert_eq!(contract.owner().value(), 3);
     }
@@ -736,33 +697,44 @@ mod tests {
     #[test]
     fn payload_envelope_derives_slot_domain_and_validates_exact_coordinate() {
         let contract = exact_payload_contract();
-        let text_coordinate = coordinate(5, RealtimeFrameSlot::Text);
+        let text_coordinate = coordinate(5, RealtimeChannelId::new(0));
         let text = RealtimePayloadEnvelope::new(contract.clone(), text_coordinate, "text").unwrap();
         assert_eq!(text.contract(), &contract);
         assert_eq!(text.coordinate(), text_coordinate);
-        assert_eq!(text.domain(), TokenDomain::new(32));
+        assert_eq!(
+            text.geometry(),
+            &RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: 32
+            }
+        );
         assert_eq!(text.payload(), &"text");
         assert_eq!(text.validate(&contract, text_coordinate), Ok(()));
 
-        let audio_coordinate = coordinate(5, RealtimeFrameSlot::Audio(1));
+        let audio_coordinate = coordinate(5, RealtimeChannelId::new(2));
         let audio =
             RealtimePayloadEnvelope::new(contract.clone(), audio_coordinate, "audio").unwrap();
-        assert_eq!(audio.domain(), TokenDomain::new(16));
+        assert_eq!(
+            audio.geometry(),
+            &RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: 16
+            }
+        );
         assert_eq!(audio.validate(&contract, audio_coordinate), Ok(()));
         assert_eq!(
-            audio.validate(&contract, coordinate(6, RealtimeFrameSlot::Audio(1))),
+            audio.validate(&contract, coordinate(6, RealtimeChannelId::new(2))),
             Err(RealtimePayloadContractError::CoordinateMismatch)
         );
 
         assert_eq!(
             RealtimePayloadEnvelope::new(
                 contract,
-                coordinate(5, RealtimeFrameSlot::Audio(2)),
+                coordinate(5, RealtimeChannelId::new(3)),
                 "invalid",
             ),
             Err(RealtimePayloadContractError::InvalidSlot {
-                slot: RealtimeFrameSlot::Audio(2),
-                total_audio_codebooks: 2,
+                slot: RealtimeChannelId::new(3),
             })
         );
     }
@@ -770,8 +742,8 @@ mod tests {
     #[test]
     fn history_requires_first_contract_binding_and_stores_only_typed_envelopes() {
         let schedule = schedule();
-        let text = coordinate(0, RealtimeFrameSlot::Text);
-        let audio = coordinate(0, RealtimeFrameSlot::Audio(0));
+        let text = coordinate(0, RealtimeChannelId::new(0));
+        let audio = coordinate(0, RealtimeChannelId::new(1));
         let mut history = RealtimePayloadHistory::new(schedule.clone());
         assert!(history.contract().is_none());
         assert_eq!(history.get(&schedule, text), Ok(None));
@@ -791,11 +763,23 @@ mod tests {
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].contract(), &contract);
         assert_eq!(envelopes[0].coordinate(), text);
-        assert_eq!(envelopes[0].domain(), TokenDomain::new(32));
+        assert_eq!(
+            envelopes[0].geometry(),
+            &RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: 32
+            }
+        );
         assert_eq!(envelopes[0].payload(), &3);
         assert_eq!(envelopes[1].contract(), &contract);
         assert_eq!(envelopes[1].coordinate(), audio);
-        assert_eq!(envelopes[1].domain(), TokenDomain::new(16));
+        assert_eq!(
+            envelopes[1].geometry(),
+            &RealtimeChannelPayload::Categorical {
+                width: 1,
+                cardinality: 16
+            }
+        );
         assert_eq!(
             history.envelope(&schedule, audio).unwrap(),
             Some(envelopes[1])
@@ -806,20 +790,27 @@ mod tests {
     fn bound_history_rejects_every_contract_perturbation_without_mutation() {
         let exact = exact_payload_contract();
         let schedule = schedule();
-        let text = coordinate(0, RealtimeFrameSlot::Text);
+        let text = coordinate(0, RealtimeChannelId::new(0));
         let mut history = RealtimePayloadHistory::with_contract(exact.clone());
         history.insert(&schedule, text, 3).unwrap();
-        let other_schedule = RealtimeSpeechConfig::new(
-            2,
-            1,
-            1,
-            1,
-            0,
-            1,
-            RealtimeFrameConvention::AbsoluteDelayedSlots,
-            vec![2, 0, 3],
+        let other_schedule = RealtimeIngressContract::new(
+            RealtimeSpeechConfig::new(
+                2,
+                1,
+                1,
+                1,
+                0,
+                1,
+                RealtimeFrameConvention::AbsoluteDelayedSlots,
+                vec![2, 0, 3],
+            )
+            .unwrap(),
+            TokenDomain::new(32),
+            TokenDomain::new(16),
         )
-        .unwrap();
+        .unwrap()
+        .channels()
+        .clone();
         let perturbations = [
             (
                 payload_contract(
@@ -852,7 +843,7 @@ mod tests {
                     7,
                     3,
                 ),
-                RealtimePayloadContractError::TextDomainMismatch,
+                RealtimePayloadContractError::ScheduleMismatch,
             ),
             (
                 payload_contract(
@@ -863,7 +854,7 @@ mod tests {
                     7,
                     3,
                 ),
-                RealtimePayloadContractError::AudioDomainMismatch,
+                RealtimePayloadContractError::ScheduleMismatch,
             ),
             (
                 payload_contract(
@@ -909,7 +900,7 @@ mod tests {
             history
                 .insert(
                     &schedule,
-                    coordinate(position, RealtimeFrameSlot::Text),
+                    coordinate(position, RealtimeChannelId::new(0)),
                     position,
                 )
                 .unwrap();
@@ -932,9 +923,9 @@ mod tests {
     fn exact_insert_get_and_required_resolution_preserve_coordinate_order() {
         let schedule = schedule();
         let mut history = payload_history();
-        let text = coordinate(2, RealtimeFrameSlot::Text);
-        let audio_zero = coordinate(2, RealtimeFrameSlot::Audio(0));
-        let audio_one = coordinate(2, RealtimeFrameSlot::Audio(1));
+        let text = coordinate(2, RealtimeChannelId::new(0));
+        let audio_zero = coordinate(2, RealtimeChannelId::new(1));
+        let audio_one = coordinate(2, RealtimeChannelId::new(2));
         history
             .insert_many(
                 &schedule,
@@ -961,32 +952,27 @@ mod tests {
     fn invalid_or_duplicate_publications_are_atomic() {
         let schedule = schedule();
         let mut history = payload_history();
-        let retained = coordinate(0, RealtimeFrameSlot::Text);
+        let retained = coordinate(0, RealtimeChannelId::new(0));
         history.insert(&schedule, retained, 7).unwrap();
-        let invalid = coordinate(1, RealtimeFrameSlot::Audio(2));
+        let invalid = coordinate(1, RealtimeChannelId::new(3));
 
         assert_eq!(
             history.insert_many(
                 &schedule,
-                [
-                    (coordinate(1, RealtimeFrameSlot::Audio(0)), 8),
-                    (invalid, 9)
-                ]
+                [(coordinate(1, RealtimeChannelId::new(1)), 8), (invalid, 9)]
             ),
             Err(RealtimePayloadHistoryError::InvalidSlot {
-                slot: RealtimeFrameSlot::Audio(2),
-                total_audio_codebooks: 2,
+                slot: RealtimeChannelId::new(3),
             })
         );
         assert_eq!(history.len(), 1);
         assert_eq!(
             history.insert_many(&schedule, [(invalid, 8), (invalid, 9)]),
             Err(RealtimePayloadHistoryError::InvalidSlot {
-                slot: RealtimeFrameSlot::Audio(2),
-                total_audio_codebooks: 2,
+                slot: RealtimeChannelId::new(3),
             })
         );
-        let pending = coordinate(1, RealtimeFrameSlot::Audio(0));
+        let pending = coordinate(1, RealtimeChannelId::new(1));
         assert_eq!(
             history.insert_many(&schedule, [(pending, 8), (pending, 9)]),
             Err(RealtimePayloadHistoryError::DuplicatePayload {
@@ -1006,26 +992,33 @@ mod tests {
     #[test]
     fn mismatch_missing_and_arithmetic_fail_without_mutation() {
         let schedule = schedule();
-        let other = RealtimeSpeechConfig::new(
-            2,
-            1,
-            1,
-            1,
-            0,
-            1,
-            RealtimeFrameConvention::AbsoluteDelayedSlots,
-            vec![2, 0, 3],
+        let other = RealtimeIngressContract::new(
+            RealtimeSpeechConfig::new(
+                2,
+                1,
+                1,
+                1,
+                0,
+                1,
+                RealtimeFrameConvention::AbsoluteDelayedSlots,
+                vec![2, 0, 3],
+            )
+            .unwrap(),
+            TokenDomain::new(32),
+            TokenDomain::new(16),
         )
-        .unwrap();
+        .unwrap()
+        .channels()
+        .clone();
         let mut history = payload_history();
-        let retained = coordinate(0, RealtimeFrameSlot::Text);
+        let retained = coordinate(0, RealtimeChannelId::new(0));
         history.insert(&schedule, retained, 7).unwrap();
 
         assert_eq!(
-            history.insert(&other, coordinate(1, RealtimeFrameSlot::Text), 8),
+            history.insert(&other, coordinate(1, RealtimeChannelId::new(0)), 8),
             Err(RealtimePayloadHistoryError::ScheduleMismatch)
         );
-        let missing = coordinate(1, RealtimeFrameSlot::Audio(0));
+        let missing = coordinate(1, RealtimeChannelId::new(1));
         assert_eq!(
             history.required(&schedule, missing),
             Err(RealtimePayloadHistoryError::MissingPayload {
@@ -1033,7 +1026,7 @@ mod tests {
             })
         );
         assert_eq!(
-            history.insert_delayed(&schedule, usize::MAX, RealtimeFrameSlot::Text, 9,),
+            history.insert_delayed(&schedule, usize::MAX, RealtimeChannelId::new(0), 9,),
             Err(RealtimePayloadHistoryError::CoordinateOverflow {
                 base_position: usize::MAX,
                 delay: 2,
@@ -1051,7 +1044,7 @@ mod tests {
             history
                 .insert(
                     &schedule,
-                    coordinate(position, RealtimeFrameSlot::Text),
+                    coordinate(position, RealtimeChannelId::new(0)),
                     position,
                 )
                 .unwrap();

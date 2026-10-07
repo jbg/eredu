@@ -1,0 +1,67 @@
+{
+  "official": {
+    "repository": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B",
+    "revision": "443794ea956ef0065f001967ffd00e77f519cb39",
+    "file": "model.safetensors",
+    "header_length": 216016,
+    "header_sha256": "b2095b892df6be267e5d42fc86fb4e65fa822f06f485c3c28a0d6d3dea3824fd"
+  },
+  "gguf": {
+    "repository": "hoidhxd/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF",
+    "revision": "89883a05a031557729771f94abb9998e4facdd45",
+    "directories": [
+      {
+        "fixture": "gguf-q4-tensors.json",
+        "file": "nemotron_voicechat_11b-Q4_0.gguf",
+        "tensor_count": 1632,
+        "fixture_sha256": "cbece51481b492984250c7b8b888e22e129a2b496ac88b017de2adf5092e263d",
+        "metadata_fixture": "gguf-q4-metadata.json",
+        "metadata_fixture_sha256": "4a29334dd65117ab6fc71a35c616dc4fd1981a1b390d58d307672035cc544e40"
+      },
+      {
+        "fixture": "gguf-0-tensors.json",
+        "file": "llamacpp/mmproj-voicechat-perception-Q4_0.gguf",
+        "tensor_count": 640,
+        "fixture_sha256": "2f7984ca47c823d7e7a36c1b9daf3d6f1b8afc45f9d5398b210b8baecce8d8cd",
+        "metadata_fixture": "gguf-0-metadata.json",
+        "metadata_fixture_sha256": "23086d6ee64dab7cc186acf003183fd815a9c9a537b0fc479cb4ca66ff017d56"
+      },
+      {
+        "fixture": "gguf-1-tensors.json",
+        "file": "llamacpp/nemotron_voicechat_11b-stt-llm-Q4_0-function-head.gguf",
+        "tensor_count": 1,
+        "fixture_sha256": "694c137c01d5429db5da4ba4166f407183b071242d6b72ec99d344bf82b3a45d",
+        "metadata_fixture": "gguf-1-metadata.json",
+        "metadata_fixture_sha256": "187d375edb5582a84d43c41253f7341f143002484f2d291ca6cc0e47c2bcd093"
+      },
+      {
+        "fixture": "gguf-2-tensors.json",
+        "file": "llamacpp/nemotron_voicechat_11b-stt-llm-Q4_0.gguf",
+        "tensor_count": 341,
+        "fixture_sha256": "24b572bff4851c3bcc3c85ab0d131cda1e6c9c6e09f05d5a3300929f8eb4e5bb",
+        "metadata_fixture": "gguf-2-metadata.json",
+        "metadata_fixture_sha256": "3bcc0458a7acd56825e5a12f5fafce0368e35abc30f992b56f2071c0e27cbb31"
+      },
+      {
+        "fixture": "gguf-3-tensors.json",
+        "file": "llamacpp/voicechat-tts-Q4_0.gguf",
+        "tensor_count": 559,
+        "fixture_sha256": "d5ec3d69a19531596768e289abea034210fec7719dfb3ef29f47284d9a6f2e03",
+        "metadata_fixture": "gguf-3-metadata.json",
+        "metadata_fixture_sha256": "503d656ef6adaa60b94b304dd63a9173c9ed65ef84eb3d4a7ad2434fa7e9544b"
+      },
+      {
+        "fixture": "gguf-4-tensors.json",
+        "file": "nemotron_voicechat_11b-Q8_0.gguf",
+        "tensor_count": 1632,
+        "fixture_sha256": "2998b3b01af1c6eadb611abcc895c6d2c23fb3de0da2d90ba4fb05434c730505"
+      },
+      {
+        "fixture": "gguf-5-tensors.json",
+        "file": "nemotron_voicechat_11b-f16.gguf",
+        "tensor_count": 1632,
+        "fixture_sha256": "6605ebf2f1b902b9bf2e5458d41351991efcd1d8705cb1eb97a8f02c81fb08b0"
+      }
+    ]
+  }
+}

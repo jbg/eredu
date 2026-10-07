@@ -538,11 +538,7 @@ fn dense_qwen_partition_geometry_rejects_routed_moe_before_construction() {
     let description = qwen::dense_parameter_description(&args).unwrap();
     let topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, 0).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &description,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
     let error = qwen::partition_local_geometry(&args, &layout, 0..2).unwrap_err();
     assert!(
         error.to_string().contains("does not accept routed MoE"),
@@ -695,11 +691,7 @@ fn routed_qwen_and_gpt_oss_cartesian_partitions_own_exact_units_state_and_banks(
                 qwen::RoutedLayeredModel::<ReferenceBackend>::new(qwen_args.clone(), &()).unwrap();
             let qwen_description = qwen_global.parameter_description(&()).unwrap();
             let qwen_layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-                    &qwen_description,
-                    rank,
-                )
-                .unwrap();
+                eredu_runtime::derive_partitioned_local_layout(&qwen_description, rank).unwrap();
             let qwen_plan = qwen_realization(&qwen_args, &qwen_layout, rank);
             let qwen_geometry = qwen::partition_local_routed_geometry(
                 &qwen_args,
@@ -776,11 +768,7 @@ fn routed_qwen_and_gpt_oss_cartesian_partitions_own_exact_units_state_and_banks(
             let gpt_args = gpt_oss_partition_args();
             let gpt_description = gpt_oss_parameter_description(&gpt_args);
             let gpt_layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-                    &gpt_description,
-                    rank,
-                )
-                .unwrap();
+                eredu_runtime::derive_partitioned_local_layout(&gpt_description, rank).unwrap();
             let gpt_plan = gpt_oss_realization(&gpt_args, &gpt_layout, rank);
             let gpt_geometry = gpt_oss::partition_local_routed_geometry(
                 &gpt_args,
@@ -857,11 +845,7 @@ fn routed_partition_geometry_rejects_wrong_expert_owner_and_state() {
     let topology = eredu_core::ParallelTopology::new(1, 2, 2, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, 3).unwrap();
     let wrong_rank = eredu_core::ParallelRankTopology::new(topology, 2).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &description,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
     let wrong_plan = qwen_realization(&args, &layout, wrong_rank);
     assert!(
         qwen::partition_local_routed_geometry(&args, &layout, 2..4, rank, &wrong_plan)
@@ -924,11 +908,7 @@ fn local_llama_partition(
     let description = llama::dense_parameter_description(args).unwrap();
     let topology = eredu_core::ParallelTopology::new(tensor_parts, 1, 1, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, tensor_rank).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &description,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
     let geometry = llama::partition_local_geometry(args, &layout, units.clone()).unwrap();
     let state = geometry.complete_state_layout().clone();
     let state_plan =
@@ -1057,11 +1037,7 @@ fn local_lfm2_partition(
     );
     let topology = eredu_core::ParallelTopology::new(tensor_parts, 1, 1, 1).unwrap();
     let rank = eredu_core::ParallelRankTopology::new(topology, tensor_rank).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &description,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
     let geometry = lfm2::partition_local_geometry(args, &layout, units.clone()).unwrap();
     let state = geometry.complete_state_layout().clone();
     let state_plan =
@@ -1196,7 +1172,7 @@ impl
         _store: eredu_checkpoint::store::SharedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+        A: eredu_runtime::PipelinePartitionArchitecture<
                 ReferenceBackend,
                 DeviceState<ReferenceBackend, ReferenceCache>,
             > + eredu_runtime::ReplicatedTextArchitecture<
@@ -3857,11 +3833,7 @@ fn deepseek_v3_v4_partition_foundations_cover_cartesian_ownership_and_compact_ba
             let v3_args = deepseek_v3_partition_args();
             let v3_parameters = deepseek::parallel::v3_parameter_description(&v3_args).unwrap();
             let v3_layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-                    &v3_parameters,
-                    rank,
-                )
-                .unwrap();
+                eredu_runtime::derive_partitioned_local_layout(&v3_parameters, rank).unwrap();
             let v3_local = deepseek::parallel::v3_local_geometry(&v3_args, &v3_layout).unwrap();
             let v3_realization =
                 deepseek::v3_partition_expert_realization_plan(&v3_args, &v3_local, rank).unwrap();
@@ -3941,11 +3913,7 @@ fn deepseek_v3_v4_partition_foundations_cover_cartesian_ownership_and_compact_ba
             let v4_args = deepseek_v4_partition_args();
             let v4_parameters = deepseek::parallel::v4_parameter_description(&v4_args).unwrap();
             let v4_layout =
-                eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-                    &v4_parameters,
-                    rank,
-                )
-                .unwrap();
+                eredu_runtime::derive_partitioned_local_layout(&v4_parameters, rank).unwrap();
             let v4_local = deepseek::parallel::v4_local_geometry(&v4_args, &v4_layout).unwrap();
             let v4_realization =
                 deepseek::v4_partition_expert_realization_plan(&v4_args, &v4_local, rank).unwrap();
@@ -4011,11 +3979,7 @@ fn deepseek_partition_foundations_reject_prediction_and_wrong_expert_owner_befor
     let rank = eredu_core::ParallelRankTopology::new(topology, 3).unwrap();
     let wrong_rank = eredu_core::ParallelRankTopology::new(topology, 2).unwrap();
     let parameters = deepseek::parallel::v3_parameter_description(&args).unwrap();
-    let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
-        &parameters,
-        rank,
-    )
-    .unwrap();
+    let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, rank).unwrap();
     let local = deepseek::parallel::v3_local_geometry(&args, &layout).unwrap();
     let realization = deepseek::v3_partition_expert_realization_plan(&args, &local, rank).unwrap();
     let ownership = deepseek_partition_ownership(rank, false);

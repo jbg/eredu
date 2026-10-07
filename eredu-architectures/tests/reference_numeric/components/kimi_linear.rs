@@ -309,7 +309,7 @@ fn kimi_observed_pipeline_cut_preserves_components_and_cached_trials() {
             let (mut ordinary_state, mut reference_state) = (state(), state());
             let mut stages = (0..2).map(|layer| {
                 let rank = ParallelRankTopology::new(topology, layer).unwrap();
-                let layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                let layout = eredu_runtime::derive_partitioned_local_layout(
                     &description, rank,
                 ).unwrap();
                 let realization = family::expert_realization_plan(&model(), rank).unwrap().unwrap();
@@ -817,8 +817,8 @@ fn kimi_prepared_transforms_retain_source_layout_across_residency_and_parallelis
                             let target = family::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
                             let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
                             let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                            let mut layout = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
-                            let encoded = eredu_architectures::partitioned_execution::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();
+                            let mut layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
+                            let encoded = eredu_runtime::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();
                             for (name, companion) in encoded.tensors() { if !layout.contains(name) { layout.insert(name.to_owned(), companion.clone()); } }
                             let mut context = NumericContext::with_partition(layout, rank, world);
                             context.bind_checkpoint_values = true;

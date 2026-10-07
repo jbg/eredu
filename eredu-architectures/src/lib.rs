@@ -97,6 +97,8 @@ pub use selected_execution::{
 pub mod processor_execution;
 /// Backend-neutral family preprocessing and framing plans.
 pub mod processor_plan;
+/// Shared realtime model discovery and artifact preparation.
+pub mod realtime;
 mod replicated_model;
 /// Architecture-owned admission for replicated text execution.
 pub mod replicated_text;
@@ -175,3 +177,6 @@ pub mod qwen;
 
 /// Qwen4 experimental family equations and checkpoint contracts.
 pub mod qwen4_exp;
+
+/// NemotronLabs VoiceChat release configuration and artifact contracts.
+pub mod voicechat;

@@ -1,13 +1,18 @@
 //! Portable realtime-frame validation before opaque token materialization.
 
-use eredu_core::{RealtimeFrameForcing, RealtimeInputFrame, RealtimeSpeechConfig};
+use eredu_core::{
+    RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelFeedback, RealtimeChannelId,
+    RealtimeChannelLayout, RealtimeChannelPayload, RealtimeFrameForcing, RealtimeInputFrame,
+    RealtimeSpeechConfig,
+};
 
-use crate::TokenDomain;
+use crate::{RealtimeChannelIngressError, TokenDomain};
 
 /// Exact schedule and token domains used to validate portable realtime input.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RealtimeIngressContract {
     schedule: RealtimeSpeechConfig,
+    channels: RealtimeChannelLayout,
     text: TokenDomain,
     audio: TokenDomain,
 }
@@ -25,8 +30,47 @@ impl RealtimeIngressContract {
             audio,
             RealtimeTokenKind::Audio,
         )?;
+        let channels = RealtimeChannelLayout::new(
+            serde_json::to_string(&schedule).expect("validated schedule serializes"),
+            schedule
+                .delays()
+                .iter()
+                .enumerate()
+                .map(|(index, &delay)| RealtimeChannelDeclaration {
+                    id: RealtimeChannelId::new(index),
+                    payload: RealtimeChannelPayload::Categorical {
+                        width: 1,
+                        cardinality: if index == 0 {
+                            text.cardinality()
+                        } else {
+                            audio.cardinality()
+                        },
+                    },
+                    cadence: RealtimeChannelCadence {
+                        period: 1,
+                        phase: 0,
+                    },
+                    delay,
+                    feedback: {
+                        let mut dependencies = vec![RealtimeChannelFeedback {
+                            source: RealtimeChannelId::new(index),
+                            lag: 1,
+                        }];
+                        if index > 0 && index <= schedule.generated_audio_codebooks() {
+                            dependencies.push(RealtimeChannelFeedback {
+                                source: RealtimeChannelId::new(index - 1),
+                                lag: 0,
+                            });
+                        }
+                        dependencies
+                    },
+                })
+                .collect(),
+        )
+        .map_err(RealtimeIngressError::Channels)?;
         Ok(Self {
             schedule,
+            channels,
             text,
             audio,
         })
@@ -35,6 +79,11 @@ impl RealtimeIngressContract {
     /// Returns the exact normalized speech schedule.
     pub const fn schedule(&self) -> &RealtimeSpeechConfig {
         &self.schedule
+    }
+
+    /// Exact typed channels used by retained payloads and transaction identity.
+    pub const fn channels(&self) -> &RealtimeChannelLayout {
+        &self.channels
     }
 
     /// Returns the complete admitted text-token domain.
@@ -136,34 +185,50 @@ impl ValidatedRealtimeInput<'_> {
         materializer: &mut M,
     ) -> Result<MaterializedRealtimeInput<M::Tensor>, M::Error> {
         let batch = self.frame.batch();
-        let input_audio = materializer.materialize_i32(
-            self.frame.input_audio_tokens(),
-            [batch, self.contract.schedule.input_audio_codebooks()],
-        )?;
-        let forced_audio = self
-            .frame
-            .forced_generated_audio_tokens()
-            .map(|tokens| {
-                materializer.materialize_i32(
-                    tokens,
-                    [batch, self.contract.schedule.generated_audio_codebooks()],
-                )
-            })
-            .transpose()?;
-        let forced_text = self
-            .frame
-            .forced_text_tokens()
-            .map(|tokens| materializer.materialize_i32(tokens, [batch, 1]))
-            .transpose()?;
-        Ok(MaterializedRealtimeInput {
-            schedule: self.contract.schedule.clone(),
+        let generated = self.contract.schedule.generated_audio_codebooks();
+        let input_columns = self.contract.schedule.input_audio_codebooks();
+        let mut inputs = Vec::with_capacity(input_columns);
+        for column in 0..input_columns {
+            let values = self
+                .frame
+                .input_audio_tokens()
+                .chunks_exact(input_columns)
+                .map(|row| row[column])
+                .collect::<Vec<_>>();
+            inputs.push((
+                RealtimeChannelId::new(1 + generated + column),
+                materializer.materialize_i32(&values, [batch, 1])?,
+            ));
+        }
+        let mut forced = Vec::new();
+        if let Some(tokens) = self.frame.forced_text_tokens() {
+            forced.push((
+                RealtimeChannelId::new(0),
+                materializer.materialize_i32(tokens, [batch, 1])?,
+            ));
+        }
+        if let Some(tokens) = self.frame.forced_generated_audio_tokens() {
+            for (column, selected) in self.forcing.generated_audio().iter().enumerate() {
+                if !selected {
+                    continue;
+                }
+                let values = tokens
+                    .chunks_exact(generated)
+                    .map(|row| row[column])
+                    .collect::<Vec<_>>();
+                forced.push((
+                    RealtimeChannelId::new(1 + column),
+                    materializer.materialize_i32(&values, [batch, 1])?,
+                ));
+            }
+        }
+        Ok(MaterializedRealtimeInput::from_validated(
+            self.contract.channels.clone(),
             batch,
-            input_audio,
-            forced_audio,
-            forced_text,
-            forcing: self.forcing.clone(),
-            retain_diagnostics: self.frame.retains_diagnostics(),
-        })
+            inputs,
+            forced,
+            self.frame.retains_diagnostics(),
+        ))
     }
 }
 
@@ -182,74 +247,116 @@ pub trait RealtimeHostTokenMaterializer {
     ) -> Result<Self::Tensor, Self::Error>;
 }
 
-/// Opaque input tensors paired with the neutral forcing and diagnostic policy.
+/// Host materialization capability for mixed categorical and dense channels.
+pub trait RealtimeHostFrameMaterializer: RealtimeHostTokenMaterializer {
+    /// Copies a validated finite f32 frame with its leading batch dimension.
+    fn materialize_f32(
+        &mut self,
+        values: &[f32],
+        shape: &[usize],
+    ) -> Result<Self::Tensor, Self::Error>;
+}
+
+/// Opaque categorical or dense channel inputs and independently selected overrides.
+///
+/// A channel may occur once in each group. Architecture policy determines which
+/// channels are required and how an override participates in execution; this
+/// container has no text/audio matrix convention or schedule state.
+#[derive(Debug, Clone)]
 pub struct MaterializedRealtimeInput<T> {
-    schedule: RealtimeSpeechConfig,
+    channels: RealtimeChannelLayout,
     batch: usize,
-    input_audio: T,
-    forced_audio: Option<T>,
-    forced_text: Option<T>,
-    forcing: RealtimeFrameForcing,
+    inputs: Vec<(RealtimeChannelId, T)>,
+    forced: Vec<(RealtimeChannelId, T)>,
     retain_diagnostics: bool,
 }
 
 impl<T> MaterializedRealtimeInput<T> {
-    /// Returns the exact schedule under which host validation completed.
-    pub const fn schedule(&self) -> &RealtimeSpeechConfig {
-        &self.schedule
+    /// Validates channel identities and batch-expanded geometry for opaque values.
+    /// Native shape and dtype validation belongs to the materialization mechanism;
+    /// host values use [`crate::ValidatedRealtimeFrameInput`] before allocation.
+    pub fn new(
+        channels: RealtimeChannelLayout,
+        batch: usize,
+        inputs: Vec<(RealtimeChannelId, T)>,
+        forced: Vec<(RealtimeChannelId, T)>,
+        retain_diagnostics: bool,
+    ) -> Result<Self, RealtimeChannelIngressError> {
+        crate::realtime_channel_ingress::validate_channel_metadata(
+            &channels,
+            batch,
+            inputs.iter().map(|(id, _)| *id),
+        )?;
+        crate::realtime_channel_ingress::validate_channel_metadata(
+            &channels,
+            batch,
+            forced.iter().map(|(id, _)| *id),
+        )?;
+        Ok(Self::from_validated(
+            channels,
+            batch,
+            inputs,
+            forced,
+            retain_diagnostics,
+        ))
     }
 
-    /// Returns the validated positive batch dimension.
+    pub(crate) fn from_validated(
+        channels: RealtimeChannelLayout,
+        batch: usize,
+        inputs: Vec<(RealtimeChannelId, T)>,
+        forced: Vec<(RealtimeChannelId, T)>,
+        retain_diagnostics: bool,
+    ) -> Self {
+        Self {
+            channels,
+            batch,
+            inputs,
+            forced,
+            retain_diagnostics,
+        }
+    }
+
+    /// Exact channels admitted before materialization.
+    pub const fn channels(&self) -> &RealtimeChannelLayout {
+        &self.channels
+    }
+    /// Validated positive batch dimension.
     pub const fn batch(&self) -> usize {
         self.batch
     }
-
-    /// Returns input-side audio tokens in batch-by-input-codebook shape.
-    pub const fn input_audio(&self) -> &T {
-        &self.input_audio
+    /// Ordinary inputs in submission order, keyed by channel identity.
+    pub fn inputs(&self) -> &[(RealtimeChannelId, T)] {
+        &self.inputs
     }
-
-    /// Returns optional forced generated-audio tokens.
-    pub const fn forced_audio(&self) -> Option<&T> {
-        self.forced_audio.as_ref()
+    /// Selected overrides only; unselected sentinel values are never materialized.
+    pub fn forced_values(&self) -> &[(RealtimeChannelId, T)] {
+        &self.forced
     }
-
-    /// Returns optional forced text tokens.
-    pub const fn forced_text(&self) -> Option<&T> {
-        self.forced_text.as_ref()
+    /// Looks up an ordinary input by declared channel identity.
+    pub fn input(&self, channel: RealtimeChannelId) -> Option<&T> {
+        self.inputs
+            .iter()
+            .find(|(id, _)| *id == channel)
+            .map(|(_, value)| value)
     }
-
-    /// Returns the neutral forcing mask.
-    pub const fn forcing(&self) -> &RealtimeFrameForcing {
-        &self.forcing
+    /// Looks up a selected override by declared channel identity.
+    pub fn forced(&self, channel: RealtimeChannelId) -> Option<&T> {
+        self.forced
+            .iter()
+            .find(|(id, _)| *id == channel)
+            .map(|(_, value)| value)
     }
-
-    /// Returns whether ordered logits diagnostics were requested.
+    /// Every materialized payload requiring completion ownership.
+    pub fn retained_payloads(&self) -> impl Iterator<Item = &T> {
+        self.inputs
+            .iter()
+            .chain(&self.forced)
+            .map(|(_, value)| value)
+    }
+    /// Whether ordered categorical diagnostics were requested.
     pub const fn retains_diagnostics(&self) -> bool {
         self.retain_diagnostics
-    }
-
-    /// Consumes opaque tensors and neutral policy.
-    pub fn into_parts(
-        self,
-    ) -> (
-        RealtimeSpeechConfig,
-        usize,
-        T,
-        Option<T>,
-        Option<T>,
-        RealtimeFrameForcing,
-        bool,
-    ) {
-        (
-            self.schedule,
-            self.batch,
-            self.input_audio,
-            self.forced_audio,
-            self.forced_text,
-            self.forcing,
-            self.retain_diagnostics,
-        )
     }
 }
 
@@ -318,6 +425,9 @@ fn validate_token(
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeIngressError {
+    /// Invalid channel declaration.
+    #[error(transparent)]
+    Channels(eredu_core::RealtimeChannelError),
     /// Realtime input must contain at least one batch row.
     #[error("realtime input batch must be positive")]
     EmptyBatch,
@@ -424,10 +534,24 @@ mod tests {
         let validated = contract.validate(&valid).unwrap();
         assert_eq!(validated.forcing().generated_audio(), &[true, false]);
         let input = validated.materialize(&mut materializer).unwrap();
-        assert_eq!(materializer.0.len(), 3);
-        assert_eq!(materializer.0[0].1, [2, 2]);
-        assert_eq!(materializer.0[1].1, [2, 2]);
-        assert_eq!(materializer.0[2].1, [2, 1]);
+        assert_eq!(
+            materializer.0,
+            vec![
+                (vec![1, 3], [2, 1]),
+                (vec![2, 4], [2, 1]),
+                (vec![7, 8], [2, 1]),
+                (vec![5, 6], [2, 1]),
+            ]
+        );
+        assert_eq!(input.input(RealtimeChannelId::new(3)), Some(&0));
+        assert_eq!(input.input(RealtimeChannelId::new(4)), Some(&1));
+        assert_eq!(input.forced(RealtimeChannelId::new(0)), Some(&2));
+        assert_eq!(input.forced(RealtimeChannelId::new(1)), Some(&3));
+        assert_eq!(input.forced(RealtimeChannelId::new(2)), None);
+        assert_eq!(
+            input.retained_payloads().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         assert!(input.retains_diagnostics());
     }
 

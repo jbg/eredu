@@ -20,16 +20,16 @@ use eredu_runtime::{
     RealtimeArchitectureRequirements, RealtimeDecisionExecution, RealtimeExecutionRequirements,
     RealtimeIdentity, RealtimeMaterializationComponent, RealtimeMaterializationTask,
     RealtimeMechanism, RealtimeMechanismCapabilities, RealtimeMechanismRequirements,
-    RealtimeObservationRequirements, RealtimeSelectionError, RealtimeSelectionRequest,
-    RealtimeTopologyPolicy, RealtimeWeightComponentRequirement, RealtimeWeightComponentRole,
-    RealtimeWeightLoweringRequirement, ResettableRuntimeState, RuntimeState,
-    SelectedRealtimeRealization, WeightLoweringDescriptor, WeightLoweringKind,
+    RealtimeObservationRequirements, RealtimeScheduleDescriptor, RealtimeSelectionError,
+    RealtimeSelectionRequest, RealtimeTopologyPolicy, RealtimeWeightComponentRequirement,
+    RealtimeWeightComponentRole, RealtimeWeightLoweringRequirement, ResettableRuntimeState,
+    RuntimeState, SelectedRealtimeRealization, WeightLoweringDescriptor, WeightLoweringKind,
 };
 
 use super::{
     observation_points, parameter_contract, select_parallel_execution, state_layout,
     DecisionBoundary, MoshiConfig, MoshiParallelSelection, MoshiParameterContract,
-    RealtimePreparationPlan,
+    MoshiPreparationPlan,
 };
 
 /// Derives portable input validation from normalized Moshi architecture policy.
@@ -41,6 +41,25 @@ pub fn realtime_ingress_contract(
         config.frame_schedule().clone(),
         boundary.text_token_domain(),
         boundary.audio_token_domain(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Retains exact Moshi temporal policy and channel geometry for cold selection
+/// and session admission, independent of the backend realization.
+pub fn realtime_frame_contract(
+    config: &MoshiConfig,
+) -> Result<eredu_runtime::RealtimeFrameContract, String> {
+    let ingress = realtime_ingress_contract(config)?;
+    eredu_runtime::RealtimeFrameContract::new(
+        RealtimeIdentity::new(format!(
+            "moshi.schedule:{}",
+            config.architecture_fingerprint()
+        ))
+        .map_err(|error| error.to_string())?,
+        config.frame_schedule().schedule_descriptor(),
+        ingress.channels().clone(),
+        realtime_generation_contract(config.frame_schedule()).sampler_count(),
     )
     .map_err(|error| error.to_string())
 }
@@ -70,6 +89,18 @@ pub fn realtime_generation_samplers(
                 .take(schedule.depth_audio_codebooks()),
         )
         .collect()
+}
+
+/// Declares the exact schedule identity and text-plus-depth sampler cardinality.
+/// Native composition retains this architecture contract without deriving its
+/// decision ordering or count from backend resources.
+pub fn realtime_generation_contract(
+    schedule: &RealtimeSpeechConfig,
+) -> eredu_runtime::RealtimeGenerationContract<RealtimeSpeechConfig> {
+    eredu_runtime::RealtimeGenerationContract::new(
+        schedule.clone(),
+        schedule.depth_audio_codebooks() + 1,
+    )
 }
 
 /// Selects Moshi's architecture-proven fully-forced depth-tail optimization.
@@ -313,13 +344,14 @@ where
     S: eredu_runtime::Sampler<SB>,
     O: ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
 {
-    let expected = constructed
-        .selected()
-        .requirements()
-        .speech_schedule()
-        .total_audio_codebooks()
-        .checked_add(1)
-        .ok_or(MoshiRealtimeExecutionError::TemporalCardinalityOverflow)?;
+    let expected = match constructed.execution() {
+        eredu_runtime::RealtimeLayerwiseRuntime::Resident(runtime) => {
+            runtime.architecture().realtime_temporal_cardinality()
+        }
+        eredu_runtime::RealtimeLayerwiseRuntime::Bounded(runtime) => {
+            runtime.architecture().realtime_temporal_cardinality()
+        }
+    };
     if temporal.len() != expected {
         return Err(MoshiRealtimeExecutionError::TemporalCardinality {
             expected,
@@ -559,9 +591,6 @@ where
 /// Failure while running one already-prepared Moshi temporal execution slice.
 #[derive(Debug, thiserror::Error)]
 pub enum MoshiRealtimeExecutionError<P: std::fmt::Display> {
-    /// Text plus audio cardinality overflowed the host representation.
-    #[error("Moshi temporal token cardinality overflowed")]
-    TemporalCardinalityOverflow,
     /// The prepared token list did not contain text plus every audio codebook.
     #[error("Moshi temporal token count is {actual}, expected {expected}")]
     TemporalCardinality {
@@ -673,7 +702,7 @@ pub fn moshi_realtime_request_from_normalized(
 /// Architecture-owned result selected before backend construction.
 #[derive(Debug)]
 pub struct PreparedMoshiRealtime {
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     execution_config: MoshiConfig,
     source_parameters: MoshiParameterContract,
     execution_parameters: MoshiParameterContract,
@@ -1056,7 +1085,7 @@ impl PreparedMoshiRealtime {
     pub fn into_parts(
         self,
     ) -> (
-        RealtimePreparationPlan,
+        MoshiPreparationPlan,
         MoshiConfig,
         MoshiParameterContract,
         MoshiParameterContract,
@@ -1105,7 +1134,7 @@ impl InspectedMoshiRealtime {
 
 /// Resolves source/execution contracts without invoking backend construction.
 pub fn inspect_moshi_realtime(
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     request: MoshiRealtimeRequest,
 ) -> Result<InspectedMoshiRealtime, MoshiRealtimeSelectionError> {
     build_candidate(preparation, request).map(|candidate| InspectedMoshiRealtime { candidate })
@@ -1141,7 +1170,7 @@ pub fn select_inspected_moshi_realtime(
 
 /// Selects Moshi or PersonaPlex execution before any backend construction.
 pub fn select_moshi_realtime(
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     request: MoshiRealtimeRequest,
     capabilities: &RealtimeMechanismCapabilities,
 ) -> Result<PreparedMoshiRealtime, MoshiRealtimeSelectionError> {
@@ -1422,7 +1451,7 @@ fn materialization_tasks(
 
 #[derive(Debug)]
 struct Candidate {
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     execution_config: MoshiConfig,
     source_parameters: MoshiParameterContract,
     execution_parameters: MoshiParameterContract,
@@ -1432,7 +1461,7 @@ struct Candidate {
 }
 
 fn build_candidate(
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     request: MoshiRealtimeRequest,
 ) -> Result<Candidate, MoshiRealtimeSelectionError> {
     if request
@@ -1499,10 +1528,9 @@ fn build_candidate(
         "moshi.realtime:{}",
         execution_config.architecture_fingerprint()
     ))?;
-    let schedule_identity = identity(format!(
-        "moshi.schedule:{}",
-        execution_config.architecture_fingerprint()
-    ))?;
+    let frame_contract = realtime_frame_contract(&execution_config)
+        .map_err(MoshiRealtimeSelectionError::InvalidArchitecture)?;
+    let schedule_identity = frame_contract.policy_identity().clone();
     let state_identity = identity(match parallel.as_ref() {
         Some(parallel) => format!("moshi.state:{}", parallel.execution_identity()),
         None => format!(
@@ -1560,8 +1588,7 @@ fn build_candidate(
         )
         .map_err(|error| MoshiRealtimeSelectionError::InvalidArchitecture(error.to_string()))?],
         eredu_nn::NeuralOperatorCapabilities::NONE,
-        schedule_identity.clone(),
-        execution_config.frame_schedule().clone(),
+        frame_contract,
         state_identity.clone(),
         state,
         RealtimeMechanismRequirements::new(mechanisms)
@@ -1649,7 +1676,7 @@ fn requested_quantization(
 }
 
 fn weight_lowerings(
-    preparation: &RealtimePreparationPlan,
+    preparation: &MoshiPreparationPlan,
     source: &MoshiParameterContract,
     execution: &MoshiParameterContract,
 ) -> Result<Vec<RealtimeWeightLoweringRequirement>, MoshiRealtimeSelectionError> {
@@ -1691,7 +1718,7 @@ fn weight_lowerings(
 
 #[allow(clippy::too_many_arguments)]
 fn matrix_lowering(
-    preparation: &RealtimePreparationPlan,
+    preparation: &MoshiPreparationPlan,
     target: &str,
     source_matrix: &super::MoshiMatrixContract,
     target_matrix: &super::MoshiMatrixContract,
@@ -1767,7 +1794,7 @@ fn matrix_lowering(
 
 #[allow(clippy::too_many_arguments)]
 fn append_matrix_companion(
-    preparation: &RealtimePreparationPlan,
+    preparation: &MoshiPreparationPlan,
     primary: &str,
     source_target: Option<&str>,
     execution_target: Option<&str>,
@@ -1850,7 +1877,7 @@ fn append_matrix_companion(
 }
 
 fn non_matrix_lowering(
-    preparation: &RealtimePreparationPlan,
+    preparation: &MoshiPreparationPlan,
     target: &str,
     source_member: &eredu_runtime::ParameterMemberSpec,
     target_member: &eredu_runtime::ParameterMemberSpec,
@@ -1897,7 +1924,7 @@ struct RecipeComponent {
 }
 
 fn recipe_component(
-    preparation: &RealtimePreparationPlan,
+    preparation: &MoshiPreparationPlan,
     execution_target: &str,
     recipe_target: &str,
     expected_shape: &[usize],
@@ -2121,9 +2148,7 @@ mod tests {
         ));
     }
 
-    use crate::moshi::{
-        prepare_realtime_model, prepare_realtime_model_from_catalog, safetensors_plan,
-    };
+    use crate::moshi::{prepare_moshi_from_catalog, safetensors_plan};
 
     use super::*;
 
@@ -2202,7 +2227,7 @@ mod tests {
         .unwrap()
     }
 
-    fn preparation(config: MoshiConfig) -> RealtimePreparationPlan {
+    fn preparation(config: MoshiConfig) -> MoshiPreparationPlan {
         preparation_at(config, "logical/artifact", "logical/checkpoint")
     }
 
@@ -2210,11 +2235,10 @@ mod tests {
         config: MoshiConfig,
         artifact_root: &str,
         checkpoint_source: &str,
-    ) -> RealtimePreparationPlan {
+    ) -> MoshiPreparationPlan {
         let plan = safetensors_plan(&config).unwrap();
         let catalog = MetadataCatalog::from_plan(&plan);
-        prepare_realtime_model_from_catalog(artifact_root, checkpoint_source, config, &catalog)
-            .unwrap()
+        prepare_moshi_from_catalog(artifact_root, checkpoint_source, config, &catalog).unwrap()
     }
 
     fn affine_config(dimensions: usize) -> MoshiConfig {
@@ -2391,7 +2415,14 @@ mod tests {
         .unwrap();
         let capability_candidate = build_candidate(preparation(config), request.clone()).unwrap();
         let mechanisms = capabilities(&capability_candidate);
-        let preparation = prepare_realtime_model(root.path()).unwrap();
+        let crate::realtime::PreparedRealtimeArtifact::Moshi(preparation) =
+            crate::realtime::prepare_realtime_model(
+                &crate::realtime::RealtimeArtifactRequest::safetensors(root.path()),
+            )
+            .unwrap()
+        else {
+            panic!("fixture must resolve to Moshi")
+        };
         let inspected = inspect_moshi_realtime(preparation, request).unwrap();
         assert!(!inspected.requirements().executions()[0]
             .weight_lowerings()
@@ -2429,8 +2460,8 @@ mod tests {
         );
         assert_eq!(prepared.selected().rank(), 0);
         assert_eq!(
-            prepared.selected().requirements().speech_schedule(),
-            prepared.source_config().frame_schedule()
+            prepared.selected().requirements().frame_contract(),
+            &realtime_frame_contract(prepared.source_config()).unwrap()
         );
         assert!(prepared.parallel().is_none());
         assert!(prepared

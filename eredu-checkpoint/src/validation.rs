@@ -311,8 +311,11 @@ impl Constraint<GgufType> for GgufTensorConstraint {
         self.encoding.accepts(*encoding)
     }
     fn encoding_detail(&self) -> String {
-        let GgufTypeConstraint::OperationClass(operation) = &self.encoding;
-        format!("a {operation:?} operation")
+        match &self.encoding {
+            GgufTypeConstraint::OperationClass(operation) => format!("a {operation:?} operation"),
+            GgufTypeConstraint::Exact(encoding) => format!("exact {encoding:?} storage"),
+            GgufTypeConstraint::OneOf(encodings) => format!("storage in {encodings:?}"),
+        }
     }
     fn unsupported_detail(&self, identity: &str, actual: &GgufType) -> String {
         format!(
@@ -1324,6 +1327,73 @@ mod tests {
             &plan.catalog_policy,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn gguf_explicit_storage_contracts_preserve_integer_and_quantized_types() {
+        let plan = GgufCheckpointPlan::new(
+            "mixed",
+            vec![
+                GgufTensorConstraint::required(
+                    "control",
+                    vec![1],
+                    GgufTypeConstraint::Exact(GgufType::I64),
+                ),
+                GgufTensorConstraint::required(
+                    "conv",
+                    vec![2, 32],
+                    GgufTypeConstraint::OneOf(vec![GgufType::F16, GgufType::Q8_0, GgufType::Q4_0]),
+                ),
+            ],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        )
+        .unwrap();
+        let mut catalog = BTreeMap::from([
+            (
+                "control".into(),
+                PhysicalMetadata {
+                    shape: vec![1],
+                    encoding: GgufType::I64,
+                },
+            ),
+            (
+                "conv".into(),
+                PhysicalMetadata {
+                    shape: vec![2, 32],
+                    encoding: GgufType::Q4_0,
+                },
+            ),
+        ]);
+        let validate = |catalog: &BTreeMap<_, _>| {
+            validate_catalog(
+                catalog,
+                &plan.identity,
+                &plan.common_tensors,
+                &plan.layout_groups,
+                &plan.catalog_policy,
+            )
+        };
+        assert!(validate(&catalog).is_empty());
+        catalog.get_mut("control").unwrap().encoding = GgufType::I32;
+        catalog.get_mut("conv").unwrap().encoding = GgufType::Q5_0;
+        let issues = validate(&catalog);
+        assert_eq!(issues.len(), 2);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.detail.contains("exact I64")));
+        assert!(issues.iter().any(|issue| issue.detail.contains("Q5_0")));
+        assert!(GgufCheckpointPlan::new(
+            "empty",
+            vec![GgufTensorConstraint::required(
+                "conv",
+                vec![2, 32],
+                GgufTypeConstraint::OneOf(vec![])
+            )],
+            Vec::new(),
+            CatalogPolicy::strict()
+        )
+        .is_err());
     }
 
     #[test]

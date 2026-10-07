@@ -629,6 +629,17 @@ impl MlxKeyValueState {
                 })
     }
 
+    pub(super) fn has_same_snapshot_layout(&self, other: &Self) -> bool {
+        self.layout == other.layout
+            && self.global_layer_start == other.global_layer_start
+            && self.layers.len() == other.layers.len()
+            && self
+                .layers
+                .iter()
+                .zip(&other.layers)
+                .all(|(a, b)| std::mem::discriminant(a) == std::mem::discriminant(b))
+    }
+
     /// Restores every append-only layer to an exact speculative checkpoint.
     pub fn restore_checkpoint(
         &mut self,

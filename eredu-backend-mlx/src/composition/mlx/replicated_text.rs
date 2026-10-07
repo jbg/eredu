@@ -3,9 +3,8 @@
 use std::{
     collections::BTreeMap,
     marker::PhantomData,
-    ops::{Deref, DerefMut},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
@@ -23,7 +22,7 @@ use eredu_runtime::{
     WeightLoweringDescriptor, WeightResidencyMechanism,
 };
 use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Dtype,
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array,
     Stream,
 };
 
@@ -48,8 +47,7 @@ use crate::{
                 },
             },
             execution::generic::{
-                MlxLayerwisePolicy, MlxResidentPolicy, MlxResidentUnit, MlxSelectiveUnitPopulator,
-                MlxUnitLease, MlxUnitPopulator,
+                MlxLayerwisePolicy, MlxSelectiveUnitPopulator,
             },
             media::input,
         },
@@ -89,6 +87,7 @@ mod session;
 mod state;
 
 pub(super) use capability::*;
+pub(crate) use capability::state_capabilities;
 pub(super) use lowering::*;
 use partitioned::*;
 pub(crate) use prediction::ErasedPrefillCursor;

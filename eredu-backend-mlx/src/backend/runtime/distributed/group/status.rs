@@ -73,7 +73,7 @@ pub(super) fn independent_status_sum(
             &group.native,
             group.communication_stream(stream.as_ref())?,
         )?;
-        finish_send(&sent, group, stream, policy, started)?;
+        complete_output(&sent, group, stream, policy, started)?;
         total = native::recv_like(
             input,
             peer,
@@ -88,13 +88,16 @@ pub(super) fn independent_status_sum(
             &group.native,
             group.communication_stream(stream.as_ref())?,
         )?;
-        finish_send(&sent, group, stream, policy, started)?;
+        complete_output(&sent, group, stream, policy, started)?;
     }
     Ok(Some(total))
 }
 
-fn finish_send(
-    sent: &Array,
+/// Retains exact native resources until an output completes or its timed-out
+/// submission is quarantined. Both status and guarded data traffic use this
+/// boundary before another operation may reuse the transport.
+pub(super) fn complete_output(
+    output: &Array,
     group: &Group,
     stream: &Stream,
     policy: CommunicationCompletionPolicy,
@@ -104,13 +107,13 @@ fn finish_send(
     let remaining = policy.timeout().saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return Err(Exception::custom(
-            "independent status setup deadline exceeded before submission",
+            "communication output deadline exceeded before submission",
         ));
     }
     let completion =
         crate::backend::runtime::distributed::completion::MlxCommunicationCompletion::submit(
-            [sent],
-            vec![sent.clone()],
+            [output],
+            vec![output.clone()],
             vec![],
             vec![group.clone()],
             vec![],
@@ -124,7 +127,7 @@ fn finish_send(
         .map_err(|error| Exception::custom(error.to_string()))?;
     match completion.wait_bounded(wait)? {
         BoundedCompletionOutcome::Completed => Ok(()),
-        BoundedCompletionOutcome::DeadlineExceeded { .. } => Err(Exception::custom("independent status send exceeded its deadline; native resources retained until completion")),
+        BoundedCompletionOutcome::DeadlineExceeded { .. } => Err(Exception::custom("communication output exceeded its deadline; native resources retained until completion")),
     }
 }
 
@@ -148,7 +151,7 @@ mod tests {
         )
         .unwrap();
         force_next_communication_pending();
-        let result = finish_send(&value, &group, &stream, policy, std::time::Instant::now());
+        let result = complete_output(&value, &group, &stream, policy, std::time::Instant::now());
         assert!(result
             .unwrap_err()
             .what()
@@ -156,7 +159,7 @@ mod tests {
         assert!(ensure_group_available(&group).is_err());
         release_forced_pending_orphans();
         assert!(ensure_group_available(&group).is_ok());
-        finish_send(&value, &group, &stream, policy, std::time::Instant::now()).unwrap();
+        complete_output(&value, &group, &stream, policy, std::time::Instant::now()).unwrap();
     }
     #[test]
     fn independent_status_fact_matches_connected_native_ring_membership() {

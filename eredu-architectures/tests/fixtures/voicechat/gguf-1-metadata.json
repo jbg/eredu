@@ -1,0 +1,12 @@
+{
+  "general.architecture": "voicechat_function_head",
+  "general.type": "model",
+  "general.name": "NemotronLabs VoiceChat 11B function head",
+  "general.description": "Turn-taking / tool-call output head for llama-voicechat. Shares the STT LLM's vocabulary and hidden state; its output token is part of the next frame's input sum.",
+  "voicechat.fusion.text_weight": 1.0,
+  "voicechat.fusion.audio_weight": 1.0,
+  "voicechat.fusion.function_weight": 2.0,
+  "voicechat.function.sotc_token_id": 20,
+  "voicechat.function.eotc_token_id": 21,
+  "voicechat.function.eotr_token_id": 22
+}

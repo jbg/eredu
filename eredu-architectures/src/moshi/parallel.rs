@@ -228,7 +228,7 @@ pub fn select_parallel_execution<'a>(
                 "Moshi maximum tensor-parallel sequence length must be positive".into(),
             )
         })?;
-    let layout = crate::partitioned_execution::derive_partitioned_local_layout(parameters, rank)
+    let layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank)
         .map_err(ParallelPlanError::InvalidTensor)?;
     if layout.is_empty() {
         return Err(ParallelPlanError::InvalidTensor(

@@ -10,6 +10,57 @@ use crate::decoder::ComponentInstrumentation;
 
 use super::{Block, LayerGeometry, LayerPolicy, ModelArgs};
 
+/// Output selected for a target invocation; prediction passes retain vocabulary readout.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum TargetReadout {
+    /// Apply final normalization and the existing vocabulary projection.
+    #[default]
+    Logits,
+    /// Return final normalized hidden states without evaluating the vocabulary head.
+    NormalizedHidden,
+}
+
+impl TargetReadout {
+    /// Encodes invocation policy as an exact pipeline control tensor.
+    pub fn encode<T: Tensor>(self, context: &T::Context) -> Result<T, Error> {
+        T::from_i32_slice(
+            &[match self {
+                Self::Logits => 0,
+                Self::NormalizedHidden => 1,
+            }],
+            &[1],
+            context,
+        )
+    }
+
+    /// Validates and decodes one exact invocation control received at a partition.
+    pub fn decode<T: Tensor>(value: &T, context: &T::Context) -> Result<Self, Error> {
+        if value.shape() != [1] || value.element_type() != Some(eredu_nn::TensorElementType::I32) {
+            return Err(Error::backend(
+                "Nemotron-H readout control requires exact I32[1]",
+            ));
+        }
+        match value.to_i32_vec(context)?.as_slice() {
+            [0] => Ok(Self::Logits),
+            [1] => Ok(Self::NormalizedHidden),
+            _ => Err(Error::backend("invalid Nemotron-H target readout control")),
+        }
+    }
+}
+
+pub(crate) fn validate_target_embeddings<T: Tensor>(
+    tokens: &T,
+    embedded: &T,
+    width: i32,
+) -> Result<(), Error> {
+    let ids = tokens.shape();
+    let shape = embedded.shape();
+    if ids.len() != 2 || ids[0] <= 0 || ids[1] <= 0 || shape != [ids[0], ids[1], width] {
+        return Err(Error::backend("Nemotron-H supplied target embeddings must match [batch, sequence, hidden] and token geometry"));
+    }
+    Ok(())
+}
+
 /// Borrowed input selecting target execution or one MTP prediction depth.
 pub enum EmbeddedInput<'a, T> {
     /// Execute the complete target schedule.
@@ -18,6 +69,17 @@ pub enum EmbeddedInput<'a, T> {
         tokens: &'a T,
         /// Optional caller-provided attention mask.
         mask: Option<&'a T>,
+    },
+    /// Execute target layers over caller-supplied embeddings without vocabulary lookup.
+    TargetEmbedded {
+        /// Logical token identities retained for target/MTP and pipeline context.
+        tokens: &'a T,
+        /// Input hidden states shaped `[batch, sequence, hidden]`.
+        embedded: &'a T,
+        /// Optional caller-provided attention mask.
+        mask: Option<&'a T>,
+        /// Final target readout policy, propagated across pipeline boundaries.
+        readout: TargetReadout,
     },
     /// Execute exactly one appended MTP prediction group.
     Draft {
@@ -34,6 +96,21 @@ impl<'a, T> EmbeddedInput<'a, T> {
     /// Creates target-model input.
     pub const fn target(tokens: &'a T, mask: Option<&'a T>) -> Self {
         Self::Target { tokens, mask }
+    }
+
+    /// Creates supplied-embedding target input with an explicit readout policy.
+    pub const fn target_embedded(
+        tokens: &'a T,
+        embedded: &'a T,
+        mask: Option<&'a T>,
+        readout: TargetReadout,
+    ) -> Self {
+        Self::TargetEmbedded {
+            tokens,
+            embedded,
+            mask,
+            readout,
+        }
     }
 
     /// Creates one MTP draft input.

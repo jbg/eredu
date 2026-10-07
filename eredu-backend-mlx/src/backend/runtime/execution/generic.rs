@@ -270,6 +270,11 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
         sample_mlx_memory: bool,
         sample_process_memory: bool,
     ) -> Result<Self, Error> {
+        if unit_ids.len() != layout.len() {
+            return Err(Error::Parallel(
+                "residency units differ from the selected canonical execution layout".into(),
+            ));
+        }
         if unit_ids.is_empty() {
             return Err(Error::Parallel(
                 "generic MLX layerwise policy requires at least one unit".into(),
@@ -395,6 +400,11 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
     /// Returns residency reports for every semantic execution group.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
         (0..self.layout.group_count())
+            .filter(|&group| {
+                self.layout
+                    .group_range(group)
+                    .is_some_and(|range| !range.is_empty())
+            })
             .map(|group| {
                 self.execution_group(group)?
                     .report(&self.residency)
@@ -451,6 +461,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             unit_ids: self.unit_ids.clone(),
             layout: self.layout.clone(),
             window_depth: self.window_depth,
+            _static_leases: self._static_leases,
             _transfer: transfer,
         })
     }
@@ -498,6 +509,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             unit_ids: self.unit_ids.clone(),
             layout: self.layout.clone(),
             window_depth: self.window_depth,
+            _static_leases: self._static_leases,
             _transfer: transfer,
         })
     }
@@ -552,8 +564,12 @@ where
 /// Cold preparation for bounded and resident policies.
 mod preparation;
 pub use preparation::{
-    prepare_layerwise_policy, prepare_layerwise_policy_from_bindings,
-    prepare_layerwise_policy_with_bindings, prepare_layerwise_policy_with_supplementary_bindings,
+    prepare_layerwise_policy, prepare_layerwise_policy_from_addressed_bindings,
+    prepare_layerwise_policy_from_bindings, prepare_layerwise_policy_with_bindings,
+    prepare_layerwise_policy_with_supplementary_bindings,
 };
 
 mod bounded;
+
+mod selected;
+pub(crate) use selected::MlxSelectedLayerwisePolicy;

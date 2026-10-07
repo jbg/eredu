@@ -44,10 +44,8 @@ impl
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+            + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
             + eredu_architectures::prediction_extension::MaterializedPredictionTarget<
                 MlxNeuralBackend,
             > + 'static,
@@ -108,10 +106,8 @@ impl
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxPoolingAttentionState,
-            > + ReplicatedTextArchitecture<
+        A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxPoolingAttentionState>
+            + ReplicatedTextArchitecture<
                 MlxNeuralBackend,
                 MlxPoolingAttentionState,
                 Error = eredu_nn::Error,
@@ -163,7 +159,7 @@ macro_rules! impl_partitioned_prediction_binding {
                 store: Arc<dyn CheckpointSource>,
             ) -> Result<Self::Output, Self::Error>
             where
-                A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
+                A: eredu_runtime::PipelinePartitionArchitecture<
                         MlxNeuralBackend,
                         $state,
                     > + ReplicatedTextArchitecture<MlxNeuralBackend, $state, Error = eredu_nn::Error>
@@ -228,10 +224,8 @@ impl
         >,
     >
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+            + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
             + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
             + 'static,
         A::StaticModules: Clone,
@@ -258,10 +252,8 @@ impl
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+            + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
             + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
             + 'static,
         A::StaticModules: Clone,
@@ -301,10 +293,8 @@ impl
         store: Arc<dyn CheckpointSource>,
     ) -> Result<Self::Output, Self::Error>
     where
-        A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-                MlxNeuralBackend,
-                MlxHybridState,
-            > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+            + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
             + 'static,
         A::StaticModules: Clone,
         G: 'static,
@@ -336,10 +326,8 @@ pub(crate) fn bind_partitioned<A, G, F>(
     finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + 'static,
     A::StaticModules: Clone,
     G: 'static,
@@ -397,10 +385,8 @@ pub(crate) fn bind_partitioned_local<A, G, F>(
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + 'static,
     A::StaticModules: Clone,
     G: 'static,

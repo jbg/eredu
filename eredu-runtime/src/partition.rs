@@ -1493,6 +1493,13 @@ impl<G, A> ArchitecturePartition<G, A> {
         plan: &ArchitectureStatePartitionPlan,
     ) -> Result<Option<PartitionState>, ArchitectureStatePartitionError> {
         if plan.rules().is_empty() {
+            if complete
+                .layers()
+                .iter()
+                .all(|policy| matches!(policy, eredu_core::cache::LayerCachePolicy::NoState))
+            {
+                return Ok(None);
+            }
             return Err(ArchitectureStatePartitionError::EmptyPlan);
         }
 
@@ -1870,12 +1877,16 @@ impl LayeredPartitionDriver {
         M: PartitionedLayeredArchitecture<B, S>,
         M::Error: std::fmt::Display,
     {
+        let expected = self
+            .state_layout
+            .as_ref()
+            .ok_or(LayeredPartitionBeginError::MissingState { group: self.group })?;
         self.begin_with_preparation(
             architecture,
             state,
             parallel,
             context,
-            |architecture, state, expected| match observer {
+            |architecture, state, _| match observer {
                 Some(observer) => architecture.begin_partition_observed(
                     input, mask, state, expected, 0, parallel, context, observer,
                 ),
@@ -1890,7 +1901,8 @@ impl LayeredPartitionDriver {
     }
 
     /// Prepares architecture-owned request ingress and enters the selected group once.
-    /// The callback receives the exact local state layout; local state ordinals start at zero.
+    /// The callback receives the exact local state layout for a state-owning group,
+    /// or `None` for a stateless group. Local state ordinals start at zero.
     pub fn begin_with_preparation<B, S, M, F>(
         &self,
         architecture: &mut M,
@@ -1910,14 +1922,10 @@ impl LayeredPartitionDriver {
         F: FnOnce(
             &mut M,
             &mut S,
-            &StateLayout,
+            Option<&StateLayout>,
         ) -> Result<LayeredForwardState<B::Tensor, M::ForwardContext>, M::Error>,
     {
-        let expected = self
-            .state_layout
-            .as_ref()
-            .ok_or(LayeredPartitionBeginError::MissingState { group: self.group })?;
-        let mut forward = prepare(architecture, state, expected)
+        let mut forward = prepare(architecture, state, self.state_layout.as_ref())
             .map_err(LayeredPartitionBeginError::Architecture)?;
         forward.hidden = architecture
             .enter_partition_group(
@@ -2121,11 +2129,9 @@ where
         ))
     })?;
     let primary_transport = architecture.group_transport(primary_index);
-    if primary_transport.kind != crate::ArchitectureGroupKind::Decoder
-        || primary_transport.placement != crate::ArchitectureGroupPlacement::Pipeline
-    {
+    if primary_transport.placement != crate::ArchitectureGroupPlacement::Pipeline {
         return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
-            "primary execution group {primary:?} must be a pipeline decoder"
+            "primary execution group {primary:?} must have pipeline placement"
         )));
     }
     let mut declared_groups = BTreeSet::from([primary.to_owned()]);
@@ -2450,6 +2456,31 @@ mod tests {
             [],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn empty_state_plan_admits_only_stateless_architectures() {
+        let output = state_plan_partition(
+            0..4,
+            PartitionOwnership::new(true, true, std::iter::empty::<&str>()).unwrap(),
+        );
+        let plan = ArchitectureStatePartitionPlan::new([]);
+        assert!(output
+            .resolve_state_partition(&state_layout(1), &plan)
+            .unwrap()
+            .is_none());
+        let stateful = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(eredu_core::AttentionPolicy::Full, 1, 8).unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            output.resolve_state_partition(&stateful, &plan),
+            Err(ArchitectureStatePartitionError::EmptyPlan)
+        ));
     }
 
     #[test]

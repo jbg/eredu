@@ -15,9 +15,15 @@ use eredu_runtime::{
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use std::path::Path;
 
-fn prepare(path: &Path) -> RealtimePreparationPlan {
-    eredu_architectures::moshi::prepare_realtime_model(path)
-        .unwrap_or_else(|error| panic!("prepare realtime artifact {}: {error}", path.display()))
+fn prepare(path: &Path) -> MoshiPreparationPlan {
+    eredu_architectures::realtime::prepare_realtime_model(
+        &eredu_architectures::realtime::RealtimeArtifactRequest::safetensors(path),
+    )
+    .map(|artifact| match artifact {
+        eredu_architectures::realtime::PreparedRealtimeArtifact::Moshi(preparation) => preparation,
+        _ => panic!("fixture must be a Moshi-family realtime artifact"),
+    })
+    .unwrap_or_else(|error| panic!("prepare realtime artifact {}: {error}", path.display()))
 }
 
 struct SelectedTestModel {
@@ -26,7 +32,10 @@ struct SelectedTestModel {
 }
 
 type TestScheduler = RealtimeSessionScheduler<
+    RealtimeInputFrame,
     RealtimePayloadState<MlxKeyValueState, MlxTensor>,
+    eredu_core::RealtimeFrameScheduleState,
+    RealtimeSampling,
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
@@ -35,7 +44,7 @@ type TestScheduler = RealtimeSessionScheduler<
 
 fn load_selected_test_model(
     backend: MlxRealtimeExecutionContext,
-    preparation: RealtimePreparationPlan,
+    preparation: MoshiPreparationPlan,
     options: MlxLoadRequest,
 ) -> SelectedTestModel {
     let selected =
@@ -65,7 +74,10 @@ fn selected_scheduler(
             .backend
             .new_realtime_model_state(&model.model)
             .unwrap(),
-        schedule.clone(),
+        eredu_architectures::moshi::realtime_ingress_contract(model.model.execution_config())
+            .unwrap()
+            .channels()
+            .clone(),
     );
     let random = model
         .backend
@@ -74,8 +86,15 @@ fn selected_scheduler(
     scheduler
         .register(
             request,
-            RealtimeGenerationState::new(model_state, schedule, sampling, samplers, random)
-                .unwrap(),
+            RealtimeGenerationState::new(
+                model_state,
+                eredu_architectures::moshi::realtime_generation_contract(&schedule),
+                eredu_core::RealtimeFrameScheduleState::new(schedule),
+                sampling,
+                samplers,
+                random,
+            )
+            .unwrap(),
         )
         .unwrap();
     scheduler
@@ -785,6 +804,104 @@ fn portable_realtime_input_domains_are_strict_before_materialization() {
     ] {
         assert!(ingress.validate(&input).is_err());
     }
+}
+
+#[test]
+fn mixed_realtime_channels_materialize_exact_native_values() {
+    use eredu_core::{
+        RealtimeChannelCadence, RealtimeChannelDeclaration, RealtimeChannelId,
+        RealtimeChannelLayout, RealtimeChannelPayload,
+    };
+    use eredu_runtime::{RealtimeChannelValues, ValidatedRealtimeFrameInput};
+
+    let layout = RealtimeChannelLayout::new(
+        "mixed-native-frame".into(),
+        vec![
+            RealtimeChannelDeclaration {
+                id: RealtimeChannelId::new(3),
+                payload: RealtimeChannelPayload::Dense { shape: vec![2, 2] },
+                cadence: RealtimeChannelCadence {
+                    period: 1,
+                    phase: 0,
+                },
+                delay: 0,
+                feedback: vec![],
+            },
+            RealtimeChannelDeclaration {
+                id: RealtimeChannelId::new(8),
+                payload: RealtimeChannelPayload::Categorical {
+                    width: 1,
+                    cardinality: 10,
+                },
+                cadence: RealtimeChannelCadence {
+                    period: 1,
+                    phase: 0,
+                },
+                delay: 0,
+                feedback: vec![],
+            },
+        ],
+    )
+    .unwrap();
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let mut mechanism = MlxRealtimeFrameTensorMechanisms::new(&stream);
+    let input = ValidatedRealtimeFrameInput::new(
+        &layout,
+        1,
+        [
+            (
+                RealtimeChannelId::new(3),
+                RealtimeChannelValues::Dense(&[0.25, -0.5, 2.0, 3.5]),
+            ),
+            (
+                RealtimeChannelId::new(8),
+                RealtimeChannelValues::Categorical(&[7]),
+            ),
+        ],
+        [(
+            RealtimeChannelId::new(3),
+            RealtimeChannelValues::Dense(&[-1.0, 0.5, 4.0, -2.0]),
+        )],
+        true,
+    )
+    .unwrap();
+    let tensors = input.materialize(&mut mechanism).unwrap();
+    assert_eq!(tensors.channels(), &layout);
+    assert_eq!(tensors.batch(), 1);
+    assert!(tensors.retains_diagnostics());
+    let ordinary_dense = tensors.input(RealtimeChannelId::new(3)).unwrap().as_array();
+    let ordinary_category = tensors.input(RealtimeChannelId::new(8)).unwrap().as_array();
+    let forced_dense = tensors
+        .forced(RealtimeChannelId::new(3))
+        .unwrap()
+        .as_array();
+    assert_eq!(ordinary_dense.shape(), &[1, 2, 2]);
+    assert_eq!(ordinary_category.shape(), &[1, 1]);
+    assert_eq!(forced_dense.shape(), &[1, 2, 2]);
+    assert_eq!(
+        ordinary_dense
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap(),
+        vec![0.25, -0.5, 2.0, 3.5]
+    );
+    assert_eq!(
+        ordinary_category
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<i32>()
+            .unwrap(),
+        vec![7]
+    );
+    assert_eq!(
+        forced_dense
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap(),
+        vec![-1.0, 0.5, 4.0, -2.0]
+    );
 }
 
 fn required_fixture_array<'a>(

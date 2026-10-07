@@ -21,12 +21,15 @@ pub mod capture;
 pub mod communication;
 /// Typed multimodal component graphs and residency accounting.
 pub mod component;
+mod component_pipeline;
 /// Mechanism-only selection contracts for composite model input.
 pub mod composite;
 /// Backend-neutral sequential prediction decisions and layered handoff.
 pub mod decision;
 /// Backend-neutral dense-stream residency telemetry.
 pub mod dense;
+/// Dense draws and Gumbel selection sharing the ordinary retained random stream.
+pub mod dense_sampling;
 /// Bounded observations of detached native work and its retained resources.
 pub mod detached_resources;
 /// Backend-neutral speculative-state fork, commit, and rollback ownership.
@@ -44,6 +47,8 @@ pub mod execution_topology;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
+/// Explicitly seeded host randomness with retained, clonable generator state.
+pub mod host_random;
 /// Backend-neutral ownership of prepared multimodal tensors.
 pub mod input;
 /// Explicit prepared-input copy admission.
@@ -53,6 +58,9 @@ pub mod inspection;
 pub mod intervention;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
+/// Shared access to existing resident and bounded layered invocations.
+pub mod layered_invocation;
+pub mod layered_partition;
 /// Normalized portable policy for cold model preparation.
 pub mod load_request;
 /// Physical storage descriptions and retention facts for reusable mechanisms.
@@ -68,11 +76,26 @@ pub mod memory_forecast;
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
+/// Physical rank-local parameter-layout lowering.
+pub mod parameter_layout;
 pub mod parameter_operations;
 /// Backend-neutral rank-local architecture ownership.
 pub mod partition;
 /// Rank-local graph execution over opaque communication resources.
 pub mod partitioned_execution;
+mod pipeline_executor;
+/// Bounded agreement and owner publication for architecture-owned replicated transitions.
+pub mod replicated_execution;
+mod tensor_wave;
+pub use component_pipeline::{
+    validate_component_pipeline, validate_component_pipeline_ranges, PipelineBindingError,
+};
+pub use pipeline_executor::{
+    validate_pipeline_local_agreement, PipelineLocalAgreementError,
+    OrdinaryPipelinePartitionUnitStrategy, PartitionTensorAllocator, PipelinePartitionArchitecture,
+    PipelinePartitionExecutor, PipelinePartitionUnitStrategy, ResidentPipelinePartitionPass,
+};
+pub use tensor_wave::{RoutedTensorDimension, RoutedTensorReduction, RoutedTensorReductions};
 pub mod placement;
 /// Ordinary embedded prediction invocation and storage descriptions.
 pub mod prediction_resources;
@@ -86,6 +109,12 @@ pub mod processor_resources;
 pub mod projection_memory;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
 pub mod realtime;
+/// Mixed categorical and dense host frame admission.
+pub mod realtime_channel_ingress;
+/// Channel-attributed categorical and dense completed frame outputs.
+pub mod realtime_completed;
+/// Exact immutable frame policy and canonical admission descriptors.
+pub mod realtime_contract;
 /// Complete family-blind realtime frame coordination.
 pub mod realtime_executor;
 /// Portable realtime input validation before opaque token materialization.
@@ -189,6 +218,9 @@ pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
 };
+pub use dense_sampling::{
+    DenseSamplingBackend, DenseSamplingError, DenseSamplingPolicyError, GumbelTruncation,
+};
 pub use draft::{execute_draft_group, DraftGroupExecutionError, DraftStateTransaction};
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupSchedule,
@@ -223,6 +255,7 @@ pub use generation::{
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
     TokenDomain,
 };
+pub use host_random::HostRandomState;
 pub use input::{
     PreparedInputCacheIdentity, PreparedInputCacheIdentityError, PreparedInputInspector,
     PreparedInputPart, PreparedInputPayload, PreparedModelInput,
@@ -235,13 +268,18 @@ pub use inspection::{
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
     ArchitectureMergeDestination, ArchitectureParallelSubgroup, ArchitectureParameters,
-    CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, LayeredPipelineSchedule, LayeredPipelineScheduleError,
-    LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction, LayerwiseAcquireError,
-    LayerwisePolicy, LayerwisePolicyForward, LayerwiseRuntime, LayerwiseRuntimeError,
-    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, PartitionedLayeredArchitecture,
-    ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
-    StaticParameterVisitor, StaticParameterVisitorMut,
+    CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredLocalPhase,
+    LayeredPartitionInput, LayeredPartitionOutput, LayeredPipelineSchedule,
+    LayeredPipelineScheduleError, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
+    LayerwiseAcquireError, LayerwisePolicy, LayerwisePolicyForward, LayerwiseRuntime,
+    LayerwiseRuntimeError, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    PartitionedLayeredArchitecture, ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError,
+    ResidentUnitsError, RoutedLayeredArchitecture, StaticParameterVisitor,
+    StaticParameterVisitorMut,
+};
+pub use layered_invocation::{LayeredInvocation, ParallelLayeredInvocation};
+pub use layered_partition::{
+    LayerwisePartitionConstructionError, LayerwisePartitionRuntime, LayerwisePartitionRuntimeError,
 };
 pub use load_request::{
     DraftingLoadRequest, NormalizedLoadRequest, NormalizedLoadRequestError, ParallelLoadRequest,
@@ -272,6 +310,9 @@ pub use parameter::{
     ParameterBatchBudget, ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding,
     RecipeBindingError, SelectedBindingPlan,
 };
+pub use parameter_layout::{
+    derive_partitioned_group_layout, derive_partitioned_local_layout, retained_partition_layout,
+};
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
     ArchitectureBoundaryValue, ArchitectureParameterDescription, ArchitectureParameterError,
@@ -301,20 +342,35 @@ pub use placement::{
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{
     RealtimeCompletionAttachmentError, RealtimeFrameExecutionError, RealtimeFrameTransition,
-    RealtimeGenerationBranch, RealtimeGenerationState, RealtimeGenerationTransactionError,
+    RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
+    RealtimeGenerationTransactionError, RealtimeRandomStateTransactionError, RealtimeScheduleState,
+    RealtimeSnapshotError,
+};
+pub use realtime_channel_ingress::{
+    validate_completed_realtime_host_frame, RealtimeChannelIngressError, RealtimeChannelValues,
+    RealtimeHostChannelValues, ValidatedRealtimeChannels, ValidatedRealtimeFrameInput,
+};
+pub use realtime_completed::{
+    CompletedRealtimeFrame, RealtimeCompletedFrameError, RealtimeFrameChannel,
+};
+pub use realtime_contract::{
+    RealtimeFrameContract, RealtimeFrameContractError, RealtimeScheduleDescriptor,
 };
 pub use realtime_executor::{
-    execute_realtime_frame, PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame,
-    RealtimeCompletionCreationError, RealtimeDecisionExecution, RealtimeFrameCompletionMechanism,
-    RealtimeFrameCoordinatorError, RealtimeFrameHostObserver, RealtimeHostOutputUnavailable,
-    RealtimePrepublicationError, SubmittedRealtimeFrame,
+    execute_realtime_frame, submit_realtime_output, MappedRealtimeFrameHostObserver,
+    PreparedRealtimeFrameExecutor, PrepublicationRealtimeFrame, RealtimeCompletionCreationError,
+    RealtimeCompletionMechanism, RealtimeDecisionExecution, RealtimeFrameCoordinatorError,
+    RealtimeFrameHostObserver, RealtimeFrameResources, RealtimeHostOutputMappingError,
+    RealtimeHostOutputUnavailable, RealtimeOutputSubmissionError, RealtimePrepublicationError,
+    SubmittedRealtimeFrame,
 };
 pub use realtime_ingress::{
-    MaterializedRealtimeInput, RealtimeHostTokenMaterializer, RealtimeIngressContract,
-    RealtimeIngressError, RealtimePayloadKind, RealtimeTokenKind, ValidatedRealtimeInput,
+    MaterializedRealtimeInput, RealtimeHostFrameMaterializer, RealtimeHostTokenMaterializer,
+    RealtimeIngressContract, RealtimeIngressError, RealtimePayloadKind, RealtimeTokenKind,
+    ValidatedRealtimeInput,
 };
 pub use realtime_interpreter::{
-    complete_realtime_frame, prepare_realtime_frame, CompletedRealtimeFrame, PreparedRealtimeFrame,
+    complete_realtime_frame, prepare_realtime_frame, PreparedRealtimeFrame,
     RealtimeFrameInterpretationError, RealtimeFrameTensorMechanisms,
 };
 pub use realtime_mechanism_synthesis::{
@@ -351,8 +407,8 @@ pub use realtime_session::{
     RealtimeHistoryGeneration, RealtimeModelOwnerIdentity, RealtimeModelSessionIdentity,
     RealtimeSamplingReplacementError, RealtimeSamplingUpdateError, RealtimeSessionBranch,
     RealtimeSessionError, RealtimeSessionExecutionError, RealtimeSessionIncarnation,
-    RealtimeSessionScheduler, RealtimeSessionState, RealtimeSessionTransactionError,
-    ReleasedRealtimeSession,
+    RealtimeSessionInput, RealtimeSessionScheduler, RealtimeSessionState,
+    RealtimeSessionTransactionError, ReleasedRealtimeSession,
 };
 pub use replicated_session::{
     construct_replicated_text_session, construct_replicated_text_session_with_execution,

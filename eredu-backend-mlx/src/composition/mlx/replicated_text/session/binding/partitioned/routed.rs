@@ -17,7 +17,7 @@ pub(crate) fn bind_partitioned_routed<A, S, G, F>(
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,
@@ -69,10 +69,8 @@ pub(super) fn bind_retained_partitioned_routed_prediction<A, G, P>(
     weights_stream: &Stream,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        > + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, MlxHybridState>
+        + ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
         + 'static,
     A::StaticModules: Clone,
@@ -160,7 +158,7 @@ fn partition_bank_mechanisms<A, S, G>(
 >
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,
@@ -229,7 +227,7 @@ fn bind_selected_partition_provider<A, S, G, Provider, F>(
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,
@@ -274,7 +272,7 @@ pub(crate) fn bind_partitioned_routed_with_provider<A, S, G, Provider, F>(
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,
@@ -390,7 +388,7 @@ pub(super) fn bind_partitioned_routed_local_with_provider<A, S, G, Provider, F>(
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
-    A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<MlxNeuralBackend, S>
+    A: eredu_runtime::PipelinePartitionArchitecture<MlxNeuralBackend, S>
         + ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, S>
         + 'static,

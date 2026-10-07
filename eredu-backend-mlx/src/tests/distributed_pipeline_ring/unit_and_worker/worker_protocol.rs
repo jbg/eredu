@@ -426,7 +426,7 @@ fn pipeline_ring_worker() {
                 let description =
                     eredu_architectures::k2_horizon::parameter_description(&args).unwrap();
                 let layout =
-                    eredu_architectures::partitioned_execution::derive_partitioned_local_layout(
+                    eredu_runtime::derive_partitioned_local_layout(
                         &description,
                         topology,
                     )

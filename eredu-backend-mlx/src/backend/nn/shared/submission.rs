@@ -828,13 +828,18 @@ impl BroadcastBackend for MlxNeuralBackend {
         let input = value.into_array();
         #[cfg(test)]
         trace_partition_collective("broadcast", &input, group, &format!("root={root}"));
-        validate_communication_tensor(&input, MlxCommunicationDtypes::Floating)?;
+        validate_communication_tensor(&input, MlxCommunicationDtypes::FloatingAndI32)?;
         // Preserve every rank's lazy predecessor graph in the submitted event.
         // A zero-valued expression keeps non-roots in the same dependency order
         // without performing an unbounded host synchronization before returning
         // the exact communication completion.
         let contribution = if group.rank() == root {
             input.clone()
+        } else if input.dtype() == Dtype::Int32 {
+            // Integer control values remain exact, including values outside the
+            // F32 mantissa and both signed extrema. Every nonowner contributes
+            // typed zero without dropping its predecessor dependency.
+            input.multiply(Array::from_slice(&[0_i32], &[]), executor)?
         } else {
             input.multiply(Array::from_f32(0.0), executor)?
         };
