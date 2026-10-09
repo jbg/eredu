@@ -674,6 +674,42 @@ implementation/benchmark patches, hashes, commands, binary, timings, events, WAV
 and quality comparisons. The benchmark-only bypass and on-load quantization edits
 are restored to their implementation hashes; no bypass flag is retained in source.
 
+Resident serial-group execution uses the caller's executor and defers group
+submissions to the surrounding forward completion. Eligibility is portable:
+every group must lie on one dependency chain, and the parameter policy must
+explicitly guarantee retained unit storage. Branched graphs, bounded policies
+and parallel execution retain exact group submission boundaries. Unit and group
+hooks, policy completion/abort, candidate state and final publication still use
+the shared drivers; no runtime feature flag controls this mechanism.
+
+With the accepted combined precision and cached perception positions, complete
+serial PCM conversation measurements on the same M3 Ultra use 386 warmed frames:
+
+| Resident chain comparison | Mean 80 ms frame | p95 frame |
+| --- | ---: | ---: |
+| Preserved control before | 113.287 ms | 118.458 ms |
+| Deferred resident chain | 98.345 ms | 102.575 ms |
+| Preserved control after | 113.219 ms | 118.545 ms |
+
+Against the faster control, batching saves 14.874 ms/frame (13.14%). Throughput
+is 0.813 times realtime, real-time factor is 1.229, and the remaining mean gap
+is 18.345 ms; another 18.65% reduction is needed to reach 80 ms without scheduling
+headroom. All 386 warmed intervals still miss the deadline. All 1,418 semantic
+events and the complete accepted WAV bytes match, with SHA-256
+`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
+The neutral resident-chain regression checks repeated values, state and group
+order against ordinary execution, eliminates intermediate submissions, and
+preserves branched scheduling. Pinned MoG resident/bounded numerical parity and
+selected-bank failure/RNG retry coverage pass. Six native VoiceChat lifecycle
+tests cover preparation and frame failure/unwind, retained owners, host delivery,
+virtual continuation and publication. The explicit Metal mixed-precision test
+confirms controlled and scheduled cached publication parity. The Metal/audio
+release build passes. External `/private/tmp/eredu-completion-optimisation` retains the report,
+reproduction scripts, binary hashes, exact benchmark and implementation patches,
+logs, complete events and WAVs. All seven temporary on-load quantization source
+edits match their implementation hashes after the build. This measures offline
+serial inference; live audio scheduling and echo cancellation are not measured.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover

@@ -179,6 +179,18 @@ where
     type Lease = MlxSelectedUnitLease<U>;
     type Error = Error;
 
+    fn permits_deferred_serial_groups(&self) -> bool {
+        let Ok(policy) = self.inner.lock() else {
+            return false;
+        };
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.permits_deferred_serial_groups()
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { .. } => false,
+        }
+    }
+
     fn resident_parameters_available(&self) -> bool {
         let Ok(policy) = self.inner.lock() else {
             return false;

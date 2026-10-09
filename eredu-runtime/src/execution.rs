@@ -268,6 +268,19 @@ pub enum ExecutionUnitLayoutError {
 }
 
 impl ExecutionGraph {
+    /// Whether every group lies on one dependency chain ending at the output.
+    pub(crate) fn is_serial_chain(&self) -> bool {
+        let mut previous = None;
+        for &group in &self.execution_order {
+            let expected = previous.as_slice();
+            if self.dependencies[group] != expected {
+                return false;
+            }
+            previous = Some(group);
+        }
+        previous == Some(self.output)
+    }
+
     /// Validates names, dependency references, acyclicity, and output reachability.
     pub fn new(
         groups: Vec<ExecutionGroupSpec>,

@@ -2122,6 +2122,14 @@ where
     /// Concrete acquisition or completion failure.
     type Error;
 
+    /// Allows dependent groups in a serial graph to remain lazy on the caller's
+    /// executor. All unit parameters remain owned through the surrounding
+    /// forward completion; returning a unit lease does not evict its storage.
+    /// The policy preserves ordinary completion and abort retention guarantees.
+    fn permits_deferred_serial_groups(&self) -> bool {
+        false
+    }
+
     /// Whether every bound unit is idle and can be visited without materialization.
     fn resident_parameters_available(&self) -> bool {
         false
@@ -3105,6 +3113,8 @@ where
     {
         let graph = <A as LayeredArchitecture<B, S2>>::execution_graph(&self.architecture)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        let deferred_serial =
+            self.policy.permits_deferred_serial_groups() && graph.is_serial_chain();
         let counts = (0..graph.groups().len())
             .map(|group| {
                 <A as LayeredArchitecture<B, S2>>::group_unit_count(&self.architecture, group)
@@ -3112,16 +3122,13 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+        if !deferred_serial && self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
             self.executors = Some(
                 B::fork_executors(context, graph.groups().len())
                     .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
             );
         }
-        let executors = self
-            .executors
-            .as_ref()
-            .expect("layered runtime initialized its executor cache");
+        let executors = self.executors.as_ref();
         let forward = if hook.observes_activations() {
             <A as LayeredArchitecture<B, S2>>::begin_forward_observed(
                 &mut self.architecture,
@@ -3142,7 +3149,7 @@ where
             )
         }
         .map_err(LayerwiseRuntimeError::Architecture)?;
-        let initial_completion = (graph.groups().len() > 1)
+        let initial_completion = (!deferred_serial && graph.groups().len() > 1)
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
             .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
@@ -3155,7 +3162,11 @@ where
         let mut completions: Vec<Option<B::Completion>> =
             (0..graph.groups().len()).map(|_| None).collect();
         for &group in graph.execution_order() {
-            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            let executor = if deferred_serial {
+                context
+            } else {
+                std::borrow::Borrow::borrow(&executors.expect("initialized graph executors")[group])
+            };
             let group_dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group");
@@ -3165,7 +3176,7 @@ where
                         .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
                 }
             }
-            for &dependency in group_dependencies {
+            for &dependency in group_dependencies.iter().filter(|_| !deferred_serial) {
                 B::order_after(
                     completions[dependency]
                         .as_ref()
@@ -3317,7 +3328,7 @@ where
             hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
-            if graph.groups().len() > 1 {
+            if !deferred_serial && graph.groups().len() > 1 {
                 completions[group] = Some(
                     B::submit(
                         executor,
@@ -4247,6 +4258,10 @@ where
 {
     type Lease = ResidentUnitLease<U>;
     type Error = ResidentUnitWindowError;
+
+    fn permits_deferred_serial_groups(&self) -> bool {
+        true
+    }
 
     fn begin(
         &mut self,

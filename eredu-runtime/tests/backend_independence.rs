@@ -7402,6 +7402,7 @@ impl Parameterized<FakeTensor> for FakeUnit {
 }
 
 struct GroupedFixture {
+    serial: bool,
     static_modules: FakeOperator,
     trace: Vec<(usize, usize)>,
 }
@@ -7483,15 +7484,10 @@ impl ArchitectureParameters<FakeBackend> for GroupedFixture {
         &self,
         _: &(),
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
-            ],
-            "text",
-        )
-        .map_err(Error::backend)?;
+        let graph = <Self as LayeredArchitecture<
+            FakeBackend,
+            DeviceState<FakeBackend, FakeLayerState>,
+        >>::execution_graph(self)?;
         let layout = ExecutionUnitLayout::new(&graph, [1, 1, 2]).map_err(Error::backend)?;
         ArchitectureParameterDescription::new(&graph, &layout, [], []).map_err(Error::backend)
     }
@@ -7567,11 +7563,19 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
         ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::root("audio"),
-                ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
-            ],
+            if self.serial {
+                vec![
+                    ExecutionGroupSpec::root("vision"),
+                    ExecutionGroupSpec::with_dependencies("audio", ["vision"]),
+                    ExecutionGroupSpec::with_dependencies("text", ["audio"]),
+                ]
+            } else {
+                vec![
+                    ExecutionGroupSpec::root("vision"),
+                    ExecutionGroupSpec::root("audio"),
+                    ExecutionGroupSpec::with_dependencies("text", ["vision", "audio"]),
+                ]
+            },
             "text",
         )
         .map_err(Error::backend)
@@ -7670,6 +7674,15 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
         _: &mut Self::ForwardContext,
         _: &(),
     ) -> Result<FakeTensor, Self::Error> {
+        if self.serial {
+            return if group == 0 && dependencies.is_empty() {
+                Ok(FakeTensor(vec![10]))
+            } else if dependencies.len() == 1 {
+                Ok(dependencies[0].clone())
+            } else {
+                Err(Error::backend("invalid serial dependency inputs"))
+            };
+        }
         if initial.0.len() == 3 {
             return match group {
                 0 if dependencies.is_empty() => Ok(FakeTensor(vec![initial.0[1]])),
@@ -7851,6 +7864,7 @@ fn partition_extension_uses_stable_groups_ownership_and_boundary_schema() {
     type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
 
     let mut architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8044,6 +8058,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8084,6 +8099,74 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     );
     assert_eq!(SUBMIT_COUNT.get(), 8);
     assert_eq!(ORDER_COUNT.get(), 10);
+}
+
+#[test]
+fn resident_serial_groups_preserve_values_and_state_without_intermediate_submissions() {
+    let run = |deferred, serial| {
+        FORK_COUNT.set(0);
+        SUBMIT_COUNT.set(0);
+        ORDER_COUNT.set(0);
+        let policies = (0..4)
+            .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+            .collect();
+        let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
+        let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
+            Ok::<_, Infallible>(FakeLayerState(0))
+        })
+        .unwrap();
+        let units = [0, 10, 20, 21]
+            .into_iter()
+            .map(|marker| FakeUnit { marker })
+            .collect();
+        let architecture = GroupedFixture {
+            serial,
+            static_modules: FakeOperator,
+            trace: Vec::new(),
+        };
+        let (first, second, trace) = if deferred {
+            let mut runtime = LayerwiseRuntime::<_, FakeBackend, _, _>::new(
+                architecture,
+                eredu_runtime::ResidentUnitWindow::new(units),
+            );
+            let first = runtime.forward(None, &mut state, &()).unwrap();
+            let second = runtime.forward(None, &mut state, &()).unwrap();
+            (first, second, runtime.architecture().trace.clone())
+        } else {
+            let mut runtime = LayerwiseRuntime::<_, FakeBackend, _, _>::new(
+                architecture,
+                RecordingPolicy::new(units),
+            );
+            let first = runtime.forward(None, &mut state, &()).unwrap();
+            let second = runtime.forward(None, &mut state, &()).unwrap();
+            (first, second, runtime.architecture().trace.clone())
+        };
+        (
+            first,
+            second,
+            trace,
+            state
+                .as_ref()
+                .iter()
+                .map(|layer| layer.0)
+                .collect::<Vec<_>>(),
+            (FORK_COUNT.get(), SUBMIT_COUNT.get(), ORDER_COUNT.get()),
+        )
+    };
+    let ordinary = run(false, true);
+    let deferred = run(true, true);
+    assert_eq!(ordinary.0, FakeTensor(vec![10, 0, 10, 20, 21]));
+    assert_eq!(deferred.0, ordinary.0);
+    assert_eq!(deferred.1, ordinary.1);
+    assert_eq!(deferred.2, ordinary.2);
+    assert_eq!(ordinary.3, vec![0, 0, 2, 2]);
+    assert_eq!(deferred.3, ordinary.3);
+    assert_eq!(ordinary.4, (1, 8, 8));
+    assert_eq!(deferred.4, (0, 0, 0));
+    let branched = run(true, false);
+    assert_eq!(branched.0, FakeTensor(vec![30, 20, 21]));
+    assert_eq!(branched.3, vec![0, 0, 2, 2]);
+    assert_eq!(branched.4, (1, 8, 10));
 }
 
 fn prepared_composite_input(image: i32) -> PreparedModelInput<FakeTensor> {
@@ -8232,6 +8315,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
         LayerWeightResidency::LayerwiseHost(Default::default()),
     ] {
         let architecture = GroupedFixture {
+            serial: false,
             static_modules: FakeOperator,
             trace: Vec::new(),
         };
@@ -8424,6 +8508,7 @@ fn production_composite_input_reuses_the_shared_session_lifecycle() {
 #[test]
 fn composite_prepared_parts_drive_dependency_group_output() {
     let architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8460,6 +8545,7 @@ fn composite_prepared_parts_drive_dependency_group_output() {
 fn layerwise_runtime_aborts_active_lease_and_forward_after_observer_error() {
     let mut state = fixture_state();
     let architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8497,6 +8583,7 @@ fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
     })
     .unwrap();
     let architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8644,6 +8731,7 @@ fn fixture_state() -> DeviceState<FakeBackend, FakeLayerState> {
 #[test]
 fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     let resident_architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -8680,6 +8768,7 @@ fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
     );
 
     let layerwise_architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };
@@ -9302,6 +9391,7 @@ fn distributed_prompt_cache_and_manual_rollback_never_reuse_a_commit_epoch() {
 #[test]
 fn parameter_unit_loans_preserve_semantic_addresses_and_forward_order() {
     let architecture = GroupedFixture {
+        serial: false,
         static_modules: FakeOperator,
         trace: Vec::new(),
     };

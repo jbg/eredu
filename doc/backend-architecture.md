@@ -2540,6 +2540,15 @@ terminates the process nor waits for native work in destructors. Unobservable
 work stays owned and its affected execution resources remain unavailable.
 Terminal proof and reclamation are distinct: bounded native scope progress
 publishes completion without destroying arbitrary primitive or group owners.
+Portable layered execution runs a strict dependency chain on the caller's
+executor when its parameter policy explicitly permits deferred serial groups.
+Resident policies retain every unit's parameter storage until the surrounding
+forward completes, so these groups need no intermediate submit/event boundaries.
+Unit acquisition, completion, abort and semantic group hooks remain in use.
+Branched graphs, bounded policies and parallel execution retain independently
+schedulable group executors and exact group submissions. The MLX realization
+reports the generic resident policy fact; it contains no family equations or
+graph-specific selection.
 Ordinary owner-thread native operations reclaim terminal records outside the
 registry lock; a departed owner thread cannot be replaced by a recycled thread
 identifier. Rust recovery tries the runtime lock without waiting and retains

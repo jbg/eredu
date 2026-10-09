@@ -103,6 +103,10 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
     type Lease = MlxResidentUnit<U>;
     type Error = Error;
 
+    fn permits_deferred_serial_groups(&self) -> bool {
+        true
+    }
+
     fn publish_parameter_replacements(
         &mut self,
         values: &std::collections::BTreeMap<String, MlxTensor>,
