@@ -38,9 +38,7 @@ pub(crate) struct TestKeys {
 #[cfg(test)]
 impl TestKeys {
     pub(crate) fn with_seed(seed: u64) -> Result<Self> {
-        Ok(Self {
-            key: key(seed)?,
-        })
+        Ok(Self { key: key(seed)? })
     }
 
     pub(crate) fn next_key(&mut self, stream: impl AsRef<Stream>) -> Result<Array> {
@@ -634,5 +632,4 @@ mod tests {
         let expected = Array::from_slice(&[16, 3, 14, 10, 17, 7, 6, 8, 12, 8], &[5, 2]);
         assert_array_eq!(result, expected, 0.01, stream = stream);
     }
-
 }

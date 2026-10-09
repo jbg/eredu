@@ -365,5 +365,4 @@ mod tests {
         assert_eq!(irfftn.dtype(), Dtype::Float32);
         assert_eq!(crate::array::eval_vec::<f32>(&irfftn), RFFTN_DATA);
     }
-
 }

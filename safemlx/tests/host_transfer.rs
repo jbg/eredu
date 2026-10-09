@@ -1,8 +1,7 @@
 use safemlx::{
     host_transfer_capacity_upper_bound, host_transfer_memory_stats, memory,
     reset_host_transfer_peak_memory, transforms::async_eval_with_event, Array, Device, DeviceType,
-    Dtype, EventBackend, HostTransferBuffer, HostTransferPolicy, HostTransferStorageKind,
-    Stream,
+    Dtype, EventBackend, HostTransferBuffer, HostTransferPolicy, HostTransferStorageKind, Stream,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 

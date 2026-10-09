@@ -83,8 +83,6 @@ fn test_bar() {
         stream = &stream
     );
     assert_eq!(result, 10);
-
-
 }
 
 // Test named mandatory arguments.

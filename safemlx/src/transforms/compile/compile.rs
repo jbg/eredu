@@ -942,7 +942,7 @@ fn call_mut_inner(
             fun_id,
             shapeless,
             constants.as_ptr(),
-            0,
+            constants.len(),
         )
     })?;
 

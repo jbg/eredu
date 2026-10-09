@@ -832,5 +832,4 @@ mod tests {
         let a = crate::random::normal::<f32>(&[3, 5, 5], None, None, &key, &stream).unwrap();
         check_eigs_and_vecs(&a, &stream);
     }
-
 }

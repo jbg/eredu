@@ -55,8 +55,6 @@ fn test_ops_factory_arange() {
     let data: Vec<f32> = common::eval_vec(&array);
     let expected: Vec<f32> = (1..50).step_by(2).map(|x| x as f32).collect();
     assert_eq!(data, expected);
-
-
 }
 
 // Test functions defined in `safemlx::fft` module.
