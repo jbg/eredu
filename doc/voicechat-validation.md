@@ -758,6 +758,64 @@ report, exact benchmark and implementation patches, binaries and hashes, complet
 logs, events and WAVs. All seven temporary on-load quantization source edits
 match their implementation hashes after the build.
 
+Full-conversation backbone projection comparisons retain native affine 8-bit
+weights. The historical intrusive profile identifies 16.096 ms GPU/frame in 27
+Mamba input projections and 16.709 ms in 25 dense MLP blocks, including their
+normalization, activation and residual work. The 32.805 ms union identifies a
+candidate subset; it is not a promised saving or a current shader-duration
+measurement.
+
+The same pinned checkpoint, corpus and accepted combined precision execute 396
+live frames, with 386 warmed intervals after discarding the first ten. Each run
+executes the complete conversation across successive model weights and cached
+states. Loading and prefill are excluded; hot single-projection replay is not
+used to select an implementation. Six generic packed-matvec layouts compare
+indexed and pointer-based traversal, each with 8/16/32 output rows per 64-thread
+group. Ordered F32 affine arithmetic is retained, and aligned native fast paths
+remain selected. Three precision configurations replace selected Q8 source
+weights with F16 weights using F32 projection arithmetic; normalization and
+recurrent accumulation remain F32.
+
+| Backbone comparison | Mean 80 ms frame | p95 frame |
+| --- | ---: | ---: |
+| Native steady controls, range | 88.278–88.478 ms | 92.349–93.016 ms |
+| Indexed rows 8 / 16 / 32 | 108.680 / 89.453 / 90.315 ms | 113.623 / 93.586 / 94.540 ms |
+| Indexed rows 8 repeat | 108.694 ms | 113.767 ms |
+| Pointer rows 8 / 16 / 32 | 88.687 / 88.998 / 89.757 ms | 92.931 / 93.297 / 94.074 ms |
+| F16 Mamba input weights | 91.900 ms | 96.105 ms |
+| F16 dense MLP up/down weights | 93.082 ms | 97.117 ms |
+| Both F16 selections | 96.436 ms | 100.368 ms |
+
+None improves complete-conversation latency. An initial same-binary dense
+control measures 108.284 ms, whereas its repeated unchanged configuration
+measures 88.369 ms. The cause is unmeasured; that initial control is not used to
+claim an optimization gain. Native throughput remains approximately 0.904–0.906
+times realtime, with an 8.278–8.478 ms mean gap and another 9.38–9.58% reduction
+required to reach 80 ms without scheduling headroom. All 386 warmed intervals
+miss the deadline in every configuration. No live audio scheduling measurement
+or isolated kernel attribution is implied.
+
+All six packed layouts, the repeated indexed layout, and the input-only and
+MLP-only F16 selections preserve all 1,418 semantic events and the complete
+accepted WAV bytes. The combined F16 selection changes the answer to
+“the sky appears blue due to a phenomenon called Rayleigh scattering,” producing
+1,421 events and different audio. First lexical divergence is at invocation 162,
+12,880 ms audio. Its longer wording changes the workload, so the combined timing
+does not isolate precision overhead. Retained backbone binding requests are
+10,005,583,872 bytes for Q8, 12,403,494,912 for F16 inputs, 13,078,863,872 for F16
+MLPs, and 15,476,774,912 for both. These are parameter binding bytes, not measured
+GPU traffic or total process memory.
+
+Both generic kernel implementations pass focused Metal numerical comparisons
+against native bit patterns and independent dequantized expectations, including
+strided activations, nonzero affine companions and partial reduction tails.
+External `/private/tmp/eredu-backbone-projections` retains `REPORT.md`,
+`comparison.json`, pinned binary hashes, exact source/benchmark patches,
+reproduction scripts, build/test logs, full event streams and WAVs. Restoration
+manifests confirm all temporary source edits are restored. The production tree
+contains neither these candidate kernels nor their experiment flags; native
+8-bit selection and existing architecture/backend ownership remain unchanged.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover
