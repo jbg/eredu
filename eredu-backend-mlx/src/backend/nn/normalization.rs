@@ -92,7 +92,7 @@ pub(crate) fn f32_weightless_rms(
 }
 
 /// Fuses ordered reduction, normalization and optional learned gain.
-/// One lane reduces each row, then its group applies the gain in parallel.
+/// Independent cascade chains and gain application run in parallel per row.
 /// Group and offset semantics come from the neutral normalization specification.
 pub(crate) fn f32_grouped_rms(
     input: &Array,
@@ -149,12 +149,9 @@ pub(crate) fn f32_grouped_rms(
                     uint row = threadgroup_position_in_grid.x;
                     uint lane = thread_position_in_threadgroup.x;
                     size_t base = size_t(row) * WIDTH;
-                    threadgroup float inverse;
-                    if (lane == 0) {
-                        float variance = cascade_sum_f32(squared + base, WIDTH) / float(WIDTH);
-                        inverse = 1.0f / metal::precise::sqrt(variance + scalars[0]);
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    float sum = parallel_cascade_sum_f32(squared + base, WIDTH, lane);
+                    float variance = sum / float(WIDTH);
+                    float inverse = 1.0f / metal::precise::sqrt(variance + scalars[0]);
                     size_t gain_base = size_t(row % GROUPS) * WIDTH;
                     for (uint i=lane; i<WIDTH; i+=32) {
                         // Keep the F32 product boundary before applying gain.
@@ -238,6 +235,62 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn parallel_cascade_matches_cpu_addition_order_at_carries_and_tails() {
+        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let gpu = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        // Cover partial vectors/chains and carries into all three upper levels.
+        for width in [1, 7, 17, 255, 257, 4095, 4097, 65537] {
+            let values = (0..3 * width)
+                .map(|i| {
+                    let signed = ((i * 37 % 103) as f32 - 51.0) / 13.0;
+                    signed * 2.0_f32.powi((i % 19) as i32 - 9)
+                })
+                .collect::<Vec<_>>();
+            let input = Array::from_slice(&values, &[3, width as i32]);
+            let expected = input
+                .sum_axes(&[-1], true, &cpu)
+                .unwrap()
+                .into_evaluated()
+                .unwrap();
+            use safemlx::fast::{CustomKernelConfig, MetalKernel};
+            let kernel = MetalKernel::new(
+                "parallel_cascade_parity",
+                ["input"],
+                ["output"],
+                "uint row = threadgroup_position_in_grid.x; uint lane = thread_position_in_threadgroup.x; float sum = parallel_cascade_sum_f32(input + size_t(row) * WIDTH, WIDTH, lane); if (lane == 0) output[row] = sum;",
+                include_str!("rms_cascade.metal"),
+                true,
+                false,
+            ).unwrap();
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int("WIDTH", width as i32)
+                .with_grid([3 * 32, 1, 1])
+                .with_thread_group([32, 1, 1])
+                .with_output_arg([3, 1], Dtype::Float32);
+            let actual = kernel
+                .apply_device([&input], &config, &gpu)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into_evaluated()
+                .unwrap();
+            assert_eq!(
+                actual
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .as_slice::<f32>()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                "width {width}"
+            );
         }
     }
 

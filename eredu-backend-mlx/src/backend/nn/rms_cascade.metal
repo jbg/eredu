@@ -66,3 +66,65 @@ inline float cascade_sum_f32(Pointer values, size_t size) {
   }
   return sum;
 }
+
+// Sixteen independent chains preserve the CPU cascade's FP32 addition order.
+// A 32-thread SIMD group exchanges chains without changing the merge tree.
+template <typename Pointer>
+inline float parallel_cascade_sum_f32(Pointer values, size_t size, uint lane_id) {
+  constexpr size_t lanes = 4;
+  constexpr size_t parallel = 4;
+  const size_t vectors = size / lanes;
+  const size_t steps = vectors / parallel;
+  size_t ceil_log = 0;
+  for (size_t n = steps > 0 ? steps - 1 : 0; n; n >>= 1) {
+    ++ceil_log;
+  }
+  const size_t power = metal::max(size_t(4), ceil_log / 4);
+  const size_t chunk = size_t(1) << power;
+  float partial = 0;
+  if (lane_id < parallel * lanes) {
+    const size_t p = lane_id / lanes;
+    const size_t lane = lane_id % lanes;
+    float sums[4] = {};
+    size_t i = 0;
+    for (; i + chunk <= steps;) {
+      for (size_t end = i + chunk; i < end; ++i) {
+        sums[0] += values[(i * parallel + p) * lanes + lane];
+      }
+      for (size_t level = 1; level < 4; ++level) {
+        sums[level] += sums[level - 1];
+        sums[level - 1] = 0;
+        if (i & ((chunk - 1) << (level * power))) {
+          break;
+        }
+      }
+    }
+    for (; i < steps; ++i) {
+      sums[0] += values[(i * parallel + p) * lanes + lane];
+    }
+    for (size_t level = 1; level < 4; ++level) {
+      sums[0] += sums[level];
+    }
+    if (p == 0) {
+      for (size_t v = steps * parallel; v < vectors; ++v) {
+        sums[0] += values[v * lanes + lane];
+      }
+    }
+    partial = sums[0];
+  }
+  // All lanes participate in each shuffle. Each component keeps p=0,1,2,3
+  // addition order; all lanes then receive the same tail-first completed sum.
+  const uint component = lane_id % lanes;
+  float merged = simd_shuffle(partial, component);
+  for (uint p = 1; p < parallel; ++p) {
+    merged += simd_shuffle(partial, p * lanes + component);
+  }
+  float sum = 0;
+  for (size_t tail = vectors * lanes; tail < size; ++tail) {
+    sum += values[tail];
+  }
+  for (uint lane = 0; lane < lanes; ++lane) {
+    sum += simd_shuffle(merged, lane);
+  }
+  return sum;
+}

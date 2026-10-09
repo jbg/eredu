@@ -816,6 +816,65 @@ manifests confirm all temporary source edits are restored. The production tree
 contains neither these candidate kernels nor their experiment flags; native
 8-bit selection and existing architecture/backend ownership remain unchanged.
 
+Generic Metal grouped F32 RMS distributes its sixteen independent cascade
+accumulator chains across a 32-thread SIMD group. Each chain retains the CPU
+cascade's local addition/carry order; ordered SIMD exchanges retain its component
+merge and tail order. The separate F32 square, precise reciprocal square root,
+normalization product and learned-gain product retain their rounding boundaries.
+Group and offset semantics remain neutral specifications. This mechanism changes
+neither model equations nor RNG, cache, rollback or completion ownership, and
+requires no feature flag. Weightless RMS and ordinary row sums retain their
+scalar-per-row mechanism.
+
+The same pinned checkpoint, corpus and accepted on-load Q8/mixed-precision
+configuration provide complete-conversation validation on the M3 Ultra. Each run
+contains 396 live frames and 386 warmed intervals after discarding the first ten.
+Loading and prefill are excluded. All 1,418 semantic events and the complete
+698,552-sample WAV match the accepted bytes, with SHA-256
+`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
+
+| Grouped RMS comparison | Mean 80 ms frame | p95 frame | p99 frame | Maximum |
+| --- | ---: | ---: | ---: | ---: |
+| Preserved control before | 88.316 ms | 92.285 ms | 94.727 ms | 95.370 ms |
+| Grouped RMS only | 69.667 ms | 74.130 ms | 76.143 ms | 76.996 ms |
+| Preserved final control | 88.217 ms | 92.505 ms | 94.506 ms | 95.464 ms |
+| Grouped RMS only, repeat | 69.588 ms | 73.998 ms | 76.098 ms | 77.428 ms |
+
+Against the fastest control and slower retained run, the reduction is
+18.549 ms/frame (21.03%). Throughput is 1.148 times realtime, with real-time factor
+0.871. Mean headroom is 10.333 ms (12.92% of the 80 ms budget). All 772 warmed
+intervals across both retained runs meet the deadline. The slowest observed frame
+leaves 2.572 ms of headroom. These figures do not establish performance at longer
+conversation histories.
+
+Exact GPU/CPU bit comparisons cover signed, varying-magnitude row sums at widths
+1/7/17/255/257/4095/4097/65537, including partial vectors/chains and carries into
+all three upper cascade levels. Independently computed grouped RMS comparisons
+cover strided rows, learned offset and widths 17/72/1152. The retained
+grouped-only mechanism passes the carry/tail and strided-group regressions. Reproducible focused native validation uses:
+
+```sh
+cargo test --offline --release -p eredu-backend-mlx --no-default-features \
+  --features audio,metal --lib -- \
+  parallel_cascade_matches_cpu_addition_order_at_carries_and_tails \
+  fused_grouped_rms_handles_strided_rows_groups_and_reduction_tails --nocapture
+```
+
+A dependent 112-operation chain at width 1152 measures 4.73–4.74 ms GPU time for
+the parallel variants versus 10.27 ms for the scalar cascade. The narrow
+16-row/72-column chain is essentially unchanged. Extending the per-row
+threadgroup strategy to weightless RMS and row sums measures 89.03–89.13 ms/frame
+for the complete conversation, despite the isolated chain improvement. Those
+extensions are absent from the production tree. These measurements do not
+attribute isolated shader durations or distinguish the two extension costs.
+
+External `/private/tmp/eredu-rms-parallel` retains the report, comparison data,
+exact implementation/benchmark patches, reproduction scripts, binary/source
+hashes, numerical logs, full event streams and WAVs. Restoration manifests
+confirm all temporary on-load quantization and profiling source edits are restored.
+This measures offline serial inference; live microphone/speaker scheduling and
+echo cancellation are not measured.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover
