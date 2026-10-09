@@ -875,6 +875,57 @@ confirm all temporary on-load quantization and profiling source edits are restor
 This measures offline serial inference; live microphone/speaker scheduling and
 echo cancellation are not measured.
 
+The pinned native MLX command encoder exposes process-level batching through
+`MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER`, read during device
+initialization. The Ultra defaults are 50 encoded operations and 50 MiB of
+unique input buffers. Either threshold can trigger a commit after a primitive;
+these are batching triggers rather than strict command-buffer size limits.
+Per-primitive completion handlers and input retention remain intact.
+
+A full-conversation sweep with the same grouped-RMS binary, accepted precision
+recipe and pinned fixture varies resource thresholds across 128/256/512/1024 MiB
+at 50 operations, and operation thresholds across 10/25/50/100/200/500 at
+512 MiB, with additional 25-operation/256 MiB runs. All 1,418 semantic events
+and accepted WAV bytes remain exact in all fifteen unprofiled sweep runs.
+
+| Native batching selection | Mean 80 ms frame | p95 frame |
+| --- | ---: | ---: |
+| Four default controls | 69.606 / 69.693 / 69.670 / 69.588 ms | 73.944 / 74.048 / 74.136 / 73.807 ms |
+| 50 operations / 512 MiB | 69.364 ms | 73.662 ms |
+| 25 operations / 256 MiB, two runs | 68.885 / 69.078 ms | 73.544 / 74.091 ms |
+| 10 operations / 512 MiB | 70.305 ms | 74.350 ms |
+| 500 operations / 512 MiB | 70.995 ms | 75.289 ms |
+
+The confirmed 25-operation/256 MiB selection averages 68.982 ms, versus
+69.640 ms across four controls: 0.658 ms (0.94%) less mean wall time.
+Mean headroom is 11.018 ms (13.77% of the frame budget), or 1.160 times realtime.
+All 772 selected warmed intervals meet the deadline; the maximum is 76.889 ms.
+The p95 ranges overlap, so these runs do not establish a tail-latency gain.
+The selection is an explicit workload-specific launch override; native global
+defaults remain unchanged. No new portable API, model-specific backend policy
+or feature flag is required:
+
+```sh
+MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 <voicechat-command>
+```
+
+Bounded warmed Metal traces observe 142.737 command buffers/frame at default
+and 230.023 at the selected setting. Counts range over 142–145 and 230–231
+within 57 and 43 complete observed frames respectively. Agent-active counts
+are 143.286 and 230.024, so the different conversation windows do not explain
+the increase. The faster unprofiled setting increases command-buffer count;
+its gain is consistent with timely GPU supply, rather than fewer submissions.
+The traces do not isolate the cause. Profiling strongly perturbs the selected
+run, so trace wall times are excluded from performance comparisons.
+
+The existing Metal controlled/scheduled cached-publication test passes at
+500 operations / 512 MiB. No completion, rollback or resource-retention code
+changes. External `/private/tmp/eredu-mlx-batching` retains `REPORT.md`,
+`comparison.json`, reproduction scripts, binary and artifact hashes, full event
+streams/WAVs, native traces and per-frame command-buffer counts. These timings
+exclude loading and prefill, use 386 warmed intervals per run, and do not
+establish live I/O scheduling or longer-history performance.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover
