@@ -217,3 +217,65 @@ fn voicechat_perception_invalid_overlap_retry_snapshot_and_fork_preserve_caches(
         assert_cache(&snapshot, &expected[1], 2, &fixture, &context);
     }
 }
+
+#[test]
+fn voicechat_perception_positions_reuse_constants_and_rebind_without_stale_projection() {
+    use eredu_architectures::voicechat::conformer::{ConformerBlock, ConformerState};
+    let fixture = fixture();
+    let context = NumericContext::default();
+    let dimensions = super::voicechat_perception_residency::dimensions(&fixture).block;
+    let parameters = super::voicechat_perception_residency::parameters(&fixture);
+    let build = || {
+        let mut block = ConformerBlock::<NumericBackend>::new(dimensions, 0, &context).unwrap();
+        replace_numeric_parameters(&mut block, &parameters);
+        block
+    };
+    let mut cached = build();
+    let windows = fixture["conformer"]["steps"].as_array().unwrap();
+    let mut state = ConformerState::default();
+    for window in windows.iter().take(2) {
+        let (output, next) = cached
+            .forward(&tensor(&window["input"]), &state, &context)
+            .unwrap();
+        assert_tensor(&output, &window["output"], &fixture);
+        assert_eq!(
+            context.position_projection_calls.get(),
+            1,
+            "same single-frame positions must not execute the projection again"
+        );
+        state = next;
+    }
+    let input = tensor(&windows[3]["input"]);
+    let (original, _) = cached.forward(&input, &state, &context).unwrap();
+    assert_eq!(context.position_projection_calls.get(), 1);
+
+    struct ReplacePosition;
+    impl<'a> ParameterVisitorMut<'a, NumericTensor> for ReplacePosition {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, slot: &'a mut NumericTensor) {
+            if metadata
+                .id
+                .as_str()
+                .ends_with("self_attn.linear_pos.weight")
+            {
+                *slot =
+                    NumericTensor::new(slot.shape(), slot.data.iter().map(|x| x * -7.0).collect());
+            }
+        }
+    }
+    cached.visit_parameters_mut(&mut ReplacePosition);
+    let mut fresh = build();
+    fresh.visit_parameters_mut(&mut ReplacePosition);
+    let (rebuilt, _) = fresh.forward(&input, &state, &context).unwrap();
+    let (rebound, _) = cached.forward(&input, &state, &context).unwrap();
+    assert_eq!(context.position_projection_calls.get(), 3);
+    assert_eq!(rebound.data, rebuilt.data);
+    assert_ne!(
+        rebound.data, original.data,
+        "the rebound position weights must change this nonzero fixture"
+    );
+    assert_eq!(
+        state.valid_channel(),
+        2,
+        "candidate execution must not advance its parent"
+    );
+}

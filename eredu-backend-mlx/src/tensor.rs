@@ -98,6 +98,18 @@ fn tensor(result: Result<Array, safemlx::error::Exception>) -> Result<MlxTensor,
 impl Tensor for MlxTensor {
     type Context = Stream;
 
+    fn immutable_context_key(context: &Stream) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
+        let device = backend(context.get_device())?;
+        let kind = u32::from(backend(device.get_type())?);
+        let index = backend(device.get_index())?;
+        let stream = backend(context.get_index())?;
+        Ok(Some(eredu_nn::TensorContextKey::new([
+            u64::from(kind),
+            index as u64,
+            stream as u64,
+        ])))
+    }
+
     fn shape(&self) -> &[i32] {
         self.0.shape()
     }

@@ -759,6 +759,11 @@ fn unsupported<T>(operation: &str) -> Result<T, Error> {
 impl Tensor for NumericTensor {
     type Context = NumericContext;
 
+    fn immutable_context_key(_: &NumericContext) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
+        // This eager scalar backend has one device and no context-dependent arithmetic.
+        Ok(Some(eredu_nn::TensorContextKey::new([0, 0, 0])))
+    }
+
     fn compact(&self, _: &Self::Context) -> Result<Self, Error> {
         Ok(self.clone())
     }
@@ -2357,8 +2362,11 @@ impl LinearOperator<NumericTensor> for NumericLinear {
     fn forward(
         &mut self,
         input: &NumericTensor,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
+        if self.weight_metadata.id.as_str().ends_with("self_attn.linear_pos.weight") {
+            context.position_projection_calls.set(context.position_projection_calls.get() + 1);
+        }
         linear(
             input,
             self.execution_weight.as_ref().unwrap_or(&self.weight),
@@ -3036,6 +3044,7 @@ struct NumericContext {
     sliding_attention_calls: Cell<usize>,
     integer_tensor_constructions: Cell<usize>,
     embedding_forward_calls: Cell<usize>,
+    position_projection_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
     // Affine numerical execution stores expanded weights while admission and
     // transport retain the selected packed layout.
@@ -3052,6 +3061,7 @@ impl NumericContext {
             sliding_attention_calls: Cell::new(0),
             integer_tensor_constructions: Cell::new(0),
             embedding_forward_calls: Cell::new(0),
+            position_projection_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             expanded_weight_layout: None,
             mechanisms: Arc::default(),
@@ -3070,6 +3080,7 @@ impl NumericContext {
             sliding_attention_calls: Cell::new(0),
             integer_tensor_constructions: Cell::new(0),
             embedding_forward_calls: Cell::new(0),
+            position_projection_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             expanded_weight_layout: None,
             mechanisms: Arc::default(),

@@ -643,6 +643,37 @@ comparisons. The profile covers offline serial PCM execution; live mic/speaker,
 echo cancellation, external tool-service latency and individual shader durations
 are outside its evidence.
 
+Perception caches the single-frame relative-position table and its projection in
+each parameter owner. The position equation and attention arithmetic are
+unchanged. Larger chunks bypass this fixed-size cache; parameter mutation and
+precision changes invalidate projected values, context/dtype changes rebuild
+constants and cloned owners start cold. These immutable values are separate from
+causal state and snapshots. Cold admission reserves 27,721,728 additional bytes
+for the released 24-layer geometry, separately from parameter pools.
+
+Same-binary complete-conversation comparisons with accepted combined precision
+use sequential uncached/cached/uncached runs and 386 warmed frames each:
+
+| Position cache comparison | Mean 80 ms frame | p95 frame |
+| --- | ---: | ---: |
+| Uncached control before | 144.606 ms | 149.084 ms |
+| Cached positions and projections | 113.440 ms | 118.624 ms |
+| Uncached control after | 124.003 ms | 128.622 ms |
+
+Caching saves 10.564 ms/frame (8.52%) against the faster control;
+the first control is anomalously slow and is excluded from the savings claim.
+The final control agrees with the preceding profiling-disabled 124.145 ms control
+and a fresh preserved-binary calibration (123.865 ms, p95 128.865 ms). Throughput
+is 0.705 times realtime and the remaining mean gap is 33.440 ms. All warmed intervals miss the deadline.
+All 1,418 semantic events and complete accepted WAV bytes match. Thirteen existing
+neutral perception tests cover pinned outputs, retries, snapshots, bounded units
+and TP/PP; the focused nonzero position regression checks projection reuse and
+rebinding against a fresh owner. The native Metal/audio release build passes.
+External `/private/tmp/eredu-voicechat-position-cache` retains `REPORT.md`, exact
+implementation/benchmark patches, hashes, commands, binary, timings, events, WAVs
+and quality comparisons. The benchmark-only bypass and on-load quantization edits
+are restored to their implementation hashes; no bypass flag is retained in source.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover

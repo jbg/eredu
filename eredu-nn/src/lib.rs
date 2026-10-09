@@ -4930,6 +4930,19 @@ mod selective_state_space_reference_tests {
     }
 }
 
+/// Opaque identity of a tensor execution context within one backend's namespace.
+/// Equal keys certify compatible device placement and execution arithmetic for
+/// reusing immutable tensors. Keys must not be recycled while tensors survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorContextKey([u64; 3]);
+
+impl TensorContextKey {
+    /// Constructs a backend-defined device/executor identity without native handles.
+    pub const fn new(parts: [u64; 3]) -> Self {
+        Self(parts)
+    }
+}
+
 /// Opaque tensor handle and the neural operations required by shared Eredu
 /// architectures.
 ///
@@ -4938,6 +4951,14 @@ mod selective_state_space_reference_tests {
 pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Backend execution context, such as a stream or command queue.
     type Context: ?Sized;
+
+    /// Certifies a stable context identity for immutable derived-value reuse.
+    /// The default declines caching. This observation must not evaluate, submit
+    /// or synchronize work. Contexts with mutable execution arithmetic must
+    /// change their key when that arithmetic changes or return `None`.
+    fn immutable_context_key(_context: &Self::Context) -> Result<Option<TensorContextKey>, Error> {
+        Ok(None)
+    }
 
     /// Logical tensor shape maintained without materializing tensor values.
     fn shape(&self) -> &[i32];

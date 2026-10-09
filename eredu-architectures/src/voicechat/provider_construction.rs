@@ -342,10 +342,22 @@ impl PreparedSpeechProviders {
         } else {
             0
         };
+        let perception = self.perception.dimensions();
+        // One single-frame position table and its projection per layer. Bound
+        // rebuilt units by all layers as well; parameter pools do not pay for
+        // derived tensors, and local heads never exceed this replicated bound.
+        let positions = (perception.block.left_context as u64)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(perception.block.width as u64))
+            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_mul(perception.layers as u64))
+            .ok_or(SpeechResidencyError::ArithmeticOverflow)?;
         policy.validate_with_execution_cache(
             &self.resources,
             norms
-                .checked_add(characters)
+                .checked_add(positions)
+                .and_then(|n| n.checked_add(characters))
                 .ok_or(SpeechResidencyError::ArithmeticOverflow)?,
         )
     }

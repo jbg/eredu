@@ -18,6 +18,10 @@ use eredu_nn::{
 
 use super::config::PerceptionEncoderConfig;
 
+#[path = "conformer_positions.rs"]
+mod positions;
+use positions::RelativePositionProjection;
+
 /// Geometry of one released causal FastConformer layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConformerDimensions {
@@ -250,7 +254,7 @@ pub struct ConformerBlock<B: NeuralBackend> {
     key: B::Linear,
     value: B::Linear,
     attention_output: B::Linear,
-    position: B::Linear,
+    position: RelativePositionProjection<B>,
     pos_bias_u: Parameter<B::Tensor>,
     pos_bias_v: Parameter<B::Tensor>,
     norm_conv: LayerNorm<B::Tensor>,
@@ -391,7 +395,10 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             key: linear("self_attn.linear_k", d, attention_width)?,
             value: linear("self_attn.linear_v", d, attention_width)?,
             attention_output: linear("self_attn.linear_out", attention_width, d)?,
-            position: linear("self_attn.linear_pos", d, attention_width)?,
+            position: RelativePositionProjection::new(
+                linear("self_attn.linear_pos", d, attention_width)?,
+                dimensions.left_context.saturating_add(1),
+            ),
             pos_bias_u: Parameter::unloaded(
                 parameter("self_attn.pos_bias_u"),
                 &[local.heads, d / dimensions.heads],
@@ -709,10 +716,9 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             .forward(channel, context)?
             .reshape(&[batch, total, heads, head], context)?
             .transpose_axes(&[0, 2, 1, 3], context)?;
-        let positional = relative_positions::<B::Tensor>(total, d.width, query, context)?;
         let p = self
             .position
-            .forward(&positional, context)?
+            .forward(total, d.width, query, context)?
             .reshape(&[1, 2 * total - 1, heads, head], context)?
             .transpose_axes(&[0, 2, 3, 1], context)?;
         let relative = B::Tensor::matmul(&q_v, &p, context)?;
@@ -800,26 +806,3 @@ fn float_like<T: Tensor>(value: f32, prototype: &T, context: &T::Context) -> Res
     }
 }
 
-fn relative_positions<T: Tensor>(
-    total: i32,
-    width: i32,
-    prototype: &T,
-    context: &T::Context,
-) -> Result<T, Error> {
-    let coefficient = -(10000.0_f64.ln() / width as f64) as f32;
-    let mut data = Vec::with_capacity((2 * total - 1) as usize * width as usize);
-    for position in (1 - total..total).rev() {
-        for feature in (0..width).step_by(2) {
-            let phase = position as f32 * (feature as f32 * coefficient).exp();
-            data.push(phase.sin());
-            data.push(phase.cos());
-        }
-    }
-    let tensor = T::from_f32_slice(&data, &[1, 2 * total - 1, width], context)?;
-    match prototype.element_type() {
-        Some(dtype) if dtype != eredu_nn::TensorElementType::F32 => {
-            tensor.cast_float(dtype, context)
-        }
-        _ => Ok(tensor),
-    }
-}

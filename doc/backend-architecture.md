@@ -1709,7 +1709,21 @@ The cache contains no causal state, random decisions or tentative codes and is
 shared by ordinary and controlled advancement. Cold speech admission reserves
 `execution_cache_device_bytes` separately from parameter pools: F32 RVQ norms
 plus the maximum resident character-result payload. Both speech and combined
-VoiceChat admission include this allowance in the device limit.
+VoiceChat admission include this allowance in the device limit, including the
+perception position tables and their projections.
+
+`ConformerBlock` owns a single-frame relative-position table and its projected
+values separately from causal conversation state. Larger chunks bypass this
+fixed-size cache. The layer's position operator clears projected values before
+mutable parameter traversal or precision reselection; cloned parameter owners
+start cold, while snapshots retain only causal state. Context and input dtype
+changes rebuild the constants. The neutral `Tensor::immutable_context_key`
+contract defaults to no reuse; MLX certifies its device/stream identity using only
+native metadata. The backend owns this identity and ordinary tensor operators;
+position equations, cache policy and cold memory bounds remain architecture-owned.
+The conservative cache allowance is two F32 position tensors per global layer;
+local head projections do not exceed that bound. Unit eviction releases its
+constants along with the parameter owner.
 
 Conditioning tensor parallelism partitions character embedding columns, character
 projection rows, speaker-projection output columns and both fusion projections'
