@@ -7,7 +7,7 @@
 #[path = "execution_coordination.rs"]
 mod coordination;
 pub use coordination::ExecutionCoordination;
-use coordination::{ExecutionPhase, finish_child, gate, invocation_descriptor};
+use coordination::{finish_child, gate, invocation_descriptor, ExecutionPhase};
 
 use super::function_head_layered::FunctionHeadExecution;
 use super::tts_conditioning_layered::{ConditioningExecution, ResidentConditioning};
@@ -204,17 +204,17 @@ impl<T: Tensor, C: RetainedTensorRoots<T>, K: RetainedTensorRoots<T>> RetainedTe
 }
 
 impl<
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    R,
-    I: InputExecution<B>,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    A: AudioDecoderExecution<B>,
-    F: FunctionHeadExecution<B>,
-    E: TransformerExecution<B>,
-> Components<'_, B, R, I, X, Y, Z, W, A, F, E>
+        B: GroupedNeuralBackend + DistributedNeuralBackend,
+        R,
+        I: InputExecution<B>,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        A: AudioDecoderExecution<B>,
+        F: FunctionHeadExecution<B>,
+        E: TransformerExecution<B>,
+    > Components<'_, B, R, I, X, Y, Z, W, A, F, E>
 {
     /// Checks invocation, input readiness and component frontiers without
     /// claiming or advancing the candidate or submitting neural work.
@@ -238,10 +238,10 @@ impl<
     ) -> Result<StepPlan, ExecutionError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         N: NeuralStateParts,
@@ -429,10 +429,10 @@ impl<
     ) -> Result<ExecutionOutput<B::Tensor, I::PerceptionCache, A::NeuralState>, ExecutionError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         N: NeuralStateParts,

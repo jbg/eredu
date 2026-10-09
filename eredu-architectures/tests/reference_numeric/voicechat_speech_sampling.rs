@@ -442,32 +442,18 @@ fn voicechat_speech_sampling_replays_nvidia_draws_and_rolls_back_complete_operat
         ),
         Err(SpeechSamplingError::MissingRandomState)
     ));
-    assert!(
-        speech
-            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                &complete,
-                &mut missing,
-                None,
-                &context
-            )
-            .is_ok()
-    );
+    assert!(speech
+        .generate_sampled_frame::<Recorded, _, _, _, _, _>(&complete, &mut missing, None, &context)
+        .is_ok());
     assert!(missing.random_state().is_none());
     let rendered_complete = speech
         .render_sampled_frame::<Recorded, _, _, _, _, _>(&complete, &mut missing, None, &context)
         .unwrap();
     assert_eq!(rendered_complete.pcm.data, right.pcm.data);
     assert!(missing.random_state().is_none());
-    assert!(
-        speech
-            .advance_sampled_frame::<Recorded, _, _, _, _, _>(
-                &complete,
-                &mut ordinary,
-                None,
-                &context
-            )
-            .is_err()
-    );
+    assert!(speech
+        .advance_sampled_frame::<Recorded, _, _, _, _, _>(&complete, &mut ordinary, None, &context)
+        .is_err());
     assert_eq!(ordinary.random_state().unwrap().cursor, 10);
     ordinary.attach_submission_completion(Ready).unwrap();
     assert!(matches!(

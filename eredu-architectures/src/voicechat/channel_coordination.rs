@@ -2,7 +2,7 @@
 
 use eredu_core::{BackendFailure, BackendFailureKind};
 use eredu_nn::{Tensor, TensorElementType};
-use eredu_runtime::{SamplingBackend, replicated_execution::ReplicatedCoordinator};
+use eredu_runtime::{replicated_execution::ReplicatedCoordinator, SamplingBackend};
 
 use super::{ChannelDecision, FeedbackTokens};
 

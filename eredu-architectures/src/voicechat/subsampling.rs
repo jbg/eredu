@@ -94,7 +94,7 @@ pub enum SubsamplingError {
     /// Input geometry cannot execute under this component's contract.
     #[error("{0}")]
     Input(&'static str),
-    /// Input or parameters do not use the pinned Float32 inference policy.
+    /// Input or parameters differ from the selected floating execution policy.
     #[error("{0}")]
     Precision(&'static str),
     /// Backend-neutral numerical failure retaining its original source.
@@ -143,7 +143,12 @@ impl<T: Tensor> Convolution<T> {
         })
     }
 
-    fn forward(&self, input: &T, context: &T::Context) -> Result<T, Error> {
+    fn forward(
+        &self,
+        input: &T,
+        precision: super::precision::SpeechPrecision,
+        context: &T::Context,
+    ) -> Result<T, Error> {
         let input = if self.stride == 2 {
             T::pad(
                 input,
@@ -154,8 +159,8 @@ impl<T: Tensor> Convolution<T> {
         } else {
             input.clone()
         };
-        T::conv2d(
-            &input,
+        let value = T::conv2d(
+            &precision.conv_input(&input, context)?,
             &self
                 .weight
                 .as_ref()
@@ -165,8 +170,10 @@ impl<T: Tensor> Convolution<T> {
             (1, 1),
             self.groups,
             context,
-        )?
-        .add(self.bias.as_ref(), context)
+        )?;
+        precision
+            .restore(value, context)?
+            .add(self.bias.as_ref(), context)
     }
 }
 
@@ -174,6 +181,8 @@ impl<T: Tensor> Convolution<T> {
 #[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct CausalSubsampling<B: NeuralBackend> {
+    #[parameter(skip)]
+    precision: super::precision::SpeechPrecision,
     #[parameter(skip)]
     dimensions: SubsamplingDimensions,
     initial: Convolution<B::Tensor>,
@@ -187,6 +196,7 @@ pub struct CausalSubsampling<B: NeuralBackend> {
 impl<B: NeuralBackend> Clone for CausalSubsampling<B> {
     fn clone(&self) -> Self {
         Self {
+            precision: self.precision,
             dimensions: self.dimensions,
             initial: self.initial.clone(),
             depthwise1: self.depthwise1.clone(),
@@ -199,6 +209,18 @@ impl<B: NeuralBackend> Clone for CausalSubsampling<B> {
 }
 
 impl<B: NeuralBackend> CausalSubsampling<B> {
+    /// Selects projection arithmetic; parameters are supplied by the matching retained plan.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, SubsamplingError> {
+        precision.validate().map_err(SubsamplingError::Precision)?;
+        self.projection
+            .set_compute_element(precision.projection_element())?;
+        self.precision = precision;
+        Ok(self)
+    }
+
     /// Constructs canonical released convolution and output parameter identities.
     pub fn new(
         dimensions: SubsamplingDimensions,
@@ -215,6 +237,7 @@ impl<B: NeuralBackend> CausalSubsampling<B> {
             parameter
         };
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             initial: Convolution::new(0, 1, channels, 3, 2, 1, context)?,
             depthwise1: Convolution::new(2, channels, channels, 3, 2, channels, context)?,
@@ -255,21 +278,23 @@ impl<B: NeuralBackend> CausalSubsampling<B> {
             ));
         }
         let frames = self.dimensions.output_frames(shape[1])?;
-        super::precision::require_float32(self, input).map_err(SubsamplingError::Precision)?;
+        self.precision
+            .require(self, input)
+            .map_err(SubsamplingError::Precision)?;
         let input = input.expand_dims(-1, context)?;
         let hidden = self
             .initial
-            .forward(&input, context)?
+            .forward(&input, self.precision, context)?
             .maximum_scalar(0.0, context)?;
-        let hidden = self.depthwise1.forward(&hidden, context)?;
+        let hidden = self.depthwise1.forward(&hidden, self.precision, context)?;
         let hidden = self
             .pointwise1
-            .forward(&hidden, context)?
+            .forward(&hidden, self.precision, context)?
             .maximum_scalar(0.0, context)?;
-        let hidden = self.depthwise2.forward(&hidden, context)?;
+        let hidden = self.depthwise2.forward(&hidden, self.precision, context)?;
         let hidden = self
             .pointwise2
-            .forward(&hidden, context)?
+            .forward(&hidden, self.precision, context)?
             .maximum_scalar(0.0, context)?;
         // NVIDIA flattens channels before frequency after converting NCTF to
         // NTCF. Flattening NHWC directly would silently interchange these axes.

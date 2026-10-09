@@ -456,38 +456,93 @@ fn verify_partitions(
             placement::verify_rejections(&reference_sources, description);
             let capture_world = Arc::new(observer::World::default());
             let results = std::thread::scope(|scope| {
-                (0..topology.world_size()).map(|rank| {
-                    let (inspection,description,inputs,descriptor) = (&inspection,&description,&inputs,&descriptor);
-                    let reference_layouts = &reference_layouts;
-                    let capture_world = capture_world.clone();
-                    let expected = &expected[0];
-                    let world = world.clone(); let residency = residency.clone();
-                    scope.spawn(move || {
-                        let rank_topology = ParallelRankTopology::new(topology,rank).unwrap();
-                        let plan = prepared_adapter::plan(None).with_topology(topology).with_residency(residency);
-                        let sources = partitioned_adapter::prepare_plan(inspection,&plan,rank,std::time::Duration::from_secs(10)).unwrap();
-                        let retained = placement::layouts(&sources, description);
-                        assert_eq!(&retained, reference_layouts, "all cold ranks agree on the actual selected placement");
-                        placement::verify(&retained, descriptor);
-                        let layout = eredu_runtime::derive_partitioned_local_layout(description,rank_topology).unwrap();
-                        let mut context = NumericContext::with_partition(layout,rank,world);
-                        context.bind_checkpoint_values = true;
-                        let mut executable = partitioned_adapter::routed(sources,&context,Arc::new(AtomicUsize::new(0)),None).unwrap();
-                        let transport = observer::Transport::new(capture_world,rank,topology.world_size());
-                        observer::run(&mut executable,&retained,descriptor,&transport,inputs,Some(expected),None);
-                        [false,true].map(|edit| {
-                            executable.reset().unwrap();
-                            inputs.iter().enumerate().map(|(step,tokens)| {
-                                let mut observer = Observe::new(descriptor,Some(rank_topology),tokens.data.len(),edit);
-                                observer.retained = retained.rank(rank).cloned();
-                                let output = executable.forward_observed(tokens,step==0,&mut observer).unwrap();
-                                assert!(observer.active.is_none());
-                                assert_eq!(observer.started.len(), observer.requested.len(), "idle local invocations must also finish");
-                                (output,observer.original,observer.effective)
-                            }).collect::<Vec<_>>()
+                (0..topology.world_size())
+                    .map(|rank| {
+                        let (inspection, description, inputs, descriptor) =
+                            (&inspection, &description, &inputs, &descriptor);
+                        let reference_layouts = &reference_layouts;
+                        let capture_world = capture_world.clone();
+                        let expected = &expected[0];
+                        let world = world.clone();
+                        let residency = residency.clone();
+                        scope.spawn(move || {
+                            let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                            let plan = prepared_adapter::plan(None)
+                                .with_topology(topology)
+                                .with_residency(residency);
+                            let sources = partitioned_adapter::prepare_plan(
+                                inspection,
+                                &plan,
+                                rank,
+                                std::time::Duration::from_secs(10),
+                            )
+                            .unwrap();
+                            let retained = placement::layouts(&sources, description);
+                            assert_eq!(
+                                &retained, reference_layouts,
+                                "all cold ranks agree on the actual selected placement"
+                            );
+                            placement::verify(&retained, descriptor);
+                            let layout = eredu_runtime::derive_partitioned_local_layout(
+                                description,
+                                rank_topology,
+                            )
+                            .unwrap();
+                            let mut context = NumericContext::with_partition(layout, rank, world);
+                            context.bind_checkpoint_values = true;
+                            let mut executable = partitioned_adapter::routed(
+                                sources,
+                                &context,
+                                Arc::new(AtomicUsize::new(0)),
+                                None,
+                            )
+                            .unwrap();
+                            let transport = observer::Transport::new(
+                                capture_world,
+                                rank,
+                                topology.world_size(),
+                            );
+                            observer::run(
+                                &mut executable,
+                                &retained,
+                                descriptor,
+                                &transport,
+                                inputs,
+                                Some(expected),
+                                None,
+                            );
+                            [false, true].map(|edit| {
+                                executable.reset().unwrap();
+                                inputs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(step, tokens)| {
+                                        let mut observer = Observe::new(
+                                            descriptor,
+                                            Some(rank_topology),
+                                            tokens.data.len(),
+                                            edit,
+                                        );
+                                        observer.retained = retained.rank(rank).cloned();
+                                        let output = executable
+                                            .forward_observed(tokens, step == 0, &mut observer)
+                                            .unwrap();
+                                        assert!(observer.active.is_none());
+                                        assert_eq!(
+                                            observer.started.len(),
+                                            observer.requested.len(),
+                                            "idle local invocations must also finish"
+                                        );
+                                        (output, observer.original, observer.effective)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
                         })
                     })
-                }).collect::<Vec<_>>().into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
             });
             for trial in 0..2 {
                 for step in 0..inputs.len() {

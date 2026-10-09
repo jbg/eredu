@@ -179,6 +179,23 @@ impl LayerStreams {
         manager: Option<&CacheResidencyManager>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        self.copy_candidate(manager, stream, true)
+    }
+
+    pub(super) fn transaction_candidate(
+        &self,
+        manager: Option<&CacheResidencyManager>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        self.copy_candidate(manager, stream, false)
+    }
+
+    fn copy_candidate(
+        &self,
+        manager: Option<&CacheResidencyManager>,
+        stream: &Stream,
+        isolated: bool,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             bindings: self.bindings.clone(),
             values: self
@@ -189,6 +206,9 @@ impl LayerStreams {
                         *slot,
                         *lane,
                         match value {
+                            MlxAppendStream::Resident(s) if !isolated => {
+                                MlxAppendStream::Resident(s.clone())
+                            }
                             MlxAppendStream::Resident(s) => {
                                 MlxAppendStream::Resident(s.try_clone_with(|value| {
                                     value

@@ -268,6 +268,36 @@ impl SamplingBackend for MlxSamplingBackend {
         Ok(token.as_array().clone().item::<u32>(stream))
     }
 
+    fn token_ids<const N: usize>(
+        tokens: [&MlxTensor; N],
+        stream: &Stream,
+    ) -> Result<[u32; N], Exception> {
+        if N == 0 {
+            return Ok([0; N]);
+        }
+        let arrays = tokens
+            .into_iter()
+            .map(|token| {
+                let value = token.as_array();
+                if value.size() != 1 || !matches!(value.dtype(), Dtype::Int32 | Dtype::Uint32) {
+                    return Err(Exception::custom(
+                        "selected token must be one int32 or uint32 scalar",
+                    ));
+                }
+                value.as_type::<u32>(stream)?.reshape(&[1], stream)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let packed = safemlx::ops::concatenate_axis(&arrays, 0, stream)?;
+        // One dependency graph and host transfer for the whole decision group.
+        let evaluated = packed.evaluated()?;
+        let values = evaluated
+            .try_to_vec::<u32>()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        values
+            .try_into()
+            .map_err(|_| Exception::custom("selected token group size differs"))
+    }
+
     fn token_probability(
         logits: &MlxTensor,
         token: u32,

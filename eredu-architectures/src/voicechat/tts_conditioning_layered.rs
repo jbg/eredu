@@ -165,6 +165,16 @@ pub fn conditioning_local_dimensions(
 
 /// Shared conditioning choreography; phase invocations complete before another provider runs.
 pub trait ConditioningExecution<B: NeuralBackend> {
+    /// Identity certifying immutable parameters and deterministic encoder results.
+    /// Replacing parameters, equations or execution resources changes the identity.
+    /// Mutable and collective providers return `None`; cache hits skip their calls.
+    fn immutable_parameters_identity(
+        &self,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        None
+    }
+
     /// Exact selected geometry.
     fn dimensions(&self) -> ConditioningDimensions;
     /// Looks up packed character embeddings.

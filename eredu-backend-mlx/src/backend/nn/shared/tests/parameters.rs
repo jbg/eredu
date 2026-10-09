@@ -311,3 +311,65 @@ fn supported_embedding_formats() -> [Option<WeightQuantization>; 3] {
         Some(WeightQuantization::MxFp4),
     ]
 }
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn mlx_explicit_projection_precision_rounds_input_and_restores_f32_output() {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let stream = execution.stream();
+    let native = safemlx::distributed::init(false, safemlx::distributed::Backend::Ring).unwrap();
+    let group = crate::backend::runtime::distributed::Group::uncontracted(&native);
+    for (element, dtype, expected) in [
+        (
+            eredu_nn::TensorElementType::F16,
+            Dtype::Float16,
+            vec![1.0, -2.00390625],
+        ),
+        (
+            eredu_nn::TensorElementType::Bf16,
+            Dtype::Bfloat16,
+            vec![1.0, -2.0],
+        ),
+    ] {
+        let mut projection = <MlxNeuralBackend as NeuralBackend>::linear(
+            LinearSpec {
+                input: 2,
+                output: 2,
+                weight: parameter("precision.weight"),
+                bias: None,
+                format: test_format("precision.weight", LinearFormat::Dense)
+                    .with_compute_element(Some(element))
+                    .unwrap(),
+            },
+            stream,
+        )
+        .unwrap();
+        bind_linear(
+            &mut projection,
+            Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2])
+                .as_dtype(dtype, stream)
+                .unwrap(),
+            LinearFormat::Dense,
+            stream,
+        );
+        let input = MlxTensor::from_array(Array::from_slice(&[1.0003f32, -2.003], &[1, 2]));
+        let output = projection.forward(&input, stream).unwrap();
+        assert_eq!(
+            output.element_type(),
+            Some(eredu_nn::TensorElementType::F32)
+        );
+        assert_eq!(output.to_f32_vec(stream).unwrap(), expected);
+        let observed = projection
+            .forward_with_input_observer(&input, stream, None)
+            .unwrap();
+        assert_eq!(observed.to_f32_vec(stream).unwrap(), expected);
+        let parallel =
+            MlxNeuralBackend::row_parallel_linear(&mut projection, &input, &group, stream).unwrap();
+        assert_eq!(
+            parallel.element_type(),
+            Some(eredu_nn::TensorElementType::F32)
+        );
+        assert_eq!(parallel.to_f32_vec(stream).unwrap(), expected);
+        assert_eq!(input.to_f32_vec(stream).unwrap(), vec![1.0003, -2.003]);
+    }
+}

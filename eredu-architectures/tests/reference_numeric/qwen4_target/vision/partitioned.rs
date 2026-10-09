@@ -141,11 +141,8 @@ fn run_tensor_rank(
             &local_target.parameter_description(&context).unwrap(),
         )
         .unwrap();
-    let mut layout = eredu_runtime::derive_partitioned_local_layout(
-        parameters,
-        rank_topology,
-    )
-    .unwrap();
+    let mut layout =
+        eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
     for (name, tensor) in target_layout.tensors() {
         layout.insert(name.to_owned(), tensor.clone());
     }

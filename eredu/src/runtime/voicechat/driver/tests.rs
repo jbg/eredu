@@ -16,23 +16,23 @@ use eredu_architectures::voicechat::{
     tts_feedback::WaveformSilence,
     tts_ingress::PromptLayout,
 };
-use eredu_core::BackendFailure;
 use eredu_core::scheduler::{
     RequestId, Scheduler, SchedulerLimits, SemanticStateTransaction, TransitionOutput,
     WorkDescriptor,
 };
-use eredu_runtime::{PrepublicationRealtimeFrame, submit_realtime_output};
+use eredu_core::BackendFailure;
+use eredu_runtime::{submit_realtime_output, PrepublicationRealtimeFrame};
 
 use super::*;
 use crate::runtime::voicechat::{
+    conversation::tests::{capacity, frame},
+    ingress::tests::{state, Branch, State},
+    publication::tests::{Observer, Ready},
+    tools::tests::{channel, limits},
     PreparedVoiceChatPrompt, VoiceChatConversationError, VoiceChatConversationOutput,
     VoiceChatExecutionError, VoiceChatExecutionInputs, VoiceChatPublicationReceiver,
     VoiceChatSpeechOptions, VoiceChatSubmittedWork, VoiceChatToolWaitMessages,
     VoiceChatToolWaitPolicy,
-    conversation::tests::{capacity, frame},
-    ingress::tests::{Branch, State, state},
-    publication::tests::{Observer, Ready},
-    tools::tests::{channel, limits},
 };
 
 fn advance(at: u64) -> VoiceChatAdvance {
@@ -374,20 +374,18 @@ fn queued_policy_and_capacity_are_reserved_until_drop_or_scheduler_cancellation(
     scheduler.register(request, state).unwrap();
     scheduler.enqueue(request, work).unwrap();
     scheduler.cancel(request).unwrap();
-    assert!(
-        scheduler
-            .run_local_turn(Instant::now(), |_, work, branch| {
-                submit(
-                    work,
-                    branch,
-                    position.output(work, Some(12)),
-                    Rc::new(Cell::new(true)),
-                )
-            })
-            .unwrap()
-            .committed
-            .is_empty()
-    );
+    assert!(scheduler
+        .run_local_turn(Instant::now(), |_, work, branch| {
+            submit(
+                work,
+                branch,
+                position.output(work, Some(12)),
+                Rc::new(Cell::new(true)),
+            )
+        })
+        .unwrap()
+        .committed
+        .is_empty());
     assert!(input.status().closed);
     assert_eq!(input.status().reserved_samples, 0);
     assert_eq!(input.status().queued_samples, 1280);

@@ -6,7 +6,7 @@ use eredu_architectures::voicechat::{
         FunctionHeadArchitecture, FunctionHeadDimensions, FunctionHeadExecution,
         FunctionHeadRuntimeState, LayerwiseFunctionHead,
     },
-    function_head_preparation::{PreparedFunctionHeadBindings, validate_parallel_communication},
+    function_head_preparation::{validate_parallel_communication, PreparedFunctionHeadBindings},
 };
 use eredu_core::{BackendFailure, ParallelRankTopology, ParallelTopology};
 use eredu_runtime::{
@@ -16,18 +16,18 @@ use eredu_runtime::{
 use safemlx::{Array, Stream};
 
 use crate::{
-    MlxTensor,
     backend::{
         nn::shared::MlxNeuralBackend,
         runtime::distributed::{
-            Group,
             coordinator::{MlxLayeredAgreement, MlxReplicatedCoordinator},
+            Group,
         },
         runtime::execution::generic::{
-            MlxLayerwisePolicy, MlxResidentPolicy, prepare_layerwise_policy_from_bindings,
+            prepare_layerwise_policy_from_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
         },
         submission_recovery::detached_preparation,
     },
+    MlxTensor,
 };
 
 type Unit = FunctionHead<MlxNeuralBackend>;

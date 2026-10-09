@@ -14,7 +14,7 @@ use eredu_runtime::{
 };
 
 use super::channels::{
-    ChannelAgreement, ChannelError, ChannelFusion, DualChannelLogits, PromptPolicy, validate_logits,
+    validate_logits, ChannelAgreement, ChannelError, ChannelFusion, DualChannelLogits, PromptPolicy,
 };
 use super::function_head_layered::FunctionHeadExecution;
 use crate::{

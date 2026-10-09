@@ -269,6 +269,20 @@ impl PreparedSpeechProviders {
         Ok(prepared)
     }
 
+    /// Reprojects narrow weights before aggregate resource admission or native binding.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+        parameters: &BTreeMap<String, ParameterAdmission>,
+    ) -> Result<Self, ProviderConstructionError> {
+        self.perception = self.perception.with_precision(precision)?;
+        self.character = self.character.with_precision(precision)?;
+        self.transformer = self.transformer.with_precision(precision)?;
+        self.mog = self.mog.with_precision(precision)?;
+        self.prepare_resources(parameters)?;
+        Ok(self)
+    }
+
     fn prepare_resources(
         &mut self,
         parameters: &BTreeMap<String, ParameterAdmission>,
@@ -304,6 +318,38 @@ impl PreparedSpeechProviders {
         &self.resources
     }
 
+    /// Admits parameter pools and bounded immutable speech execution caches.
+    pub fn validate_residency(
+        &self,
+        policy: &SpeechResidencyPolicy,
+    ) -> Result<SpeechResidencyReport, super::provider_residency::SpeechResidencyError> {
+        use super::provider_residency::SpeechResidencyError;
+        let norms = 31_u64
+            .checked_mul(self.rvq.dimensions().cardinality as u64)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(SpeechResidencyError::ArithmeticOverflow)?;
+        let characters = if policy
+            .provider(SpeechProvider::Conditioning)
+            .is_fully_resident()
+            && policy
+                .provider(SpeechProvider::CharacterEncoder)
+                .is_fully_resident()
+        {
+            (super::tts_generator::CHARACTER_CACHE_ENTRIES as u64)
+                .checked_mul(self.rvq.dimensions().hidden as u64)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(SpeechResidencyError::ArithmeticOverflow)?
+        } else {
+            0
+        };
+        policy.validate_with_execution_cache(
+            &self.resources,
+            norms
+                .checked_add(characters)
+                .ok_or(SpeechResidencyError::ArithmeticOverflow)?,
+        )
+    }
+
     /// Binds selected providers and consumes them into the existing coupled executor.
     /// No backbone or session is constructed here.
     pub fn materialize<B: NeuralBackend, V: SpeechProviderBinder<B>>(
@@ -313,7 +359,7 @@ impl PreparedSpeechProviders {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(BoundSpeechProviders<B, V>, SpeechResidencyReport), ProviderConstructionError>
     {
-        let report = policy.validate(&self.resources)?;
+        let report = self.validate_residency(policy)?;
         self.plan.validate_spectral_capabilities::<B>()?;
         let dimensions = self.conditioning.dimensions();
         let perception = visitor

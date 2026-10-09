@@ -395,10 +395,8 @@ where
             .map_err(ChannelDecisionError::Backend)?;
         let raw_function = B::validate_token(&raw_function, domain, context)
             .map_err(ChannelDecisionError::Backend)?;
-        let raw_agent_id =
-            B::token_id(&raw_agent, context).map_err(ChannelDecisionError::Backend)?;
-        let raw_function_id =
-            B::token_id(&raw_function, context).map_err(ChannelDecisionError::Backend)?;
+        let [raw_agent_id, raw_function_id] = B::token_ids([&raw_agent, &raw_function], context)
+            .map_err(ChannelDecisionError::Backend)?;
         validate_id(raw_agent_id, domain.cardinality())?;
         validate_id(raw_function_id, domain.cardinality())?;
         let policy = policy
@@ -460,12 +458,9 @@ where
             .map_err(ChannelDecisionError::Backend)?;
         decision.raw_function = B::validate_token(&decision.raw_function, domain, context)
             .map_err(ChannelDecisionError::Backend)?;
-        if B::token_id(&decision.raw_agent, context).map_err(ChannelDecisionError::Backend)?
-            != decision.raw_agent_id
-            || B::token_id(&decision.raw_function, context)
-                .map_err(ChannelDecisionError::Backend)?
-                != decision.raw_function_id
-        {
+        let ids = B::token_ids([&decision.raw_agent, &decision.raw_function], context)
+            .map_err(ChannelDecisionError::Backend)?;
+        if ids != [decision.raw_agent_id, decision.raw_function_id] {
             return Err(ChannelDecisionPreflightError::PublishedDecision.into());
         }
         if !owner {

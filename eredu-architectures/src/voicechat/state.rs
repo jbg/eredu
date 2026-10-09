@@ -7,13 +7,13 @@
 
 use eredu_codec::ear_decoder::DecoderState;
 use eredu_core::scheduler::SemanticStateTransaction;
-use eredu_core::{BackendFailure, execution_control::SnapshotEstimate};
+use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_nn::{RetainedTensorRoots, Tensor};
-use eredu_runtime::StateLayout;
 use eredu_runtime::execution_control::{
-    ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork, SnapshotReservation, SnapshotValue,
-    snapshot_value_estimate,
+    snapshot_value_estimate, ForkStateEstimate, IsolatedStateCopy, IsolatedStateFork,
+    SnapshotReservation, SnapshotValue,
 };
+use eredu_runtime::StateLayout;
 
 use super::{
     channel_decision::FeedbackTokens, input::InputState, perception::PerceptionState,
@@ -401,11 +401,11 @@ impl<T: Tensor, N: SemanticStateTransaction, C: Clone, K: Clone> SemanticStateTr
 }
 
 impl<
-    T: Tensor + SnapshotValue,
-    N: IsolatedStateCopy,
-    C: Clone + SnapshotValue,
-    K: Clone + SnapshotValue,
-> IsolatedStateCopy for State<T, N, C, K>
+        T: Tensor + SnapshotValue,
+        N: IsolatedStateCopy,
+        C: Clone + SnapshotValue,
+        K: Clone + SnapshotValue,
+    > IsolatedStateCopy for State<T, N, C, K>
 {
     type Error = BackendFailure;
 
@@ -444,11 +444,11 @@ impl<
 }
 
 impl<
-    T: Tensor + SnapshotValue,
-    N: IsolatedStateCopy,
-    C: Clone + SnapshotValue,
-    K: Clone + SnapshotValue,
-> State<T, N, C, K>
+        T: Tensor + SnapshotValue,
+        N: IsolatedStateCopy,
+        C: Clone + SnapshotValue,
+        K: Clone + SnapshotValue,
+    > State<T, N, C, K>
 {
     fn copy_components(
         &self,
@@ -475,11 +475,11 @@ impl<
 }
 
 impl<
-    T: Tensor + SnapshotValue,
-    N: IsolatedStateFork,
-    C: Clone + SnapshotValue,
-    K: Clone + SnapshotValue,
-> IsolatedStateFork for State<T, N, C, K>
+        T: Tensor + SnapshotValue,
+        N: IsolatedStateFork,
+        C: Clone + SnapshotValue,
+        K: Clone + SnapshotValue,
+    > IsolatedStateFork for State<T, N, C, K>
 {
     fn fork_isolated(&self, retention: &SnapshotReservation) -> Result<Self, Self::Error> {
         self.copy_components(retention, |neural| neural.fork_isolated(retention))
@@ -487,11 +487,11 @@ impl<
 }
 
 impl<
-    T: Tensor + SnapshotValue,
-    N: ForkStateEstimate,
-    C: Clone + SnapshotValue,
-    K: Clone + SnapshotValue,
-> ForkStateEstimate for State<T, N, C, K>
+        T: Tensor + SnapshotValue,
+        N: ForkStateEstimate,
+        C: Clone + SnapshotValue,
+        K: Clone + SnapshotValue,
+    > ForkStateEstimate for State<T, N, C, K>
 {
     fn estimate_fork_branch(branch: &Self::Branch) -> Result<u64, BackendFailure> {
         let neural = N::estimate_fork_branch(&branch.neural)?;
@@ -512,7 +512,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_core::{AttentionPolicy, cache::LayerCachePolicy};
+    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy};
 
     #[test]
     fn voicechat_neural_geometry_preserves_guidance_lanes_and_attention_windows() {

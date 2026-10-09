@@ -151,11 +151,9 @@ fn voicechat_transformers_match_pinned_hf_cached_and_bidirectional_outputs() {
         if execution == "chunks" {
             let capacity = data["config"]["max_position_embeddings"].as_i64().unwrap() as i32;
             let oversized = NumericTensor::zeros(vec![1, capacity, 8]);
-            assert!(
-                model
-                    .forward_causal(&oversized, &mut caches[..], &context)
-                    .is_err()
-            );
+            assert!(model
+                .forward_causal(&oversized, &mut caches[..], &context)
+                .is_err());
             let last = data["chunks"].as_array().unwrap().last().unwrap();
             for (cache, expected) in caches.iter().zip(last["cache"].as_array().unwrap()) {
                 assert_eq!(cache.offset(), expected["seen"].as_i64().unwrap() as i32);

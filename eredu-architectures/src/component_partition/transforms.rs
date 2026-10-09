@@ -399,9 +399,7 @@ mod tests {
         let topology = ParallelTopology::new(2, 2, 1, 1).unwrap();
         for rank in 0..topology.world_size() {
             let rank = ParallelRankTopology::new(topology, rank).unwrap();
-            let layout =
-                eredu_runtime::derive_partitioned_local_layout(&parameters, rank)
-                    .unwrap();
+            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, rank).unwrap();
             let owns = |name: &str| {
                 let owner = parameters
                     .groups()

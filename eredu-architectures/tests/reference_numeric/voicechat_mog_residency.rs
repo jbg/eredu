@@ -185,8 +185,8 @@ fn parity(
 }
 
 #[test]
-fn voicechat_mog_resident_and_bounded_match_nvidia_without_reacquiring_prediction_for_selected_readout()
- {
+fn voicechat_mog_resident_and_bounded_match_nvidia_without_reacquiring_prediction_for_selected_readout(
+) {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::MOG_REFERENCE_JSON).unwrap();
     let context = NumericContext::default();
@@ -291,7 +291,7 @@ fn voicechat_mog_bounded_refinement_matches_all_nvidia_code_prefixes_and_uninter
 
 #[test]
 fn voicechat_mog_selected_bank_failure_preserves_frame_and_shared_rng_until_retry() {
-    use super::voicechat_speech_sampling::{Recorded, Tape, generation};
+    use super::voicechat_speech_sampling::{generation, Recorded, Tape};
     use super::voicechat_transformer::CausalCache;
     use eredu_architectures::voicechat::{
         tts_generator::{TtsGenerator, TtsGeneratorParts},
@@ -354,11 +354,9 @@ fn voicechat_mog_selected_bank_failure_preserves_frame_and_shared_rng_until_retr
     let error = generator
         .advance_sampled_frame::<Recorded, _, _, _, _, _>(&frame, &mut branch, None, &context)
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected dense-stream acquisition failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected dense-stream acquisition failure"));
     assert_eq!(
         tape.issued.get(),
         2,
@@ -642,13 +640,13 @@ fn parallel_mog_parity(fixture: &Value, include_resident: bool) {
 
 #[test]
 fn voicechat_mog_tp_preparation_failures_agree_and_retry() {
-    use super::voicechat_rnnt_coordination::{Coordinator, coordinator_pair};
+    use super::voicechat_rnnt_coordination::{coordinator_pair, Coordinator};
     use eredu_architectures::voicechat::{
         tts_mog::TtsError,
-        tts_mog_layered::{MogForward, MogInput, mog_parameter_description},
+        tts_mog_layered::{mog_parameter_description, MogForward, MogInput},
     };
     use eredu_runtime::{
-        LayeredLocalPhase, LayeredTraversalHook, replicated_execution::ReplicatedCoordinator,
+        replicated_execution::ReplicatedCoordinator, LayeredLocalPhase, LayeredTraversalHook,
     };
     use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
     struct Hook(Rc<RefCell<Coordinator>>);
@@ -740,20 +738,18 @@ fn voicechat_mog_tp_preparation_failures_agree_and_retry() {
                     let input = tensor(&step["input"]);
                     let guidance = step["guidance_scale"].as_f64().unwrap() as f32;
                     model.runtime_mut().policy_mut().inner.fail_acquire = (rank == 0).then_some(1);
-                    assert!(
-                        model
-                            .invoke_parallel_guarded(
-                                MogInput::Predict {
-                                    hidden: &input,
-                                    guidance
-                                },
-                                &parallel,
-                                &context,
-                                &mut hook,
-                                agree
-                            )
-                            .is_err()
-                    );
+                    assert!(model
+                        .invoke_parallel_guarded(
+                            MogInput::Predict {
+                                hidden: &input,
+                                guidance
+                            },
+                            &parallel,
+                            &context,
+                            &mut hook,
+                            agree
+                        )
+                        .is_err());
                     assert_eq!(
                         parallel.trace().len(),
                         1,
@@ -771,20 +767,18 @@ fn voicechat_mog_tp_preparation_failures_agree_and_retry() {
                             .insert(key.into(), NumericTensor::zeros([d.hidden, 1]));
                     }
                     let before = parallel.trace().len();
-                    assert!(
-                        model
-                            .invoke_parallel_guarded(
-                                MogInput::Predict {
-                                    hidden: &input,
-                                    guidance
-                                },
-                                &parallel,
-                                &context,
-                                &mut hook,
-                                agree
-                            )
-                            .is_err()
-                    );
+                    assert!(model
+                        .invoke_parallel_guarded(
+                            MogInput::Predict {
+                                hidden: &input,
+                                guidance
+                            },
+                            &parallel,
+                            &context,
+                            &mut hook,
+                            agree
+                        )
+                        .is_err());
                     assert_eq!(parallel.trace().len() - before, 1);
                     model
                         .runtime_mut()
@@ -820,22 +814,20 @@ fn voicechat_mog_tp_preparation_failures_agree_and_retry() {
                         );
                     }
                     let before = parallel.trace().len();
-                    assert!(
-                        model
-                            .invoke_parallel_guarded(
-                                MogInput::Selected {
-                                    prediction: &prediction,
-                                    mixture: &mixture,
-                                    gaussian: &gaussian,
-                                    noise_scale
-                                },
-                                &parallel,
-                                &context,
-                                &mut hook,
-                                agree
-                            )
-                            .is_err()
-                    );
+                    assert!(model
+                        .invoke_parallel_guarded(
+                            MogInput::Selected {
+                                prediction: &prediction,
+                                mixture: &mixture,
+                                gaussian: &gaussian,
+                                noise_scale
+                            },
+                            &parallel,
+                            &context,
+                            &mut hook,
+                            agree
+                        )
+                        .is_err());
                     assert_eq!(
                         parallel.trace().len(),
                         before,

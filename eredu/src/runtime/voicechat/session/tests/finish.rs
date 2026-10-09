@@ -1,6 +1,6 @@
 use super::*;
 use crate::runtime::voicechat::{
-    VoiceChatConversationOutput, VoiceChatPublicationReceiver, ingress::tests::Neural,
+    ingress::tests::Neural, VoiceChatConversationOutput, VoiceChatPublicationReceiver,
 };
 use eredu_architectures::voicechat::schedule::Step;
 use eredu_core::{execution_control::SnapshotLimits, scheduler::RequestId};
@@ -61,11 +61,9 @@ fn partial_finish_continuation_and_automatic_drain_match_iterator_advancement() 
                 })
                 .collect::<Vec<_>>()
         };
-        assert!(
-            progress
-                .iter()
-                .all(|step| step.submitted == 1 && step.committed == 1)
-        );
+        assert!(progress
+            .iter()
+            .all(|step| step.submitted == 1 && step.committed == 1));
         assert_eq!(session.status(), VoiceChatSessionStatus::Finished);
         let status = input.status();
         assert_eq!(

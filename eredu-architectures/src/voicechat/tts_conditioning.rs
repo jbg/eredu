@@ -180,7 +180,7 @@ impl CharacterMapping {
 }
 
 /// Packed valid subwords plus immutable scatter/flag data for one invocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharacterBatch {
     batch: i32,
     time: i32,

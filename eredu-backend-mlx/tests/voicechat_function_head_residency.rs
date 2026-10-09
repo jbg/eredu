@@ -15,8 +15,8 @@ use eredu_architectures::{
     },
 };
 use eredu_backend_mlx::{
-    MlxTensor, backend::runtime::checkpoint::binding::binding_bytes,
-    native::materialize_voicechat_function_head,
+    backend::runtime::checkpoint::binding::binding_bytes,
+    native::materialize_voicechat_function_head, MlxTensor,
 };
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -26,7 +26,7 @@ use eredu_core::residency::{MemoryTier, OffloadConfig};
 use eredu_nn::Tensor;
 use eredu_runtime::{DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions};
 use safemlx::{Array, Device, DeviceType, Stream};
-use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::Value;
 
 fn floats(value: &Value) -> Vec<f32> {

@@ -3,10 +3,10 @@ use super::*;
 use eredu_architectures::voicechat::{
     channel_decision::{ChannelDecision, FeedbackTokens},
     config::VoiceChatConfig,
-    output::{SpeechPayload, assemble},
+    output::{assemble, SpeechPayload},
     schedule::{
-        AGENT_CHANNEL, AudioSource, OUTPUT_CHANNEL, Progress, ScheduleLimits, SchedulePolicy,
-        ScheduleState, Step,
+        AudioSource, Progress, ScheduleLimits, SchedulePolicy, ScheduleState, Step, AGENT_CHANNEL,
+        OUTPUT_CHANNEL,
     },
 };
 use eredu_core::{RealtimeChannelPayload, RealtimeSlotCoordinate};
@@ -146,16 +146,14 @@ fn voicechat_output_keeps_tool_audio_clocks_and_validates_before_publication() {
         };
         let heads = has_heads.then_some(&decision);
         if has_speech {
-            assert!(
-                assemble(
-                    plan.clone(),
-                    progress,
-                    heads,
-                    SpeechPayload::<NumericTensor>::None,
-                    &context
-                )
-                .is_err()
-            );
+            assert!(assemble(
+                plan.clone(),
+                progress,
+                heads,
+                SpeechPayload::<NumericTensor>::None,
+                &context
+            )
+            .is_err());
             let mut wrong = progress;
             wrong.audio_frames += 1;
             assert!(assemble(plan.clone(), wrong, heads, payload(), &context).is_err());
@@ -258,24 +256,20 @@ fn voicechat_output_keeps_tool_audio_clocks_and_validates_before_publication() {
         codec_finished: true,
         ..empty
     };
-    assert!(
-        assemble::<NumericTensor>(
-            drain.clone(),
-            finished,
-            None,
-            SpeechPayload::Tail(&tail),
-            &context
-        )
-        .is_err()
-    );
+    assert!(assemble::<NumericTensor>(
+        drain.clone(),
+        finished,
+        None,
+        SpeechPayload::Tail(&tail),
+        &context
+    )
+    .is_err());
     let output =
         assemble::<NumericTensor>(drain, finished, None, SpeechPayload::None, &context).unwrap();
-    assert!(
-        output
-            .projection
-            .project(&host(&output.frame))
-            .unwrap()
-            .speech
-            .is_none()
-    );
+    assert!(output
+        .projection
+        .project(&host(&output.frame))
+        .unwrap()
+        .speech
+        .is_none());
 }

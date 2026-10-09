@@ -1,20 +1,20 @@
 //! Owner-only channel decisions retain the ordinary sampler and transaction.
 use super::voicechat_agent_sampling::{Draw, Sampling};
-use super::voicechat_rnnt_coordination::{Coordinator, coordinator_pair};
+use super::voicechat_rnnt_coordination::{coordinator_pair, Coordinator};
 use super::voicechat_speech_sampling::{Host, Ready};
 use super::*;
 use eredu_architectures::voicechat::{
     agent_sampling::{AgentSampler, AgentSamplingPolicy},
     channel_decision::{
-        ChannelDecisionPolicy, DecisionEvidence, DecisionInput, DecisionResolver, DecisionSource,
-        ReplicatedChannelDecisions, select_channels,
+        select_channels, ChannelDecisionPolicy, DecisionEvidence, DecisionInput, DecisionResolver,
+        DecisionSource, ReplicatedChannelDecisions,
     },
     channels::DualChannelLogits,
 };
-use eredu_core::{BackendFailure, scheduler::SemanticStateTransaction};
+use eredu_core::{scheduler::SemanticStateTransaction, BackendFailure};
 use eredu_runtime::{
-    RealtimeGenerationContract, RealtimeGenerationState,
-    replicated_execution::ReplicatedCoordinator,
+    replicated_execution::ReplicatedCoordinator, RealtimeGenerationContract,
+    RealtimeGenerationState,
 };
 use serde_json::Value;
 use std::{cell::Cell, sync::atomic::Ordering};
@@ -279,18 +279,16 @@ fn voicechat_channel_coordination_owner_policy_rollback_and_replay() {
                             audio_frame_index: Some(4),
                         };
                         let mut coordination = ReplicatedChannelDecisions::new(&mut wire, identity);
-                        assert!(
-                            select_channels::<TensorSampling, _, _, _, _>(
-                                &mut branch,
-                                &logits,
-                                DecisionSource::Resolved(&resolver),
-                                evidence,
-                                domain,
-                                Some(&mut coordination),
-                                &context
-                            )
-                            .is_err()
-                        );
+                        assert!(select_channels::<TensorSampling, _, _, _, _>(
+                            &mut branch,
+                            &logits,
+                            DecisionSource::Resolved(&resolver),
+                            evidence,
+                            domain,
+                            Some(&mut coordination),
+                            &context
+                        )
+                        .is_err());
                         assert_eq!(
                             branch.random_state().map(|r| r.count),
                             (rank == 0).then_some(0)
@@ -314,12 +312,10 @@ fn voicechat_channel_coordination_owner_policy_rollback_and_replay() {
                     );
                     assert!(failure.is_err());
                     if rank == 0 {
-                        assert!(
-                            failure
-                                .unwrap_err()
-                                .to_string()
-                                .contains("owner policy refused")
-                        );
+                        assert!(failure
+                            .unwrap_err()
+                            .to_string()
+                            .contains("owner policy refused"));
                     }
                     assert_eq!(
                         branch.random_state().map(|r| r.count),
@@ -332,18 +328,16 @@ fn voicechat_channel_coordination_owner_policy_rollback_and_replay() {
                     wire.corrupt = true;
                     let mut branch = canonical.branch().unwrap();
                     let mut coordination = ReplicatedChannelDecisions::new(&mut wire, [9, 2, 30]);
-                    assert!(
-                        select_channels::<TensorSampling, _, _, _, _>(
-                            &mut branch,
-                            &logits,
-                            DecisionSource::Resolved(&resolver),
-                            DecisionEvidence::default(),
-                            TokenDomain::new(16),
-                            Some(&mut coordination),
-                            &context
-                        )
-                        .is_err()
-                    );
+                    assert!(select_channels::<TensorSampling, _, _, _, _>(
+                        &mut branch,
+                        &logits,
+                        DecisionSource::Resolved(&resolver),
+                        DecisionEvidence::default(),
+                        TokenDomain::new(16),
+                        Some(&mut coordination),
+                        &context
+                    )
+                    .is_err());
                     assert_eq!(
                         branch.random_state().map(|r| r.count),
                         (rank == 0).then_some(0)
@@ -363,7 +357,10 @@ fn voicechat_channel_coordination_owner_policy_rollback_and_replay() {
                         &context,
                     )
                     .unwrap();
-                    assert_eq!(actual.raw_agent_id, case["expected"]["token"].as_u64().unwrap() as u32);
+                    assert_eq!(
+                        actual.raw_agent_id,
+                        case["expected"]["token"].as_u64().unwrap() as u32
+                    );
                     assert_eq!(
                         (
                             actual.raw_function_id,
@@ -387,18 +384,16 @@ fn voicechat_channel_coordination_owner_policy_rollback_and_replay() {
                         assert_eq!(resolver.calls.get(), 0);
                     }
                     // Authority cannot be replayed even with a still-unpublished branch.
-                    assert!(
-                        select_channels::<TensorSampling, _, _, _, _>(
-                            &mut branch,
-                            &logits,
-                            DecisionSource::Resolved(&resolver),
-                            DecisionEvidence::default(),
-                            TokenDomain::new(16),
-                            Some(&mut coordination),
-                            &context
-                        )
-                        .is_err()
-                    );
+                    assert!(select_channels::<TensorSampling, _, _, _, _>(
+                        &mut branch,
+                        &logits,
+                        DecisionSource::Resolved(&resolver),
+                        DecisionEvidence::default(),
+                        TokenDomain::new(16),
+                        Some(&mut coordination),
+                        &context
+                    )
+                    .is_err());
                     assert_eq!(
                         branch.random_state().map(|r| r.count),
                         (rank == 0).then_some(1)

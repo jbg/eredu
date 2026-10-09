@@ -22,7 +22,8 @@ fn linear<C: Config>(
         format: crate::linear_format::standard_linear_format(
             &weight,
             config.linear_format(&weight),
-        )?,
+        )?
+        .with_compute_element(config.linear_compute_element())?,
     })
 }
 

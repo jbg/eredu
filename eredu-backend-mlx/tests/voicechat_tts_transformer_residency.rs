@@ -12,7 +12,9 @@ use eredu_architectures::{
         checkpoint::Component,
         config::GemmaConfig,
         tts_transformer::TransformerConfig,
-        tts_transformer_layered::{CausalTransformerExecution, TransformerError, TransformerExecution},
+        tts_transformer_layered::{
+            CausalTransformerExecution, TransformerError, TransformerExecution,
+        },
         tts_transformer_preparation::PreparedTtsTransformerBindings,
     },
 };

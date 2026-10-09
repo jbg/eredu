@@ -6,6 +6,8 @@
 //! facade namespace for composing those semantics with reference, mock, or
 //! selected native mechanisms.
 
+pub use eredu_architectures::voicechat::precision::{SpeechFloat, SpeechPrecision};
+
 pub use crate::runtime::voicechat::{
     BoundVoiceChatFork, BoundVoiceChatSession, PreparedVoiceChatPhrase, PreparedVoiceChatPrompt,
     PreparedVoiceChatSession, PreparedVoiceChatSessionParts, PreparedVoiceChatToolResponse,

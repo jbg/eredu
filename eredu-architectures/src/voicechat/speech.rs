@@ -10,14 +10,14 @@ use super::tts_mog::MogHead;
 use super::tts_mog_layered::MogExecution;
 use super::tts_rvq::RvqRefinement;
 use super::tts_rvq_layered::{
-    RefinementPhase, RefinementSampling, RefinementStage, RvqExecution, agree_result,
+    agree_result, RefinementPhase, RefinementSampling, RefinementStage, RvqExecution,
 };
 use eredu_codec::ear::AudioDecoderExecution;
 use eredu_codec::ear_decoder::DecoderState;
-use eredu_core::{BackendFailure, execution_control::SnapshotEstimate};
+use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_nn::RetainedTensorRoots;
 use eredu_runtime::execution_control::{
-    SnapshotReservation, SnapshotValue, snapshot_value_estimate,
+    snapshot_value_estimate, SnapshotReservation, SnapshotValue,
 };
 
 use std::sync::Arc;
@@ -154,15 +154,15 @@ pub struct SpeechComponents<
     codec: &'a mut A,
 }
 impl<
-    'a,
-    B: NeuralBackend,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    A: AudioDecoderExecution<B>,
-    E: TransformerExecution<B>,
-> SpeechComponents<'a, B, X, Y, Z, W, A, E>
+        'a,
+        B: NeuralBackend,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        A: AudioDecoderExecution<B>,
+        E: TransformerExecution<B>,
+    > SpeechComponents<'a, B, X, Y, Z, W, A, E>
 {
     /// Validates cross-component codebook geometry before any causal invocation.
     pub fn new(

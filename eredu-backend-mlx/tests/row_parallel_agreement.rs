@@ -2,7 +2,7 @@
 #[path = "support/component_coordinator.rs"]
 mod component_coordinator;
 
-use eredu_backend_mlx::{MlxTensor, backend::nn::shared::MlxNeuralBackend as Backend};
+use eredu_backend_mlx::{backend::nn::shared::MlxNeuralBackend as Backend, MlxTensor};
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
     Error, LinearFormatSpec, LinearSpec, NeuralBackend, ParameterMetadata, ParameterSpec,
@@ -145,30 +145,26 @@ fn native_row_parallel_agreement_worker() {
     observer.fail = false;
 
     let malformed = tensor(&[1., 2., 3.], &[1, 3]);
-    assert!(
-        Backend::row_parallel_linear_with_input_observer(
-            &mut module,
-            if rank == 0 { &malformed } else { &input },
-            parallel,
-            &stream,
-            None,
-        )
-        .is_err()
-    );
+    assert!(Backend::row_parallel_linear_with_input_observer(
+        &mut module,
+        if rank == 0 { &malformed } else { &input },
+        parallel,
+        &stream,
+        None,
+    )
+    .is_err());
 
     // Both projections are valid locally, but different batch extents cannot
     // enter one all-reduce even though local feature widths may differ.
     let two_batches = tensor(&[1., 2., 1., 2.], &[2, 2]);
-    assert!(
-        Backend::row_parallel_linear_with_input_observer(
-            &mut module,
-            if rank == 0 { &two_batches } else { &input },
-            parallel,
-            &stream,
-            None,
-        )
-        .is_err()
-    );
+    assert!(Backend::row_parallel_linear_with_input_observer(
+        &mut module,
+        if rank == 0 { &two_batches } else { &input },
+        parallel,
+        &stream,
+        None,
+    )
+    .is_err());
 
     // Rank 0's valid projection exceeds the retained reduction contract's
     // 8,192-element limit; its peer must stop before submitting its own sum.
@@ -186,16 +182,14 @@ fn native_row_parallel_agreement_worker() {
     }
 
     let mut bias_mismatch = linear(rank, rank == 0, &stream);
-    assert!(
-        Backend::row_parallel_linear_with_input_observer(
-            &mut bias_mismatch,
-            &input,
-            parallel,
-            &stream,
-            None,
-        )
-        .is_err()
-    );
+    assert!(Backend::row_parallel_linear_with_input_observer(
+        &mut bias_mismatch,
+        &input,
+        parallel,
+        &stream,
+        None,
+    )
+    .is_err());
 
     // Equal metadata can still fail after reduction: length-three bias cannot
     // broadcast over a two-column output. Both ranks agree that returned error.
@@ -209,16 +203,14 @@ fn native_row_parallel_agreement_worker() {
     }
     let mut invalid_bias = linear(rank, true, &stream);
     invalid_bias.visit_parameters_mut(&mut InvalidBias);
-    assert!(
-        Backend::row_parallel_linear_with_input_observer(
-            &mut invalid_bias,
-            &input,
-            parallel,
-            &stream,
-            None,
-        )
-        .is_err()
-    );
+    assert!(Backend::row_parallel_linear_with_input_observer(
+        &mut invalid_bias,
+        &input,
+        parallel,
+        &stream,
+        None,
+    )
+    .is_err());
 
     // Agreed failures preserve this exact retained authority for a fresh call.
     let output = Backend::row_parallel_linear_with_input_observer(

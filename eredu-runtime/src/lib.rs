@@ -91,8 +91,8 @@ pub use component_pipeline::{
     validate_component_pipeline, validate_component_pipeline_ranges, PipelineBindingError,
 };
 pub use pipeline_executor::{
-    validate_pipeline_local_agreement, PipelineLocalAgreementError,
-    OrdinaryPipelinePartitionUnitStrategy, PartitionTensorAllocator, PipelinePartitionArchitecture,
+    validate_pipeline_local_agreement, OrdinaryPipelinePartitionUnitStrategy,
+    PartitionTensorAllocator, PipelineLocalAgreementError, PipelinePartitionArchitecture,
     PipelinePartitionExecutor, PipelinePartitionUnitStrategy, ResidentPipelinePartitionPass,
 };
 pub use tensor_wave::{RoutedTensorDimension, RoutedTensorReduction, RoutedTensorReductions};

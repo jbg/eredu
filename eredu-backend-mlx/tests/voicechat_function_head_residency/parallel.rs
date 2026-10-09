@@ -70,15 +70,13 @@ fn native_function_head_parallel_worker() {
         };
         assert_eq!(local_bytes, expected_rows as u64 * 4 * 4);
         let reads = source.source_diagnostics().unwrap().physical_reads;
-        assert!(
-            materialize_voicechat_function_head(
-                selected,
-                LayerWeightResidency::FullyResident,
-                &weights,
-                &stream
-            )
-            .is_err()
-        );
+        assert!(materialize_voicechat_function_head(
+            selected,
+            LayerWeightResidency::FullyResident,
+            &weights,
+            &stream
+        )
+        .is_err());
         assert_eq!(
             source.source_diagnostics().unwrap().physical_reads,
             reads,
@@ -91,16 +89,14 @@ fn native_function_head_parallel_worker() {
             .select_parallel(wrong_topology)
             .unwrap();
         let reads = source.source_diagnostics().unwrap().physical_reads;
-        assert!(
-            materialize_voicechat_function_head_parallel(
-                wrong_rank,
-                &coordinator,
-                LayerWeightResidency::FullyResident,
-                &weights,
-                &stream,
-            )
-            .is_err()
-        );
+        assert!(materialize_voicechat_function_head_parallel(
+            wrong_rank,
+            &coordinator,
+            LayerWeightResidency::FullyResident,
+            &weights,
+            &stream,
+        )
+        .is_err());
         assert_eq!(
             source.source_diagnostics().unwrap().physical_reads,
             reads,

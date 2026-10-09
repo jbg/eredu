@@ -5,8 +5,8 @@ use super::*;
 use eredu_core::execution_control::SnapshotResourceKind;
 use eredu_core::scheduler::RequestId;
 use eredu_runtime::execution_control::{
-    ForkStateEstimate, IsolatedStateFork, SnapshotBudget, SnapshotRetainedGrowth, SnapshotValue,
-    snapshot_value_estimate,
+    snapshot_value_estimate, ForkStateEstimate, IsolatedStateFork, SnapshotBudget,
+    SnapshotRetainedGrowth, SnapshotValue,
 };
 
 pub(in crate::runtime::voicechat) struct ForkedPublication<S: SemanticStateTransaction, D> {

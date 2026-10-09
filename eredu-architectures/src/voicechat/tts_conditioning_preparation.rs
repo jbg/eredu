@@ -208,9 +208,8 @@ impl PreparedConditioningBindings {
             ));
         }
         let description = conditioning_parameter_description(self.dimensions)?;
-        let layout =
-            eredu_runtime::derive_partitioned_local_layout(&description, topology)
-                .map_err(ConditioningPreparationError::Parallel)?;
+        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
+            .map_err(ConditioningPreparationError::Parallel)?;
         if let Some(selected) = self.local_layout.as_ref() {
             if selected != &layout {
                 return Err(ConditioningPreparationError::Parallel(

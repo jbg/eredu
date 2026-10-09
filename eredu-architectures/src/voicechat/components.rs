@@ -153,6 +153,17 @@ impl<'a> PreparedVoiceChatConstruction<'a> {
         })
     }
 
+    /// Selects architecture-owned precision before native construction and pool admission.
+    pub fn with_speech_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, VoiceChatConstructionError> {
+        self.speech = self
+            .speech
+            .with_precision(precision, self.artifacts.plan().parameters())?;
+        Ok(self)
+    }
+
     /// Exact independently selected speech parameter requirements.
     pub fn speech_providers(&self) -> &PreparedSpeechProviders {
         &self.speech

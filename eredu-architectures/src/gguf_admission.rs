@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use eredu_checkpoint::validation::{CheckpointValidation, validate_gguf_plan};
+use eredu_checkpoint::validation::{validate_gguf_plan, CheckpointValidation};
 use eredu_gguf::{Checkpoint, MetadataValue};
 
 use crate::{
-    GgufArchitecture,
     configuration::{GgufArchitecturePlan, GgufModelConfig},
+    GgufArchitecture,
 };
 
 pub(crate) fn resolve(
@@ -137,7 +137,7 @@ fn resolve_family(
     match architecture {
         GgufArchitecture::VoiceChat => {
             use crate::voicechat::checkpoint::{
-                GgufLayout, config_from_gguf_metadata, gguf_plan, validate_gguf_metadata,
+                config_from_gguf_metadata, gguf_plan, validate_gguf_metadata, GgufLayout,
             };
             let config = config_from_gguf_metadata(checkpoint.metadata())?;
             validate_gguf_metadata(&config, GgufLayout::Complete, checkpoint.metadata())?;

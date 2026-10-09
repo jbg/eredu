@@ -152,22 +152,22 @@ mod shadow;
 mod voicechat_perception;
 #[path = "reference_numeric/voicechat_perception_distributed.rs"]
 mod voicechat_perception_distributed;
-#[path = "reference_numeric/voicechat_perception_pipeline_failure.rs"]
-mod voicechat_perception_pipeline_failure;
 #[path = "reference_numeric/voicechat_perception_parallel.rs"]
 mod voicechat_perception_parallel;
+#[path = "reference_numeric/voicechat_perception_pipeline_failure.rs"]
+mod voicechat_perception_pipeline_failure;
 #[path = "reference_numeric/voicechat_perception_residency.rs"]
 mod voicechat_perception_residency;
 #[path = "reference_numeric/voicechat_rnnt.rs"]
 mod voicechat_rnnt;
 #[path = "reference_numeric/voicechat_rnnt_coordination.rs"]
 mod voicechat_rnnt_coordination;
-#[path = "reference_numeric/voicechat_rnnt_residency.rs"]
-mod voicechat_rnnt_residency;
-#[path = "reference_numeric/voicechat_rnnt_predictor.rs"]
-mod voicechat_rnnt_predictor;
 #[path = "reference_numeric/voicechat_rnnt_pipeline.rs"]
 mod voicechat_rnnt_pipeline;
+#[path = "reference_numeric/voicechat_rnnt_predictor.rs"]
+mod voicechat_rnnt_predictor;
+#[path = "reference_numeric/voicechat_rnnt_residency.rs"]
+mod voicechat_rnnt_residency;
 #[path = "reference_numeric/voicechat_silence.rs"]
 mod voicechat_silence;
 
@@ -28935,14 +28935,14 @@ mod voicechat_channels;
 
 #[path = "reference_numeric/voicechat_codec_decoder_residency.rs"]
 mod voicechat_codec_decoder_residency;
-#[path = "reference_numeric/voicechat_codec_pipeline.rs"]
-mod voicechat_codec_pipeline;
 #[path = "reference_numeric/voicechat_codec_encoder_residency.rs"]
 mod voicechat_codec_encoder_residency;
-#[path = "reference_numeric/voicechat_codec_quantizer_residency.rs"]
-mod voicechat_codec_quantizer_residency;
+#[path = "reference_numeric/voicechat_codec_pipeline.rs"]
+mod voicechat_codec_pipeline;
 #[path = "reference_numeric/voicechat_codec_quantizer_failure.rs"]
 mod voicechat_codec_quantizer_failure;
+#[path = "reference_numeric/voicechat_codec_quantizer_residency.rs"]
+mod voicechat_codec_quantizer_residency;
 #[path = "reference_numeric/voicechat_conditioning.rs"]
 mod voicechat_conditioning;
 #[path = "reference_numeric/voicechat_conditioning_residency.rs"]
@@ -28993,10 +28993,10 @@ mod voicechat_function_head_residency;
 #[path = "reference_numeric/voicechat_agent_sampling.rs"]
 mod voicechat_agent_sampling;
 
-#[path = "reference_numeric/voicechat_channel_decision.rs"]
-mod voicechat_channel_decision;
 #[path = "reference_numeric/voicechat_channel_coordination.rs"]
 mod voicechat_channel_coordination;
+#[path = "reference_numeric/voicechat_channel_decision.rs"]
+mod voicechat_channel_decision;
 
 #[path = "reference_numeric/voicechat_speech_sampling.rs"]
 mod voicechat_speech_sampling;

@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 /// Normalized equations and exact parameter namespace for one TTS transformer.
 #[derive(Debug, Clone)]
 pub struct TransformerConfig {
+    precision: super::precision::SpeechPrecision,
     geometry: GemmaConfig,
     schedule: LayerSchedule<AttentionPolicy>,
     formats: BTreeMap<String, LinearFormat>,
@@ -89,7 +90,17 @@ impl TransformerConfig {
             schedule: LayerSchedule::new(geometry.num_hidden_layers, policies)
                 .map_err(Error::backend)?,
             formats: BTreeMap::new(),
+            precision: Default::default(),
         })
+    }
+    /// Selects projection storage/arithmetic while norms and caches remain F32.
+    pub fn with_precision(mut self, precision: super::precision::SpeechPrecision) -> Self {
+        self.precision = precision;
+        self
+    }
+    /// Retained floating policy.
+    pub fn precision(&self) -> super::precision::SpeechPrecision {
+        self.precision
     }
     /// Installs physical formats selected by the retained checkpoint recipe.
     pub fn with_formats(mut self, formats: BTreeMap<String, LinearFormat>) -> Self {
@@ -135,6 +146,9 @@ impl TransformerConfig {
     }
 }
 impl Config for TransformerConfig {
+    fn linear_compute_element(&self) -> Option<eredu_nn::TensorElementType> {
+        self.precision.projection_element()
+    }
     fn model_family(&self) -> &'static str {
         "nemotron_voicechat"
     }
@@ -144,7 +158,8 @@ impl Config for TransformerConfig {
     fn architecture_fingerprint(&self) -> String {
         format!(
             "voicechat-tts-transformer:{:?}:{:?}",
-            self.geometry, self.formats
+            self.geometry,
+            (&self.formats, self.precision)
         )
     }
     fn parameter_root(&self) -> &str {

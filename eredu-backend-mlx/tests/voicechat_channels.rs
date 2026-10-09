@@ -12,7 +12,7 @@ use eredu_architectures::{
         config::ChannelPolicy,
     },
 };
-use eredu_backend_mlx::{MlxTensor, backend::nn::shared::MlxNeuralBackend as Backend};
+use eredu_backend_mlx::{backend::nn::shared::MlxNeuralBackend as Backend, MlxTensor};
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
     LinearFormatSpec, NormalizationOperator, ParameterMetadata, ParameterVisitorMut, Parameterized,

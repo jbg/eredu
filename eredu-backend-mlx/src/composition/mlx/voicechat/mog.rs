@@ -232,11 +232,13 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
+            let precision = prepared.precision();
             let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => MogArchitecture::<MlxNeuralBackend>::new_parallel(dimensions, local),
                 None => MogArchitecture::<MlxNeuralBackend>::new(dimensions),
             }
+            .and_then(|architecture| architecture.with_precision(precision))
             .map_err(BackendFailure::from_error)?;
             let (policy, metadata) = prepare_layerwise_policy_from_bindings(
                 source,

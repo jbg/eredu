@@ -257,16 +257,27 @@ impl<T> MogForward<T> {
 
 /// One architecture graph whose request policy activates only required parameter units.
 pub struct MogArchitecture<B: NeuralBackend> {
+    precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
     parallel: Option<(MogLocalDimensions, LocalModelLayout)>,
     empty: MogStaticModules,
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> MogArchitecture<B> {
+    /// Selects storage/arithmetic policy for all independently constructed units.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, TtsError> {
+        precision.validate().map_err(TtsError::Configuration)?;
+        self.precision = precision;
+        Ok(self)
+    }
     /// Validates dimensions without native allocation.
     pub fn new(dimensions: MogDimensions) -> Result<Self, TtsError> {
         dimensions.validate()?;
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             parallel: None,
             empty: MogStaticModules,
@@ -397,12 +408,10 @@ impl<B: NeuralBackend> MogArchitecture<B> {
                 rank: self.dimensions.rank,
             });
         Ok(match group {
-            0 => MogUnit::Block(MogBlock::new_local(
-                self.dimensions,
-                local.intermediate,
-                index,
-                context,
-            )?),
+            0 => MogUnit::Block(
+                MogBlock::new_local(self.dimensions, local.intermediate, index, context)?
+                    .with_precision(self.precision)?,
+            ),
             1 => MogUnit::Prediction(MogPredictionHead::new(self.dimensions, context)?),
             _ => MogUnit::Components(MogComponentBank::new_local(
                 self.dimensions,
@@ -567,7 +576,7 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for MogArchitecture<B> {
             "voicechat_mog",
             format!(
                 "{:?}:{:?}",
-                self.dimensions,
+                (self.dimensions, self.precision),
                 self.parallel.as_ref().map(|(_, layout)| layout)
             ),
             1,

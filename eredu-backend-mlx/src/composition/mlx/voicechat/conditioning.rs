@@ -40,6 +40,8 @@ enum Execution {
 pub struct MlxConditioning {
     execution: Execution,
     parallel: Option<Group>,
+    immutable_identity: eredu_core::resources::ResourceIdentity,
+    immutable_stream_index: i32,
 }
 
 impl MlxConditioning {
@@ -74,6 +76,16 @@ impl MlxConditioning {
 }
 
 impl ConditioningExecution<MlxNeuralBackend> for MlxConditioning {
+    fn immutable_parameters_identity(
+        &self,
+        context: &Stream,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        (matches!(self.execution, Execution::Resident(_))
+            && self.parallel.is_none()
+            && context.get_index().ok() == Some(self.immutable_stream_index))
+        .then_some(&self.immutable_identity)
+    }
+
     fn dimensions(&self) -> ConditioningDimensions {
         match &self.execution {
             Execution::Resident(model) => model.dimensions(),
@@ -282,6 +294,19 @@ fn materialize(
                 MlxConditioning {
                     execution,
                     parallel: parallel.map(|(_, group)| group.clone()),
+                    immutable_stream_index: execution_stream
+                        .get_index()
+                        .map_err(BackendFailure::from_error)?,
+                    immutable_identity: {
+                        static NEXT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        eredu_core::resources::ResourceIdentity {
+                            scope: "mlx.immutable.conditioning".into(),
+                            key: NEXT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        }
+                    },
                 },
                 metadata,
             ))

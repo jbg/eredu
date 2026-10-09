@@ -9,8 +9,8 @@ use super::tts_conditioning_layered::{
 };
 use super::tts_mog_layered::MogExecution;
 use super::tts_rvq_layered::{
-    BorrowedRefinementSampling, RefinementPhase, RefinementSampling, RefinementStage, RvqExecution,
-    agree_result,
+    agree_result, BorrowedRefinementSampling, RefinementPhase, RefinementSampling, RefinementStage,
+    RvqExecution,
 };
 use super::tts_transformer_layered::{CausalTransformerExecution, TransformerExecution};
 use eredu_nn::{Index, NeuralBackend, Parameterized, Tensor};
@@ -95,6 +95,61 @@ impl<T: Tensor> TtsFrame<T> {
     }
 }
 
+/// Maximum retained single-token character results; longer batches bypass the cache.
+pub const CHARACTER_CACHE_ENTRIES: usize = 64;
+const CHARACTER_CACHE_MAX_COLUMNS: i32 = 64;
+
+type ParameterOwners = (
+    eredu_core::resources::ResourceIdentity,
+    eredu_core::resources::ResourceIdentity,
+);
+
+#[derive(Default)]
+struct CharacterCache<T> {
+    owners: Option<ParameterOwners>,
+    entries: std::collections::VecDeque<(CharacterBatch, T)>,
+}
+impl<T> CharacterCache<T> {
+    fn new() -> Self {
+        Self {
+            owners: None,
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<T: Clone> CharacterCache<T> {
+    fn run<E>(
+        &mut self,
+        batch: &CharacterBatch,
+        owners: Option<ParameterOwners>,
+        compute: impl FnOnce() -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, E> {
+        if self.owners != owners {
+            self.entries.clear();
+            self.owners = owners;
+        }
+        let cacheable = self.owners.is_some()
+            && batch.token_shape() == [1, 1]
+            && batch.shape()[1] <= CHARACTER_CACHE_MAX_COLUMNS;
+        if cacheable {
+            if let Some((_, value)) = self.entries.iter().find(|(key, _)| key == batch) {
+                return Ok(Some(value.clone()));
+            }
+        }
+        let result = compute()?;
+        if cacheable {
+            if let Some(value) = result.as_ref() {
+                if self.entries.len() == CHARACTER_CACHE_ENTRIES {
+                    self.entries.pop_front();
+                }
+                self.entries.push_back((batch.clone(), value.clone()));
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Independently materializable TTS components with one composed inference path.
 #[derive(Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -118,6 +173,8 @@ pub struct TtsGenerator<
     pub mog: Y,
     #[parameter(skip)]
     geometry: FrameGeometry,
+    #[parameter(skip)]
+    character_cache: CharacterCache<B::Tensor>,
     #[parameter(skip)]
     config: TtsConfig,
     #[parameter(skip)]
@@ -149,13 +206,13 @@ pub struct TtsGeneratorParts<
 }
 
 impl<
-    B: NeuralBackend,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    E: TransformerExecution<B>,
-> TtsGeneratorParts<B, X, Y, Z, W, E>
+        B: NeuralBackend,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        E: TransformerExecution<B>,
+    > TtsGeneratorParts<B, X, Y, Z, W, E>
 {
     /// Collects selected providers for consuming generator assembly without new parameters.
     pub fn new(
@@ -186,9 +243,27 @@ impl<B: NeuralBackend> TtsGenerator<B> {
         speaker_frames: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
+        Self::new_with_precision(
+            config,
+            characters,
+            speaker_frames,
+            Default::default(),
+            context,
+        )
+    }
+    /// Constructs matching narrow projections with F32 conditioning, sampling and caches.
+    pub fn new_with_precision(
+        config: &TtsConfig,
+        characters: i32,
+        speaker_frames: i32,
+        precision: super::precision::SpeechPrecision,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, TtsError> {
+        precision.validate().map_err(TtsError::Configuration)?;
         let geometry = FrameGeometry::new(config, characters, speaker_frames)?;
-        let causal = TransformerConfig::new(&config.backbone)?;
-        let character_config = TransformerConfig::new(&config.character_encoder)?;
+        let causal = TransformerConfig::new(&config.backbone)?.with_precision(precision);
+        let character_config =
+            TransformerConfig::new(&config.character_encoder)?.with_precision(precision);
         let mog = MogDimensions::from_config(config)?;
         let parts = TtsGeneratorParts::new(
             ResidentConditioning::new(
@@ -203,20 +278,20 @@ impl<B: NeuralBackend> TtsGenerator<B> {
                 geometry.hidden,
                 context,
             )?,
-            MogHead::new(mog, context)?,
+            MogHead::new_with_precision(mog, precision, context)?,
         );
         Self::from_parts(config, characters, speaker_frames, parts)
     }
 }
 
 impl<
-    B: NeuralBackend,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    E: TransformerExecution<B>,
-> TtsGenerator<B, X, Y, Z, W, E>
+        B: NeuralBackend,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        E: TransformerExecution<B>,
+    > TtsGenerator<B, X, Y, Z, W, E>
 {
     /// Assembles bound components without redeclaring learned parameter slots.
     pub fn from_parts(
@@ -233,6 +308,7 @@ impl<
             refinement: parts.refinement,
             mog: parts.mog,
             geometry,
+            character_cache: CharacterCache::new(),
             config: config.clone(),
             conditioning_dimensions: ConditioningDimensions::from_config(
                 config,
@@ -278,12 +354,27 @@ impl<
         batch: &CharacterBatch,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, TtsError> {
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        batch.validate_dimensions(self.conditioning.dimensions().character)?;
+        let owners = self
+            .conditioning
+            .immutable_parameters_identity(context)
+            .zip(
+                self.character_transformer
+                    .immutable_parameters_identity(context),
+            )
+            .map(|(conditioning, transformer)| (conditioning.clone(), transformer.clone()));
         let transformer = &mut self.character_transformer;
-        self.conditioning.character_forward(
-            batch,
-            |embedded, mask| Ok(transformer.forward_encoder(embedded, mask, context)?),
-            context,
-        )
+        let conditioning = &mut self.conditioning;
+        self.character_cache.run(batch, owners, || {
+            conditioning.character_forward(
+                batch,
+                |embedded, mask| Ok(transformer.forward_encoder(embedded, mask, context)?),
+                context,
+            )
+        })
     }
 
     /// Prefills speaker/text context without generating a code or drawing randomness.
@@ -471,5 +562,138 @@ impl<
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod character_cache_tests {
+    use super::*;
+    use crate::voicechat::tts_conditioning::{CharacterFlags, CharacterMapping};
+
+    fn mapping() -> CharacterMapping {
+        let mut vocabulary = std::collections::BTreeMap::new();
+        for length in 1..=65 {
+            vocabulary.insert(length - 1, "a".repeat(length as usize));
+        }
+        vocabulary.insert(65, "?a".into());
+        vocabulary.insert(66, "aa?".into());
+        let mut continuation = vec![0; 68];
+        continuation[65] = 1;
+        CharacterMapping::new(
+            &vocabulary,
+            CharacterFlags {
+                continuation,
+                continuation_pad: 67,
+                special: vec![0; 67],
+                special_pad: 66,
+            },
+        )
+        .unwrap()
+    }
+    fn owners(key: &str) -> Option<ParameterOwners> {
+        let identity = eredu_core::resources::ResourceIdentity {
+            scope: "test.immutable".into(),
+            key: key.into(),
+        };
+        Some((identity.clone(), identity))
+    }
+
+    #[test]
+    fn immutable_cache_separates_flags_owners_and_uncertified_execution() {
+        let mapping = mapping();
+        let plain = mapping.prepare(&[0], None, 1, 1, 64).unwrap();
+        let continuation = mapping.prepare(&[65], None, 1, 1, 64).unwrap();
+        assert_eq!(plain.ids(), continuation.ids());
+        let mut cache = CharacterCache::<i32>::new();
+        assert_eq!(
+            cache
+                .run(&plain, owners("a"), || Ok::<_, ()>(Some(7)))
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            cache
+                .run(&plain, owners("a"), || -> Result<Option<i32>, ()> {
+                    panic!("cached token reran encoder")
+                })
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            cache
+                .run(&continuation, owners("a"), || Ok::<_, ()>(Some(11)))
+                .unwrap(),
+            Some(11)
+        );
+        assert_eq!(
+            cache
+                .run(&plain, owners("b"), || Ok::<_, ()>(Some(13)))
+                .unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            cache.run(&plain, None, || Ok::<_, ()>(Some(17))).unwrap(),
+            Some(17)
+        );
+        assert_eq!(
+            cache.run(&plain, None, || Ok::<_, ()>(Some(19))).unwrap(),
+            Some(19)
+        );
+    }
+
+    #[test]
+    fn character_cache_evicts_at_bound_and_bypasses_long_rows_and_failed_work() {
+        let mapping = mapping();
+        let mut cache = CharacterCache::<i32>::new();
+        for id in 0..64 {
+            let batch = mapping.prepare(&[id], None, 1, 1, 64).unwrap();
+            assert_eq!(
+                cache
+                    .run(&batch, owners("a"), || Ok::<_, ()>(Some(id)))
+                    .unwrap(),
+                Some(id)
+            );
+        }
+        let long = mapping.prepare(&[64], None, 1, 1, 65).unwrap();
+        assert_eq!(
+            cache
+                .run(&long, owners("a"), || Ok::<_, ()>(Some(101)))
+                .unwrap(),
+            Some(101)
+        );
+        assert_eq!(
+            cache
+                .run(&long, owners("a"), || Ok::<_, ()>(Some(103)))
+                .unwrap(),
+            Some(103)
+        );
+        let first = mapping.prepare(&[0], None, 1, 1, 64).unwrap();
+        assert_eq!(
+            cache
+                .run(&first, owners("a"), || -> Result<Option<i32>, ()> {
+                    panic!("long row evicted bounded result")
+                })
+                .unwrap(),
+            Some(0)
+        );
+        let extra = mapping.prepare(&[65], None, 1, 1, 64).unwrap();
+        assert!(cache.run(&extra, owners("a"), || Err(())).is_err());
+        assert_eq!(
+            cache
+                .run(&first, owners("a"), || -> Result<Option<i32>, ()> {
+                    panic!("failure evicted prior result")
+                })
+                .unwrap(),
+            Some(0)
+        );
+        cache
+            .run(&extra, owners("a"), || Ok::<_, ()>(Some(107)))
+            .unwrap();
+        assert_eq!(
+            cache
+                .run(&first, owners("a"), || Ok::<_, ()>(Some(109)))
+                .unwrap(),
+            Some(109)
+        );
     }
 }

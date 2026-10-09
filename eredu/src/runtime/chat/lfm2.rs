@@ -1067,8 +1067,6 @@ mod tests {
     };
     use eredu_core::generation::{FinishReason, SemanticEvent};
 
-
-
     fn parameters() -> DialectParameters {
         DialectParameters::Custom(&LFM2_PARAMETERS)
     }

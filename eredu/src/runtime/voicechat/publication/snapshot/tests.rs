@@ -5,9 +5,9 @@ use eredu_core::execution_control::{SnapshotEstimate, SnapshotLimits};
 
 use super::*;
 use crate::runtime::voicechat::{
-    VoiceChatConversationOutput,
     conversation::tests::{capacity, conversation, frame},
     tools::tests::{channel, limits},
+    VoiceChatConversationOutput,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

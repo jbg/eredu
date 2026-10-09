@@ -14,11 +14,11 @@ use eredu_architectures::voicechat::{
     state::State,
 };
 use eredu_core::{
-    AttentionPolicy, LayerSchedule, cache::LayerCachePolicy, scheduler::SemanticStateTransaction,
+    cache::LayerCachePolicy, scheduler::SemanticStateTransaction, AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::AttentionCache;
 use eredu_runtime::{RealtimeGenerationState, RealtimeGenerationTransactionError, StateLayout};
-use safemlx::{Device, DeviceType, transforms::async_eval_with_event};
+use safemlx::{transforms::async_eval_with_event, Device, DeviceType};
 use std::{panic::AssertUnwindSafe, rc::Rc};
 
 mod backbone;

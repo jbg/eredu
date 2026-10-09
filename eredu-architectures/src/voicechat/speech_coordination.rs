@@ -1,14 +1,13 @@
 //! Selected owner authority for ordinary speech refinement and its RNG transaction.
 use super::super::{
     speech_sampling::SpeechSamplingError,
-    tts_mog::{GUMBEL_EPSILON, TtsError},
+    tts_mog::{TtsError, GUMBEL_EPSILON},
     tts_rvq_layered::{RefinementPhase, RefinementSampling},
 };
 use eredu_nn::{NeuralBackend, Tensor, TensorElementType};
 use eredu_runtime::{
-    DenseSamplingBackend, GumbelTruncation, RealtimeGenerationBranch,
-    RealtimeRandomStateTransactionError, RealtimeScheduleState,
-    replicated_execution::ReplicatedCoordinator,
+    replicated_execution::ReplicatedCoordinator, DenseSamplingBackend, GumbelTruncation,
+    RealtimeGenerationBranch, RealtimeRandomStateTransactionError, RealtimeScheduleState,
 };
 
 const PROTOCOL: u64 = 0x5350454543480001;
@@ -141,10 +140,10 @@ impl<B, D> RefinementSampling<B> for Sampler<'_, '_, B, D>
 where
     B: NeuralBackend,
     D: DenseSamplingBackend<
-            Logits = B::Tensor,
-            Token = B::Tensor,
-            Context = <B::Tensor as Tensor>::Context,
-        >,
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
     fn agree(&mut self, phase: RefinementPhase, success: bool) -> Result<(), TtsError> {
@@ -249,10 +248,10 @@ pub(super) fn sampled<B, D, M, Q, P, S, C, O>(
 where
     B: NeuralBackend,
     D: DenseSamplingBackend<
-            Logits = B::Tensor,
-            Token = B::Tensor,
-            Context = <B::Tensor as Tensor>::Context,
-        >,
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
     D::RandomState: Clone,
     D::Error: std::error::Error + Send + Sync + 'static,
     Q: RealtimeScheduleState,

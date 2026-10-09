@@ -7,15 +7,15 @@ use eredu_checkpoint::{
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ExecutionUnitLayout, LocalModelLayout, ParameterGroupOwner,
-    RecipeBindingError, WeightBinding, bindings_from_recipe_set, place_weight_bindings,
+    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
+    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
 };
 
 use super::{
     artifact::{ParameterAdmission, RetainedVoiceChatArtifacts},
     channels::{ChannelError, TEXT_VOCABULARY_SIZE},
     checkpoint::Component,
-    function_head_layered::{FunctionHeadDimensions, function_head_parameter_description},
+    function_head_layered::{function_head_parameter_description, FunctionHeadDimensions},
     parameters::SpeechParameterError,
 };
 
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn function_head_collective_admission_requires_failure_and_exact_f32_gather_bounds() {
-        use eredu_core::{CollectiveGroupId, CompletionCancellationMode, checkpoint::TensorDtype};
+        use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, CompletionCancellationMode};
         use eredu_runtime::{
             CommunicationCompletionPolicy, CommunicationGroupDescriptor,
             CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
@@ -116,16 +116,14 @@ mod tests {
             CommunicationManifest::new(
                 2,
                 0,
-                vec![
-                    CommunicationGroupDescriptor::new(
-                        id,
-                        0,
-                        vec![0, 1],
-                        Some(0),
-                        CommunicationGroupRequirements::new(operations).unwrap(),
-                    )
-                    .unwrap(),
-                ],
+                vec![CommunicationGroupDescriptor::new(
+                    id,
+                    0,
+                    vec![0, 1],
+                    Some(0),
+                    CommunicationGroupRequirements::new(operations).unwrap(),
+                )
+                .unwrap()],
                 vec![],
             )
             .unwrap()
@@ -518,8 +516,8 @@ pub fn validate_parallel_communication(
 ) -> Result<(), FunctionHeadPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
     use eredu_runtime::{
-        CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-        replicated_execution::validate_collective_coordination,
+        replicated_execution::validate_collective_coordination, CommunicationOperation,
+        CommunicationOperationRequirement, CommunicationTensorLimits,
     };
     dimensions.validate()?;
     let selected = validate_collective_coordination(manifest, group, [])?;

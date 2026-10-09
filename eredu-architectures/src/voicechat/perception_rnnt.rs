@@ -222,13 +222,22 @@ impl<B: NeuralBackend> PerceptionRnnt<B> {
         rnnt: RnntDimensions,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, PerceptionRnntError> {
+        Self::new_with_precision(perception, rnnt, Default::default(), context)
+    }
+    /// Constructs perception with selected projection precision and F32 RNNT state.
+    pub fn new_with_precision(
+        perception: PerceptionDimensions,
+        rnnt: RnntDimensions,
+        precision: super::precision::SpeechPrecision,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, PerceptionRnntError> {
         if perception.block.width != rnnt.encoder_width {
             return Err(PerceptionRnntError::Geometry(
                 "RNNT must consume the unprojected perception width",
             ));
         }
         Self::from_parts(
-            Perception::new(perception, context)?,
+            Perception::new_with_precision(perception, precision, context)?,
             Rnnt::new(rnnt, context)?,
         )
     }

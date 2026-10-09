@@ -274,11 +274,9 @@ fn voicechat_function_head_parallel_resident_and_bounded_gather_pinned_logits() 
                         }
                         assert!(bounded.runtime().policy().inner.events.is_empty());
                         bounded.runtime_mut().policy_mut().inner.fail_acquire = Some(0);
-                        assert!(
-                            bounded
-                                .project_parallel(&hidden, &parallel, &context)
-                                .is_err()
-                        );
+                        assert!(bounded
+                            .project_parallel(&hidden, &parallel, &context)
+                            .is_err());
                         assert_eq!(
                             bounded.runtime().policy().inner.events,
                             vec![
@@ -311,12 +309,12 @@ fn voicechat_function_head_parallel_resident_and_bounded_gather_pinned_logits() 
 
 #[test]
 fn voicechat_function_head_parallel_local_failures_agree_before_gather_and_retry() {
-    use super::voicechat_rnnt_coordination::{Coordinator, coordinator_pair};
+    use super::voicechat_rnnt_coordination::{coordinator_pair, Coordinator};
     use eredu_architectures::voicechat::{
         channels::ChannelError, function_head_layered::function_head_parameter_description,
     };
     use eredu_runtime::{
-        LayeredLocalPhase, LayeredTraversalHook, replicated_execution::ReplicatedCoordinator,
+        replicated_execution::ReplicatedCoordinator, LayeredLocalPhase, LayeredTraversalHook,
     };
     use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
 
@@ -445,16 +443,15 @@ fn voicechat_function_head_parallel_local_failures_agree_before_gather_and_retry
                         hidden.shape()[1],
                         hidden.shape()[2],
                     ]);
-                    assert!(
-                        head.project_parallel_guarded(
+                    assert!(head
+                        .project_parallel_guarded(
                             if rank == 0 { &hidden } else { &larger_batch },
                             &parallel,
                             &context,
                             &mut hook,
                             agree,
                         )
-                        .is_err()
-                    );
+                        .is_err());
                     assert!(head.runtime().policy().inner.events.is_empty());
                     assert_eq!(world.tensor_collective_calls(), 0);
 
@@ -500,12 +497,9 @@ fn voicechat_function_head_parallel_local_failures_agree_before_gather_and_retry
                     head.runtime_mut().policy_mut().inner.fail_acquire = None;
                     head.runtime_mut().policy_mut().inner.events.clear();
                     head.runtime_mut().policy_mut().malformed_unit = rank == 0;
-                    assert!(
-                        head.project_parallel_guarded(
-                            &hidden, &parallel, &context, &mut hook, agree
-                        )
-                        .is_err()
-                    );
+                    assert!(head
+                        .project_parallel_guarded(&hidden, &parallel, &context, &mut hook, agree)
+                        .is_err());
                     assert_eq!(world.tensor_collective_calls(), 0);
                     assert_eq!(head.runtime().policy().aborted.last(), Some(&true));
                     assert_eq!(

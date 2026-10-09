@@ -75,6 +75,18 @@ impl CacheResidencyManager {
         self.copy_session(stream, self.options().clone(), false)
     }
 
+    /// Shares immutable sealed roots in an independent namespace in the same pool.
+    pub(crate) fn transaction_candidate(
+        &self,
+        stream: &Stream,
+    ) -> Result<Self, CacheResidencyError> {
+        self.copy_session(
+            stream,
+            self.options().clone().with_pool(self.pool().clone())?,
+            false,
+        )
+    }
+
     /// Copies sealed arrays into a new namespace in the same bounded process pool.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, CacheResidencyError> {
         self.copy_session(

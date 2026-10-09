@@ -5,7 +5,7 @@
 //! this component. Both guidance lanes use the same projected audio feedback.
 
 use super::{
-    tts_mog::{TtsError, f32_shape, parameter},
+    tts_mog::{f32_shape, parameter, TtsError},
     tts_rvq_layered::RvqExecution,
 };
 use eredu_nn::{Index, NeuralBackend, Parameter, ParameterSpec, Parameterized, Tensor};

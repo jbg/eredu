@@ -141,11 +141,9 @@ fn voicechat_rvq_refinement_matches_nvidia_and_replays_the_same_transition() {
             .unwrap();
         compare(&input, &step["input"], &fixture);
         // A malformed sampled payload cannot modify a retained candidate.
-        assert!(
-            refinement
-                .advance(&state, &NumericTensor::zeros(vec![1, 1, 3]), &context)
-                .is_err()
-        );
+        assert!(refinement
+            .advance(&state, &NumericTensor::zeros(vec![1, 1, 3]), &context)
+            .is_err());
         let latent = tensor(&step["latent"]);
         state = refinement.advance(&state, &latent, &context).unwrap();
         assert_eq!(snapshot.codes().data, tensor(&step["codes_before"]).data);
@@ -196,4 +194,35 @@ fn voicechat_rvq_refinement_matches_nvidia_and_replays_the_same_transition() {
         &case["summed_feedback"],
         &fixture,
     );
+}
+
+#[test]
+fn voicechat_rvq_parameter_rebinding_invalidates_retained_codebook_norms() {
+    use eredu_architectures::voicechat::tts_rvq::RvqRefinement;
+    let context = NumericContext::default();
+    let mut refinement = RvqRefinement::<NumericBackend>::new(2, 1, 1, &context).unwrap();
+    let mut parameters = BTreeMap::from([
+        (
+            "tts_model.tts_model.rvq_embs".into(),
+            NumericTensor::new(vec![31, 2, 1], vec![0., 10.].repeat(31)),
+        ),
+        (
+            "tts_model.tts_model.embed_code.weight".into(),
+            NumericTensor::new(vec![1, 1], vec![1.]),
+        ),
+    ]);
+    replace_numeric_parameters(&mut refinement, &parameters);
+    let state = refinement.start(1, 1, &context).unwrap();
+    let latent = NumericTensor::new(vec![1, 1, 1], vec![1.]);
+    let first = refinement.advance(&state, &latent, &context).unwrap();
+    assert_eq!(first.codes().data[0], 0.);
+    // New means reverse the nearest mean. Retaining old [0,100] norms chooses 0.
+    parameters.insert(
+        "tts_model.tts_model.rvq_embs".into(),
+        NumericTensor::new(vec![31, 2, 1], vec![10., 1.].repeat(31)),
+    );
+    replace_numeric_parameters(&mut refinement, &parameters);
+    let rebound = refinement.advance(&state, &latent, &context).unwrap();
+    assert_eq!(rebound.codes().data[0], 1.);
+    assert_eq!(first.codes().data[0], 0.);
 }

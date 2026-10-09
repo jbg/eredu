@@ -166,18 +166,18 @@ pub struct LearnedSpeechComponents<
 }
 
 impl<
-    B: NeuralBackend,
-    P: PerceptionExecution<B>,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    V: DecoderExecution<B>,
-    Q: QuantizerExecution<B>,
-    H: EncoderExecution<B>,
-    F: FunctionHeadExecution<B>,
-    J: RnntExecution<B>,
-> LearnedSpeechComponents<B, P, X, Y, Z, W, V, Q, H, F, J>
+        B: NeuralBackend,
+        P: PerceptionExecution<B>,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        V: DecoderExecution<B>,
+        Q: QuantizerExecution<B>,
+        H: EncoderExecution<B>,
+        F: FunctionHeadExecution<B>,
+        J: RnntExecution<B>,
+    > LearnedSpeechComponents<B, P, X, Y, Z, W, V, Q, H, F, J>
 {
     /// Prepares fixed tool-channel silence independently of live input and RNNT state.
     pub fn prepare_silence(
@@ -208,18 +208,18 @@ impl<
 }
 
 impl<
-    B: GroupedNeuralBackend + DistributedNeuralBackend,
-    P: PerceptionExecution<B>,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    V: DecoderExecution<B>,
-    Q: QuantizerExecution<B>,
-    H: EncoderExecution<B>,
-    F: FunctionHeadExecution<B>,
-    J: RnntExecution<B>,
-> LearnedSpeechComponents<B, P, X, Y, Z, W, V, Q, H, F, J>
+        B: GroupedNeuralBackend + DistributedNeuralBackend,
+        P: PerceptionExecution<B>,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        V: DecoderExecution<B>,
+        Q: QuantizerExecution<B>,
+        H: EncoderExecution<B>,
+        F: FunctionHeadExecution<B>,
+        J: RnntExecution<B>,
+    > LearnedSpeechComponents<B, P, X, Y, Z, W, V, Q, H, F, J>
 {
     /// Borrows the coupled executor around the supplied backbone provider.
     /// Neither an execution engine nor an independent transaction is created.

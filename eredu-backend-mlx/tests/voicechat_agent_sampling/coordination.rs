@@ -2,15 +2,15 @@
 use super::*;
 use eredu_architectures::voicechat::{
     channel_decision::{
-        ChannelDecisionPolicy, DecisionEvidence, DecisionInput, DecisionResolver, DecisionSource,
-        ReplicatedChannelDecisions, select_channels,
+        select_channels, ChannelDecisionPolicy, DecisionEvidence, DecisionInput, DecisionResolver,
+        DecisionSource, ReplicatedChannelDecisions,
     },
     channels::DualChannelLogits,
 };
 use eredu_backend_mlx::native::MlxReplicatedCoordinator;
 use eredu_core::{
-    BackendFailure, CollectiveGroupId, Completion, CompletionCancellationMode,
-    checkpoint::TensorDtype, scheduler::SemanticStateTransaction,
+    checkpoint::TensorDtype, scheduler::SemanticStateTransaction, BackendFailure,
+    CollectiveGroupId, Completion, CompletionCancellationMode,
 };
 use eredu_runtime::{
     CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,

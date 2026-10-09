@@ -181,6 +181,19 @@ pub trait SamplingBackend {
     /// Materializes only the selected scalar token identifier.
     fn token_id(token: &Self::Token, context: &Self::Context) -> Result<u32, Self::Error>;
 
+    /// Materializes a fixed group of selected scalar IDs. Backends may evaluate
+    /// and transfer the group together; order and scalar-token errors are retained.
+    fn token_ids<const N: usize>(
+        tokens: [&Self::Token; N],
+        context: &Self::Context,
+    ) -> Result<[u32; N], Self::Error> {
+        let mut ids = [0; N];
+        for (id, token) in ids.iter_mut().zip(tokens) {
+            *id = Self::token_id(token, context)?;
+        }
+        Ok(ids)
+    }
+
     /// Materializes one committed token probability from processed logits.
     fn token_probability(
         logits: &Self::Logits,

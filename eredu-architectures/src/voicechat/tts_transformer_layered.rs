@@ -86,6 +86,16 @@ impl<T: 'static> Parameterized<T> for TransformerStaticModules {
 
 /// Resident and bounded stacks expose one execution contract over borrowed caches.
 pub trait TransformerExecution<B: NeuralBackend> {
+    /// Identity certifying immutable parameters and deterministic encoder results.
+    /// Replacing parameters, equations or execution resources changes the identity.
+    /// Mutable and collective providers return `None`; cache hits skip their calls.
+    fn immutable_parameters_identity(
+        &self,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        None
+    }
+
     /// Exact retained equations and physical parameter formats.
     fn config(&self) -> &TransformerConfig;
     /// Runs independent character rows with boolean key-padding visibility.
@@ -682,7 +692,7 @@ pub fn tts_transformer_parameter_description(
             _ => {
                 return Err(TransformerError::Configuration(
                     "unexpected embedded transformer parameter owner",
-                ))
+                ));
             }
         };
         let spec = old.group().clone();

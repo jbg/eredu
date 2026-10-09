@@ -1,6 +1,6 @@
 //! Owner-only recorded draws over the ordinary retained speech refinement.
 use super::voicechat_rnnt_coordination::coordinator_pair;
-use super::voicechat_speech_sampling::{Recorded, Tape, generation};
+use super::voicechat_speech_sampling::{generation, Recorded, Tape};
 use super::voicechat_transformer::CausalCache;
 use super::voicechat_tts_generator::{codes, compare_cache, model, tensor};
 use super::*;
@@ -146,16 +146,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                     // Admission mismatch must not invoke a learned primitive or draw.
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [9, 2, 10 + rank as u64]);
-                    assert!(
-                        generator
-                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                &frame,
-                                &mut branch,
-                                Some(&mut coordination),
-                                &context
-                            )
-                            .is_err()
-                    );
+                    assert!(generator
+                        .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                            &frame,
+                            &mut branch,
+                            Some(&mut coordination),
+                            &context
+                        )
+                        .is_err());
                     assert_eq!(generator.mog.predictions, 0);
                     assert_eq!(generator.mog.selections, 0);
                     assert_eq!(tape.issued.get(), 0);
@@ -165,16 +163,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                     let mut missing = generation(None).branch().unwrap();
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [9, 2, 15]);
-                    assert!(
-                        generator
-                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                &frame,
-                                &mut missing,
-                                Some(&mut coordination),
-                                &context,
-                            )
-                            .is_err()
-                    );
+                    assert!(generator
+                        .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                            &frame,
+                            &mut missing,
+                            Some(&mut coordination),
+                            &context,
+                        )
+                        .is_err());
                     assert_eq!(generator.mog.predictions, 0);
                     assert_eq!(tape.issued.get(), 0);
 
@@ -210,16 +206,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                     let predictions = generator.mog.predictions;
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [9, 2, 30]);
-                    assert!(
-                        generator
-                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                if rank == 0 { &frame } else { &next },
-                                &mut branch,
-                                Some(&mut coordination),
-                                &context
-                            )
-                            .is_err()
-                    );
+                    assert!(generator
+                        .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                            if rank == 0 { &frame } else { &next },
+                            &mut branch,
+                            Some(&mut coordination),
+                            &context
+                        )
+                        .is_err());
                     assert_eq!(generator.mog.predictions, predictions);
                     assert_eq!(tape.issued.get(), 0);
 
@@ -231,16 +225,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                         let draws = tape.issued.get();
                         let mut coordination =
                             SpeechSamplingCoordination::new(&mut coordinator, [9, 2, invocation]);
-                        assert!(
-                            generator
-                                .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                    &frame,
-                                    &mut branch,
-                                    Some(&mut coordination),
-                                    &context
-                                )
-                                .is_err()
-                        );
+                        assert!(generator
+                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                                &frame,
+                                &mut branch,
+                                Some(&mut coordination),
+                                &context
+                            )
+                            .is_err());
                         assert_eq!(
                             branch.random_state().map(|random| random.cursor),
                             if rank == 0 { Some(0) } else { None }
@@ -268,16 +260,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                     let mut failed = failed.branch().unwrap();
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [9, 2, 55]);
-                    assert!(
-                        generator
-                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                &frame,
-                                &mut failed,
-                                Some(&mut coordination),
-                                &context,
-                            )
-                            .is_err()
-                    );
+                    assert!(generator
+                        .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                            &frame,
+                            &mut failed,
+                            Some(&mut coordination),
+                            &context,
+                        )
+                        .is_err());
                     assert_eq!(
                         failed.random_state().map(|random| random.cursor),
                         if rank == 0 { Some(0) } else { None }
@@ -306,16 +296,14 @@ fn voicechat_speech_coordination_owner_draws_failure_rollback_and_replay() {
                     );
                     let predictions = generator.mog.predictions;
                     // Consumed operation authority never silently authorizes a second invocation.
-                    assert!(
-                        generator
-                            .generate_sampled_frame::<Recorded, _, _, _, _, _>(
-                                &frame,
-                                &mut branch,
-                                Some(&mut coordination),
-                                &context
-                            )
-                            .is_err()
-                    );
+                    assert!(generator
+                        .generate_sampled_frame::<Recorded, _, _, _, _, _>(
+                            &frame,
+                            &mut branch,
+                            Some(&mut coordination),
+                            &context
+                        )
+                        .is_err());
                     assert_eq!(generator.mog.predictions, predictions);
 
                     let mut controlled = canonical.branch().unwrap();
@@ -520,16 +508,14 @@ fn voicechat_speech_coordination_render_failure_preserves_rng_and_codec_until_re
                     // participant may call the codec (including its collectives).
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [12, 3, 1]);
-                    assert!(
-                        speech
-                            .render_sampled_frame::<Recorded, _, _, _, _, _>(
-                                if rank == 0 { &frame } else { &other_policy },
-                                &mut branch,
-                                Some(&mut coordination),
-                                &context,
-                            )
-                            .is_err()
-                    );
+                    assert!(speech
+                        .render_sampled_frame::<Recorded, _, _, _, _, _>(
+                            if rank == 0 { &frame } else { &other_policy },
+                            &mut branch,
+                            Some(&mut coordination),
+                            &context,
+                        )
+                        .is_err());
                     assert_eq!(codec_calls.get(), 0);
                     assert_eq!(tape.issued.get(), if rank == 0 { 10 } else { 0 });
                     assert_eq!(
@@ -541,16 +527,14 @@ fn voicechat_speech_coordination_render_failure_preserves_rng_and_codec_until_re
                     // the owner's successfully rendered candidate remains unpublished.
                     let mut coordination =
                         SpeechSamplingCoordination::new(&mut coordinator, [12, 3, 2]);
-                    assert!(
-                        speech
-                            .render_sampled_frame::<Recorded, _, _, _, _, _>(
-                                &frame,
-                                &mut branch,
-                                Some(&mut coordination),
-                                &context,
-                            )
-                            .is_err()
-                    );
+                    assert!(speech
+                        .render_sampled_frame::<Recorded, _, _, _, _, _>(
+                            &frame,
+                            &mut branch,
+                            Some(&mut coordination),
+                            &context,
+                        )
+                        .is_err());
                     assert_eq!(codec_calls.get(), 1);
                     assert_eq!(tape.issued.get(), if rank == 0 { 20 } else { 0 });
                     assert_eq!(

@@ -278,23 +278,19 @@ fn encoded_catalog_projection_controls_selected_full_and_iterator_materializatio
                 };
                 assert_eq!(full.data, raw);
             }
-            assert!(
-                original
-                    .clone()
-                    .into_tensor_representation(
-                        ["missing".into()],
-                        eredu_gguf::QuantizedTensorRepresentation::Encoded
-                    )
-                    .is_err()
-            );
-            assert!(
-                original
-                    .into_tensor_representation(
-                        ["other".into()],
-                        eredu_gguf::QuantizedTensorRepresentation::Encoded
-                    )
-                    .is_err()
-            );
+            assert!(original
+                .clone()
+                .into_tensor_representation(
+                    ["missing".into()],
+                    eredu_gguf::QuantizedTensorRepresentation::Encoded
+                )
+                .is_err());
+            assert!(original
+                .into_tensor_representation(
+                    ["other".into()],
+                    eredu_gguf::QuantizedTensorRepresentation::Encoded
+                )
+                .is_err());
         }
     }
 }
@@ -562,12 +558,10 @@ fn default_catalog_decodes_quantized_buffers_and_preserves_linear_weights() {
     let supplied = Checkpoint::from_headers(&headers, limits).unwrap();
     assert_eq!(supplied.tensors().next().unwrap(), tensor);
     directory.close().unwrap();
-    assert!(
-        supplied
-            .materializer()
-            .converted_tensor("position_bias")
-            .unwrap_err()
-            .to_string()
-            .contains("no payload admission")
-    );
+    assert!(supplied
+        .materializer()
+        .converted_tensor("position_bias")
+        .unwrap_err()
+        .to_string()
+        .contains("no payload admission"));
 }

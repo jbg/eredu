@@ -7,21 +7,21 @@ use eredu_architectures::{
     voicechat::{
         artifact::ParameterAdmission,
         backbone::{BackbonePreparationError, PreparedBackboneParameters},
-        backbone_execution::{BackboneRequest, OrdinaryBackbone, execute},
+        backbone_execution::{execute, BackboneRequest, OrdinaryBackbone},
         channels::{ChannelFusion, FunctionHead, PromptPolicy},
         checkpoint::Component,
         config::VoiceChatConfig,
     },
 };
 use eredu_backend_mlx::{
-    MlxTensor,
     backend::{nn::shared::MlxNeuralBackend as Backend, runtime::cache::state::MlxHybridState},
     native::materialize_voicechat_backbone,
+    MlxTensor,
 };
 use eredu_checkpoint::{
-    LinearFormat,
     recipe::DerivedWeightRecipe,
     store::{SafetensorsWeightStore, SharedCheckpointSource, StoreError, TensorSelection},
+    LinearFormat,
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig};
 use eredu_nn::{LinearFormatSpec, ParameterMetadata, ParameterVisitorMut, Parameterized, Tensor};
@@ -30,7 +30,7 @@ use eredu_runtime::{
     ResidentRuntime, RuntimeStateComponents,
 };
 use safemlx::{Device, DeviceType, Stream};
-use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use serde_json::Value;
 
 type Reference = ResidentRuntime<nemotron_h::LayeredModel<Backend>, Backend, MlxHybridState>;
@@ -114,17 +114,16 @@ impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
             values(name, shape.iter().map(|n| *n as usize).product())
         };
         *slot = MlxTensor::from_f32_slice(&data, &shape, self.stream).unwrap();
-        assert!(
-            self.weights
-                .insert(
-                    key,
-                    (
-                        shape.into_iter().map(|n| n as usize).collect(),
-                        data.into_iter().flat_map(f32::to_le_bytes).collect(),
-                    )
+        assert!(self
+            .weights
+            .insert(
+                key,
+                (
+                    shape.into_iter().map(|n| n as usize).collect(),
+                    data.into_iter().flat_map(f32::to_le_bytes).collect(),
                 )
-                .is_none()
-        );
+            )
+            .is_none());
     }
 }
 
@@ -316,13 +315,11 @@ fn native_backbone_residency_preserves_prefill_cached_dual_logits_and_hybrid_sta
             .collect::<Vec<_>>()
     };
     let expected = run(&mut reference);
-    assert!(
-        expected[2]
-            .0
-            .iter()
-            .flatten()
-            .any(|value| value.abs() > 1e-4)
-    );
+    assert!(expected[2]
+        .0
+        .iter()
+        .flatten()
+        .any(|value| value.abs() > 1e-4));
     for (policy, device_budget) in [
         (LayerWeightResidency::FullyResident, total_bytes),
         (

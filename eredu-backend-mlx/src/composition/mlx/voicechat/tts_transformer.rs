@@ -39,6 +39,8 @@ pub struct MlxTtsTransformer {
     execution: Execution,
     parallel: Option<Group>,
     state_layout: StateLayout,
+    immutable_identity: eredu_core::resources::ResourceIdentity,
+    immutable_stream_index: i32,
 }
 
 impl MlxTtsTransformer {
@@ -78,6 +80,16 @@ impl MlxTtsTransformer {
 }
 
 impl TransformerExecution<MlxNeuralBackend> for MlxTtsTransformer {
+    fn immutable_parameters_identity(
+        &self,
+        context: &Stream,
+    ) -> Option<&eredu_core::resources::ResourceIdentity> {
+        (matches!(self.execution, Execution::Resident(_))
+            && self.parallel.is_none()
+            && context.get_index().ok() == Some(self.immutable_stream_index))
+        .then_some(&self.immutable_identity)
+    }
+
     fn config(&self) -> &TransformerConfig {
         match &self.execution {
             Execution::Resident(model) => model.config(),
@@ -227,6 +239,19 @@ fn materialize(
                 MlxTtsTransformer {
                     execution,
                     parallel: parallel.map(|(_, group)| group.clone()),
+                    immutable_stream_index: execution_stream
+                        .get_index()
+                        .map_err(BackendFailure::from_error)?,
+                    immutable_identity: {
+                        static NEXT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        eredu_core::resources::ResourceIdentity {
+                            scope: "mlx.immutable.tts_transformer".into(),
+                            key: NEXT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        }
+                    },
                     state_layout,
                 },
                 metadata,

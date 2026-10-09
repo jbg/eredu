@@ -1,11 +1,6 @@
 //! MLX mechanisms and generic binding for replicated text composition.
 
-use std::{
-    collections::BTreeMap,
-    marker::PhantomData,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, marker::PhantomData, path::Path, sync::Arc};
 
 use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
 use eredu_core::cache::{
@@ -22,8 +17,7 @@ use eredu_runtime::{
     WeightLoweringDescriptor, WeightResidencyMechanism,
 };
 use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array,
-    Stream,
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 
 #[cfg(test)]
@@ -46,9 +40,7 @@ use crate::{
                     MlxPoolingAttentionState, MlxPoolingAttentionStateFactory,
                 },
             },
-            execution::generic::{
-                MlxLayerwisePolicy, MlxSelectiveUnitPopulator,
-            },
+            execution::generic::{MlxLayerwisePolicy, MlxSelectiveUnitPopulator},
             media::input,
         },
     },
@@ -86,8 +78,8 @@ mod prediction;
 mod session;
 mod state;
 
-pub(super) use capability::*;
 pub(crate) use capability::state_capabilities;
+pub(super) use capability::*;
 pub(super) use lowering::*;
 use partitioned::*;
 pub(crate) use prediction::ErasedPrefillCursor;

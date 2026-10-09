@@ -17,11 +17,11 @@ use eredu_architectures::voicechat::{
     tts_mog::TtsError,
     tts_prompt::PreparedTtsPrompt,
 };
-use eredu_core::{BackendFailure, backend::Completion};
+use eredu_core::{backend::Completion, BackendFailure};
 use eredu_nn::{RetainedTensorRoots, TensorElementType};
 use eredu_runtime::{
-    PrepublicationRealtimeFrame, RealtimeGenerationBranch, RealtimeOutputSubmissionError,
-    submit_realtime_output,
+    submit_realtime_output, PrepublicationRealtimeFrame, RealtimeGenerationBranch,
+    RealtimeOutputSubmissionError,
 };
 use safemlx::{Array, Stream};
 

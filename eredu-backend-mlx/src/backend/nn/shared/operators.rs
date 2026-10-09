@@ -6,14 +6,35 @@ mod grouped_units;
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
 pub struct MlxLinear {
+    pub(super) compute_element: Option<eredu_nn::TensorElementType>,
     pub(super) module: common::linear::PhysicalLinear,
     pub(super) topology: BTreeMap<String, ParameterSpec>,
     pub(super) vocabulary_range: Option<VocabularyParallelRange>,
 }
 
 impl LinearOperator<MlxTensor> for MlxLinear {
+    fn set_compute_element(
+        &mut self,
+        element: Option<eredu_nn::TensorElementType>,
+    ) -> Result<(), ComputeError> {
+        eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)?
+            .with_compute_element(element)?;
+        self.compute_element = element;
+        Ok(())
+    }
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(self.module.forward(input.as_array(), context))
+        let original = input
+            .element_type()
+            .ok_or_else(|| ComputeError::backend("unknown linear input precision"))?;
+        let value = self
+            .compute_element
+            .map_or_else(|| Ok(input.clone()), |e| input.cast_float(e, context))?;
+        let output = compute_tensor(self.module.forward(value.as_array(), context))?;
+        if self.compute_element.is_some() {
+            output.cast_float(original, context)
+        } else {
+            Ok(output)
+        }
     }
     fn forward_with_input_observer(
         &mut self,
@@ -67,6 +88,15 @@ impl MlxLinear {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
+        let original = input
+            .element_type()
+            .ok_or_else(|| ComputeError::backend("unknown projection input precision"))?;
+        let cast = self
+            .compute_element
+            .filter(|_| parallel.is_none())
+            .map(|e| input.cast_float(e, context))
+            .transpose()?;
+        let input = cast.as_ref().unwrap_or(input);
         let mut adapter = observer.map(|inner| NativeInputObserver {
             inner,
             failure: None,
@@ -75,11 +105,16 @@ impl MlxLinear {
             .as_mut()
             .map(|adapter| adapter as &mut dyn common::linear::NativeProjectionInputObserver);
         let result = match parallel {
-            Some(group) => self.module.forward_row_parallel_with_input_observer(
+            Some(group) => self.module.forward_row_parallel_with_compute(
                 input.as_array(),
                 group,
                 context,
                 observer,
+                self.compute_element.map(|e| match e {
+                    eredu_nn::TensorElementType::F16 => safemlx::Dtype::Float16,
+                    eredu_nn::TensorElementType::Bf16 => safemlx::Dtype::Bfloat16,
+                    _ => safemlx::Dtype::Float32,
+                }),
             ),
             None => self
                 .module
@@ -87,7 +122,14 @@ impl MlxLinear {
         };
         match adapter.and_then(|adapter| adapter.failure) {
             Some(error) => Err(error),
-            None => compute_tensor(result),
+            None => {
+                let output = compute_tensor(result)?;
+                if self.compute_element.is_some() {
+                    output.cast_float(original, context)
+                } else {
+                    Ok(output)
+                }
+            }
         }
     }
 }

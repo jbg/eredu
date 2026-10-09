@@ -22,6 +22,9 @@ use super::{
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum MogPreparationError {
+    /// Invalid floating execution profile or attempted precision reselection.
+    #[error("invalid speech precision: {0}")]
+    Precision(&'static str),
     /// Selected communication lacks required bounded mechanisms.
     #[error(transparent)]
     Coordination(#[from] eredu_runtime::replicated_execution::CollectiveCoordinationError),
@@ -185,6 +188,7 @@ mod tests {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedMogBindings {
+    precision: super::precision::SpeechPrecision,
     dimensions: MogDimensions,
     layout: ExecutionUnitLayout,
     source: SharedCheckpointSource,
@@ -193,6 +197,28 @@ pub struct PreparedMogBindings {
 }
 
 impl PreparedMogBindings {
+    /// Selects portable execution precision and exact converted bindings before materialization.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, MogPreparationError> {
+        if self.precision != Default::default() && self.precision != precision {
+            return Err(MogPreparationError::Precision(
+                "precision is already selected",
+            ));
+        }
+        precision
+            .validate()
+            .map_err(MogPreparationError::Precision)?;
+        precision.bindings(&self.source, &mut self.units)?;
+        self.precision = precision;
+        Ok(self)
+    }
+    /// Retained floating storage and arithmetic policy.
+    pub fn precision(&self) -> super::precision::SpeechPrecision {
+        self.precision
+    }
+
     /// Projects exact MoG bindings from selected retained artifacts.
     pub fn from_retained(
         artifacts: &RetainedVoiceChatArtifacts,
@@ -289,6 +315,7 @@ impl PreparedMogBindings {
             })
             .collect::<Result<_, MogPreparationError>>()?;
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             layout,
             source,

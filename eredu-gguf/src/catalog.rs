@@ -1,5 +1,5 @@
 use crate::convert::{
-    ConversionKind, affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes,
+    affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
 };
 use crate::{
     ConvertedTensor, DenseDtype, DenseTensorSpan, DenseTensorSpanPlan, Endian, Error, Limits,

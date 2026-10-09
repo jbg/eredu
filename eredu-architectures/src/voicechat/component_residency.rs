@@ -164,7 +164,9 @@ pub enum VoiceChatResidencyError {
         tier: &'static str,
     },
     /// Device capacity cannot retain statics and the selected block window.
-    #[error("VoiceChat backbone statics and selected block window require {required} device bytes, limit {limit}")]
+    #[error(
+        "VoiceChat backbone statics and selected block window require {required} device bytes, limit {limit}"
+    )]
     BackboneUnitCapacity {
         /// Pinned statics plus the largest selected consecutive block window.
         required: u64,
@@ -218,7 +220,7 @@ impl VoiceChatResidencyPolicy {
         backbone: &PreparedBackboneParameters,
         speech: &PreparedSpeechProviders,
     ) -> Result<VoiceChatResidencyReport, VoiceChatResidencyError> {
-        let speech = self.speech.validate(speech.resources())?;
+        let speech = speech.validate_residency(&self.speech)?;
         self.combine(&BackboneResources::from_prepared(backbone)?, speech)
     }
 
@@ -297,7 +299,10 @@ impl VoiceChatResidencyPolicy {
         for (tier, required, limit) in [
             (
                 "device",
-                report.device_parameter_bytes,
+                add(
+                    report.device_parameter_bytes,
+                    report.speech.execution_cache_device_bytes,
+                )?,
                 self.device_limit_bytes,
             ),
             ("host", report.host_required_bytes, self.host_limit_bytes),

@@ -735,9 +735,34 @@ impl MlxHybridState {
         })
     }
 
+    pub(crate) fn has_immutable_roots(&self) -> bool {
+        self.manager.is_none()
+            && self.layers.iter().all(|layer| {
+                layer.streams.consistent_manager(None)
+                    && match &layer.attention {
+                        None
+                        | Some(MlxHybridAttentionState::KeyValue(
+                            MlxKeyValueLayerState::Stateless,
+                        )) => true,
+                        Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
+                            cache,
+                        ))) => cache.has_immutable_roots(),
+                        _ => false,
+                    }
+            })
+    }
+
+    pub(crate) fn transaction_candidate(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.copy_candidate(stream, false)
+    }
+
     /// Deeply copies attention and every architecture-declared fixed tensor.
     /// Fixed-state handles must not inherit the transaction checkpoint's sharing.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.copy_candidate(stream, true)
+    }
+
+    fn copy_candidate(&self, stream: &Stream, isolated: bool) -> Result<Self, Exception> {
         if !self.supports_isolated_snapshot() {
             return Err(Exception::custom(
                 "isolated snapshots require consistent attention paging managers",
@@ -747,9 +772,12 @@ impl MlxHybridState {
             .manager
             .as_ref()
             .map(|manager| {
-                manager
-                    .isolated_snapshot(stream)
-                    .map_err(|e| Exception::custom(e.to_string()))
+                (if isolated {
+                    manager.isolated_snapshot(stream)
+                } else {
+                    manager.transaction_candidate(stream)
+                })
+                .map_err(|e| Exception::custom(e.to_string()))
             })
             .transpose()?;
         let layers = self
@@ -766,7 +794,11 @@ impl MlxHybridState {
                     Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
                         cache,
                     ))) => Some(MlxHybridAttentionState::KeyValue(
-                        MlxKeyValueLayerState::Device(cache.isolated_snapshot(stream)?),
+                        MlxKeyValueLayerState::Device(if isolated {
+                            cache.isolated_snapshot(stream)?
+                        } else {
+                            cache.checkpoint_clone_state()?
+                        }),
                     )),
                     Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(
                         cache,
@@ -795,27 +827,37 @@ impl MlxHybridState {
                         Some(MlxHybridAttentionState::Compressed(cache))
                     }
                 };
-                let fixed = layer
-                    .fixed
-                    .iter()
-                    .map(|(role, value)| {
-                        Ok((
-                            *role,
-                            value
-                                .as_ref()
-                                .map(|value| {
-                                    value
-                                        .as_array()
-                                        .contiguous(false, stream)?
-                                        .deep_clone()
-                                        .map(MlxTensor::from_array)
-                                })
-                                .transpose()?,
-                        ))
-                    })
-                    .collect::<Result<_, Exception>>()?;
+                let fixed = if !isolated {
+                    layer.fixed.clone()
+                } else {
+                    layer
+                        .fixed
+                        .iter()
+                        .map(|(role, value)| {
+                            Ok((
+                                *role,
+                                value
+                                    .as_ref()
+                                    .map(|value| {
+                                        value
+                                            .as_array()
+                                            .contiguous(false, stream)?
+                                            .deep_clone()
+                                            .map(MlxTensor::from_array)
+                                    })
+                                    .transpose()?,
+                            ))
+                        })
+                        .collect::<Result<_, Exception>>()?
+                };
                 Ok(MlxHybridLayerState {
-                    streams: layer.streams.fork(manager.as_ref(), stream)?,
+                    streams: if isolated {
+                        layer.streams.fork(manager.as_ref(), stream)?
+                    } else {
+                        layer
+                            .streams
+                            .transaction_candidate(manager.as_ref(), stream)?
+                    },
                     attention,
                     fixed,
                     fixed_offset: layer.fixed_offset,

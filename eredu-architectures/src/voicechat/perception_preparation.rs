@@ -22,6 +22,9 @@ use super::{
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum PerceptionPreparationError {
+    /// Invalid floating execution profile or attempted precision reselection.
+    #[error("invalid speech precision: {0}")]
+    Precision(&'static str),
     /// Perception geometry cannot be constructed.
     #[error(transparent)]
     Perception(#[from] PerceptionError),
@@ -55,6 +58,7 @@ pub enum PerceptionPreparationError {
 /// conversion bounds use the shared speech recipe projection. This component
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedPerceptionBindings {
+    precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
     layout: ExecutionUnitLayout,
     source: SharedCheckpointSource,
@@ -63,6 +67,28 @@ pub struct PreparedPerceptionBindings {
 }
 
 impl PreparedPerceptionBindings {
+    /// Selects portable execution precision and exact converted bindings before materialization.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, PerceptionPreparationError> {
+        if self.precision != Default::default() && self.precision != precision {
+            return Err(PerceptionPreparationError::Precision(
+                "precision is already selected",
+            ));
+        }
+        precision
+            .validate()
+            .map_err(PerceptionPreparationError::Precision)?;
+        precision.bindings(&self.source, &mut self.units)?;
+        self.precision = precision;
+        Ok(self)
+    }
+    /// Retained floating storage and arithmetic policy.
+    pub fn precision(&self) -> super::precision::SpeechPrecision {
+        self.precision
+    }
+
     /// Projects complete perception bindings from selected retained artifacts.
     pub fn from_retained(
         artifacts: &RetainedVoiceChatArtifacts,
@@ -156,6 +182,7 @@ impl PreparedPerceptionBindings {
             })
             .collect::<Result<_, PerceptionPreparationError>>()?;
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             layout,
             source,
@@ -258,6 +285,7 @@ impl PreparedPerceptionBindings {
             inputs,
         )?);
         Ok(PreparedPerceptionPartitionBindings {
+            precision: self.precision,
             dimensions: self.dimensions,
             local_layout: self.local_layout,
             source,
@@ -302,6 +330,7 @@ impl PreparedPerceptionBindings {
 /// Exact canonical units and restricted retained sources for a pipeline stage.
 /// A parameter-only stage has no state and owns only its selected recipes.
 pub struct PreparedPerceptionPartitionBindings {
+    precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
     local_layout: Option<LocalModelLayout>,
     source: SharedCheckpointSource,
@@ -309,6 +338,10 @@ pub struct PreparedPerceptionPartitionBindings {
     state_layout: Option<eredu_runtime::StateLayout>,
 }
 impl PreparedPerceptionPartitionBindings {
+    /// Retained floating policy for partition construction.
+    pub fn precision(&self) -> super::precision::SpeechPrecision {
+        self.precision
+    }
     /// Global family equations; physical TP geometry is retained separately.
     pub fn dimensions(&self) -> PerceptionDimensions {
         self.dimensions
@@ -363,6 +396,89 @@ mod tests {
         },
     };
     use eredu_core::{ParallelRankTopology, ParallelTopology};
+
+    #[test]
+    fn perception_precision_keeps_norms_and_history_f32_and_accounts_narrow_bindings() {
+        use crate::voicechat::precision::{SpeechFloat, SpeechPrecision};
+        let config =
+            VoiceChatConfig::from_json(include_str!("fixtures/official-inference-config.json"))
+                .unwrap();
+        let dimensions = PerceptionDimensions::from_config(&config.perception).unwrap();
+        let source: SharedCheckpointSource = Arc::new(HeaderSource(
+            checkpoint::tests::official().tensors().clone(),
+        ));
+        let parameters = official_parameters();
+        for compute in [SpeechFloat::F32, SpeechFloat::F16] {
+            let policy = SpeechPrecision {
+                weights: SpeechFloat::F16,
+                compute,
+            };
+            let prepared = PreparedPerceptionBindings::from_parameters(
+                dimensions,
+                source.clone(),
+                &parameters,
+            )
+            .unwrap()
+            .with_precision(policy)
+            .unwrap();
+            for (name, dtype) in [
+                (
+                    "stt_model.perception.encoder.layers.0.feed_forward1.linear1.weight",
+                    RecipeDtype::F16,
+                ),
+                (
+                    "stt_model.perception.encoder.layers.0.norm_feed_forward1.weight",
+                    RecipeDtype::F32,
+                ),
+                (
+                    "stt_model.perception.encoder.layers.0.conv.pointwise_conv1.weight",
+                    if compute == SpeechFloat::F32 {
+                        RecipeDtype::F32
+                    } else {
+                        RecipeDtype::F16
+                    },
+                ),
+            ] {
+                let binding = prepared
+                    .units
+                    .iter()
+                    .flatten()
+                    .find(|b| b.name() == name)
+                    .unwrap();
+                let output = binding.source_recipe().infer(source.as_ref()).unwrap();
+                assert_eq!(output.dtype, dtype);
+                assert_eq!(output.byte_len(), binding.expected_bytes());
+            }
+            let resources =
+                crate::voicechat::provider_residency::SpeechProviderResources::from_bindings(
+                    prepared.source(),
+                    prepared.unit_bindings(),
+                    &parameters,
+                )
+                .unwrap();
+            assert!(resources.parameter_bytes < 2_436_566_528);
+            let topology =
+                ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), 1).unwrap();
+            let (selected, _) = prepared.select_parallel(topology).unwrap();
+            let name = "stt_model.perception.encoder.layers.0.feed_forward1.linear1.weight";
+            let binding = selected
+                .unit_bindings()
+                .iter()
+                .flatten()
+                .find(|binding| binding.logical_target() == Some(name))
+                .unwrap();
+            let output = binding.source_recipe().infer(source.as_ref()).unwrap();
+            assert_eq!(output.shape, [2048, 1024]);
+            assert_eq!(output.dtype, RecipeDtype::F16);
+            assert_eq!(binding.expected_bytes(), 2048 * 1024 * 2);
+        }
+        assert!(SpeechPrecision {
+            weights: SpeechFloat::F16,
+            compute: SpeechFloat::Bf16
+        }
+        .validate()
+        .is_err());
+    }
 
     struct HeaderSource(BTreeMap<String, TensorMetadata>);
     impl CheckpointSource for HeaderSource {

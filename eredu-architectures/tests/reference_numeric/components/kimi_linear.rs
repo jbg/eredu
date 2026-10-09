@@ -307,43 +307,58 @@ fn kimi_observed_pipeline_cut_preserves_components_and_cached_trials() {
             let mut ordinary = LayerwiseRuntime::new(model(), ResidentUnitWindow::new(units()));
             let mut reference = LayerwiseRuntime::new(model(), ResidentUnitWindow::new(units()));
             let (mut ordinary_state, mut reference_state) = (state(), state());
-            let mut stages = (0..2).map(|layer| {
-                let rank = ParallelRankTopology::new(topology, layer).unwrap();
-                let layout = eredu_runtime::derive_partitioned_local_layout(
-                    &description, rank,
-                ).unwrap();
-                let realization = family::expert_realization_plan(&model(), rank).unwrap().unwrap();
-                let geometry = family::partition_local_routed_geometry(
-                    &args, &layout, layer..layer + 1, rank, &realization,
-                ).unwrap();
-                let complete = geometry.complete_state_layout().clone();
-                let partition = ArchitecturePartition::from_description(
-                    &description, [(decoder::TARGET_EXECUTION_GROUP, layer..layer + 1)],
-                    if layer == 0 {
-                        PartitionOwnership::new(true, false, ["embedding"]).unwrap()
-                    } else {
-                        PartitionOwnership::new(false, true, ["norm", "output"]).unwrap()
-                    },
-                    &complete,
-                    &ArchitectureStatePartitionPlan::new([
-                        ArchitectureStatePartitionRule::group_units(0, 0..2),
-                    ]),
-                    geometry, NoAuxiliaryBoundarySchema::new(args.hidden_size),
-                ).unwrap();
-                let mut architecture = Partition::from_partition(
-                    args.clone(), &description, &partition, &context,
-                ).unwrap();
-                <Partition as LayeredArchitecture<NumericBackend, State>>::static_modules_mut(
-                    &mut architecture,
-                ).visit_parameters_mut(&mut Initialize);
-                let mut unit = architecture.construct_unit(layer, &context).unwrap();
-                unit.visit_parameters_mut(&mut Initialize);
-                let state = State::create(partition.state().unwrap().layout().clone(), |_, policy| {
-                    Ok::<_, Error>(NumericHybridLayerState::new(policy))
-                }).unwrap();
-                let driver = LayeredPartitionDriver::new(&partition, 0, layer..layer + 1).unwrap();
-                (architecture, unit, state, driver)
-            }).collect::<Vec<_>>();
+            let mut stages = (0..2)
+                .map(|layer| {
+                    let rank = ParallelRankTopology::new(topology, layer).unwrap();
+                    let layout =
+                        eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
+                    let realization = family::expert_realization_plan(&model(), rank)
+                        .unwrap()
+                        .unwrap();
+                    let geometry = family::partition_local_routed_geometry(
+                        &args,
+                        &layout,
+                        layer..layer + 1,
+                        rank,
+                        &realization,
+                    )
+                    .unwrap();
+                    let complete = geometry.complete_state_layout().clone();
+                    let partition = ArchitecturePartition::from_description(
+                        &description,
+                        [(decoder::TARGET_EXECUTION_GROUP, layer..layer + 1)],
+                        if layer == 0 {
+                            PartitionOwnership::new(true, false, ["embedding"]).unwrap()
+                        } else {
+                            PartitionOwnership::new(false, true, ["norm", "output"]).unwrap()
+                        },
+                        &complete,
+                        &ArchitectureStatePartitionPlan::new([
+                            ArchitectureStatePartitionRule::group_units(0, 0..2),
+                        ]),
+                        geometry,
+                        NoAuxiliaryBoundarySchema::new(args.hidden_size),
+                    )
+                    .unwrap();
+                    let mut architecture =
+                        Partition::from_partition(args.clone(), &description, &partition, &context)
+                            .unwrap();
+                    <Partition as LayeredArchitecture<NumericBackend, State>>::static_modules_mut(
+                        &mut architecture,
+                    )
+                    .visit_parameters_mut(&mut Initialize);
+                    let mut unit = architecture.construct_unit(layer, &context).unwrap();
+                    unit.visit_parameters_mut(&mut Initialize);
+                    let state =
+                        State::create(partition.state().unwrap().layout().clone(), |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let driver =
+                        LayeredPartitionDriver::new(&partition, 0, layer..layer + 1).unwrap();
+                    (architecture, unit, state, driver)
+                })
+                .collect::<Vec<_>>();
             let mut position = 0;
             for ids in [vec![1, 3, 2], vec![4], vec![5]] {
                 let tokens = NumericTensor::token_ids(&ids);
@@ -806,30 +821,93 @@ fn kimi_prepared_transforms_retain_source_layout_across_residency_and_parallelis
                 .with_residency(residency);
                 let world = Arc::new(NumericPartitionWorld::default());
                 let results = std::thread::scope(|scope| {
-                    let handles = (0..topology.world_size()).map(|rank| {
-                        let (inspection, plan, args, parameters) = (&inspection, &plan, &args, &parameters);
-                        let world = world.clone();
-                        scope.spawn(move || {
-                            let sources = partitioned_adapter::prepare_plan(inspection, plan, rank, std::time::Duration::from_secs(30)).unwrap();
-                            let selected = sources.selected().execution().text_realization();
-                            assert!(selected.parameters().iter().any(|p| matches!(p.lowering(), eredu_runtime::WeightLoweringKind::Transform | eredu_runtime::WeightLoweringKind::DerivedTransform)));
-                            let target_args = family::with_checkpoint_formats(args, selected.parameters().iter().filter_map(|p| p.executable().weight_quantization().map(|format| (p.name().to_owned(), format))).collect()).unwrap();
-                            let target = family::LayeredModel::<NumericBackend>::new(target_args, &NumericContext::default()).unwrap();
-                            let target_parameters = target.parameter_description(&NumericContext::default()).unwrap();
-                            let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                            let mut layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
-                            let encoded = eredu_runtime::derive_partitioned_local_layout(&target_parameters, rank_topology).unwrap();
-                            for (name, companion) in encoded.tensors() { if !layout.contains(name) { layout.insert(name.to_owned(), companion.clone()); } }
-                            let mut context = NumericContext::with_partition(layout, rank, world);
-                            context.bind_checkpoint_values = true;
-                            let mut executable = if routed {
-                                partitioned_adapter::routed(sources, &context, Arc::new(AtomicUsize::new(0)), None)
-                            } else { partitioned_adapter::dense(sources, &context) }.unwrap();
-                            [&[1_usize, 3, 2][..], &[4][..], &[5][..]].into_iter().enumerate().map(|(step, tokens)| {
-                                executable.forward_observed(&NumericTensor::token_ids(tokens), step == 0, &mut Components::strict()).unwrap()
-                            }).collect::<Vec<_>>()
+                    let handles = (0..topology.world_size())
+                        .map(|rank| {
+                            let (inspection, plan, args, parameters) =
+                                (&inspection, &plan, &args, &parameters);
+                            let world = world.clone();
+                            scope.spawn(move || {
+                                let sources = partitioned_adapter::prepare_plan(
+                                    inspection,
+                                    plan,
+                                    rank,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .unwrap();
+                                let selected = sources.selected().execution().text_realization();
+                                assert!(selected.parameters().iter().any(|p| matches!(
+                                    p.lowering(),
+                                    eredu_runtime::WeightLoweringKind::Transform
+                                        | eredu_runtime::WeightLoweringKind::DerivedTransform
+                                )));
+                                let target_args = family::with_checkpoint_formats(
+                                    args,
+                                    selected
+                                        .parameters()
+                                        .iter()
+                                        .filter_map(|p| {
+                                            p.executable()
+                                                .weight_quantization()
+                                                .map(|format| (p.name().to_owned(), format))
+                                        })
+                                        .collect(),
+                                )
+                                .unwrap();
+                                let target = family::LayeredModel::<NumericBackend>::new(
+                                    target_args,
+                                    &NumericContext::default(),
+                                )
+                                .unwrap();
+                                let target_parameters = target
+                                    .parameter_description(&NumericContext::default())
+                                    .unwrap();
+                                let rank_topology =
+                                    ParallelRankTopology::new(topology, rank).unwrap();
+                                let mut layout = eredu_runtime::derive_partitioned_local_layout(
+                                    parameters,
+                                    rank_topology,
+                                )
+                                .unwrap();
+                                let encoded = eredu_runtime::derive_partitioned_local_layout(
+                                    &target_parameters,
+                                    rank_topology,
+                                )
+                                .unwrap();
+                                for (name, companion) in encoded.tensors() {
+                                    if !layout.contains(name) {
+                                        layout.insert(name.to_owned(), companion.clone());
+                                    }
+                                }
+                                let mut context =
+                                    NumericContext::with_partition(layout, rank, world);
+                                context.bind_checkpoint_values = true;
+                                let mut executable = if routed {
+                                    partitioned_adapter::routed(
+                                        sources,
+                                        &context,
+                                        Arc::new(AtomicUsize::new(0)),
+                                        None,
+                                    )
+                                } else {
+                                    partitioned_adapter::dense(sources, &context)
+                                }
+                                .unwrap();
+                                [&[1_usize, 3, 2][..], &[4][..], &[5][..]]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(step, tokens)| {
+                                        executable
+                                            .forward_observed(
+                                                &NumericTensor::token_ids(tokens),
+                                                step == 0,
+                                                &mut Components::strict(),
+                                            )
+                                            .unwrap()
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
                         })
-                    }).collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
                     handles
                         .into_iter()
                         .map(|handle| handle.join().unwrap())

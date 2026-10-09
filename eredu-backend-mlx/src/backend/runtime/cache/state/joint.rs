@@ -1,4 +1,4 @@
-//! Atomic ownership of independently copied heterogeneous and attention state.
+//! Atomic ownership of unpublished heterogeneous and attention state updates.
 
 use super::*;
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
@@ -71,7 +71,7 @@ impl Drop for CopyPermitOwner {
 
 /// One canonical owner of heterogeneous and key/value cache families.
 ///
-/// Branch copies have independent arrays and paging namespaces in the same
+/// Candidates share immutable roots and copy mutable storage and paging namespaces in the same
 /// finite process pools. They remain exclusive until commit/discard, including
 /// after a failed copy with unresolved native work. The enclosing scheduler
 /// establishes execution completion before committing or discarding a branch.
@@ -174,8 +174,7 @@ impl MlxJointState {
         component_copy_estimate(&self.hybrid, &self.key_value)
     }
 
-    fn admit(&self) -> Result<CopyPermit, JointStateError> {
-        let estimate = self.copy_estimate()?;
+    fn admit(&self, estimate: SnapshotEstimate) -> Result<CopyPermit, JointStateError> {
         if estimate.retained_bytes > self.admission.accounting.limits.max_branch_bytes {
             return Err(JointStateError::Budget);
         }
@@ -285,10 +284,30 @@ impl MlxJointState {
     fn copy_candidate(
         &self,
         retention: Option<&SnapshotReservation>,
+        isolated: bool,
     ) -> Result<MlxJointStateBranch, JointStateError> {
         crate::backend::submission_recovery::reap();
         ordinary_retirement::reclaim();
-        let permit = self.admit()?;
+        let immutable =
+            !isolated && self.hybrid.has_immutable_roots() && self.key_value.has_immutable_roots();
+        let mut estimate = self.copy_estimate()?;
+        if immutable {
+            estimate.copy_bytes = 0;
+        }
+        let permit = self.admit(estimate)?;
+        if immutable {
+            // Only metadata is copied. Execution replaces fixed values and
+            // appends new attention/stream roots; it cannot mutate these roots.
+            // Completion retains the predecessor handles and permit before
+            // any eager work, exactly as for a physically copied candidate.
+            return Ok(MlxJointStateBranch {
+                hybrid: self.hybrid.clone(),
+                key_value: self.key_value.clone(),
+                paging_identity: paging_identity(&self.hybrid, &self.key_value),
+                permit,
+                generation: self.generation,
+            });
+        }
         let mut recovery =
             Recovery::begin(CopyRetention(OrdinaryRetirement::new(CopyResources {
                 source_hybrid: self.hybrid.clone(),
@@ -300,15 +319,19 @@ impl MlxJointState {
                 _stream: self.stream.clone(),
                 _snapshot_retention: retention.cloned(),
             })))?;
-        let hybrid = recovery
-            .retention()
-            .source_hybrid
-            .isolated_snapshot(&self.stream)?;
+        let source = &recovery.retention().source_hybrid;
+        let hybrid = if isolated {
+            source.isolated_snapshot(&self.stream)?
+        } else {
+            source.transaction_candidate(&self.stream)?
+        };
         recovery.retention_mut().hybrid = Some(hybrid);
-        let key_value = recovery
-            .retention()
-            .source_key_value
-            .isolated_snapshot(&self.stream)?;
+        let source = &recovery.retention().source_key_value;
+        let key_value = if isolated {
+            source.isolated_snapshot(&self.stream)?
+        } else {
+            source.transaction_candidate(&self.stream)?
+        };
         recovery.retention_mut().key_value = Some(key_value);
         let values = arrays(
             recovery.retention().hybrid.as_ref().expect("copied hybrid"),
@@ -356,7 +379,7 @@ impl SemanticStateTransaction for MlxJointState {
     type Error = JointStateError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
-        self.copy_candidate(None)
+        self.copy_candidate(None, false)
     }
 
     fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
@@ -462,7 +485,7 @@ impl MlxJointState {
             permit,
             generation,
             ..
-        } = self.copy_candidate(Some(retention))?;
+        } = self.copy_candidate(Some(retention), true)?;
         let copied = Self {
             hybrid,
             key_value,
@@ -531,9 +554,81 @@ mod tests {
     }
 
     #[test]
+    fn candidate_updates_preserve_committed_values_on_discard_and_publish_on_commit() {
+        for mutable in [false, true] {
+            let mut owner = canonical();
+            if mutable {
+                owner.key_value.as_mut()[0] =
+                    MlxKeyValueLayerState::Device(ConcatKeyValueCache::new_with_step(4));
+                let input = MlxTensor::from_array(Array::from_slice(&[1_f32, 2.], &[2, 1, 1, 1]));
+                AttentionCache::update_for_attention(
+                    &mut owner.key_value.as_mut()[0],
+                    input.clone(),
+                    input,
+                    &owner.stream,
+                )
+                .unwrap();
+            } else {
+                // Immutable candidates need no cumulative native-copy allowance.
+                Arc::get_mut(&mut owner.admission).unwrap().accounting = Arc::new(CopyAccounting {
+                    consumed: AtomicU64::new(0),
+                    limits: JointCopyLimits {
+                        max_branch_bytes: 1 << 20,
+                        max_total_copy_bytes: 0,
+                    },
+                });
+            }
+            let before = owner
+                .retained_arrays()
+                .into_iter()
+                .map(|a| a.evaluated().unwrap().try_to_vec::<f32>().unwrap())
+                .collect::<Vec<_>>();
+            for commit in [false, true] {
+                let mut branch = owner.branch().unwrap();
+                let input = MlxTensor::from_array(Array::from_slice(&[3_f32, 4.], &[2, 1, 1, 1]));
+                let (keys, _) = AttentionCache::update_for_attention(
+                    &mut branch.key_value.as_mut()[0],
+                    input.clone(),
+                    input,
+                    &owner.stream,
+                )
+                .unwrap();
+                assert_eq!(
+                    keys.as_array()
+                        .contiguous(false, &owner.stream)
+                        .unwrap()
+                        .evaluated()
+                        .unwrap()
+                        .try_to_vec::<f32>()
+                        .unwrap(),
+                    vec![1., 3., 2., 4.]
+                );
+                async_eval_with_event(branch.retained_arrays())
+                    .unwrap()
+                    .synchronize()
+                    .unwrap();
+                assert_eq!(owner.key_value.offset(), 1);
+                let unchanged = owner
+                    .retained_arrays()
+                    .into_iter()
+                    .map(|a| a.evaluated().unwrap().try_to_vec::<f32>().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(unchanged, before);
+                if commit {
+                    owner.commit_branch(branch).unwrap();
+                    assert_eq!(owner.key_value.offset(), 2);
+                } else {
+                    MlxJointState::discard_branch(branch).unwrap();
+                }
+            }
+            assert_eq!(owner.copy_bytes_consumed() > 0, mutable);
+        }
+    }
+
+    #[test]
     fn joint_retention_keeps_branch_admission_until_completion_owner_releases_it() {
         let canonical = canonical();
-        let cost = canonical.copy_estimate().unwrap().copy_bytes;
+        let cost = 0;
         let branch = canonical.branch().unwrap();
         let completion_retention = branch.retention();
         drop(branch);
@@ -573,7 +668,7 @@ mod tests {
         assert_eq!(budget.usage().branches, 1);
         assert_eq!(budget.usage().retained_bytes, estimate.retained_bytes);
         // The parent shares cumulative native copying, not its child's lease.
-        assert_eq!(parent.copy_bytes_consumed(), 2 * estimate.copy_bytes);
+        assert_eq!(parent.copy_bytes_consumed(), estimate.copy_bytes);
         let source_branch = parent.branch().unwrap();
         drop(source_branch);
         drop(completion_retention);

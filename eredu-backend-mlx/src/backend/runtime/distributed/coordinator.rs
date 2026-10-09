@@ -1,19 +1,19 @@
 //! Native resources for shared replicated agreement and owner publication.
 
-use super::{Group, topology::CommunicationRouteRealization};
+use super::{topology::CommunicationRouteRealization, Group};
 use crate::{
-    MlxTensor,
     backend::{
         distributed::MlxDistributedSession,
         nn::shared::{MlxCommunicationTensorMetadata, MlxNeuralBackend},
     },
+    MlxTensor,
 };
 use eredu_core::{BackendFailure, CollectiveGroupId};
 use eredu_runtime::{
-    CommunicationManifest, LayeredLocalPhase, LayeredTraversalHook,
     replicated_execution::{
-        OpaqueReplicatedCoordinator, ReplicatedCoordinator, validate_coordination,
+        validate_coordination, OpaqueReplicatedCoordinator, ReplicatedCoordinator,
     },
+    CommunicationManifest, LayeredLocalPhase, LayeredTraversalHook,
 };
 use safemlx::Stream;
 use std::{cell::RefCell, rc::Rc};

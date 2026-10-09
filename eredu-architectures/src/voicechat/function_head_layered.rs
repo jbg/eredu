@@ -1,10 +1,10 @@
 //! Independent function-vocabulary projection over shared bounded execution.
 use super::channels::{
-    ChannelError, DualChannelLogits, FunctionHead, agree_parallel_projection, compute_type,
-    head_spec, validate_logits,
+    agree_parallel_projection, compute_type, head_spec, validate_logits, ChannelError,
+    DualChannelLogits, FunctionHead,
 };
 use crate::decoder::StaticModules;
-use eredu_core::{BackendFailure, LayerSchedule, cache::LayerCachePolicy};
+use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
 use eredu_nn::{
     DistributedNeuralBackend, LinearFormatSpec, NeuralBackend, Parameterized, Tensor,
     VocabularyParallelRange,

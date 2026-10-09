@@ -197,11 +197,10 @@ fn missing_rnnt_requires_an_explicit_companion_and_preserves_primary_function_we
         .unwrap();
     assert_eq!(rnnt_view[&companion].len(), 15);
     assert!(!rnnt_view[&companion].contains("stt_model.function_head.weight"));
-    assert!(
-        plan.sources()
-            .role(ArtifactSourceRole::Component("voicechat/backbone"))
-            .is_none()
-    );
+    assert!(plan
+        .sources()
+        .role(ArtifactSourceRole::Component("voicechat/backbone"))
+        .is_none());
 }
 
 #[test]
@@ -395,7 +394,7 @@ fn retained_gguf_component_reads_exact_integer_ranges_and_cannot_access_other_ro
 
 #[test]
 fn voicechat_complete_gguf_uses_generic_configuration_and_discovery() {
-    use crate::{GgufArchitecture, ModelKind, configuration::MODEL_CONFIGURATIONS};
+    use crate::{configuration::MODEL_CONFIGURATIONS, GgufArchitecture, ModelKind};
     use eredu_core::artifact::{ArtifactMetadata, CheckpointMetadata, MetadataProvenance};
     let metadata = ArtifactMetadata {
         provenance: MetadataProvenance {
@@ -416,10 +415,9 @@ fn voicechat_complete_gguf_uses_generic_configuration_and_discovery() {
         plan.gguf_plan().unwrap().architecture(),
         GgufArchitecture::VoiceChat
     );
-    assert!(
-        plan.architecture_descriptor()
-            .nodes
-            .iter()
-            .any(|node| node.id == "transcription.joint")
-    );
+    assert!(plan
+        .architecture_descriptor()
+        .nodes
+        .iter()
+        .any(|node| node.id == "transcription.joint"));
 }

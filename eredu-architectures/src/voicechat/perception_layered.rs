@@ -85,6 +85,7 @@ impl<T: 'static> Parameterized<T> for PerceptionStaticModules {
 
 /// Architecture-owned graph and cold unit construction, with no pinned learned modules.
 pub struct PerceptionArchitecture<B: NeuralBackend> {
+    precision: super::precision::SpeechPrecision,
     dimensions: PerceptionDimensions,
     local_blocks: Option<Vec<ConformerLocalDimensions>>,
     partition: Option<partition::PerceptionOwnership>,
@@ -92,12 +93,24 @@ pub struct PerceptionArchitecture<B: NeuralBackend> {
     backend: PhantomData<fn() -> B>,
 }
 impl<B: NeuralBackend> PerceptionArchitecture<B> {
+    /// Selects storage/arithmetic policy for all independently constructed units.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, PerceptionError> {
+        precision
+            .validate()
+            .map_err(PerceptionError::Configuration)?;
+        self.precision = precision;
+        Ok(self)
+    }
     /// Validates component geometry before constructing any parameters.
     pub fn new(dimensions: PerceptionDimensions) -> Result<Self, PerceptionError> {
         dimensions.validate()?;
         dimensions.block.validate()?;
         dimensions.subsampling.validate()?;
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             local_blocks: None,
             partition: None,
@@ -581,7 +594,7 @@ impl<B: NeuralBackend> ArchitectureParameters<B> for PerceptionArchitecture<B> {
         eredu_runtime::ModelStateIdentity::new(
             "nemotron_voicechat",
             "voicechat_perception",
-            format!("{:?}", self.dimensions),
+            format!("{:?}:{:?}", self.dimensions, self.precision),
             global.len(),
             begin,
             0,
@@ -674,20 +687,27 @@ impl<B: NeuralBackend> LayeredArchitecture<B, PerceptionRuntimeState<B::Tensor>>
         self.validate_unit(group, index)?;
         self.require_owned(group, index)?;
         Ok(match group {
-            0 => PerceptionUnit::Subsampling(CausalSubsampling::new(
-                self.dimensions.subsampling,
-                context,
-            )?),
-            1 => PerceptionUnit::Block(match &self.local_blocks {
-                Some(blocks) => ConformerBlock::new_parallel(
-                    self.dimensions.block,
-                    blocks[index],
-                    index,
-                    context,
-                )?,
-                None => ConformerBlock::new(self.dimensions.block, index, context)?,
-            }),
-            _ => PerceptionUnit::Projection(self.dimensions.build_projection::<B>(context)?),
+            0 => PerceptionUnit::Subsampling(
+                CausalSubsampling::new(self.dimensions.subsampling, context)?
+                    .with_precision(self.precision)?,
+            ),
+            1 => PerceptionUnit::Block(
+                match &self.local_blocks {
+                    Some(blocks) => ConformerBlock::new_parallel(
+                        self.dimensions.block,
+                        blocks[index],
+                        index,
+                        context,
+                    )?,
+                    None => ConformerBlock::new(self.dimensions.block, index, context)?,
+                }
+                .with_precision(self.precision)?,
+            ),
+            _ => {
+                let mut projection = self.dimensions.build_projection::<B>(context)?;
+                projection.set_compute_element(self.precision.projection_element())?;
+                PerceptionUnit::Projection(projection)
+            }
         })
     }
     fn begin_forward<'a>(
@@ -863,7 +883,8 @@ impl<B: NeuralBackend> PerceptionArchitecture<B> {
                 Ok(output)
             }
             (2, PerceptionUnit::Projection(module)) => {
-                super::precision::require_float32(module, hidden)
+                self.precision
+                    .require(module, hidden)
                     .map_err(PerceptionError::Precision)?;
                 let output = module.forward(hidden, context)?;
                 forward.projected = true;

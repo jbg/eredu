@@ -1,8 +1,8 @@
 //! Compact nonzero Nemotron units for native coupled-execution coverage.
-use crate::{MlxTensor, backend::nn::shared::MlxNeuralBackend};
+use crate::{backend::nn::shared::MlxNeuralBackend, MlxTensor};
 use eredu_architectures::nemotron_h;
 use eredu_nn::{ParameterMetadata, ParameterVisitorMut, Parameterized, Tensor};
-use safemlx::Stream;
+use safemlx::{Device, DeviceType, Stream};
 use serde_json::Value;
 
 pub(super) fn args() -> nemotron_h::ModelArgs {
@@ -141,8 +141,12 @@ pub(super) fn function(
     } else {
         LayerWeightResidency::FullyResident
     };
+    let source_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     crate::composition::mlx::voicechat::materialize_voicechat_function_head(
-        prepared, residency, stream, stream,
+        prepared,
+        residency,
+        &source_stream,
+        stream,
     )
     .unwrap()
     .0

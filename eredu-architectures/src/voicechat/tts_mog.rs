@@ -188,6 +188,8 @@ pub(crate) fn f32_shape<T: Tensor>(input: &T, width: i32) -> Result<(), TtsError
 #[derive(Debug, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct MogBlock<B: NeuralBackend> {
+    #[parameter(skip)]
+    precision: super::precision::SpeechPrecision,
     pre: B::Normalization,
     gate: B::Linear,
     up: B::Linear,
@@ -199,6 +201,22 @@ pub struct MogBlock<B: NeuralBackend> {
     intermediate: i32,
 }
 impl<B: NeuralBackend> MogBlock<B> {
+    /// Selects projection arithmetic; parameters are supplied by the matching retained plan.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, TtsError> {
+        precision.validate().map_err(TtsError::Shape)?;
+        self.gate
+            .set_compute_element(precision.projection_element())?;
+        self.up
+            .set_compute_element(precision.projection_element())?;
+        self.down
+            .set_compute_element(precision.projection_element())?;
+        self.precision = precision;
+        Ok(self)
+    }
+
     /// Declares one canonical residual stage, independently of the large heads.
     pub fn new(
         dimensions: MogDimensions,
@@ -224,6 +242,7 @@ impl<B: NeuralBackend> MogBlock<B> {
         let name = format!("mog_head.mlp_stack.{index}");
         let group = format!("voicechat.tts.mog.layer.{index}");
         Ok(Self {
+            precision: Default::default(),
             pre: norm::<B>(&format!("{name}.pre_norm"), &group, dimensions, context)?,
             gate: linear::<B>(
                 &format!("{name}.mlp.gate_proj"),
@@ -262,7 +281,9 @@ impl<B: NeuralBackend> MogBlock<B> {
                 "sharded MoG block requires its tensor communicator",
             ));
         }
-        self.forward_with_reduction(hidden, context, |value| value)
+        self.validate_hidden(hidden)?;
+        let projected = self.project(hidden, context)?;
+        Ok(self.finish(hidden, &projected, context)?)
     }
     /// Runs local intermediate projections, reducing before post-normalization.
     pub fn forward_parallel(
@@ -293,6 +314,30 @@ impl<B: NeuralBackend> MogBlock<B> {
     pub(super) fn geometry(&self) -> (MogDimensions, i32) {
         (self.dimensions, self.intermediate)
     }
+    fn validate_hidden(&self, hidden: &B::Tensor) -> Result<(), TtsError> {
+        f32_shape(hidden, self.dimensions.hidden)?;
+        self.precision
+            .require(self, hidden)
+            .map_err(TtsError::Shape)
+    }
+    fn project(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        let normalized = self.pre.forward(hidden, context)?;
+        let gate = B::gelu_approximate(self.gate.forward(&normalized, context)?, context)?;
+        let activated = gate.multiply(&self.up.forward(&normalized, context)?, context)?;
+        self.down.forward(&activated, context)
+    }
+    fn finish(
+        &mut self,
+        hidden: &B::Tensor,
+        projected: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        hidden.add(&self.post.forward(projected, context)?, context)
+    }
     pub(super) fn forward_with_reduction(
         &mut self,
         hidden: &B::Tensor,
@@ -300,15 +345,11 @@ impl<B: NeuralBackend> MogBlock<B> {
         reduce: impl FnOnce(Result<B::Tensor, TtsError>) -> Result<B::Tensor, TtsError>,
     ) -> Result<B::Tensor, TtsError> {
         let prepared = (|| {
-            f32_shape(hidden, self.dimensions.hidden)?;
-            super::precision::require_float32(self, hidden).map_err(TtsError::Shape)?;
-            let normalized = self.pre.forward(hidden, context)?;
-            let gate = B::gelu_approximate(self.gate.forward(&normalized, context)?, context)?;
-            let activated = gate.multiply(&self.up.forward(&normalized, context)?, context)?;
-            Ok(self.down.forward(&activated, context)?)
+            self.validate_hidden(hidden)?;
+            Ok(self.project(hidden, context)?)
         })();
         let projected = reduce(prepared)?;
-        Ok(hidden.add(&self.post.forward(&projected, context)?, context)?)
+        Ok(self.finish(hidden, &projected, context)?)
     }
 }
 
@@ -472,14 +513,16 @@ impl<B: NeuralBackend> MogComponentBank<B> {
                 "sharded MoG components require their tensor communicator",
             ));
         }
-        self.selected_with_reduction(
-            prediction,
-            mixture,
+        let (mus, low) =
+            self.selected_inputs(prediction, mixture, gaussian, noise_scale, context)?;
+        let expanded = Self::expand(&prediction.hidden, &mus, &low, context)?;
+        Ok(self.moments(
+            &prediction.hidden,
+            &expanded,
             gaussian,
             noise_scale,
             context,
-            |value| value,
-        )
+        )?)
     }
     pub(super) fn geometry(&self) -> (MogDimensions, i32) {
         (self.dimensions, self.rank)
@@ -493,43 +536,77 @@ impl<B: NeuralBackend> MogComponentBank<B> {
         context: &<B::Tensor as Tensor>::Context,
         reduce: impl FnOnce(Result<B::Tensor, TtsError>) -> Result<B::Tensor, TtsError>,
     ) -> Result<MogSample<B::Tensor>, TtsError> {
-        let d = self.dimensions;
         let prepared = (|| {
-            f32_shape(&prediction.hidden, d.hidden)?;
-            super::precision::require_float32(self, &prediction.hidden).map_err(TtsError::Shape)?;
-            f32_shape(gaussian, d.latent)?;
-            let shape = prediction.hidden.shape();
-            if mixture.shape() != &shape[..2]
-                || mixture.element_type() != Some(TensorElementType::I32)
-                || gaussian.shape()[..2] != shape[..2]
-            {
-                return Err(TtsError::Shape(
-                    "MoG decisions/draws do not match hidden batch and time",
-                ));
-            }
-            if !noise_scale.is_finite() || noise_scale < 0.0 {
-                return Err(TtsError::Configuration("invalid MoG noise scale"));
-            }
-            let mus = self
-                .mus
-                .as_ref()
-                .reshape(&[d.mixtures, self.rank, d.hidden], context)?
-                .take_axis(mixture, 0, context)?;
-            let low = self.low.as_ref().take_axis(mixture, 0, context)?;
-            let ranked =
-                B::Tensor::matmul(&mus, &prediction.hidden.expand_dims(-1, context)?, context)?;
-            Ok(B::Tensor::matmul(&low, &ranked, context)?.squeeze_axes(&[-1], context)?)
+            let (mus, low) =
+                self.selected_inputs(prediction, mixture, gaussian, noise_scale, context)?;
+            Ok(Self::expand(&prediction.hidden, &mus, &low, context)?)
         })();
         let expanded = reduce(prepared)?;
+        Ok(self.moments(
+            &prediction.hidden,
+            &expanded,
+            gaussian,
+            noise_scale,
+            context,
+        )?)
+    }
+    fn selected_inputs(
+        &self,
+        prediction: &MogPrediction<B::Tensor>,
+        mixture: &B::Tensor,
+        gaussian: &B::Tensor,
+        noise_scale: f32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, B::Tensor), TtsError> {
+        let d = self.dimensions;
+        f32_shape(&prediction.hidden, d.hidden)?;
+        super::precision::require_float32(self, &prediction.hidden).map_err(TtsError::Shape)?;
+        f32_shape(gaussian, d.latent)?;
+        let shape = prediction.hidden.shape();
+        if mixture.shape() != &shape[..2]
+            || mixture.element_type() != Some(TensorElementType::I32)
+            || gaussian.shape()[..2] != shape[..2]
+        {
+            return Err(TtsError::Shape(
+                "MoG decisions/draws do not match hidden batch and time",
+            ));
+        }
+        if !noise_scale.is_finite() || noise_scale < 0.0 {
+            return Err(TtsError::Configuration("invalid MoG noise scale"));
+        }
+        let mus = self
+            .mus
+            .as_ref()
+            .reshape(&[d.mixtures, self.rank, d.hidden], context)?
+            .take_axis(mixture, 0, context)?;
+        let low = self.low.as_ref().take_axis(mixture, 0, context)?;
+        Ok((mus, low))
+    }
+    fn expand(
+        hidden: &B::Tensor,
+        mus: &B::Tensor,
+        low: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        let ranked = B::Tensor::matmul(mus, &hidden.expand_dims(-1, context)?, context)?;
+        B::Tensor::matmul(low, &ranked, context)?.squeeze_axes(&[-1], context)
+    }
+    fn moments(
+        &mut self,
+        hidden: &B::Tensor,
+        expanded: &B::Tensor,
+        gaussian: &B::Tensor,
+        noise_scale: f32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<MogSample<B::Tensor>, eredu_nn::Error> {
         let log_std = self
             .logs
-            .forward(&prediction.hidden, context)?
-            .maximum_scalar(d.min_log_std, context)?;
+            .forward(hidden, context)?
+            .maximum_scalar(self.dimensions.min_log_std, context)?;
         let std = B::exp(log_std.clone(), context)?;
-        let mean = expanded.multiply(&std, context)?.add(
-            &self.residual.forward(&prediction.hidden, context)?,
-            context,
-        )?;
+        let mean = expanded
+            .multiply(&std, context)?
+            .add(&self.residual.forward(hidden, context)?, context)?;
         let latent = mean.add(
             &std.multiply(gaussian, context)?
                 .multiply_scalar(noise_scale, context)?,
@@ -628,9 +705,18 @@ impl<B: NeuralBackend> MogHead<B> {
         dimensions: MogDimensions,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, TtsError> {
+        Self::new_with_precision(dimensions, Default::default(), context)
+    }
+    /// Constructs units with the selected portable projection precision.
+    pub fn new_with_precision(
+        dimensions: MogDimensions,
+        precision: super::precision::SpeechPrecision,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, TtsError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::tts_mog_layered::MogArchitecture::new(dimensions)?,
+                super::tts_mog_layered::MogArchitecture::new(dimensions)?
+                    .with_precision(precision)?,
                 context,
             )?,
         })

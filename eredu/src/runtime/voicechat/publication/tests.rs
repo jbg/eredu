@@ -11,17 +11,17 @@ use eredu_architectures::voicechat::{
     schedule::{AudioSource, Progress, Step},
 };
 use eredu_core::{
-    Completion,
     generation::SemanticEvent,
     scheduler::{
         RequestId, Scheduler, SchedulerLimits, SemanticStateTransaction, TransitionOutput,
         WorkDescriptor,
     },
+    Completion,
 };
 use eredu_runtime::{
-    PrepublicationRealtimeFrame, RealtimeFrameHostObserver, RealtimeGenerationBranch,
-    RealtimeGenerationContract, RealtimeGenerationState, RealtimeScheduleState,
-    submit_realtime_output,
+    submit_realtime_output, PrepublicationRealtimeFrame, RealtimeFrameHostObserver,
+    RealtimeGenerationBranch, RealtimeGenerationContract, RealtimeGenerationState,
+    RealtimeScheduleState,
 };
 
 use super::*;
@@ -586,12 +586,10 @@ fn cancelled_submission_retires_only_after_exact_native_completion() {
     let committed = receiver.pop_output().unwrap();
     assert_eq!(committed.frame.invocation_index, 0);
     assert_eq!(committed.transcription.unwrap().text, "hi");
-    assert!(
-        scheduler
-            .poll_completions(Instant::now())
-            .committed
-            .is_empty()
-    );
+    assert!(scheduler
+        .poll_completions(Instant::now())
+        .committed
+        .is_empty());
     assert_eq!(discarded.get(), 0);
     assert_eq!(receiver.usage().reserved_publications, 1);
     ready.set(true);

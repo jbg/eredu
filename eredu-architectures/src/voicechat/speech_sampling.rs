@@ -39,17 +39,17 @@ pub enum SpeechSamplingError {
 #[path = "speech_coordination.rs"]
 mod coordination;
 use super::tts_rvq_layered::BorrowedRefinementSampling;
-pub use coordination::SpeechSamplingCoordination;
 use coordination::sampled;
+pub use coordination::SpeechSamplingCoordination;
 
 impl<
-    B: NeuralBackend,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    E: TransformerExecution<B>,
-> TtsGenerator<B, X, Y, Z, W, E>
+        B: NeuralBackend,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        E: TransformerExecution<B>,
+    > TtsGenerator<B, X, Y, Z, W, E>
 {
     /// Advances one active slot using the enclosing realtime branch's RNG. The
     /// three empty schedule slots consume no draws. On any error, neither the
@@ -64,10 +64,10 @@ impl<
     ) -> Result<TtsFrame<B::Tensor>, SpeechSamplingError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         Q: RealtimeScheduleState,
@@ -95,10 +95,10 @@ impl<
     ) -> Result<TtsFrame<B::Tensor>, SpeechSamplingError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         Q: RealtimeScheduleState,
@@ -116,14 +116,14 @@ impl<
 }
 
 impl<
-    B: NeuralBackend,
-    X: TransformerExecution<B>,
-    Y: MogExecution<B>,
-    Z: RvqExecution<B>,
-    W: ConditioningExecution<B>,
-    E: TransformerExecution<B>,
-    A: AudioDecoderExecution<B>,
-> SpeechComponents<'_, B, X, Y, Z, W, A, E>
+        B: NeuralBackend,
+        X: TransformerExecution<B>,
+        Y: MogExecution<B>,
+        Z: RvqExecution<B>,
+        W: ConditioningExecution<B>,
+        E: TransformerExecution<B>,
+        A: AudioDecoderExecution<B>,
+    > SpeechComponents<'_, B, X, Y, Z, W, A, E>
 {
     /// Completes retained refinement, applies speech feedback and renders one
     /// codec frame under a single RNG adoption boundary. A synchronous rendering
@@ -143,10 +143,10 @@ impl<
     ) -> Result<SpeechOutput<B::Tensor, A::NeuralState>, SpeechSamplingError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         Q: RealtimeScheduleState,
@@ -177,10 +177,10 @@ impl<
     ) -> Result<SpeechFrame<B::Tensor, A::NeuralState>, SpeechSamplingError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         Q: RealtimeScheduleState,
@@ -208,10 +208,10 @@ impl<
     ) -> Result<SpeechFrame<B::Tensor, A::NeuralState>, SpeechSamplingError>
     where
         D: DenseSamplingBackend<
-                Logits = B::Tensor,
-                Token = B::Tensor,
-                Context = <B::Tensor as Tensor>::Context,
-            >,
+            Logits = B::Tensor,
+            Token = B::Tensor,
+            Context = <B::Tensor as Tensor>::Context,
+        >,
         D::RandomState: Clone,
         D::Error: std::error::Error + Send + Sync + 'static,
         Q: RealtimeScheduleState,

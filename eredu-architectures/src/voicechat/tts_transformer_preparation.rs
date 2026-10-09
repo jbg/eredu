@@ -32,6 +32,9 @@ pub enum TtsTransformerKind {
 /// Invalid component geometry or exact retained parameter contract.
 #[derive(Debug, thiserror::Error)]
 pub enum TtsTransformerPreparationError {
+    /// Invalid floating execution profile or attempted precision reselection.
+    #[error("invalid speech precision: {0}")]
+    Precision(&'static str),
     /// Transformer geometry cannot be constructed.
     #[error(transparent)]
     Transformer(#[from] TransformerError),
@@ -73,6 +76,24 @@ pub struct PreparedTtsTransformerBindings {
 }
 
 impl PreparedTtsTransformerBindings {
+    /// Selects exact narrow projections; all norms and cache storage remain F32.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, TtsTransformerPreparationError> {
+        if self.config.precision() != Default::default() && self.config.precision() != precision {
+            return Err(TtsTransformerPreparationError::Precision(
+                "precision is already selected",
+            ));
+        }
+        precision
+            .validate()
+            .map_err(TtsTransformerPreparationError::Precision)?;
+        precision.bindings(&self.source, &mut self.units)?;
+        self.config = self.config.with_precision(precision);
+        Ok(self)
+    }
+
     /// Projects exact transformer bindings from selected retained artifacts.
     pub fn from_retained(
         artifacts: &RetainedVoiceChatArtifacts,
@@ -203,9 +224,8 @@ impl PreparedTtsTransformerBindings {
             ));
         }
         let description = tts_transformer_parameter_description(&self.config)?;
-        let layout =
-            eredu_runtime::derive_partitioned_local_layout(&description, topology)
-                .map_err(TtsTransformerPreparationError::Parallel)?;
+        let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
+            .map_err(TtsTransformerPreparationError::Parallel)?;
         Ok((self.into_parallel(&layout)?, layout))
     }
 

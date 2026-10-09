@@ -3,7 +3,7 @@ use super::voicechat_agent_sampling::{Draw, Sampling};
 use super::*;
 use eredu_architectures::voicechat::{
     agent_sampling::{AgentSampler, AgentSamplingPolicy},
-    channel_decision::{ChannelDecisionPolicy, select_channels},
+    channel_decision::{select_channels, ChannelDecisionPolicy},
     channels::DualChannelLogits,
 };
 use eredu_core::scheduler::SemanticStateTransaction;
@@ -330,18 +330,16 @@ fn voicechat_channel_decision_rejects_before_draws_and_rolls_back_partial_select
         function_feedback: None,
         spoken_text: None,
     };
-    assert!(
-        select_channels::<TensorSampling, _, _, _, _>(
-            &mut branch,
-            &logits,
-            invalid.into(),
-            Default::default(),
-            TokenDomain::new(16),
-            None,
-            &context
-        )
-        .is_err()
-    );
+    assert!(select_channels::<TensorSampling, _, _, _, _>(
+        &mut branch,
+        &logits,
+        invalid.into(),
+        Default::default(),
+        TokenDomain::new(16),
+        None,
+        &context
+    )
+    .is_err());
     assert!(
         context.borrow().is_none(),
         "invalid effective feedback is rejected before sampling"
@@ -350,46 +348,42 @@ fn voicechat_channel_decision_rejects_before_draws_and_rolls_back_partial_select
     assert_eq!(branch.samplers(), &[sampler.clone()]);
     let mut malformed = logits.clone();
     malformed.function = NumericTensor::new(vec![2, 8], vec![0.; 16]);
-    assert!(
-        select_channels::<TensorSampling, _, _, _, _>(
-            &mut branch,
-            &malformed,
-            ChannelDecisionPolicy::Main {
-                agent_feedback: None,
-                function_feedback: None,
-                spoken_text: None
-            }
-            .into(),
-            Default::default(),
-            TokenDomain::new(16),
-            None,
-            &context
-        )
-        .is_err()
-    );
+    assert!(select_channels::<TensorSampling, _, _, _, _>(
+        &mut branch,
+        &malformed,
+        ChannelDecisionPolicy::Main {
+            agent_feedback: None,
+            function_feedback: None,
+            spoken_text: None
+        }
+        .into(),
+        Default::default(),
+        TokenDomain::new(16),
+        None,
+        &context
+    )
+    .is_err());
     assert!(
         context.borrow().is_none(),
         "malformed function geometry cannot consume an agent draw"
     );
     let mut failure = logits.clone();
     failure.function.data[0] = f32::NAN;
-    assert!(
-        select_channels::<TensorSampling, _, _, _, _>(
-            &mut branch,
-            &failure,
-            ChannelDecisionPolicy::Main {
-                agent_feedback: None,
-                function_feedback: None,
-                spoken_text: None
-            }
-            .into(),
-            Default::default(),
-            TokenDomain::new(16),
-            None,
-            &context
-        )
-        .is_err()
-    );
+    assert!(select_channels::<TensorSampling, _, _, _, _>(
+        &mut branch,
+        &failure,
+        ChannelDecisionPolicy::Main {
+            agent_feedback: None,
+            function_feedback: None,
+            spoken_text: None
+        }
+        .into(),
+        Default::default(),
+        TokenDomain::new(16),
+        None,
+        &context
+    )
+    .is_err());
     assert!(
         context.borrow().is_some(),
         "the injected function failure follows raw agent sampling"
@@ -402,23 +396,21 @@ fn voicechat_channel_decision_rejects_before_draws_and_rolls_back_partial_select
     assert_eq!(branch.samplers(), &[sampler]);
     branch.samplers_mut()[0].set_history(&[3, 4]).unwrap();
     *context.borrow_mut() = None;
-    assert!(
-        select_channels::<TensorSampling, _, _, _, _>(
-            &mut branch,
-            &logits,
-            ChannelDecisionPolicy::Main {
-                agent_feedback: None,
-                function_feedback: None,
-                spoken_text: None
-            }
-            .into(),
-            Default::default(),
-            TokenDomain::new(16),
-            None,
-            &context
-        )
-        .is_err()
-    );
+    assert!(select_channels::<TensorSampling, _, _, _, _>(
+        &mut branch,
+        &logits,
+        ChannelDecisionPolicy::Main {
+            agent_feedback: None,
+            function_feedback: None,
+            spoken_text: None
+        }
+        .into(),
+        Default::default(),
+        TokenDomain::new(16),
+        None,
+        &context
+    )
+    .is_err());
     assert!(
         context.borrow().is_none(),
         "full effective history rejects before sampling"
@@ -430,7 +422,7 @@ fn voicechat_channel_decision_rejects_before_draws_and_rolls_back_partial_select
 fn voicechat_channel_decision_effective_feedback_reaches_the_next_cached_backbone_step() {
     use super::voicechat_backbone_execution::{function, model, state};
     use eredu_architectures::voicechat::{
-        backbone_execution::{BackboneRequest, OrdinaryBackbone, execute},
+        backbone_execution::{execute, BackboneRequest, OrdinaryBackbone},
         channels::ChannelFusion,
         config::VoiceChatConfig,
     };
@@ -656,18 +648,16 @@ fn voicechat_dynamic_channel_policy_sees_current_rnnt_and_raw_tokens_before_rng_
             reject: true,
         },
     ] {
-        assert!(
-            select_channels::<TensorSampling, _, _, _, _>(
-                &mut branch,
-                &logits,
-                DecisionSource::Resolved(&policy),
-                evidence,
-                TokenDomain::new(16),
-                None,
-                &context,
-            )
-            .is_err()
-        );
+        assert!(select_channels::<TensorSampling, _, _, _, _>(
+            &mut branch,
+            &logits,
+            DecisionSource::Resolved(&policy),
+            evidence,
+            TokenDomain::new(16),
+            None,
+            &context,
+        )
+        .is_err());
         assert!(
             context.borrow().is_some(),
             "raw sampling precedes dynamic policy"

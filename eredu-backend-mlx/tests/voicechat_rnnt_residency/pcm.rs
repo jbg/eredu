@@ -1,4 +1,5 @@
 //! PCM preprocessing and both neural frontiers use the same retained pipeline bundle.
+use super::perception::perception_fixture;
 use super::*;
 use eredu_architectures::voicechat::{
     config::VoiceChatConfig,
@@ -21,7 +22,6 @@ use eredu_backend_mlx::{
 use eredu_core::DistributedCommitEpoch;
 use eredu_media::audio::streaming::{FinalPcmFrame, PcmFinishPolicy};
 use eredu_runtime::CommunicationManifest;
-use super::perception::perception_fixture;
 
 type State = InputState<MlxTensor, MlxPerceptionPipelineState>;
 fn roots(state: &State, stream: &Stream) -> Retained {

@@ -3,8 +3,8 @@
 use std::fmt::Display;
 
 use eredu_checkpoint::schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan};
-use eredu_core::InputModalities;
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
+use eredu_core::InputModalities;
 #[cfg(test)]
 use serde_json::Value;
 
@@ -708,16 +708,14 @@ mod tests {
     fn gguf_dtype_source_plan() -> GgufCheckpointPlan {
         GgufCheckpointPlan::new(
             "test GGUF architecture",
-            vec![
-                eredu_checkpoint::schema::GgufTensorConstraint::required(
-                    "token_embd.weight",
-                    vec![32, 16],
-                    eredu_checkpoint::schema::GgufTypeConstraint::OperationClass(
-                        eredu_checkpoint::schema::TensorOperation::Matrix,
-                    ),
-                )
-                .with_aliases(["released_token_embd.weight"]),
-            ],
+            vec![eredu_checkpoint::schema::GgufTensorConstraint::required(
+                "token_embd.weight",
+                vec![32, 16],
+                eredu_checkpoint::schema::GgufTypeConstraint::OperationClass(
+                    eredu_checkpoint::schema::TensorOperation::Matrix,
+                ),
+            )
+            .with_aliases(["released_token_embd.weight"])],
             Vec::new(),
             eredu_checkpoint::schema::CatalogPolicy::strict(),
         )
@@ -967,11 +965,9 @@ mod tests {
             &unknown,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("did not find floating-state dtype source")
-        );
+        assert!(error
+            .to_string()
+            .contains("did not find floating-state dtype source"));
 
         let ambiguous = TensorCatalog::new([
             tensor("released.embedding.weight", TensorDtype::F16),

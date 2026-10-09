@@ -10,11 +10,11 @@ use std::{
 };
 
 use eredu_core::{
-    BackendFailure,
     scheduler::{
         RequestId, RequestStatus, Scheduler, SchedulerError, SchedulerLimits, SchedulerProgress,
         SchedulerReport, SemanticStateTransaction,
     },
+    BackendFailure,
 };
 
 use super::{
@@ -30,7 +30,7 @@ mod retained_failure;
 mod snapshot;
 pub use super::publication::snapshot::VoiceChatSnapshotError;
 pub use fork::VoiceChatFork;
-use retained_failure::{FailureSlot, TrackedOutput, TrackedState, capture};
+use retained_failure::{capture, FailureSlot, TrackedOutput, TrackedState};
 pub use snapshot::VoiceChatSessionSnapshot;
 
 /// Bounded session composition over already prepared neural and conversation state.

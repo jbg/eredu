@@ -986,8 +986,7 @@ impl SelectedExecution {
         let Some(rank) = self.parallel_topology() else {
             return Ok(None);
         };
-        let layout =
-            eredu_runtime::derive_partitioned_local_layout(parameters, rank)?;
+        let layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank)?;
         let (routed, independent) = self.bank_parameter_targets();
         fn size<R, Q>(
             selected: &SelectedPartitionedAdmission<R, Q>,
@@ -1037,10 +1036,8 @@ impl SelectedExecution {
         if !auxiliary.is_empty() {
             let prediction_rank = crate::prediction_extension::tensor_rank(rank)
                 .map_err(|error| error.to_string())?;
-            let prediction_layout = eredu_runtime::derive_partitioned_local_layout(
-                parameters,
-                prediction_rank,
-            )?;
+            let prediction_layout =
+                eredu_runtime::derive_partitioned_local_layout(parameters, prediction_rank)?;
             let owned = parameters
                 .groups()
                 .iter()

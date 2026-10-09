@@ -3,8 +3,8 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
 use eredu_core::{
-    BackendFailure,
     execution_control::{ExecutionControlError, SnapshotEstimate},
+    BackendFailure,
 };
 use eredu_runtime::HostRandomState;
 

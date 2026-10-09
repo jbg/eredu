@@ -165,6 +165,7 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
+            let precision = prepared.precision();
             let (dimensions, layout, source, units) = prepared.into_parts();
             let mut architecture = match parallel {
                 Some((local, _)) => {
@@ -172,6 +173,7 @@ fn materialize(
                 }
                 None => PerceptionArchitecture::<MlxNeuralBackend>::new(dimensions),
             }
+            .and_then(|architecture| architecture.with_precision(precision))
             .map_err(BackendFailure::from_error)?;
             let state_layout = architecture
                 .state_layout()

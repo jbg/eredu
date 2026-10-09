@@ -5,10 +5,10 @@ use eredu_architectures::voicechat::frontend::{INPUT_FRAME_SAMPLES, INPUT_SAMPLE
 
 use super::*;
 use crate::runtime::voicechat::{
-    VoiceChatInputError, VoiceChatToolAudioPolicy,
     conversation::tests::capacity,
-    driver::tests::{Position, submit},
-    ingress::tests::{Branch, CommitFailure, state as fixture_state},
+    driver::tests::{submit, Position},
+    ingress::tests::{state as fixture_state, Branch, CommitFailure},
+    VoiceChatInputError, VoiceChatToolAudioPolicy,
 };
 
 fn config() -> VoiceChatSessionConfig {
@@ -73,11 +73,9 @@ fn iterator_and_controlled_advancement_publish_the_same_finished_stream() {
                 .unwrap()
         };
         assert_eq!(progress.len(), 4);
-        assert!(
-            progress
-                .iter()
-                .all(|step| step.submitted == 1 && step.committed == 1)
-        );
+        assert!(progress
+            .iter()
+            .all(|step| step.submitted == 1 && step.committed == 1));
         assert_eq!(session.status(), VoiceChatSessionStatus::Finished);
         assert_eq!(session.input().status().committed_samples, 1500);
         assert_eq!(session.input().status().committed_frames, 2);
@@ -111,7 +109,7 @@ fn iterator_and_controlled_advancement_publish_the_same_finished_stream() {
 #[test]
 fn bound_shared_execution_waits_before_admission_and_retries() {
     use crate::runtime::voicechat::{
-        BoundVoiceChatSession, VoiceChatExecutor, ingress::tests::Neural,
+        ingress::tests::Neural, BoundVoiceChatSession, VoiceChatExecutor,
     };
 
     struct SharedExecutor {

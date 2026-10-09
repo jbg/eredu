@@ -159,37 +159,91 @@ fn composite_independent_banks_preserve_media_writes_and_cached_decode() {
                         .with_residency(residency);
                     let world = Arc::new(NumericPartitionWorld::default());
                     let results = std::thread::scope(|scope| {
-                        let workers = (0..topology.world_size()).map(|rank| {
-                            let (inspection, parameters, inputs, plan, complete, provider_local) = (&inspection, &parameters, &inputs, &plan, &complete_writes, &provider_local);
-                            let world = world.clone();
-                            scope.spawn(move || {
-                                let sources = partitioned_adapter::prepare_plan_with_banks(
-                                    inspection, plan, rank, std::time::Duration::from_secs(30),
-                                    independent.then(|| ParameterBankLoadOptions::new(
-                                        eredu_core::residency::OffloadConfig::new(Some(bank_budget), Some(1 << 20), 1).unwrap(), bank_budget, bank_budget).unwrap()),
-                                ).unwrap();
-                                let layout = eredu_runtime::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
-                                let mut context = NumericContext::with_partition(layout, rank, world);
-                                context.bind_checkpoint_values = true;
-                                reset_reference_stage_evidence("SafeTensors");
-                                let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
-                                let mut captures = BTreeMap::new();
-                                let outputs = inputs.iter().enumerate().map(|(step, input)| {
-                                    let mut trace = Trace { values:BTreeMap::new(),complete,provider_local };
-                                    let output = executable.forward_observed(input, step == 0, &mut trace).unwrap();
-                                    captures.extend(trace.values.into_iter().map(|(path, value)| ((step, path), value)));
-                                    output
-                                }).collect::<Vec<_>>();
-                                if independent {
-                                    let evidence = last_reference_stage_evidence();
-                                    assert!(!evidence.bank_acquisitions.is_empty());
-                                    assert!(evidence.bank_completions > 0);
-                                    assert!(evidence.peak_bank_bytes <= bank_budget);
-                                    if tp == 1 && pp == 1 { assert!(evidence.bank_evictions > 0); }
-                                }
-                                (outputs, captures)
+                        let workers = (0..topology.world_size())
+                            .map(|rank| {
+                                let (
+                                    inspection,
+                                    parameters,
+                                    inputs,
+                                    plan,
+                                    complete,
+                                    provider_local,
+                                ) = (
+                                    &inspection,
+                                    &parameters,
+                                    &inputs,
+                                    &plan,
+                                    &complete_writes,
+                                    &provider_local,
+                                );
+                                let world = world.clone();
+                                scope.spawn(move || {
+                                    let sources = partitioned_adapter::prepare_plan_with_banks(
+                                        inspection,
+                                        plan,
+                                        rank,
+                                        std::time::Duration::from_secs(30),
+                                        independent.then(|| {
+                                            ParameterBankLoadOptions::new(
+                                                eredu_core::residency::OffloadConfig::new(
+                                                    Some(bank_budget),
+                                                    Some(1 << 20),
+                                                    1,
+                                                )
+                                                .unwrap(),
+                                                bank_budget,
+                                                bank_budget,
+                                            )
+                                            .unwrap()
+                                        }),
+                                    )
+                                    .unwrap();
+                                    let layout = eredu_runtime::derive_partitioned_local_layout(
+                                        parameters,
+                                        ParallelRankTopology::new(topology, rank).unwrap(),
+                                    )
+                                    .unwrap();
+                                    let mut context =
+                                        NumericContext::with_partition(layout, rank, world);
+                                    context.bind_checkpoint_values = true;
+                                    reset_reference_stage_evidence("SafeTensors");
+                                    let mut executable =
+                                        partitioned_adapter::composite(sources, &context).unwrap();
+                                    let mut captures = BTreeMap::new();
+                                    let outputs = inputs
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(step, input)| {
+                                            let mut trace = Trace {
+                                                values: BTreeMap::new(),
+                                                complete,
+                                                provider_local,
+                                            };
+                                            let output = executable
+                                                .forward_observed(input, step == 0, &mut trace)
+                                                .unwrap();
+                                            captures.extend(
+                                                trace
+                                                    .values
+                                                    .into_iter()
+                                                    .map(|(path, value)| ((step, path), value)),
+                                            );
+                                            output
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if independent {
+                                        let evidence = last_reference_stage_evidence();
+                                        assert!(!evidence.bank_acquisitions.is_empty());
+                                        assert!(evidence.bank_completions > 0);
+                                        assert!(evidence.peak_bank_bytes <= bank_budget);
+                                        if tp == 1 && pp == 1 {
+                                            assert!(evidence.bank_evictions > 0);
+                                        }
+                                    }
+                                    (outputs, captures)
+                                })
                             })
-                        }).collect::<Vec<_>>();
+                            .collect::<Vec<_>>();
                         workers
                             .into_iter()
                             .map(|worker| worker.join().unwrap())

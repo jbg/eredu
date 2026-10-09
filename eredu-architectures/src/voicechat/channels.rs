@@ -12,7 +12,7 @@ use eredu_nn::{
     TensorElementType, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole, module_parameter_group,
+    module_parameter_group, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
 };
 
 /// Released `<s>` ID used to frame system-prompt tokens.

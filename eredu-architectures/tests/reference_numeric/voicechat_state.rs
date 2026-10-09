@@ -85,12 +85,10 @@ fn voicechat_generation_preparation_admits_startup_and_retains_cold_feedback() {
     assert_eq!(generation.random_state(), Some(&123));
     assert!(generation.samplers()[0].history().is_empty());
     assert!(generation.schedule_state().plan(Step::LiveAudio).is_err());
-    assert!(
-        generation
-            .schedule_state()
-            .plan(Step::Prefill { backbone_tokens: 5 })
-            .is_ok()
-    );
+    assert!(generation
+        .schedule_state()
+        .plan(Step::Prefill { backbone_tokens: 5 })
+        .is_ok());
 }
 
 // Deliberately not Clone: coupled state must use the neural owner's transaction,

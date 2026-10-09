@@ -58,7 +58,17 @@ pub fn input_state<T: Tensor>() -> InputState<T> {
 }
 /// Compact nonzero perception and RNNT with a forced blank joint readout.
 pub fn perception<B: NeuralBackend>(context: &<B::Tensor as Tensor>::Context) -> PerceptionRnnt<B> {
-    struct Bind<'c, T: Tensor>(&'c T::Context);
+    perception_with_precision::<B>(Default::default(), context)
+}
+/// Compact learned perception with selected precision and F32 recurrent transcription.
+pub fn perception_with_precision<B: NeuralBackend>(
+    precision: eredu_architectures::voicechat::precision::SpeechPrecision,
+    context: &<B::Tensor as Tensor>::Context,
+) -> PerceptionRnnt<B> {
+    struct Bind<'c, T: Tensor>(
+        &'c T::Context,
+        eredu_architectures::voicechat::precision::SpeechPrecision,
+    );
     impl<'a, T: Tensor> ParameterVisitorMut<'a, T> for Bind<'_, T> {
         fn visit_mut(&mut self, metadata: ParameterMetadata, target: &'a mut T) {
             let count = target
@@ -72,9 +82,14 @@ pub fn perception<B: NeuralBackend>(context: &<B::Tensor as Tensor>::Context) ->
                 _ => (0..count).map(|i| ((i % 11) as f32 - 4.) * 0.015).collect(),
             };
             *target = T::from_f32_slice(&values, target.shape(), self.0).unwrap();
+            if self.1.weights != eredu_architectures::voicechat::precision::SpeechFloat::F32
+                && self.1.narrows(metadata.id.as_str(), target.shape().len())
+            {
+                *target = target.cast_float(self.1.weights.element(), self.0).unwrap();
+            }
         }
     }
-    let mut model = PerceptionRnnt::<B>::new(
+    let mut model = PerceptionRnnt::<B>::new_with_precision(
         PerceptionDimensions {
             subsampling: SubsamplingDimensions {
                 features: 128,
@@ -98,10 +113,11 @@ pub fn perception<B: NeuralBackend>(context: &<B::Tensor as Tensor>::Context) ->
             encoder_width: 4,
             joint_width: 1,
         },
+        precision,
         context,
     )
     .unwrap();
-    model.visit_parameters_mut(&mut Bind::<B::Tensor>(context));
+    model.visit_parameters_mut(&mut Bind::<B::Tensor>(context, precision));
     model
 }
 /// Causal Gemma geometry for the compact fixture's two guidance cache lanes.
@@ -114,6 +130,14 @@ pub fn tts<B: NeuralBackend>(
     fixture: &Value,
     context: &<B::Tensor as Tensor>::Context,
 ) -> TtsGenerator<B> {
+    tts_with_precision::<B>(fixture, Default::default(), context)
+}
+/// Learned TTS projections with selected precision and unchanged conditioning/RVQ.
+pub fn tts_with_precision<B: NeuralBackend>(
+    fixture: &Value,
+    precision: eredu_architectures::voicechat::precision::SpeechPrecision,
+    context: &<B::Tensor as Tensor>::Context,
+) -> TtsGenerator<B> {
     let mut policy = config().tts;
     policy.backbone = tts_backbone_config(fixture);
     policy.character_encoder = geometry(&fixture["character"]["config"], false);
@@ -122,14 +146,19 @@ pub fn tts<B: NeuralBackend>(
     policy.mog.intermediate_size = 12;
     policy.mog.low_rank = 2;
     policy.mog.num_predictions = 4;
-    let mut generator = TtsGenerator::<B>::new(
+    let mut generator = TtsGenerator::<B>::new_with_precision(
         &policy,
         fixture["character"]["characters"].as_i64().unwrap() as i32,
         37,
+        precision,
         context,
     )
     .unwrap();
-    struct Bind<'v, 'c, T: Tensor>(&'v Value, &'c T::Context);
+    struct Bind<'v, 'c, T: Tensor>(
+        &'v Value,
+        &'c T::Context,
+        eredu_architectures::voicechat::precision::SpeechPrecision,
+    );
     impl<'a, T: Tensor> ParameterVisitorMut<'a, T> for Bind<'_, '_, T> {
         fn visit_mut(&mut self, metadata: ParameterMetadata, target: &'a mut T) {
             let source = &self.0[metadata.id.as_str()];
@@ -142,9 +171,18 @@ pub fn tts<B: NeuralBackend>(
             };
             assert_eq!(target.shape(), value.shape(), "{}", metadata.id.as_str());
             *target = value;
+            if self.2.weights != eredu_architectures::voicechat::precision::SpeechFloat::F32
+                && self.2.narrows(metadata.id.as_str(), target.shape().len())
+            {
+                *target = target.cast_float(self.2.weights.element(), self.1).unwrap();
+            }
         }
     }
-    generator.visit_parameters_mut(&mut Bind::<B::Tensor>(&fixture["parameters"], context));
+    generator.visit_parameters_mut(&mut Bind::<B::Tensor>(
+        &fixture["parameters"],
+        context,
+        precision,
+    ));
     generator
 }
 /// Compact nonzero decoder retaining the released 1764-sample frame cadence.

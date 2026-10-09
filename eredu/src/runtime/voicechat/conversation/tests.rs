@@ -1,8 +1,8 @@
 use super::*;
 use crate::runtime::voicechat::{
+    tools::tests::{call, channel, limits},
     VoiceChatToolWaitAction, VoiceChatToolWaitMessages, VoiceChatToolWaitPolicy,
     VoiceChatTurnLimits, VoiceChatTurnPolicy,
-    tools::tests::{call, channel, limits},
 };
 use eredu_architectures::voicechat::{
     channel_decision::FeedbackTokens,
@@ -480,13 +480,11 @@ fn sustained_tool_speech_interrupts_only_when_its_publication_commits() {
                 transcription_text_bytes: 0,
                 ..capacity()
             };
-            assert!(
-                owner
-                    .admit(step, insufficient)
-                    .unwrap()
-                    .stage(output.clone())
-                    .is_err()
-            );
+            assert!(owner
+                .admit(step, insufficient)
+                .unwrap()
+                .stage(output.clone())
+                .is_err());
             let staged = owner
                 .admit(step, capacity())
                 .unwrap()
@@ -860,24 +858,20 @@ fn streaming_phrase_selections_replay_across_discard_restore_and_fork() {
                 .initial_reminder
                 .selected()
                 .unwrap();
-            assert!(
-                owner
-                    .owner
-                    .borrow()
-                    .state
-                    .initial_reminder
-                    .selected()
-                    .is_none()
-            );
-            assert!(
-                owner
-                    .owner
-                    .borrow()
-                    .state
-                    .acknowledgement
-                    .selected()
-                    .is_none()
-            );
+            assert!(owner
+                .owner
+                .borrow()
+                .state
+                .initial_reminder
+                .selected()
+                .is_none());
+            assert!(owner
+                .owner
+                .borrow()
+                .state
+                .acknowledgement
+                .selected()
+                .is_none());
             drop(staged);
             let retry = owner
                 .admit(output.step, capacity())
@@ -932,24 +926,20 @@ fn streaming_phrase_selections_replay_across_discard_restore_and_fork() {
         assert!(reminder < 10);
         assert_eq!(owner.owner.borrow().state.acknowledgement_token(), Some(1));
         owner.interrupt().unwrap();
-        assert!(
-            owner
-                .owner
-                .borrow()
-                .state
-                .acknowledgement
-                .selected()
-                .is_none()
-        );
-        assert!(
-            owner
-                .owner
-                .borrow()
-                .state
-                .initial_reminder
-                .selected()
-                .is_none()
-        );
+        assert!(owner
+            .owner
+            .borrow()
+            .state
+            .acknowledgement
+            .selected()
+            .is_none());
+        assert!(owner
+            .owner
+            .borrow()
+            .state
+            .initial_reminder
+            .selected()
+            .is_none());
         (selected, reminder)
     }
 
@@ -1098,14 +1088,12 @@ fn configured_initial_reminder_survives_eotc_and_holds_ready_result_until_playba
             .unwrap()
             .commit();
     }
-    assert!(
-        owner
-            .owner
-            .borrow()
-            .state
-            .initial_reminder
-            .selected()
-            .is_none()
-    );
+    assert!(owner
+        .owner
+        .borrow()
+        .state
+        .initial_reminder
+        .selected()
+        .is_none());
     assert!(owner.pending().is_none());
 }

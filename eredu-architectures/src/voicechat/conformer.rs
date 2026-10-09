@@ -129,7 +129,7 @@ pub enum ConformerError {
     /// Input or retained cache does not match the selected block.
     #[error("{0}")]
     State(&'static str),
-    /// Input or parameters do not use the pinned Float32 inference policy.
+    /// Input or parameters differ from the selected floating execution policy.
     #[error("{0}")]
     Precision(&'static str),
     /// Backend-neutral numerical failure retaining its original source.
@@ -237,6 +237,8 @@ impl<T: Tensor> ConformerState<T> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct ConformerBlock<B: NeuralBackend> {
     #[parameter(skip)]
+    precision: super::precision::SpeechPrecision,
+    #[parameter(skip)]
     dimensions: ConformerDimensions,
     #[parameter(skip)]
     local: ConformerLocalDimensions,
@@ -265,6 +267,7 @@ pub struct ConformerBlock<B: NeuralBackend> {
 impl<B: NeuralBackend> Clone for ConformerBlock<B> {
     fn clone(&self) -> Self {
         Self {
+            precision: self.precision,
             dimensions: self.dimensions,
             local: self.local,
             norm_feed_forward1: self.norm_feed_forward1.clone(),
@@ -292,6 +295,34 @@ impl<B: NeuralBackend> Clone for ConformerBlock<B> {
 }
 
 impl<B: NeuralBackend> ConformerBlock<B> {
+    /// Selects projection arithmetic; parameters are supplied by the matching retained plan.
+    pub fn with_precision(
+        mut self,
+        precision: super::precision::SpeechPrecision,
+    ) -> Result<Self, ConformerError> {
+        precision.validate().map_err(ConformerError::Precision)?;
+        self.ff1_up
+            .set_compute_element(precision.projection_element())?;
+        self.ff1_down
+            .set_compute_element(precision.projection_element())?;
+        self.query
+            .set_compute_element(precision.projection_element())?;
+        self.key
+            .set_compute_element(precision.projection_element())?;
+        self.value
+            .set_compute_element(precision.projection_element())?;
+        self.position
+            .set_compute_element(precision.projection_element())?;
+        self.attention_output
+            .set_compute_element(precision.projection_element())?;
+        self.ff2_up
+            .set_compute_element(precision.projection_element())?;
+        self.ff2_down
+            .set_compute_element(precision.projection_element())?;
+        self.precision = precision;
+        Ok(self)
+    }
+
     /// Constructs exact canonical parameter identities for one encoder layer.
     pub fn new(
         dimensions: ConformerDimensions,
@@ -349,6 +380,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             )
         };
         Ok(Self {
+            precision: Default::default(),
             dimensions,
             local,
             norm_feed_forward1: norm("norm_feed_forward1")?,
@@ -511,7 +543,9 @@ impl<B: NeuralBackend> ConformerBlock<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, ConformerState<B::Tensor>), ConformerError> {
         self.validate(input, previous)?;
-        super::precision::require_float32(self, input).map_err(ConformerError::Precision)?;
+        self.precision
+            .require(self, input)
+            .map_err(ConformerError::Precision)?;
         let mut next = self.initialize(input, previous, context)?;
         let d = self.dimensions;
         let batch = input.dim(0);
@@ -552,7 +586,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
         let residual = residual.add(&attention, context)?;
         let conv = self.norm_conv.forward(&residual, context)?;
         let conv = B::Tensor::conv1d(
-            &conv,
+            &self.precision.conv_input(&conv, context)?,
             &self
                 .pointwise1
                 .as_ref()
@@ -563,6 +597,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             1,
             context,
         )?;
+        let conv = self.precision.restore(conv, context)?;
         let gate = B::sigmoid(
             conv.index(
                 &[Index::Full, Index::Full, Index::Range(d.width, 2 * d.width)],
@@ -597,7 +632,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
                 .compact(context)?,
         );
         let conv = B::Tensor::conv1d(
-            &history,
+            &self.precision.conv_input(&history, context)?,
             &self
                 .depthwise
                 .as_ref()
@@ -608,9 +643,10 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             d.width,
             context,
         )?;
+        let conv = self.precision.restore(conv, context)?;
         let conv = B::silu(self.conv_norm.forward(&conv, context)?, context)?;
         let conv = B::Tensor::conv1d(
-            &conv,
+            &self.precision.conv_input(&conv, context)?,
             &self
                 .pointwise2
                 .as_ref()
@@ -621,6 +657,7 @@ impl<B: NeuralBackend> ConformerBlock<B> {
             1,
             context,
         )?;
+        let conv = self.precision.restore(conv, context)?;
         let residual = residual.add(&conv, context)?;
         let ff = self.norm_feed_forward2.forward(&residual, context)?;
         let ff = self.ff2_up.forward(&ff, context)?;

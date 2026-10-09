@@ -366,17 +366,15 @@ fn voicechat_channel_ingress_guarded_failures_stop_before_peer_lookup_and_retry(
                             function_tokens: &function,
                         }
                     };
-                    assert!(
-                        BackboneInput::prepare_parallel_guarded(
-                            &fusion,
-                            &mut modules,
-                            request,
-                            &parallel,
-                            &context,
-                            &mut agree
-                        )
-                        .is_err()
-                    );
+                    assert!(BackboneInput::prepare_parallel_guarded(
+                        &fusion,
+                        &mut modules,
+                        request,
+                        &parallel,
+                        &context,
+                        &mut agree
+                    )
+                    .is_err());
                     assert_eq!(context.embedding_forward_calls.get(), 0);
                     assert!(parallel.trace().is_empty());
 
@@ -407,17 +405,15 @@ fn voicechat_channel_ingress_guarded_failures_stop_before_peer_lookup_and_retry(
                         tokens: if rank == 0 { &[5, 7] } else { &[5, 8] },
                         policy,
                     };
-                    assert!(
-                        BackboneInput::prepare_parallel_guarded(
-                            &fusion,
-                            &mut modules,
-                            request,
-                            &parallel,
-                            &context,
-                            &mut agree
-                        )
-                        .is_err()
-                    );
+                    assert!(BackboneInput::prepare_parallel_guarded(
+                        &fusion,
+                        &mut modules,
+                        request,
+                        &parallel,
+                        &context,
+                        &mut agree
+                    )
+                    .is_err());
                     assert_eq!(context.embedding_forward_calls.get(), 0);
                     assert!(parallel.trace().is_empty());
 
@@ -555,11 +551,9 @@ fn voicechat_channel_ingress_guarded_failures_stop_before_peer_lookup_and_retry(
                         agent_tokens: &agent,
                         function_tokens: if rank == 0 { &malformed } else { &function },
                     };
-                    assert!(
-                        selected
-                            .execute_hidden(&fusion, request, &mut state, &selected_context)
-                            .is_err()
-                    );
+                    assert!(selected
+                        .execute_hidden(&fusion, request, &mut state, &selected_context)
+                        .is_err());
                     assert_eq!(selected.position(&mut state).unwrap(), 0);
                     assert_eq!(selected_context.embedding_forward_calls.get(), 0);
                     assert_eq!(parallel.trace().len(), before);

@@ -1,5 +1,5 @@
 //! Pinned TTS/character equations through the ordinary execution-unit providers.
-use super::voicechat_transformer::{CausalCache, geometry};
+use super::voicechat_transformer::{geometry, CausalCache};
 use super::voicechat_tts_generator::{compare, compare_cache, tensor};
 use super::*;
 use eredu_architectures::voicechat::tts_transformer_layered::CausalTransformerExecution;
@@ -219,16 +219,12 @@ fn voicechat_transformer_late_acquisition_failure_only_mutates_the_unpublished_c
     let error = model
         .forward_causal(&input, &mut branch, &context)
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected dense-stream acquisition failure")
-    );
-    assert!(
-        branch
-            .iter()
-            .all(|cache| cache.offset() == parent[0].offset() + 1)
-    );
+    assert!(error
+        .to_string()
+        .contains("injected dense-stream acquisition failure"));
+    assert!(branch
+        .iter()
+        .all(|cache| cache.offset() == parent[0].offset() + 1));
     compare_cache(&parent, &first["cache"], &fixture);
     assert_eq!(model.runtime().policy().inner.events, events()[..6]);
     drop(branch);

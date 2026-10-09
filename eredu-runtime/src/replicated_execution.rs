@@ -247,7 +247,7 @@ mod tests {
         CommunicationGroupRequirements, CommunicationOperationRequirement,
         CommunicationTensorLimits,
     };
-    use eredu_core::{CompletionCancellationMode, checkpoint::TensorDtype};
+    use eredu_core::{checkpoint::TensorDtype, CompletionCancellationMode};
 
     #[test]
     fn coordinated_collectives_require_failure_completion_and_exact_payload_capacity() {

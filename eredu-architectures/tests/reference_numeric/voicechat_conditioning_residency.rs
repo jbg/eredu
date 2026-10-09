@@ -172,16 +172,14 @@ fn voicechat_conditioning_resident_and_bounded_character_pooling_and_fusion_matc
     let empty = mapping
         .prepare(&tokens, Some(&[false; 8]), 2, 4, 0)
         .unwrap();
-    assert!(
-        bounded
-            .character_forward(
-                &empty,
-                |_, _| panic!("empty character selection cannot execute its backbone"),
-                &context
-            )
-            .unwrap()
-            .is_none()
-    );
+    assert!(bounded
+        .character_forward(
+            &empty,
+            |_, _| panic!("empty character selection cannot execute its backbone"),
+            &context
+        )
+        .unwrap()
+        .is_none());
     assert!(bounded.runtime().policy().inner.events.is_empty());
 }
 
@@ -378,11 +376,9 @@ fn voicechat_conditioning_fusion_acquisition_failure_preserves_causal_parent_and
             &context,
         )
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected dense-stream acquisition failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected dense-stream acquisition failure"));
     compare_cache(&caches, &prompt["cache"], &fixture);
     assert_eq!(
         generator.conditioning.runtime().policy().inner.events,
@@ -654,11 +650,9 @@ fn voicechat_conditioning_parallel_tp2_matches_nvidia_character_flags_fusion_and
             bounded.runtime_mut().policy_mut().inner.events.clear();
             // Fail on both ranks before a collective, then retry the same inputs.
             bounded.runtime_mut().policy_mut().inner.fail_acquire = Some(2);
-            assert!(
-                bounded
-                    .fuse_parallel(&audio, &text, parallel, context)
-                    .is_err()
-            );
+            assert!(bounded
+                .fuse_parallel(&audio, &text, parallel, context)
+                .is_err());
             assert_eq!(bounded.runtime().policy().inner.events, events(2)[..2]);
             bounded.runtime_mut().policy_mut().inner.fail_acquire = None;
             bounded.runtime_mut().policy_mut().inner.events.clear();

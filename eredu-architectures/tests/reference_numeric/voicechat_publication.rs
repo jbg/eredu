@@ -7,8 +7,8 @@ use eredu_architectures::voicechat::{
 use eredu_core::scheduler::{RequestId, Scheduler, SchedulerLimits, WorkDescriptor};
 use eredu_media::audio::streaming::{FinalPcmFrame, PcmFinishPolicy};
 use eredu_runtime::{
-    PrepublicationRealtimeFrame, RealtimeCompletionCreationError, RealtimeFrameHostObserver,
-    submit_realtime_output,
+    submit_realtime_output, PrepublicationRealtimeFrame, RealtimeCompletionCreationError,
+    RealtimeFrameHostObserver,
 };
 use std::{cell::Cell, rc::Rc, time::Instant};
 

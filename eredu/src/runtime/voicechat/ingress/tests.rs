@@ -7,7 +7,7 @@ use std::{
 };
 
 use eredu_architectures::voicechat::{
-    frontend::{FrontendError, INPUT_FRAME_SAMPLES, INPUT_SAMPLE_RATE, PcmPrecision},
+    frontend::{FrontendError, PcmPrecision, INPUT_FRAME_SAMPLES, INPUT_SAMPLE_RATE},
     input::{InputError, PcmInputState, PcmInputStatus},
     observation::OwnedHostOutput,
     schedule::{AudioSource, Progress, Step},
@@ -18,18 +18,18 @@ use eredu_core::scheduler::{
 };
 use eredu_media::audio::streaming::PcmFrameQueue;
 use eredu_runtime::{
-    PrepublicationRealtimeFrame, RealtimeGenerationBranch, RealtimeGenerationContract,
-    RealtimeGenerationState, submit_realtime_output,
+    submit_realtime_output, PrepublicationRealtimeFrame, RealtimeGenerationBranch,
+    RealtimeGenerationContract, RealtimeGenerationState,
 };
 
 use super::*;
 use crate::runtime::voicechat::{
+    conversation::tests::{capacity, conversation, frame},
+    publication::tests::{queue_limits, Observer, Ready, Schedule},
+    tools::tests::{channel, limits},
     VoiceChatPublicationBranch, VoiceChatPublicationError, VoiceChatPublicationPermit,
     VoiceChatPublicationReceiver, VoiceChatPublicationState, VoiceChatToolWaitAction,
     VoiceChatToolWaitMessages, VoiceChatToolWaitPolicy,
-    conversation::tests::{capacity, conversation, frame},
-    publication::tests::{Observer, Ready, Schedule, queue_limits},
-    tools::tests::{channel, limits},
 };
 
 // A portable neural transaction retains actual PCM frame contents; completion
@@ -222,29 +222,25 @@ fn partial_ingress_and_pending_completion_retain_charged_pcm_until_commit() {
     let work = Work::new(scheduler.request_state(request).unwrap(), first, true);
     scheduler.enqueue(request, work).unwrap();
     let ready = Rc::new(Cell::new(false));
-    assert!(
-        scheduler
-            .run_local_turn(Instant::now(), |_, work, branch| submit(
-                work,
-                branch,
-                ready.clone()
-            ))
-            .unwrap()
-            .committed
-            .is_empty()
-    );
+    assert!(scheduler
+        .run_local_turn(Instant::now(), |_, work, branch| submit(
+            work,
+            branch,
+            ready.clone()
+        ))
+        .unwrap()
+        .committed
+        .is_empty());
     input.submit(&vec![-0.25; 1280], INPUT_SAMPLE_RATE).unwrap();
     assert!(
         input.submit(&[1.0], INPUT_SAMPLE_RATE).is_err(),
         "submitted head remains charged while completion is pending"
     );
-    assert!(
-        scheduler
-            .request_state(request)
-            .unwrap()
-            .reserve_input()
-            .is_err()
-    );
+    assert!(scheduler
+        .request_state(request)
+        .unwrap()
+        .reserve_input()
+        .is_err());
     assert!(receiver.pop_output().is_none());
     assert_eq!(
         (
@@ -343,11 +339,9 @@ fn retained_tool_steps_preserve_pcm_and_drain_cannot_skip_unread_audio() {
     commit(&mut state, end, false);
     assert_eq!(state.neural_state().model_state().seen.len(), 1);
     let mut branch = state.branch().unwrap();
-    assert!(
-        branch
-            .admit(Step::Drain, state.reserve(capacity()).unwrap())
-            .is_err()
-    );
+    assert!(branch
+        .admit(Step::Drain, state.reserve(capacity()).unwrap())
+        .is_err());
     State::discard_branch(branch).unwrap();
     let mut branch = state.branch().unwrap();
     assert!(
@@ -415,14 +409,12 @@ fn final_partial_and_finish_only_drains_preserve_real_sample_attribution() {
             .submit(&vec![0.375; samples], INPUT_SAMPLE_RATE)
             .unwrap();
         if samples == 17 {
-            assert!(
-                input
-                    .finish(eredu_media::audio::streaming::PcmFinishPolicy {
-                        final_frame: eredu_media::audio::streaming::FinalPcmFrame::RequireComplete,
-                        trailing_silence_frames: 0
-                    })
-                    .is_err()
-            );
+            assert!(input
+                .finish(eredu_media::audio::streaming::PcmFinishPolicy {
+                    final_frame: eredu_media::audio::streaming::FinalPcmFrame::RequireComplete,
+                    trailing_silence_frames: 0
+                })
+                .is_err());
         }
         if samples != 1280 {
             input
@@ -512,17 +504,15 @@ fn cancellation_closes_sender_but_retains_pending_pcm_until_native_retirement() 
     );
     scheduler.enqueue(request, work).unwrap();
     let ready = Rc::new(Cell::new(false));
-    assert!(
-        scheduler
-            .run_local_turn(Instant::now(), |_, work, branch| submit(
-                work,
-                branch,
-                ready.clone()
-            ))
-            .unwrap()
-            .committed
-            .is_empty()
-    );
+    assert!(scheduler
+        .run_local_turn(Instant::now(), |_, work, branch| submit(
+            work,
+            branch,
+            ready.clone()
+        ))
+        .unwrap()
+        .committed
+        .is_empty());
     input.submit(&[0.75; 17], INPUT_SAMPLE_RATE).unwrap();
     scheduler.cancel(request).unwrap();
     assert!(input.status().closed);
@@ -538,12 +528,10 @@ fn cancellation_closes_sender_but_retains_pending_pcm_until_native_retirement() 
         ),
         (1297, 1280, true)
     );
-    assert!(
-        scheduler
-            .poll_completions(Instant::now())
-            .committed
-            .is_empty()
-    );
+    assert!(scheduler
+        .poll_completions(Instant::now())
+        .committed
+        .is_empty());
     assert!(input.status().pending);
     ready.set(true);
     let retired = scheduler.poll_completions(Instant::now());
@@ -565,7 +553,7 @@ impl eredu_runtime::execution_control::IsolatedStateCopy for PcmModel {
     fn estimate_isolated_copy(
         &self,
     ) -> Result<eredu_core::execution_control::SnapshotEstimate, Self::Error> {
-        use eredu_runtime::execution_control::{SnapshotValue, snapshot_value_estimate};
+        use eredu_runtime::execution_control::{snapshot_value_estimate, SnapshotValue};
         let bytes = self.input.snapshot_storage_bytes().unwrap();
         snapshot_value_estimate::<Self>([
             Ok(eredu_core::execution_control::SnapshotEstimate {

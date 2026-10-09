@@ -3,7 +3,7 @@
 //! The caller supplies admitted neural caches and input carry. Initialization
 //! allocates no backend resources, executes no prompt, and creates no scheduler.
 
-use eredu_core::{Completion, scheduler::SemanticStateTransaction};
+use eredu_core::{scheduler::SemanticStateTransaction, Completion};
 use eredu_nn::{Tensor, TensorElementType};
 use eredu_runtime::{
     RealtimeFrameContract, RealtimeGenerationContract, RealtimeGenerationState,

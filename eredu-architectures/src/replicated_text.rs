@@ -17,9 +17,9 @@ use std::{
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
-    ArtifactInspection, InputModalities, InputModality,
     cache::PromptCacheModelIdentity,
     checkpoint::{TensorCatalog, TensorDtype},
+    ArtifactInspection, InputModalities, InputModality,
 };
 use eredu_nn::{AttentionCache, NeuralBackend, NeuralOperatorCapabilities, Tensor};
 use eredu_runtime::{
@@ -31,7 +31,6 @@ use eredu_runtime::{
 };
 
 use crate::{
-    GgufArchitecture,
     configuration::{GgufModelConfig, SafetensorsModelConfig},
     processor_plan::ArtifactArchitecturePlan,
     replicated_model::{
@@ -39,6 +38,7 @@ use crate::{
         FixedReplicatedFamily, FixedReplicatedModel, FixedState, MixedState,
         ReplicatedForwardContext, Stateless,
     },
+    GgufArchitecture,
 };
 
 struct Lfm2Replicated;
@@ -2120,18 +2120,18 @@ where
     type AttentionComponentState: LayerRuntimeState<B>;
     /// State exposing the combined attention, fixed and named-stream contract.
     type AttentionStreamState: LayerRuntimeState<
-            B,
-            LayerState: AttentionCache<B::Tensor>
-                            + eredu_runtime::RuntimeStateComponents<B>
-                            + eredu_runtime::RuntimeAppendStreams<B>,
-        >;
+        B,
+        LayerState: AttentionCache<B::Tensor>
+                        + eredu_runtime::RuntimeStateComponents<B>
+                        + eredu_runtime::RuntimeAppendStreams<B>,
+    >;
     /// Visitor preserving the concrete combined-state access bounds.
     type AttentionStreamVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::AttentionStreamState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::AttentionStreamState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Consumes this adapter into its attention-with-streams visitor.
     fn into_attention_stream_visitor(self) -> Self::AttentionStreamVisitor;
     /// State representation used by compressed attention.
@@ -2141,46 +2141,46 @@ where
 
     /// Visitor for a stateless architecture.
     type StatelessVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::StatelessState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::StatelessState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Visitor for an ordinary key/value architecture.
     type AttentionVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::AttentionState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::AttentionState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Visitor for a fixed-component architecture.
     type ComponentVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::ComponentState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::ComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Visitor for key/value attention with fixed components.
     type AttentionComponentVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::AttentionComponentState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::AttentionComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Visitor for compressed attention.
     type CompressedVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::CompressedState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::CompressedState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
     /// Visitor for compressed attention with fixed components.
     type CompressedComponentVisitor: ReplicatedTextArchitectureVisitor<
-            B,
-            Self::CompressedComponentState,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::CompressedComponentState,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
 
     /// Consumes the adapter into its stateless visitor.
     fn into_stateless_visitor(self) -> Self::StatelessVisitor;
@@ -2346,12 +2346,12 @@ where
     type State: LayerRuntimeState<B>;
     /// Exact prediction-aware visitor for that representation.
     type Visitor: ReplicatedPredictionTargetVisitor<
-            B,
-            Self::State,
-            M,
-            Output = Self::Output,
-            Error = Self::Error,
-        >;
+        B,
+        Self::State,
+        M,
+        Output = Self::Output,
+        Error = Self::Error,
+    >;
 
     /// Consumes the adapter into its exact typed visitor.
     fn into_visitor(self) -> Self::Visitor;
@@ -6227,9 +6227,9 @@ where
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         W: crate::prediction_extension::PreparedRoutedPrediction<
-                B,
-                crate::composite_execution::PreparedCompositeArchitecture<A>,
-            >,
+            B,
+            crate::composite_execution::PreparedCompositeArchitecture<A>,
+        >,
     {
         Err(crate::prepared_execution::PreparedExecutionError::UnavailablePrediction)
     }
@@ -8151,7 +8151,7 @@ where
 mod tests {
     use super::*;
     use eredu_core::ModelConfigurationResolver;
-    use safetensors::{Dtype, tensor::TensorView, tensor::serialize_to_file};
+    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
 
     fn config(model_type: &str) -> serde_json::Value {
         let architecture = match model_type {
@@ -8254,15 +8254,13 @@ mod tests {
                 .find(|tensor| tensor.key == "model.visual.blocks.0.attn.qkv.weight")
                 .unwrap();
             *matrix.shape.last_mut().unwrap() += 1;
-            assert!(
-                family_linear_parameter_shapes(
-                    plan,
-                    |_| Some(format.into()),
-                    "model.language_model.embed_tokens.weight"
-                )
-                .unwrap_err()
-                .contains("GGUF block geometry")
-            );
+            assert!(family_linear_parameter_shapes(
+                plan,
+                |_| Some(format.into()),
+                "model.language_model.embed_tokens.weight"
+            )
+            .unwrap_err()
+            .contains("GGUF block geometry"));
         }
     }
 
@@ -8338,11 +8336,10 @@ mod tests {
                 "model.layers.0.mlp.down_proj.biases"
             ))
         );
-        assert!(
-            down.sources()
-                .iter()
-                .any(|source| source == "model.language_model.layers.0.mlp.down_proj.weight")
-        );
+        assert!(down
+            .sources()
+            .iter()
+            .any(|source| source == "model.language_model.layers.0.mlp.down_proj.weight"));
         for quantization in [
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap()),
@@ -9469,13 +9466,11 @@ mod tests {
             ])
             .unwrap(),
         );
-        assert!(
-            incomplete
-                .validate_manifest(requirements.communication())
-                .unwrap_err()
-                .to_string()
-                .contains("AllGather")
-        );
+        assert!(incomplete
+            .validate_manifest(requirements.communication())
+            .unwrap_err()
+            .to_string()
+            .contains("AllGather"));
         assert_eq!(
             requirements.activation_dtype(),
             eredu_runtime::PipelineActivationDtype::Float32
@@ -9500,11 +9495,9 @@ mod tests {
             CollectPartitionedAdmission,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("data-parallel execution is not supported")
-        );
+        assert!(error
+            .to_string()
+            .contains("data-parallel execution is not supported"));
     }
 
     #[test]
@@ -9600,14 +9593,12 @@ mod tests {
                 selected.schema().identity()
             );
         }
-        assert!(
-            requirements
-                .communication()
-                .routes()
-                .iter()
-                .all(|route| route.requirement().operation()
-                    == eredu_runtime::CommunicationOperation::SendReceive)
-        );
+        assert!(requirements
+            .communication()
+            .routes()
+            .iter()
+            .all(|route| route.requirement().operation()
+                == eredu_runtime::CommunicationOperation::SendReceive));
     }
 
     #[test]

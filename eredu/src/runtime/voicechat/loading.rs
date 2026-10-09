@@ -32,6 +32,8 @@ use super::{
 /// Recorded timing is supplied by the caller; preparation reads no wall clock.
 #[derive(Debug, Clone)]
 pub struct VoiceChatStartOptions {
+    /// Portable projection storage and arithmetic policy. Sensitive state remains F32.
+    pub speech_precision: eredu_architectures::voicechat::precision::SpeechPrecision,
     /// Shared scheduler request identity.
     pub request: RequestId,
     /// ASCII system instructions, rendered with the tool definitions.
@@ -192,7 +194,8 @@ impl<'a> PreparedVoiceChatSession<'a> {
     ) -> Result<Self, VoiceChatLoadingError> {
         options.validate_host()?;
         let _ = VoiceChatFrontend::from_retained(artifacts, options.frontend)?;
-        let construction = PreparedVoiceChatConstruction::from_retained(artifacts)?;
+        let construction = PreparedVoiceChatConstruction::from_retained(artifacts)?
+            .with_speech_precision(options.speech_precision)?;
         let text =
             VoiceChatTextPreparation::new(construction.host_conditioning(), options.text_limits)?;
         let channel = VoiceChatToolChannel::new(
@@ -285,6 +288,7 @@ mod tests {
             ..Default::default()
         };
         let mut options = VoiceChatStartOptions {
+            speech_precision: Default::default(),
             request: RequestId::new(1),
             system_prompt: String::new(),
             tools: Vec::new(),

@@ -607,6 +607,11 @@ pub trait Config: 'static {
     fn attention_schedule(&self) -> &LayerSchedule<AttentionPolicy>;
     /// Physical encoding selected for one canonical checkpoint parameter.
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization>;
+    /// Optional floating projection execution precision; residuals keep their input dtype.
+    fn linear_compute_element(&self) -> Option<eredu_nn::TensorElementType> {
+        None
+    }
+
     /// Complete matrix encoding, including block-FP8 companions.
     fn linear_format(&self, name: &str) -> eredu_checkpoint::LinearFormat {
         self.weight_quantization(name).into()

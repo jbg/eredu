@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{
-    StoredDtype,
     recipe::{DerivedWeightRecipe, RecipeDtype},
     schema::{
         CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
         SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
     },
     store::TensorSelection,
+    StoredDtype,
 };
 use eredu_gguf::GgmlType;
 
@@ -1023,8 +1023,8 @@ pub(in crate::voicechat) mod tests {
     use eredu_checkpoint::{
         safetensors::{SafetensorsHeader, SafetensorsHeaderCatalog},
         validation::{
-            CatalogTensorMetadata, CheckpointIssueKind, CheckpointValidation, SafetensorsCatalog,
-            validate_safetensors_plan,
+            validate_safetensors_plan, CatalogTensorMetadata, CheckpointIssueKind,
+            CheckpointValidation, SafetensorsCatalog,
         },
     };
 
@@ -1236,11 +1236,9 @@ pub(in crate::voicechat) mod tests {
             let mut metadata = metadata_fixture(source);
             validate_gguf_metadata(&config, layout, &metadata).unwrap();
             metadata.insert(key.to_owned(), mutation);
-            assert!(
-                validate_gguf_metadata(&config, layout, &metadata)
-                    .unwrap_err()
-                    .contains(key)
-            );
+            assert!(validate_gguf_metadata(&config, layout, &metadata)
+                .unwrap_err()
+                .contains(key));
         }
         let mut metadata = metadata_fixture(include_str!(
             "../../tests/fixtures/voicechat/gguf-q4-metadata.json"

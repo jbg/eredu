@@ -5,7 +5,7 @@
 //! does not enter repetition history on its own. Randomness belongs to the shared
 //! decision driver and its unpublished generation branch.
 
-use eredu_core::{BackendFailure, execution_control::SnapshotEstimate};
+use eredu_core::{execution_control::SnapshotEstimate, BackendFailure};
 use eredu_runtime::execution_control::{SnapshotReservation, SnapshotValue};
 use eredu_runtime::{PenaltyConfig, Sampler, SamplingBackend, TokenDomain};
 

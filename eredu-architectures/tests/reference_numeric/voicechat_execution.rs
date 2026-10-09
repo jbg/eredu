@@ -1,5 +1,5 @@
 //! Coupled equations use compact nonzero towers with the released frame clocks.
-use super::voicechat_rnnt_coordination::{Coordinator, coordinator_pair};
+use super::voicechat_rnnt_coordination::{coordinator_pair, Coordinator};
 use super::voicechat_transformer::CausalCache;
 use super::*;
 use eredu_architectures::voicechat::{
@@ -61,7 +61,7 @@ use eredu_architectures::voicechat::{
     tts_rvq::RvqRefinement,
     tts_transformer::TtsTransformer,
 };
-use eredu_core::{RealtimeChannelPayload, scheduler::SemanticStateTransaction};
+use eredu_core::{scheduler::SemanticStateTransaction, RealtimeChannelPayload};
 use eredu_runtime::{
     CompletedRealtimeFrame, DenseSamplingBackend, GumbelTruncation, RealtimeFrameChannel,
     RealtimeFrameTransition, RealtimeGenerationBranch, RealtimeGenerationState,
@@ -939,40 +939,43 @@ fn voicechat_execution_selected_tp_backbone_matches_coupled_cached_transitions()
         &context,
     );
     let group = NumericParallelGroup::new(2);
-    let outputs =
-        std::thread::scope(|scope| {
-            let workers =
-                (0..2)
-                    .map(|rank| {
-                        let fixture = &fixture;
-                        let group = Arc::clone(&group);
-                        scope.spawn(move || {
-                let (context, mut runtime, mut function, state) =
-                    super::voicechat_backbone_execution::parallel_components(fixture, rank);
-                let parallel = NumericParallelContext::new(rank, group);
-                // The selected providers implement the coupled contract directly;
-                // Components cannot fall back to an ordinary LayeredInvocation.
-                let records = run(
-                    ParallelBackbone::new(&mut runtime, &parallel, None),
-                    state,
-                    ParallelFunctionHead::new(&mut function, &parallel),
-                    perception(&context), input_state(),
-                    codec(&eredu_evaluation::voicechat::coupled::fixture(), &context),
-                    None, false,
-        None, &context,
-                );
-                assert_eq!(runtime.policy().events,
-                    expected_stream_events(&[(0, 0), (0, 1), (0, 2)]).repeat(3),
-                    "prefill and the two backbone decode steps retain bounded layer leases");
-                records
+    let outputs = std::thread::scope(|scope| {
+        let workers = (0..2)
+            .map(|rank| {
+                let fixture = &fixture;
+                let group = Arc::clone(&group);
+                scope.spawn(move || {
+                    let (context, mut runtime, mut function, state) =
+                        super::voicechat_backbone_execution::parallel_components(fixture, rank);
+                    let parallel = NumericParallelContext::new(rank, group);
+                    // The selected providers implement the coupled contract directly;
+                    // Components cannot fall back to an ordinary LayeredInvocation.
+                    let records = run(
+                        ParallelBackbone::new(&mut runtime, &parallel, None),
+                        state,
+                        ParallelFunctionHead::new(&mut function, &parallel),
+                        perception(&context),
+                        input_state(),
+                        codec(&eredu_evaluation::voicechat::coupled::fixture(), &context),
+                        None,
+                        false,
+                        None,
+                        &context,
+                    );
+                    assert_eq!(
+                        runtime.policy().events,
+                        expected_stream_events(&[(0, 0), (0, 1), (0, 2)]).repeat(3),
+                        "prefill and the two backbone decode steps retain bounded layer leases"
+                    );
+                    records
+                })
             })
-                    })
-                    .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .collect::<Vec<_>>()
-        });
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
     for rank in outputs {
         assert_eq!(rank.len(), ordinary.len());
         for (actual, expected) in rank.iter().zip(&ordinary) {

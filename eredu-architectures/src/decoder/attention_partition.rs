@@ -274,11 +274,8 @@ mod tests {
                 } else {
                     vec![32, 17, 32]
                 };
-                let layout = eredu_runtime::derive_partitioned_local_layout(
-                    &description,
-                    rank,
-                )
-                .unwrap();
+                let layout =
+                    eredu_runtime::derive_partitioned_local_layout(&description, rank).unwrap();
                 for (layer, &expected_heads) in expected_heads.iter().enumerate() {
                     let policy = AttentionPartition::new(&args, layer).unwrap();
                     let head_range = policy.head_range(2, rank.tensor_parallel_rank()).unwrap();

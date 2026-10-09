@@ -3277,10 +3277,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        DeclarativeCallId, DeclarativeDialectSpec,
-        DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
-        GenerationPromptBehavior, JsonFunctionEnvelope, NamedJsonArgumentsEncoding,
-        ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
+        DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
+        DialectParameters, ExactEnvelope, FormatDialect, GenerationPromptBehavior,
+        JsonFunctionEnvelope, NamedJsonArgumentsEncoding, ParallelCallLayout,
+        StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
         runtime::chat::constraints::ConstraintCompiler,
@@ -4845,5 +4845,4 @@ mod tests {
             ]
         );
     }
-
 }

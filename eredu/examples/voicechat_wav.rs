@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use eredu_media::audio::wav::{WavReader, WavWriter};
 use serde::de::DeserializeOwned;
 

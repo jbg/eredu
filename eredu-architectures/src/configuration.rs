@@ -1,21 +1,21 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_checkpoint::{
-    StoredDtype,
     recipe::{AtomicRecipeSet, RecipeCatalog},
     schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
     store::{StoreError, TensorMetadata},
     validation::{
-        CatalogTensorMetadata, CheckpointValidation, ResolvedCheckpointPlan, SafetensorsCatalog,
-        StrictLoadFailure, resolve_safetensors_plan,
+        resolve_safetensors_plan, CatalogTensorMetadata, CheckpointValidation,
+        ResolvedCheckpointPlan, SafetensorsCatalog, StrictLoadFailure,
     },
+    StoredDtype,
 };
 use eredu_core::{
+    artifact::ArtifactError,
+    checkpoint::{TensorCatalog, TensorDtype},
     ArtifactFormat, GgufCompanionEncoding, GgufCompanionRequirement, GgufCompanionRole,
     LoadingProtocol, ModelConfiguration, ModelConfigurationResolver, ResolvedModelConfiguration,
     ValidatedGguf,
-    artifact::ArtifactError,
-    checkpoint::{TensorCatalog, TensorDtype},
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1773,37 +1773,27 @@ mod tests {
             .target_capture()
             .instantiate([vec![1, 3, 16]])
             .unwrap();
-        assert!(
-            contract
-                .target_capture()
-                .instantiate([vec![3, 3, 16]])
-                .is_err()
-        );
-        assert!(
-            contract
-                .target_capture()
-                .instantiate([vec![1, 9, 16]])
-                .is_err()
-        );
-        assert!(
-            contract
-                .target_capture()
-                .instantiate([vec![1, 3, 15]])
-                .is_err()
-        );
-        assert!(
-            contract
-                .target_capture()
-                .instantiate([vec![0, 3, 16]])
-                .is_err()
-        );
-        assert!(
-            contract
-                .requirements()
-                .mechanisms()
-                .mechanisms()
-                .contains(&eredu_runtime::SpeculativeMechanism::GroupedNeuralOperations)
-        );
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![3, 3, 16]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 9, 16]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![1, 3, 15]])
+            .is_err());
+        assert!(contract
+            .target_capture()
+            .instantiate([vec![0, 3, 16]])
+            .is_err());
+        assert!(contract
+            .requirements()
+            .mechanisms()
+            .mechanisms()
+            .contains(&eredu_runtime::SpeculativeMechanism::GroupedNeuralOperations));
         let mechanisms = eredu_runtime::SpeculativeMechanismCapabilities::new(
             contract
                 .requirements()
@@ -1873,27 +1863,21 @@ mod tests {
             inspected.architecture_plan().model_kind(),
             ModelKind::VoiceChat
         );
-        assert!(
-            inspected
-                .architecture_plan()
-                .safetensors_architecture()
-                .unwrap()
-                .checkpoint_resolution()
-                .is_some()
-        );
+        assert!(inspected
+            .architecture_plan()
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint_resolution()
+            .is_some());
         let graph = inspected.architecture_plan().architecture_descriptor();
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.from == "perception.encoder" && edge.to == "transcription.joint")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.from == "backbone" && edge.to == "function")
-        );
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "perception.encoder" && edge.to == "transcription.joint"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "backbone" && edge.to == "function"));
         assert!(graph.edges.iter().any(|edge| edge.from == "codec.quantizer"
             && edge.to == "tts.backbone"
             && edge.kind == eredu_core::ArchitectureEdgeKind::State));
@@ -1943,12 +1927,11 @@ mod tests {
 
         assert_eq!(plan.model_kind(), ModelKind::Moshi);
         assert!(plan.moshi_recipes().is_some());
-        assert!(
-            plan.moshi_recipes()
-                .unwrap()
-                .get("transformer.layers.0.self_attn.in_proj.weight")
-                .is_some()
-        );
+        assert!(plan
+            .moshi_recipes()
+            .unwrap()
+            .get("transformer.layers.0.self_attn.in_proj.weight")
+            .is_some());
     }
 
     #[test]
@@ -2112,13 +2095,11 @@ mod tests {
                 resolved_plan.clone(),
             )
             .unwrap();
-        assert!(
-            admitted
-                .safetensors_architecture()
-                .unwrap()
-                .checkpoint_resolution()
-                .is_some()
-        );
+        assert!(admitted
+            .safetensors_architecture()
+            .unwrap()
+            .checkpoint_resolution()
+            .is_some());
 
         let error = MODEL_CONFIGURATIONS
             .artifact_plan(
@@ -2197,18 +2178,14 @@ mod tests {
             Some(config.attention.heads as usize)
         );
         for &layer in &config.ngram.layers {
-            assert!(
-                graph
-                    .node(&format!("decoder.layers.{layer}.lexical.table"))
-                    .is_some()
-            );
+            assert!(graph
+                .node(&format!("decoder.layers.{layer}.lexical.table"))
+                .is_some());
         }
         let mut architecture = resolved.architecture;
-        assert!(
-            architecture
-                .admit_catalog(&TensorCatalog::new(Vec::new()).unwrap())
-                .is_err()
-        );
+        assert!(architecture
+            .admit_catalog(&TensorCatalog::new(Vec::new()).unwrap())
+            .is_err());
         assert!(architecture.qwen4_exp_target_plan().is_none());
 
         let mut mismatched = json.clone();
@@ -2288,11 +2265,9 @@ mod tests {
                 .unwrap();
             integer.dtype = TensorDtype::F32;
             let mut rejected = resolve_model_config(&json).unwrap().architecture;
-            assert!(
-                rejected
-                    .admit_catalog(&TensorCatalog::new(malformed).unwrap())
-                    .is_err()
-            );
+            assert!(rejected
+                .admit_catalog(&TensorCatalog::new(malformed).unwrap())
+                .is_err());
             assert!(rejected.qwen4_exp_target_plan().is_none());
         }
     }
@@ -2381,11 +2356,9 @@ mod tests {
             gguf_companion_requirements(GgufArchitecture::Gemma4).unwrap(),
             vec![optional_dense]
         );
-        assert!(
-            gguf_companion_requirements(GgufArchitecture::Llama)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(gguf_companion_requirements(GgufArchitecture::Llama)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

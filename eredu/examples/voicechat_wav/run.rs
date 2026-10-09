@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use eredu::api::realtime::{
     BoundVoiceChatSession, FinalPcmFrame, PcmFinishPolicy, VoiceChatAdvance, VoiceChatBlocked,
     VoiceChatConversationError, VoiceChatConversationOutput, VoiceChatExecutor,
@@ -21,7 +21,7 @@ use eredu_media::audio::{
     wav::{WavReader, WavWriter},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const CADENCE: Duration = Duration::from_millis(80);
 const INPUT_FRAME_SAMPLES: usize = 1_280;
@@ -856,11 +856,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(&fixture.consumed[..input.len()], input);
-            assert!(
-                fixture.consumed[input.len()..]
-                    .iter()
-                    .all(|&sample| sample == 0.0)
-            );
+            assert!(fixture.consumed[input.len()..]
+                .iter()
+                .all(|&sample| sample == 0.0));
             assert_eq!(speech, [0.25, -0.5, 0.25, -0.5, 0.25, -0.5, 0.25, -0.5]);
             let lines: Vec<Value> = String::from_utf8(events)
                 .unwrap()
@@ -893,22 +891,18 @@ mod tests {
             {"call_index":0,"after_ms":80,"response":"two"}
         ]))
         .unwrap();
-        assert!(
-            validate_scripts(&duplicate)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate")
-        );
+        assert!(validate_scripts(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
         let unicode: Vec<ScriptedToolResponse> = serde_json::from_value(json!([
             {"call_index":1,"after_ms":0,"response":"caf\u{e9}"}
         ]))
         .unwrap();
-        assert!(
-            validate_scripts(&unicode)
-                .unwrap_err()
-                .to_string()
-                .contains("ASCII")
-        );
+        assert!(validate_scripts(&unicode)
+            .unwrap_err()
+            .to_string()
+            .contains("ASCII"));
         for (field, value, expected) in [
             ("response", json!(" \t\n"), "non-whitespace"),
             ("response", json!("x".repeat(65_537)), "65536-byte"),
@@ -918,12 +912,10 @@ mod tests {
             let mut script = json!({"call_index":0,"after_ms":0,"response":"ok"});
             script[field] = value;
             let scripts = vec![serde_json::from_value(script).unwrap()];
-            assert!(
-                validate_scripts(&scripts)
-                    .unwrap_err()
-                    .to_string()
-                    .contains(expected)
-            );
+            assert!(validate_scripts(&scripts)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
         }
     }
 
@@ -990,12 +982,10 @@ mod tests {
         .unwrap();
         let mut channel = VoiceChatToolChannel::new(text, RequestId::new(91), vec![json!({"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{}}}})], VoiceChatToolLimits { max_payload_tokens:32, max_payload_bytes:2_048, max_calls:1 }).unwrap();
         for token in [20, 30] {
-            assert!(
-                channel
-                    .observe_committed_function(channel.turn_identity(), token)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(channel
+                .observe_committed_function(channel.turn_identity(), token)
+                .unwrap()
+                .is_none());
         }
         channel
             .observe_committed_function(channel.turn_identity(), 21)
@@ -1142,11 +1132,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert!(
-            lines.iter().any(|event| {
-                event["event"] == "input_silence" && event["purpose"] == "tool_work"
-            })
-        );
+        assert!(lines
+            .iter()
+            .any(|event| { event["event"] == "input_silence" && event["purpose"] == "tool_work" }));
         assert_eq!(lines.last().unwrap()["source_samples"], INPUT_FRAME_SAMPLES);
         assert_eq!(lines.last().unwrap()["undelivered_script_responses"], 0);
     }

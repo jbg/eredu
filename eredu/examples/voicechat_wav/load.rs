@@ -36,6 +36,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub speech_weights: SpeechFloatChoice,
+    #[serde(default)]
+    pub speech_compute: SpeechFloatChoice,
     pub official_assets: PathBuf,
     pub base_assets: PathBuf,
     pub source: Source,
@@ -81,6 +85,25 @@ pub enum Device {
     #[default]
     Cpu,
     Gpu,
+}
+
+/// Portable speech projection precision, configured independently of the device.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechFloatChoice {
+    #[default]
+    F32,
+    F16,
+    Bf16,
+}
+impl From<SpeechFloatChoice> for eredu_architectures::voicechat::precision::SpeechFloat {
+    fn from(value: SpeechFloatChoice) -> Self {
+        match value {
+            SpeechFloatChoice::F32 => Self::F32,
+            SpeechFloatChoice::F16 => Self::F16,
+            SpeechFloatChoice::Bf16 => Self::Bf16,
+        }
+    }
 }
 
 /// Every speech provider has its own finite pool; the enclosing totals include all ten.
@@ -306,8 +329,13 @@ pub fn load(config: &Config) -> Result<MlxVoiceChatSession> {
         }),
     )?;
     if let Some(report) = prepared.speech_residency_report() {
-        eprintln!("parameter admission: device={} host={} materialization={} bytes; mutable state and activations are separate",
-            report.device_parameter_bytes, report.host_parameter_bytes, report.host_materialization_bytes);
+        eprintln!(
+            "parameter admission: device={} host={} materialization={} execution_cache={} bytes; mutable state and activations are separate",
+            report.device_parameter_bytes,
+            report.host_parameter_bytes,
+            report.host_materialization_bytes,
+            report.speech.execution_cache_device_bytes
+        );
     }
     let weights = ExecutionContext::cpu()?;
     let execution = match config.device {
@@ -336,6 +364,10 @@ fn start_options(config: &Config) -> Result<VoiceChatStartOptions> {
         diagnostics: 128,
     };
     Ok(VoiceChatStartOptions {
+        speech_precision: eredu_architectures::voicechat::precision::SpeechPrecision {
+            weights: config.speech_weights.into(),
+            compute: config.speech_compute.into(),
+        },
         request: RequestId::new(1),
         system_prompt: config.system_prompt.clone(),
         tools: config.tools.clone(),

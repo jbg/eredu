@@ -63,9 +63,19 @@ fn compare(actual: &MlxTensor, expected: &Value, fixture: &Value, stream: &Strea
 
 #[test]
 fn cpu_mog_matches_nvidia_guidance_low_rank_means_and_gaussian_draws() {
+    compare_mog(Stream::new_with_device(&Device::new(DeviceType::Cpu, 0)));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn metal_mog_matches_nvidia_guidance_low_rank_means_and_gaussian_draws() {
+    compare_mog(Stream::new_with_device(&Device::new(DeviceType::Gpu, 0)));
+}
+
+fn compare_mog(stream: Stream) {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::MOG_REFERENCE_JSON).unwrap();
-    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let mut head = MogHead::<Backend>::new(dimensions(&fixture["dimensions"]), &stream).unwrap();
     head.visit_parameters_mut(&mut Bind(&fixture["parameters"]));
     for case in ["released_policy", "top_k_without_guidance"] {
@@ -131,10 +141,21 @@ fn cpu_mog_matches_nvidia_guidance_low_rank_means_and_gaussian_draws() {
         }
     }
     head.visit_parameters_mut(&mut Narrow(&stream));
+    let step = &fixture["released_policy"]["steps"][0];
+    // Prediction leaves the component bank idle. The selected invocation must
+    // still reject changed parameter precision when the bank is consumed.
+    let prediction = head.predict(&tensor(&step["input"]), 0.2, &stream).unwrap();
+    let shape = prediction.hidden.shape()[..2].to_vec();
+    let decisions = MlxTensor::from_array(Array::from_slice(
+        &vec![0_i32; shape.iter().map(|n| *n as usize).product()],
+        &shape,
+    ));
     assert!(head
-        .predict(
-            &tensor(&fixture["released_policy"]["steps"][0]["input"]),
-            0.2,
+        .selected(
+            &prediction,
+            &decisions,
+            &tensor(&step["gaussian_draw"]),
+            0.8,
             &stream
         )
         .is_err());

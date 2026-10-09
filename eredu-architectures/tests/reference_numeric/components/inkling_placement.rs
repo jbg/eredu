@@ -332,30 +332,77 @@ fn inkling_selected_provider_components_match_cold_placement_and_masked_executio
             for trial in 0..4 {
                 let world = Arc::new(NumericPartitionWorld::default());
                 let results = std::thread::scope(|scope| {
-                    (0..topology.world_size()).map(|rank| {
-                        let inspection = &inspection;
-                        let parameters = &parameters;
-                        let world = world.clone();
-                        scope.spawn(move || {
-                            let sources = partitioned_adapter::prepare_with_timeout(inspection, topology, rank, false, std::time::Duration::from_secs(30)).unwrap();
-                            let discovery = sources.prepare_discovery(Default::default(), Default::default()).bind_partition_parameters(Some(Arc::new(parameters.clone()))).unwrap();
-                            let retained = discovery.component_partition_layouts(64).unwrap().unwrap();
-                            let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                            let layout = eredu_runtime::derive_partitioned_local_layout(parameters, rank_topology).unwrap();
-                            let mut context = NumericContext::with_partition(layout, rank, world);
-                            context.bind_checkpoint_values = true;
-                            let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
-                            let mut observer = PlacedUnits { layout: retained.rank(rank).unwrap().clone(), path: String::new(), active: false, last_token: 0, mask_shared: match trial { 2 => Some(false), 3 => Some(true), _ => None }, original: None, rows: 0, edits: 0, fail_shared: false, failure_seen: false };
-                            let outputs = [&[1_usize,2,5][..], &[3][..], &[4][..]].into_iter().enumerate().map(|(step, tokens)| {
-                                observer.last_token = tokens.len()-1;
-                                let input = numeric_text_prepared_input(tokens);
-                                if trial == 0 { executable.forward(&input, step == 0).unwrap() }
-                                else { executable.forward_observed(&input, step == 0, &mut observer).unwrap() }
-                            }).collect::<Vec<_>>();
-                            assert!(!observer.active);
-                            (outputs, observer.rows, observer.edits)
+                    (0..topology.world_size())
+                        .map(|rank| {
+                            let inspection = &inspection;
+                            let parameters = &parameters;
+                            let world = world.clone();
+                            scope.spawn(move || {
+                                let sources = partitioned_adapter::prepare_with_timeout(
+                                    inspection,
+                                    topology,
+                                    rank,
+                                    false,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .unwrap();
+                                let discovery = sources
+                                    .prepare_discovery(Default::default(), Default::default())
+                                    .bind_partition_parameters(Some(Arc::new(parameters.clone())))
+                                    .unwrap();
+                                let retained =
+                                    discovery.component_partition_layouts(64).unwrap().unwrap();
+                                let rank_topology =
+                                    ParallelRankTopology::new(topology, rank).unwrap();
+                                let layout = eredu_runtime::derive_partitioned_local_layout(
+                                    parameters,
+                                    rank_topology,
+                                )
+                                .unwrap();
+                                let mut context =
+                                    NumericContext::with_partition(layout, rank, world);
+                                context.bind_checkpoint_values = true;
+                                let mut executable =
+                                    partitioned_adapter::composite(sources, &context).unwrap();
+                                let mut observer = PlacedUnits {
+                                    layout: retained.rank(rank).unwrap().clone(),
+                                    path: String::new(),
+                                    active: false,
+                                    last_token: 0,
+                                    mask_shared: match trial {
+                                        2 => Some(false),
+                                        3 => Some(true),
+                                        _ => None,
+                                    },
+                                    original: None,
+                                    rows: 0,
+                                    edits: 0,
+                                    fail_shared: false,
+                                    failure_seen: false,
+                                };
+                                let outputs = [&[1_usize, 2, 5][..], &[3][..], &[4][..]]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(step, tokens)| {
+                                        observer.last_token = tokens.len() - 1;
+                                        let input = numeric_text_prepared_input(tokens);
+                                        if trial == 0 {
+                                            executable.forward(&input, step == 0).unwrap()
+                                        } else {
+                                            executable
+                                                .forward_observed(&input, step == 0, &mut observer)
+                                                .unwrap()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                assert!(!observer.active);
+                                (outputs, observer.rows, observer.edits)
+                            })
                         })
-                    }).collect::<Vec<_>>().into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|thread| thread.join().unwrap())
+                        .collect::<Vec<_>>()
                 });
                 if trial > 0 {
                     assert!(results.iter().map(|result| result.1).sum::<usize>() > 0);
@@ -418,27 +465,66 @@ fn inkling_selected_shared_provider_failure_rejects_every_replica_before_commit(
         let topology = ParallelTopology::new(tp, pp, ep, 1).unwrap();
         let world = Arc::new(NumericPartitionWorld::default());
         let results = std::thread::scope(|scope| {
-            (0..topology.world_size()).map(|rank| {
-                let inspection = &inspection;
-                let parameters = &parameters;
-                let world = world.clone();
-                scope.spawn(move || {
-                    let sources = partitioned_adapter::prepare_with_timeout(inspection, topology, rank, false, std::time::Duration::from_secs(10)).unwrap();
-                    let discovery = sources.prepare_discovery(Default::default(), Default::default()).bind_partition_parameters(Some(Arc::new(parameters.clone()))).unwrap();
-                    let retained = discovery.component_partition_layouts(64).unwrap().unwrap();
-                    let layout = eredu_runtime::derive_partitioned_local_layout(parameters, ParallelRankTopology::new(topology, rank).unwrap()).unwrap();
-                    let mut context = NumericContext::with_partition(layout, rank, world);
-                    context.bind_checkpoint_values = true;
-                    let mut executable = partitioned_adapter::composite(sources, &context).unwrap();
-                    let mut observer = PlacedUnits { layout: retained.rank(rank).unwrap().clone(), path: String::new(), active: false, last_token: 2, mask_shared: None, original: None, rows: 0, edits: 0, fail_shared: rank == 0, failure_seen: false };
-                    let before = executable.positions().unwrap();
-                    let result = executable.forward_observed(&numeric_text_prepared_input(&[1,2,5]), true, &mut observer);
-                    assert!(result.is_err(), "peer failure must reject rank {rank}");
-                    assert_eq!(executable.positions().unwrap(), before, "failed shared bank must not advance mutable state");
-                    assert!(!observer.active);
-                    observer.failure_seen
+            (0..topology.world_size())
+                .map(|rank| {
+                    let inspection = &inspection;
+                    let parameters = &parameters;
+                    let world = world.clone();
+                    scope.spawn(move || {
+                        let sources = partitioned_adapter::prepare_with_timeout(
+                            inspection,
+                            topology,
+                            rank,
+                            false,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .unwrap();
+                        let discovery = sources
+                            .prepare_discovery(Default::default(), Default::default())
+                            .bind_partition_parameters(Some(Arc::new(parameters.clone())))
+                            .unwrap();
+                        let retained = discovery.component_partition_layouts(64).unwrap().unwrap();
+                        let layout = eredu_runtime::derive_partitioned_local_layout(
+                            parameters,
+                            ParallelRankTopology::new(topology, rank).unwrap(),
+                        )
+                        .unwrap();
+                        let mut context = NumericContext::with_partition(layout, rank, world);
+                        context.bind_checkpoint_values = true;
+                        let mut executable =
+                            partitioned_adapter::composite(sources, &context).unwrap();
+                        let mut observer = PlacedUnits {
+                            layout: retained.rank(rank).unwrap().clone(),
+                            path: String::new(),
+                            active: false,
+                            last_token: 2,
+                            mask_shared: None,
+                            original: None,
+                            rows: 0,
+                            edits: 0,
+                            fail_shared: rank == 0,
+                            failure_seen: false,
+                        };
+                        let before = executable.positions().unwrap();
+                        let result = executable.forward_observed(
+                            &numeric_text_prepared_input(&[1, 2, 5]),
+                            true,
+                            &mut observer,
+                        );
+                        assert!(result.is_err(), "peer failure must reject rank {rank}");
+                        assert_eq!(
+                            executable.positions().unwrap(),
+                            before,
+                            "failed shared bank must not advance mutable state"
+                        );
+                        assert!(!observer.active);
+                        observer.failure_seen
+                    })
                 })
-            }).collect::<Vec<_>>().into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
         });
         assert_eq!(results.iter().filter(|failed| **failed).count(), 1);
         assert!(

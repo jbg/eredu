@@ -9,7 +9,7 @@ use eredu_architectures::voicechat::{
     schedule::AudioSource,
     tts_ingress::PromptLayout,
 };
-use eredu_core::{BackendFailure, Completion, scheduler::TransitionOutput};
+use eredu_core::{scheduler::TransitionOutput, BackendFailure, Completion};
 use eredu_runtime::{PrepublicationRealtimeFrame, RealtimeFrameHostObserver};
 
 use super::{

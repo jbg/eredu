@@ -7,8 +7,8 @@ use eredu_checkpoint::{
     store::{RestrictedCheckpointSource, SharedCheckpointSource, StoreError},
 };
 use eredu_runtime::{
-    BindingPlacementError, ExecutionUnitLayout, LocalModelLayout, ParameterGroupOwner,
-    RecipeBindingError, WeightBinding, bindings_from_recipe_set, place_weight_bindings,
+    bindings_from_recipe_set, place_weight_bindings, BindingPlacementError, ExecutionUnitLayout,
+    LocalModelLayout, ParameterGroupOwner, RecipeBindingError, WeightBinding,
 };
 
 use crate::{prvq::Geometry, prvq_layered::quantizer_parameter_description};
@@ -262,8 +262,8 @@ pub fn validate_parallel_communication(
 ) -> Result<(), QuantizerPreparationError> {
     use eredu_core::checkpoint::TensorDtype;
     use eredu_runtime::{
-        CommunicationOperation, CommunicationOperationRequirement, CommunicationTensorLimits,
-        replicated_execution::validate_collective_coordination,
+        replicated_execution::validate_collective_coordination, CommunicationOperation,
+        CommunicationOperationRequirement, CommunicationTensorLimits,
     };
     geometry.validate()?;
     let selected = validate_collective_coordination(

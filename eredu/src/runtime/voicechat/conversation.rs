@@ -12,7 +12,7 @@ use eredu_core::generation::SemanticEvent;
 use eredu_runtime::execution_control::SnapshotRetainedGrowth;
 
 use super::phrase_selection::{
-    ACK_PHRASES, INITIAL_REMINDER_PHRASES, PreparedPhraseSelection, VoiceChatPhrasePolicy,
+    PreparedPhraseSelection, VoiceChatPhrasePolicy, ACK_PHRASES, INITIAL_REMINDER_PHRASES,
 };
 
 use super::decoded_text::{
@@ -22,8 +22,8 @@ use super::decoded_text::{
 mod planning;
 mod snapshot;
 
-pub(super) use snapshot::ConversationSnapshot;
 pub(super) use snapshot::host_storage;
+pub(super) use snapshot::ConversationSnapshot;
 
 use super::{
     VoiceChatReminderPlayback, VoiceChatReminderStep, VoiceChatTextError, VoiceChatToolBatch,

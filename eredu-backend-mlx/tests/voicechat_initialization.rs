@@ -193,7 +193,7 @@ fn voicechat_initialization_preserves_device_and_paged_state_and_guidance_rows()
                 assert_eq!(owner.parts().1.offset(), 0);
             }
         }
-        assert!(owner.copy_bytes_consumed() > 0);
+        assert_eq!(owner.copy_bytes_consumed() > 0, paged);
     }
 }
 

@@ -3,21 +3,21 @@
 mod coordination;
 use eredu_architectures::voicechat::{
     agent_sampling::{AgentSampler, AgentSamplingPolicy},
-    channel_decision::{ChannelDecisionPolicy, select_channels},
+    channel_decision::{select_channels, ChannelDecisionPolicy},
     channels::DualChannelLogits,
     config::{GemmaConfig, VoiceChatConfig},
     tts_generator::TtsGenerator,
     tts_ingress::{PromptLayout, SpeakerPrompt},
 };
 use eredu_backend_mlx::{
-    MlxTensor,
     backend::{
         nn::shared::MlxNeuralBackend,
         random::RandomState,
         runtime::{cache::state::MlxKeyValueState, generation::MlxSamplingBackend},
     },
+    MlxTensor,
 };
-use eredu_core::{Completion, scheduler::SemanticStateTransaction};
+use eredu_core::{scheduler::SemanticStateTransaction, Completion};
 use eredu_nn::{AttentionCache, ParameterMetadata, ParameterVisitorMut, Parameterized, Tensor};
 use eredu_runtime::{
     DenseSamplingBackend, RealtimeGenerationContract, RealtimeGenerationState,
@@ -333,11 +333,9 @@ fn voicechat_speech_sampling_native_controlled_and_uninterrupted_share_exact_rng
                 .unwrap();
             assert_eq!(actual.to_f32_vec(&stream).unwrap(), expected);
         }
-        assert!(
-            caches
-                .as_ref()
-                .iter()
-                .all(|cache| AttentionCache::offset(cache) == 6)
-        );
+        assert!(caches
+            .as_ref()
+            .iter()
+            .all(|cache| AttentionCache::offset(cache) == 6));
     }
 }

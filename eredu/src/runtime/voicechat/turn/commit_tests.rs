@@ -1,8 +1,8 @@
 use super::*;
 use crate::runtime::voicechat::{
+    tools::tests::{call, channel, limits},
     VoiceChatToolWait, VoiceChatToolWaitAction, VoiceChatToolWaitError, VoiceChatToolWaitMessages,
     VoiceChatToolWaitPolicy,
-    tools::tests::{call, channel, limits},
 };
 use eredu_architectures::voicechat::{
     channel_decision::FeedbackTokens, observation::TranscriptionOutput, output::OutputDecisions,
@@ -303,12 +303,10 @@ fn live_commit_retains_admitted_tool_activity_when_response_finishes_before_obse
         .submit_response(ticket, "<TOOL_RESPONSE> ok </TOOL_RESPONSE>")
         .unwrap();
     for token in [50, 51, 52, 22] {
-        assert!(
-            channel
-                .observe_committed_function(identity, token)
-                .unwrap()
-                .is_none()
-        );
+        assert!(channel
+            .observe_committed_function(identity, token)
+            .unwrap()
+            .is_none());
     }
     assert!(!channel.is_active());
     assert_eq!(channel.turn_identity(), identity);

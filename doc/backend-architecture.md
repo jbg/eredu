@@ -46,6 +46,24 @@ graphs release chunk-local intermediates. Input/output storage and allocator cac
 remain separate from that graph bound. Short scans retain lazy execution. This is
 a general neural mechanism inside the existing submission scope; it neither changes
 the scan equations nor publishes or commits a model transaction.
+F32 single-step scans on Metal fuse stable timestep softplus/clamping,
+transition discretization, recurrent update, output-vector products and direct
+skip products into one native launch. Each threadgroup shares its timestep and
+decay; output projection retains MLX's ordinary reduction order and final add.
+The kernel writes independent F32 carry, preserves intermediate rounding without
+multiply/add contraction, and accepts strided inputs through ordinary native
+contiguous preparation. Complete input geometry is checked before indexing.
+CPU, multi-token prefill and other precisions use the ordinary scan path.
+
+`SamplingBackend::token_ids` groups a fixed number of scalar decision readbacks
+without transferring logits or choosing sampling policy. Its portable default
+reads IDs in order. MLX packs the integer scalars, evaluates their dependency
+graphs together and transfers one contiguous ID vector. VoiceChat uses this
+mechanism for its agent/function pair at selection and publication validation;
+domain checks, owner/follower agreement, sampler/RNG adoption and completion
+remain in the shared portable driver. Stochastic special-token preflight may
+still require an earlier greedy-ID read before penalties and filtering.
+
 
 `eredu-nn::residual_streams` owns checked stream expansion and flattening plus a
 portable gated residual module assembled from ordinary normalization, projection,
@@ -1294,13 +1312,25 @@ lanes together. The architecture does not clone mutable native cache handles or
 compose two fallible cache commits. Component candidates are adopted only after
 the joint neural commit succeeds; discard delegates to the same neural owner.
 MLX's reusable `MlxJointState` owns a hybrid state and a key/value state under
-one transaction identity. Private candidates use isolated copies in the same
-bounded paging pools; identity and layout validation precede replacement of
-either canonical state. Copy admission uses actual retained tensor extents,
-including both rows of classifier-free guidance, and keeps cumulative copy
-usage outside the candidate. Native recovery retains unresolved copy work.
-The final composition adapter implements the architecture's borrowed cache
-access contract; the reusable owner has no VoiceChat scheduling policy.
+one transaction identity. Identity and layout validation precede replacement of
+either canonical state. Admission uses actual retained tensor extents, including
+both rows of classifier-free guidance, and keeps cumulative copy usage outside
+the candidate. Native recovery retains unresolved copy work. The final composition
+adapter implements the architecture's borrowed cache access contract; the reusable
+owner has no VoiceChat scheduling policy.
+
+Joint frame candidates copy metadata and share immutable attention, fixed-state
+and resident append-stream roots. Attention concatenation and fixed-state
+replacement construct unpublished roots; discard leaves committed values intact.
+Fully immutable candidates submit no copy graph and require no copy-completion
+wait. Capacity-backed caches, compressed storage and mutable paging namespaces
+retain physical isolation and native recovery before execution. Mixed candidates
+share immutable device/fixed/stream roots and sealed paging blocks while copying
+mutable storage. Paging candidates own independent catalogs and identities within
+the same finite process pool. Explicit snapshots and forks deep copy all state. Branch retention limits remain conservative; immutable candidates
+consume zero native-copy allowance, and mutable isolation keeps the full
+conservative charge without refunds. Exclusive admission and generation identity
+remain held through native completion, including failed observations.
 
 `eredu-runtime::execution_control::IsolatedStateCopy` declares completed,
 independent state copying and atomic restore without text- or family-specific
@@ -1309,7 +1339,7 @@ before invoking those mechanisms, retains the original budget for later restores
 and translates mechanism failures through `BackendFailure`. Native recovery
 retains a clone of the logical reservation with unresolved copied resources.
 
-`MlxJointState` realizes this contract by sharing the existing completed copy path.
+`MlxJointState` realizes this contract through its completed isolated-copy path.
 An isolated owner has its own exclusive execution admission and shares its
 origin's cumulative copy counter and limits. Saved caches therefore coexist with
 continued inference; restoration adopts both cache families only after origin,
@@ -1607,6 +1637,22 @@ architecture-owned gates agree local projection and selected-component preparati
 before each reduction. These component calls do not introduce a sampling
 authority, pipeline stage or conversational commit.
 
+`eredu-nn::NeuralBackend::ordered_codebook_lookup_sum` describes a generic
+F32 stack of codebooks, I32 per-depth indices and increasing-depth additions
+starting from zero. The vocabulary-sized sentinel contributes zero; signed
+indices retain ordinary gather semantics. The portable implementation uses
+ordinary tensor operations. MLX fuses lookup, sentinel masking and the ordered
+sum in one Metal kernel, with one lazy domain assertion owned by the enclosing
+submission. Invalid candidates remain memory-safe and cannot publish successfully.
+The native mechanism does not own speech-family geometry, refinement policy
+or sampling.
+
+RVQ banks retain squared norms `[31, cardinality]` of their bound F32 means.
+Parameter mutation visits invalidate the norms. Bounded eviction releases the
+cache with its bank; channel-sharded banks retain local norms and still reduce
+scores before argmin. `eredu-codec` accepts caller-retained norms through its
+shared score-reduction seam, including local preparation failure agreement.
+
 TTS RVQ tensor parallelism partitions the stacked feedback bank's latent axis and
 the shared feedback projection's input columns coherently. Codebook scoring stays
 in `eredu-codec`: its reusable score-reduction seam combines channel contributions
@@ -1652,6 +1698,18 @@ bounded F32 conversion recipes; MLX uses the ordinary resident, host-layerwise o
 disk-streamed parameter policy. The generator consumes these providers through
 one conditioning contract, including controlled advancement and sampled execution.
 
+
+The generator caches at most 64 single-token character results with at most 64
+packed columns. Its key includes the complete prepared batch, flags and masks,
+plus the identities of both parameter providers. The neutral contracts default
+to no immutable identity; mutable, bounded and collective providers bypass the
+cache. Native resident providers certify their private immutable parameters only
+on the bound execution stream. Provider replacement clears retained results.
+The cache contains no causal state, random decisions or tentative codes and is
+shared by ordinary and controlled advancement. Cold speech admission reserves
+`execution_cache_device_bytes` separately from parameter pools: F32 RVQ norms
+plus the maximum resident character-result payload. Both speech and combined
+VoiceChat admission include this allowance in the device limit.
 
 Conditioning tensor parallelism partitions character embedding columns, character
 projection rows, speaker-projection output columns and both fusion projections'
@@ -8862,6 +8920,45 @@ it is not a duration or an executed-GPU-instruction counter. Tracing is silent b
 default and changes no dispatch choice, kernel equation, precision policy or
 completion ownership. All native work continues through `safemlx`; no additional
 unsafe-code exception or public inference error type is required.
+
+### Speech projection precision
+
+`SpeechPrecision` is an architecture-owned storage and arithmetic policy. The
+facade retains it in `VoiceChatStartOptions::speech_precision`; the default is F32.
+Cold construction converts eligible perception matrices and speech attention/MLP
+weights through exact retained recipes before resource admission. Norms, biases,
+MoG component banks, RVQ tables and codec parameters retain F32. Narrow compute
+requires matching F16 or BF16 weight storage. Perception convolution weights remain
+F32 with F32 compute and become narrow only with the matching narrow compute policy.
+Converted bindings carry their actual byte lengths and materialization recipe peaks.
+
+Shared linear construction declares optional floating execution precision through
+`LinearFormatSpec`. MLX casts projection inputs, performs the projection with the
+selected stored weights, and restores the caller's floating dtype. Architecture
+convolution calls likewise restore F32 before normalization, residual additions or
+history publication. Perception attention and convolution histories, causal TTS KV
+state, sampling reductions and recurrent transcription remain F32. TTS and perception
+state identities retain the selected precision. The same prepared providers serve
+explicit advancement and ordinary shared scheduling.
+
+Native row-parallel projection casts its local result back to the original input
+precision before reduction and bias addition. Cast/projection failures enter the
+existing local agreement phase, and ordinary and observed paths use the same native
+mechanism. Native operators own casts and kernels; they contain no VoiceChat policy,
+parameter-name matching or source-format selection. The portable policy selects
+eligible parameter roles and enforces boundary precision before neural execution.
+
+### Native compilation safety
+
+Native compilation forwards the complete scalar-specialization slice to MLX.
+Scalar constants therefore distinguish cached graphs even when their array inputs
+have identical geometry. The pinned `mlx-compile-cache-lifetime.patch` exposes a
+trivial thread-local live-cache pointer to erasure. C++ cache destruction clears
+it before destroying entries, so later foreign-language TLS destructors cannot
+erase already-destroyed storage. Native destruction remains within the existing
+`safemlx`/`safemlx-sys` unsafe boundary; portable crates gain no native dependency.
+The native regressions exercise scalar specialization, lazy outputs after cache
+erasure, and wrapper teardown after the populated C++ thread-local cache.
 
 ### Mixed-storage FP32 GEMM
 

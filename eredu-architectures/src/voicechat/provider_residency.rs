@@ -128,6 +128,8 @@ pub struct SpeechResidencyPolicy {
 pub struct SpeechResidencyReport {
     /// Sum of bounded device caps and resident provider outputs.
     pub device_parameter_bytes: u64,
+    /// Bounded derived tensors retained independently of parameter pools.
+    pub execution_cache_device_bytes: u64,
     /// Sum of independently retained host-pool caps.
     pub host_parameter_bytes: u64,
     /// Conservative concurrent materialization reservation across all providers.
@@ -151,7 +153,9 @@ pub enum SpeechResidencyError {
         tier: &'static str,
     },
     /// A pool cannot accommodate even its largest independent output unit.
-    #[error("VoiceChat speech provider {provider:?} requires at least {required} device bytes, limit {limit}")]
+    #[error(
+        "VoiceChat speech provider {provider:?} requires at least {required} device bytes, limit {limit}"
+    )]
     UnitCapacity {
         /// Rejected provider.
         provider: SpeechProvider,
@@ -229,8 +233,18 @@ impl SpeechResidencyPolicy {
         &self,
         providers: &BTreeMap<SpeechProvider, SpeechProviderResources>,
     ) -> Result<SpeechResidencyReport, SpeechResidencyError> {
+        self.validate_with_execution_cache(providers, 0)
+    }
+
+    /// Admits architecture-sized retained derived tensors alongside provider pools.
+    pub fn validate_with_execution_cache(
+        &self,
+        providers: &BTreeMap<SpeechProvider, SpeechProviderResources>,
+        execution_cache_device_bytes: u64,
+    ) -> Result<SpeechResidencyReport, SpeechResidencyError> {
         let mut report = SpeechResidencyReport {
             device_parameter_bytes: 0,
+            execution_cache_device_bytes,
             host_parameter_bytes: 0,
             host_materialization_bytes: 0,
             host_required_bytes: 0,
@@ -285,7 +299,10 @@ impl SpeechResidencyPolicy {
         for (tier, required, limit) in [
             (
                 "device",
-                report.device_parameter_bytes,
+                add(
+                    report.device_parameter_bytes,
+                    report.execution_cache_device_bytes,
+                )?,
                 self.device_limit_bytes,
             ),
             ("host", report.host_required_bytes, self.host_limit_bytes),
@@ -351,6 +368,25 @@ mod tests {
             host,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn retained_execution_cache_cannot_consume_parameter_capacity_twice() {
+        let resources = descriptors();
+        assert!(matches!(
+            policy(LayerWeightResidency::FullyResident, 1007, 1511)
+                .validate_with_execution_cache(&resources, 8),
+            Err(SpeechResidencyError::AggregateCapacity {
+                tier: "device",
+                required: 1015,
+                limit: 1007
+            })
+        ));
+        let report = policy(LayerWeightResidency::FullyResident, 1015, 1511)
+            .validate_with_execution_cache(&resources, 8)
+            .unwrap();
+        assert_eq!(report.device_parameter_bytes, 1007);
+        assert_eq!(report.execution_cache_device_bytes, 8);
     }
 
     #[test]

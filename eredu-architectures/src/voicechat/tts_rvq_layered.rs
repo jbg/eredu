@@ -1,11 +1,11 @@
 //! Independently leased feedback bank and shared projection over ordinary traversal.
 
 use super::{
-    tts_mog::{TtsError, f32_shape},
+    tts_mog::{f32_shape, TtsError},
     tts_mog_layered::MogExecution,
     tts_rvq::{RefinementPolicy, RefinementState, RvqBank, RvqDimensions, RvqProjection},
 };
-use eredu_core::{BackendFailure, LayerSchedule, cache::LayerCachePolicy};
+use eredu_core::{cache::LayerCachePolicy, BackendFailure, LayerSchedule};
 use eredu_nn::{DistributedNeuralBackend, NeuralBackend, Parameterized, Tensor, TensorElementType};
 use eredu_runtime::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,

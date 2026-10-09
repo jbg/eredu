@@ -86,6 +86,11 @@ impl ConcatKeyValueCache {
         Ok(cache)
     }
 
+    // Capacity-backed caches may overwrite storage; concatenating caches replace roots.
+    pub(crate) fn has_immutable_roots(&self) -> bool {
+        self.step <= 1
+    }
+
     /// Snapshots the ordinary append-only cache without changing array layout.
     /// Capacity-backed caches can update storage in place and therefore still
     /// require an independent data copy.

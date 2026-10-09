@@ -4619,11 +4619,8 @@ where
                 crate::deepseek::v3_with_checkpoint_formats(args, formats).map_err(invalid)?;
             let parameters = crate::deepseek::parallel::v3_parameter_description(&target_args)
                 .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(
-                &parameters,
-                tensor_rank,
-            )
-            .map_err(invalid)?;
+            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
+                .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v3_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let source_layout = if tasks.iter().any(|task| {
@@ -4735,11 +4732,8 @@ where
                 crate::deepseek::v4_with_checkpoint_formats(args, formats).map_err(invalid)?;
             let parameters = crate::deepseek::parallel::v4_parameter_description(&target_args)
                 .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(
-                &parameters,
-                tensor_rank,
-            )
-            .map_err(invalid)?;
+            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
+                .map_err(invalid)?;
             let geometry = crate::deepseek::parallel::v4_local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let state_layout = crate::deepseek::v4::state_layout(geometry.args())
@@ -4906,11 +4900,8 @@ where
                 crate::inkling::LayeredModel::<B>::new(target_args.clone(), execution_context)
                     .and_then(|model| model.parameter_description(execution_context))
                     .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(
-                &parameters,
-                tensor_rank,
-            )
-            .map_err(invalid)?;
+            let layout = eredu_runtime::derive_partitioned_local_layout(&parameters, tensor_rank)
+                .map_err(invalid)?;
             let source = crate::inkling::MtpModel::<B>::new(args, source_context)
                 .map_err(|error| invalid(error.to_string()))?
                 .ok_or_else(|| invalid("Inkling prediction extension has no configured depth"))?;
@@ -4960,11 +4951,8 @@ where
                     .and_then(|model| model.parameter_description(source_context))
             }
             .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(
-                &description,
-                tensor_rank,
-            )
-            .map_err(invalid)?;
+            let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
+                .map_err(invalid)?;
             let geometry = crate::qwen::hybrid::local_geometry(&args.text, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let target = usize::try_from(args.text.num_hidden_layers)
@@ -5068,11 +5056,8 @@ where
                     .map_err(|error| invalid(error.to_string()))?
                     .parameter_description(execution_context)
                     .map_err(|error| invalid(error.to_string()))?;
-            let layout = eredu_runtime::derive_partitioned_local_layout(
-                &description,
-                tensor_rank,
-            )
-            .map_err(invalid)?;
+            let layout = eredu_runtime::derive_partitioned_local_layout(&description, tensor_rank)
+                .map_err(invalid)?;
             let geometry = crate::nemotron_h::local_geometry(&target_args, &layout)
                 .map_err(|error| invalid(error.to_string()))?;
             let source_layout = if tasks.iter().any(|task| {

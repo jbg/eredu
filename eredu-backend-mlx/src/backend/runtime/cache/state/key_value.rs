@@ -531,9 +531,25 @@ impl MlxKeyValueState {
             .checked_mul(8192)
     }
 
+    pub(crate) fn has_immutable_roots(&self) -> bool {
+        self.layers.iter().all(|layer| match layer {
+            MlxKeyValueLayerState::Stateless => true,
+            MlxKeyValueLayerState::Device(cache) => cache.has_immutable_roots(),
+            MlxKeyValueLayerState::Paged(_) => false,
+        })
+    }
+
+    pub(crate) fn transaction_candidate(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.copy_candidate(stream, false)
+    }
+
     /// Copies device arrays, mutable tails and sealed blocks with independent
     /// namespace ownership. Every paged copy remains in the same finite pool.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.copy_candidate(stream, true)
+    }
+
+    fn copy_candidate(&self, stream: &Stream, isolated: bool) -> Result<Self, Exception> {
         if !self.supports_isolated_snapshot() {
             return Err(Exception::custom(
                 "isolated state contains inconsistent paging managers",
@@ -547,9 +563,12 @@ impl MlxKeyValueState {
                 _ => None,
             })
             .map(|manager| {
-                manager
-                    .isolated_snapshot(stream)
-                    .map_err(|e| Exception::custom(e.to_string()))
+                (if isolated {
+                    manager.isolated_snapshot(stream)
+                } else {
+                    manager.transaction_candidate(stream)
+                })
+                .map_err(|e| Exception::custom(e.to_string()))
             })
             .transpose()?;
         let layers = self
@@ -557,6 +576,9 @@ impl MlxKeyValueState {
             .iter()
             .map(|layer| match layer {
                 MlxKeyValueLayerState::Stateless => Ok(MlxKeyValueLayerState::Stateless),
+                MlxKeyValueLayerState::Device(cache) if !isolated => cache
+                    .checkpoint_clone_state()
+                    .map(MlxKeyValueLayerState::Device),
                 MlxKeyValueLayerState::Device(cache) => cache
                     .isolated_snapshot(stream)
                     .map(MlxKeyValueLayerState::Device),

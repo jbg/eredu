@@ -1,6 +1,6 @@
 //! Explicit bounded tensor and failure authority for compact component fixtures.
 use eredu_backend_mlx::native::MlxReplicatedCoordinator;
-use eredu_core::{CollectiveGroupId, CompletionCancellationMode, checkpoint::TensorDtype};
+use eredu_core::{checkpoint::TensorDtype, CollectiveGroupId, CompletionCancellationMode};
 use eredu_runtime::{
     CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
     CommunicationManifest, CommunicationOperation, CommunicationOperationRequirement,

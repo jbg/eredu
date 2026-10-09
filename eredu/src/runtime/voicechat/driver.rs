@@ -10,9 +10,9 @@ use eredu_architectures::voicechat::{
 use eredu_core::scheduler::WorkDescriptor;
 
 use super::{
-    VoiceChatInputPermit, VoiceChatPublicationAdmission, VoiceChatPublicationBranch,
-    VoiceChatPublicationError, VoiceChatPublicationPermit, VoiceChatReminderStep,
-    conversation::VoiceChatConversationTransition,
+    conversation::VoiceChatConversationTransition, VoiceChatInputPermit,
+    VoiceChatPublicationAdmission, VoiceChatPublicationBranch, VoiceChatPublicationError,
+    VoiceChatPublicationPermit, VoiceChatReminderStep,
 };
 
 /// Recorded advancement inputs. The driver never reads the wall clock.

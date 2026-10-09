@@ -1,13 +1,13 @@
 //! Coupled channel ingress and readout through the ordinary cached Nemotron driver.
 use super::*;
 use eredu_architectures::voicechat::{
-    backbone_execution::{BackboneRequest, OrdinaryBackbone, ParallelBackbone, execute},
+    backbone_execution::{execute, BackboneRequest, OrdinaryBackbone, ParallelBackbone},
     channels::{ChannelFusion, FunctionHead, PromptPolicy},
     config::VoiceChatConfig,
     frontend::FrontendOptions,
     function_head_layered::ParallelFunctionHead,
     input::InputState,
-    progress::{ProgressError, observe},
+    progress::{observe, ProgressError},
 };
 use serde_json::Value;
 

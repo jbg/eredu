@@ -3,6 +3,7 @@
 pub(crate) mod arithmetic;
 /// Shared attention inputs, transforms, cache updates, and kernels.
 pub mod attention;
+pub(crate) mod codebooks;
 /// Architecture-neutral block-scaled FP8 projections.
 pub mod fp8;
 /// Gated-delta recurrent scans shared by linear-attention architectures.
@@ -29,6 +30,7 @@ pub(crate) mod primitives;
 pub mod projection_profile;
 pub(crate) mod relative_attention;
 pub(crate) mod rope;
+pub(crate) mod selective_scan;
 /// Backend-neutral architecture operators specialized to MLX.
 pub mod shared;
 /// Shared tensor and attention-mask helpers.

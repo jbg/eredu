@@ -309,47 +309,67 @@ fn nanbeige_actual_payload_tp_pp_and_combined_match_replicated() {
         ] {
             let world = Arc::new(NumericPartitionWorld::default());
             let actual = std::thread::scope(|scope| {
-                let threads = (0..topology.world_size()).map(|rank| {
-                    let world = Arc::clone(&world);
-                    let args = &args;
-                    let inspection = &inspection;
-                    let inputs = &inputs;
-                    scope.spawn(move || {
-                        use eredu_runtime::derive_partitioned_local_layout;
-                        let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
-                        let plan = prepared_adapter::plan(quantization)
-                            .with_topology(topology)
-                            .with_prompt_cache_persistence(true);
-                        let sources = partitioned_adapter::prepare_plan(
-                            inspection, &plan, rank, std::time::Duration::from_secs(10),
-                        ).unwrap();
-                        let formats = sources.selected().text_realization().parameters()
-                            .iter().filter_map(|p| {
-                                p.executable().weight_quantization()
-                                    .map(|format| (p.name().to_owned(), format))
-                            }).collect();
-                        let selected_args = family::with_checkpoint_formats(args, formats).unwrap();
-                        let description = decoder::dense_parameter_description(&selected_args).unwrap();
-                        let layout = derive_partitioned_local_layout(&description, rank_topology).unwrap();
-                        let mut context = NumericContext::with_partition(layout, rank, world);
-                        if quantization.is_some() {
-                            let expanded = decoder::dense_parameter_description(args).unwrap();
-                            context.expanded_weight_layout = Some(Arc::new(
-                                derive_partitioned_local_layout(&expanded, rank_topology).unwrap(),
-                            ));
-                        }
-                        context.bind_checkpoint_values = true;
-                        let mut executable = partitioned_adapter::dense(sources, &context).unwrap();
-                        let outputs = inputs.iter().enumerate()
-                            .map(|(i, tokens)| executable.forward(tokens, i == 0).unwrap())
-                            .collect::<Vec<_>>();
-                        assert!(executable.positions().unwrap().iter().all(|p| *p == 5));
-                        executable.reset().unwrap();
-                        let replay = executable.forward(&inputs[0], true).unwrap();
-                        assert_tensor_exact(&replay, &outputs[0], "partition reset");
-                        outputs
+                let threads = (0..topology.world_size())
+                    .map(|rank| {
+                        let world = Arc::clone(&world);
+                        let args = &args;
+                        let inspection = &inspection;
+                        let inputs = &inputs;
+                        scope.spawn(move || {
+                            use eredu_runtime::derive_partitioned_local_layout;
+                            let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
+                            let plan = prepared_adapter::plan(quantization)
+                                .with_topology(topology)
+                                .with_prompt_cache_persistence(true);
+                            let sources = partitioned_adapter::prepare_plan(
+                                inspection,
+                                &plan,
+                                rank,
+                                std::time::Duration::from_secs(10),
+                            )
+                            .unwrap();
+                            let formats = sources
+                                .selected()
+                                .text_realization()
+                                .parameters()
+                                .iter()
+                                .filter_map(|p| {
+                                    p.executable()
+                                        .weight_quantization()
+                                        .map(|format| (p.name().to_owned(), format))
+                                })
+                                .collect();
+                            let selected_args =
+                                family::with_checkpoint_formats(args, formats).unwrap();
+                            let description =
+                                decoder::dense_parameter_description(&selected_args).unwrap();
+                            let layout =
+                                derive_partitioned_local_layout(&description, rank_topology)
+                                    .unwrap();
+                            let mut context = NumericContext::with_partition(layout, rank, world);
+                            if quantization.is_some() {
+                                let expanded = decoder::dense_parameter_description(args).unwrap();
+                                context.expanded_weight_layout = Some(Arc::new(
+                                    derive_partitioned_local_layout(&expanded, rank_topology)
+                                        .unwrap(),
+                                ));
+                            }
+                            context.bind_checkpoint_values = true;
+                            let mut executable =
+                                partitioned_adapter::dense(sources, &context).unwrap();
+                            let outputs = inputs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, tokens)| executable.forward(tokens, i == 0).unwrap())
+                                .collect::<Vec<_>>();
+                            assert!(executable.positions().unwrap().iter().all(|p| *p == 5));
+                            executable.reset().unwrap();
+                            let replay = executable.forward(&inputs[0], true).unwrap();
+                            assert_tensor_exact(&replay, &outputs[0], "partition reset");
+                            outputs
+                        })
                     })
-                }).collect::<Vec<_>>();
+                    .collect::<Vec<_>>();
                 threads
                     .into_iter()
                     .map(|thread| thread.join().unwrap())

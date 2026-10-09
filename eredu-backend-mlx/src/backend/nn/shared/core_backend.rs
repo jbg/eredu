@@ -152,6 +152,7 @@ impl NeuralBackend for MlxNeuralBackend {
         ))?;
         let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
         Ok(MlxLinear {
+            compute_element: spec.format.compute_element(),
             module,
             topology,
             vocabulary_range: None,
@@ -228,6 +229,14 @@ impl NeuralBackend for MlxNeuralBackend {
             dimensions: spec.dimensions,
             traditional: spec.traditional,
         })
+    }
+
+    fn ordered_codebook_lookup_sum(
+        table: &MlxTensor,
+        codes: &MlxTensor,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        common::codebooks::ordered_lookup_sum(table, codes, context)
     }
 
     fn silu(input: MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
@@ -474,6 +483,16 @@ impl NeuralBackend for MlxNeuralBackend {
         }
         let [batch, sequence, heads, head_dimensions] =
             <[i32; 4]>::try_from(shape).expect("validated rank-four shape");
+        // Validate all strides-independent geometry before native indexing.
+        input.memory_invocation(
+            input
+                .values
+                .element_type()
+                .ok_or_else(|| ComputeError::backend("unknown selective scan element type"))?,
+        )?;
+        if let Some(output) = super::super::selective_scan::single_step(&input, context)? {
+            return Ok(output);
+        }
         let state_dimensions = input.input_state.dim(3);
         let mut state = match input.initial_state {
             Some(state) => compute(state.as_array().as_dtype(Dtype::Float32, context))?,
@@ -997,11 +1016,7 @@ impl NeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(
-            linear
-                .module
-                .forward_row_parallel(input.as_array(), parallel, context),
-        )
+        linear.forward_observed_input(input, Some(parallel), context, None)
     }
 
     fn row_parallel_linear_with_input_observer(
@@ -1063,6 +1078,7 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         ))?;
         let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
         Ok(MlxLinear {
+            compute_element: spec.format.compute_element(),
             module,
             topology,
             vocabulary_range: Some(range),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::runtime::voicechat::{
-    VoiceChatFork, VoiceChatPublicationReceiver, ingress::tests::Neural,
+    ingress::tests::Neural, VoiceChatFork, VoiceChatPublicationReceiver,
 };
 use eredu_core::{
     execution_control::{ExecutionControlError, SnapshotLimits},

@@ -1,5 +1,5 @@
 //! Composed NVIDIA cached TTS transitions with explicit sampled decisions.
-use super::voicechat_transformer::{CausalCache, geometry};
+use super::voicechat_transformer::{geometry, CausalCache};
 use super::*;
 use eredu_architectures::voicechat::{
     config::VoiceChatConfig,
@@ -216,21 +216,17 @@ fn voicechat_tts_generator_matches_original_cached_frames_and_retained_refinemen
                     fail_after_append: layer == 1,
                 })
                 .collect::<Vec<_>>();
-            assert!(
-                generator
-                    .begin_frame(
-                        &codes(&call["input_codes"], &context),
-                        any.then_some(&condition),
-                        &mut branch,
-                        &context
-                    )
-                    .is_err()
-            );
-            assert!(
-                branch
-                    .iter()
-                    .all(|cache| cache.offset() == previous[0].offset() + 1)
-            );
+            assert!(generator
+                .begin_frame(
+                    &codes(&call["input_codes"], &context),
+                    any.then_some(&condition),
+                    &mut branch,
+                    &context
+                )
+                .is_err());
+            assert!(branch
+                .iter()
+                .all(|cache| cache.offset() == previous[0].offset() + 1));
             // Only the unpublished branch was mutated. The retained parent
             // remains a valid replay origin; the failed branch is discarded.
             compare_cache(&caches, &prompt["cache"], &fixture);
@@ -283,15 +279,13 @@ fn voicechat_tts_generator_matches_original_cached_frames_and_retained_refinemen
             );
             // An explicit draw failure leaves the retained frame reusable. The
             // causal cache was already submitted; refinement does not touch it.
-            assert!(
-                generator
-                    .advance_frame(
-                        &snapshot,
-                        |_, _: &NumericTensor, _| Err(TtsError::Shape("injected draw failure")),
-                        &context
-                    )
-                    .is_err()
-            );
+            assert!(generator
+                .advance_frame(
+                    &snapshot,
+                    |_, _: &NumericTensor, _| Err(TtsError::Shape("injected draw failure")),
+                    &context
+                )
+                .is_err());
             let retry = generator
                 .advance_frame(
                     &snapshot,

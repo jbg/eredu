@@ -146,8 +146,8 @@ fn events(project: bool) -> Vec<StreamPolicyEvent> {
 }
 
 #[test]
-fn voicechat_rvq_resident_and_bounded_feedback_and_quantization_match_nvidia_without_unused_projection()
- {
+fn voicechat_rvq_resident_and_bounded_feedback_and_quantization_match_nvidia_without_unused_projection(
+) {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::MOG_REFERENCE_JSON).unwrap();
     let context = NumericContext::default();
@@ -248,7 +248,7 @@ fn voicechat_rvq_resident_and_bounded_feedback_and_quantization_match_nvidia_wit
 
 #[test]
 fn voicechat_rvq_quantization_acquisition_failure_after_draws_preserves_frame_rng_and_retry() {
-    use super::voicechat_speech_sampling::{Recorded, Tape, generation};
+    use super::voicechat_speech_sampling::{generation, Recorded, Tape};
     use super::voicechat_transformer::CausalCache;
     use eredu_architectures::voicechat::{
         tts_generator::{TtsGenerator, TtsGeneratorParts},
@@ -319,11 +319,9 @@ fn voicechat_rvq_quantization_acquisition_failure_after_draws_preserves_frame_rn
     let error = generator
         .advance_sampled_frame::<Recorded, _, _, _, _, _>(&frame, &mut branch, None, &context)
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected dense-stream acquisition failure")
-    );
+    assert!(error
+        .to_string()
+        .contains("injected dense-stream acquisition failure"));
     assert_eq!(
         tape.issued.get(),
         2,
@@ -519,11 +517,9 @@ fn voicechat_rvq_parallel_tp2_matches_nvidia_prefixes_feedback_and_bank_retry() 
                     // Both ranks refuse their bank before collective execution.
                     // The caller retains the same parent and explicit latent on retry.
                     bounded.runtime_mut().policy_mut().fail_bank_acquisition = Some(1);
-                    assert!(
-                        bounded
-                            .advance_parallel(&state, &latent, &parallel, &context)
-                            .is_err()
-                    );
+                    assert!(bounded
+                        .advance_parallel(&state, &latent, &parallel, &context)
+                        .is_err());
                     assert_eq!(bounded.runtime().policy().inner.events, events(false)[..2]);
                     assert_eq!(state.codes().data, vec![5.; 31]);
                     assert_eq!(state.next_slot(), Some(3));
@@ -692,14 +688,14 @@ fn voicechat_rvq_parallel_uneven_latent_reduces_distances_before_argmin_and_pres
 }
 
 mod guarded {
-    use super::super::voicechat_rnnt_coordination::{Coordinator, coordinator_pair};
+    use super::super::voicechat_rnnt_coordination::{coordinator_pair, Coordinator};
     use super::*;
     use eredu_architectures::voicechat::{
         tts_mog::TtsError,
-        tts_rvq_layered::{RvqForward, RvqInput, rvq_parameter_description},
+        tts_rvq_layered::{rvq_parameter_description, RvqForward, RvqInput},
     };
     use eredu_runtime::{
-        LayeredLocalPhase, LayeredTraversalHook, replicated_execution::ReplicatedCoordinator,
+        replicated_execution::ReplicatedCoordinator, LayeredLocalPhase, LayeredTraversalHook,
     };
     use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
 
@@ -793,35 +789,29 @@ mod guarded {
         } else {
             RvqInput::Embed(state.codes())
         };
-        assert!(
-            model
-                .invoke_parallel_guarded(mismatch, &parallel, &context, &mut hook, agree)
-                .is_err()
-        );
+        assert!(model
+            .invoke_parallel_guarded(mismatch, &parallel, &context, &mut hook, agree)
+            .is_err());
         assert!(model.runtime().policy().inner.events.is_empty());
         assert!(parallel.trace().is_empty());
         // The bank has completed before a projection acquisition fails on one rank.
         model.runtime_mut().policy_mut().fail_projection = rank == 0;
-        assert!(
-            model
-                .invoke_parallel_guarded(
-                    RvqInput::Embed(state.codes()),
-                    &parallel,
-                    &context,
-                    &mut hook,
-                    agree
-                )
-                .is_err()
-        );
+        assert!(model
+            .invoke_parallel_guarded(
+                RvqInput::Embed(state.codes()),
+                &parallel,
+                &context,
+                &mut hook,
+                agree
+            )
+            .is_err());
         assert_eq!(model.runtime().policy().aborted, 1);
-        assert!(
-            model
-                .runtime()
-                .policy()
-                .inner
-                .events
-                .contains(&StreamPolicyEvent::Complete(0, 0, 0))
-        );
+        assert!(model
+            .runtime()
+            .policy()
+            .inner
+            .events
+            .contains(&StreamPolicyEvent::Complete(0, 0, 0)));
         assert!(parallel.trace().is_empty());
         assert_eq!(state.codes().data, initial.data);
         model.runtime_mut().policy_mut().fail_projection = false;
@@ -836,17 +826,15 @@ mod guarded {
                     .with_dtype(eredu_core::checkpoint::TensorDtype::F16),
             );
         }
-        assert!(
-            model
-                .invoke_parallel_guarded(
-                    RvqInput::Embed(state.codes()),
-                    &parallel,
-                    &context,
-                    &mut hook,
-                    agree
-                )
-                .is_err()
-        );
+        assert!(model
+            .invoke_parallel_guarded(
+                RvqInput::Embed(state.codes()),
+                &parallel,
+                &context,
+                &mut hook,
+                agree
+            )
+            .is_err());
         assert!(parallel.trace().is_empty());
         model
             .runtime_mut()
@@ -868,20 +856,18 @@ mod guarded {
                         .insert(bank.into(), NumericTensor::zeros([31, 5, 3]));
                 }
                 let before = parallel.trace().len();
-                assert!(
-                    model
-                        .invoke_parallel_guarded(
-                            RvqInput::Advance {
-                                state: &state,
-                                latent: &latent
-                            },
-                            &parallel,
-                            &context,
-                            &mut hook,
-                            agree
-                        )
-                        .is_err()
-                );
+                assert!(model
+                    .invoke_parallel_guarded(
+                        RvqInput::Advance {
+                            state: &state,
+                            latent: &latent
+                        },
+                        &parallel,
+                        &context,
+                        &mut hook,
+                        agree
+                    )
+                    .is_err());
                 assert_eq!(parallel.trace().len(), before);
                 assert_eq!(state.codes().data, tensor(&step["codes_before"]).data);
                 model

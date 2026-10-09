@@ -3593,17 +3593,16 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, format_bytes, median,
-        requested_load_quantization, select_cached_gguf_from_revisions,
-        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
-        use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
-        write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
-        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
-        ExecutionPlan, ExecutionPlanReport, ModelResourceProfile, NativeToolSupport, Observed,
-        PlanExplanation, QuantizationRequest, ReasoningOutput, ReasoningStream, ResidencyPlan,
-        ResolvedModel, SemanticEvent, SemanticSupport, SpeculativeDraftDevice,
-        StopReason, WeightTransformationPlan,
+        discover_local_hardware, format_bytes, median, requested_load_quantization,
+        select_cached_gguf_from_revisions, select_cached_gguf_pair_from_revisions,
+        select_cached_gguf_path, select_revision, select_unique_cached_gguf,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
+        validate_args, validate_artifact_pair, write_auto_plan_cache, write_semantic_event,
+        write_timing_report, AutoMode, AutoPlanCacheKey, AutomaticCliOverrides, CachedGgufRole,
+        Cli, CliDevice, CliToolChoice, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
+        ModelResourceProfile, NativeToolSupport, Observed, PlanExplanation, QuantizationRequest,
+        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
+        SemanticSupport, SpeculativeDraftDevice, StopReason, WeightTransformationPlan,
     };
 
     fn scanned_revision() -> CachedRevision {

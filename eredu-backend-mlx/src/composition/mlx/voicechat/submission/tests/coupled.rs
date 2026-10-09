@@ -15,11 +15,11 @@ use eredu_architectures::{
         tts_transformer::TransformerConfig,
     },
 };
-use eredu_core::RealtimeDecisionDiagnostics;
 use eredu_core::execution_control::{SnapshotLimits, SnapshotResourceKind};
 use eredu_core::scheduler::{
     RequestId, Scheduler, SchedulerLimits, TransitionOutput, WorkDescriptor,
 };
+use eredu_core::RealtimeDecisionDiagnostics;
 use eredu_evaluation::voicechat::coupled as fixture;
 use eredu_nn::{ParameterMetadata, ParameterVisitorMut, Parameterized};
 use eredu_runtime::execution_control::{
@@ -242,6 +242,14 @@ fn submit(
 }
 
 fn run(controlled: bool, input_case: InputCase, stream: &Stream) -> Vec<Record> {
+    run_with_precision(controlled, input_case, Default::default(), stream)
+}
+fn run_with_precision(
+    controlled: bool,
+    input_case: InputCase,
+    precision: eredu_architectures::voicechat::precision::SpeechPrecision,
+    stream: &Stream,
+) -> Vec<Record> {
     assert!(!controlled || matches!(input_case, InputCase::Partial));
     let data = fixture::fixture();
     let mut backbone: Runtime = ResidentRuntime::new(backbone::model(stream), stream).unwrap();
@@ -250,7 +258,7 @@ fn run(controlled: bool, input_case: InputCase, stream: &Stream) -> Vec<Record> 
     // the scheduled baseline keeps the identical selected provider resident.
     let mut function = backbone::function(controlled, stream);
     let fusion = ChannelFusion::from_config(&fixture::config().channels).unwrap();
-    let mut perception = fixture::perception::<MlxNeuralBackend>(stream);
+    let mut perception = fixture::perception_with_precision::<MlxNeuralBackend>(precision, stream);
     // Emit two symbols per frame to exercise retained LSTM state, independently
     // of the perception result and greedy joint-network tie behavior.
     struct Emit;
@@ -262,7 +270,7 @@ fn run(controlled: bool, input_case: InputCase, stream: &Stream) -> Vec<Record> 
         }
     }
     perception.visit_parameters_mut(&mut Emit);
-    let mut tts = fixture::tts::<MlxNeuralBackend>(&data, stream);
+    let mut tts = fixture::tts_with_precision::<MlxNeuralBackend>(&data, precision, stream);
     let mut codec = fixture::codec::<MlxNeuralBackend>(&data, stream);
     let feedback = fixture::controls(&data);
     let mapping = fixture::mapping(&data);
@@ -634,12 +642,11 @@ fn coupled_native_execution_matches_explicit_and_scheduler_publication() {
         assert_eq!(p.rnnt_frames, p.audio_frames);
         assert_eq!(p.tts_unconditional_positions, p.tts_conditional_positions);
         assert_same_record(a, b);
-        assert!(
-            a.retained
-                .iter()
-                .flat_map(|(_, v)| v)
-                .all(|v| v.is_finite())
-        );
+        assert!(a
+            .retained
+            .iter()
+            .flat_map(|(_, v)| v)
+            .all(|v| v.is_finite()));
         if let Some(speech) = &a.host.speech {
             assert_eq!(speech.samples.len(), if index == 5 { 8 } else { 1764 });
             assert!(speech.samples.iter().all(|v| v.is_finite()));
@@ -676,4 +683,26 @@ fn coupled_native_execution_matches_explicit_and_scheduler_publication() {
     assert_ne!(controlled[2].random, controlled[3].random);
     assert_ne!(controlled[3].random, controlled[4].random);
     assert_eq!(controlled[4].random, controlled[5].random);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn coupled_mixed_precision_matches_controlled_and_scheduled_cached_publication() {
+    use eredu_architectures::voicechat::precision::{SpeechFloat, SpeechPrecision};
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    for (weights, compute) in [
+        (SpeechFloat::F16, SpeechFloat::F32),
+        (SpeechFloat::F16, SpeechFloat::F16),
+        (SpeechFloat::Bf16, SpeechFloat::Bf16),
+    ] {
+        let precision = SpeechPrecision { weights, compute };
+        let controlled = run_with_precision(true, InputCase::Partial, precision, &stream);
+        let scheduled = run_with_precision(false, InputCase::Partial, precision, &stream);
+        assert_eq!(controlled.len(), 6);
+        assert_eq!(scheduled.len(), 6);
+        for (a, b) in controlled.iter().zip(&scheduled) {
+            assert_same_record(a, b);
+        }
+        assert!(controlled.last().unwrap().host.after.codec_finished);
+    }
 }

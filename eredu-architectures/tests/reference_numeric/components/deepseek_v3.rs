@@ -173,47 +173,82 @@ fn verify_v3_partition_transforms(sparse: bool, independent_banks: bool) {
             let world = Arc::new(NumericPartitionWorld::default());
             std::thread::scope(|scope| {
                 let handles = (0..topology.world_size())
-                .map(|rank| {
-                    let world = world.clone();
-                    let plan = plan.clone().with_topology(topology).with_residency(residency.clone());
-                    let parameters = &parameters;
-                    let target_parameters = &target_parameters;
-                    let inspection = &inspection;
-                    let expected = &expected.outputs;
-                    let tokens = &tokens;
-                    scope.spawn(move || {
-                        let mut layout = eredu_runtime::derive_partitioned_local_layout(
-                            parameters,
-                            ParallelRankTopology::new(topology, rank).unwrap(),
-                        ).unwrap();
-                        let encoded = eredu_runtime::derive_partitioned_local_layout(
-                            target_parameters, ParallelRankTopology::new(topology, rank).unwrap(),
-                        ).unwrap();
-                        for (name, companion) in encoded.tensors() {
-                            if !layout.contains(name) {
-                                layout.insert(name.to_owned(), companion.clone());
+                    .map(|rank| {
+                        let world = world.clone();
+                        let plan = plan
+                            .clone()
+                            .with_topology(topology)
+                            .with_residency(residency.clone());
+                        let parameters = &parameters;
+                        let target_parameters = &target_parameters;
+                        let inspection = &inspection;
+                        let expected = &expected.outputs;
+                        let tokens = &tokens;
+                        scope.spawn(move || {
+                            let mut layout = eredu_runtime::derive_partitioned_local_layout(
+                                parameters,
+                                ParallelRankTopology::new(topology, rank).unwrap(),
+                            )
+                            .unwrap();
+                            let encoded = eredu_runtime::derive_partitioned_local_layout(
+                                target_parameters,
+                                ParallelRankTopology::new(topology, rank).unwrap(),
+                            )
+                            .unwrap();
+                            for (name, companion) in encoded.tensors() {
+                                if !layout.contains(name) {
+                                    layout.insert(name.to_owned(), companion.clone());
+                                }
                             }
-                        }
-                        let mut context = NumericContext::with_partition(layout, rank, world);
-                        context.bind_checkpoint_values = true;
-                        let sources = partitioned_adapter::prepare_plan_with_banks(
-                            inspection, &plan, rank, std::time::Duration::from_secs(10),
-                            independent_banks.then(ParameterBankLoadOptions::default),
-                        ).unwrap();
-                        assert!(sources.selected().execution().text_realization().parameters().iter().any(|parameter|
-                            matches!(parameter.lowering(), eredu_runtime::WeightLoweringKind::Transform)));
-                        let mut executable = if sparse {
-                            partitioned_adapter::routed(sources, &context, Arc::new(AtomicUsize::new(0)), None)
-                        } else {
-                            partitioned_adapter::dense(sources, &context)
-                        }.unwrap();
-                        for (step, tokens) in [tokens.clone(), NumericTensor::token_ids(&[4]), NumericTensor::token_ids(&[5])].iter().enumerate() {
-                            let actual = executable.forward(tokens, step == 0).unwrap();
-                            assert_tensor_close(&actual, &expected[step], "transformed V3 partition");
-                        }
+                            let mut context = NumericContext::with_partition(layout, rank, world);
+                            context.bind_checkpoint_values = true;
+                            let sources = partitioned_adapter::prepare_plan_with_banks(
+                                inspection,
+                                &plan,
+                                rank,
+                                std::time::Duration::from_secs(10),
+                                independent_banks.then(ParameterBankLoadOptions::default),
+                            )
+                            .unwrap();
+                            assert!(sources
+                                .selected()
+                                .execution()
+                                .text_realization()
+                                .parameters()
+                                .iter()
+                                .any(|parameter| matches!(
+                                    parameter.lowering(),
+                                    eredu_runtime::WeightLoweringKind::Transform
+                                )));
+                            let mut executable = if sparse {
+                                partitioned_adapter::routed(
+                                    sources,
+                                    &context,
+                                    Arc::new(AtomicUsize::new(0)),
+                                    None,
+                                )
+                            } else {
+                                partitioned_adapter::dense(sources, &context)
+                            }
+                            .unwrap();
+                            for (step, tokens) in [
+                                tokens.clone(),
+                                NumericTensor::token_ids(&[4]),
+                                NumericTensor::token_ids(&[5]),
+                            ]
+                            .iter()
+                            .enumerate()
+                            {
+                                let actual = executable.forward(tokens, step == 0).unwrap();
+                                assert_tensor_close(
+                                    &actual,
+                                    &expected[step],
+                                    "transformed V3 partition",
+                                );
+                            }
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
+                    .collect::<Vec<_>>();
                 for handle in handles {
                     handle.join().unwrap();
                 }

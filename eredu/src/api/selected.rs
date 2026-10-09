@@ -664,9 +664,7 @@ pub fn benchmark_local_expert_cache(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        validate_expert_cache_benchmark_prompt, ExpertCacheBenchmarkError,
-    };
+    use super::{validate_expert_cache_benchmark_prompt, ExpertCacheBenchmarkError};
 
     #[test]
     fn local_overhead_covers_retained_cache_and_checks_overflow() {
@@ -697,5 +695,4 @@ mod tests {
         ));
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
     }
-
 }

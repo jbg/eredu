@@ -5,8 +5,8 @@ mod coordination;
 
 use eredu_architectures::voicechat::agent_sampling::{AgentSampler, AgentSamplingPolicy};
 use eredu_backend_mlx::{
-    MlxTensor,
     backend::{random::RandomState, runtime::generation::MlxSamplingBackend as Backend},
+    MlxTensor,
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{DenseSamplingBackend, Sampler, SamplingBackend};
@@ -102,10 +102,10 @@ fn voicechat_agent_sampling_matches_reference_distribution_and_native_rng_progre
 #[test]
 fn voicechat_tool_handoff_keeps_native_rng_feedback_and_spoken_text_separate() {
     use eredu_architectures::voicechat::{
-        channel_decision::{ChannelDecisionPolicy, select_channels},
+        channel_decision::{select_channels, ChannelDecisionPolicy},
         channels::DualChannelLogits,
     };
-    use eredu_core::{Completion, scheduler::SemanticStateTransaction};
+    use eredu_core::{scheduler::SemanticStateTransaction, Completion};
     use eredu_runtime::{
         RealtimeGenerationContract, RealtimeGenerationState, RealtimeScheduleState, TokenDomain,
     };

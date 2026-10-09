@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::voicechat::config::VoiceChatConfig;
-use eredu_core::{Completion, scheduler::SemanticStateTransaction};
+use eredu_core::{scheduler::SemanticStateTransaction, Completion};
 use eredu_runtime::{
     RealtimeFrameTransition, RealtimeGenerationBranch, RealtimeGenerationState,
     RealtimeScheduleDescriptor,
@@ -231,11 +231,9 @@ fn mixed_audio_tool_reminder_trace_matches_controlled_publication() {
         assert_eq!(ordinary.model_state(), controlled.model_state());
     }
     let calls = ordinary_transition.calls.get();
-    assert!(
-        ordinary
-            .execute_frame_transition(&Step::LiveAudio, &mut ordinary_transition)
-            .is_err()
-    );
+    assert!(ordinary
+        .execute_frame_transition(&Step::LiveAudio, &mut ordinary_transition)
+        .is_err());
     assert_eq!(ordinary_transition.calls.get(), calls);
 }
 
@@ -258,11 +256,9 @@ fn mismatched_component_receipts_do_not_publish_candidate_state() {
             fault: Some(fault),
             ..Default::default()
         };
-        assert!(
-            state
-                .execute_frame_transition(&Step::LiveAudio, &mut transition)
-                .is_err()
-        );
+        assert!(state
+            .execute_frame_transition(&Step::LiveAudio, &mut transition)
+            .is_err());
         assert_eq!(transition.calls.get(), 1);
         assert_eq!(state.model_state(), &before);
         assert_eq!(
@@ -306,11 +302,9 @@ fn component_capacity_rejection_precedes_all_mechanisms() {
             .execute_frame_transition(&Step::LiveAudio, &mut transition)
             .unwrap();
         let before = state.model_state().clone();
-        assert!(
-            state
-                .execute_frame_transition(&Step::LiveAudio, &mut transition)
-                .is_err()
-        );
+        assert!(state
+            .execute_frame_transition(&Step::LiveAudio, &mut transition)
+            .is_err());
         assert_eq!(transition.calls.get(), 2);
         assert_eq!(state.model_state(), &before);
         assert_eq!(
@@ -343,11 +337,9 @@ fn first_feedback_and_sampling_follow_backbone_not_audio_or_prompt_positions() {
                 state.schedule_state().plan(retained),
                 Err(ScheduleError::MissingRetainedAudio)
             ));
-            assert!(
-                state
-                    .execute_frame_transition(&retained, &mut transition)
-                    .is_err()
-            );
+            assert!(state
+                .execute_frame_transition(&retained, &mut transition)
+                .is_err());
             assert_eq!(transition.calls.get(), 1);
         }
     }
@@ -413,11 +405,9 @@ fn empty_drain_and_stale_architecture_predecessor_preserve_publication_boundary(
         .execute_frame_transition(&Step::Drain, &mut transition)
         .unwrap();
     assert_eq!(drained, expected(0, 5, 37, 0, 0, true));
-    assert!(
-        empty
-            .execute_frame_transition(&Step::Reminder, &mut transition)
-            .is_err()
-    );
+    assert!(empty
+        .execute_frame_transition(&Step::Reminder, &mut transition)
+        .is_err());
     assert_eq!(transition.calls.get(), 2);
 
     let mut state = generation(policy_with(limits()));

@@ -414,8 +414,30 @@ impl PhysicalLinear {
         stream: &Stream,
         observer: Option<&mut dyn NativeProjectionInputObserver>,
     ) -> Result<Array, Exception> {
+        self.forward_row_parallel_with_compute(input, group, stream, observer, None)
+    }
+
+    pub(crate) fn forward_row_parallel_with_compute(
+        &mut self,
+        input: &Array,
+        group: &crate::backend::runtime::distributed::Group,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeProjectionInputObserver>,
+        compute_dtype: Option<Dtype>,
+    ) -> Result<Array, Exception> {
         let guarded = group.has_local_phase_agreement();
-        let prepared = self.project_without_bias(input, stream, observer);
+        let prepared = (|| {
+            let cast = compute_dtype
+                .map(|dtype| input.as_dtype(dtype, stream))
+                .transpose()?;
+            let partial =
+                self.project_without_bias(cast.as_ref().unwrap_or(input), stream, observer)?;
+            if compute_dtype.is_some() {
+                partial.as_dtype(input.dtype(), stream)
+            } else {
+                Ok(partial)
+            }
+        })();
         let partial = if guarded {
             let prepared = prepared.and_then(|partial| {
                 // Admit the exact immutable data contract before any participant

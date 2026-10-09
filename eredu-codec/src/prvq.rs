@@ -94,6 +94,42 @@ pub fn quantize_residual_with_score_reduction<T: Tensor>(
     context: &T::Context,
     reduce: impl FnOnce(Result<T, Error>) -> Result<T, Error>,
 ) -> Result<QuantizedStage<T>, Error> {
+    let means_norm = (|| {
+        validate_means(means)?;
+        Ok::<_, Error>(T::sum_axis(&means.square(context)?, -1, false, context)?)
+    })();
+    quantize_with_norms(residual, means, means_norm, metric, context, reduce)
+}
+
+/// Quantizes with caller-retained squared codebook norms. The norms belong to
+/// the exact immutable means supplied here; replacing means invalidates them.
+/// Local tensor shards supply local norms before the ordinary score reduction.
+pub fn quantize_residual_with_norms_and_score_reduction<T: Tensor>(
+    residual: &T,
+    means: &T,
+    means_norm: &T,
+    metric: DistanceMetric,
+    context: &T::Context,
+    reduce: impl FnOnce(Result<T, Error>) -> Result<T, Error>,
+) -> Result<QuantizedStage<T>, Error> {
+    quantize_with_norms(
+        residual,
+        means,
+        Ok(means_norm.clone()),
+        metric,
+        context,
+        reduce,
+    )
+}
+
+fn quantize_with_norms<T: Tensor>(
+    residual: &T,
+    means: &T,
+    means_norm: Result<T, Error>,
+    metric: DistanceMetric,
+    context: &T::Context,
+    reduce: impl FnOnce(Result<T, Error>) -> Result<T, Error>,
+) -> Result<QuantizedStage<T>, Error> {
     let prepared = (|| {
         validate_means(means)?;
         require_f32(residual)?;
@@ -104,12 +140,18 @@ pub fn quantize_residual_with_score_reduction<T: Tensor>(
         }
         let rows = checked_rows(residual.dim(0), residual.dim(1))?;
         let flat = residual.reshape(&[rows, means.dim(1)], context)?;
-        let means_norm = T::sum_axis(&means.square(context)?, -1, false, context)?;
+        let means_norm = means_norm?;
+        require_f32(&means_norm)?;
+        if means_norm.shape() != [means.dim(0)] {
+            return Err(invalid(
+                "precomputed codebook norms differ from vocabulary geometry",
+            ));
+        }
         let norms = match metric {
             DistanceMetric::SquaredEuclidean => {
                 T::sum_axis(&flat.square(context)?, -1, true, context)?.add(&means_norm, context)?
             }
-            DistanceMetric::CodebookNormMinusTwiceDot => means_norm,
+            DistanceMetric::CodebookNormMinusTwiceDot => means_norm.clone(),
         };
         let dot = T::matmul(&flat, &means.transpose(context)?, context)?;
         let scores = norms.subtract(&dot.multiply_scalar(2.0, context)?, context)?;

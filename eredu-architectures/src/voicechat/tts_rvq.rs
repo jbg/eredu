@@ -6,9 +6,9 @@
 
 use super::{
     config::TtsConfig,
-    tts_mog::{TtsError, f32_shape, linear, parameter},
+    tts_mog::{f32_shape, linear, parameter, TtsError},
 };
-use eredu_codec::prvq::{DistanceMetric, quantize_residual_with_score_reduction};
+use eredu_codec::prvq::{quantize_residual_with_norms_and_score_reduction, DistanceMetric};
 use eredu_nn::{
     DistributedNeuralBackend, Index, LinearOperator, NeuralBackend, Parameter, Parameterized,
     Tensor, TensorElementType,
@@ -144,14 +144,31 @@ impl<T> RefinementState<T> {
 }
 
 /// Independently leased canonical stack of 31 feedback codebooks.
-#[derive(Debug, Parameterized)]
-#[parameterized(tensor = "B::Tensor")]
+#[derive(Debug)]
 pub struct RvqBank<B: NeuralBackend> {
     table: Parameter<B::Tensor>,
-    #[parameter(skip)]
     dimensions: RvqDimensions,
-    #[parameter(skip)]
     local: super::tts_rvq_layered::RvqLocalDimensions,
+    squared_norms: std::cell::RefCell<Option<B::Tensor>>,
+}
+impl<B: NeuralBackend> Parameterized<B::Tensor> for RvqBank<B> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: eredu_nn::ParameterVisitor<'a, B::Tensor>,
+    {
+        self.table.visit_parameters(visitor);
+    }
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: eredu_nn::ParameterVisitorMut<'a, B::Tensor>,
+    {
+        self.squared_norms.get_mut().take();
+        self.table.visit_parameters_mut(visitor);
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        self.squared_norms.get_mut().take();
+        self.table.set_trainable(trainable);
+    }
 }
 impl<B: NeuralBackend> RvqBank<B> {
     /// Declares the exact immutable checkpoint bank without a projection copy.
@@ -182,7 +199,19 @@ impl<B: NeuralBackend> RvqBank<B> {
             table: Parameter::unloaded(spec, &[31, dimensions.cardinality, local.latent], context)?,
             dimensions,
             local,
+            squared_norms: std::cell::RefCell::new(None),
         })
+    }
+    fn squared_norms(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, TtsError> {
+        if let Some(norms) = self.squared_norms.borrow().as_ref() {
+            return Ok(norms.clone());
+        }
+        let norms = B::Tensor::sum_axis(&self.table.as_ref().square(context)?, -1, false, context)?;
+        *self.squared_norms.borrow_mut() = Some(norms.clone());
+        Ok(norms)
     }
     pub(super) fn geometry(&self) -> (RvqDimensions, super::tts_rvq_layered::RvqLocalDimensions) {
         (self.dimensions, self.local)
@@ -211,30 +240,11 @@ impl<B: NeuralBackend> RvqBank<B> {
                 "feedback requires I32 [batch, time, 31] codes",
             ));
         }
-        let mut sum = B::Tensor::full_f32(
-            0.0,
-            &[codes.dim(0), codes.dim(1), self.local.latent],
+        Ok(B::ordered_codebook_lookup_sum(
+            self.table.as_ref(),
+            codes,
             context,
-        )?;
-        let zero = B::Tensor::full_f32(0.0, &[], context)?;
-        let zero_index = B::Tensor::full_i32(0, &[], context)?;
-        for depth in 0..31 {
-            let table = self.table.as_ref().index(&[Index::At(depth)], context)?;
-            let ids = codes.index(&[Index::Full, Index::Full, Index::At(depth)], context)?;
-            let pad = ids.equal_i32(self.dimensions.cardinality, context)?;
-            let safe_ids = B::Tensor::where_condition(&pad, &zero_index, &ids, context)?;
-            let selected = table.take_axis(&safe_ids, 0, context)?;
-            // Mask the gathered vectors instead of allocating another complete
-            // vocabulary table merely to append its zero sentinel row.
-            let selected = B::Tensor::where_condition(
-                &pad.expand_dims(-1, context)?,
-                &zero,
-                &selected,
-                context,
-            )?;
-            sum = sum.add(&selected, context)?;
-        }
-        Ok(sum)
+        )?)
     }
 
     /// Assigns the current slot's contiguous codebooks using a fresh sampled residual.
@@ -263,6 +273,7 @@ impl<B: NeuralBackend> RvqBank<B> {
             Result<B::Tensor, TtsError>,
         ) -> Result<B::Tensor, TtsError>,
     ) -> Result<RefinementState<B::Tensor>, TtsError> {
+        let mut squared_norms = None;
         let prepared = (|| {
             state.validate(self.dimensions)?;
             f32_shape(latent, self.local.latent)?;
@@ -278,9 +289,11 @@ impl<B: NeuralBackend> RvqBank<B> {
                     "refinement bank or sampled latent geometry differs",
                 ));
             }
+            squared_norms = Some(self.squared_norms(context)?);
             Ok(latent.clone())
         })();
         let mut residual = transition(0, false, prepared)?;
+        let squared_norms = squared_norms.expect("agreed local preparation initializes norms");
         let slot = state.slot;
         let end = state.depth + REFINEMENT_DEPTHS[slot];
         let mut pieces = Vec::with_capacity(REFINEMENT_DEPTHS[slot] + 2);
@@ -303,17 +316,22 @@ impl<B: NeuralBackend> RvqBank<B> {
         }
         for depth in state.depth..end {
             let phase = 2 + depth as u64 * 3;
+            let mut depth_norm = None;
             let means = transition(
                 phase,
                 false,
-                self.table
-                    .as_ref()
-                    .index(&[Index::At(depth as i32)], context)
-                    .map_err(TtsError::from),
+                (|| {
+                    depth_norm = Some(squared_norms.index(&[Index::At(depth as i32)], context)?);
+                    Ok(self
+                        .table
+                        .as_ref()
+                        .index(&[Index::At(depth as i32)], context)?)
+                })(),
             )?;
-            let stage = quantize_residual_with_score_reduction(
+            let stage = quantize_residual_with_norms_and_score_reduction(
                 &residual,
                 &means,
+                &depth_norm.expect("agreed local preparation initializes depth norm"),
                 DistanceMetric::CodebookNormMinusTwiceDot,
                 context,
                 |scores| {

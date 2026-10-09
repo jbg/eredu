@@ -248,9 +248,18 @@ impl<B: NeuralBackend> Perception<B> {
         dimensions: PerceptionDimensions,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, PerceptionError> {
+        Self::new_with_precision(dimensions, Default::default(), context)
+    }
+    /// Constructs units with the selected portable projection precision.
+    pub fn new_with_precision(
+        dimensions: PerceptionDimensions,
+        precision: super::precision::SpeechPrecision,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, PerceptionError> {
         Ok(Self {
             runtime: eredu_runtime::ResidentRuntime::new(
-                super::perception_layered::PerceptionArchitecture::new(dimensions)?,
+                super::perception_layered::PerceptionArchitecture::new(dimensions)?
+                    .with_precision(precision)?,
                 context,
             )?,
         })

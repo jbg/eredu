@@ -168,11 +168,9 @@ fn voicechat_spoken_text_runs_character_encoder_and_cached_speech_against_nvidia
             .iter()
             .map(|cache| cache.offset())
             .collect::<Vec<_>>();
-        assert!(
-            speech
-                .begin_text_frame(&state, &spoken, &mapping, 0, policy, &mut caches, &context)
-                .is_err()
-        );
+        assert!(speech
+            .begin_text_frame(&state, &spoken, &mapping, 0, policy, &mut caches, &context)
+            .is_err());
         assert_eq!(
             caches
                 .iter()
@@ -297,21 +295,19 @@ fn voicechat_speech_retains_feedback_guidance_and_actual_codec_candidates() {
             waveform: WaveformSilence::PreserveGenerated,
         };
         // Malformed rendering policy is rejected before the borrowed cache moves.
-        assert!(
-            speech
-                .begin_frame(
-                    &state,
-                    &subword,
-                    Some(&condition),
-                    OutputPolicy {
-                        silence_on_pad: &[],
-                        ..policy
-                    },
-                    &mut caches,
-                    &context
-                )
-                .is_err()
-        );
+        assert!(speech
+            .begin_frame(
+                &state,
+                &subword,
+                Some(&condition),
+                OutputPolicy {
+                    silence_on_pad: &[],
+                    ..policy
+                },
+                &mut caches,
+                &context
+            )
+            .is_err());
         compare_cache(
             &caches,
             if index == 0 {
@@ -387,13 +383,11 @@ fn voicechat_speech_retains_feedback_guidance_and_actual_codec_candidates() {
             12 * (index as u64 + 1)
         );
         assert_eq!(parent.codec().frames_seen(), index as u64);
-        assert!(
-            output
-                .pcm
-                .data
-                .iter()
-                .all(|v| v.is_finite() && v.abs() <= 1.)
-        );
+        assert!(output
+            .pcm
+            .data
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= 1.));
         assert!(output.pcm.data.iter().any(|v| v.abs() > 1e-5));
         if subword[0] == 2 {
             assert_eq!(
@@ -508,22 +502,20 @@ fn voicechat_speech_retains_feedback_guidance_and_actual_codec_candidates() {
         Err(progress::ProgressError::Inconsistent(_))
     ));
     assert!(speech.finish(&finished, &context).unwrap().0.is_none());
-    assert!(
-        speech
-            .begin_frame(
-                &finished,
-                &[3],
-                None,
-                OutputPolicy {
-                    force_silence_on_eos: false,
-                    silence_on_pad: &[false],
-                    waveform: WaveformSilence::PreserveGenerated
-                },
-                &mut caches,
-                &context
-            )
-            .is_err()
-    );
+    assert!(speech
+        .begin_frame(
+            &finished,
+            &[3],
+            None,
+            OutputPolicy {
+                force_silence_on_eos: false,
+                silence_on_pad: &[false],
+                waveform: WaveformSilence::PreserveGenerated
+            },
+            &mut caches,
+            &context
+        )
+        .is_err());
     // Exact silence policy is part of retained state, even when neural geometry
     // and completed refinement agree. Rebinding it cannot reinterpret a branch.
     let mut other_generator = model(&fixture, &context);
@@ -532,21 +524,15 @@ fn voicechat_speech_retains_feedback_guidance_and_actual_codec_candidates() {
     let other_controls = FeedbackControls::new(5, 2, 12, true, &[5, 6, 7], &other_silence).unwrap();
     let mut other =
         SpeechComponents::new(&mut other_generator, &other_controls, &mut decoder).unwrap();
-    assert!(
-        other
-            .render(retained_frame.as_ref().unwrap(), &context)
-            .is_err()
-    );
-    assert!(
-        other
-            .generate_frame(
-                retained_frame.as_ref().unwrap(),
-                |_, _: &NumericTensor, _| {
-                    panic!("policy mismatch must be rejected before a draw")
-                },
-                &context
-            )
-            .is_err()
-    );
+    assert!(other
+        .render(retained_frame.as_ref().unwrap(), &context)
+        .is_err());
+    assert!(other
+        .generate_frame(
+            retained_frame.as_ref().unwrap(),
+            |_, _: &NumericTensor, _| { panic!("policy mismatch must be rejected before a draw") },
+            &context
+        )
+        .is_err());
     assert!(other.finish(&state, &context).is_err());
 }

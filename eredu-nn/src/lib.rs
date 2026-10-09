@@ -14,6 +14,9 @@ use eredu_checkpoint::LinearFormat;
 
 pub use eredu_nn_macros::Parameterized;
 
+/// Ordered lookup and feedback summation over stacked codebooks.
+pub mod codebooks;
+
 mod indexed_attention;
 pub use indexed_attention::{IndexedAttentionInput, LocalAttentionInput};
 
@@ -809,9 +812,35 @@ pub struct LinearFormatSpec {
     scale: Option<ParameterSpec>,
     affine_bias: Option<ParameterSpec>,
     row_layout: LinearRowLayout,
+    compute_element: Option<TensorElementType>,
 }
 
 impl LinearFormatSpec {
+    /// Requests floating projection inputs in this precision through `LinearSpec`,
+    /// restoring the caller's floating precision after the projection. Parameters,
+    /// accumulator precision and bias arithmetic retain their mechanism's policy.
+    /// Other mechanisms using this encoding do not gain a precision override.
+    /// Implementations reject unsupported requests.
+    pub fn with_compute_element(
+        mut self,
+        element: Option<TensorElementType>,
+    ) -> Result<Self, Error> {
+        if element.is_some_and(|e| {
+            !matches!(
+                e,
+                TensorElementType::F32 | TensorElementType::F16 | TensorElementType::Bf16
+            )
+        }) {
+            return Err(Error::backend("linear compute precision must be floating"));
+        }
+        self.compute_element = element;
+        Ok(self)
+    }
+
+    /// Explicit projection precision, or ordinary input arithmetic when absent.
+    pub const fn compute_element(&self) -> Option<TensorElementType> {
+        self.compute_element
+    }
     /// Declares a dense or checkpoint-native encoding with no companions.
     pub fn unscaled(format: LinearFormat) -> Result<Self, Error> {
         let spec = Self {
@@ -819,6 +848,7 @@ impl LinearFormatSpec {
             scale: None,
             affine_bias: None,
             row_layout: LinearRowLayout::Contiguous,
+            compute_element: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -834,6 +864,7 @@ impl LinearFormatSpec {
             scale: Some(scale),
             affine_bias: None,
             row_layout: LinearRowLayout::Contiguous,
+            compute_element: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -856,6 +887,7 @@ impl LinearFormatSpec {
             scale: Some(scale),
             affine_bias: Some(affine_bias),
             row_layout: LinearRowLayout::Contiguous,
+            compute_element: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -1437,6 +1469,17 @@ pub use TensorValueObserver as ProjectionInputObserver;
 
 /// Backend-native affine projection used by shared architectures.
 pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Selects explicit floating projection arithmetic. Unsupported backends reject it.
+    fn set_compute_element(&mut self, element: Option<TensorElementType>) -> Result<(), Error> {
+        if element.is_some() {
+            Err(Error::backend(
+                "explicit projection precision is unsupported",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Applies the projection without host materialization.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
     /// Projects while optionally exposing the actual multiplication input.
@@ -4092,6 +4135,17 @@ pub trait NeuralBackend: Sized + 'static {
         spec: RotarySpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Rotary, Error>;
+    /// Looks up a stacked codebook vector per depth and sums in depth order.
+    /// The vocabulary-sized sentinel contributes zero; all other invalid indices
+    /// are rejected before successful completion. See [`codebooks`].
+    fn ordered_codebook_lookup_sum(
+        table: &Self::Tensor,
+        codes: &Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        codebooks::ordered_codebook_lookup_sum(table, codes, context)
+    }
+
     /// Applies SiLU using a backend-native implementation.
     fn silu(
         input: Self::Tensor,

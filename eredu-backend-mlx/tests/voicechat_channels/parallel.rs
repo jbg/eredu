@@ -102,25 +102,21 @@ fn native_guarded_channel_ingress_worker() {
     } else {
         &audio
     };
-    assert!(
-        prepare(BackboneRequest::Audio {
-            projected_audio: malformed,
-            agent_tokens: &agent,
-            function_tokens: &function,
-        })
-        .is_err()
-    );
+    assert!(prepare(BackboneRequest::Audio {
+        projected_audio: malformed,
+        agent_tokens: &agent,
+        function_tokens: &function,
+    })
+    .is_err());
     // Prompt framing fails on one rank, before allocation can lead into lookup.
-    assert!(
-        prepare(BackboneRequest::Prompt {
-            tokens: &[5, 7],
-            policy: PromptPolicy {
-                repeat: 2,
-                max_tokens: if world.rank() == 0 { 7 } else { 8 }
-            },
-        })
-        .is_err()
-    );
+    assert!(prepare(BackboneRequest::Prompt {
+        tokens: &[5, 7],
+        policy: PromptPolicy {
+            repeat: 2,
+            max_tokens: if world.rank() == 0 { 7 } else { 8 }
+        },
+    })
+    .is_err());
     // Valid peers also reject a distinct invocation; equal tensor payloads cannot
     // allow prompt and live-audio collective sequences to cross.
     let mismatched = if world.rank() == 0 {
