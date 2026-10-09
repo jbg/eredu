@@ -91,10 +91,156 @@ pub(crate) fn f32_weightless_rms(
     }
 }
 
+/// Fuses ordered reduction, normalization and optional learned gain.
+/// One lane reduces each row, then its group applies the gain in parallel.
+/// Group and offset semantics come from the neutral normalization specification.
+pub(crate) fn f32_grouped_rms(
+    input: &Array,
+    weight: Option<&Array>,
+    groups: i32,
+    epsilon: f32,
+    offset: Option<f32>,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        use safemlx::{
+            fast::{CustomKernelConfig, MetalKernel},
+            DeviceType, Dtype,
+        };
+        use std::cell::RefCell;
+        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        if input.dtype() != Dtype::Float32
+            || input.size() == 0
+            || input.shape().is_empty()
+            || groups <= 0
+            || input.dim(-1) % groups != 0
+            || weight.is_some_and(|weight| {
+                weight.dtype() != Dtype::Float32 || weight.shape() != [input.dim(-1)]
+            })
+            || stream.get_device()?.get_type()? != DeviceType::Gpu
+        {
+            return Ok(None);
+        }
+        let width = input.dim(-1) / groups;
+        let rows = i32::try_from(input.size() / width as usize)
+            .map_err(|_| Exception::custom("normalization row count overflow"))?;
+        let squared = input.square(stream)?;
+        let extent = rows
+            .checked_mul(32)
+            .ok_or_else(|| Exception::custom("normalization grid extent overflow"))?;
+        let scalars = Array::from_slice(&[epsilon, offset.unwrap_or(0.0)], &[2]);
+        let config = CustomKernelConfig::new()
+            .with_template_arg_int("WIDTH", width)
+            .with_template_arg_int("GROUPS", groups)
+            .with_template_arg_bool("WEIGHTED", weight.is_some())
+            .with_template_arg_bool("OFFSET", offset.is_some())
+            .with_grid([extent, 1, 1])
+            .with_thread_group([32, 1, 1])
+            .with_output_arg(input.shape(), Dtype::Float32);
+        let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "f32_grouped_rms",
+                    ["input", "squared", "weight", "scalars"],
+                    ["output"],
+                    r#"
+                    #pragma clang fp contract(off)
+                    uint row = threadgroup_position_in_grid.x;
+                    uint lane = thread_position_in_threadgroup.x;
+                    size_t base = size_t(row) * WIDTH;
+                    threadgroup float inverse;
+                    if (lane == 0) {
+                        float variance = cascade_sum_f32(squared + base, WIDTH) / float(WIDTH);
+                        inverse = 1.0f / metal::precise::sqrt(variance + scalars[0]);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    size_t gain_base = size_t(row % GROUPS) * WIDTH;
+                    for (uint i=lane; i<WIDTH; i+=32) {
+                        // Keep the F32 product boundary before applying gain.
+                        float normalized = input[base+i] * inverse;
+                        if (WEIGHTED) {
+                            float gain = OFFSET
+                                ? weight[gain_base+i] + scalars[1]
+                                : weight[gain_base+i];
+                            output[base+i] = normalized * gain;
+                        } else {
+                            output[base+i] = normalized;
+                        }
+                    }
+                    "#,
+                    include_str!("rms_cascade.metal"),
+                    true,
+                    false,
+                )?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("normalization kernel initialized")
+                .apply_device(
+                    [input, &squared, weight.unwrap_or(input), &scalars],
+                    &config,
+                    stream,
+                )
+        })?;
+        Ok(output.pop())
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (input, weight, groups, epsilon, offset, stream);
+        Ok(None)
+    }
+}
+
 #[cfg(all(test, feature = "metal", not(feature = "cuda")))]
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType, Dtype};
+    #[test]
+    fn fused_grouped_rms_handles_strided_rows_groups_and_reduction_tails() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        for width in [17, 72, 1152] {
+            let dimensions = width * 3;
+            let values = (0..4 * dimensions)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
+                .collect::<Vec<_>>();
+            let weights = (0..dimensions)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.0625)
+                .collect::<Vec<_>>();
+            let input = Array::from_slice(&values, &[2, dimensions as i32, 2])
+                .transpose_axes(&[0, 2, 1], &stream)
+                .unwrap();
+            let gain = Array::from_slice(&weights, &[dimensions as i32]);
+            let result = f32_grouped_rms(&input, Some(&gain), 3, 0.125, Some(1.0), &stream)
+                .unwrap()
+                .unwrap()
+                .into_evaluated()
+                .unwrap();
+            let actual = result.as_slice::<f32>();
+            for batch in 0..2 {
+                for token in 0..2 {
+                    for group in 0..3 {
+                        let row = (0..width)
+                            .map(|column| {
+                                values[(batch * dimensions + group * width + column) * 2 + token]
+                            })
+                            .collect::<Vec<_>>();
+                        let mean =
+                            row.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / width as f64;
+                        for column in 0..width {
+                            let expected = row[column] as f64 / (mean + 0.125).sqrt()
+                                * (1.0 + weights[group * width + column] as f64);
+                            let observed =
+                                actual[(batch * 2 + token) * dimensions + group * width + column];
+                            assert!((observed as f64 - expected).abs() < 2e-6,
+                                "width {width} batch {batch} token {token} group {group} column {column}: {observed} vs {expected}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn native_cascade_normalization_matches_independent_bf16_rounding() {
         let weights = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));

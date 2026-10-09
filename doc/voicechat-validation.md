@@ -710,6 +710,54 @@ logs, complete events and WAVs. All seven temporary on-load quantization source
 edits match their implementation hashes after the build. This measures offline
 serial inference; live audio scheduling and echo cancellation are not measured.
 
+Generic Metal F32 RMS and `InputProducts` rotary fusion preserves the accepted
+conversation under the same combined precision and resident serial execution.
+RMS keeps its ordered reduction and separate F32 square, then applies
+normalization and gain across the threadgroup. Rotary retains precise
+trigonometric functions, separate product rounding and runtime sequence extents.
+These native operators consume existing neutral specifications; family equations,
+cache state, RNG and completion ownership retain their existing contracts.
+
+Complete-conversation measurements on the same M3 Ultra use 386 warmed frames:
+
+| Generic speech operator comparison | Mean 80 ms frame | p95 frame |
+| --- | ---: | ---: |
+| Preserved committed control before | 98.286 ms | 102.432 ms |
+| Fused RMS and rotary | 88.264 ms | 92.618 ms |
+| Preserved committed control after | 98.315 ms | 102.448 ms |
+
+Against the faster bracketing control, fusion saves 10.021 ms/frame (10.20%).
+Throughput is 0.906 times realtime, real-time factor is 1.103, and the mean
+remaining gap is 8.264 ms; another 9.36% reduction reaches 80 ms without scheduling
+headroom. The p99 is 95.127 ms and maximum 95.582 ms. All 386 warmed intervals
+still miss the deadline. All 1,418 semantic events and the complete accepted
+698,552-sample WAV bytes match, with SHA-256
+`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
+This combined end-to-end measurement does not attribute isolated operator or
+shader durations. Microphone/speaker scheduling and echo cancellation are not
+measured.
+
+Four focused Metal tests pass: independently computed grouped RMS values across
+strided rows and widths 17/72/1152 with reduction tails; learned-offset RMS
+input-precision and F32 scale boundaries; strided rotary pairs, partial tails and
+F32 position rounding beyond `2^24`; and controlled/scheduled mixed-precision
+cached publication. Reproducible native validation uses:
+
+```sh
+cargo test --offline --release -p eredu-backend-mlx --no-default-features \
+  --features audio,metal --lib -- fused_grouped_rms fused_input_products_rotary \
+  mlx_learned_offset_rms_preserves_precision_and_float32_scale_arithmetic \
+  coupled_mixed_precision_matches_controlled_and_scheduled_cached_publication \
+  --include-ignored --nocapture
+cargo check --offline -p eredu-backend-mlx --no-default-features
+```
+
+The Metal/audio release build and non-Metal fallback compiler check pass.
+External `/private/tmp/eredu-speech-fusion` retains reproduction scripts, the
+report, exact benchmark and implementation patches, binaries and hashes, complete
+logs, events and WAVs. All seven temporary on-load quantization source edits
+match their implementation hashes after the build.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover

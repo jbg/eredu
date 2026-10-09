@@ -277,6 +277,16 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
         }
         if self.groups.is_some() || self.offset.is_some() {
             let groups = self.groups.unwrap_or(1);
+            if let Some(output) = compute(super::super::normalization::f32_grouped_rms(
+                input,
+                self.module.as_ref().map(|module| module.weight.as_ref()),
+                groups,
+                self.epsilon,
+                self.offset,
+                context,
+            ))? {
+                return Ok(MlxTensor::from_array(output));
+            }
             let mut shape = input.shape().to_vec();
             shape.pop();
             shape.extend([groups, self.dimensions / groups]);

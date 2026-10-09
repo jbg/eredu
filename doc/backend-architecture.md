@@ -6687,6 +6687,23 @@ near a rounding midpoint do not change downstream component experiments. The
 parameterized operator, learned-offset form and direct weighted operation share
 that mechanism; mixed-precision gains retain the native promotion behavior.
 
+On Metal, F32 grouped and learned-offset RMS normalization combines the ordered four-level
+reduction, normalization and optional gain in one native kernel. One lane reduces
+each row; its threadgroup applies normalization and gain in parallel. Separate
+native squaring preserves the F32 square boundary, and contraction is disabled
+before the gain. Groups index the retained full-width gain. Weightless
+normalization retains its existing mechanism. Strided inputs are made contiguous by the native kernel
+interface. Other devices and dtypes retain their existing realization.
+
+The native F32 realization of `RotaryArithmetic::InputProducts` combines position
+construction, frequency multiplication, precise sine/cosine, amplitude scaling
+and paired output arithmetic. Separate rounded products prevent contraction into
+fused multiply-add. Position starts round to F32 before adding sequence indices;
+traditional pairs, split halves and untouched tails retain their neutral
+contracts. Sequence extents are runtime inputs and do not specialize shaders. Narrow dtypes and non-Metal execution retain the expanded realization.
+These are generic backend mechanisms: architecture-owned equations, policies,
+frequency preparation, state and completion ownership remain unchanged.
+
 
 The V3 provider-aware TP traversal invokes the additive shared-write hooks and
 preserves its ordinary fused reduction through a shared helper. A nonzero neutral

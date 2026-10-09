@@ -370,6 +370,8 @@ pub enum RopeVariant {
     Yarn(YarnRope),
 }
 
+mod input_products;
+
 /// Explicit input-dtype rotary products over precomputed frequency denominators.
 #[derive(Debug, Clone)]
 pub(super) struct ElementwiseRotary {
@@ -443,6 +445,17 @@ impl ElementwiseRotary {
         offset: i32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        if let Some(output) = input_products::forward(
+            input,
+            &self.inverse_frequencies,
+            self.dimensions,
+            self.traditional,
+            offset,
+            self.amplitude,
+            stream,
+        )? {
+            return Ok(output);
+        }
         let shape = input.shape();
         let length = input.dim(-2);
         let width = input.dim(-1);
