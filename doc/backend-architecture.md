@@ -91,6 +91,13 @@ and a fixed softmax reduction with a pinned exponential polynomial. These are
 generic native numerical operations, independent of checkpoint and family policy.
 Metal realizes complete BF16 row and batched products, cascade normalization
 and FP32 softmax/sigmoid with the same accumulation and rounding boundaries.
+The Metal FP32 last-axis softmax uses one cooperative SIMD group per row.
+Maximum selection is parallel; four lanes retain the ordered exponential sum
+chains and their fixed final merge. A device-memory barrier separates writing
+exponentials from parallel normalization in the output buffer. Row widths/counts
+are runtime tensor inputs, so growing histories reuse the same shader instead of
+creating a shape specialization. Input layout preparation and native graph
+retention keep their ordinary ownership and completion contracts.
 The shared FP32 sigmoid/SiLU kernel reshapes scalar inputs to a one-element
 array for Metal argument binding, while retaining the original output shape.
 Scalar, singleton and vector calls use the same exponential rounding policy.

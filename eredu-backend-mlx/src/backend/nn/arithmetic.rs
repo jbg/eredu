@@ -1,4 +1,4 @@
-//! Native FP32 pointwise arithmetic with explicit exponential rounding.
+//! Native FP32 pointwise and softmax arithmetic with explicit rounding.
 use safemlx::{error::Exception, Array, Stream};
 #[derive(Clone, Copy)]
 pub(crate) enum Pointwise {
@@ -60,6 +60,100 @@ pub(crate) fn f32_pointwise(
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType, Dtype};
+
+    /// Compatibility reference for the released ordered FP32 softmax arithmetic.
+    #[test]
+    fn cooperative_softmax_preserves_ordered_scores_tails_and_exceptional_rows() {
+        use safemlx::fast::{CustomKernelConfig, MetalKernel};
+        use safemlx::ops::indexing::TryIndexOp;
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let reference = MetalKernel::new(
+            "serial_softmax_compatibility_reference",
+            ["input"], ["output"],
+            concat!("uint row=thread_position_in_grid.x; if(row>=ROWS) return; size_t base=size_t(row)*WIDTH;",
+                "float maximum=-INFINITY; for(uint i=0;i<WIDTH;++i) { float v=input[base+i]; maximum=(isnan(v)||isnan(maximum)) ? NAN : max(maximum,v); }",
+                "float sums[4]={}; for(uint i=0;i<WIDTH;++i) { float v=stable_exp_f32(input[base+i]-maximum); output[base+i]=v; sums[i%4]+=v; }",
+                "float inverse=1.0f/((sums[0]+sums[2])+(sums[1]+sums[3]));",
+                "for(uint i=0;i<WIDTH;++i) output[base+i]*=inverse;"),
+            include_str!("exp_f32.metal"), true, false,
+        ).unwrap();
+        // Reuse one cooperative shader across vector/SIMD tails and changing
+        // shapes, including strided origins and more than one SIMD of rows.
+        for width in [4, 5, 7, 31, 32, 33, 257, 511, 512, 513, 1024, 1537, 4097] {
+            let rows = 35;
+            let mut data: Vec<f32> = (0..rows * (width + 3))
+                .map(|i| (((i * 17) % 131) as f32 - 65.0) * 0.25)
+                .collect();
+            for row in 0..5 {
+                for column in 0..width {
+                    data[row * (width + 3) + column + 1] = match row {
+                        0 => {
+                            if column % 2 == 0 {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        }
+                        1 => f32::NEG_INFINITY,
+                        2 => {
+                            if column == width - 1 {
+                                f32::NAN
+                            } else {
+                                column as f32
+                            }
+                        }
+                        3 => {
+                            if column == 0 {
+                                f32::INFINITY
+                            } else {
+                                -(column as f32)
+                            }
+                        }
+                        _ => {
+                            if column % 3 == 0 {
+                                f32::NEG_INFINITY
+                            } else {
+                                -(column as f32)
+                            }
+                        }
+                    };
+                }
+            }
+            let input = Array::from_slice(&data, &[rows as i32, (width + 3) as i32])
+                .try_index_device((.., 1..width as i32 + 1), &stream)
+                .unwrap()
+                .expand_dims(1, &stream)
+                .unwrap();
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int("WIDTH", width as i32)
+                .with_template_arg_int("ROWS", rows as i32)
+                .with_grid([rows as i32, 1, 1])
+                .with_thread_group([32, 1, 1])
+                .with_output_arg(input.shape(), Dtype::Float32);
+            let expected = reference
+                .apply_device([&input], &config, &stream)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into_evaluated()
+                .unwrap();
+            let actual = softmax_last(&input, &stream).unwrap().unwrap();
+            assert_eq!(actual.shape(), input.shape());
+            let actual = actual.into_evaluated().unwrap();
+            for (index, (a, e)) in actual
+                .as_slice::<f32>()
+                .iter()
+                .zip(expected.as_slice::<f32>())
+                .enumerate()
+            {
+                assert!(
+                    a.to_bits() == e.to_bits() || (a.is_nan() && e.is_nan()),
+                    "width {width}, element {index}: {a} != {e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn native_pointwise_scalar_and_singleton_preserve_shape_and_rounding() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
@@ -131,6 +225,7 @@ mod tests {
     }
 }
 
+/// Cooperative last-axis softmax preserving four ordered FP32 sum chains.
 pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -150,21 +245,28 @@ pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Arra
         let width = input.dim(-1);
         let rows = i32::try_from(input.size() / width as usize)
             .map_err(|_| Exception::custom("softmax row count overflow"))?;
+        // Shape data is a runtime input: growing histories reuse one shader.
+        let dimensions = Array::from_slice(&[width, rows], &[2]);
         let config = CustomKernelConfig::new()
-            .with_template_arg_int("WIDTH", width)
-            .with_template_arg_int("ROWS", rows)
-            .with_grid([rows, 1, 1])
+            .with_grid([32, rows, 1])
             .with_thread_group([32, 1, 1])
             .with_output_arg(input.shape(), Dtype::Float32);
-        let mut output=KERNEL.with(|cell| -> Result<Vec<Array>,Exception> {
-            if cell.borrow().is_none() { *cell.borrow_mut()=Some(MetalKernel::new("f32_softmax_last",["input"],["output"],
-                concat!("uint row=thread_position_in_grid.x; if(row>=ROWS) return; size_t base=size_t(row)*WIDTH;",
-                    "float maximum=-INFINITY; for(uint i=0;i<WIDTH;++i) { float v=input[base+i]; maximum=(isnan(v)||isnan(maximum)) ? NAN : max(maximum,v); }",
-                    "float sums[4]={}; for(uint i=0;i<WIDTH;++i) { float v=stable_exp_f32(input[base+i]-maximum); output[base+i]=v; sums[i%4]+=v; }",
-                    "float inverse=1.0f/((sums[0]+sums[2])+(sums[1]+sums[3]));",
-                    "for(uint i=0;i<WIDTH;++i) output[base+i]*=inverse;"),
-                include_str!("exp_f32.metal"),true,false)?); }
-            cell.borrow().as_ref().expect("softmax kernel initialized").apply_device([input],&config,stream)
+        let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    "f32_ordered_parallel_softmax_last",
+                    ["input", "dimensions"],
+                    ["output"],
+                    include_str!("softmax_f32.metal"),
+                    include_str!("exp_f32.metal"),
+                    true,
+                    false,
+                )?);
+            }
+            cell.borrow()
+                .as_ref()
+                .expect("softmax kernel initialized")
+                .apply_device([input, &dimensions], &config, stream)
         })?;
         Ok(output.pop())
     }

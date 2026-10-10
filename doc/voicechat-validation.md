@@ -1065,6 +1065,53 @@ cache coverage includes selected-content identity, bounded reload reads, lease
 capacity, eviction, reduced-budget hits, unrelated-file protection, corruption
 repair and incomplete-write cleanup. The portable facade check passes.
 
+### Cooperative ordered FP32 softmax
+
+The generic Metal last-axis FP32 softmax uses one SIMD group per row, parallel
+maximum selection and normalization, and four ordered exponential sum chains.
+It retains the pinned exponential and `(s0+s2)+(s1+s3)` merge. Runtime width and
+row-count inputs permit growing attention histories to reuse the shader. These
+mechanisms preserve InputScores scaling/masking and existing resource retention;
+no family equations or selection policy enter the backend.
+
+The 2026-10-10 M3 Ultra comparison uses the same pinned checkpoint, accepted
+experimental Q8/group-64 and mixed-precision recipe, adaptive allocator,
+prepared-checkpoint reuse and 25-operation / 256 MiB batching described above.
+Four sequential fresh-process conversations execute 996 live frames (79.68 s),
+with 986 measured intervals excluding the first ten, loading, prefill and drain.
+Profiling collectors are disabled and no build or other GPU workload overlaps.
+
+| Softmax realization | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Serial, first process | 86.212 ms | 104.673 ms | 112.370 ms | 121.922 ms | 600 / 986 |
+| Cooperative, first process | 68.579 ms | 71.850 ms | 72.102 ms | 72.375 ms | 0 / 986 |
+| Cooperative, repeat | 68.581 ms | 71.860 ms | 72.146 ms | 72.666 ms | 0 / 986 |
+| Serial, warmed final control | 74.217 ms | 84.812 ms | 92.358 ms | 93.837 ms | 121 / 986 |
+
+Against the warmed final control, the cooperative repeat saves 5.635 ms/frame
+(7.59% latency), with 11.419 ms mean headroom (14.27% of the 80 ms budget) and
+1.1665 times realtime throughput. The final 200 frames average 71.573 ms instead
+of 81.065 ms, saving 9.492 ms. The repeat's p95 margin is 8.140 ms and its smallest
+measured margin is 7.334 ms. Both cooperative processes avoid the first serial
+process's late-history cliff. These observations do not attribute every cold
+serial delay to shader compilation, establish an unbounded-history guarantee, or
+measure microphone/speaker pacing or echo cancellation.
+
+All four runs match all 3,818 semantic events (excluding wall clocks) and full
+accepted WAV bytes exactly, SHA-256
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
+Peak process footprints are 22.425 GiB for both cooperative runs and
+22.416–22.435 GiB for serial controls; this comparison shows no meaningful
+footprint increase. Prepared-cache load times are 24.93–25.04 s.
+
+Native compatibility coverage compares frozen serial arithmetic across widths
+4–4,097, SIMD tails, strided inputs, signed zeros, NaNs, infinities and masked
+rows. The independent PyTorch InputScores fixture passes for contiguous and
+bounded paged attention. Controlled/scheduled mixed-precision VoiceChat cached
+publication parity also passes. Reproduction scripts, complete outputs, source
+patches, binary hashes and restoration manifests reside in
+`/private/tmp/eredu-parallel-softmax`, including `REPORT.md` and `comparison.json`.
+
 ### Released-checkpoint tool round trip
 
 The tool-round-trip measurement dated 2026-10-05 uses the resident Metal WAV
