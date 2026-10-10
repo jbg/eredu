@@ -404,29 +404,18 @@ impl PreparedAttentionKeyValues {
         arithmetic: eredu_nn::AttentionArithmetic,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let batch = queries.dim(0);
-        let heads = queries.dim(1);
-        let kv_heads = keys.dim(1);
-        let tokens = keys.dim(2);
-        let repeat = heads / kv_heads;
-        let expand = |x: &Array| -> Result<Array, Exception> {
-            broadcast_to(
-                &x.reshape(&[batch, kv_heads, 1, tokens, x.dim(3)], stream)?,
-                &[batch, kv_heads, repeat, tokens, x.dim(3)],
-                stream,
-            )?
-            .reshape(&[batch, heads, tokens, x.dim(3)], stream)
-        };
         let score_dtype = if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
             queries.dtype()
         } else {
             Dtype::Float32
         };
-        let keys = expand(keys)?
+        // Retain the physical K/V head axis. Native products can consume batch
+        // strides directly; collapsing a broadcast head axis would replicate
+        // K/V, and an unconditional contiguous conversion copies cache views.
+        let keys = keys
             .as_dtype(score_dtype, stream)?
-            .contiguous(false, stream)?
             .swap_axes(-1, -2, stream)?;
-        let values = expand(values)?.contiguous(false, stream)?;
+        let values = values.clone();
         let key_product = super::matrix::PreparedBf16BatchedProduct::new(&keys, false, stream)?;
         let value_product = super::matrix::PreparedBf16BatchedProduct::new(&values, true, stream)?;
         Ok(Self {
@@ -437,6 +426,32 @@ impl PreparedAttentionKeyValues {
             score_dtype,
         })
     }
+}
+
+/// Broadcasts each physical RHS head over its contiguous group of query heads
+/// without flattening or materializing the broadcast K/V axis.
+pub(crate) fn grouped_head_product(
+    lhs: &Array,
+    rhs: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let heads = lhs.dim(1);
+    let kv_heads = rhs.dim(1);
+    if heads == kv_heads {
+        return safemlx::ops::matmul(lhs, rhs, stream);
+    }
+    let grouped = lhs.reshape(
+        &[
+            lhs.dim(0),
+            kv_heads,
+            heads / kv_heads,
+            lhs.dim(2),
+            lhs.dim(3),
+        ],
+        stream,
+    )?;
+    safemlx::ops::matmul(&grouped, &rhs.expand_dims(2, stream)?, stream)?
+        .reshape(&[lhs.dim(0), heads, lhs.dim(2), rhs.dim(3)], stream)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,7 +477,7 @@ fn attention_with_prepared_key_values(
         .flatten()
     {
         Some(scores) => scores,
-        None => safemlx::ops::matmul(&query, &prepared.keys, stream)?,
+        None => grouped_head_product(&query, &prepared.keys, stream)?,
     };
     scores = scores
         .as_dtype(Dtype::Float32, stream)?
@@ -511,7 +526,7 @@ fn attention_with_prepared_key_values(
         .flatten()
     {
         Some(output) => Ok(output),
-        None => safemlx::ops::matmul(&probabilities, &prepared.values, stream),
+        None => grouped_head_product(&probabilities, &prepared.values, stream),
     }
 }
 

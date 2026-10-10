@@ -1,6 +1,7 @@
 //! Blockwise attention over ordered paged-cache blocks.
 
 use super::*;
+use crate::backend::nn::attention::grouped_head_product;
 
 pub struct KeyValueAttentionBlock {
     pub start: i64,
@@ -198,6 +199,8 @@ impl BlockwiseAttentionAccumulator {
             || values.dim(0) != keys.dim(0)
             || values.dim(1) != keys.dim(1)
             || values.dim(2) != keys.dim(2)
+            || keys.dim(1) <= 0
+            || keys.dim(3) != self.head_dim
         {
             return Err(Exception::custom(
                 "paged key/value block shapes are inconsistent",
@@ -211,37 +214,16 @@ impl BlockwiseAttentionAccumulator {
         }
         let key_len = keys.dim(2);
         let value_dim = values.dim(3);
-        let repeats = self.query_heads / key_heads;
-        let (keys, values) = if repeats == 1 {
-            (keys.clone(), values.clone())
-        } else {
-            let keys = broadcast_to(
-                &keys.reshape(&[self.batch, key_heads, 1, key_len, self.head_dim], stream)?,
-                &[self.batch, key_heads, repeats, key_len, self.head_dim],
-                stream,
-            )?
-            .reshape(
-                &[self.batch, self.query_heads, key_len, self.head_dim],
-                stream,
-            )?;
-            let values = broadcast_to(
-                &values.reshape(&[self.batch, key_heads, 1, key_len, value_dim], stream)?,
-                &[self.batch, key_heads, repeats, key_len, value_dim],
-                stream,
-            )?
-            .reshape(&[self.batch, self.query_heads, key_len, value_dim], stream)?;
-            (keys, values)
-        };
         let keys = keys.as_dtype(Dtype::Float32, stream)?;
         let values = values.as_dtype(Dtype::Float32, stream)?;
         let mut scores = if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
-            matmul(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
+            grouped_head_product(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
                 .as_dtype(self.output_dtype, stream)?
                 .as_dtype(Dtype::Float32, stream)?
                 .multiply(Array::from_f32(self.scale), stream)?
                 .as_dtype(self.output_dtype, stream)?
         } else {
-            matmul(
+            grouped_head_product(
                 &self.queries.multiply(Array::from_f32(self.scale), stream)?,
                 &keys.swap_axes(-1, -2, stream)?,
                 stream,
@@ -321,7 +303,7 @@ impl BlockwiseAttentionAccumulator {
                 .as_dtype(self.output_dtype, stream)?;
             // Each page contributes to one FP32 product accumulator; rounding
             // partial page outputs would make the equation depend on page size.
-            let product = matmul(
+            let product = grouped_head_product(
                 &probabilities.as_dtype(Dtype::Float32, stream)?,
                 &values,
                 stream,
@@ -343,7 +325,7 @@ impl BlockwiseAttentionAccumulator {
                 stream,
             )?
         } else {
-            matmul(&weights, &values, stream)?
+            grouped_head_product(&weights, &values, stream)?
         };
         match (&self.running_max, &self.running_sum, &self.accumulator) {
             (Some(old_max), Some(old_sum), Some(old_accumulator)) => {

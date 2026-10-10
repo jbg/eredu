@@ -926,6 +926,54 @@ streams/WAVs, native traces and per-frame command-buffer counts. These timings
 exclude loading and prefill, use 386 warmed intervals per run, and do not
 establish live I/O scheduling or longer-history performance.
 
+Explicit attention retains the physical K/V head axis. Native batched products
+broadcast a singleton RHS axis over contiguous query-head groups, avoiding
+expanded K/V storage. Equal-head products consume native batch strides directly
+without forced contiguous preparation. BF16 prepared products retain physical
+RHS banks and map query groups onto those banks with the existing reduction
+order. Blockwise attention uses the same grouped product. Native memory facts
+price physical heads and blockwise F32 conversion; portable conservative scratch
+allowances remain unchanged. InputScores scale, mask, softmax and probability
+rounding boundaries, cache snapshots, rollback and completion ownership remain
+unchanged. No feature flag or new public API is required.
+
+The released speech transformers have sixteen query heads and sixteen K/V heads.
+They receive no head-replication saving. Contiguous preparation can already alias
+contiguous inputs, so removing it does not establish a particular byte-traffic
+reduction. Complete-conversation measurements use the same pinned corpus,
+accepted precision recipe and 386 warmed intervals per run:
+
+| Shared K/V layout selection | Mean 80 ms frame | p95 frame | Maximum |
+| --- | ---: | ---: | ---: |
+| Fresh preserved control, default batching | 69.711 ms | 74.374 ms | 79.894 ms |
+| Shared layouts, initial default run | 69.409 ms | 73.568 ms | 77.516 ms |
+| Retained implementation, default batching | 69.271 ms | 73.809 ms | 76.585 ms |
+| Retained implementation, 25 operations / 256 MiB | 68.873 ms | 73.083 ms | 78.648 ms |
+
+The final default comparison saves 0.441 ms/frame (0.63%). The combined batching
+selection leaves 11.127 ms mean headroom (13.91% of the budget), or 1.162 times
+realtime. All warmed intervals in these four runs meet their deadline; all
+1,418 semantic events and accepted WAV bytes remain exact. These measurements
+show a modest gain for this equal-head checkpoint; the single combined run does
+not establish an additional gain over the prior batching selection.
+
+Independent scalar fixtures cover nonzero grouped attention with two batches,
+six query heads, two K/V heads, strided sequence origins and unequal key/value
+widths on CPU and Metal. Published BF16 attention and contiguous/paged
+InputScores references pass, as does controlled/scheduled cached publication.
+A BF16 allocator fixture with eight query heads, two K/V heads, 128 queries,
+1,024 keys, key width 64 and value width 256 measures 22,159,424 bytes peak for
+shared preparation versus 37,883,968 for separately prepared query tiles:
+41.51% less with exact output. This measures grouped-attention preparation,
+rather than whole-model memory use.
+
+External `/private/tmp/eredu-speech-attention` retains `REPORT.md`, comparison
+data, source/binary hashes, restoration manifests, reproduction commands,
+native test logs and complete event streams/WAVs. Score-fusion experiments
+preserve complete output but provide no end-to-end benefit; their code and
+plumbing are absent from production. Timings exclude loading and prefill and
+do not establish microphone/speaker scheduling or longer-history performance.
+
 The native tests cover ordered F32 rounding, strided code views, signed gather
 indices, PAD, synchronous and completion-owned invalid-index rejection, and
 batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover

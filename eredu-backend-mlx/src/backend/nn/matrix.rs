@@ -182,19 +182,25 @@ impl PreparedBf16BatchedProduct {
             || lhs.dtype() != safemlx::Dtype::Bfloat16
             || lhs.ndim() != 4
             || lhs.dim(0) != self.batch
-            || lhs.dim(1) != self.heads
+            || lhs.dim(1) % self.heads != 0
             || lhs.dim(3) != self.width
         {
             return Ok(None);
         }
         let rows = lhs.dim(2);
+        let heads = lhs.dim(1);
+        let repeats = heads / self.heads;
+        let query_banks = self
+            .batch
+            .checked_mul(heads)
+            .ok_or_else(|| Exception::custom("matrix batch count overflow"))?;
         let input = lhs.reshape(&[-1, self.width], stream)?;
-        let ids = (0..self.batch * self.heads)
-            .flat_map(|batch| std::iter::repeat_n(batch, rows as usize))
+        let ids = (0..query_banks)
+            .flat_map(|head| std::iter::repeat_n(head / repeats, rows as usize))
             .collect::<Vec<_>>();
         let groups = Array::from_slice(&ids, &[ids.len() as i32]);
         bf16_projection(&input, &self.weights, Some(&groups), self.columns, stream)?
-            .map(|output| output.reshape(&[self.batch, self.heads, rows, self.outputs], stream))
+            .map(|output| output.reshape(&[self.batch, heads, rows, self.outputs], stream))
             .transpose()
     }
 }

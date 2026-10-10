@@ -3,7 +3,7 @@ use safemlx::{
     ops::{
         broadcast_to, concatenate_axis,
         indexing::{TryIndexMutOp, TryIndexOp},
-        matmul, maximum, r#where, sum_axis, zeros_dtype,
+        maximum, r#where, sum_axis, zeros_dtype,
     },
     Array, Dtype, Stream,
 };

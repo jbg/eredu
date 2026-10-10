@@ -5,6 +5,92 @@ use crate::backend::{nn::tensor::create_causal_mask, ExecutionContext};
 
 #[test]
 #[ignore = "requires MLX runtime execution"]
+fn shared_kv_heads_preserve_strided_batches_and_head_mapping() {
+    use safemlx::ops::indexing::TryIndexOp;
+    let devices = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+        vec![DeviceType::Cpu, DeviceType::Gpu]
+    } else {
+        vec![DeviceType::Cpu]
+    };
+    let q: Vec<f32> = (0..2 * 6 * 3 * 8)
+        .map(|i| ((i * 13 % 23) as f32 - 11.0) / 16.0)
+        .collect();
+    let k: Vec<f32> = (0..2 * 2 * 11 * 8)
+        .map(|i| ((i * 7 % 19) as f32 - 9.0) / 16.0)
+        .collect();
+    let v: Vec<f32> = (0..2 * 2 * 11 * 5)
+        .map(|i| ((i * 11 % 29) as f32 - 14.0) / 8.0)
+        .collect();
+    let mut expected = Vec::new();
+    for batch in 0..2 {
+        for head in 0..6 {
+            for row in 0..3 {
+                let scores: Vec<f32> = (0..7)
+                    .map(|token| {
+                        (0..8)
+                            .map(|d| {
+                                q[((batch * 6 + head) * 3 + row) * 8 + d]
+                                    * k[((batch * 2 + head / 3) * 11 + token + 1) * 8 + d]
+                            })
+                            .sum::<f32>()
+                            * 0.25
+                    })
+                    .collect();
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights: Vec<f32> = scores.iter().map(|x| (x - maximum).exp()).collect();
+                let sum: f32 = weights.iter().sum();
+                for d in 0..5 {
+                    expected.push(
+                        (0..7)
+                            .map(|token| {
+                                weights[token] / sum
+                                    * v[((batch * 2 + head / 3) * 11 + token + 1) * 5 + d]
+                            })
+                            .sum::<f32>(),
+                    );
+                }
+            }
+        }
+    }
+    for device in devices {
+        let context = ExecutionContext::new(Device::new(device, 0));
+        let stream = context.stream();
+        let keys = Array::from_slice(&k, &[2, 2, 11, 8])
+            .try_index_device((.., .., 1..8, ..), stream)
+            .unwrap();
+        let values = Array::from_slice(&v, &[2, 2, 11, 5])
+            .try_index_device((.., .., 1..8, ..), stream)
+            .unwrap();
+        let output = super::attention_with_softcap(
+            &Array::from_slice(&q, &[2, 6, 3, 8]),
+            &keys,
+            &values,
+            0.25,
+            None,
+            None,
+            None,
+            eredu_nn::AttentionArithmetic::InputScores,
+            stream,
+        )
+        .unwrap();
+        assert!(
+            output
+                .all_close(
+                    Array::from_slice(&expected, &[2, 6, 3, 5]),
+                    2e-6,
+                    2e-6,
+                    None,
+                    stream
+                )
+                .unwrap()
+                .item::<bool>(stream),
+            "{device:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
 fn bounded_input_score_attention_matches_pytorch_with_broadcast_noncausal_mask() {
     use safemlx::Dtype;
     let devices = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
@@ -688,7 +774,9 @@ fn prepared_input_score_tiles_share_native_key_value_layout_allocations() {
     };
     let q = tensor(&[1, 8, 128, 64], 0.1);
     let k = tensor(&[1, 2, 1024, 64], 0.3);
-    let v = tensor(&[1, 2, 1024, 64], 0.7);
+    // A wide value bank makes retained RHS layouts dominate score scratch,
+    // even though query heads share the two physical K/V heads.
+    let v = tensor(&[1, 2, 1024, 256], 0.7);
     let measure = |shared: bool| {
         stream.synchronize().unwrap();
         let baseline = memory::active_memory().unwrap();

@@ -449,14 +449,21 @@ fn describe_selected(
                 ] {
                     let mut storage = allocation(
                         name,
-                        bytes(&[batch, query_heads, tile.1, width], scalar)?,
+                        bytes(
+                            &[batch, kv_heads, tile.1, width],
+                            if path == super::attention::AttentionMemoryPath::KeyTiles {
+                                4
+                            } else {
+                                scalar
+                            },
+                        )?,
                         MechanismStorageRole::Scratch,
                         StorageRetention::Evaluation,
                     );
                     // Contiguous no-op and dtype-preserving casts can retain the
                     // borrowed input. We cannot assign fresh backing cold.
                     storage.backing = MechanismBacking::Unknown;
-                    storage.detail = format!("selected {:?} prepared K/V layout; grouped repetition {} and contiguous conversion may alias input", path, query_heads / kv_heads);
+                    storage.detail = format!("selected {path:?} shared physical K/V heads; native layout/dtype conversion may alias input");
                     result.storage.push(storage);
                 }
                 result.missing.push(format!("selected {path:?}: lazy graph retention follows tile evaluation policy; tile count and overlap require lifetime composition"));
