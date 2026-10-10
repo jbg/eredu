@@ -26,6 +26,12 @@ retain audio timestamps and sample offsets. Execution uses recorded time, withou
 real-time pacing. Tool scripts supply responses; this example does not execute tools.
 After EOF, bounded silence supports active tool work, followed by --tail-frames
 live response frames before drain. Explicit session and step bounds remain enforced.
+With the projection-profiling build feature, --projection-profile FILE captures one
+--profile-advance N (default 22) and replays affine projections, attention products
+and immutable cache appends after drain;
+--profile-samples N defaults to 5. --profile-metal PATH exports the replay selected
+by --profile-metal-case N (default 0), with MTL_CAPTURE_ENABLED=1 at process launch.
+Captured-run timings are not ordinary inference measurements.
 See doc/voicechat-validation.md for configuration, pinned sources and validation limits.";
 
 struct Arguments {
@@ -58,6 +64,11 @@ impl Arguments {
                         | "--chunk-samples"
                         | "--tail-frames"
                         | "--max-steps"
+                        | "--projection-profile"
+                        | "--profile-advance"
+                        | "--profile-samples"
+                        | "--profile-metal"
+                        | "--profile-metal-case"
                 ),
                 "unknown option {key}; use --help"
             );
@@ -80,6 +91,21 @@ impl Arguments {
         let output = required("--output")?;
         let events = required("--events")?;
         let script = values.remove("--script").map(PathBuf::from);
+        let profile_options_requested = [
+            "--profile-advance",
+            "--profile-samples",
+            "--profile-metal",
+            "--profile-metal-case",
+        ]
+        .iter()
+        .any(|key| values.contains_key(*key));
+        let profile_metal_case_requested = values.contains_key("--profile-metal-case");
+        let profile_output = values.remove("--projection-profile").map(PathBuf::from);
+        let profile_metal = values.remove("--profile-metal").map(PathBuf::from);
+        ensure!(
+            !profile_metal_case_requested || profile_metal.is_some(),
+            "--profile-metal-case requires --profile-metal"
+        );
         let mut number = |name: &str, default: u64| -> Result<u64> {
             match values.remove(name) {
                 None => Ok(default),
@@ -98,6 +124,37 @@ impl Arguments {
         let tail_frames = number("--tail-frames", 200)?;
         let max_steps = number("--max-steps", 100_000)?;
         ensure!(max_steps != 0, "--max-steps must be positive");
+        ensure!(
+            !profile_options_requested || profile_output.is_some(),
+            "profiling options require --projection-profile"
+        );
+        let profile_advance = number("--profile-advance", 22)?;
+        let profile_samples = usize::try_from(number("--profile-samples", 5)?)?;
+        let profile_metal_case = usize::try_from(number("--profile-metal-case", 0)?)?;
+        ensure!(
+            profile_advance > 0 && (1..=1000).contains(&profile_samples),
+            "invalid profiling advance/samples"
+        );
+        ensure!(
+            profile_metal.is_none() || profile_output.is_some(),
+            "--profile-metal requires --projection-profile"
+        );
+        #[cfg(not(feature = "projection-profiling"))]
+        {
+            ensure!(
+                profile_output.is_none(),
+                "--projection-profile requires the projection-profiling build feature"
+            );
+            let _ = (profile_advance, profile_samples, profile_metal_case);
+        }
+        #[cfg(feature = "projection-profiling")]
+        let profile = profile_output.map(|output| run::ProfileOptions {
+            output,
+            advance: profile_advance,
+            samples: profile_samples,
+            metal: profile_metal,
+            metal_case: profile_metal_case,
+        });
         Ok(Some(Self {
             config,
             input,
@@ -108,6 +165,8 @@ impl Arguments {
                 chunk_samples,
                 tail_frames,
                 max_steps,
+                #[cfg(feature = "projection-profiling")]
+                profile,
             },
         }))
     }
@@ -182,6 +241,25 @@ fn main() -> Result<()> {
         output_path != events_path,
         "speech and event paths must differ"
     );
+    #[cfg(feature = "projection-profiling")]
+    if let Some(profile) = &args.run.profile {
+        let profile_path = output_destination(&profile.output)?;
+        ensure!(
+            !profile_path.try_exists()?,
+            "projection profile output already exists"
+        );
+        ensure!(
+            profile_path != output_path && profile_path != events_path,
+            "projection profile path must differ from speech/events"
+        );
+        ensure!(
+            profile.advance <= args.run.max_steps,
+            "profile advance exceeds --max-steps"
+        );
+        if let Some(path) = &profile.metal {
+            ensure!(!path.try_exists()?, "Metal capture already exists");
+        }
+    }
     let mut session = load::load(&config)?;
     let mut speech = WavWriter::new(BufWriter::new(create_output(&output_path)?), 22_050)?;
     let mut events = BufWriter::new(create_output(&events_path)?);

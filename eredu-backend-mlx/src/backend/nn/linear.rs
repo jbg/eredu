@@ -371,7 +371,7 @@ impl PhysicalLinear {
             )?
             .linear(input, true, stream)?
         } else if let Some(scales) = self.scales.as_ref() {
-            quantized_matmul_with_mode(
+            let output = quantized_matmul_with_mode(
                 input,
                 self.weight.as_ref(),
                 scales,
@@ -381,7 +381,21 @@ impl PhysicalLinear {
                 self.bits,
                 self.mode,
                 stream,
-            )?
+            )?;
+            #[cfg(feature = "projection-profiling")]
+            super::projection_profile::affine::record(
+                input,
+                self.weight.as_ref(),
+                scales,
+                self.biases.as_ref().as_ref(),
+                &output,
+                self.group_size,
+                self.bits,
+                self.mode,
+                "linear",
+                stream,
+            );
+            output
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
             super::fp8::linear_with_input_observer(
                 input,

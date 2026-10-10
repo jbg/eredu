@@ -27,6 +27,13 @@ fn cpu_timing_is_positive_and_stable() {
     assert!(first > Duration::ZERO);
     assert_eq!(first, second);
     assert_eq!(timed.try_elapsed().unwrap(), Some(first));
+    let summary = timed.summary().unwrap();
+    assert_eq!(summary.sum, first);
+    assert_eq!(summary.occupied, first);
+    assert_eq!(summary.span, first);
+    assert_eq!(summary.interval_count, 1);
+    assert_eq!(summary.missing_timestamps, 0);
+    assert_eq!(summary, timed.summary().unwrap());
 }
 
 #[test]
@@ -129,6 +136,12 @@ fn empty_and_completed_evaluations_are_zero_duration() {
     let empty = async_eval_timed(std::iter::empty(), &stream).unwrap();
     assert_eq!(empty.try_elapsed().unwrap(), Some(Duration::ZERO));
     assert_eq!(empty.elapsed().unwrap(), Duration::ZERO);
+    let stats = empty.summary().unwrap();
+    assert_eq!(stats.sum, Duration::ZERO);
+    assert_eq!(stats.occupied, Duration::ZERO);
+    assert_eq!(stats.span, Duration::ZERO);
+    assert_eq!(stats.interval_count, 0);
+    assert_eq!(stats.missing_timestamps, 0);
 
     let available = Array::from_slice(&[1.0f32, 2.0], &[2]);
     let completed = async_eval_timed([&available], &stream).unwrap();
@@ -214,4 +227,34 @@ fn metal_rejects_cross_device_timing_stream() {
     let error = async_eval_timed([&output], &gpu).unwrap_err();
     assert!(error.what().contains("Requested Stream(Device(gpu, 0)"));
     assert!(error.what().contains("rooted on Stream(Device(cpu, 0)"));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "explicit Metal interval summary; run outside the sandbox"]
+fn metal_interval_summary_covers_multiple_buffers_and_is_stable() {
+    let stream = stream(DeviceType::Gpu);
+    // More than the native operation trigger; independent branches allow
+    // overlapping buffer intervals without assuming the driver overlaps them.
+    let weights = Array::ones::<f32>(&[1024, 1024], &stream).unwrap();
+    safemlx::transforms::eval([&weights]).unwrap();
+    let outputs = (0..128)
+        .map(|i| {
+            let input = Array::from_slice(&vec![1f32 + i as f32 / 128.; 1024], &[1, 1024]);
+            input.matmul(&weights, &stream).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let start = Instant::now();
+    let timed = async_eval_timed(outputs.iter(), &stream).unwrap();
+    let stats = timed.summary().unwrap();
+    assert_eq!(stats.sum, timed.elapsed().unwrap());
+    assert!(stats.interval_count > 1);
+    assert_eq!(stats.missing_timestamps, 0);
+    assert!(stats.occupied > Duration::ZERO);
+    assert!(stats.occupied <= stats.sum);
+    assert!(stats.occupied <= stats.span);
+    assert!(stats.span <= start.elapsed());
+    assert_eq!(stats, timed.summary().unwrap());
+    let actual = outputs.last().unwrap().clone().into_evaluated().unwrap();
+    assert_eq!(actual.as_slice::<f32>()[0], (1. + 127. / 128.) * 1024.);
 }

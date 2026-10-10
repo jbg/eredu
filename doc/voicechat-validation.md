@@ -1112,6 +1112,337 @@ publication parity also passes. Reproduction scripts, complete outputs, source
 patches, binary hashes and restoration manifests reside in
 `/private/tmp/eredu-parallel-softmax`, including `REPORT.md` and `comparison.json`.
 
+### Additional MoG and perception Q8 selections
+
+The 2026-10-10 M3 Ultra experiment uses the same pinned checkpoint, accepted
+Q8/mixed-precision recipe, prepared cache and batching policy as the cooperative
+softmax comparison. Separate selections pack nine MoG trunk gate/up/down
+matrices and 96 perception feed-forward matrices as affine Q8/group-64 with F32
+companions. The accepted config selects F16 speech weights and compute; the
+causal-TTS benchmark override selects F32 compute separately. MoG/perception
+retain F16 projection input preparation and F32 component boundaries,
+normalization, recurrent/residual accumulation, state and sensitive math. F32
+companions promote packed matmul execution back to F32, so this comparison
+changes effective projection execution/output precision as well as storage.
+
+Six sequential unprofiled conversations execute 996 live frames each, with
+986 measured intervals excluding the first ten, loading, prefill and drain.
+Both prepared-cache repeats report zero quantization source tiles/read bytes.
+
+| Selection | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control before | 68.623 ms | 71.898 ms | 72.205 ms | 73.888 ms | 0 / 986 |
+| Control after | 68.626 ms | 71.841 ms | 72.132 ms | 72.337 ms | 0 / 986 |
+| MoG Q8, first | 82.673 ms | 86.120 ms | 86.405 ms | 87.313 ms | 887 / 986 |
+| MoG Q8, cache repeat | 82.444 ms | 86.058 ms | 86.516 ms | 86.785 ms | 857 / 986 |
+| Perception Q8, first | 100.858 ms | 104.168 ms | 104.678 ms | 107.443 ms | 986 / 986 |
+| Perception Q8, cache repeat | 101.067 ms | 104.299 ms | 104.633 ms | 105.290 ms | 986 / 986 |
+
+Against the two-control mean, repeated MoG Q8 adds 13.819 ms/frame and perception
+Q8 adds 32.443 ms. Fenced GPU profiles localize the regressions: MoG prediction
+increases from 4.377 to 16.959 ms/frame and perception from 10.433 to 36.537 ms;
+unchanged regions remain essentially flat. These frontier intervals include
+stalls and profiling fences, so they are not individual shader durations or
+additive wall savings. Neither selection is retained or combined.
+
+Short fenced kernel-selection diagnostics confirm nine F32 affine wide-QMV
+requests per MoG call and 96 F32 affine fast-QMV requests per perception call;
+the corresponding accepted projections use F16 dense GEMM. Diagnostics stop
+after 30 application advances and do not contribute to the complete-conversation
+timing or quality tables. Kernel names establish dispatch, not individual shader
+durations or a decomposition of dequantization, occupancy and memory costs.
+
+Selected weight storage falls 43.75% including F32 companions, saving
+41,803,776 bytes for MoG and 352,321,536 for perception. Whole-process peak
+footprints are 22.412–22.415 GiB for controls, 22.392–22.393 GiB for MoG and
+22.034–22.038 GiB for perception. All runs match 3,818 semantic events after
+excluding wall clocks. Controls and perception match accepted WAV bytes exactly;
+MoG changes the waveform reproducibly, with finite, in-range samples. These
+comparisons do not establish broad perceptual or transcription quality.
+
+Portable architecture declarations select recipes and exact parameter formats;
+generic backend materialization uses the existing bounded quantizer and prepared
+cache. All temporary benchmark source changes are restored byte-for-byte. No
+production framework or feature flag is retained. Full outputs, profiles,
+quality comparisons, source patches, hashes, restoration manifests and
+reproduction scripts reside in `/private/tmp/eredu-remaining-q8`, including
+`REPORT.md` and `comparison.json`.
+
+### Narrow execution of existing Q8 backbone projections
+
+The 2026-10-10 resident M3 Ultra experiment retains the accepted Q8/group-64
+backbone packing and selects F16 projection inputs plus F16 affine scales/biases
+for either 27 Mamba input matrices or 50 dense-MLP up/down matrices. Projection
+outputs return to F32 before convolution/recurrence, ReLU-square activation,
+normalization, residual accumulation and persistent state. Unselected execution
+and the accepted speech precision/cache/batching policies remain unchanged.
+
+Seven sequential unprofiled conversations execute 996 live frames each, with
+986 measured intervals excluding the first ten, loading, prefill and drain.
+
+| Selection | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control before | 68.300 ms | 71.911 ms | 72.222 ms | 72.488 ms | 0 / 986 |
+| Mamba input F16, first | 68.527 ms | 71.747 ms | 72.035 ms | 72.449 ms | 0 / 986 |
+| Dense MLP F16, first | 68.659 ms | 71.899 ms | 72.183 ms | 72.443 ms | 0 / 986 |
+| Control after | 68.616 ms | 71.910 ms | 72.228 ms | 72.437 ms | 0 / 986 |
+| Mamba input F16, cache repeat | 68.405 ms | 71.680 ms | 71.975 ms | 72.527 ms | 0 / 986 |
+| Dense MLP F16, cache repeat | 68.712 ms | 72.085 ms | 72.387 ms | 73.222 ms | 0 / 986 |
+| Final control | 68.707 ms | 72.114 ms | 72.528 ms | 72.960 ms | 0 / 986 |
+
+Controls average 68.541 ms, with a 0.407 ms spread. Mamba-input candidates average
+68.466 ms and MLP candidates 68.686 ms: changes of -0.075 and +0.144 ms versus
+controls. These differences do not establish a meaningful mean-latency gain.
+Neither selection is retained or combined; BF16 is not evaluated.
+
+Native affine QMV uses F32 products and accumulation even with narrow
+inputs/companions. Narrow API dtype does not supply half-precision matrix
+acceleration. Selected companion storage saves 171,279,360 bytes for Mamba inputs
+or 219,520,000 bytes for MLPs from the 10,005,583,872-byte accepted backbone
+binding. Q8 primary traffic remains unchanged and projection casts add work;
+individual shader costs are not measured. Cache repeats report zero preparation
+source tiles/read bytes. First preparation obeys the 64 MiB working-set bound
+with two in-flight tiles, and is excluded from frame statistics.
+
+Two short fenced dispatch diagnostics confirm 27 or 50 F16 Q8 kernel requests
+per backbone call for the respective selections, across ten measured calls each.
+They stop after 30 application advances and are excluded from full-conversation
+timing/quality tables. Request names verify narrow dispatch; they do not measure
+shader durations.
+
+All seven runs match all 3,818 accepted semantic events after excluding wall
+clocks and the full accepted WAV bytes exactly. This fixture parity does not
+establish hidden-tensor identity or broad language/tool quality. The release
+benchmark build passes and all temporary source edits are restored byte-for-byte.
+Portable declarations select precision and companion identities; generic native
+materialization consumes them through the existing bounded prepared cache. No
+production policy, framework or benchmark flag is retained. Source patches,
+hashes, restoration manifests, full outputs and reproduction scripts reside in
+`/private/tmp/eredu-backbone-narrow`, including `REPORT.md` and `comparison.json`.
+
+### Tail-capable fast Q8 matvec
+
+The 2026-10-10 M3 Ultra resident comparison uses the accepted Q8/group-64
+backbone/head/causal-TTS recipe, F16 speech/perception execution and existing
+cache/batching policies. A generic MLX backend prototype implements eight values
+per lane, four output rows per SIMD group and guarded 256-value blocks for widths
+that miss native fast-QMV alignment. It does not pad weights or expand caches.
+Family construction and state/completion policy remain unchanged.
+
+Four sequential unprofiled conversations execute 996 live frames each, with
+986 warmed intervals excluding the first ten, loading, prefill and drain.
+
+| Selection | Mean frame (ms) | p95 (ms) | p99 (ms) | Maximum (ms) | Frames above 80 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control before | 68.680 | 71.967 | 72.261 | 73.833 | 0 / 986 |
+| Tail kernel, first | 68.498 | 71.776 | 72.060 | 72.313 | 0 / 986 |
+| Tail kernel, repeat | 68.546 | 71.797 | 72.098 | 72.350 | 0 / 986 |
+| Control after | 68.720 | 72.165 | 72.690 | 72.919 | 0 / 986 |
+
+Controls average 68.700 ms and candidates 68.522 ms: a 0.178 ms/frame (0.259%)
+observed reduction. Mean headroom against 80 ms grows from 11.300 to 11.478 ms.
+This small difference does not establish a worthwhile production gain; ordinary
+native QMV remains selected. The result does not evaluate every possible tail
+kernel or a physical zero-padding strategy.
+
+A focused GPU fixture with strided, nonzero inputs checks widths 2112, 4352,
+4480 and 15680. Outputs match native zero-padded fast Q8 bit-for-bit and independent
+F64 dequantized dot products within `5e-5 * (1 + abs(reference))`. Different
+reduction grouping permits F32 rounding differences in other inputs.
+
+Short fenced diagnostics confirm replacement of all 89 generic backbone Q8
+requests, including 27 Mamba-input and 50 dense-MLP projections; 31 existing fast
+requests remain. Both output heads select the prototype. Across 20 measured warm
+frames, fenced backbone GPU time is 24.504 versus 24.083 ms. These coarse intervals
+include profiling fences/frontier work and do not establish shader durations or
+additive wall savings.
+
+All four conversations match the 3,818 accepted semantic events after excluding
+wall clocks and accepted WAV bytes exactly. This fixture does not establish
+hidden-tensor identity or broad quality. The focused native test and release
+benchmark build pass; all temporary edits are restored byte-for-byte. No custom
+kernel, production framework or selector flag is retained. Source patches, hashes,
+restoration manifests, full outputs and reproduction scripts reside in
+`/private/tmp/eredu-q8-fast-tail`, including `REPORT.md` and `comparison.json`.
+
+### Captured affine projection replay
+
+The 2026-10-10 M3 Ultra diagnostic uses the same accepted Q8/group-64 and speech
+precision/cache/batching recipe. A profiling-enabled WAV run captures advance 22
+with limits of 2,048 invocations and 32 GiB of conservative operand payload, then
+replays after drain. It retains 318 affine invocations across 11 native layout
+classes, preserving distinct real parameter identities for rotating-weight replay.
+This diagnostic changes graph retention and synchronization; its conversation
+latency and memory are not ordinary performance measurements.
+
+One timing process uses five warm samples after a separate first sample and an
+unreported warmup. A separate selection process verifies the same class geometry
+and native pipeline requests; selection-run times are excluded. Native replay
+matches all captured output bits. Zero-padded fast-Q8 replay reports finite outputs
+and maximum scaled error about `7.55e-6`; these are projection comparisons rather
+than full-model padded-execution parity.
+
+| Class | Invocations | Rotating buffer-duration sum ms/projection | Rotating wall ms/projection | Invocation-weighted wall ms | Padded rotating wall change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mamba input, 22656 × 4480 | 27 | 0.256 | 0.157 | 4.228 | +1.08% |
+| MLP up, 15680 × 4480 | 25 | 0.199 | 0.113 | 2.832 | +0.98% |
+| MLP down, 4480 × 15680 | 25 | 0.196 | 0.114 | 2.860 | -0.56% |
+
+Negative change means faster. Wall time includes graph construction and completion.
+These weighted wall values rank investigation candidates; they are not additive
+whole-model attribution. Native Metal timing sums command-buffer intervals that
+can overlap and include waits; the sum can exceed wall time and is not elapsed GPU
+execution time. Batching changes can reduce the sum without reducing wall time. Repeating one matrix
+shows apparent native fast-path gains of roughly 35–47% for these classes, which
+vanish on rotation through the actual weights. Cache/working-set effects are a
+strong candidate explanation, but resource batching also changes. Nominal parameter
+payload/time is not measured DRAM bandwidth or evidence of hardware saturation.
+
+The full captured conversation matches all 3,818 accepted semantic events excluding
+wall clocks and the accepted WAV bytes exactly. Focused native fixtures cover
+bounded capture cancellation/overflow, distinct-weight rotation, strided nonzero
+inputs with an independent F64 oracle, and padded replay. A small Metal export
+fixture covers timing interoperability, nesting rejection, existing-path protection,
+explicit finish and drop retry. Released-weight Metal export is not part of these
+control runs. CPU profiling compilation, the profiling-enabled WAV compiler check
+and five portable WAV-driver behavior tests pass. The report tool rejects incomplete
+selection markers before publishing a summary.
+
+The nondefault `projection-profiling` feature owns native collection/replay and
+optional Metal export; the application selects capture advancement and output.
+Temporary benchmark recipe edits restore byte-for-byte. Source, recipe patches,
+binary hashes, full outputs, dispatch evidence, native capability probe and commands
+reside in `/private/tmp/eredu-gpu-profile`, including `REPORT.md`,
+`released-profile.json`, `verified-summary.json` and `released-quality.json`.
+See [affine diagnostics](projection-baseline.md#affine-projection-diagnostics)
+for the current API, controls and measurement limits.
+
+### Generic Q8 split-K validation
+
+The 2026-10-10 M3 Ultra experiment uses the same accepted Q8/group-64,
+F16 speech/perception and F32-sensitive arithmetic recipe, pinned checkpoint,
+seed-zero input and warmed prepared cache as the affine replay above. The generic
+backend prototype partitions the input dimension into 2/4/8/16 group-aligned
+ranges, writes F32 partial vectors and reduces them in a second GPU kernel.
+It reuses packed weights without padding or conversion. Final graph roots retain
+partial storage; there is no intermediate host readback or completion boundary.
+Independent F64 fixtures with strided inputs and nonzero affine companions cover
+five widths and four partition counts; all 20 cases pass at
+`5e-5 * (1 + abs(reference))` tolerance. Split-K changes F32 reduction order.
+
+Two real-operand captures replay the 318 invocations at advance 22 with ten warm
+samples per phase. Summed command-buffer durations appear to improve 32–47% for
+some classes, but their intervals overlap/include waits and exceed elapsed wall
+time. They are not elapsed GPU execution time. For MLP down, native replay records
+approximately 0.194 ms/projection from those intervals versus 0.114 ms total wall;
+two-partition replay records 0.103 ms from intervals versus 0.122 ms total wall.
+Across both captures, rotating-weight wall time increases approximately 9–10%
+for Mamba output and 7% for MLP down. Graph construction grows from approximately
+0.2 µs to 7 µs per projection. Extra partial storage and a reduction launch do not
+reduce packed-weight traffic. These results do not establish hardware saturation.
+The report ranks wall time and flags native timing sums exceeding it.
+
+Ordinary full conversations use one binary with the selector disabled for the two
+bracketing controls. The long-K selector uses `K >= 8192` and
+`4096 <= N <= 16384`, covering 52 projections per backbone frame. The broader
+selector uses `K >= 4096` and the same output range, covering 85. Both use two
+partitions; unsupported geometry and multi-vector prefill retain native dispatch.
+There are 996 live 80 ms frames; the warm statistics exclude the first ten,
+loading, prefill and drain.
+
+| Run | Warm mean ms/frame | Headroom ms | p99 ms | Warm deadline misses |
+| --- | ---: | ---: | ---: | ---: |
+| Control before | 68.598 | 11.402 | 72.108 | 0 |
+| Long K | 69.219 | 10.781 | 72.777 | 0 |
+| Mid and long K | 69.452 | 10.548 | 73.283 | 0 |
+| Control after | 68.886 | 11.114 | 72.970 | 0 |
+
+The control mean is 68.742 ms/frame with 11.258 ms headroom. Candidates cost
+0.477 and 0.710 ms/frame relative to that mean. Controls differ by 0.289 ms,
+so the exact regression magnitude is noisy; neither candidate beats either
+control. All four outputs match the accepted WAV bytes and 3,818 semantic events
+excluding wall clocks exactly. This fixture is not a broad quality evaluation.
+A separate 24-chunk selection trace verifies 1,020 partial-kernel requests and
+1,020 reduction requests across twelve backbone frames, exactly 85 each per frame.
+Selection-run timings are excluded from the ordinary controls.
+
+No split-K kernel or selector is retained. Temporary sources restore byte-for-byte.
+Numerical fixtures, replay/full-conversation binaries, source/recipe patches,
+hashes, restoration manifests, dispatch counts, complete outputs and reproducible
+scripts reside in `/private/tmp/eredu-q8-split-k`, including `REPORT.md` and
+`comparison.json`. Native timer documentation and affine diagnostics describe
+buffer-duration sums separately from elapsed wall time.
+
+### History-dependent attention/cache profiling
+
+The accepted Q8 backbone/function/causal-TTS, F32 causal execution and F16 speech
+configuration on the M3 Ultra has two ordinary 79.68-second conversation controls
+at **68.624 and 68.636 ms/frame**, excluding the first ten live intervals
+(986 warm intervals each). Their mean is **68.630 ms/frame**, with
+**11.370 ms headroom** against the 80 ms cadence and no warm deadline
+misses. Both controls and both operand-capture conversations reproduce all
+1,756,952 speech samples and 3,818 semantic events exactly against the accepted
+reference, excluding wall clocks. Controls average 65.895 ms at frames 50–150
+and 71.675 ms at frames 850–950: **5.780 ms history growth**.
+
+Bounded captures at application advances 200 and 1,000 execute live frames 100
+and 804. All 28 causal attention layers have two guidance rows, 16 heads, width
+72 and F32 operands; history lengths are 137 and 841. Each operation replay
+retains all actual layer operands and checks exact output bits. Ten warm samples
+follow one reported first sample and one unreported warmup. Median times are:
+
+| Isolated native operation | Early wall ms | Late wall ms | Early interval union ms | Late interval union ms | Early span ms | Late span ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| K append (28 calls) | 1.023 | 4.044 | 0.084 | 0.670 | 0.355 | 1.955 |
+| V append (28 calls) | 1.006 | 4.066 | 0.082 | 0.669 | 0.362 | 1.954 |
+| QK product (28 calls) | 0.371 | 0.597 | 0.056 | 0.276 | 0.056 | 0.276 |
+| PV product (28 calls) | 0.325 | 0.603 | 0.038 | 0.293 | 0.038 | 0.293 |
+
+K/V append replay wall time totals **2.029 → 8.110 ms**, versus **0.696 → 1.200 ms**
+for the two attention products. The late K/V append logical input/output payload
+is **828 MiB**, versus **420 MiB** for the products. These are logical work estimates,
+not measured DRAM traffic. Capture retains additional roots and can inhibit donation;
+independent replay changes allocation, cache reuse and overlap. Summing these classes
+does not attribute ordinary frame time or promise an 8.110 ms end-to-end saving.
+All operation samples report zero missing GPU timestamps. The sum/union/span
+statistics distinguish overlapping buffer intervals and their gaps; each can retain
+buffer waits and none measures individual shader compute time.
+
+Separate six-second post-load Metal System Trace/Time Profiler captures share
+30 complete early live frames (126–155) and 29 complete late frames (884–912).
+Direct frame-publication Unix timestamps align the trace epoch. Neither trace
+adds per-operator evaluation fences. Trace instrumentation perturbs execution:
+
+| Trace observation (ms/frame unless specified) | Early | Late |
+| --- | ---: | ---: |
+| Frame wall time | 69.854 | 74.918 |
+| Scheduled Compute interval union | 56.729 | 60.333 |
+| Wall time outside Compute interval union | 13.125 | 14.586 |
+| Distinct Metal command buffers/frame | 229.633 | 229.000 |
+| Sampled CPU graph evaluation (inclusive) | 24.400 | 25.586 |
+| Sampled CPU Metal encoding (inclusive) | 14.433 | 14.276 |
+| Sampled CPU progress (inclusive) | 1.133 | 1.172 |
+
+Trace wall growth is **5.064 ms**: **3.603 ms** more scheduled Compute activity and
+**1.461 ms** more wall time outside that interval union. Compute intervals are
+scheduled GPU activity, not individual shader durations or occupancy counters.
+CPU stack categories overlap; their inclusive weights are not additive savings.
+The stable buffer count and progress samples favor history-dependent memory/work
+rather than increasing submission count. Sampled allocator stacks are about
+2.9 ms/frame in both windows; the trace does not establish allocation alone as
+the source of the history penalty.
+
+Artifacts and reproducible scripts are under
+`/private/tmp/eredu-attention-critical/`: `REPORT.md`, `benchmark.patch`,
+`benchmark-source/`, `voicechat_wav`, profiles/replay summaries, ordinary controls,
+`early.trace`, `late.trace`, direct clock logs and exported CPU/GPU records.
+The binary SHA-256 is
+`9495604c4db25a2db319854f65d880d720bbae693662fa8ee3dde8d304249ebb`.
+All temporary benchmark source changes restore byte-for-byte. The interval-union
+fixtures, safe CPU timing tests, multi-buffer Metal timing test, bounded collector
+fixture and CPU-only profiling feature check pass. CUDA timing summary is implemented
+but has no native CUDA validation on this Mac.
+
 ### Released-checkpoint tool round trip
 
 The tool-round-trip measurement dated 2026-10-05 uses the resident Metal WAV

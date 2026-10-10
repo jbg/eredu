@@ -182,7 +182,7 @@ impl QuantizedEmbedding {
             .value
             .as_ref()
             .ok_or_else(|| Exception::custom("quantized embedding has no scale parameter"))?;
-        quantized_matmul_with_mode(
+        let output = quantized_matmul_with_mode(
             x.as_ref(),
             &self.inner.weight,
             scales,
@@ -192,7 +192,21 @@ impl QuantizedEmbedding {
             self.bits,
             self.mode,
             stream,
-        )
+        )?;
+        #[cfg(feature = "projection-profiling")]
+        crate::backend::nn::projection_profile::affine::record(
+            x.as_ref(),
+            &self.inner.weight,
+            scales,
+            self.biases.value.as_ref(),
+            &output,
+            self.group_size,
+            self.bits,
+            self.mode,
+            "tied_embedding",
+            stream,
+        );
+        Ok(output)
     }
 }
 

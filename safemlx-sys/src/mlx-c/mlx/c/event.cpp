@@ -139,3 +139,14 @@ extern "C" int mlx_event_try_elapsed(
   }
   return 0;
 }
+
+extern "C" int mlx_event_timing_summary(double* sum, double* occupied, double* span,
+    uint64_t* intervals, uint64_t* missing, mlx_event event) {
+  try {
+    const auto result = mlx_event_get_(event).timing_summary();
+    *sum = result[0]; *occupied = result[1]; *span = result[2];
+    *intervals = static_cast<uint64_t>(result[3]);
+    *missing = static_cast<uint64_t>(result[4]);
+  } catch (std::exception& e) { mlx_error(e.what()); return 1; }
+  return 0;
+}

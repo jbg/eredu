@@ -41,3 +41,69 @@ pub fn set_metallib_path(path: impl AsRef<Path>) -> Result<()> {
     let path = CString::new(path).map_err(|error| Exception::custom(error.to_string()))?;
     check_status(unsafe { safemlx_sys::mlx_metal_set_metallib_path(path.as_ptr()) })
 }
+
+static CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Process-wide Metal capture to a `.gputrace` destination. This is diagnostic
+/// instrumentation, not an ordinary timing mode. Set `MTL_CAPTURE_ENABLED=1`
+/// before starting the process. Settle pre-existing work before beginning and
+/// complete captured work before finishing; this guard does not synchronize streams.
+/// The guard is thread-affine and prevents overlapping captures through this API.
+#[derive(Debug)]
+pub struct Capture {
+    active: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Capture {
+    /// Begin export; rejects invalid paths and capture nesting before calling Metal.
+    pub fn begin(path: impl AsRef<Path>) -> Result<Self> {
+        use std::sync::atomic::Ordering;
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(Exception::custom(
+                "Metal capture destination already exists",
+            ));
+        }
+        let path = path
+            .to_str()
+            .ok_or_else(|| Exception::custom("Metal capture path is not valid UTF-8"))?;
+        let path = CString::new(path).map_err(|error| Exception::custom(error.to_string()))?;
+        CAPTURE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Exception::custom("Metal capture is already active or cleanup failed"))?;
+        let _guard = crate::utils::runtime_lock::enter();
+        error::ensure_mlx_error_handler();
+        // SAFETY: the NUL-terminated path remains alive throughout this synchronous call.
+        if let Err(error) =
+            check_status(unsafe { safemlx_sys::mlx_metal_start_capture(path.as_ptr()) })
+        {
+            CAPTURE_ACTIVE.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(Self {
+            active: true,
+            _thread: std::marker::PhantomData,
+        })
+    }
+    /// Stop export explicitly so errors are observable. Drop also attempts cleanup.
+    pub fn finish(mut self) -> Result<()> {
+        self.stop()
+    }
+    fn stop(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let _guard = crate::utils::runtime_lock::enter();
+        error::ensure_mlx_error_handler();
+        // SAFETY: this guard exclusively owns the capture through this wrapper.
+        check_status(unsafe { safemlx_sys::mlx_metal_stop_capture() })?;
+        self.active = false;
+        CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}

@@ -4954,3 +4954,8 @@ unsafe extern "C" {
         stream: mlx_stream,
     ) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn mlx_event_timing_summary(sum: *mut f64, occupied: *mut f64, span: *mut f64,
+        intervals: *mut u64, missing: *mut u64, event: mlx_event) -> ::std::os::raw::c_int;
+}

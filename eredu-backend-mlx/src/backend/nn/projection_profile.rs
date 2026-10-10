@@ -376,3 +376,31 @@ mod tests {
             .is_empty());
     }
 }
+
+/// Bounded affine capture and fixed/rotating-weight replay.
+pub mod affine;
+
+/// Process-wide Metal diagnostic export. Capture timings are perturbed.
+#[cfg(feature = "metal")]
+pub use safemlx::metal::Capture as GpuCapture;
+
+/// Metal export is unavailable without the native Metal build feature.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug)]
+pub struct GpuCapture(());
+#[cfg(not(feature = "metal"))]
+impl GpuCapture {
+    /// Returns an explicit unavailable result without initializing a GPU.
+    pub fn begin(_path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        Err(Exception::custom(
+            "GPU capture requires the Metal build feature",
+        ))
+    }
+    /// Finishes an owned export; no exports can be constructed in this build.
+    pub fn finish(self) -> Result<(), Exception> {
+        Ok(())
+    }
+}
+
+/// Native attention-product and immutable cache-append diagnostics.
+pub mod operations;

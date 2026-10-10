@@ -4,6 +4,7 @@
 #define MLX_EVENT_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "mlx/c/device.h"
 #include "mlx/c/stream.h"
@@ -75,18 +76,28 @@ int mlx_event_get_backend(mlx_event_backend* backend, mlx_event event);
 int mlx_event_has_timing(bool* has_timing, mlx_event event);
 
 /**
- * Resolve elapsed execution-timeline seconds, blocking until completion.
+ * Resolve native timing seconds, blocking until completion. Metal sums
+ * potentially overlapping command-buffer intervals, including buffer waits;
+ * CPU/CUDA use marker intervals. This is not individual shader compute time.
  * Repeated calls return the same cached value and retained async errors.
  */
 int mlx_event_elapsed(double* seconds, mlx_event event);
 
 /**
- * Query elapsed execution-timeline seconds without blocking.
+ * Query the native timing value without blocking.
  *
  * Sets `ready` false while work is outstanding. When ready, `seconds` receives
  * the same stable value as `mlx_event_elapsed`.
  */
 int mlx_event_try_elapsed(double* seconds, bool* ready, mlx_event event);
+
+/** Resolve sum/union/span seconds, valid interval and missing timestamp counts.
+ * Blocks for completion and retains ordinary asynchronous failure reporting.
+ * Metal intervals may overlap/include waits; CUDA/CPU report one marker interval.
+ * Empty or already available evaluations report zeros and zero intervals.
+ */
+int mlx_event_timing_summary(double* sum, double* occupied, double* span,
+    uint64_t* intervals, uint64_t* missing, mlx_event event);
 
 /**@}*/
 

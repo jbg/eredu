@@ -43,11 +43,19 @@ pub struct ScriptedToolResponse {
     pub generic: Vec<String>,
 }
 
-#[derive(Clone, Copy)]
+#[cfg(feature = "projection-profiling")]
+#[path = "profiling.rs"]
+mod profiling;
+#[cfg(feature = "projection-profiling")]
+pub use profiling::Options as ProfileOptions;
+
+#[derive(Clone)]
 pub struct RunOptions {
     pub chunk_samples: usize,
     pub tail_frames: u64,
     pub max_steps: u64,
+    #[cfg(feature = "projection-profiling")]
+    pub profile: Option<ProfileOptions>,
 }
 
 /// Streams bounded host chunks; neither the WAV nor generated speech is retained
@@ -201,6 +209,12 @@ fn drive<S: Session>(
         "chunk samples must be in 1..=1048576"
     );
     ensure!(options.max_steps > 0, "max steps must be positive");
+    #[cfg(feature = "projection-profiling")]
+    let mut profile = options
+        .profile
+        .clone()
+        .map(profiling::Profiler::new)
+        .transpose()?;
     let mut scripts = validated_scripts(scripts)?;
     let mut buffer = vec![0.0; options.chunk_samples];
     let (mut filled, mut consumed) = (0, 0);
@@ -401,7 +415,15 @@ fn drive<S: Session>(
                 options.max_steps
             );
             steps += 1;
+            #[cfg(feature = "projection-profiling")]
+            if let Some(profile) = &mut profile {
+                profile.before(steps)?;
+            }
             let progress = session.advance(at)?;
+            #[cfg(feature = "projection-profiling")]
+            if let Some(profile) = &mut profile {
+                profile.after(steps)?;
+            }
             if matches!(
                 progress.status,
                 VoiceChatSessionStatus::Blocked(
@@ -413,7 +435,13 @@ fn drive<S: Session>(
         }
     })();
     match outcome {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(feature = "projection-profiling")]
+            if let Some(profile) = profile {
+                profile.finish()?;
+            }
+            Ok(())
+        }
         Err(error) => match session.cancel(at) {
             Ok(()) => Err(error),
             Err(cancel) => Err(error.context(format!(
@@ -851,6 +879,8 @@ mod tests {
                     chunk_samples,
                     tail_frames: 1,
                     max_steps: 100,
+                    #[cfg(feature = "projection-profiling")]
+                    profile: None,
                 },
                 vec![],
             )
@@ -1019,6 +1049,8 @@ mod tests {
                     chunk_samples: 4_096,
                     tail_frames: 1,
                     max_steps: 100,
+                    #[cfg(feature = "projection-profiling")]
+                    profile: None,
                 },
                 vec![ScriptedToolResponse {
                     call_index: 0,
@@ -1095,6 +1127,8 @@ mod tests {
                 chunk_samples: INPUT_FRAME_SAMPLES,
                 tail_frames: 2,
                 max_steps: 100,
+                #[cfg(feature = "projection-profiling")]
+                profile: None,
             },
             vec![ScriptedToolResponse {
                 call_index: 0,
@@ -1154,6 +1188,8 @@ mod tests {
                 chunk_samples: 1_280,
                 tail_frames: 0,
                 max_steps: 3,
+                #[cfg(feature = "projection-profiling")]
+                profile: None,
             },
             Vec::new(),
         )

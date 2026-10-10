@@ -128,3 +128,92 @@ repeated same-build reference/selector measurements, released-checkpoint parity,
 loaded forecast evidence and hardware-validation gaps. Its integration runner
 also exercises controlled and speculative drivers; short projection replays alone
 do not establish those execution-path guarantees.
+
+## Affine projection diagnostics
+
+The same nondefault feature provides `projection_profile::affine::AffineCapture`
+for ordinary physical affine linear projections and tied-embedding readout.
+Admission bounds both invocation count and retained operand payload; aliases are
+charged conservatively on each invocation. Overflow is an explicit finish error.
+Hooks retain immutable array roots without evaluating them, changing dispatch or
+changing session completion ownership. Finish settles roots and groups by native
+stream, input/weight/companion layouts and dtype, quantization and projection site.
+Each class retains the first real input/output for every distinct weight and
+companion identity. Equal shape does not imply equal parameters.
+
+Replay compares repeatedly using one parameter set with rotating through all
+retained parameter sets. Native Q8/group-64 single-vector cases with output width
+divisible by eight and input width missing 512-value alignment also replay native
+zero-padded fast QMV. Padding and its evaluation happen outside timing; reports
+charge the complete padded parameter payload. Native replay must match captured
+output bits. Padded replay reports finite status, exact-bit equality and maximum
+absolute/scaled error, without treating a changed reduction order as exact parity.
+
+Every phase records first and warm samples, graph-build wall time, total wall
+time, native interval sum/union/span, interval count, missing timestamp count,
+projection count and allocator growth. Metal interval sums can overlap and exceed
+wall time; union removes overlap and span includes gaps. All include buffer waits
+and none measures individual shader computation. Payload bytes
+and logical dot-product FLOPs are work estimates, not measured DRAM traffic or
+hardware utilization. Timings across isolated classes are not additive full-model
+attribution. Repeating one weight can benefit from cache reuse; rotating parameters
+reduces that bias but does not reproduce the complete inference schedule.
+
+The WAV application selects one explicit advancement and replays after drain:
+
+```sh
+cargo build --release -p eredu --no-default-features \
+  --features mlx,audio,metal,projection-profiling --example voicechat_wav
+target/release/examples/voicechat_wav --config CONFIG.json --input INPUT.wav \
+  --output SPEECH.wav --events EVENTS.jsonl --projection-profile PROFILE.json \
+  --profile-advance 22 --profile-samples 5
+```
+
+Affine invocation and payload limits in this application are 2,048 and 32 GiB.
+The same advancement also captures generic attention products and immutable cache
+concatenations, bounded separately at 2,048 invocations and 4 GiB.
+`operation_replays` retains each invocation and actual shape/stride/dtype geometry.
+Replays check output bits, report first/warm wall and interval summaries, and charge
+logical input/output payload rather than claiming measured DRAM traffic. Mutable
+capacity-backed appends and alternate prepared attention products are excluded.
+Independent operands can overlap differently from sequential model execution;
+these replays localize history-dependent work without providing additive savings.
+An advancement without affine projections is an error rather than an empty
+successful report. Capture changes retention and introduces an explicit finish
+synchronization, so the captured conversation's latency/memory are not ordinary
+measurements. Released-checkpoint quantization selection remains the ordinary
+model-loading policy; this tool does not introduce a model-specific quantizer.
+
+Optional `--profile-metal PATH.gputrace` exports the captured class selected by `--profile-metal-case N` (default 0)
+for Xcode Metal inspection. Set `MTL_CAPTURE_ENABLED=1` before process launch.
+`safemlx::metal::Capture` owns the process-wide export and rejects overlapping
+captures; explicit finish reports errors and drop attempts cleanup. Failed cleanup
+retains the reservation. Captured GPU work must complete before finish. Existing
+output files are not overwritten. Metal export further perturbs timings.
+
+The M3 Ultra capability probe exposes the timestamp counter set at compute-stage
+boundaries, with no dispatch-boundary sampling or public bandwidth/occupancy set.
+Consequently completion timers do not claim individual shader duration or actual
+DRAM traffic. Metal capture enables deeper inspection with platform tools rather
+than inventing unavailable counter values. Apple's
+[counter sampling documentation](https://developer.apple.com/documentation/metal/sampling-gpu-data-into-counter-sample-buffers)
+describes the device-dependent sampling boundaries.
+
+`validation/affine_projection_profile.py PROFILE.json --output SUMMARY.json`
+ranks classes by isolated wall time per projection multiplied by observed
+invocations. Wall time includes graph construction and completion. The report
+retains native timing separately, includes union/span/counts when available, and
+flags sums exceeding wall time.
+That estimate is not additive end-to-end attribution. The optional
+`--kernel-log SELECTION.log --selection-profile SELECTION.json` attaches native
+pipeline requests only from matched replay markers and verifies class geometry
+against the independently collected selection profile. Run selection tracing in
+a separate process with `MLX_METAL_LOG_KERNEL_SELECTION=1`, never use those timing
+samples as controls. Missing evidence or incomplete markers are errors.
+
+On Metal, native evaluation timing sums each associated command buffer's
+`GPUEndTime - GPUStartTime`. It does not include idle gaps between buffers and
+can include waits inside a buffer. Buffer intervals can overlap, so their sum can
+exceed elapsed wall time. It is neither elapsed GPU execution time nor a sum of
+individual shader durations. A change in batching can reduce this sum without
+reducing execution time. Full-conversation controls determine optimization gains.

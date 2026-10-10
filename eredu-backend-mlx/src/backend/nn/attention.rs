@@ -479,6 +479,17 @@ fn attention_with_prepared_key_values(
         Some(scores) => scores,
         None => grouped_head_product(&query, &prepared.keys, stream)?,
     };
+    #[cfg(feature = "projection-profiling")]
+    if prepared.key_product.is_none() {
+        super::projection_profile::operations::record(
+            super::projection_profile::operations::Operation::AttentionProduct,
+            "attention_scores",
+            &query,
+            &prepared.keys,
+            &scores,
+            stream,
+        );
+    }
     scores = scores
         .as_dtype(Dtype::Float32, stream)?
         .multiply(Array::from_f32(scale), stream)?
@@ -518,7 +529,7 @@ fn attention_with_prepared_key_values(
     let probabilities = probabilities
         .try_index_device((.., .., .., ..tokens), stream)?
         .as_dtype(queries.dtype(), stream)?;
-    match prepared
+    let output = match prepared
         .value_product
         .as_ref()
         .map(|product| product.apply(&probabilities, stream))
@@ -527,7 +538,19 @@ fn attention_with_prepared_key_values(
     {
         Some(output) => Ok(output),
         None => grouped_head_product(&probabilities, &prepared.values, stream),
+    }?;
+    #[cfg(feature = "projection-profiling")]
+    if prepared.value_product.is_none() {
+        super::projection_profile::operations::record(
+            super::projection_profile::operations::Operation::AttentionProduct,
+            "attention_values",
+            &probabilities,
+            &prepared.values,
+            &output,
+            stream,
+        );
     }
+    Ok(output)
 }
 
 /// Explicit rounding need not materialize the complete Q-by-K score matrix.

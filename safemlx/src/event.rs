@@ -42,6 +42,28 @@ pub struct Event {
     pub(crate) c_event: safemlx_sys::mlx_event,
 }
 
+/// Native timing statistics for one completed evaluation.
+///
+/// Metal sums, merges and spans command-buffer GPU intervals. Union removes
+/// overlap, span includes gaps, and both can include waits/stalls inside buffers.
+/// Neither is individual shader compute time. Only the selected stream's buffers
+/// are measured; dependencies on other streams are not separately attributed.
+/// CUDA and CPU use one marker interval, so all three durations are equal.
+/// Empty/already available evaluations have zero durations and zero intervals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimingSummary {
+    /// Sum of native interval durations, counting overlap repeatedly.
+    pub sum: Duration,
+    /// Duration of the union of all intervals with valid timestamps.
+    pub occupied: Duration,
+    /// Last interval end minus first interval start, including gaps.
+    pub span: Duration,
+    /// Intervals with valid timestamps (command buffers on Metal).
+    pub interval_count: u64,
+    /// Metal buffers without valid GPU timestamps; union/span omit them.
+    pub missing_timestamps: u64,
+}
+
 /// An asynchronously submitted evaluation with execution-timeline timestamps.
 ///
 /// This token owns the ordinary completion [`Event`] and the backend timestamp
@@ -55,8 +77,10 @@ pub struct Event {
 /// unrelated work queued before the start marker. Dependencies on other
 /// streams are honored. Metal sums native command-buffer GPU start/end
 /// intervals and therefore excludes gaps when no measured command buffer is
-/// active; CUDA event and CPU marker intervals include waits and idle gaps
-/// between their markers.
+/// active. Those buffer intervals can overlap and include waits inside a
+/// buffer; their sum can exceed elapsed wall time. It is not elapsed GPU
+/// execution time or a sum of individual shader durations. CUDA event and CPU
+/// marker intervals include waits and idle gaps between their markers.
 ///
 /// Repeated elapsed-time queries return one cached duration. Backend failures
 /// are retained and returned by both completion and timing resolution.
@@ -84,11 +108,13 @@ impl TimedEvaluation {
         self.completion.synchronize()
     }
 
-    /// Return elapsed execution-timeline time, blocking only here if needed.
+    /// Resolve the backend timing value, blocking only here if needed.
     ///
-    /// Metal timestamps have command-buffer accuracy and exclude command-queue
-    /// wait time; CUDA event precision is typically around half a microsecond;
-    /// CPU timing is limited by the platform monotonic clock and scheduler
+    /// Metal sums potentially overlapping command-buffer GPU intervals; waits
+    /// inside those intervals remain included. See the type documentation for
+    /// why that sum can exceed wall time. CUDA event precision is typically
+    /// around half a microsecond; CPU timing is limited by the platform
+    /// monotonic clock and scheduler
     /// dispatch. An empty or already-completed evaluation is defined to take
     /// zero time.
     pub fn elapsed(&self) -> Result<Duration> {
@@ -97,6 +123,36 @@ impl TimedEvaluation {
             safemlx_sys::mlx_event_elapsed(seconds, self.completion.c_event)
         })?;
         duration_from_seconds(seconds)
+    }
+
+    /// Resolve native interval statistics after ordinary completion/error checks.
+    /// This blocks only at this explicit resolution point. Statistics are stable
+    /// across queries. Timing storage grows with the number of submitted buffers;
+    /// ordinary untimed evaluations allocate none of it.
+    pub fn summary(&self) -> Result<TimingSummary> {
+        let _guard = runtime_lock::enter();
+        let (mut sum, mut occupied, mut span) = (0.0, 0.0, 0.0);
+        let (mut intervals, mut missing) = (0, 0);
+        // All out-pointers are initialized, valid for the call, and disjoint.
+        // The completion handle and its retained timing resources remain owned
+        // by self throughout the serialized native call.
+        <() as Guarded>::try_from_op(|_| unsafe {
+            safemlx_sys::mlx_event_timing_summary(
+                &mut sum,
+                &mut occupied,
+                &mut span,
+                &mut intervals,
+                &mut missing,
+                self.completion.c_event,
+            )
+        })?;
+        Ok(TimingSummary {
+            sum: duration_from_seconds(sum)?,
+            occupied: duration_from_seconds(occupied)?,
+            span: duration_from_seconds(span)?,
+            interval_count: intervals,
+            missing_timestamps: missing,
+        })
     }
 
     /// Query elapsed time without blocking the host.

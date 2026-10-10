@@ -9009,6 +9009,43 @@ default and changes no dispatch choice, kernel equation, precision policy or
 completion ownership. All native work continues through `safemlx`; no additional
 unsafe-code exception or public inference error type is required.
 
+Affine projection diagnostics use the same nondefault feature and native-only
+ownership. Their hooks retain immutable operands without evaluating them or
+changing dispatch. Explicit finish settles roots, groups by actual stream/layout
+and quantization, and retains distinct parameters for fixed/rotating-weight
+replay. Admission bounds invocation count and retained operand payload; overflow
+is an error. Isolated native and zero-padded fast-Q8 replays account for padding
+storage and report numerical differences. These evaluation intervals and payload
+estimates are not per-shader duration, DRAM traffic or ordinary full-model metrics.
+
+Application tooling selects capture advancement and replay/output policy. The
+backend supplies generic native collection and replay; it owns no VoiceChat
+configuration or family equations. The safe native wrapper owns process-wide
+Metal export, nesting rejection and cleanup through MLX's existing capture API.
+No new neutral inference capability, unsafe-code exception, native dependency in
+portable crates or public application error parameter is introduced. See
+[projection diagnostics](projection-baseline.md#affine-projection-diagnostics).
+The safe native completion timer reports command-buffer interval sum, union,
+span, valid interval count and missing timestamps. Union removes overlap; span
+includes gaps. Each still includes buffer waits and is not individual shader
+compute time. Metal reserves timestamp slots before handler installation and
+records completed buffers without callback allocation. Summary resolution first
+establishes ordinary completion or reports its failure; it does not release
+submission authority earlier. CPU/CUDA marker intervals report identical sum,
+union and span. Only explicit timed evaluations retain interval records; diagnostic
+tooling bounds their duration. Ranking uses wall time including construction and
+completion, with ordinary conversation controls required for optimization claims.
+
+The same diagnostic feature captures generic attention matrix products and
+immutable cache concatenations with separate invocation/payload bounds. It retains
+every real invocation, groups actual native layouts, and checks replay output bits
+against captured outputs. Mutable capacity-backed appends are excluded rather
+than replaying writes into retained storage. Hooks retain roots without evaluation
+or mechanism changes; explicit finish settles them. Captured and independent
+replay workloads can affect donation, allocation and scheduling, so their timings
+are not additive full-model attribution. Generic native roles carry no family
+geometry or equations; application tooling selects the capture advancement.
+
 ### Speech projection precision
 
 `SpeechPrecision` is an architecture-owned storage and arithmetic policy. The

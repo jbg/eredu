@@ -89,7 +89,8 @@ else()
       mlx-cache-limit-query.patch
       mlx-metal-kernel-selection-trace.patch
       mlx-metal-mixed-storage-gemm.patch
-      mlx-compile-cache-lifetime.patch)
+      mlx-compile-cache-lifetime.patch
+      mlx-timing-summary.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -122,6 +123,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     ${CMAKE_CURRENT_LIST_DIR}/tests/event_submission_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/array_storage_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/timing_summary_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
     ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
@@ -136,7 +138,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*,*timing interval union*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")

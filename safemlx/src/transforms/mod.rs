@@ -121,7 +121,7 @@ pub fn async_eval_with_event<'a>(outputs: impl IntoIterator<Item = &'a Array>) -
     })
 }
 
-/// Submit `outputs` asynchronously and measure their execution timeline.
+/// Submit `outputs` asynchronously and collect backend execution timing.
 ///
 /// Unlike timing Rust graph construction, this function records a timestamp,
 /// submits the selected lazy MLX graph, and records the ending timestamp on
@@ -133,7 +133,9 @@ pub fn async_eval_with_event<'a>(outputs: impl IntoIterator<Item = &'a Array>) -
 /// other streams and are honored without a host wait. Unrelated work queued on
 /// `stream` before the starting marker is excluded. Graphs large enough to use
 /// multiple command buffers remain inside the measured phase; see
-/// [`TimedEvaluation`] for backend-specific treatment of waits and idle gaps.
+/// [`TimedEvaluation`] for backend-specific treatment of waits, idle gaps and
+/// overlapping Metal command-buffer intervals. Metal returns their sum rather
+/// than elapsed GPU execution time.
 ///
 /// Ordinary [`async_eval`] and [`async_eval_with_event`] do not allocate or
 /// record timestamp resources, so timing-disabled execution retains its normal

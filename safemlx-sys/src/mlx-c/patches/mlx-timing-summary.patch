@@ -1,0 +1,254 @@
+diff --git a/mlx/backend/common/timing_intervals.h b/mlx/backend/common/timing_intervals.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/timing_intervals.h
+@@ -0,0 +1,32 @@
++// Completion interval diagnostics for the native timer.
++#pragma once
++#include <algorithm>
++#include <array>
++#include <utility>
++#include <vector>
++
++namespace mlx::core {
++// Sum, union, span, valid interval count, missing timestamp count.
++using TimingSummary = std::array<double, 5>;
++inline TimingSummary summarize_timing_intervals(
++    std::vector<std::pair<double, double>> intervals,
++    double sum, size_t missing) {
++  intervals.erase(std::remove_if(intervals.begin(), intervals.end(),
++      [](const auto& interval) { return interval.first <= 0; }), intervals.end());
++  TimingSummary result{sum, 0, 0, double(intervals.size()), double(missing)};
++  if (intervals.empty()) return result;
++  std::sort(intervals.begin(), intervals.end());
++  double start = intervals.front().first, stop = intervals.front().second;
++  const double first = start;
++  for (size_t i = 1; i < intervals.size(); ++i) {
++    if (intervals[i].first > stop) {
++      result[1] += stop - start;
++      start = intervals[i].first;
++    }
++    stop = std::max(stop, intervals[i].second);
++  }
++  result[1] += stop - start;
++  result[2] = stop - first;
++  return result;
++}
++} // namespace mlx::core
+diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
+--- a/mlx/backend/metal/timing.h
++++ b/mlx/backend/metal/timing.h
+@@ -1,6 +1,8 @@
+ // Copyright © 2026 Apple Inc.
+ #pragma once
+ 
++#include <cmath>
++#include "mlx/backend/common/timing_intervals.h"
+ #include <condition_variable>
+ #include <mutex>
+ #include <optional>
+@@ -10,6 +12,13 @@
+ namespace mlx::core::metal {
+ 
+ struct TimerState {
++  size_t reserve_slot() {
++    std::lock_guard lock(mutex);
++    // Allocate before handler installation; callbacks only fill reserved slots.
++    const auto slot = intervals.size();
++    intervals.emplace_back(0, 0);
++    return slot;
++  }
+   void submitted() {
+     std::lock_guard lock(mutex);
+     pending++;
+@@ -23,13 +32,18 @@
+     }
+   }
+ 
+-  void record(MTL::CommandBuffer* command_buffer) {
++  void record(MTL::CommandBuffer* command_buffer, size_t slot) {
+     auto start = command_buffer->GPUStartTime();
+     auto stop = command_buffer->GPUEndTime();
+     {
+       std::lock_guard lock(mutex);
+       if (stop >= start) {
+         elapsed_seconds += stop - start;
++      }
++      if (start > 0 && stop >= start && std::isfinite(start) && std::isfinite(stop)) {
++        intervals[slot] = {start, stop};
++      } else {
++        missing++;
+       }
+       pending--;
+       if (stopped && pending == 0) {
+@@ -52,11 +66,21 @@
+     return elapsed_seconds;
+   }
+ 
++  TimingSummary summary() const {
++    std::unique_lock lock(mutex);
++    ready.wait(lock, [this] { return stopped && pending == 0; });
++    if (!cached_summary) cached_summary = summarize_timing_intervals(intervals, elapsed_seconds, missing);
++    return *cached_summary;
++  }
++
+   mutable std::mutex mutex;
+   mutable std::condition_variable ready;
+   size_t pending{0};
+   bool stopped{false};
+   double elapsed_seconds{0.0};
++  std::vector<std::pair<double, double>> intervals;
++  size_t missing{0};
++  mutable std::optional<TimingSummary> cached_summary;
+ };
+ 
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -624,6 +624,7 @@
+   auto waits = wait_events_;
+   auto signals = signal_events_;
+   auto timer = timer_;
++  const auto timing_slot = timer ? timer->reserve_slot() : 0;
+   if (!receipt_->active) {
+     submission_state_->check_admission();
+     submission_state_->open();
+@@ -636,12 +637,12 @@
+   // accepted work even if the caller sees an exception.
+   commit_attempted_ = true;
+   buffer_->addCompletedHandler(
+-      [this, receipt, state, timer, waits = std::move(waits),
++      [this, receipt, state, timer, timing_slot, waits = std::move(waits),
+        signals = std::move(signals), completion = std::move(completion)]
+       (MTL::CommandBuffer* cbuf) mutable noexcept {
+         bool failed = cbuf->status() == MTL::CommandBufferStatusError;
+         try {
+-          if (timer) { timer->record(cbuf); }
++          if (timer) { timer->record(cbuf, timing_slot); }
+           for (auto& event : waits) {
+             if (event->failed()) { failed = true; }
+             if (auto error = event->error()) {
+diff --git a/mlx/backend/gpu/timing.h b/mlx/backend/gpu/timing.h
+--- a/mlx/backend/gpu/timing.h
++++ b/mlx/backend/gpu/timing.h
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ #pragma once
+ 
++#include "mlx/backend/common/timing_intervals.h"
+ #include <memory>
+ #include <optional>
+ 
+@@ -11,6 +12,8 @@
+ std::shared_ptr<void> new_timer(Stream stream);
+ void record_timer_start(const std::shared_ptr<void>& state, Stream stream);
+ void record_timer_stop(const std::shared_ptr<void>& state, Stream stream);
++TimingSummary timer_summary(const std::shared_ptr<void>& state);
++
+ double timer_elapsed_seconds(const std::shared_ptr<void>& state);
+ std::optional<double> timer_try_elapsed_seconds(
+     const std::shared_ptr<void>& state);
+diff --git a/mlx/backend/metal/timing.cpp b/mlx/backend/metal/timing.cpp
+--- a/mlx/backend/metal/timing.cpp
++++ b/mlx/backend/metal/timing.cpp
+@@ -20,6 +20,10 @@
+   metal::get_command_encoder(stream).end_timing(timer);
+ }
+ 
++TimingSummary timer_summary(const std::shared_ptr<void>& state) {
++  return std::static_pointer_cast<metal::TimerState>(state)->summary();
++}
++
+ double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
+   return std::static_pointer_cast<metal::TimerState>(state)->elapsed();
+ }
+diff --git a/mlx/backend/cuda/timing.cu b/mlx/backend/cuda/timing.cu
+--- a/mlx/backend/cuda/timing.cu
++++ b/mlx/backend/cuda/timing.cu
+@@ -47,6 +47,11 @@
+   return timer->start.elapsed_seconds(timer->stop);
+ }
+ 
++TimingSummary timer_summary(const std::shared_ptr<void>& state) {
++  const double elapsed = timer_elapsed_seconds(state);
++  return {elapsed, elapsed, elapsed, 1, 0};
++}
++
+ std::optional<double> timer_try_elapsed_seconds(
+     const std::shared_ptr<void>& state) {
+   return timer_elapsed_seconds(state);
+diff --git a/mlx/backend/no_gpu/timing.cpp b/mlx/backend/no_gpu/timing.cpp
+--- a/mlx/backend/no_gpu/timing.cpp
++++ b/mlx/backend/no_gpu/timing.cpp
+@@ -17,6 +17,8 @@
+   throw std::runtime_error("GPU timing is unavailable in this MLX build.");
+ }
+ 
++TimingSummary timer_summary(const std::shared_ptr<void>&) { throw std::runtime_error("GPU timing unavailable"); }
++
+ std::optional<double> timer_try_elapsed_seconds(
+     const std::shared_ptr<void>&) {
+   throw std::runtime_error("GPU timing is unavailable in this MLX build.");
+diff --git a/mlx/timing.h b/mlx/timing.h
+--- a/mlx/timing.h
++++ b/mlx/timing.h
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ #pragma once
+ 
++#include "mlx/backend/common/timing_intervals.h"
+ #include <memory>
+ #include <optional>
+ 
+@@ -28,6 +29,7 @@
+   void start();
+   void stop();
+   double elapsed_seconds() const;
++  TimingSummary summary() const;
+   std::optional<double> try_elapsed_seconds() const;
+ 
+   const Stream& stream() const {
+diff --git a/mlx/timing.cpp b/mlx/timing.cpp
+--- a/mlx/timing.cpp
++++ b/mlx/timing.cpp
+@@ -67,6 +67,12 @@
+   return std::chrono::duration<double>(*state->stop - *state->start).count();
+ }
+ 
++TimingSummary DeviceTimer::summary() const {
++  if (stream_.device != Device::cpu) return gpu::timer_summary(state_);
++  const double elapsed = elapsed_seconds();
++  return {elapsed, elapsed, elapsed, 1, 0};
++}
++
+ std::optional<double> DeviceTimer::try_elapsed_seconds() const {
+   if (stream_.device != Device::cpu) {
+     return gpu::timer_try_elapsed_seconds(state_);
+diff --git a/mlx/completion.h b/mlx/completion.h
+--- a/mlx/completion.h
++++ b/mlx/completion.h
+@@ -63,6 +63,7 @@
+ 
+   /** Block until complete and return the stable measured elapsed seconds. */
+   double elapsed_seconds() const;
++  TimingSummary timing_summary() const;
+ 
+   /** Return elapsed seconds when ready without blocking, otherwise nullopt. */
+   std::optional<double> try_elapsed_seconds() const;
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -597,6 +597,12 @@
+   return *elapsed_seconds_;
+ }
+ 
++TimingSummary Completion::timing_summary() const {
++  const double elapsed = elapsed_seconds(); // Completion and failure checks precede timestamps.
++  if (timer_) return timer_->summary();
++  return {elapsed, elapsed, elapsed, 0, 0};
++}
++
+ std::optional<double> Completion::try_elapsed_seconds() const {
+   if (!is_timed()) {
+     throw std::invalid_argument(
