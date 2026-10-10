@@ -169,18 +169,21 @@ fn isolated_joint_copy_allows_continuation_and_restores_both_nonzero_caches() {
     assert_eq!(canonical.copy_bytes_consumed(), consumed);
     assert_eq!(child.copy_bytes_consumed(), consumed);
 
+    // Isolated snapshots retain only logical elements, dropping both caches'
+    // 126-position spare capacity for two lanes of width two.
+    let restore_cost = cost - 2 * 126 * 2 * 2 * 4;
     saved.restore(&mut canonical).unwrap();
     assert_eq!(values(canonical.retained_arrays()), baseline);
     assert_eq!(canonical.parts().0.offset(), 2);
     assert_eq!(AttentionCache::offset(&canonical.parts().1.as_ref()[0]), 2);
-    assert_eq!(canonical.copy_bytes_consumed(), consumed + cost);
-    assert_eq!(child.copy_bytes_consumed(), consumed + cost);
+    assert_eq!(canonical.copy_bytes_consumed(), consumed + restore_cost);
+    assert_eq!(child.copy_bytes_consumed(), consumed + restore_cost);
     assert_eq!(child.parts().0.offset(), 4);
     let retained = budget.usage().retained_bytes;
     saved.restore(&mut canonical).unwrap();
     assert_eq!(values(canonical.retained_arrays()), baseline);
     assert_eq!(budget.usage().retained_bytes, retained);
-    assert_eq!(canonical.copy_bytes_consumed(), consumed + 2 * cost);
+    assert_eq!(canonical.copy_bytes_consumed(), consumed + 2 * restore_cost);
 }
 
 #[test]
@@ -408,7 +411,8 @@ fn joint_state_prices_both_batch_lanes_and_reserves_copy_allowance_for_isolation
     assert_eq!(two.retained_tensor_bytes().unwrap(), 72);
     assert_eq!(
         two.copy_estimate().unwrap().copy_bytes - one.copy_estimate().unwrap().copy_bytes,
-        64
+        // Two logical copies plus the additional batch lane's private spare capacity.
+        64 + 2 * 126 * 2 * 4
     );
     let cost = two.copy_estimate().unwrap().copy_bytes;
     let limited = owner(

@@ -253,10 +253,10 @@ fn isolated_pooling_snapshots_copy_all_streams_and_preserve_interleaved_siblings
                 let source = source.evaluated().unwrap();
                 let copy = copy.evaluated().unwrap();
                 if source.as_array().size() > 0 {
-                    assert_ne!(
-                        source.as_slice::<f32>().as_ptr(),
-                        copy.as_slice::<f32>().as_ptr()
-                    );
+                    let storage =
+                        safemlx::inspect_storage(&[source.as_array(), copy.as_array()]).unwrap();
+                    assert!(storage.values.iter().all(Option::is_some));
+                    assert_ne!(storage.values[0], storage.values[1]);
                 }
             }
             let mut first =

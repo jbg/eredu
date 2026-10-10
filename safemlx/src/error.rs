@@ -76,6 +76,9 @@ impl From<RawException> for IoError {
 /// Error associated with `Array::try_as_slice()`
 #[derive(Debug, PartialEq, Error)]
 pub enum AsSliceError {
+    /// A strided view cannot be borrowed as a contiguous logical Rust slice.
+    #[error("The array is not row-contiguous; use try_to_vec for logical values.")]
+    NonContiguous,
     /// The underlying data pointer is null.
     ///
     /// This is likely because the array has not been evaluated yet.

@@ -109,10 +109,9 @@ fn isolated_compressed_snapshots_copy_strided_state_and_isolate_paged_catalogs()
         for (source, copy) in parent.retained_arrays().iter().zip(saved.retained_arrays()) {
             let source = source.evaluated().unwrap();
             let copy = copy.evaluated().unwrap();
-            assert_ne!(
-                source.as_slice::<f32>().as_ptr(),
-                copy.as_slice::<f32>().as_ptr()
-            );
+            let storage = safemlx::inspect_storage(&[source.as_array(), copy.as_array()]).unwrap();
+            assert!(storage.values.iter().all(Option::is_some));
+            assert_ne!(storage.values[0], storage.values[1]);
         }
         if paged {
             assert_ne!(
@@ -275,9 +274,10 @@ fn isolated_native_hybrid_snapshots_copy_strided_recurrent_and_convolution_stora
     for (source, copied) in parent.retained_arrays().iter().zip(saved.retained_arrays()) {
         let source = source.evaluated().unwrap();
         let copied = copied.evaluated().unwrap();
+        let storage = safemlx::inspect_storage(&[source.as_array(), copied.as_array()]).unwrap();
+        assert!(storage.values.iter().all(Option::is_some));
         assert_ne!(
-            source.as_slice::<f32>().as_ptr(),
-            copied.as_slice::<f32>().as_ptr(),
+            storage.values[0], storage.values[1],
             "native fixed storage must be independent, not just its Rust handle"
         );
     }

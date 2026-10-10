@@ -25,6 +25,8 @@ pub mod distributed;
 mod dtype;
 pub mod error;
 mod event;
+mod prefix_append;
+pub use prefix_append::PrefixAppendBuffer;
 pub mod fast;
 pub mod fft;
 mod host_transfer;

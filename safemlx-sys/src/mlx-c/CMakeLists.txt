@@ -180,6 +180,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/mixed_gemm.cpp
     # ${CMAKE_CURRENT_LIST_DIR}/mlx/c/object.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ops.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/prefix_append.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/random.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/stream.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/submission.cpp
@@ -192,6 +193,10 @@ set(mlxc-src
 add_library(mlxc ${mlxc-src})
 if(MLX_BUILD_METAL AND MLX_METAL_JIT AND NOT MLX_C_USE_SYSTEM_MLX)
   target_compile_definitions(mlxc PRIVATE MLX_C_MIXED_STORAGE_GEMM)
+endif()
+
+if(MLX_BUILD_METAL)
+  target_compile_definitions(mlxc PRIVATE MLX_C_PREFIX_APPEND_GPU)
 endif()
 
 target_link_libraries(mlxc PRIVATE mlx)

@@ -172,13 +172,15 @@ impl MlxHybridLayerState {
                 MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
                     match (window, key_only) {
                         (Some(window), true) => {
-                            ConcatKeyValueCache::new_key_only_for_sliding_attention(window)
+                            ConcatKeyValueCache::new_key_only_append_only_for_sliding_attention(
+                                window,
+                            )
                         }
                         (Some(window), false) => {
-                            ConcatKeyValueCache::new_for_sliding_attention(window)
+                            ConcatKeyValueCache::new_append_only_for_sliding_attention(window)
                         }
-                        (None, true) => ConcatKeyValueCache::new_key_only(),
-                        (None, false) => ConcatKeyValueCache::new(),
+                        (None, true) => ConcatKeyValueCache::new_key_only_append_only(),
+                        (None, false) => ConcatKeyValueCache::new_append_only(),
                     },
                 ))
             }
@@ -295,13 +297,15 @@ impl MlxHybridLayerState {
                     MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
                         match (window, key_only) {
                             (Some(window), true) => {
-                                ConcatKeyValueCache::new_key_only_for_sliding_attention(window)
+                                ConcatKeyValueCache::new_key_only_append_only_for_sliding_attention(
+                                    window,
+                                )
                             }
                             (Some(window), false) => {
-                                ConcatKeyValueCache::new_for_sliding_attention(window)
+                                ConcatKeyValueCache::new_append_only_for_sliding_attention(window)
                             }
-                            (None, true) => ConcatKeyValueCache::new_key_only(),
-                            (None, false) => ConcatKeyValueCache::new(),
+                            (None, true) => ConcatKeyValueCache::new_key_only_append_only(),
+                            (None, false) => ConcatKeyValueCache::new_append_only(),
                         },
                     ))
                 }
@@ -705,7 +709,15 @@ impl MlxHybridState {
             .map(|manager| manager.isolated_snapshot_bytes())
             .unwrap_or(Some(0))?;
         self.layers.iter().try_fold(manager, |bytes, layer| {
-            bytes.checked_add(layer.streams.metadata_bytes()?)
+            let spare = match &layer.attention {
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
+                    cache.spare_capacity_bytes()?
+                }
+                _ => 0,
+            };
+            bytes
+                .checked_add(layer.streams.metadata_bytes()?)?
+                .checked_add(spare)
         })
     }
 

@@ -1432,6 +1432,18 @@ rather than increasing submission count. Sampled allocator stacks are about
 2.9 ms/frame in both windows; the trace does not establish allocation alone as
 the source of the history penalty.
 
+Full-attention device caches and sliding caches before their first retention crop
+use a generic transaction-safe append mechanism: private chunked capacity retains
+immutable visible prefixes and reserves unused suffix slots once. Sliding capacity
+is clipped to the declared retention limit; cropped caches use immutable
+concatenation. Divergence, truncation and explicit snapshots preserve rollback
+and independent continuation. Cache policy and capacity/residency accounting remain
+shared infrastructure; native buffer operations belong in the backend. Ordinary
+attention consumes the prefix's native matrix strides. Legacy overwriting caches
+retain physical transaction isolation. The measured 5.780 ms early/late penalty
+identifies a workload effect, not guaranteed recoverable headroom. Individual shader
+durations and measured DRAM bandwidth remain unavailable in this evidence.
+
 Artifacts and reproducible scripts are under
 `/private/tmp/eredu-attention-critical/`: `REPORT.md`, `benchmark.patch`,
 `benchmark-source/`, `voicechat_wav`, profiles/replay summaries, ordinary controls,
@@ -1442,6 +1454,91 @@ All temporary benchmark source changes restore byte-for-byte. The interval-union
 fixtures, safe CPU timing tests, multi-buffer Metal timing test, bounded collector
 fixture and CPU-only profiling feature check pass. CUDA timing summary is implemented
 but has no native CUDA validation on this Mac.
+
+### Transaction-safe append capacity
+
+The resident device K/V cache uses private 128-position append capacity, including
+sliding caches before their first retention crop. Published prefix elements remain
+immutable. Reservations are never refunded on discard or construction failure;
+branches, truncation and explicit snapshots preserve independent continuation.
+Cropped sliding caches retain immutable concatenation and absolute-position/window
+semantics. Existing neutral cache policies select storage, and capacity admission
+and snapshot charges include private padding. This implementation introduces no
+model-family branch, portable backend dependency or feature flag.
+
+Released-checkpoint measurements dated 2026-10-10 use the M3 Ultra 80-core GPU,
+256 GiB unified memory, resident Metal execution, Q8 backbone/function/causal-TTS
+weights, F32 causal execution and F16 speech/perception execution. Command-buffer
+limits are 25 operations and 256 MiB. The pinned checkpoint, utterance and seed match
+the history-growth profile above. Four ordinary runs use the order control,
+append, append, control, with 996 live frames (79.68 seconds), excluding the first
+10 from warm statistics. Controls use immutable concatenation with identical
+host-view safety fixes and accepted quantization/precision settings.
+
+| Measurement | Concatenation | Private append |
+| --- | ---: | ---: |
+| Mean frame time, two runs (ms) | 68.590 | 66.856 |
+| Mean per-run p95 (ms) | 71.910 | 68.316 |
+| Mean budget remaining, 80 ms frame (ms) | 11.410 | 13.144 |
+| Early frames 50–150 (ms) | 65.833 | 65.579 |
+| Late frames 850–950 (ms) | 71.619 | 68.126 |
+| Mean process peak footprint (GiB) | 22.575 | 20.927 |
+| Frames above 80 ms, both runs | 0 / 1,972 | 0 / 1,972 |
+
+Individual control means are 68.534 and 68.647 ms; append means are 66.867 and
+66.845 ms. The mean saving is **1.734 ms/frame (2.53%)**, increasing average
+headroom by **15.2%**. The late-window saving is **3.492 ms**. Early-to-late growth
+falls from 5.785 to 2.547 ms; attention work still grows with history. Mean process
+peak footprint falls by 1.649 GiB; this is a process measurement including native
+allocation caching and temporary work, not a measurement of K/V payload alone.
+Private spare payload is at most 127 positions per cache: for 28 speech layers,
+batch 2, 16 heads and width 72 at F32, both K and V total at most 62.508 MiB.
+
+All four runs produce exactly the accepted 1,756,952 F32 audio samples and all
+3,818 semantic events, excluding wall timestamps. Waveform SHA-256 is
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
+This is one utterance/seed with silence afterward, not a broad dialogue quality
+or arbitrary-duration latency guarantee.
+
+The extended 159.68-second comparison uses 1,996 live frames (1,986 warm), the
+same input followed by more silence, and the existing long concatenation control
+from this investigation. It is one pair, with the control measured earlier rather
+than interleaved with the final append run:
+
+| Extended measurement | Concatenation | Private append |
+| --- | ---: | ---: |
+| Mean frame time (ms) | 71.844 | 68.475 |
+| p95 (ms) | 77.564 | 71.448 |
+| Mean budget remaining (ms) | 8.156 | 11.525 |
+| Late frames 1850–1950 (ms) | 77.566 | 71.512 |
+| Maximum frame time (ms) | 79.691 | 75.916 |
+| Process peak footprint (GiB) | 23.613 | 23.421 |
+| Frames above 80 ms | 0 / 1,986 | 0 / 1,986 |
+
+The extended mean saving is 3.369 ms (4.69%), adding 41.3% to mean headroom;
+the late-window saving is 6.054 ms. All 3,520,952 samples and 7,818 semantic events
+match exactly. Waveform SHA-256 is
+`d1074bd2cab12ea1c61fcedab2ebf06ec89c674c8ae0705319c64780a5174650`.
+These measurements precede the speech layers' first sliding retention crop;
+performance after that crop is not measured here. Sliding transition correctness
+is checked with a small-window fixture.
+
+CPU/Metal buffer tests cover actual backing reuse, delayed discarded updates,
+truncation, growth, cross-stream completion, held immutable host borrows and
+rejection of graph replay. Cache tests compare sliding truncation, multi-token
+updates and retention transitions with ordinary concatenation. Five snapshot
+isolation tests, three joint lifecycle tests and eight joint integration tests
+cover rollback, atomic publication, copy budgets and completion-held admission.
+The restored backend builds with Metal and profiling enabled. CUDA uses an
+immutable-copy fallback and has no native CUDA validation on this Mac.
+
+Reproduction artifacts reside in `/private/tmp/eredu-prefix-append`: `build.py`,
+`run.py`, `batch-final.py`, `compare-final.py`, `long.py`, benchmark patches,
+per-frame records, waveform comparisons, source snapshots and binary hashes.
+`final-results.json` contains the four ordinary-run comparisons and
+`final-long-results.json` contains the extended pair. Temporary
+quantization benchmark edits restore byte-for-byte. The append binary SHA-256 is
+`800048f6d4d950f48859070e125805d5afcc0c26628a8b615fdf1c09c1ff9046`.
 
 ### Released-checkpoint tool round trip
 

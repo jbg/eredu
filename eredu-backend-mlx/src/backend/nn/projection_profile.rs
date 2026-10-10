@@ -156,7 +156,7 @@ fn bits(array: &Array) -> Result<Vec<u32>, Exception> {
     Ok(array
         .clone()
         .into_evaluated()?
-        .try_as_slice::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|error| Exception::custom(error.to_string()))?
         .iter()
         .map(|x| x.to_bits())

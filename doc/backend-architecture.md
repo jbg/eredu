@@ -1327,10 +1327,20 @@ adapter implements the architecture's borrowed cache access contract; the reusab
 owner has no VoiceChat scheduling policy.
 
 Joint frame candidates copy metadata and share immutable attention, fixed-state
-and resident append-stream roots. Attention concatenation and fixed-state
-replacement construct unpublished roots; discard leaves committed values intact.
+and resident append-stream roots. Fixed-state replacement constructs unpublished
+roots; discard leaves committed values intact. Full-attention device caches use
+private capacity in 128-position chunks, publishing only logical prefix views.
+Each suffix is reserved once before native construction, without refunds on
+failure or discard. Committed append chains reuse unused slots; divergence,
+truncation and restoration allocate independent backing before appending. Native
+one-use append nodes reject graph tracing and retain ordinary stream dependencies
+and completion resources. Published prefix elements remain immutable even while
+private suffix writes are pending. Sliding caches use reserved suffixes before the
+first retention crop, with capacity clipped to the declared retention limit. Once
+cropping changes the prefix origin, they use immutable concatenation; returned
+multi-token spans, absolute positions and attention windows remain unchanged.
 Fully immutable candidates submit no copy graph and require no copy-completion
-wait. Capacity-backed caches, compressed storage and mutable paging namespaces
+wait. Overwriting capacity caches, compressed storage and mutable paging namespaces
 retain physical isolation and native recovery before execution. Mixed candidates
 share immutable device/fixed/stream roots and sealed paging blocks while copying
 mutable storage. Paging candidates own independent catalogs and identities within
@@ -1338,6 +1348,19 @@ the same finite process pool. Explicit snapshots and forks deep copy all state. 
 consume zero native-copy allowance, and mutable isolation keeps the full
 conservative charge without refunds. Exclusive admission and generation identity
 remain held through native completion, including failed observations.
+
+The backend's reusable cache mechanism consumes existing neutral cache policies;
+no family selects a separate storage path. Append memory contracts and continuation
+bounds include padded capacity; snapshot reservations additionally price private
+spare bytes absent from visible tensor extents. Explicit snapshots copy only
+logical elements and discard shared capacity ownership. `safemlx::PrefixAppendBuffer`
+keeps capacity arrays inaccessible through its safe API and reserves suffixes
+through thread-affine ownership. Borrowed host slices require row-contiguous
+storage; owned reads and copies gather strided logical elements, and strided
+views cannot exceed logical input extents. CPU and Metal perform suffix writes;
+CUDA uses immutable copy construction because host access may transfer complete
+physical allocations. This mechanism changes no portable family equations or
+public inference capabilities.
 
 `eredu-runtime::execution_control::IsolatedStateCopy` declares completed,
 independent state copying and atomic restore without text- or family-specific

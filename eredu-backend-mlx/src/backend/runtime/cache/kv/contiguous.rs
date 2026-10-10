@@ -1,6 +1,7 @@
 //! Contiguous append-only key/value cache storage.
 
 use super::*;
+use safemlx::PrefixAppendBuffer;
 
 /// A cache that appends all key/value states along the sequence axis.
 #[derive(Debug, Clone, Default)]
@@ -8,6 +9,9 @@ pub struct ConcatKeyValueCache {
     keys: Option<Array>,
     values: Option<Array>,
     key_only: bool,
+    append_only: bool,
+    key_buffer: Option<PrefixAppendBuffer>,
+    value_buffer: Option<PrefixAppendBuffer>,
     offset: i32,
     pub(super) length: i32,
     pub(super) capacity: i32,
@@ -20,12 +24,26 @@ pub struct ConcatKeyValueCache {
 }
 
 impl ConcatKeyValueCache {
+    fn append_eligible(&self, additional: u64) -> bool {
+        self.append_only
+            && self.attention_window.is_none_or(|window| {
+                self.offset == self.length
+                    && u64::try_from(self.length)
+                        .ok()
+                        .and_then(|length| length.checked_add(additional))
+                        .is_some_and(|required| required < window as u64)
+            })
+    }
+
     /// Maximum logical sequence dimension retained after the admitted input
     /// span. Includes chunk padding and existing capacity; sliding views are
     /// priced by their logical extent, not the allocator's underlying buffer.
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         let required = u64::try_from(self.length).ok()?.checked_add(additional)?;
-        let bound = if let Some(window) = self.attention_window {
+        let bound = if let Some(window) = self
+            .attention_window
+            .filter(|_| !self.append_eligible(additional))
+        {
             required.min(u64::try_from(window.checked_sub(1)?).ok()?)
         } else {
             let step = u64::try_from(self.step.max(1)).ok()?;
@@ -33,16 +51,17 @@ impl ConcatKeyValueCache {
                 .checked_add(step - 1)?
                 .checked_div(step)?
                 .checked_mul(step)?;
-            match self.max_size {
-                Some(maximum) => padded.min(u64::try_from(maximum).ok()?),
-                None => padded,
+            match (self.attention_window, self.max_size) {
+                (Some(window), _) => padded.min(u64::try_from(window.checked_sub(1)?).ok()?),
+                (_, Some(maximum)) => padded.min(u64::try_from(maximum).ok()?),
+                _ => padded,
             }
         };
         Some(bound.max(u64::try_from(self.capacity).ok()?))
     }
 
-    /// Independent snapshot of every logical element, including strided/windowed
-    /// views. Preserve capacity, offsets and window metadata with the copied arrays.
+    /// Independent snapshot of retained elements, including strided/windowed views.
+    /// Private append capacity is discarded; offsets and window metadata persist.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
         let mut cache = self.clone();
         cache.keys = self
@@ -55,7 +74,60 @@ impl ConcatKeyValueCache {
             .as_ref()
             .map(|array| array.contiguous(false, stream)?.deep_clone())
             .transpose()?;
+        if cache.append_only {
+            cache.key_buffer = None;
+            cache.value_buffer = None;
+            cache.capacity = cache.length;
+        }
         Ok(cache)
+    }
+
+    /// Creates a cache with private chunked capacity and immutable visible prefixes.
+    /// Divergent descendants allocate independently; committed appends reuse only
+    /// unused suffix slots. The chunk size is a native allocation policy.
+    pub fn new_append_only() -> Self {
+        Self {
+            append_only: true,
+            step: 128,
+            ..Self::default()
+        }
+    }
+
+    /// Append-only capacity cache with shared key/value data.
+    pub fn new_key_only_append_only() -> Self {
+        Self {
+            key_only: true,
+            ..Self::new_append_only()
+        }
+    }
+
+    /// Sliding cache with private suffix reuse before the first retention crop.
+    /// Once history is discarded, ordinary immutable concatenation preserves
+    /// absolute positions and returns the complete newly submitted span.
+    pub fn new_append_only_for_sliding_attention(window: i32) -> Self {
+        assert!(window > 0, "sliding attention window must be positive");
+        Self {
+            attention_window: Some(window),
+            ..Self::new_append_only()
+        }
+    }
+
+    /// Key-only sliding cache with private suffix reuse before retention begins.
+    pub fn new_key_only_append_only_for_sliding_attention(window: i32) -> Self {
+        Self {
+            key_only: true,
+            ..Self::new_append_only_for_sliding_attention(window)
+        }
+    }
+
+    /// Private capacity not represented by visible retained tensor extents.
+    pub(crate) fn spare_capacity_bytes(&self) -> Option<u64> {
+        [self.key_buffer.as_ref(), self.value_buffer.as_ref()]
+            .into_iter()
+            .flatten()
+            .try_fold(0u64, |sum, buffer| {
+                sum.checked_add(u64::try_from(buffer.spare_capacity_bytes()).ok()?)
+            })
     }
 
     /// Creates an empty concatenating key/value cache.
@@ -83,19 +155,25 @@ impl ConcatKeyValueCache {
             .as_ref()
             .map(|array| array.clone().deep_clone())
             .transpose()?;
+        if cache.append_only {
+            cache.key_buffer = None;
+            cache.value_buffer = None;
+            cache.capacity = cache.length;
+        }
         Ok(cache)
     }
 
-    // Capacity-backed caches may overwrite storage; concatenating caches replace roots.
+    // Published prefixes remain immutable for reserved-suffix and concatenating
+    // caches. Legacy overwriting capacity needs physical isolation.
     pub(crate) fn has_immutable_roots(&self) -> bool {
-        self.step <= 1
+        self.append_only || self.step <= 1
     }
 
-    /// Snapshots the ordinary append-only cache without changing array layout.
-    /// Capacity-backed caches can update storage in place and therefore still
-    /// require an independent data copy.
+    /// Shares immutable prefixes without changing array layout. Reserved suffixes
+    /// force divergent descendants to allocate independently. Overwriting storage
+    /// requires a physical copy.
     pub fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
-        if self.step <= 1 {
+        if self.has_immutable_roots() {
             Ok(self.clone())
         } else {
             self.deep_clone_state()
@@ -170,9 +248,21 @@ impl ConcatKeyValueCache {
             if let Some(values) = self.values.take() {
                 self.values = Some(values.try_index_device((.., .., ..retained, ..), stream)?);
             }
+            self.key_buffer = self
+                .key_buffer
+                .as_ref()
+                .map(|b| b.truncated(retained))
+                .transpose()?;
+            self.value_buffer = self
+                .value_buffer
+                .as_ref()
+                .map(|b| b.truncated(retained))
+                .transpose()?;
             self.offset = len;
             self.length = retained;
-            self.capacity = retained;
+            if self.key_buffer.is_none() {
+                self.capacity = retained;
+            }
             return Ok(());
         }
         if len < 0 || len > self.length {
@@ -180,6 +270,35 @@ impl ConcatKeyValueCache {
                 "concatenating cache truncate length {len} is outside 0..{}",
                 self.length
             )));
+        }
+        if self.append_only {
+            let key_buffer = self
+                .key_buffer
+                .as_ref()
+                .map(|b| b.truncated(len))
+                .transpose()?;
+            let value_buffer = self
+                .value_buffer
+                .as_ref()
+                .map(|b| b.truncated(len))
+                .transpose()?;
+            let keys = self
+                .keys
+                .as_ref()
+                .map(|a| a.try_index_device((.., .., ..len, ..), stream))
+                .transpose()?;
+            let values = self
+                .values
+                .as_ref()
+                .map(|a| a.try_index_device((.., .., ..len, ..), stream))
+                .transpose()?;
+            self.key_buffer = key_buffer;
+            self.value_buffer = value_buffer;
+            self.keys = keys;
+            self.values = values;
+            self.offset = len;
+            self.length = len;
+            return Ok(());
         }
         if self.step > 1 {
             // Chunked caches treat the array shape as backing capacity and
@@ -212,6 +331,8 @@ impl ConcatKeyValueCache {
     pub fn clear(&mut self) {
         self.keys = None;
         self.values = None;
+        self.key_buffer = None;
+        self.value_buffer = None;
         self.offset = 0;
         self.length = 0;
         self.capacity = 0;
@@ -225,6 +346,61 @@ impl ConcatKeyValueCache {
         let capacity = chunks * step;
         self.max_size
             .map_or(capacity, |max_size| capacity.min(max_size))
+    }
+
+    fn update_append_only(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let key_shape = keys.shape();
+        let value_shape = values.shape();
+        if key_shape.len() != 4 || value_shape.len() != 4 || key_shape[..3] != value_shape[..3] {
+            return Err(Exception::custom(
+                "cache append requires matching batch/head/token geometry",
+            ));
+        }
+        let required = self
+            .length
+            .checked_add(key_shape[2])
+            .ok_or_else(|| Exception::custom("cache append overflow"))?;
+        let capacity = self
+            .continuation_capacity_bound(key_shape[2] as u64)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Exception::custom("cache capacity overflow"))?;
+        let candidate =
+            |buffer: &Option<PrefixAppendBuffer>, previous: &Option<Array>, update: &Array| {
+                if let Some(buffer) = buffer {
+                    buffer.appended(update, capacity, stream)
+                } else if let Some(previous) = previous {
+                    PrefixAppendBuffer::new(previous, capacity, -2, stream)?
+                        .appended(update, capacity, stream)
+                } else {
+                    PrefixAppendBuffer::new(update, capacity, -2, stream)
+                }
+            };
+        // Publish only after both candidate constructions succeed. Reservations
+        // survive failure; another descendant then copies its immutable prefix.
+        let key_buffer = candidate(&self.key_buffer, &self.keys, &keys)?;
+        let value_buffer = if self.key_only {
+            None
+        } else {
+            Some(candidate(&self.value_buffer, &self.values, &values)?)
+        };
+        let keys = key_buffer.prefix(stream)?;
+        let values = match &value_buffer {
+            Some(buffer) => buffer.prefix(stream)?,
+            None => keys.clone(),
+        };
+        self.capacity = key_buffer.capacity();
+        self.key_buffer = Some(key_buffer);
+        self.value_buffer = value_buffer;
+        self.keys = Some(keys.clone());
+        self.values = (!self.key_only).then_some(values.clone());
+        self.length = required;
+        self.offset = required;
+        Ok((keys, values))
     }
 
     fn padded(array: &Array, capacity: i32, stream: &Stream) -> Result<Array, Exception> {
@@ -288,6 +464,8 @@ impl ConcatKeyValueCache {
         }
         self.keys = Some(keys);
         self.values = (!self.key_only).then_some(values);
+        self.key_buffer = None;
+        self.value_buffer = None;
         self.offset = end;
         self.length = length;
         self.capacity = length;
@@ -362,11 +540,12 @@ impl KeyValueCache for ConcatKeyValueCache {
             .ok_or_else(|| ComputeError::backend("cache append capacity overflowed"))?;
         // Sliding retention is a view into the complete concatenation. Its
         // shorter logical history does not reduce this backing payload.
-        let backing_positions = if self.attention_window.is_some() {
-            visible
-        } else {
-            padded.max(visible)
-        };
+        let backing_positions =
+            if self.attention_window.is_some() && !self.append_eligible(appended) {
+                visible
+            } else {
+                padded.max(visible)
+            };
         for (name, width) in [("cache_keys", key_width), ("cache_values", value_width)] {
             if self.key_only && name == "cache_values" {
                 continue;
@@ -386,7 +565,19 @@ impl KeyValueCache for ConcatKeyValueCache {
                 storage.detail =
                     "empty cache borrows appended tensor backing; no independent cache allocation"
                         .into();
-            } else if self.step > 1
+            } else if self.append_eligible(appended)
+                && self.key_buffer.as_ref().is_some_and(|b| {
+                    i32::try_from(appended).is_ok_and(|n| b.can_append_without_copy(n))
+                })
+                && (self.key_only
+                    || self.value_buffer.as_ref().is_some_and(|b| {
+                        i32::try_from(appended).is_ok_and(|n| b.can_append_without_copy(n))
+                    }))
+            {
+                storage.backing = MechanismBacking::Owner(name.into());
+                storage.detail = "append reserves an unused suffix of private owner capacity; published prefixes remain immutable".into();
+            } else if !self.append_only
+                && self.step > 1
                 && self.attention_window.is_none()
                 && visible <= self.capacity as u64
             {
@@ -423,9 +614,16 @@ impl KeyValueCache for ConcatKeyValueCache {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let new_tokens = keys.dim(-2);
+        if self.append_eligible(new_tokens as u64) {
+            return self.update_append_only(keys, values, stream);
+        }
         self.offset += new_tokens;
 
         if let Some(window) = self.attention_window {
+            // Cropping changes the prefix origin. No capacity owner may reserve
+            // suffixes relative to the old origin after retention begins.
+            self.key_buffer = None;
+            self.value_buffer = None;
             let combined_keys = match self.keys.take() {
                 Some(previous) => append_immutable(previous, keys, "cache_append_keys", stream)?,
                 None => keys,
@@ -730,4 +928,154 @@ fn append_immutable(
         );
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod append_only_tests {
+    use super::*;
+    use eredu_nn::{mechanism_memory::*, TensorElementType};
+
+    #[test]
+    fn append_candidates_preserve_roots_and_report_private_capacity() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let input = |x: f32| Array::from_slice(&[x, x + 1.], &[2, 1, 1, 1]);
+        let read = |a: Array| a.into_evaluated().unwrap().try_to_vec::<f32>().unwrap();
+        let mut owner = ConcatKeyValueCache::new_append_only();
+        owner
+            .update_and_fetch(input(1.), input(-2.), &stream)
+            .unwrap();
+        let request = MechanismInvocation::CacheUpdate {
+            batch: 2,
+            heads: 1,
+            previous: 1,
+            appended: 1,
+            key_width: 1,
+            value_width: 1,
+            element: TensorElementType::F32,
+        };
+        assert!(owner.has_immutable_roots());
+        assert_eq!(owner.spare_capacity_bytes(), Some(2 * 127 * 2 * 4));
+        let storage = owner.update_memory_contract(&request).unwrap();
+        assert!(storage
+            .storage
+            .iter()
+            .filter(|s| s.name.starts_with("cache_"))
+            .all(|s| {
+                s.payload == MechanismBytes::exact(2 * 128 * 4)
+                    && matches!(s.backing, MechanismBacking::Owner(_))
+            }));
+        let original = owner.snapshot_arrays(&stream).unwrap().unwrap();
+        let snapshot = owner.isolated_snapshot(&stream).unwrap();
+        let mut discarded = owner.checkpoint_clone_state().unwrap();
+        let lazy = discarded
+            .update_and_fetch(input(3.), input(-4.), &stream)
+            .unwrap();
+        assert!(owner
+            .update_memory_contract(&request)
+            .unwrap()
+            .storage
+            .iter()
+            .filter(|s| s.name.starts_with("cache_"))
+            .all(|s| !matches!(s.backing, MechanismBacking::Owner(_))));
+        let mut committed = owner.checkpoint_clone_state().unwrap();
+        let selected = committed
+            .update_and_fetch(input(5.), input(-6.), &stream)
+            .unwrap();
+        assert_eq!(read(selected.0), [1., 5., 2., 6.]);
+        assert_eq!(read(lazy.0), [1., 3., 2., 4.]);
+        assert_eq!(read(original.0), [1., 2.]);
+        assert_eq!(
+            read(snapshot.snapshot_arrays(&stream).unwrap().unwrap().1),
+            [-2., -1.]
+        );
+        // Invalid second updates consume no visible publication, even when a
+        // key reservation is made before the value dtype error is detected.
+        let before = committed.offset();
+        let wrong = Array::from_slice(&[1i32, 2], &[2, 1, 1, 1]);
+        assert!(committed
+            .update_and_fetch(input(7.), wrong, &stream)
+            .is_err());
+        assert_eq!(committed.offset(), before);
+        committed.truncate(1, &stream).unwrap();
+        assert_eq!(
+            read(
+                committed
+                    .update_and_fetch(input(9.), input(-10.), &stream)
+                    .unwrap()
+                    .0
+            ),
+            [1., 9., 2., 10.]
+        );
+        assert_eq!(
+            read(discarded.snapshot_arrays(&stream).unwrap().unwrap().0),
+            [1., 3., 2., 4.]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sliding_append_tests {
+    use super::*;
+    #[test]
+    fn reserved_sliding_prefixes_match_concat_through_truncate_and_crop() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        for key_only in [false, true] {
+            let mut optimized = if key_only {
+                ConcatKeyValueCache::new_key_only_append_only_for_sliding_attention(4)
+            } else {
+                ConcatKeyValueCache::new_append_only_for_sliding_attention(4)
+            };
+            let mut reference = if key_only {
+                ConcatKeyValueCache::new_key_only_for_sliding_attention(4)
+            } else {
+                ConcatKeyValueCache::new_for_sliding_attention(4)
+            };
+            let input =
+                |values: &[f32]| Array::from_slice(values, &[2, 1, values.len() as i32 / 2, 1]);
+            let read = |a: Array| a.into_evaluated().unwrap().try_to_vec::<f32>().unwrap();
+            for (round, data) in [
+                vec![1., 2., 11., 12.],
+                vec![3., 13.],
+                vec![4., 5., 14., 15.],
+                vec![6., 16.],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let a = optimized
+                    .update_and_fetch(input(&data), input(&data), &stream)
+                    .unwrap();
+                let b = reference
+                    .update_and_fetch(input(&data), input(&data), &stream)
+                    .unwrap();
+                assert_eq!(read(a.0), read(b.0));
+                assert_eq!(read(a.1), read(b.1));
+                assert_eq!(optimized.offset(), reference.offset());
+                if round == 0 {
+                    assert!(optimized.key_buffer.is_some());
+                    assert_eq!(optimized.continuation_capacity_bound(1), Some(3));
+                    optimized.truncate(1, &stream).unwrap();
+                    reference.truncate(1, &stream).unwrap();
+                }
+                if round >= 2 {
+                    assert!(optimized.key_buffer.is_none());
+                }
+                let a = optimized.snapshot_arrays(&stream).unwrap().unwrap();
+                let b = reference.snapshot_arrays(&stream).unwrap().unwrap();
+                assert_eq!(read(a.0), read(b.0));
+                assert_eq!(read(a.1), read(b.1));
+            }
+            let origin = optimized.offset() - optimized.length;
+            optimized.truncate(origin + 1, &stream).unwrap();
+            reference.truncate(origin + 1, &stream).unwrap();
+            let a = optimized
+                .update_and_fetch(input(&[7., 17.]), input(&[7., 17.]), &stream)
+                .unwrap();
+            let b = reference
+                .update_and_fetch(input(&[7., 17.]), input(&[7., 17.]), &stream)
+                .unwrap();
+            assert_eq!(read(a.0), read(b.0));
+            assert_eq!(optimized.offset(), reference.offset());
+        }
+    }
 }

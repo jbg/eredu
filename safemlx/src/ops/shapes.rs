@@ -3,7 +3,7 @@ use smallvec::SmallVec;
 
 use crate::{
     constants::DEFAULT_STACK_VEC_LEN,
-    error::Result,
+    error::{Exception, Result},
     utils::{guard::Guarded, IntoOption, VectorArray},
     Array, Stream,
 };
@@ -199,6 +199,25 @@ pub fn as_strided<'a>(
     let shape = shape.into_option().unwrap_or(a.shape());
     let resolved_strides = resolve_strides(shape, strides.into_option());
     let offset = offset.into().unwrap_or(0);
+    // MLX flattens the logical input before applying strides. Bound every
+    // addressed element to that logical extent, including negative strides;
+    // physical spare capacity is not an admitted input region.
+    if shape.len() != resolved_strides.len() || shape.iter().any(|&dim| dim < 0) {
+        return Err(Exception::custom("invalid strided view geometry"));
+    }
+    let mut low = offset as i128;
+    let mut high = low;
+    for (&dim, &stride) in shape.iter().zip(&resolved_strides) {
+        let delta = (dim.saturating_sub(1).max(0) as i128) * stride as i128;
+        low += delta.min(0);
+        high += delta.max(0);
+    }
+    let empty = shape.contains(&0);
+    if (empty && offset > a.size()) || (!empty && (low < 0 || high >= a.size() as i128)) {
+        return Err(Exception::custom(
+            "strided view exceeds logical input extent",
+        ));
+    }
 
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_as_strided(

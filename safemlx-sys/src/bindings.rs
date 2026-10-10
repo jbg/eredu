@@ -4959,3 +4959,15 @@ unsafe extern "C" {
     pub fn mlx_event_timing_summary(sum: *mut f64, occupied: *mut f64, span: *mut f64,
         intervals: *mut u64, missing: *mut u64, event: mlx_event) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn _mlx_array_is_row_contiguous(result: *mut bool, array: mlx_array) -> ::std::os::raw::c_int;
+    /// Private one-use append into safe-wrapper-owned suffix storage.
+    ///
+    /// # Safety
+    /// The backing's suffix must be private, initialized storage, reserved once
+    /// before this call. No published view may include the written suffix.
+    /// Reservations cannot be refunded after failure or discarded lazy work.
+    pub fn _mlx_prefix_append(result: *mut mlx_array, backing: mlx_array, update: mlx_array,
+        axis: ::std::os::raw::c_int, start: ::std::os::raw::c_int, stream: mlx_stream) -> ::std::os::raw::c_int;
+}

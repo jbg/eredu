@@ -13,6 +13,19 @@ use std::ffi::c_void;
 mod element;
 mod storage;
 
+fn row_contiguous(array: &Array) -> crate::error::Result<bool> {
+    let _guard = runtime_lock::enter_for_metadata();
+    bool::try_from_op(|result| unsafe {
+        safemlx_sys::_mlx_array_is_row_contiguous(result, array.as_ptr())
+    })
+}
+fn host_contiguous_copy(array: &Array) -> crate::error::Result<EvaluatedArray<'static>> {
+    thread_local! {
+        static CPU: Stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+    }
+    CPU.with(|stream| array.contiguous(false, stream)?.into_evaluated())
+}
+
 pub use storage::{inspect_storage, ArrayBackingStorage, ArrayStorageSurvey};
 
 cfg_safetensors! {
@@ -801,7 +814,8 @@ impl<'a> EvaluatedArray<'a> {
     /// # Safety
     ///
     /// This is unsafe because the underlying data ptr is not checked for null or if the desired
-    /// dtype matches the actual dtype of the array.
+    /// dtype matches the actual dtype of the array. The caller must also ensure
+    /// that the array is row-contiguous.
     ///
     /// # Example
     ///
@@ -844,6 +858,9 @@ impl<'a> EvaluatedArray<'a> {
     /// ```
     pub fn try_as_slice<T: ArrayElement>(&self) -> Result<&[T], AsSliceError> {
         let array = self.as_array();
+        if !row_contiguous(array)? {
+            return Err(AsSliceError::NonContiguous);
+        }
         if array.dtype() != T::DTYPE {
             return Err(AsSliceError::DtypeMismatch {
                 expecting: T::DTYPE,
@@ -892,11 +909,15 @@ impl<'a> EvaluatedArray<'a> {
 
     /// Copies evaluated array data into an owned vector.
     ///
+    /// Strided views are copied in logical order into independent contiguous storage.
     /// Unlike [`Self::try_as_slice`], this accepts MLX views whose data pointer
     /// is not aligned for a Rust slice. Each element is copied with an
     /// unaligned read instead of constructing a reference to that storage.
     pub fn try_to_vec<T: ArrayElement + Copy>(&self) -> Result<Vec<T>, AsSliceError> {
         let array = self.as_array();
+        if !row_contiguous(array)? {
+            return host_contiguous_copy(array)?.try_to_vec();
+        }
         if array.dtype() != T::DTYPE {
             return Err(AsSliceError::DtypeMismatch {
                 expecting: T::DTYPE,
@@ -930,6 +951,9 @@ impl<'a> EvaluatedArray<'a> {
     ///
     /// This is named `deep_clone` to avoid confusion with the `Clone` trait.
     pub fn deep_clone(&self) -> crate::error::Result<EvaluatedArray<'static>> {
+        if !row_contiguous(self.as_array())? {
+            return host_contiguous_copy(self.as_array());
+        }
         unsafe {
             let array = self.as_array();
             let dtype = array.dtype();

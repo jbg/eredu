@@ -329,8 +329,10 @@ impl MlxKeyValueState {
                 }
                 let window = key_value_window(layer, policy)?;
                 Ok(MlxKeyValueLayerState::Device(match window {
-                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
-                    None => ConcatKeyValueCache::new(),
+                    Some(window) => {
+                        ConcatKeyValueCache::new_append_only_for_sliding_attention(window)
+                    }
+                    None => ConcatKeyValueCache::new_append_only(),
                 }))
             })
             .collect::<Result<Vec<_>, Exception>>()?;
@@ -418,9 +420,9 @@ impl MlxKeyValueState {
                     Some(StateComponentPlacement::Device) => {
                         Ok(MlxKeyValueLayerState::Device(match window {
                             Some(window) => {
-                                ConcatKeyValueCache::new_for_sliding_attention(window)
+                                ConcatKeyValueCache::new_append_only_for_sliding_attention(window)
                             }
-                            None => ConcatKeyValueCache::new(),
+                            None => ConcatKeyValueCache::new_append_only(),
                         }))
                     }
                     Some(StateComponentPlacement::Paged) => {
@@ -506,7 +508,8 @@ impl MlxKeyValueState {
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
-        self.layers
+        let paged = self
+            .layers
             .iter()
             .find_map(|layer| match layer {
                 MlxKeyValueLayerState::Paged(cache) => {
@@ -514,7 +517,15 @@ impl MlxKeyValueState {
                 }
                 _ => None,
             })
-            .unwrap_or(Some(0))
+            .unwrap_or(Some(0))?;
+        self.layers
+            .iter()
+            .try_fold(paged, |bytes, layer| match layer {
+                MlxKeyValueLayerState::Device(cache) => {
+                    bytes.checked_add(cache.spare_capacity_bytes()?)
+                }
+                _ => Some(bytes),
+            })
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
