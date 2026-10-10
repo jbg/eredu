@@ -39,6 +39,17 @@ impl Drop for Queue {
 thread_local! {
     static RETIRED: RefCell<Queue> = RefCell::default();
     static RECLAIMING: Cell<bool> = const { Cell::new(false) };
+    static TRIM_CACHE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Last field of a retired executable owner: schedules allocator cleanup after
+/// its resources finish ordinary-host destruction, never inside native Drop.
+pub(crate) struct TrimCacheOnRetirement;
+
+impl Drop for TrimCacheOnRetirement {
+    fn drop(&mut self) {
+        let _ = TRIM_CACHE.try_with(|pending| pending.set(true));
+    }
 }
 
 /// Preallocated ownership staged for explicit, unlocked ordinary-host cleanup.
@@ -117,6 +128,16 @@ pub(crate) fn reclaim() {
         while let Some(mut node) = pending.0.take() {
             pending.0 = node.take_next();
             drop(node);
+        }
+        // No native query on ordinary frame retirement. A final executable
+        // requests cleanup only after nested owners have finished destruction.
+        if TRIM_CACHE.try_with(Cell::get).unwrap_or(false) {
+            let empty = RETIRED
+                .try_with(|retired| retired.borrow().0.is_none())
+                .unwrap_or(false);
+            if empty && safemlx::memory::clear_cache().is_ok() {
+                let _ = TRIM_CACHE.try_with(|pending| pending.set(false));
+            }
         }
     });
 }

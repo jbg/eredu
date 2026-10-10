@@ -8498,7 +8498,7 @@ The native allocator also retains cache-policy provenance. Its locked getter
 returns the limit and origin together; direct native setters mark explicit
 ownership even for unchanged values. Conditional initialization under that same
 lock caps only untouched defaults at a ceiling sized by portable runtime policy:
-1/32 of currently available host memory, capped at 2 GiB, with a 256 MiB fallback
+1/32 of currently available host memory, capped at 8 GiB, with a 256 MiB fallback
 when the observation is unavailable. Smaller native defaults remain smaller;
 there is no minimum for constrained processes. The adapter supplies the host
 observation without selecting model-family behavior. Initialization can instead
@@ -8512,6 +8512,47 @@ ceiling is selected once, not resized during active requests or in response to
 later memory pressure. Reclamation is
 still native; existing retention and graph allowances remain in the forecast.
 The native wrapper owns the unsafe-code boundary.
+
+VoiceChat component construction and independent speech-provider construction
+use the same initialization contract. Construction boundaries trim unused native
+buffers after binding and after completed fixed prompt/silence preparation;
+bounded quantization also reaps completed tile owners
+before trimming its one-use conversion buffers. Final text and VoiceChat
+executable owners schedule cache trimming through ordinary retirement. Nested
+resource retirement finishes before that trim runs, outside native locks and
+without releasing unresolved completion roots. Inference frames retain reusable
+buffers under the selected policy. `trim_local_allocator_cache` exposes explicit
+ordinary-host trimming without changing the limit or its provenance.
+
+`eredu-checkpoint::prepared_cache` owns content-addressed, file-backed prepared
+weights. The producer identity includes the conversion mechanism version,
+native platform, execution-device class, quantization policy, source recipes and companion
+precision. Source identity hashes exact bounded leases, including scalar geometry
+and source encoding; filenames and timestamps do not authorize reuse. The generic
+MLX bounded quantizer writes each completed encoded tile directly to this neutral
+sink, with no complete packed payload retained in host vectors. The default cache
+uses the user cache directory under `eredu/prepared-checkpoints-v1` (with the
+operating-system temporary directory as a fallback) and retains at most 32 GiB
+of prepared files. `EREDU_PREPARED_CHECKPOINT_CACHE`
+selects its directory; `BoundedQuantizationPlan::with_prepared_cache` accepts an
+explicit neutral location and byte budget. External cache cleanup can remove
+unused entries between processes; misses reconstruct them from the original
+prepared source.
+
+Cache admission serializes publication and eviction using a directory lock.
+Only cache-owned content-addressed filenames participate in cleanup and eviction;
+unrelated files in a configured directory remain untouched.
+Published source owners hold shared per-entry file locks; eviction requires an
+exclusive lock and skips leased entries. Capacity pinned by active sources is a
+typed store failure, never permission to exceed the budget. Reuse refreshes
+recency metadata separately from immutable tensor-file admission. Ordered bounded
+writes must cover every declared tensor before publication. File checksums reject
+corruption; incomplete files are unpublished and removed on failure or the next
+admission. Prepared tensors use the existing SafeTensors source, bounded selection,
+exact file-admission and weak payload-lease cache mechanisms. Repeated loads skip
+native quantization, while still verifying source content and prepared-file
+integrity. File-backed source pages remain subject to operating-system caching;
+prepared storage does not claim zero physical-memory use.
 
 Cold prefix support is an explicit architecture declaration in
 `ReplicatedTextRequirements`, combined with the backend's settled-prefix mechanism

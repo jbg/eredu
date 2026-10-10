@@ -17,6 +17,8 @@ pub mod expert;
 /// Neutral block-FP8 metadata normalization.
 pub mod fp8;
 pub mod gguf_store;
+/// Bounded persisted encoded prepared-checkpoint storage.
+pub mod prepared_cache;
 pub mod recipe;
 /// Compact row-addressable recipes and bounded, duplicate-aware read planning.
 pub mod rows;

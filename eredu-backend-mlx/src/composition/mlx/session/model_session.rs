@@ -27,6 +27,7 @@ pub(super) struct SessionPayload {
     processor: Option<ModelProcessor>,
     #[cfg(test)]
     _retirement_probe: Option<Box<dyn std::any::Any>>,
+    _cache_cleanup: crate::backend::ordinary_retirement::TrimCacheOnRetirement,
 }
 
 /// One submission owns both the entire executable and its neutral authority.
@@ -697,6 +698,7 @@ impl MlxModelSession {
                 processor,
                 #[cfg(test)]
                 _retirement_probe: None,
+                _cache_cleanup: crate::backend::ordinary_retirement::TrimCacheOnRetirement,
             })),
             poison: Rc::new(Cell::new(false)),
             failure: RefCell::new(None),

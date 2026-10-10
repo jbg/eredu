@@ -1,22 +1,19 @@
 use super::*;
 use super::{
-    layout::{
-        allocate_output_buffer, output_layouts, BoundedAllocatorCache, OutputLayout, OutputShard,
-    },
+    layout::{output_layouts, BoundedAllocatorCache, OutputLayout, OutputShard},
     preflight::{
         checked_product, output_names_for, preflight_source_collisions, quantization_error,
         report_source_bytes,
     },
 };
 
-/// A source checkpoint overlaid with memory-backed, load-time-quantized weights.
+/// A source checkpoint overlaid with persisted, load-time-quantized weights.
 ///
-/// The packed store lives as long as this value. Runtime acquisitions of
-/// transformed keys use bounded in-memory leases; all other keys delegate to
-/// the original store.
+/// Transformed keys use bounded file-backed leases from the neutral prepared
+/// cache; all other keys delegate to the original admitted source.
 pub struct BoundedQuantizedWeightStore {
     source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    transformed: MemoryWeightStore,
+    transformed: eredu_checkpoint::store::SharedCheckpointSource,
     transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
     materialized_source_shards: BTreeSet<PathBuf>,
@@ -81,6 +78,74 @@ impl BoundedQuantizedWeightStore {
                 materialized_source_shards.insert(path);
             }
         }
+        let geometries = plan
+            .targets
+            .iter()
+            .map(|target| target_geometry(source.as_ref(), target, &plan))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let fingerprint_bound = plan
+            .max_working_set_bytes
+            .min(8 * 1024 * 1024)
+            .max(geometries.iter().map(|g| g.one_row_peak).max().unwrap_or(0));
+        let prepared_layouts = geometries
+            .into_iter()
+            .flat_map(|geometry| geometry.layouts)
+            .map(|layout| PreparedTensorLayout {
+                name: layout.name,
+                dtype: layout.dtype,
+                shape: layout.shape,
+            })
+            .collect::<Vec<_>>();
+        // Versioned generic native mechanism identity; semantic recipes come
+        // from the retained plan, never reconstructed from checkpoint names.
+        let identity = format!(
+            "mlx-bounded-quantization-v1:{}:{}:{:?}:{:?}:{:?}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            device.get_type()?,
+            plan.quantization,
+            plan.targets
+        );
+        let key = prepared_checkpoint_recipe_key(
+            source.as_ref(),
+            &plan
+                .targets
+                .iter()
+                .map(|target| target.source.clone())
+                .collect::<Vec<_>>(),
+            identity.as_bytes(),
+            fingerprint_bound,
+        )?;
+        let entry = plan
+            .cache
+            .prepare(&key, &prepared_layouts, plan.max_working_set_bytes)?;
+        let writer = match entry {
+            PreparedCheckpointEntry::Cached(transformed) => {
+                let transformed_keys = transformed.source_keys().into_iter().collect();
+                let output_bytes = prepared_layouts.iter().try_fold(
+                    0u64,
+                    |sum, layout| -> Result<u64, Error> {
+                        let bytes = transformed.source_metadata(&layout.name)?.encoded_byte_len;
+                        sum.checked_add(bytes)
+                            .ok_or_else(|| quantization_error("prepared output size overflow"))
+                    },
+                )?;
+                return Ok(Self {
+                    source,
+                    transformed,
+                    transformed_keys,
+                    materialized_source_keys,
+                    materialized_source_shards,
+                    report: WeightMaterializationReport {
+                        admitted_working_set_bytes: plan.max_working_set_bytes,
+                        transformed_weights: plan.targets.len(),
+                        output_bytes,
+                        ..Default::default()
+                    },
+                });
+            }
+            PreparedCheckpointEntry::Vacant(writer) => Arc::new(Mutex::new(writer)),
+        };
         let mut transformed_keys = BTreeSet::new();
         let mut report = WeightMaterializationReport {
             admitted_working_set_bytes: plan.max_working_set_bytes,
@@ -97,6 +162,7 @@ impl BoundedQuantizedWeightStore {
                 target,
                 &plan,
                 &tile_contexts,
+                &writer,
                 &mut output_shards,
                 &mut pending_tiles,
                 &mut allocator_cache,
@@ -114,14 +180,12 @@ impl BoundedQuantizedWeightStore {
             .all(|shard| shard.sealed && shard.pending_tiles == 0));
         allocator_cache.finish()?;
 
-        let transformed =
-            MemoryWeightStore::from_safetensors(output_shards.into_iter().flat_map(|shard| {
-                shard
-                    .layouts
-                    .into_iter()
-                    .zip(shard.buffers)
-                    .map(|(layout, bytes)| (layout.name, layout.dtype, layout.shape, bytes))
-            }))?;
+        drop(output_shards);
+        let writer = Arc::try_unwrap(writer)
+            .map_err(|_| quantization_error("prepared writer is still retained"))?
+            .into_inner()
+            .map_err(|_| quantization_error("prepared writer is poisoned"))?;
+        let transformed = writer.finish()?;
         Ok(Self {
             source,
             transformed,
@@ -185,7 +249,7 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
         key: &str,
     ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
         if self.is_transformed(key) {
-            CheckpointSource::source_metadata(&self.transformed, key)
+            self.transformed.source_metadata(key)
         } else {
             self.source.source_metadata(key)
         }
@@ -193,15 +257,38 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
         if self.is_transformed(&request.key) {
-            CheckpointSource::acquire_lease(&self.transformed, request)
+            self.transformed.acquire_lease(request)
         } else {
             self.source.acquire_lease(request)
         }
     }
 
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
+        if self.is_transformed(key) {
+            self.transformed.source_provenance(key)
+        } else {
+            self.source.source_provenance(key)
+        }
+    }
+    fn prepare_encoded_read(
+        &self,
+        requests: &[TensorReadRequest],
+    ) -> Result<Option<eredu_checkpoint::store::EncodedReadBatch>, StoreError> {
+        if requests.iter().all(|r| self.is_transformed(&r.key)) {
+            self.transformed.prepare_encoded_read(requests)
+        } else if requests.iter().all(|r| !self.is_transformed(&r.key)) {
+            self.source.prepare_encoded_read(requests)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         let source = self.source.source_diagnostics()?;
-        let transformed = CheckpointSource::source_diagnostics(&self.transformed)?;
+        let transformed = self.transformed.source_diagnostics()?;
         let mut touched = source.touched_shard_paths;
         touched.extend(transformed.touched_shard_paths);
         touched.sort();
@@ -233,16 +320,22 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
     }
 }
 
-fn transform_target(
-    source: &dyn eredu_checkpoint::store::CheckpointSource,
+struct TargetGeometry {
+    metadata: eredu_checkpoint::recipe::RecipeMetadata,
+    row_axis: usize,
+    leading: usize,
+    rows: usize,
+    columns: usize,
+    layouts: Vec<OutputLayout>,
+    output_row_bytes: u64,
+    one_row_source_bytes: u64,
+    one_row_peak: u64,
+}
+fn target_geometry(
+    source: &dyn CheckpointSource,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
-    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
-    output_shards: &mut Vec<OutputShard>,
-    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
-    allocator_cache: &mut BoundedAllocatorCache,
-    report: &mut WeightMaterializationReport,
-) -> Result<(), Error> {
+) -> Result<TargetGeometry, Error> {
     let metadata = target.source.infer(source)?;
     if metadata.shape().len() < 2
         || !matches!(
@@ -323,6 +416,41 @@ fn transform_target(
             .select_bounded_matrix_rows(source, matrix, 0, 1)?
             .preflight_bounded(source)?;
     }
+    Ok(TargetGeometry {
+        metadata,
+        row_axis,
+        leading,
+        rows,
+        columns,
+        layouts,
+        output_row_bytes,
+        one_row_source_bytes,
+        one_row_peak,
+    })
+}
+
+fn transform_target(
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    target: &BoundedQuantizationTarget,
+    plan: &BoundedQuantizationPlan,
+    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
+    writer: &Arc<Mutex<PreparedCheckpointWriter>>,
+    output_shards: &mut Vec<OutputShard>,
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    allocator_cache: &mut BoundedAllocatorCache,
+    report: &mut WeightMaterializationReport,
+) -> Result<(), Error> {
+    let TargetGeometry {
+        metadata,
+        row_axis,
+        leading,
+        rows,
+        columns,
+        layouts,
+        output_row_bytes,
+        one_row_source_bytes,
+        one_row_peak,
+    } = target_geometry(source, target, plan)?;
     let tile_buffers = if one_row_peak
         .checked_mul(BOUNDED_QUANTIZATION_TILE_BUFFERS as u64)
         .is_some_and(|bytes| bytes <= plan.max_working_set_bytes)
@@ -343,13 +471,9 @@ fn transform_target(
             .ok_or_else(|| quantization_error("quantized output telemetry overflow"))
     })?;
     let output_shard = output_shards.len();
-    let buffers = layouts
-        .iter()
-        .map(|layout| allocate_output_buffer(&layout.name, layout.byte_len))
-        .collect::<Result<Vec<_>, _>>()?;
     output_shards.push(OutputShard {
         layouts,
-        buffers,
+        writer: writer.clone(),
         pending_tiles: 0,
         sealed: false,
     });
@@ -670,13 +794,12 @@ struct SubmittedQuantizationTile {
 impl SubmittedQuantizationTile {
     fn write(self, shard: &mut OutputShard) -> Result<(), Error> {
         self.completion.wait()?;
-        for ((layout, output), buffer) in shard
-            .layouts
-            .iter()
-            .zip(self.completion.outputs())
-            .zip(&mut shard.buffers)
-        {
-            write_tile(buffer, layout, self.output_start, self.rows, output)?;
+        let mut writer = shard
+            .writer
+            .lock()
+            .map_err(|_| quantization_error("prepared writer is poisoned"))?;
+        for (layout, output) in shard.layouts.iter().zip(self.completion.outputs()) {
+            write_tile(&mut writer, layout, self.output_start, self.rows, output)?;
         }
         Ok(())
     }
@@ -711,7 +834,7 @@ fn queued_working_set_bytes(
 }
 
 fn write_tile(
-    buffer: &mut [u8],
+    writer: &mut PreparedCheckpointWriter,
     layout: &OutputLayout,
     start_row: usize,
     rows: usize,
@@ -735,20 +858,6 @@ fn write_tile(
         .row_bytes
         .checked_mul(start_row as u64)
         .ok_or_else(|| quantization_error("quantized tile memory offset overflow"))?;
-    let offset = usize::try_from(offset)
-        .map_err(|_| quantization_error("quantized tile memory offset is not representable"))?;
-    let expected_bytes = usize::try_from(expected_bytes)
-        .map_err(|_| quantization_error("quantized tile byte count is not representable"))?;
-    let destination = buffer
-        .get_mut(offset..offset + expected_bytes)
-        .ok_or_else(|| {
-            quantization_error(format!(
-                "quantized output {:?} tile rows {}..{} exceed its in-memory buffer",
-                layout.name,
-                start_row,
-                start_row + rows
-            ))
-        })?;
     let evaluated = output.evaluated()?;
     match output.dtype() {
         Dtype::Uint32 | Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Uint8 => {}
@@ -759,6 +868,6 @@ fn write_tile(
             )));
         }
     }
-    destination.copy_from_slice(&evaluated.to_native_bytes());
+    writer.write(&layout.name, offset, &evaluated.to_native_bytes())?;
     Ok(())
 }

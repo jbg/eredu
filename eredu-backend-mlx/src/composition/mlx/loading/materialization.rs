@@ -273,6 +273,7 @@ impl PreparedExecutableAssembler<MlxDistributedSession> for MlxExecutableAssembl
         {
             model = model.with_processor(processor.map(ModelProcessor::from_prepared));
         }
+        crate::trim_allocator_cache()?;
         Ok(model)
     }
 }

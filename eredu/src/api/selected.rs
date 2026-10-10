@@ -696,3 +696,11 @@ mod tests {
         validate_expert_cache_benchmark_prompt(&[1]).unwrap();
     }
 }
+
+/// Releases unused local allocator buffers without changing the configured policy.
+/// Active tensors and unresolved native submissions remain protected.
+pub fn trim_local_allocator_cache() -> Result<(), eredu_core::BackendFailure> {
+    eredu_backend_mlx::trim_allocator_cache().map_err(|error| {
+        eredu_core::BackendFailure::from_error(error).with_operation("allocator-cache trimming")
+    })
+}

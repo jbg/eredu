@@ -1319,6 +1319,14 @@ pub enum StoreError {
     /// The configured cached-shard or reader limit was zero.
     #[error("maximum cached-shard count must be nonzero")]
     InvalidShardCacheLimit,
+    /// Prepared-file admission exceeds its byte budget or is pinned by live sources.
+    #[error("prepared checkpoint cache needs {required_bytes} bytes, but permits {limit_bytes}")]
+    PreparedCacheCapacity {
+        /// Total bytes that cannot be admitted after unleased eviction.
+        required_bytes: u64,
+        /// Configured prepared-file byte budget.
+        limit_bytes: u64,
+    },
     /// A requested tensor is absent.
     #[error("unknown checkpoint tensor {key:?}")]
     UnknownTensor {

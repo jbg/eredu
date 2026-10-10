@@ -91,12 +91,13 @@ impl BoundedQuantizationTarget {
     }
 }
 
-/// A validated collection of source-bounded, memory-resident transformations.
+/// A validated collection of source-bounded, file-backed transformations.
 #[derive(Debug, Clone)]
 pub struct BoundedQuantizationPlan {
     pub(super) quantization: WeightQuantization,
     pub(super) max_working_set_bytes: u64,
     pub(super) targets: Vec<BoundedQuantizationTarget>,
+    pub(super) cache: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
 }
 
 impl BoundedQuantizationPlan {
@@ -145,7 +146,17 @@ impl BoundedQuantizationPlan {
             quantization,
             max_working_set_bytes,
             targets,
+            cache: Default::default(),
         })
+    }
+
+    /// Selects filesystem location and total retained prepared-checkpoint bytes.
+    pub fn with_prepared_cache(
+        mut self,
+        policy: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
+    ) -> Self {
+        self.cache = policy;
+        self
     }
 
     /// Returns the final packed encoding.

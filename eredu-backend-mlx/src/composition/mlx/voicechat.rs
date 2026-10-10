@@ -183,7 +183,10 @@ pub fn materialize_voicechat_components(
     weights_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<(MlxVoiceChatComponents, InputState<MlxTensor>), VoiceChatConstructionError> {
-    detached_preparation(
+    crate::initialize_allocator_cache_policy(false).map_err(|error| {
+        VoiceChatConstructionError::Backend(eredu_core::BackendFailure::from_error(error))
+    })?;
+    let result = detached_preparation(
         Vec::<Array>::new(),
         || {
             let mut binder = providers::Binder::new(weights_stream, execution_stream);
@@ -195,7 +198,16 @@ pub fn materialize_voicechat_components(
             )
         },
         |error| VoiceChatConstructionError::Backend(eredu_core::BackendFailure::from_error(error)),
-    )
+    );
+    // One-use construction buffers have no inference reuse value. Active roots
+    // and unresolved submissions remain protected by native ownership.
+    let trim = crate::trim_allocator_cache();
+    result.and_then(|value| {
+        trim.map_err(|error| {
+            VoiceChatConstructionError::Backend(eredu_core::BackendFailure::from_error(error))
+        })?;
+        Ok(value)
+    })
 }
 
 impl NeuralStateParts for MlxJointStateBranch {

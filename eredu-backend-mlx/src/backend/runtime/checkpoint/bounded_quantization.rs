@@ -1,22 +1,13 @@
-//! Bounded load-time weight quantization into resident memory.
-
+//! Bounded load-time quantization into persisted prepared-checkpoint storage.
 //!
-//! A [`BoundedQuantizedWeightStore`](crate::backend::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
-//! overlays packed tensors on an existing
-//! checkpoint store. Source matrices are selected in row tiles, quantized on
-//! explicit conversion streams, and written directly into final in-memory
-//! encoded tensors. A fixed two-slot completion window spans tensor boundaries and
-//! overlaps the next tile with the prior tile's host copy when both slots fit
-//! the admitted working set, and otherwise falls back to one slot. The
-//! process never requires a complete dense matrix in active memory: tile size is
-//! admitted against an explicit byte bound, while final packed storage remains
-//! resident for the subsequent model load. The
-//! ordinary residency machinery subsequently sees only the final packed tensor
-//! geometry.
+//! Native conversion uses explicit streams and a two-slot completion window.
+//! The neutral checkpoint cache owns bounded encoded writes, content identity,
+//! atomic publication, eviction and source leases. Runtime materialization sees
+//! ordinary file-backed packed tensors without permanent host payload copies.
 
 use eredu_checkpoint::store::{
-    CheckpointLease, CheckpointSource, MemoryWeightStore, StoreError, TensorReadRequest,
-    TensorSelection, WeightStoreDiagnostics,
+    CheckpointLease, CheckpointSource, StoreError, TensorReadRequest, TensorSelection,
+    WeightStoreDiagnostics,
 };
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -24,10 +15,15 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::WeightMaterializationReport;
 
+use eredu_checkpoint::prepared_cache::{
+    prepared_checkpoint_recipe_key, PreparedCheckpointEntry, PreparedCheckpointWriter,
+    PreparedTensorLayout,
+};
+
 use std::{
     collections::{BTreeSet, VecDeque},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use safemlx::{memory, Array, Dtype, Stream};

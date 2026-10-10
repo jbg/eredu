@@ -72,12 +72,17 @@ impl MlxRealtimeExecutionContext {
         selected: MlxPreparedRealtimeExecution,
     ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
         crate::initialize_allocator_cache_policy(false)?;
-        materialize_realtime_model(
+        let result = materialize_realtime_model(
             selected,
             self.world_group.clone(),
             &self.stream,
             &self.weights_stream,
-        )
+        );
+        let trim = crate::trim_allocator_cache();
+        result.and_then(|model| {
+            trim?;
+            Ok(model)
+        })
     }
 
     /// Creates backend-native cache state from the selected neutral layout.

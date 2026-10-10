@@ -1014,6 +1014,57 @@ These tensors have no numerical comparison with Eredu and establish no
 tolerance or parity result. Complete NVIDIA speech comparison,
 released-weight snapshots and distributed/residency comparisons remain unvalidated.
 
+### Allocator and prepared-checkpoint memory
+
+VoiceChat component and speech-provider realization use the ordinary allocator
+policy: 1/32 of currently available memory, capped at 8 GiB, with the shared
+256 MiB fallback. Explicit and preserved-native choices remain authoritative.
+Completed binding and fixed prompt/silence preparation trim unused buffers;
+inference retains reusable buffers. Final executable retirement trims after
+nested owners finish ordinary-host destruction, preserving unresolved completion
+roots. The generic bounded quantizer persists encoded tiles through the neutral
+prepared-checkpoint cache and existing bounded SafeTensors leases, eliminating
+complete packed host payload vectors. The default prepared-file budget is 32 GiB;
+active source leases prevent eviction. `doc/backend-architecture.md` describes
+location, identity, integrity, publication and budget contracts.
+
+The M3 Ultra comparison uses the pinned checkpoint and accepted experimental
+8-bit/group-64 backbone/function/causal-TTS recipe, F16 remaining speech/perception
+weights with F32 arithmetic, F32 quantized TTS inputs/companions, and 25-operation /
+256 MiB batching. Each run contains 996 live frames (79.68 s audio); 986 warmed
+intervals exclude loading, prefill, drain and the first ten live frames. Native
+memory probes and 250 ms macOS footprint sampling run without vmmap pauses or
+concurrent native compilation.
+
+| Long-conversation source/cache realization | Peak process footprint | Load | Warm mean frame | p95 | Frames above 80 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Memory-backed packed sources, explicit 8 GiB allocator control | 36.205 GiB | 98.379 s | 74.207 ms | 84.590 ms | 118 |
+| Persisted packed sources, cold conversion, adaptive allocator | 22.773 GiB | 125.155 s | 74.097 ms | 84.806 ms | 117 |
+| Persisted packed sources, reused cache, adaptive allocator | 22.501 GiB | 24.914 s | 74.092 ms | 84.766 ms | 117 |
+
+The matched cold run reduces peak footprint by 13.432 GiB (37.10%). Three packed
+sources contain 11,326,242,816 payload bytes (10.548 GiB), without permanent host
+vectors. Fresh preparation includes source-content fingerprinting, file writes
+and checksum work; reuse performs no native quantization tiles. Automatically
+selected allocator limits are about 7.24 GiB with `ManagedDefault` provenance.
+Unused native cache is zero after completed startup preparation. After session
+drop and ordinary retirement, live and cached MLX counters are both exactly zero.
+File-backed pages remain subject to operating-system caching, separate from those
+counters. Legitimate history growth and the remaining late-frame deadline misses
+remain; mean throughput does not certify hard realtime or microphone/speaker
+pacing.
+
+Both persisted-source runs reproduce all 3,818 semantic events and full accepted
+WAV bytes exactly. The WAV SHA-256 is
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
+External `/private/tmp/eredu-memory-cache` retains `REPORT.md`, `comparison.json`,
+reproduction/build scripts, source/binary hashes, restoration manifests, full
+WAV/JSONL output, sampled memory and per-frame latency. Native bounded-quantization,
+retirement/completion and controlled/scheduled publication checks pass; neutral
+cache coverage includes selected-content identity, bounded reload reads, lease
+capacity, eviction, reduced-budget hits, unrelated-file protection, corruption
+repair and incomplete-write cleanup. The portable facade check passes.
+
 ### Released-checkpoint tool round trip
 
 The tool-round-trip measurement dated 2026-10-05 uses the resident Metal WAV

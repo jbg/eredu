@@ -87,3 +87,12 @@ pub fn allocator_memory() -> Result<AllocatorMemoryMetrics, Error> {
 pub fn set_accelerator_library_path(path: impl AsRef<std::path::Path>) -> Result<(), Error> {
     safemlx::metal::set_metallib_path(path).map_err(Into::into)
 }
+
+/// Releases unused allocator buffers at an explicit ordinary-host boundary.
+/// Active tensors and unresolved completion roots remain owned; this does not
+/// synchronize work, change cache policy, or release compiled functions.
+pub fn trim_allocator_cache() -> Result<(), Error> {
+    crate::backend::submission_recovery::reap();
+    crate::backend::ordinary_retirement::reclaim_all();
+    safemlx::memory::clear_cache().map_err(Into::into)
+}

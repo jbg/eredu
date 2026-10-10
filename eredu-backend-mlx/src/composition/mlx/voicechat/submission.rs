@@ -81,6 +81,7 @@ struct ExecutionPayload {
     stream: Stream,
     poisoned: Cell<bool>,
     active: Cell<bool>,
+    _cache_cleanup: crate::backend::ordinary_retirement::TrimCacheOnRetirement,
 }
 
 /// Selected native execution whose invocations use the ordinary shared scheduler.
@@ -101,6 +102,7 @@ impl MlxVoiceChatExecution {
                 stream: stream.clone(),
                 poisoned: Cell::new(false),
                 active: Cell::new(false),
+                _cache_cleanup: crate::backend::ordinary_retirement::TrimCacheOnRetirement,
             })),
         }
     }
@@ -186,6 +188,14 @@ impl MlxVoiceChatExecution {
             visit_roots,
         )?;
         completion.wait().map_err(|error| {
+            VoiceChatSubmissionError::Backend(BackendFailure::from_error(error))
+        })?;
+        // Fixed prompt/silence preparation is a one-use construction region.
+        // Release settled scope owners before discarding its unused buffers,
+        // with no component borrow held during ordinary retirement.
+        drop(completion);
+        drop(components);
+        crate::trim_allocator_cache().map_err(|error| {
             VoiceChatSubmissionError::Backend(BackendFailure::from_error(error))
         })?;
         Ok(output)
