@@ -1670,6 +1670,34 @@ cargo test -p eredu-backend-mlx --no-default-features --lib mixed_realtime_obser
 cargo test -p eredu-backend-mlx --no-default-features --lib mixed_realtime_channels_materialize_exact_native_values
 ```
 
+## Conversational quality limits
+
+Correct transcription does not guarantee a relevant agent response. A clean
+Samantha-synthesized recording of "Get out from under the table, please." produces
+a sexual-content refusal under both resident Q8/F16 speech execution and
+unquantized F32 execution. Both runs recognize `get out from under the table
+please`, start agent text at 3,920 ms, and produce the same 391-character response,
+beginning `I cannot fulfill this request.` The fixed mono PCM16 fixture contains
+341,119 samples at 16 kHz, including one second of leading silence and 18 seconds
+of trailing silence. Its WAV SHA-256 is
+`b25db6092a611fae32c7626241f3f0c95fb765ebbb930b78f3ddad2fc10f6a0c`.
+
+These measurements use the pinned official checkpoint and base assets above,
+seed zero, the system prompt `You are a helpful assistant.`, Metal on M3 Ultra,
+`MLX_MAX_OPS_PER_BUFFER=25`, `MLX_MAX_MB_PER_BUFFER=256`, offline WAV input and
+`--tail-frames 0`. Q8 uses `--quantize 8 --speech-weights f16 --speech-compute f16`;
+the floating control omits quantization and uses
+`--speech-weights f32 --speech-compute f32`.
+
+Quantization and narrow speech precision are not necessary to trigger this
+fixture's false refusal. Both controls use Eredu's execution mechanisms; they
+do not establish independent complete-model parity with NVIDIA's runtime.
+[NVIDIA's known limitations](https://github.com/NVIDIA-NeMo/Speech/tree/nemotron-labs-voicechat#known-limitations)
+include irrelevant canned replies, refusal loops, agent continuations without
+new input and missing transcription even on clear audio. These published
+limitations match the observed class of behavior without proving the cause of
+every incorrect response.
+
 ## MLX Community SafeTensors validation
 
 The shared SafeTensors path admits these pinned community artifacts:
