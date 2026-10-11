@@ -341,12 +341,13 @@ pub fn load(
     )?;
     if let Some(report) = prepared.speech_residency_report() {
         eprintln!(
-            "parameter admission: device={} host={} materialization={} execution_cache={} bytes; mutable state and activations are separate",
-            report.device_parameter_bytes,
-            report.host_parameter_bytes,
-            report.host_materialization_bytes,
-            report.speech.execution_cache_device_bytes
+            "Planned model memory: device weights {}, host weights {}, loading workspace {}, execution cache {}",
+            crate::format_memory_size(report.device_parameter_bytes),
+            crate::format_memory_size(report.host_parameter_bytes),
+            crate::format_memory_size(report.host_materialization_bytes),
+            crate::format_memory_size(report.speech.execution_cache_device_bytes)
         );
+        eprintln!("Conversation history and temporary computation buffers require additional memory.");
     }
     let weights = ExecutionContext::cpu()?;
     let execution = match device {

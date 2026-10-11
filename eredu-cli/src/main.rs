@@ -2862,6 +2862,10 @@ fn cli_execution_plan(
 }
 
 fn format_bytes(bytes: usize) -> String {
+    format!("{} ({bytes} bytes)", format_memory_size(bytes as u64))
+}
+
+fn format_memory_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
@@ -2876,7 +2880,7 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         (bytes_float, "B")
     };
-    format!("{value:.2} {unit} ({bytes} bytes)")
+    format!("{value:.2} {unit}")
 }
 
 fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkSample) {

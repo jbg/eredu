@@ -310,6 +310,13 @@ keeps sensitive floating operations intact. `--quantize-components` selects a
 subset. Quantized causal projections retain F32 arithmetic. Released packed
 checkpoints load without `--quantize`; re-quantization is rejected.
 
+Startup reports planned memory for device-side weights, separate host-side weight
+pools, loading/conversion workspace, and cached computations. These are admission
+allowances, not measured process RAM usage. Conversation history and temporary
+computation buffers require additional memory. On Apple silicon, device and host
+allocations share physical RAM; the loading workspace is a loading reservation,
+not an additional permanent weight copy.
+
 Use `--config voicechat.json` for tool declarations, split GGUF sources and precise
 resource configuration. Device, sampling, seed, mixed precision, parameter budgets
 and bounded host/disk residency have command-line overrides. Model identifiers
