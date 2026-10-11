@@ -1620,6 +1620,67 @@ per-frame records, waveforms, event comparisons and cache inventories. The tempo
 precision/quantization harness preserves parameter storage preferences and restores
 source files byte-for-byte after each build.
 
+### Fused FP32 gated arithmetic
+
+The existing generic grouped-RMS and tanh-GELU gated-product contracts use fused
+MLX Metal kernels for matching F32 arrays on the GPU. Grouped RMS retains MLX's
+ordinary sum reduction and fuses sigmoid/gating/squaring before it and
+mean/epsilon/rsqrt/scaling after it. GELU gating retains native power, coefficient
+square root and precise tanh, with independent F32 intermediates and disabled
+contraction/reassociation. Runtime scalar operands preserve the native power and
+mean arithmetic. Other dtypes, broadcasting, arrays exceeding the custom grid's
+integer range and non-Metal execution retain the ordinary operator path.
+
+Elementwise kernels use exact thread grids without specializing on array length;
+partial threadgroups cover uneven tails. The RMS output distributes independent
+elements across the grid. Kernels consume ordinary immutable array roots and
+produce independent outputs through the existing evaluation/completion mechanism;
+they do not mutate candidate state or introduce a separate completion path. These
+are reusable backend mechanisms behind existing neutral contracts, with no family
+code or application feature flag.
+
+Focused numerical fixtures compare exact F32 bits and NaN classification with the
+unfused native graph for grouped widths 17, 72, 257, 1280 and 10,240, multiple
+groups/rows, strided inputs, partial threadgroups, and GELU signed zeros, infinities,
+NaNs and small values. The backend also builds without accelerator features.
+
+```sh
+CARGO_INCREMENTAL=0 cargo test --offline -p eredu-backend-mlx \
+  --no-default-features --features accelerate,audio,metal --lib gated_arithmetic \
+  -- --test-threads=1
+CARGO_INCREMENTAL=0 cargo check --offline -p eredu-backend-mlx --no-default-features
+```
+
+Released-checkpoint measurements dated 2026-10-11 use the same M3 Ultra 80-core GPU,
+256 GiB memory, official checkpoint revision, accepted Q8/F16 precision recipe,
+input, seed and command-buffer limits as the exact-zero projection measurement
+above. Four controls disable only the two gated fast paths; three candidates enable
+both. Each conversation runs 996 live frames (79.68 seconds), excluding its first
+10 intervals from warm statistics. No profiling or compilation overlaps inference.
+
+| Measurement | Ordinary gated operators | Fused gated operators |
+| --- | ---: | ---: |
+| Pooled warm mean (ms) | 65.702 | 64.467 |
+| Pooled warm p95 (ms) | 67.166 | 66.018 |
+| Pooled warm p99 (ms) | 67.504 | 66.341 |
+| Worst warm interval (ms) | 69.312 | 69.673 |
+| Mean budget remaining, 80 ms frame (ms) | 14.298 | 15.533 |
+| Warm frames above 80 ms | 0 / 3,944 | 0 / 2,958 |
+
+The mean saving is **1.235 ms/frame (1.88%)**, increasing mean headroom by
+**8.64%**. Each candidate mean is below every control mean. The candidate means
+are 64.433, 64.667 and 64.300 ms/frame. All seven conversations match the accepted
+waveform and every semantic event exactly; waveform SHA-256 is
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
+These measurements cover the retained utterance and seed; they do not establish
+arbitrary dialogue histories or live microphone/speaker scheduling.
+
+Reproduction artifacts reside in `/private/tmp/eredu-gated-fusion`: `REPORT.md`,
+`results.json`, `build.py`, `run.py`, `measure.py`, source snapshots, benchmark
+patches, restoration checks, binary hashes, per-frame records, waveforms and
+semantic comparisons. The temporary accepted quantization preparation harness
+restores source files byte-for-byte after each build.
+
 ### Released-checkpoint tool round trip
 
 The tool-round-trip measurement dated 2026-10-05 uses the resident Metal WAV

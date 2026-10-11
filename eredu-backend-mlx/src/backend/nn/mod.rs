@@ -6,6 +6,7 @@ pub mod attention;
 pub(crate) mod codebooks;
 /// Architecture-neutral block-scaled FP8 projections.
 pub mod fp8;
+mod gated_arithmetic;
 /// Gated-delta recurrent scans shared by linear-attention architectures.
 pub mod gated_delta;
 pub(crate) mod grouped;

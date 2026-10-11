@@ -345,6 +345,11 @@ impl NeuralBackend for MlxNeuralBackend {
                 "invalid gated grouped RMS normalization geometry",
             ));
         }
+        if let Some(output) = compute(super::super::gated_arithmetic::grouped_rms(
+            input, gate, weight, groups, epsilon, context,
+        ))? {
+            return Ok(MlxTensor::from_array(output));
+        }
         let input = compute(input.as_dtype(Dtype::Float32, context))?;
         let gate = compute(gate.as_dtype(Dtype::Float32, context))?;
         let gate =
@@ -673,6 +678,11 @@ impl NeuralBackend for MlxNeuralBackend {
                 compute(gate.multiply(probability, context))?
             }
             eredu_nn::GatedProductActivation::GeluApproximate => {
+                if let Some(output) = compute(super::super::gated_arithmetic::gelu_product(
+                    &gate, &up, context,
+                ))? {
+                    return Ok(MlxTensor::from_array(output));
+                }
                 compute(nn::gelu_approximate(gate, context))?
             }
             _ => {
