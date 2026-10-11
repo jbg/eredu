@@ -13,7 +13,8 @@ readme = "README.md"
 default = []
 image = ["dep:image"]
 audio = ["dep:rustfft"]
-system-audio = ["audio", "dep:cpal", "dep:rtrb", "dep:rubato"]
+system-audio = ["audio", "echo-cancellation", "dep:cpal", "dep:rtrb", "dep:rubato"]
+echo-cancellation = ["audio", "dep:webrtc-audio-processing"]
 
 [lints]
 workspace = true
@@ -27,6 +28,7 @@ rustfft = { version = "6", optional = true }
 cpal = { version = "0.18.2", optional = true }
 rtrb = { version = "0.3", optional = true }
 rubato = { version = "0.16.2", default-features = false, optional = true }
+webrtc-audio-processing = { version = "~2.1", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 eredu-evaluation.workspace = true

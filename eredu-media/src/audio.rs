@@ -1,5 +1,7 @@
 //! Shared PCM validation and log-mel feature extraction.
 
+#[cfg(feature = "echo-cancellation")]
+pub mod echo;
 pub mod streaming;
 #[cfg(feature = "system-audio")]
 pub mod system;

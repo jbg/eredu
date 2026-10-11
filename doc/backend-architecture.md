@@ -236,6 +236,15 @@ no native inference runtime. The CLI drives file and system PCM through the same
 controlled-session adapter; native completion, rollback and neural state remain
 in their existing owners.
 
+`eredu-media::audio::echo` owns optional host WebRTC AEC3 processing, independent
+of model families and accelerator runtimes. System-audio duplex construction
+connects capture and actual native playback through bounded timestamped reference
+queues; callbacks only convert/copy PCM and update counters. Resampling and echo
+processing run on the capture reader. The CLI chooses whether a live device pair
+uses cancellation; it does not own the filter or its synchronization mechanism.
+The safe external host-library wrapper retains its own FFI boundary; repository
+crates retain `unsafe_code = "forbid"`.
+
 `eredu-checkpoint::quantization` owns bounded transformation targets, cold output
 metadata and pending prepared-source publication. Architecture preparation selects
 eligible matrices and execution precision before residency admission. The MLX

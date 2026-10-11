@@ -75,6 +75,9 @@ pub struct Args {
     /// Disable system playback (useful for unattended WAV benchmarks).
     #[arg(long)]
     no_playback: bool,
+    /// Disable acoustic echo cancellation for live microphone/speaker input.
+    #[arg(long, conflicts_with_all = ["input", "no_playback"])]
+    no_echo_cancellation: bool,
     /// Process file input without wall-clock pacing; requires --input --no-playback.
     #[arg(long, requires_all = ["input", "no_playback"])]
     offline: bool,
@@ -465,8 +468,8 @@ pub fn run(args: Args) -> Result<()> {
         }
     );
     let result = run::run_io(&mut session, &mut io, &mut events, options, scripts);
-    let finalize = io.finish(result.is_ok());
     let event_finish = events.flush();
+    let finalize = io.finish(result.is_ok());
     events.summary();
     result?;
     finalize?;

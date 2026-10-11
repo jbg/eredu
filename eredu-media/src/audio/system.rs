@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod echo;
 mod resample;
 pub use resample::PcmResampler;
 
@@ -36,6 +37,9 @@ pub enum SystemAudioError {
     /// Output cannot accept more samples within its bounded queue.
     #[error("speaker queue remains full")]
     OutputFull,
+    /// Acoustic echo processing or playback-reference continuity failure.
+    #[error("audio echo cancellation: {0}")]
+    Echo(String),
 }
 
 /// Enumerated host device name and directions.
@@ -132,7 +136,9 @@ pub struct AudioInputConfiguration {
 pub struct SystemAudioInput {
     configuration: AudioInputConfiguration,
     stream: cpal::Stream,
-    queue: Consumer<f32>,
+    queue: Consumer<StampedSample>,
+    origin: Instant,
+    echo: Option<echo::EchoInput>,
     overflow: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
     resampler: PcmResampler,
@@ -166,6 +172,7 @@ impl SystemAudioInput {
             output_sample_rate: sample_rate,
         };
         let config = supported.into();
+        let origin = Instant::now();
         macro_rules! build {
             ($t:ty) => {
                 input_stream::<$t>(
@@ -175,6 +182,7 @@ impl SystemAudioInput {
                     producer,
                     overflow.clone(),
                     failed.clone(),
+                    origin,
                 )
             };
         }
@@ -197,6 +205,8 @@ impl SystemAudioInput {
             configuration,
             stream,
             queue,
+            origin,
+            echo: None,
             overflow,
             failed,
             resampler: PcmResampler::new(rate, sample_rate)?,
@@ -217,6 +227,9 @@ impl SystemAudioInput {
     pub fn stop(&mut self) -> Result<(), SystemAudioError> {
         self.stream.pause().map_err(device_error)?;
         self.stopped = true;
+        if let Some(echo) = &self.echo {
+            echo.stop_reference();
+        }
         Ok(())
     }
     /// Returns pending (`None`), samples, or drained EOF (`Some(0)`).
@@ -227,21 +240,36 @@ impl SystemAudioInput {
         }
         let mut native = [0.0; 1024];
         let mut count = 0;
+        let mut first_ns = 0;
         if self.pending.is_empty() {
             while count < native.len() {
                 match self.queue.pop() {
                     Ok(v) => {
-                        native[count] = v;
+                        if count == 0 {
+                            first_ns = v.at_ns;
+                        }
+                        native[count] = v.value;
                         count += 1;
                     }
                     Err(_) => break,
                 }
             }
             if count != 0 {
-                self.pending.extend(self.resampler.push(&native[..count])?);
+                let samples = self.resampler.push(&native[..count])?;
+                if let Some(echo) = &mut self.echo {
+                    self.pending.extend(echo.push_capture(&samples, first_ns)?);
+                } else {
+                    self.pending.extend(samples);
+                }
             }
             if self.stopped && self.queue.slots() == 0 && !self.flushed {
-                self.pending.extend(self.resampler.finish()?);
+                let samples = self.resampler.finish()?;
+                if let Some(echo) = &mut self.echo {
+                    self.pending.extend(echo.push_capture(&samples, first_ns)?);
+                    self.pending.extend(echo.finish()?);
+                } else {
+                    self.pending.extend(samples);
+                }
                 self.flushed = true;
             }
         }
@@ -257,6 +285,9 @@ impl SystemAudioInput {
     }
     /// Reports callback errors or continuity loss to the application thread.
     pub fn check(&self) -> Result<(), SystemAudioError> {
+        if let Some(echo) = &self.echo {
+            echo.check()?;
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(SystemAudioError::Device(
                 "input stream callback failed or received nonfinite PCM".into(),
@@ -269,23 +300,64 @@ impl SystemAudioInput {
         Ok(())
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct StampedSample {
+    value: f32,
+    at_ns: u64,
+}
+
+/// Opens ordinary capture/playback with a shared timestamped speaker reference
+/// and host AEC3 processing. Capture starts only when the caller calls `start`.
+/// The processed input rate must be 16, 32 or 48 kHz.
+pub fn duplex(
+    input_name: Option<&str>,
+    output_name: Option<&str>,
+    input_rate: u32,
+    output_rate: u32,
+    queue_ms: u32,
+) -> Result<(SystemAudioInput, SystemAudioOutput), SystemAudioError> {
+    let mut input = SystemAudioInput::new(input_name, input_rate, queue_ms)?;
+    let (output, reference) =
+        SystemAudioOutput::open(output_name, output_rate, queue_ms, Some(input.origin))?;
+    input.echo = Some(echo::EchoInput::new(
+        reference.expect("requested playback reference"),
+        input_rate,
+    )?);
+    Ok((input, output))
+}
+
 fn input_stream<T: SizedSample + Send + 'static>(
     device: &Device,
     config: cpal::StreamConfig,
     channels: usize,
-    mut queue: Producer<f32>,
+    mut queue: Producer<StampedSample>,
     overflow: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    origin: Instant,
 ) -> Result<cpal::Stream, SystemAudioError>
 where
     f32: FromSample<T>,
 {
     let error = failed.clone();
+    let sample_rate = config.sample_rate;
     device
         .build_input_stream(
             config,
-            move |data: &[T], _| {
-                capture(data, channels, &mut queue, &overflow, &failed);
+            move |data: &[T], info| {
+                let time = info.timestamp();
+                let start = origin
+                    .elapsed()
+                    .saturating_sub(time.callback.duration_since(time.capture));
+                capture(
+                    data,
+                    channels,
+                    &mut queue,
+                    &overflow,
+                    &failed,
+                    start.as_nanos() as u64,
+                    sample_rate,
+                );
             },
             move |_| {
                 error.store(true, Ordering::Release);
@@ -297,9 +369,11 @@ where
 fn capture<T: Sample>(
     data: &[T],
     channels: usize,
-    queue: &mut Producer<f32>,
+    queue: &mut Producer<StampedSample>,
     overflow: &AtomicU64,
     failed: &AtomicBool,
+    first_ns: u64,
+    sample_rate: u32,
 ) where
     f32: FromSample<T>,
 {
@@ -307,13 +381,19 @@ fn capture<T: Sample>(
         failed.store(true, Ordering::Release);
         return;
     }
-    for frame in data.chunks_exact(channels) {
+    for (i, frame) in data.chunks_exact(channels).enumerate() {
         let sample = frame.iter().map(|v| f32::from_sample(*v)).sum::<f32>() / channels as f32;
         if !sample.is_finite() {
             failed.store(true, Ordering::Release);
             continue;
         }
-        if queue.push(sample).is_err() {
+        if queue
+            .push(StampedSample {
+                value: sample,
+                at_ns: first_ns + i as u64 * 1_000_000_000 / u64::from(sample_rate),
+            })
+            .is_err()
+        {
             overflow.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -354,6 +434,14 @@ impl SystemAudioOutput {
         sample_rate: u32,
         queue_ms: u32,
     ) -> Result<Self, SystemAudioError> {
+        Self::open(name, sample_rate, queue_ms, None).map(|(output, _)| output)
+    }
+    fn open(
+        name: Option<&str>,
+        sample_rate: u32,
+        queue_ms: u32,
+        reference_origin: Option<Instant>,
+    ) -> Result<(Self, Option<echo::RenderReference>), SystemAudioError> {
         let device = select_device(name, false)?;
         let supported = device.default_output_config().map_err(device_error)?;
         let rate = supported.sample_rate();
@@ -376,9 +464,16 @@ impl SystemAudioOutput {
         });
         let format = supported.sample_format();
         let config = supported.into();
+        let (tap, reference) = match reference_origin {
+            Some(origin) => {
+                let (tap, reference) = echo::reference(rate, max_queued, origin);
+                (Some(tap), Some(reference))
+            }
+            None => (None, None),
+        };
         macro_rules! build {
             ($t:ty) => {
-                output_stream::<$t>(&device, config, channels, consumer, state.clone())
+                output_stream::<$t>(&device, config, channels, consumer, state.clone(), tap)
             };
         }
         let stream = match format {
@@ -401,17 +496,20 @@ impl SystemAudioOutput {
             }
         }?;
         stream.play().map_err(device_error)?;
-        Ok(Self {
-            stream,
-            queue,
-            state,
-            resampler: PcmResampler::new(sample_rate, rate)?,
-            from: sample_rate,
-            to: rate,
-            max_queued,
-            preroll: (rate as usize * 160).div_ceil(1000),
-            queued_since_interrupt: 0,
-        })
+        Ok((
+            Self {
+                stream,
+                queue,
+                state,
+                resampler: PcmResampler::new(sample_rate, rate)?,
+                from: sample_rate,
+                to: rate,
+                max_queued,
+                preroll: (rate as usize * 160).div_ceil(1000),
+                queued_since_interrupt: 0,
+            },
+            reference,
+        ))
     }
     /// Queues model PCM, waiting only on the application thread when playback lags.
     pub fn write(&mut self, samples: &[f32]) -> Result<(), SystemAudioError> {
@@ -632,7 +730,11 @@ fn output_stream<T: SizedSample + FromSample<f32> + Send + 'static>(
     channels: usize,
     queue: Consumer<PlaybackSample>,
     state: Arc<PlaybackState>,
-) -> Result<cpal::Stream, SystemAudioError> {
+    mut tap: Option<echo::RenderTap>,
+) -> Result<cpal::Stream, SystemAudioError>
+where
+    f32: FromSample<T>,
+{
     let rate = config.sample_rate;
     let error = state.clone();
     let mut consumer = PlaybackConsumer::new(queue);
@@ -646,6 +748,11 @@ fn output_stream<T: SizedSample + FromSample<f32> + Send + 'static>(
                     + timestamp.playback.duration_since(timestamp.callback)
                     + Duration::from_secs_f64((data.len() / channels) as f64 / rate as f64);
                 consumer.render(data, channels, &state, now, end);
+                if let Some(tap) = &mut tap {
+                    let start = tap.origin.elapsed()
+                        + timestamp.playback.duration_since(timestamp.callback);
+                    tap.capture(data, channels, start.as_nanos() as u64);
+                }
             },
             move |_| {
                 error.failed.store(true, Ordering::Release);
@@ -669,12 +776,22 @@ mod tests {
             &mut producer,
             &overflow,
             &failed,
+            0,
+            48_000,
         );
-        assert_eq!(consumer.pop().unwrap(), 0.125);
-        assert_eq!(consumer.pop().unwrap(), 0.25);
+        assert_eq!(consumer.pop().unwrap().value, 0.125);
+        assert_eq!(consumer.pop().unwrap().value, 0.25);
         assert_eq!(overflow.load(Ordering::Relaxed), 1);
         assert!(!failed.load(Ordering::Relaxed));
-        capture(&[f32::NAN, 0.0], 2, &mut producer, &overflow, &failed);
+        capture(
+            &[f32::NAN, 0.0],
+            2,
+            &mut producer,
+            &overflow,
+            &failed,
+            0,
+            48_000,
+        );
         assert!(failed.load(Ordering::Relaxed));
         assert!(consumer.pop().is_err());
     }

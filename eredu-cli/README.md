@@ -161,6 +161,12 @@ Linux builds require the host audio development libraries used by CPAL (normally
 ALSA). A WAV-only build uses `--no-default-features --features mlx,metal,realtime`
 on Apple silicon. CUDA hosts use `--no-default-features --features cuda,realtime,system-audio`.
 
+System-audio builds include WebRTC echo cancellation and require Meson, Ninja,
+a C/C++ toolchain and `rustup component add llvm-tools-preview`. On macOS,
+`brew install meson ninja pkg-config` supplies the additional build tools. The
+bundled library downloads pinned Abseil sources when a suitable system dependency
+is unavailable.
+
 ```sh
 eredu realtime --list-audio-devices
 MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
@@ -205,6 +211,15 @@ other devices. Headphones avoid acoustic feedback. First Ctrl-C closes capture
 and drains the response tail; a second Ctrl-C cancels. Queue storage is bounded
 by `--audio-buffer-ms`; capture overflow reports a continuity error.
 
+Live microphone-and-speaker sessions enable WebRTC AEC3 echo cancellation by
+default. The reference is PCM actually sent to the speaker, including playback
+silence, clipping, underruns and interruptions. Cancellation runs in 10 ms host
+frames after microphone resampling, while capture stays live for user barge-in.
+`--no-echo-cancellation` disables it, for example when comparing headphone input.
+File input and `--no-playback` do not use echo cancellation. No automatic gain
+control or background-noise suppression is applied. Cancellation needs time to
+adapt to the acoustic path; it does not guarantee removal of all speaker leakage.
+
 In an interactive terminal, conversation text appears on stderr as separate
 `Heard:` and `Agent:` lines. Token fragments are joined into readable chunks;
 transcription is flushed after an 800 ms pause, at a turn boundary or at shutdown.
@@ -221,7 +236,8 @@ consumes audio features directly, so a response preceding transcript text does
 not imply that the model has received no audio.
 
 For microphone diagnostics, use `--record-input microphone.wav` to save the
-resampled source audio accepted by the session as mono 16 kHz float32 WAV.
+resampled, echo-processed source audio accepted by the session as mono 16 kHz
+float32 WAV.
 The recording excludes injected silence and response-tail padding. The CLI reports
 the selected microphone device and native format at startup, and accepted sample
 count, RMS level and peak level at shutdown. Background dialogue can reach the

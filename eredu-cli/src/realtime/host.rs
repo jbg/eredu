@@ -42,24 +42,39 @@ impl HostIo {
         max_seconds: f64,
     ) -> Result<Self> {
         #[cfg(feature = "system-audio")]
-        let microphone = if file.is_none() {
-            Some(SystemAudioInput::new(
+        let (microphone, speaker) = if file.is_none()
+            && !args.no_playback
+            && !args.no_echo_cancellation
+        {
+            let (input, output) = eredu_media::audio::system::duplex(
                 args.input_device.as_deref(),
-                16_000,
-                args.audio_buffer_ms,
-            )?)
-        } else {
-            None
-        };
-        #[cfg(feature = "system-audio")]
-        let speaker = if args.no_playback {
-            None
-        } else {
-            Some(SystemAudioOutput::new(
                 args.output_device.as_deref(),
+                16_000,
                 22_050,
                 args.audio_buffer_ms,
-            )?)
+            )?;
+            eprintln!("echo cancellation: WebRTC AEC3; microphone remains live during playback");
+            (Some(input), Some(output))
+        } else {
+            let input = if file.is_none() {
+                Some(SystemAudioInput::new(
+                    args.input_device.as_deref(),
+                    16_000,
+                    args.audio_buffer_ms,
+                )?)
+            } else {
+                None
+            };
+            let output = if args.no_playback {
+                None
+            } else {
+                Some(SystemAudioOutput::new(
+                    args.output_device.as_deref(),
+                    22_050,
+                    args.audio_buffer_ms,
+                )?)
+            };
+            (input, output)
         };
         let start = Instant::now();
         #[cfg(feature = "system-audio")]
