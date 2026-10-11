@@ -395,6 +395,9 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
+    crate::backend::runtime::checkpoint::bounded_quantization::realize_prepared_source(
+        &store, stream,
+    )?;
     let unit_count = layout.len();
     if unit_count == 0 || unit_bindings.len() != unit_count {
         return Err(Error::Parallel(format!(

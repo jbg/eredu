@@ -1,4 +1,4 @@
-use super::preflight::{checked_product, quantization_error};
+use super::preflight::quantization_error;
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -144,89 +144,32 @@ pub(super) fn output_layouts(
     target: &BoundedQuantizationTarget,
     quantization: WeightQuantization,
     source_shape: &[usize],
-    rows: usize,
-    columns: usize,
-    bits: usize,
 ) -> Result<Vec<OutputLayout>, Error> {
-    let scales_name = target.scales_name.clone();
-    let biases_name = target.biases_name.clone();
-    let packed_columns = columns
-        .checked_mul(bits)
-        .and_then(|bits| bits.checked_div(32))
-        .ok_or_else(|| quantization_error("packed column count overflow"))?;
-    let scale_columns = columns
-        .checked_div(quantization.group_size() as usize)
-        .ok_or_else(|| quantization_error("scale column count overflow"))?;
-    let mut prefix = source_shape[..source_shape.len() - 2].to_vec();
-    prefix.push(rows);
-
-    let mut layouts = Vec::with_capacity(if quantization.has_biases() { 3 } else { 2 });
-    let (affine_dtype, affine_scalar_bytes) = match target.affine_companion_dtype {
-        RecipeDtype::F16 => (SafeDtype::F16, 2),
-        RecipeDtype::BF16 => (SafeDtype::BF16, 2),
-        RecipeDtype::F32 => (SafeDtype::F32, 4),
-        _ => {
-            return Err(quantization_error(format!(
-                "bounded affine companion output has invalid dtype {:?}",
-                target.affine_companion_dtype
-            )));
-        }
-    };
-    layouts.push(layout(
-        target.weight_name.clone(),
-        SafeDtype::U32,
-        prefix.clone(),
-        packed_columns,
-        4,
-    )?);
-    layouts.push(layout(
-        scales_name,
-        if matches!(quantization, WeightQuantization::MxFp4) {
-            SafeDtype::U8
-        } else {
-            affine_dtype
-        },
-        prefix.clone(),
-        scale_columns,
-        if matches!(quantization, WeightQuantization::MxFp4) {
-            1
-        } else {
-            affine_scalar_bytes
-        },
-    )?);
-    if quantization.has_biases() {
-        layouts.push(layout(
-            biases_name.expect("bounded plan validated affine-bias identity"),
-            affine_dtype,
-            prefix,
-            scale_columns,
-            affine_scalar_bytes,
-        )?);
-    }
-
-    Ok(layouts)
-}
-
-fn layout(
-    name: String,
-    dtype: SafeDtype,
-    mut prefix: Vec<usize>,
-    columns: usize,
-    scalar_bytes: u64,
-) -> Result<OutputLayout, Error> {
-    prefix.push(columns);
-    let row_bytes = (columns as u64)
-        .checked_mul(scalar_bytes)
-        .ok_or_else(|| quantization_error("quantized row size overflow"))?;
-    let rows = checked_product(&prefix[..prefix.len() - 1], "quantized output rows")?;
-    let byte_len = (rows as u64)
-        .checked_mul(row_bytes)
-        .ok_or_else(|| quantization_error("quantized tensor size overflow"))?;
-    Ok(OutputLayout {
-        name,
-        dtype,
-        shape: prefix,
-        row_bytes,
-        byte_len,
-    })
+    let metadata = target.output_metadata(quantization, source_shape)?;
+    target
+        .output_names(quantization)?
+        .into_iter()
+        .map(|name| {
+            let metadata = &metadata[&name];
+            let dtype = match metadata.stored_dtype {
+                eredu_checkpoint::StoredDtype::U32 => SafeDtype::U32,
+                eredu_checkpoint::StoredDtype::U8 => SafeDtype::U8,
+                eredu_checkpoint::StoredDtype::F32 => SafeDtype::F32,
+                eredu_checkpoint::StoredDtype::F16 => SafeDtype::F16,
+                eredu_checkpoint::StoredDtype::BF16 => SafeDtype::BF16,
+                _ => return Err(quantization_error("invalid quantization output dtype")),
+            };
+            let rows = super::preflight::checked_product(
+                &source_shape[..source_shape.len() - 1],
+                "quantized rows",
+            )?;
+            Ok(OutputLayout {
+                name,
+                dtype,
+                shape: metadata.physical_shape.clone(),
+                row_bytes: metadata.encoded_byte_len / rows as u64,
+                byte_len: metadata.encoded_byte_len,
+            })
+        })
+        .collect()
 }

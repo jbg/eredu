@@ -510,7 +510,7 @@ credit. Neutral tests cover continuation, tool-ID capacity, growth rejection and
 failure or cancellation retention. Native checkpoint-backed facade snapshot/fork parity is
 not established.
 Released-checkpoint evidence covers single-device execution. Retained public
-speech loading and the `voicechat_wav` example complete a released-weight, resident
+speech loading and the `eredu realtime` command complete a released-weight, resident
 Metal conversation
 using NVIDIA's pinned sample: prompt prefill, 396 audio frames, agent text, RNNT
 transcription, speech publication and terminal codec drain. The output contains

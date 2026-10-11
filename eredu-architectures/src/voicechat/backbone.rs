@@ -51,6 +51,49 @@ pub struct PreparedBackboneParameters {
     parameters: BTreeMap<String, ParameterAdmission>,
 }
 impl PreparedBackboneParameters {
+    /// Selects encoded recipes before parameter pool admission and module construction.
+    pub fn with_quantization(
+        mut self,
+        quantization: eredu_checkpoint::WeightQuantization,
+    ) -> Result<Self, BackbonePreparationError> {
+        let args = nemotron_h::load_time_quantization(&self.args, quantization)
+            .map_err(BackbonePreparationError::Configuration)?;
+        let plan =
+            nemotron_h::safetensors_plan(&args).map_err(BackbonePreparationError::Configuration)?;
+        let eligible = plan
+            .common_tensors
+            .iter()
+            .chain(plan.layout_groups.iter().flat_map(|group| {
+                group
+                    .variants
+                    .iter()
+                    .flat_map(|layout| layout.tensors.iter())
+            }))
+            .map(|tensor| {
+                nemotron_h::checkpoint::normalized_parameter_key(&tensor.key, &args)
+                    .map_err(BackbonePreparationError::Configuration)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|name| {
+                name.strip_suffix(".scales")
+                    .map(|prefix| format!("{prefix}.weight"))
+            })
+            .filter(|name| self.parameters.contains_key(name))
+            .collect();
+        let (source, parameters) = super::quantization::project_parameters(
+            self.source,
+            &self.parameters,
+            quantization,
+            &eligible,
+            RecipeDtype::F32,
+        )?;
+        self.args = args;
+        self.source = source;
+        self.parameters = parameters;
+        Ok(self)
+    }
+
     /// Projects admitted canonical parameters using the already verified base asset.
     pub fn from_retained(
         artifacts: &RetainedVoiceChatArtifacts,

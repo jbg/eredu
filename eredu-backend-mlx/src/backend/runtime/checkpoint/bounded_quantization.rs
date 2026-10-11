@@ -44,11 +44,24 @@ const MAX_QUANTIZATION_SUBMISSION_ELEMENTS: usize = i32::MAX as usize;
 
 mod layout;
 mod pipeline;
-mod plan;
 mod preflight;
 
+pub use eredu_checkpoint::quantization::{BoundedQuantizationPlan, BoundedQuantizationTarget};
 pub use pipeline::BoundedQuantizedWeightStore;
-pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};
 
 #[cfg(test)]
 mod tests;
+
+/// Realizes a retained neutral transformation through the ordinary bounded cache.
+/// The source publishes only after native conversion and file admission finish.
+pub fn realize_prepared_source(
+    source: &eredu_checkpoint::store::SharedCheckpointSource,
+    stream: &Stream,
+) -> Result<(), Error> {
+    if let Some((input, plan)) = source.preparation() {
+        realize_prepared_source(&input, stream)?;
+        let output = Arc::new(BoundedQuantizedWeightStore::create(input, plan, stream)?);
+        source.publish_preparation(output)?;
+    }
+    Ok(())
+}

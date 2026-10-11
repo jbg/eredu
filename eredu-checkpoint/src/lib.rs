@@ -448,3 +448,6 @@ impl<'de> Deserialize<'de> for WeightQuantization {
         }
     }
 }
+
+/// Portable bounded checkpoint quantization preparation.
+pub mod quantization;

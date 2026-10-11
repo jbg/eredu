@@ -1,6 +1,8 @@
 //! Shared PCM validation and log-mel feature extraction.
 
 pub mod streaming;
+#[cfg(feature = "system-audio")]
+pub mod system;
 pub mod wav;
 
 #[cfg(feature = "audio")]

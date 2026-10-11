@@ -114,6 +114,23 @@ pub struct PreparedVoiceChatConstruction<'a> {
 }
 
 impl<'a> PreparedVoiceChatConstruction<'a> {
+    /// Selects load-time matrix recipes without changing neural state geometry.
+    pub fn with_quantization(
+        mut self,
+        policy: super::quantization::SpeechQuantizationPolicy,
+    ) -> Result<Self, VoiceChatConstructionError> {
+        if let Some(quantization) = policy.backbone {
+            self.backbone = self
+                .backbone
+                .with_quantization(quantization)
+                .map_err(BackboneConstructionError::from)?;
+        }
+        self.speech = self
+            .speech
+            .with_quantization(policy, self.artifacts.plan().parameters())?;
+        Ok(self)
+    }
+
     /// Admits the coupled component set without reopening any artifact.
     pub fn from_retained(
         artifacts: &'a RetainedVoiceChatArtifacts,

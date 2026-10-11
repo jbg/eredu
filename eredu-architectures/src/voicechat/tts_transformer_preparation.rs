@@ -164,7 +164,10 @@ impl PreparedTtsTransformerBindings {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
                 let parameter = execution_parameter(parameter, &source)?;
-                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32) {
+                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32)
+                    && !(parameter.output.dtype == RecipeDtype::U8
+                        && super::parameters::is_byte_scale(parameters, name))
+                {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
                 unit_recipes[ordinal].insert(name.into(), parameter.recipe);

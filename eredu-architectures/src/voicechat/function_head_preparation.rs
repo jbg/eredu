@@ -353,7 +353,10 @@ impl PreparedFunctionHeadBindings {
                 if name == weight {
                     selected_parameter = Some(parameter.clone());
                 }
-                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32) {
+                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32)
+                    && !(parameter.output.dtype == RecipeDtype::U8
+                        && super::parameters::is_byte_scale(parameters, name))
+                {
                     return Err(FunctionHeadPreparationError::Geometry(name.into()));
                 }
                 unit_recipes[ordinal].insert(name.into(), parameter.recipe);

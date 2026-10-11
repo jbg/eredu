@@ -186,6 +186,15 @@ pub struct PreparedVoiceChatSessionParts<'a> {
 }
 
 impl<'a> PreparedVoiceChatSession<'a> {
+    /// Selects portable load-time matrix formats before residency admission.
+    pub fn with_quantization(
+        mut self,
+        policy: eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy,
+    ) -> Result<Self, VoiceChatLoadingError> {
+        self.parts.construction = self.parts.construction.with_quantization(policy)?;
+        Ok(self)
+    }
+
     /// Validates one request using retained artifacts only, before native binding.
     /// The system prompt and call validator share the same tool definitions.
     pub fn from_retained(

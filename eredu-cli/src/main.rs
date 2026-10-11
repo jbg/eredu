@@ -1,4 +1,24 @@
 mod memory;
+#[cfg(feature = "realtime")]
+mod realtime;
+
+fn cli_command() -> clap::Command {
+    let command = Cli::command();
+    #[cfg(feature = "realtime")]
+    let command = <CliCommand as clap::Subcommand>::augment_subcommands(command)
+        .about("Local text generation and realtime speech")
+        .subcommand_negates_reqs(true)
+        .args_conflicts_with_subcommands(true);
+    command
+}
+
+#[cfg(feature = "realtime")]
+#[derive(Debug, clap::Subcommand)]
+enum CliCommand {
+    /// Converse using system audio or a recorded WAV, with bounded realtime sessions.
+    #[cfg(feature = "realtime")]
+    Realtime(realtime::Args),
+}
 
 use std::{
     collections::HashSet,
@@ -944,11 +964,23 @@ fn use_semantic_generation(
 }
 
 fn requested_load_quantization(args: &Cli) -> Result<Option<QuantizationRequest>> {
-    match (args.quantize, args.quantization_mode) {
+    parse_load_quantization(
+        args.quantize,
+        args.quantization_mode,
+        args.quantization_group_size,
+    )
+}
+
+fn parse_load_quantization(
+    bits: Option<i32>,
+    mode: LoadQuantizationMode,
+    group_size: i32,
+) -> Result<Option<QuantizationRequest>> {
+    match (bits, mode) {
         (Some(bits), LoadQuantizationMode::Affine) => {
-            eredu_checkpoint::AffineQuantization::new(args.quantization_group_size, bits)?;
+            eredu_checkpoint::AffineQuantization::new(group_size, bits)?;
             Ok(Some(QuantizationRequest::Affine {
-                group_size: u32::try_from(args.quantization_group_size)?,
+                group_size: u32::try_from(group_size)?,
                 bits: u8::try_from(bits)?,
             }))
         }
@@ -2051,7 +2083,13 @@ fn apply_automatic_report(
 
 fn main() -> Result<()> {
     let total_started = Instant::now();
-    let matches = Cli::command().get_matches();
+    let matches = cli_command().get_matches();
+    #[cfg(feature = "realtime")]
+    if matches.subcommand_name().is_some() {
+        let CliCommand::Realtime(args) =
+            <CliCommand as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        return realtime::run(args);
+    }
     let automatic_overrides = AutomaticCliOverrides::from_matches(&matches);
     let mut args = Cli::from_arg_matches(&matches)?;
     if args.no_auto {
@@ -2956,7 +2994,9 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.estimate_memory_tokens.is_some()
         && matches!(args.auto, Some(AutoMode::Plan | AutoMode::Benchmark))
     {
-        bail!("--estimate-memory-tokens supports --auto quick or --no-auto; benchmarking would load models");
+        bail!(
+            "--estimate-memory-tokens supports --auto quick or --no-auto; benchmarking would load models"
+        );
     }
     if args.estimate_memory_tokens == Some(0) {
         bail!("--estimate-memory-tokens must be greater than zero");
@@ -3036,10 +3076,14 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     requested_load_quantization(args)?;
     if args.layerwise_host && args.quantize.is_some() {
-        bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
+        bail!(
+            "--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization"
+        );
     }
     if args.dense_disk_stream && args.quantize.is_some() {
-        bail!("--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights");
+        bail!(
+            "--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights"
+        );
     }
     if args.dense_disk_stream && args.layerwise_host {
         bail!("--dense-disk-stream conflicts with --layerwise-host");
@@ -3066,10 +3110,14 @@ fn validate_args(args: &Cli) -> Result<()> {
         bail!("--revision can only be used with a Hugging Face model identifier");
     }
     if args.raw && args.thinking != ThinkingMode::Auto {
-        bail!("--thinking on/off cannot be used with --raw because raw prompts bypass the chat template");
+        bail!(
+            "--thinking on/off cannot be used with --raw because raw prompts bypass the chat template"
+        );
     }
     if args.raw && args.reasoning_effort.is_some() {
-        bail!("--reasoning-effort cannot be used with --raw because raw prompts bypass the chat template");
+        bail!(
+            "--reasoning-effort cannot be used with --raw because raw prompts bypass the chat template"
+        );
     }
     if args.allow_unparsed_reasoning && args.thinking != ThinkingMode::On {
         bail!("--allow-unparsed-reasoning requires --thinking on");
@@ -3582,6 +3630,44 @@ fn select_revision<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "realtime")]
+    #[test]
+    fn root_cli_keeps_text_options_and_separates_realtime_options() {
+        let matches = super::cli_command()
+            .try_get_matches_from(["eredu", "--model", "test-model", "--quantize", "8", "hello"])
+            .unwrap();
+        assert!(matches.subcommand().is_none());
+        let text = super::Cli::from_arg_matches(&matches).unwrap();
+        assert_eq!(text.model, "test-model");
+        assert_eq!(text.quantize, Some(8));
+        let audio = super::cli_command()
+            .try_get_matches_from(["eredu", "realtime", "--list-audio-devices"])
+            .unwrap();
+        assert_eq!(audio.subcommand_name(), Some("realtime"));
+        assert!(<super::CliCommand as clap::FromArgMatches>::from_arg_matches(&audio).is_ok());
+        let audio = super::cli_command()
+            .try_get_matches_from([
+                "eredu",
+                "realtime",
+                "--config",
+                "voicechat.json",
+                "--input",
+                "input.wav",
+                "--offline",
+                "--no-playback",
+                "--quantize",
+                "8",
+            ])
+            .unwrap();
+        assert_eq!(audio.subcommand_name(), Some("realtime"));
+        assert!(super::cli_command()
+            .try_get_matches_from(["eredu", "realtime", "--offline"])
+            .is_err());
+        assert!(super::cli_command()
+            .try_get_matches_from(["eredu", "hello"])
+            .is_err());
+    }
+
     use std::{
         path::{Path, PathBuf},
         time::{Duration, SystemTime},

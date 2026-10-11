@@ -13,6 +13,7 @@ readme = "README.md"
 default = []
 image = ["dep:image"]
 audio = ["dep:rustfft"]
+system-audio = ["audio", "dep:cpal", "dep:rtrb", "dep:rubato"]
 
 [lints]
 workspace = true
@@ -23,6 +24,9 @@ thiserror.workspace = true
 # The resize-buffer bound in image.rs tracks this exact implementation.
 image = { version = "=0.25.10", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
+cpal = { version = "0.18.2", optional = true }
+rtrb = { version = "0.3", optional = true }
+rubato = { version = "0.16.2", default-features = false, optional = true }
 
 [dev-dependencies]
 eredu-evaluation.workspace = true

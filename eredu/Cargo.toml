@@ -16,16 +16,10 @@ include = [
     "src/**",
     "tests/**",
     "examples/*.rs",
-    "examples/voicechat_wav/**",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ]
-
-[[example]]
-name = "voicechat_wav"
-path = "examples/voicechat_wav.rs"
-required-features = ["mlx", "audio"]
 
 [[example]]
 name = "architecture_discovery"
@@ -110,10 +104,6 @@ required-features = ["mlx"]
 name = "qwen35_moe_bench"
 path = "examples/qwen35_moe_bench.rs"
 required-features = ["mlx"]
-
-[[test]]
-name = "voicechat_wav_driver"
-path = "tests/voicechat_wav_driver.rs"
 
 [[test]]
 name = "backend_conformance"

@@ -2,8 +2,7 @@ use super::*;
 use super::{
     layout::{output_layouts, BoundedAllocatorCache, OutputLayout, OutputShard},
     preflight::{
-        checked_product, output_names_for, preflight_source_collisions, quantization_error,
-        report_source_bytes,
+        checked_product, preflight_source_collisions, quantization_error, report_source_bytes,
     },
 };
 
@@ -65,9 +64,9 @@ impl BoundedQuantizedWeightStore {
 
         preflight_source_collisions(source.as_ref(), &plan)?;
         let materialized_source_keys = plan
-            .targets
+            .targets()
             .iter()
-            .flat_map(|target| target.source.source_keys())
+            .flat_map(|target| target.source().source_keys())
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
         let mut materialized_source_shards = source
@@ -80,12 +79,12 @@ impl BoundedQuantizedWeightStore {
             }
         }
         let geometries = plan
-            .targets
+            .targets()
             .iter()
             .map(|target| target_geometry(source.as_ref(), target, &plan))
             .collect::<Result<Vec<_>, Error>>()?;
         let fingerprint_bound = plan
-            .max_working_set_bytes
+            .max_working_set_bytes()
             .min(8 * 1024 * 1024)
             .max(geometries.iter().map(|g| g.one_row_peak).max().unwrap_or(0));
         let prepared_layouts = geometries
@@ -104,22 +103,22 @@ impl BoundedQuantizedWeightStore {
             std::env::consts::OS,
             std::env::consts::ARCH,
             device.get_type()?,
-            plan.quantization,
-            plan.targets
+            plan.quantization(),
+            plan.targets()
         );
         let key = prepared_checkpoint_recipe_key(
             source.as_ref(),
             &plan
-                .targets
+                .targets()
                 .iter()
-                .map(|target| target.source.clone())
+                .map(|target| target.source().clone())
                 .collect::<Vec<_>>(),
             identity.as_bytes(),
             fingerprint_bound,
         )?;
-        let entry = plan
-            .cache
-            .prepare(&key, &prepared_layouts, plan.max_working_set_bytes)?;
+        let entry =
+            plan.prepared_cache()
+                .prepare(&key, &prepared_layouts, plan.max_working_set_bytes())?;
         let writer = match entry {
             PreparedCheckpointEntry::Cached(transformed) => {
                 let transformed_keys = transformed.source_keys().into_iter().collect();
@@ -137,10 +136,10 @@ impl BoundedQuantizedWeightStore {
                     transformed_keys,
                     materialized_source_keys,
                     materialized_source_shards,
-                    cache: plan.cache.clone(),
+                    cache: plan.prepared_cache().clone(),
                     report: WeightMaterializationReport {
-                        admitted_working_set_bytes: plan.max_working_set_bytes,
-                        transformed_weights: plan.targets.len(),
+                        admitted_working_set_bytes: plan.max_working_set_bytes(),
+                        transformed_weights: plan.targets().len(),
                         output_bytes,
                         ..Default::default()
                     },
@@ -150,15 +149,15 @@ impl BoundedQuantizedWeightStore {
         };
         let mut transformed_keys = BTreeSet::new();
         let mut report = WeightMaterializationReport {
-            admitted_working_set_bytes: plan.max_working_set_bytes,
+            admitted_working_set_bytes: plan.max_working_set_bytes(),
             ..WeightMaterializationReport::default()
         };
-        let mut output_shards = Vec::with_capacity(plan.targets.len());
-        let mut allocator_cache = BoundedAllocatorCache::new(plan.max_working_set_bytes);
+        let mut output_shards = Vec::with_capacity(plan.targets().len());
+        let mut allocator_cache = BoundedAllocatorCache::new(plan.max_working_set_bytes());
         let mut pending_tiles = VecDeque::with_capacity(BOUNDED_QUANTIZATION_TILE_BUFFERS);
         allocator_cache.begin()?;
 
-        for target in &plan.targets {
+        for target in plan.targets() {
             transform_target(
                 source.as_ref(),
                 target,
@@ -170,7 +169,7 @@ impl BoundedQuantizedWeightStore {
                 &mut allocator_cache,
                 &mut report,
             )?;
-            for name in output_names_for(target, plan.quantization)? {
+            for name in target.output_names(plan.quantization())? {
                 transformed_keys.insert(name);
             }
         }
@@ -195,7 +194,7 @@ impl BoundedQuantizedWeightStore {
             materialized_source_keys,
             materialized_source_shards,
             report,
-            cache: plan.cache,
+            cache: plan.prepared_cache().clone(),
         })
     }
 
@@ -345,7 +344,7 @@ fn target_geometry(
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
 ) -> Result<TargetGeometry, Error> {
-    let metadata = target.source.infer(source)?;
+    let metadata = target.source().infer(source)?;
     if metadata.shape().len() < 2
         || !matches!(
             metadata.dtype(),
@@ -354,7 +353,7 @@ fn target_geometry(
     {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} must produce a floating-point matrix, got shape {:?} and dtype {:?}",
-            target.weight_name,
+            target.weight_name(),
             metadata.shape(),
             metadata.dtype()
         )));
@@ -364,7 +363,7 @@ fn target_geometry(
     if leading == 0 {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} must contain at least one leading matrix",
-            target.weight_name
+            target.weight_name()
         )));
     }
     let rows = metadata.shape()[row_axis];
@@ -372,28 +371,21 @@ fn target_geometry(
     if rows == 0 {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} must contain at least one row",
-            target.weight_name
+            target.weight_name()
         )));
     }
-    let group_size = usize::try_from(plan.quantization.group_size())
+    let group_size = usize::try_from(plan.quantization().group_size())
         .map_err(|_| quantization_error("quantization group size is not representable"))?;
-    let bits = usize::try_from(plan.quantization.bits())
-        .map_err(|_| quantization_error("quantization bit width is not representable"))?;
     if columns % group_size != 0 || columns % 32 != 0 {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} input dimension {} must be divisible by group_size {} and 32",
-            target.weight_name, columns, group_size
+            target.weight_name(),
+            columns,
+            group_size
         )));
     }
 
-    let layouts = output_layouts(
-        target,
-        plan.quantization,
-        metadata.shape(),
-        rows,
-        columns,
-        bits,
-    )?;
+    let layouts = output_layouts(target, plan.quantization(), metadata.shape())?;
     let output_row_bytes = layouts.iter().try_fold(0u64, |total, layout| {
         total
             .checked_add(layout.row_bytes)
@@ -403,7 +395,7 @@ fn target_geometry(
     let mut one_row_peak = 0u64;
     for matrix in 0..leading {
         let one_row = target
-            .source
+            .source()
             .select_bounded_matrix_rows(source, matrix, 0, 1)?;
         one_row_source_bytes = one_row_source_bytes.max(one_row.infer(source)?.byte_len());
         one_row_peak = one_row_peak.max(
@@ -413,15 +405,17 @@ fn target_geometry(
                 .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?,
         );
     }
-    if one_row_peak > plan.max_working_set_bytes {
+    if one_row_peak > plan.max_working_set_bytes() {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} requires at least {} working-set bytes for one row, but the plan permits {}",
-            target.weight_name, one_row_peak, plan.max_working_set_bytes
+            target.weight_name(),
+            one_row_peak,
+            plan.max_working_set_bytes()
         )));
     }
     for matrix in 0..leading {
         target
-            .source
+            .source()
             .select_bounded_matrix_rows(source, matrix, 0, 1)?
             .preflight_bounded(source)?;
     }
@@ -462,7 +456,7 @@ fn transform_target(
     } = target_geometry(source, target, plan)?;
     let tile_buffers = if one_row_peak
         .checked_mul(BOUNDED_QUANTIZATION_TILE_BUFFERS as u64)
-        .is_some_and(|bytes| bytes <= plan.max_working_set_bytes)
+        .is_some_and(|bytes| bytes <= plan.max_working_set_bytes())
     {
         BOUNDED_QUANTIZATION_TILE_BUFFERS
     } else {
@@ -473,7 +467,7 @@ fn transform_target(
             write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;
         }
     }
-    let tile_budget = plan.max_working_set_bytes / tile_buffers as u64;
+    let tile_budget = plan.max_working_set_bytes() / tile_buffers as u64;
     let output_bytes = layouts.iter().try_fold(0u64, |total, layout| {
         total
             .checked_add(layout.byte_len)
@@ -493,12 +487,12 @@ fn transform_target(
         .checked_mul(columns)
         .ok_or_else(|| quantization_error("complete target element count overflow"))?;
     let complete_peak = target
-        .source
+        .source()
         .peak_materialization_bytes(source)?
         .checked_add(output_bytes)
         .ok_or_else(|| quantization_error("complete target working-set overflow"))?;
     let leading_batch_admissible = if row_axis == 1 {
-        let one_matrix = target.source.select_bounded(
+        let one_matrix = target.source().select_bounded(
             source,
             TensorSelection::Range {
                 axis: 0,
@@ -520,12 +514,12 @@ fn transform_target(
         false
     };
     if complete_peak <= tile_budget && complete_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS {
-        target.source.preflight_bounded(source)?;
+        target.source().preflight_bounded(source)?;
         submit_quantization_tile(
             source,
-            &target.source,
+            &target.source(),
             target,
-            plan.quantization,
+            plan.quantization(),
             tile_contexts,
             tile_buffers,
             output_shard,
@@ -545,7 +539,7 @@ fn transform_target(
             let mut rejected_end = leading.saturating_add(1);
             while matrix_end + 1 < rejected_end {
                 let candidate_end = matrix_end + (rejected_end - matrix_end) / 2;
-                let candidate = target.source.select_bounded(
+                let candidate = target.source().select_bounded(
                     source,
                     TensorSelection::Range {
                         axis: 0,
@@ -575,7 +569,7 @@ fn transform_target(
                     rejected_end = candidate_end;
                 }
             }
-            let recipe = target.source.select_bounded(
+            let recipe = target.source().select_bounded(
                 source,
                 TensorSelection::Range {
                     axis: 0,
@@ -597,14 +591,15 @@ fn transform_target(
             if batch_peak > tile_budget {
                 return Err(quantization_error(format!(
                     "bounded quantization target {:?} cannot admit one leading matrix within the {}-byte tile slot",
-                    target.weight_name, tile_budget
+                    target.weight_name(),
+                    tile_budget
                 )));
             }
             submit_quantization_tile(
                 source,
                 &recipe,
                 target,
-                plan.quantization,
+                plan.quantization(),
                 tile_contexts,
                 tile_buffers,
                 output_shard,
@@ -630,7 +625,7 @@ fn transform_target(
                 let mut rejected_end = rows.saturating_add(1);
                 while end + 1 < rejected_end {
                     let candidate_end = end + (rejected_end - end) / 2;
-                    let candidate = target.source.select_bounded_matrix_rows(
+                    let candidate = target.source().select_bounded_matrix_rows(
                         source,
                         matrix,
                         start,
@@ -653,7 +648,7 @@ fn transform_target(
                 }
                 let tile_rows = end - start;
                 let tile_recipe = target
-                    .source
+                    .source()
                     .select_bounded_matrix_rows(source, matrix, start, end)?;
                 tile_recipe.preflight_bounded(source)?;
                 let tile_output_bytes = output_row_bytes
@@ -666,7 +661,10 @@ fn transform_target(
                 if tile_peak > tile_budget {
                     return Err(quantization_error(format!(
                         "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte tile slot",
-                        tile_rows, target.weight_name, tile_peak, tile_budget
+                        tile_rows,
+                        target.weight_name(),
+                        tile_peak,
+                        tile_budget
                     )));
                 }
                 let output_start = matrix
@@ -677,7 +675,7 @@ fn transform_target(
                     source,
                     &tile_recipe,
                     target,
-                    plan.quantization,
+                    plan.quantization(),
                     tile_contexts,
                     tile_buffers,
                     output_shard,
@@ -774,7 +772,7 @@ fn quantize_tile_outputs(
     stream: &Stream,
 ) -> Result<Vec<Array>, Error> {
     let quantized = quantize_tensor(dense, quantization, stream)?;
-    let companion_dtype = match target.affine_companion_dtype {
+    let companion_dtype = match *target.affine_companion_dtype() {
         RecipeDtype::F16 => Dtype::Float16,
         RecipeDtype::BF16 => Dtype::Bfloat16,
         RecipeDtype::F32 => Dtype::Float32,

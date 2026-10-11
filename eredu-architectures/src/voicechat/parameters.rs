@@ -158,6 +158,13 @@ fn host_parameter(name: &str) -> bool {
             .any(|buffer| buffer.key == name)
 }
 
+/// Integer scale storage belongs only to an explicitly encoded MXFP4 projection.
+pub(super) fn is_byte_scale(parameters: &BTreeMap<String, ParameterAdmission>, name: &str) -> bool {
+    name.strip_suffix(".scales")
+        .and_then(|prefix| parameters.get(&format!("{prefix}.weight")))
+        .is_some_and(|weight| weight.linear_format == eredu_checkpoint::LinearFormat::MxFp4)
+}
+
 pub(super) fn execution_parameter(
     parameter: &ParameterAdmission,
     source: &SharedCheckpointSource,

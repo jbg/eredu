@@ -88,7 +88,7 @@ pub enum Device {
 }
 
 /// Portable speech projection precision, configured independently of the device.
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechFloatChoice {
     #[default]
@@ -248,22 +248,22 @@ impl Config {
                 );
             }
         }
-        let _ = self.residency()?;
+        let _ = self.residency(2)?;
         Ok(())
     }
 
-    fn residency(&self) -> Result<VoiceChatResidencyPolicy> {
+    fn residency(&self, cached_shards: usize) -> Result<VoiceChatResidencyPolicy> {
         let host = |device, host, depth| -> Result<_> {
             Ok(LayerWeightResidency::LayerwiseHost(
                 LayerwiseLoadOptions::new(OffloadConfig::new(Some(device), Some(host), depth)?)
-                    .with_max_cached_shards(2),
+                    .with_max_cached_shards(cached_shards),
             ))
         };
         let disk = |device, host| -> Result<_> {
             let slots = usize::from(host != 0);
             Ok(LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(device, host, slots, slots)?
-                    .with_max_cached_shards(2),
+                    .with_max_cached_shards(cached_shards),
             ))
         };
         let (backbone, speech) = match self.parameter_residency {
@@ -308,7 +308,13 @@ impl Config {
     }
 }
 
-pub fn load(config: &Config) -> Result<MlxVoiceChatSession> {
+pub fn load(
+    config: &Config,
+    quantization: eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy,
+    device: eredu::api::LocalDevice,
+    cached_shards: usize,
+    sampling: AgentSamplingPolicy,
+) -> Result<MlxVoiceChatSession> {
     config.validate()?;
     let artifact = prepare_realtime_model(&RealtimeArtifactRequest {
         source: config.source.clone(),
@@ -320,8 +326,9 @@ pub fn load(config: &Config) -> Result<MlxVoiceChatSession> {
     let prepared = prepare_mlx_realtime(
         &artifact,
         &RealtimeLoadOptions::Speech(SpeechSessionOptions {
-            conversation: start_options(config)?,
-            parameters: config.residency()?,
+            quantization,
+            conversation: start_options(config, sampling)?,
+            parameters: config.residency(cached_shards)?,
             state: CacheResidencyPolicy::Device,
             max_branch_bytes: config.max_branch_bytes,
             max_total_copy_bytes: config.max_total_copy_bytes,
@@ -338,9 +345,11 @@ pub fn load(config: &Config) -> Result<MlxVoiceChatSession> {
         );
     }
     let weights = ExecutionContext::cpu()?;
-    let execution = match config.device {
-        Device::Cpu => ExecutionContext::cpu()?,
-        Device::Gpu => ExecutionContext::accelerator(0)?,
+    let execution = match device {
+        eredu::api::LocalDevice::Cpu => ExecutionContext::cpu()?,
+        eredu::api::LocalDevice::Accelerator(index) => {
+            ExecutionContext::accelerator(usize::try_from(index)?)?
+        }
     };
     match prepared.load(&weights, &execution)? {
         LoadedMlxRealtime::Speech(session) => Ok(session),
@@ -350,9 +359,8 @@ pub fn load(config: &Config) -> Result<MlxVoiceChatSession> {
     }
 }
 
-fn start_options(config: &Config) -> Result<VoiceChatStartOptions> {
+fn start_options(config: &Config, sampling: AgentSamplingPolicy) -> Result<VoiceChatStartOptions> {
     let frame_capacity = usize::try_from(config.max_frames)?;
-    let step_capacity = usize::try_from(config.max_model_steps)?;
     let capacity = VoiceChatPublicationCapacity {
         speech_samples: 8192,
         transcription_tokens: 128,
@@ -414,7 +422,7 @@ fn start_options(config: &Config) -> Result<VoiceChatStartOptions> {
                 .checked_add(128)
                 .context("codec position capacity overflows")?,
         },
-        sampling: AgentSamplingPolicy::streaming_defaults(step_capacity)?,
+        sampling,
         turn_policy: VoiceChatTurnPolicy {
             bou_frames: config
                 .interruption_speech_frames

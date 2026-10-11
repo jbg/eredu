@@ -138,7 +138,8 @@ impl<'a, 'o> RealtimeArtifactVisitor<'a> for Select<'o> {
                 requested: "categorical",
             });
         };
-        let prepared = PreparedVoiceChatSession::from_retained(artifacts, &options.conversation)?;
+        let prepared = PreparedVoiceChatSession::from_retained(artifacts, &options.conversation)?
+            .with_quantization(options.quantization)?;
         let construction = prepared.construction();
         let geometry = construction.neural_state_geometry();
         let backbone = select_state(

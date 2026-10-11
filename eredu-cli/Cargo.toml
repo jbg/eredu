@@ -12,7 +12,10 @@ description = "Command-line interface for running local models with Eredu"
 readme = "README.md"
 
 [features]
-default = ["mlx", "metal"]
+default = ["mlx", "metal", "realtime", "system-audio"]
+realtime = ["eredu/audio", "dep:eredu-media"]
+system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc"]
+projection-profiling = ["realtime", "eredu/projection-profiling"]
 mlx = ["eredu/mlx", "dep:eredu-backend-mlx"]
 metal = ["mlx", "eredu/metal"]
 cuda = ["mlx", "eredu/cuda"]
@@ -38,6 +41,8 @@ eredu-core.workspace = true
 eredu-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+eredu-media = { workspace = true, features = ["audio"], optional = true }
+ctrlc = { version = "3.5", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

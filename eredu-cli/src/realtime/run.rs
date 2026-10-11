@@ -1,10 +1,6 @@
-//! Recorded-time WAV delivery through the ordinary bound session.
+//! Bounded recorded-time or wall-clock PCM delivery through the ordinary bound session.
 
-use std::{
-    collections::BTreeMap,
-    io::{Read, Seek, Write},
-    time::Duration,
-};
+use std::{collections::BTreeMap, io::Write, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use eredu::api::realtime::{
@@ -16,10 +12,7 @@ use eredu::api::realtime::{
     VoiceChatToolWaitPolicy, VoiceChatTurnEvent,
 };
 use eredu_core::scheduler::SemanticStateTransaction;
-use eredu_media::audio::{
-    streaming::AudioStreamError,
-    wav::{WavReader, WavWriter},
-};
+use eredu_media::audio::streaming::AudioStreamError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -56,37 +49,6 @@ pub struct RunOptions {
     pub max_steps: u64,
     #[cfg(feature = "projection-profiling")]
     pub profile: Option<ProfileOptions>,
-}
-
-/// Streams bounded host chunks; neither the WAV nor generated speech is retained
-/// in full. The caller finalizes the WAV header after successful drain.
-pub fn run<S, D, E, R, W>(
-    session: &mut BoundVoiceChatSession<S, D, E>,
-    input: &mut WavReader<R>,
-    speech: &mut WavWriter<W>,
-    events: &mut impl Write,
-    options: RunOptions,
-    scripts: Vec<ScriptedToolResponse>,
-) -> Result<()>
-where
-    S: SemanticStateTransaction,
-    S::Error: Send + Sync + 'static,
-    E: VoiceChatExecutor<S, D>,
-    R: Read + Seek,
-    W: Write + Seek,
-{
-    ensure!(
-        input.sample_rate() == 16_000,
-        "input WAV must be mono 16 kHz"
-    );
-    drive(
-        session,
-        |buffer| Ok(input.read_samples(buffer)?),
-        |samples| Ok(speech.write_samples(samples)?),
-        events,
-        options,
-        scripts,
-    )
 }
 
 // This adapter exposes application actions for a small host-driver fixture. The
@@ -196,10 +158,84 @@ struct PendingResponse {
     text: String,
 }
 
+/// Application host I/O. `None` is pending input, distinct from EOF.
+pub trait AudioIo {
+    fn read(&mut self, buffer: &mut [f32]) -> Result<Option<usize>>;
+    fn write(&mut self, samples: &[f32]) -> Result<()>;
+    fn clock(&self, recorded: Duration) -> Duration {
+        recorded
+    }
+    fn idle(&mut self, _until: Duration) -> Result<()> {
+        std::thread::yield_now();
+        Ok(())
+    }
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+    fn playback_ticket(&mut self, output_samples: u64) -> Result<u64> {
+        Ok(output_samples)
+    }
+    fn played(&self, _ticket: u64) -> bool {
+        true
+    }
+    fn interrupt(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+#[cfg(test)]
+struct FileIo<R, W> {
+    read: R,
+    write: W,
+}
+#[cfg(test)]
+impl<R: FnMut(&mut [f32]) -> Result<usize>, W: FnMut(&[f32]) -> Result<()>> AudioIo
+    for FileIo<R, W>
+{
+    fn read(&mut self, buffer: &mut [f32]) -> Result<Option<usize>> {
+        (self.read)(buffer).map(Some)
+    }
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        (self.write)(samples)
+    }
+}
+#[cfg(test)]
 fn drive<S: Session>(
     session: &mut S,
-    mut read: impl FnMut(&mut [f32]) -> Result<usize>,
-    mut speech: impl FnMut(&[f32]) -> Result<()>,
+    read: impl FnMut(&mut [f32]) -> Result<usize>,
+    speech: impl FnMut(&[f32]) -> Result<()>,
+    events: &mut impl Write,
+    options: RunOptions,
+    scripts: Vec<ScriptedToolResponse>,
+) -> Result<()> {
+    drive_with_io(
+        session,
+        &mut FileIo {
+            read,
+            write: speech,
+        },
+        events,
+        options,
+        scripts,
+    )
+}
+/// Drives WAV and system audio through the same controlled session and tool driver.
+pub fn run_io<S, D, E, H: AudioIo>(
+    session: &mut BoundVoiceChatSession<S, D, E>,
+    io: &mut H,
+    events: &mut impl Write,
+    options: RunOptions,
+    scripts: Vec<ScriptedToolResponse>,
+) -> Result<()>
+where
+    S: SemanticStateTransaction,
+    S::Error: Send + Sync + 'static,
+    E: VoiceChatExecutor<S, D>,
+{
+    drive_with_io(session, io, events, options, scripts)
+}
+fn drive_with_io<S: Session, H: AudioIo>(
+    session: &mut S,
+    io: &mut H,
     events: &mut impl Write,
     options: RunOptions,
     scripts: Vec<ScriptedToolResponse>,
@@ -227,20 +263,23 @@ fn drive<S: Session>(
     let mut at = Duration::ZERO;
     let mut steps = 0;
     let mut output_samples = 0_u64;
+    let mut execution_started: Option<std::time::Instant> = None;
     let mut call_index = 0;
     // Each admitted script schedules at most one external result. Interrupting
     // the conversation does not cancel work already running outside the session.
     let mut pending: Vec<PendingResponse> = Vec::with_capacity(scripts.len());
-    let mut playback: Option<(VoiceChatReminderPlayback, Duration)> = None;
+    let mut playback: Option<(VoiceChatReminderPlayback, Duration, u64)> = None;
 
     let outcome = (|| {
         loop {
+            io.check()?;
+            at = at.max(io.clock(at));
             // Pending completion does not advance recorded time or consume an
             // application step. Native execution speed cannot alter tool deadlines.
             if session.status() == VoiceChatSessionStatus::Pending {
                 session.poll(at)?;
                 if session.status() == VoiceChatSessionStatus::Pending {
-                    std::thread::yield_now();
+                    io.idle(at)?;
                     continue;
                 }
             }
@@ -261,10 +300,21 @@ fn drive<S: Session>(
                 {
                     tail_remaining = tail_remaining.saturating_sub(1);
                 }
-                publish(&output, at, &mut output_samples, &mut speech, events)?;
                 if output.turn == Some(VoiceChatTurnEvent::Interrupted) {
                     playback = None;
+                    io.interrupt()?;
                 }
+                let execution_ms = execution_started
+                    .take()
+                    .map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                publish(
+                    &output,
+                    at,
+                    &mut output_samples,
+                    &mut |samples| io.write(samples),
+                    events,
+                    execution_ms,
+                )?;
                 if let Some(batch) = output.tools {
                     let script = scripts.remove(&call_index);
                     let generic: Vec<&str> = script
@@ -308,6 +358,7 @@ fn drive<S: Session>(
                     playback = Some((
                         receipt,
                         at.max(Duration::from_secs_f64(output_samples as f64 / 22_050.0)),
+                        io.playback_ticket(output_samples)?,
                     ));
                 }
             }
@@ -341,8 +392,13 @@ fn drive<S: Session>(
                     )
                     .context("input clock overflow")?,
             );
-            if playback.as_ref().is_some_and(|(_, due)| at >= *due) {
-                let (receipt, _) = playback.take().expect("due playback");
+            io.idle(at)?;
+            at = at.max(io.clock(at));
+            if playback
+                .as_ref()
+                .is_some_and(|(_, due, ticket)| at >= *due && io.played(*ticket))
+            {
+                let (receipt, _, _) = playback.take().expect("due playback");
                 session.finish_playback(receipt, at)?;
                 record(
                     events,
@@ -362,13 +418,26 @@ fn drive<S: Session>(
                     && filled == consumed
                     && session.input_status().queued_samples < INPUT_FRAME_SAMPLES
                 {
-                    filled = read(&mut buffer)?;
+                    let input_read = io.read(&mut buffer)?;
+                    if let Some(count) = input_read {
+                        filled = count;
+                    } else {
+                        filled = 0;
+                        consumed = 0;
+                        io.idle(at)?;
+                        if !session.has_tool_work()
+                            && session.status()
+                                == VoiceChatSessionStatus::Blocked(VoiceChatBlocked::NeedsInput)
+                        {
+                            continue;
+                        }
+                    }
                     ensure!(
                         filled <= buffer.len(),
                         "PCM reader returned an invalid sample count"
                     );
                     consumed = 0;
-                    if filled == 0 {
+                    if input_read == Some(0) {
                         source_finished = true;
                     }
                 }
@@ -409,6 +478,14 @@ fn drive<S: Session>(
                     }
                 }
             }
+            if !finished_input
+                && session.input_status().queued_samples < INPUT_FRAME_SAMPLES
+                && session.status() == VoiceChatSessionStatus::Blocked(VoiceChatBlocked::NeedsInput)
+                && !session.has_tool_work()
+            {
+                io.idle(at)?;
+                continue;
+            }
             ensure!(
                 steps < options.max_steps,
                 "VoiceChat reached --max-steps={} before drain; increase the explicit bound",
@@ -419,7 +496,11 @@ fn drive<S: Session>(
             if let Some(profile) = &mut profile {
                 profile.before(steps)?;
             }
+            execution_started = Some(std::time::Instant::now());
             let progress = session.advance(at)?;
+            if progress.submitted == 0 && progress.committed == 0 {
+                execution_started = None;
+            }
             #[cfg(feature = "projection-profiling")]
             if let Some(profile) = &mut profile {
                 profile.after(steps)?;
@@ -430,7 +511,7 @@ fn drive<S: Session>(
                     VoiceChatBlocked::WaitingForTime | VoiceChatBlocked::WaitingForTool
                 )
             ) {
-                at = at.checked_add(CADENCE).context("recorded time overflow")?;
+                at = io.clock(at.checked_add(CADENCE).context("recorded time overflow")?);
             }
         }
     })();
@@ -442,13 +523,16 @@ fn drive<S: Session>(
             }
             Ok(())
         }
-        Err(error) => match session.cancel(at) {
-            Ok(()) => Err(error),
-            Err(cancel) => Err(error.context(format!(
-                "cancellation at {} ms also failed: {cancel}",
-                at.as_millis()
-            ))),
-        },
+        Err(error) => {
+            let _ = io.interrupt();
+            match session.cancel(at) {
+                Ok(()) => Err(error),
+                Err(cancel) => Err(error.context(format!(
+                    "cancellation at {} ms also failed: {cancel}",
+                    at.as_millis()
+                ))),
+            }
+        }
     }
 }
 
@@ -539,12 +623,13 @@ fn publish<D>(
     output_samples: &mut u64,
     speech: &mut impl FnMut(&[f32]) -> Result<()>,
     events: &mut impl Write,
+    execution_ms: Option<f64>,
 ) -> Result<()> {
     let frame = &output.frame;
     let at_ms = millis(at)?;
     record(
         events,
-        json!({"event":"frame", "at_ms":at_ms, "invocation":frame.invocation_index, "step":format!("{:?}", frame.step), "audio_frames":frame.after.audio_frames, "backbone_positions":frame.after.backbone_positions}),
+        json!({"event":"frame", "execution_ms":execution_ms, "at_ms":at_ms, "invocation":frame.invocation_index, "step":format!("{:?}", frame.step), "audio_frames":frame.after.audio_frames, "backbone_positions":frame.after.backbone_positions}),
     )?;
     if let Some(chunk) = &frame.speech {
         ensure!(
@@ -893,7 +978,11 @@ mod tests {
             let lines: Vec<Value> = String::from_utf8(events)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
+                .map(|line| {
+                    let mut event: Value = serde_json::from_str(line).unwrap();
+                    event.as_object_mut().unwrap().remove("execution_ms");
+                    event
+                })
                 .collect();
             let final_event = lines.last().unwrap();
             assert_eq!(final_event["event"], "finished");
@@ -912,6 +1001,82 @@ mod tests {
             runs.push(lines);
         }
         assert_eq!(runs[0], runs[1]);
+    }
+
+    #[test]
+    fn pending_capture_is_not_eof_and_host_failure_cancels_the_session() {
+        struct Capture {
+            reads: usize,
+            offset: usize,
+            output: Vec<f32>,
+            interrupted: bool,
+            fail: bool,
+        }
+        impl AudioIo for Capture {
+            fn read(&mut self, buffer: &mut [f32]) -> Result<Option<usize>> {
+                self.reads += 1;
+                ensure!(self.reads < 100, "driver fails to make capture progress");
+                if self.reads % 2 == 1 {
+                    return Ok(None);
+                }
+                let count = buffer.len().min(1301 - self.offset);
+                for (i, value) in buffer[..count].iter_mut().enumerate() {
+                    *value = (self.offset + i + 1) as f32;
+                }
+                self.offset += count;
+                Ok(Some(count))
+            }
+            fn write(&mut self, samples: &[f32]) -> Result<()> {
+                ensure!(!self.fail, "host playback failure");
+                self.output.extend_from_slice(samples);
+                Ok(())
+            }
+            fn interrupt(&mut self) -> Result<()> {
+                self.interrupted = true;
+                Ok(())
+            }
+        }
+        for fail in [false, true] {
+            let mut fixture = Fixture::default();
+            let mut io = Capture {
+                reads: 0,
+                offset: 0,
+                output: Vec::new(),
+                interrupted: false,
+                fail,
+            };
+            let result = drive_with_io(
+                &mut fixture,
+                &mut io,
+                &mut Vec::new(),
+                RunOptions {
+                    chunk_samples: 127,
+                    tail_frames: 1,
+                    max_steps: 100,
+                    #[cfg(feature = "projection-profiling")]
+                    profile: None,
+                },
+                vec![],
+            );
+            if fail {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("host playback failure"));
+                assert!(io.interrupted);
+                assert_eq!(fixture.cancellations.len(), 1);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    &fixture.consumed[..1301],
+                    &(1..=1301).map(|n| n as f32).collect::<Vec<_>>()
+                );
+                assert!(fixture.consumed[1301..].iter().all(|n| *n == 0.0));
+                assert_eq!(io.output.len(), 8);
+                assert!(!io.interrupted);
+                assert!(fixture.cancellations.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -1065,7 +1230,11 @@ mod tests {
             let lines: Vec<Value> = String::from_utf8(events)
                 .unwrap()
                 .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
+                .map(|line| {
+                    let mut event: Value = serde_json::from_str(line).unwrap();
+                    event.as_object_mut().unwrap().remove("execution_ms");
+                    event
+                })
                 .collect();
             if after_ms == 1_000 {
                 assert!(fixture.responses.is_empty());

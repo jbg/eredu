@@ -8,6 +8,8 @@ use super::VoiceChatStartOptions;
 /// Host and resource policy for a PCM speech conversation.
 #[derive(Debug, Clone)]
 pub struct SpeechSessionOptions {
+    /// Eligible matrix transformations, realized through bounded prepared storage.
+    pub quantization: eredu_architectures::voicechat::quantization::SpeechQuantizationPolicy,
     /// Conversation, queue, sampling and recorded-time controls.
     pub conversation: VoiceChatStartOptions,
     /// Exact independent parameter pools for the selected speech graph.

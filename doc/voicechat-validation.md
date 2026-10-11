@@ -15,29 +15,58 @@ preparation retains the sources used to construct a single-device speech
 session. MLX CPU has RNNT, perception, channel-boundary, cached TTS, character
 conditioning, MoG/RVQ, codec encoding/decoding and retained-sampling component
 evidence; complete-model residency/parallel execution has no complete VoiceChat
-validation results. The WAV example completes the pinned released checkpoint on
+validation results. The realtime CLI completes the pinned released checkpoint on
 Metal with speech, text, transcription and drain, as recorded below. Independent
 complete-model numerical parity and speech quality remain unvalidated. No
 hardware latency claim follows from storage admission alone; resident performance
 measurements have the explicit precision, workload and timing scope below.
 
-## WAV and recorded tool responses
+## Realtime audio, WAV and recorded tool responses
 
-`eredu/examples/voicechat_wav.rs` consumes mono 16 kHz WAV input through
+`eredu realtime` consumes mono 16 kHz WAV input through
 `BoundVoiceChatSession`, writes mono 22.05 kHz float32 speech and records committed
 frame, agent-text, transcription, tool and turn events as JSONL. PCM and output
 delivery are bounded. Speech sample offsets are contiguous in the output WAV;
 JSONL retains model/audio positions and codec delay separately from the explicit
-invocation timestamp (`at_ms`). There is no wall-clock pacing or tool execution.
+invocation timestamp (`at_ms`). The default uses the system microphone and speaker
+with wall-clock pacing; `--input` selects a file, and `--offline --no-playback`
+selects recorded-time execution without opening audio streams. External tool
+execution is application-owned; `--script` supplies recorded tool results.
 
-The example uses the shared loading entry points: `prepare_realtime_model` performs
+`--quantize 8 --quantization-group-size 64` selects bounded preparation of
+backbone/readout, function-head and causal speech-transformer matrices.
+`--quantize-components` restricts those groups. Packed checkpoints load through
+the same path without `--quantize`; implicit re-quantization is rejected.
+`--speech-weights f16 --speech-compute f16` selects narrow floating execution
+for eligible unquantized speech/perception work. Quantized causal projections
+retain F32 companions and arithmetic. The bounded prepared-checkpoint cache
+persists encoded weights; reuse checks source identity and exact recipes.
+
+System audio uses optional CPAL devices and bounded lock-free queues. Native
+sample formats convert to mono and band-limited streaming resampling supplies
+16 kHz input and device-rate playback of 22.05 kHz output. Audio callbacks
+perform scalar conversion and queue access only. Playback starts after a
+160 ms preroll, or at a flushed phrase boundary; input overflow is a continuity
+error. Interruption drops queued older speech; samples already submitted to
+the operating system remain subject to device latency. First Ctrl-C closes
+input and drains the response tail; a second Ctrl-C cancels the bound session.
+`--seconds` and `--max-frames` bound capture duration. `--audio-buffer-ms` bounds
+native queue storage. Headphones avoid feeding generated speech back into capture.
+
+JSONL adds `wall_ms` and per-invocation `execution_ms`. The latter spans
+advancement through committed-output retrieval, excluding input pacing and
+output delivery. The stderr summary excludes the first ten live frames and
+compares mean/p95/p99 execution with the 80 ms frame budget; it is not a complete
+callback-to-speaker latency measurement.
+
+The CLI uses the shared loading entry points: `prepare_realtime_model` performs
 architecture-owned family discovery, source admission and auxiliary-asset retention;
 `prepare_mlx_realtime` selects cache mechanisms and parameter pools without native
 allocation; consuming `PreparedMlxRealtime::load` constructs the selected execution.
 The same preparation and loading interfaces admit Moshi/PersonaPlex categorical
 frames. `RealtimeLoadOptions` distinguishes categorical frames from PCM speech;
 a protocol mismatch fails before binding. The serialized checkpoint-source contract
-is shared with the architecture layer. The example supplies paths and policy, not
+is shared with the architecture layer. The CLI supplies paths and policy, not
 family detection, required component lists, source recipes or cache selection.
 
 All artifacts are local. `official_assets` contains `config.json` and the three
@@ -47,7 +76,8 @@ official revision `443794ea956ef0065f001967ffd00e77f519cb39`. `base_assets` cont
 `6533e8de2c68e4536bf7c411d7a3ce5734111476`. Preparation verifies exact auxiliary
 asset digests, tensor geometry, control values and tokenizer declarations.
 Checkpoint storage remains outside the source tree. Native construction consumes
-retained source views. The example does not download artifacts.
+retained source views. The CLI accepts local paths or repositories already present in the Hugging Face cache;
+it does not download artifacts.
 
 A configuration file has the following shape. These byte limits are illustrative
 admission ceilings, not measured memory requirements or hardware recommendations.
@@ -97,8 +127,7 @@ uses actual MLX mechanism facts with device storage. `device="gpu"` requires a
 compiled, available accelerator.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo run -p eredu --no-default-features --features mlx,audio \
-  --example voicechat_wav -- --config voicechat.json --input conversation.wav \
+CARGO_INCREMENTAL=0 cargo run -p eredu-cli --no-default-features --features mlx,realtime -- realtime --offline --no-playback --config voicechat.json --input conversation.wav \
   --output speech.wav --events events.jsonl --script responses.json \
   --chunk-samples 640 --tail-frames 200 --max-steps 100000
 ```
@@ -180,13 +209,13 @@ accepted by the session.
 
 Portable fixtures cover independent PCM24 decoding, malformed/truncated WAVs,
 exact float32 output, fragmented/backpressured input, pending completion, tool
-substeps and drain without an MLX dependency. Native compiler coverage does not
+substeps and drain through neutral session fixtures. Native compiler coverage does not
 establish released-weight conversations, speech quality, latency or distributed
 execution.
 
 ### Released-checkpoint single-device execution
 
-The resident F32 measurement dated 2026-10-05 uses the public WAV example on
+The resident F32 measurement dated 2026-10-05 uses the resident WAV driver on
 Apple M3 Ultra with 256 GiB unified memory, macOS 26.6.2 and Metal. The official checkpoint is
 44,382,749,892 bytes, SHA-256
 `d553750c29434a6bb524377e17634c6cafdbf621892e643a77f406e51570354b`, at the pinned
@@ -203,9 +232,8 @@ budget, not simultaneously allocated memory. Artifacts and run outputs reside in
 `/private/tmp/eredu-voicechat-reference` outside the repository.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat.json \
   --input /private/tmp/eredu-voicechat-reference/input-general.wav \
   --output /private/tmp/eredu-voicechat-reference/speech-2.wav \
@@ -232,7 +260,7 @@ session, not independent complete-model reference parity or perceptual quality.
 ### Speech precision and cache contracts
 
 `VoiceChatStartOptions::speech_precision` selects the portable
-`SpeechPrecision { weights, compute }` policy, defaulting to F32. The WAV example
+`SpeechPrecision { weights, compute }` policy, defaulting to F32. The realtime CLI
 accepts `speech_weights` and `speech_compute` as `f32`, `f16` or `bf16`. Narrow
 compute requires matching narrow weight storage. `"speech_weights":"f16",
 "speech_compute":"f32"` selects eligible narrow weights with F32 arithmetic;
@@ -357,35 +385,65 @@ native allocation caching and process overhead; it is separate from parameter
 admission accounting.
 
 The performance fixture supplies its Q8 preparation recipe through an external
-measurement harness using the ordinary bounded quantizer and prepared cache.
-`EREDU_BENCH_*` variables are harness inputs, not public WAV configuration fields.
-The ordinary loader accepts official floating and admitted community affine
-sources through the same preparation path.
+measurement fixture using the ordinary bounded quantizer and prepared cache.
+The CLI exposes the same preparation policy as `--quantize 8`; official floating
+and admitted community affine sources share one preparation path.
 
-Reproduction artifacts reside in `/private/tmp/eredu-gated-fusion`: `REPORT.md`,
-`results.json`, `build.py`, `run.py`, `measure.py`, source snapshots, benchmark
-patches, restoration checks, binary hashes, per-frame records, waveforms and
-semantic comparisons. The temporary accepted quantization preparation harness
-restores source files byte-for-byte after each build.
-
-The retained fused benchmark executable has SHA-256
+Retained measurement artifacts reside in `/private/tmp/eredu-gated-fusion`:
+`REPORT.md`, `results.json`, binary hashes, per-frame records, waveforms and
+semantic comparisons. The retained fused benchmark executable has SHA-256
 `66801a0ca1b23c64902bf9537901eb791112c7011e5a77bd858e7b2faafcc4c0`.
-The harness builds with the following command and invokes the retained binary
-with its preparation inputs:
+A current CLI run of the accepted preparation policy uses:
 
 ```sh
-cargo build --offline --release -p eredu --no-default-features \
-  --features mlx,audio,metal,projection-profiling --example voicechat_wav
-EREDU_BENCH_QUANT_BITS=8 EREDU_BENCH_FUNCTION_BITS=8 \
-EREDU_BENCH_TTS_BITS=8 EREDU_BENCH_TTS_COMPUTE=f32 \
+cargo build --offline --release -p eredu-cli
 EREDU_PREPARED_CHECKPOINT_CACHE=/private/tmp/eredu-memory-cache/prepared \
 MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
-  /private/tmp/eredu-gated-fusion/candidate-voicechat_wav \
+  target/release/eredu realtime --offline --no-playback --quantize 8 \
+  --speech-weights f16 --speech-compute f16 \
   --config /private/tmp/eredu-memory-cache/long.json \
   --input /private/tmp/eredu-voicechat-reference/input-general.wav \
   --output speech.wav --events events.jsonl \
   --chunk-samples 640 --tail-frames 800 --max-steps 2000
 ```
+
+### Realtime CLI validation
+
+The release CLI completes 996 live frames from the pinned official input with
+Q8/group-64 backbone, function-head and causal TTS projections, F32 quantized
+arithmetic/companions and F16 unquantized speech/perception execution. Configuration
+and direct `--model` requests produce the accepted WAV SHA-256
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`
+and identical 3,818 semantic records after excluding timing fields.
+
+On the M3 Ultra validation host, a direct-model warm-cache run loads in 27.689 s.
+After excluding ten live frames, invocation execution averages 64.948 ms,
+p95 66.161 ms and p99 66.561 ms; none of 986 invocations exceeds 80 ms.
+The full publication-to-publication interval averages 65.022 ms across 985
+intervals, leaving 14.978 ms of the 80 ms budget. This offline measurement
+includes host-driver work between frames, excluding device audio pacing and
+complete microphone-to-speaker latency. MLX buffer thresholds are 25 operations
+and 256 MiB. Maximum RSS is 14,918,483,968 bytes; this OS counter is separate
+from admitted parameter totals and native process-footprint accounting.
+
+Artifacts, committed events and timing logs reside in
+`/private/tmp/eredu-realtime-cli` on the validation host. The existing recorded
+input/tool fixtures cover backpressure, pending capture distinct from EOF,
+interruption, delayed responses and host-failure cancellation. Native bounded
+quantization coverage compares published prepared outputs with the canonical
+quantizer and verifies encoded-store reuse. Audio callback fixtures cover integer
+stereo downmix, overflow, preroll, interruption and timestamp-based completion;
+resampling fixtures check fragmented conversion, duration and anti-aliasing.
+WAV-only and optional profiling CLI feature configurations compile. A short
+released-checkpoint invocation also loads an MXFP4 function head, retaining its
+byte scales, and completes three live frames plus drain; this is dtype/lifecycle
+coverage, not full MXFP4 speech-quality or performance evidence.
+
+CPAL enumeration on this host exposes `Mac Studio Speakers` and `LG ULTRAWIDE`
+outputs, with no microphone. A paced input-file run opens the Mac Studio speaker,
+streams committed PCM and completes response/codec/playback drain with zero
+reported starvation samples. Hardware
+microphone capture and non-macOS device execution are not part of this validation.
 
 ### Released-checkpoint tool round trip
 
@@ -413,9 +471,8 @@ The explicit 800 ms wait exercises streaming input during tool waiting; it is no
 the pinned offline helper's immediate-injection timing.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-silent.json \
   --input /private/tmp/eredu-voicechat-reference/Speech-097dfe9e2f55baf653b83035868bdc89849f1b47/examples/speechlm2/sample_audio/sample_fc.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool.json \
@@ -474,9 +531,8 @@ with `acknowledgement` set to that phrase. Its script supplies result 20 after
 acknowledgement and `random_initial_reminder=false`.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-ack-no-reminder.json \
   --input /private/tmp/eredu-voicechat-reference/Speech-097dfe9e2f55baf653b83035868bdc89849f1b47/examples/speechlm2/sample_audio/sample_fc.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-ack.json \
@@ -528,9 +584,8 @@ respectively, each 800 ms after its batch publishes, with no reminder phrases.
 The configuration sets `random_initial_reminder=false`.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-random-no-reminder.json \
   --input /private/tmp/eredu-voicechat-reference/input-tool-random.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-random.json \
@@ -578,9 +633,8 @@ above. Checkpoint, base and reference revisions are those recorded at the start
 of this section; `tool-reminder-fixture.json` retains configuration/input hashes.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-reminder.json \
   --input /private/tmp/eredu-voicechat-reference/Speech-097dfe9e2f55baf653b83035868bdc89849f1b47/examples/speechlm2/sample_audio/sample_fc.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-reminder.json \
@@ -644,7 +698,7 @@ The generic loader completes the pinned default-reminder tool conversation with
 this command on the Metal setup above:
 
 ```sh
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-reminder.json \
   --input /private/tmp/eredu-voicechat-reference/Speech-097dfe9e2f55baf653b83035868bdc89849f1b47/examples/speechlm2/sample_audio/sample_fc.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-reminder.json \
@@ -687,9 +741,8 @@ one entry with `call_index: 0`, `after_ms: 12000`, and response
 `<TOOL_RESPONSE>[{"result": 20}]</TOOL_RESPONSE>`.
 
 ```sh
-CARGO_INCREMENTAL=0 cargo build -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+CARGO_INCREMENTAL=0 cargo build -p eredu-cli --no-default-features --features mlx,realtime,metal
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-late-silent.json \
   --input /private/tmp/eredu-voicechat-reference/Speech-097dfe9e2f55baf653b83035868bdc89849f1b47/examples/speechlm2/sample_audio/sample_fc.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-late.json \
@@ -726,7 +779,7 @@ cancellation. The session snapshot test covers committed tool activity during
 incomplete collection, restore, injection and interruption:
 
 ```sh
-CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test voicechat_wav_driver
+CARGO_INCREMENTAL=0 cargo test -p eredu-cli --no-default-features --features mlx,realtime --bin eredu realtime::run::tests
 CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib snapshot_retains_complete_tool_calls_but_never_replays_delivered_calls
 ```
 
@@ -745,7 +798,7 @@ The script delays the original tool result by 8,000 ms and selects initial
 reminder “Let me check that for you while you wait.”
 
 ```sh
-/usr/bin/time -l target/debug/examples/voicechat_wav \
+/usr/bin/time -l target/debug/eredu realtime --offline --no-playback \
   --config /private/tmp/eredu-voicechat-reference/voicechat-tool-interruption-silent.json \
   --input /private/tmp/eredu-voicechat-reference/input-tool-interruption.wav \
   --script /private/tmp/eredu-voicechat-reference/responses-tool-interruption.json \
@@ -801,7 +854,7 @@ unchanged caches/RNG/frontiers, and delayed scripted arrival through the driver:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib interrupt
-CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test voicechat_wav_driver delayed_script_arrives_after_interruption_or_is_reported_at_finish
+CARGO_INCREMENTAL=0 cargo test -p eredu-cli --no-default-features --features mlx,realtime --bin eredu realtime::run::tests::delayed_script_arrives_after_interruption_or_is_reported_at_finish
 CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric voicechat_interruption_replaces_feedback_without_advancing_candidate_state
 ```
 
@@ -819,9 +872,9 @@ CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric v
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p eredu-media --no-default-features audio::wav::tests
-CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test voicechat_wav_driver
-CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,audio --example voicechat_wav
-CARGO_INCREMENTAL=0 cargo run -p eredu --no-default-features --features mlx,audio --example voicechat_wav -- --help
+CARGO_INCREMENTAL=0 cargo test -p eredu-cli --no-default-features --features mlx,realtime --bin eredu realtime::run::tests
+CARGO_INCREMENTAL=0 cargo check -p eredu-cli --no-default-features --features mlx,realtime
+CARGO_INCREMENTAL=0 cargo run -p eredu-cli --no-default-features --features mlx,realtime -- realtime --help
 ```
 
 The portable facade exposes bounded host text preparation and a committed
@@ -1676,10 +1729,9 @@ waveform and committed events.
 hf download mlx-community/NemotronLabs-VoiceChat-11B-8bit \
   --revision 446fc83f6cde720e7fd9ad7e29d7acb3adbb8967 \
   --local-dir /models/voicechat-community-8bit
-cargo build --release -p eredu --no-default-features --features mlx,audio,metal \
-  --example voicechat_wav
+cargo build --release -p eredu-cli --no-default-features --features mlx,realtime,metal
 MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
-  target/release/examples/voicechat_wav --config voicechat-community.json \
+  target/release/eredu realtime --offline --no-playback --config voicechat-community.json \
   --input input-general.wav --output speech.wav --events events.jsonl \
   --chunk-samples 640 --tail-frames 800 --max-steps 2000
 ```
@@ -2875,7 +2927,7 @@ CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib -- \
   voicechat::provider_residency released_provider_census rnnt_retains_exact selected_target_coexists
 CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_realtime_construction voicechat
 CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features
-CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,audio --example voicechat_wav
+CARGO_INCREMENTAL=0 cargo check -p eredu-cli --no-default-features --features mlx,realtime
 ```
 
 Complete coupled parameter admission also accounts for the selected Nemotron
@@ -3356,11 +3408,11 @@ integer range, and checks completion ownership and wrong-contract rejection.
 Native Ring runs require local loopback socket access. These results do not
 validate full coupled distributed sessions, accelerator transport,
 released-weight conversational parity or hardware latency. The portable facade
-and MLX WAV example also compile with the selected feature boundaries:
+and MLX realtime CLI also compile with the selected feature boundaries:
 
 ```sh
 CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features
-CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,audio --example voicechat_wav
+CARGO_INCREMENTAL=0 cargo check -p eredu-cli --no-default-features --features mlx,realtime
 ```
 
 ```sh
@@ -3519,7 +3571,7 @@ unchanged parents, exact sample attribution and drain. Cold checks also reject a
 projection cohort that supports neural collectives but lacks the exact integer
 control publication needed by its coordinator. The standalone distributed greedy
 RNNT regression exercises ordinary coordinator construction. The portable facade
-and MLX/audio WAV example compile with the selected-input contract.
+and MLX/audio realtime CLI compile with the selected-input contract.
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric -- \
@@ -3533,8 +3585,7 @@ CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --feat
   native_rnnt_greedy_pp2_and_tp2_pp2_match_pinned_frames_and_replay \
   -- --include-ignored --nocapture
 CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features
-CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,audio \
-  --example voicechat_wav
+CARGO_INCREMENTAL=0 cargo check -p eredu-cli --no-default-features --features mlx,realtime
 ```
 
 The perception fixture executes hash-verified NVIDIA subsampling, relative

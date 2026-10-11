@@ -400,6 +400,27 @@ impl CheckpointSource for MemoryWeightStore {
 
 /// Object-safe cold-path checkpoint source used by generic materializers.
 pub trait CheckpointSource: Send + Sync {
+    /// Stable upper bound for native transformation temporaries, including after publication.
+    fn preparation_working_set_bytes(&self) -> u64 {
+        0
+    }
+    /// Retained bounded transformation awaiting native realization. Payload reads
+    /// of its outputs are unavailable until exact storage is published.
+    fn preparation(
+        &self,
+    ) -> Option<(
+        SharedCheckpointSource,
+        crate::quantization::BoundedQuantizationPlan,
+    )> {
+        None
+    }
+    /// Publishes storage matching the immutable prepared output catalog.
+    fn publish_preparation(&self, _source: SharedCheckpointSource) -> Result<(), StoreError> {
+        Err(StoreError::Internal(
+            "source has no pending preparation".into(),
+        ))
+    }
+
     /// Shared policy for additional immutable prepared representations.
     fn prepared_cache_policy(
         &self,
@@ -1065,6 +1086,21 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn preparation_working_set_bytes(&self) -> u64 {
+        self.source.preparation_working_set_bytes()
+    }
+    fn preparation(
+        &self,
+    ) -> Option<(
+        SharedCheckpointSource,
+        crate::quantization::BoundedQuantizationPlan,
+    )> {
+        self.source.preparation()
+    }
+    fn publish_preparation(&self, source: SharedCheckpointSource) -> Result<(), StoreError> {
+        self.source.publish_preparation(source)
+    }
+
     fn prepared_cache_policy(
         &self,
     ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
@@ -1341,6 +1377,14 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// A retained preparation recipe, geometry or publication is invalid.
+    #[error("invalid checkpoint preparation: {0}")]
+    InvalidPreparation(String),
+
+    /// A cold declared output has not yet received its encoded storage.
+    #[error("checkpoint tensor {0:?} requires prepared-source realization")]
+    PreparationRequired(String),
+
     /// The configured cached-shard or reader limit was zero.
     #[error("maximum cached-shard count must be nonzero")]
     InvalidShardCacheLimit,

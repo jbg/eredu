@@ -136,7 +136,7 @@ fn materialize(
 }
 
 fn assert_affine_outputs_match_reference(
-    transformed: &BoundedQuantizedWeightStore,
+    transformed: &dyn CheckpointSource,
     values: &[f32],
     quantization: AffineQuantization,
     context: &ExecutionContext,
@@ -182,6 +182,58 @@ fn assert_mxfp4_outputs_match_reference(
         scales.evaluated().unwrap().as_slice::<u8>(),
         expected.scales.evaluated().unwrap().as_slice::<u8>()
     );
+}
+
+#[test]
+fn prepared_source_publishes_canonical_outputs_and_reuses_encoded_storage() {
+    use eredu_checkpoint::{
+        quantization::PreparedQuantizedSource,
+        store::{EncodedTensorLease, SharedCheckpointSource},
+    };
+    let (directory, source, values) = direct_fixture();
+    let context = cpu_context();
+    let quantization = AffineQuantization::default();
+    let plan =
+        BoundedQuantizationPlan::new(quantization, 320, [direct_test_target("model.proj.weight")])
+            .unwrap()
+            .with_prepared_cache(
+                eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy {
+                    directory: directory.path().join("prepared"),
+                    max_bytes: 1_048_576,
+                },
+            );
+    let mut shard = None;
+    for _ in 0..2 {
+        let prepared: SharedCheckpointSource =
+            Arc::new(PreparedQuantizedSource::new(source.clone(), plan.clone()).unwrap());
+        let metadata = prepared.source_metadata("model.proj.weight").unwrap();
+        assert!(matches!(
+            prepared.acquire_lease("model.proj.weight".into()),
+            Err(StoreError::PreparationRequired(_))
+        ));
+        realize_prepared_source(&prepared, context.stream()).unwrap();
+        assert_eq!(
+            prepared.source_metadata("model.proj.weight").unwrap(),
+            metadata
+        );
+        assert_affine_outputs_match_reference(prepared.as_ref(), &values, quantization, &context);
+        let lease = prepared.acquire_lease("model.proj.weight".into()).unwrap();
+        let path = lease.backing_path().unwrap().to_owned();
+        assert!(
+            path.starts_with(directory.path().join("prepared").canonicalize().unwrap()),
+            "prepared backing {path:?}"
+        );
+        let current = (
+            path.clone(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        );
+        if let Some(previous) = shard {
+            assert_eq!(current, previous);
+        }
+        shard = Some(current);
+        // Repeated preparation on the same source is a completed no-op.
+        realize_prepared_source(&prepared, context.stream()).unwrap();
+    }
 }
 
 #[test]

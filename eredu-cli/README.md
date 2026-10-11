@@ -151,3 +151,59 @@ reserve is 256 MiB, configurable with `--memory-reserve-bytes`.
 Ordinary text prefill defaults to chunks of 512 tokens. Set
 `--prefill-chunk-size 0` for one pass. Reports preserve unknown costs and identify
 full-prompt fallbacks. See [formulas, coverage and calibration](../doc/generation-memory.md).
+
+## Realtime speech
+
+Build with `realtime,system-audio` for microphone/speaker conversations; both
+features are enabled by default. `system-audio` uses CPAL's native platform host.
+Linux builds require the host audio development libraries used by CPAL (normally
+ALSA). A WAV-only build uses `--no-default-features --features mlx,metal,realtime`
+on Apple silicon. CUDA hosts use `--no-default-features --features cuda,realtime,system-audio`.
+
+```sh
+eredu realtime --list-audio-devices
+MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
+  eredu realtime --model /models/voicechat-official \
+  --base-assets /models/nemotron-base --device gpu:0 \
+  --quantize 8 --speech-weights f16 --speech-compute f16 \
+  --seconds 60 --output speech.wav --events events.jsonl
+```
+
+The command-buffer settings in this example identify the measured M3 Ultra
+configuration; other hardware can need different batching.
+
+The default microphone and speaker are selected automatically. Use exact names
+from `--list-audio-devices` with `--input-device` and `--output-device` to select
+other devices. Headphones avoid acoustic feedback. First Ctrl-C closes capture
+and drains the response tail; a second Ctrl-C cancels. Queue storage is bounded
+by `--audio-buffer-ms`; capture overflow reports a continuity error.
+
+On-load quantization targets eligible backbone/readout, function-head and causal
+speech-transformer projections, uses the bounded prepared-checkpoint cache, and
+keeps sensitive floating operations intact. `--quantize-components` selects a
+subset. Quantized causal projections retain F32 arithmetic. Released packed
+checkpoints load without `--quantize`; re-quantization is rejected.
+
+Use `--config voicechat.json` for tool declarations, split GGUF sources and precise
+resource configuration. Device, sampling, seed, mixed precision, parameter budgets
+and bounded host/disk residency have command-line overrides. Model identifiers
+must already be cached; auxiliary assets are admitted from the exact official
+and base tokenizer/configuration sources described in
+[VoiceChat validation](../doc/voicechat-validation.md).
+
+Recorded input and unattended measurements use the same controlled driver:
+
+```sh
+eredu realtime --config voicechat.json --input conversation.wav \
+  --offline --no-playback --quantize 8 \
+  --speech-weights f16 --speech-compute f16 \
+  --output speech.wav --events events.jsonl
+```
+
+Input WAV must be mono 16 kHz; output is mono 22.05 kHz float32. Output paths must
+be new. Agent text is written to stdout; diagnostics and warm execution percentiles
+are written to stderr. JSONL records committed text, transcription, tools, turns,
+wall time and invocation execution time. Execution timing excludes input pacing
+and output delivery; it does not measure complete microphone-to-speaker latency.
+
+Run `eredu realtime --help` for the complete option list.

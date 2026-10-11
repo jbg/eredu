@@ -227,6 +227,71 @@ pub struct PreparedSpeechProviders {
 }
 
 impl PreparedSpeechProviders {
+    /// Selects eligible packed matrices while preserving all other speech policies.
+    pub fn with_quantization(
+        mut self,
+        policy: super::quantization::SpeechQuantizationPolicy,
+        parameters: &BTreeMap<String, ParameterAdmission>,
+    ) -> Result<Self, ProviderConstructionError> {
+        use eredu_checkpoint::recipe::RecipeDtype;
+        let mut selected = parameters.clone();
+        if let Some(quantization) = policy.function_head {
+            let eligible =
+                std::collections::BTreeSet::from(["stt_model.function_head.weight".to_owned()]);
+            let (source, parameters) = super::quantization::project_parameters(
+                self.function.source().clone(),
+                &selected,
+                quantization,
+                &eligible,
+                RecipeDtype::F32,
+            )
+            .map_err(FunctionHeadPreparationError::from)?;
+            self.function = PreparedFunctionHeadBindings::from_parameters(
+                self.function.dimensions(),
+                source,
+                &parameters,
+            )?;
+            selected = parameters;
+        }
+        if let Some(quantization) = policy.tts {
+            let config = self.transformer.config().clone();
+            let eligible = self
+                .transformer
+                .unit_bindings()
+                .iter()
+                .flatten()
+                .filter(|binding| {
+                    let name = binding.name();
+                    config
+                        .precision()
+                        .narrows(name, selected[name].output.shape.len())
+                })
+                .map(|binding| binding.name().to_owned())
+                .collect();
+            let (source, parameters) = super::quantization::project_parameters(
+                self.transformer.source().clone(),
+                &selected,
+                quantization,
+                &eligible,
+                RecipeDtype::F32,
+            )
+            .map_err(TtsTransformerPreparationError::from)?;
+            let precision = super::precision::SpeechPrecision {
+                weights: config.precision().weights,
+                compute: super::precision::SpeechFloat::F32,
+            };
+            self.transformer = PreparedTtsTransformerBindings::from_parameters(
+                config.with_precision(Default::default()),
+                source,
+                &parameters,
+            )?
+            .with_precision(precision)?;
+            selected = parameters;
+        }
+        self.prepare_resources(&selected)?;
+        Ok(self)
+    }
+
     /// Admits every selected speech role before allowing a native binding callback.
     pub fn from_retained(
         artifacts: &RetainedVoiceChatArtifacts,

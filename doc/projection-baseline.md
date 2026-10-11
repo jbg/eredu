@@ -162,9 +162,8 @@ reduces that bias but does not reproduce the complete inference schedule.
 The WAV application selects one explicit advancement and replays after drain:
 
 ```sh
-cargo build --release -p eredu --no-default-features \
-  --features mlx,audio,metal,projection-profiling --example voicechat_wav
-target/release/examples/voicechat_wav --config CONFIG.json --input INPUT.wav \
+cargo build --release -p eredu-cli --no-default-features --features mlx,realtime,metal,projection-profiling
+target/release/eredu realtime --offline --no-playback --config CONFIG.json --input INPUT.wav \
   --output SPEECH.wav --events EVENTS.jsonl --projection-profile PROFILE.json \
   --profile-advance 22 --profile-samples 5
 ```

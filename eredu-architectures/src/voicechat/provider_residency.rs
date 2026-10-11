@@ -110,6 +110,9 @@ impl SpeechProviderResources {
             result.materialization_peak_bytes =
                 result.materialization_peak_bytes.max(unit_peak_bytes);
         }
+        result.materialization_peak_bytes = result
+            .materialization_peak_bytes
+            .max(source.preparation_working_set_bytes());
         Ok(result)
     }
 }

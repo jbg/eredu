@@ -42,6 +42,7 @@ pub mod preprocessing;
 pub mod progress;
 pub mod provider_construction;
 pub mod provider_residency;
+pub mod quantization;
 pub mod rnnt;
 pub mod rnnt_coordination;
 pub mod rnnt_layered;

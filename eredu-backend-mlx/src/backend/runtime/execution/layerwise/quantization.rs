@@ -851,7 +851,7 @@ where
                 ),
             }
         })
-        .collect::<Result<Vec<_>, Error>>()?;
+        .collect::<Result<Vec<_>, eredu_checkpoint::store::StoreError>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
     let transformed = Arc::new(BoundedQuantizedWeightStore::create(

@@ -1629,15 +1629,17 @@ bound session loader remain single-device compositions; distributed conversation
 commit, snapshots and externally delivered speech are not established by the
 component's commit agreement.
 
-The `voicechat_wav` example advances this bound session with recorded timestamps,
-retries bounded PCM submission and drains committed publications to WAV/JSONL.
-Pending native completion holds time fixed. Live frames advance the input clock;
+The `eredu realtime` command advances this bound session with wall-clock or recorded timestamps,
+retries bounded PCM submission and drains committed publications to speakers,
+WAV and JSONL. Pending microphone input is distinct from EOF. In offline mode,
+pending native completion holds recorded time fixed. System playback receipts
+wait for native playback timestamps; interruption invalidates queued older speech. Live frames advance the input clock;
 tool serialization retains its independent substeps. Scripted tool results bind
 to committed batch tickets and are discarded after interruption or stale-result
 rejection. After WAV EOF the application submits bounded silence while committed
 tool work remains active. `VoiceChatSession::has_tool_work` observes committed
 call serialization, waiting and response decoding through EOTR, without exposing
-unpublished changes. Completing or interrupting tool work resets the example's
+unpublished changes. Completing or interrupting tool work resets the CLI's
 configured response tail; ordinary live frames consume that tail before input
 closes and the ordinary drain runs. The JSONL stream records synthetic input
 separately from WAV source samples. This application policy does not change the

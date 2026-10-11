@@ -219,16 +219,31 @@ remains backend-neutral; shared realtime cold selection chooses the execution
 mechanisms separately. See [VoiceChat validation](voicechat-validation.md) for the
 measured scope.
 
-The `voicechat_wav` example calls `api::realtime::prepare_realtime_model`,
+The `eredu realtime` command calls `api::realtime::prepare_realtime_model`,
 `prepare_mlx_realtime` and the consuming `PreparedMlxRealtime::load`, then drives
 the returned `BoundVoiceChatSession`. Checkpoint naming, admission, neural equations
-and conversation policy remain in their existing owners. The example owns CLI
-configuration, recorded tool scripts and file delivery.
+and conversation policy remain in their existing owners. The CLI owns configuration, recorded tool scripts, wall-clock pacing and
+file/device delivery.
 `eredu-media::audio::wav` supplies bounded, standard-library-only mono WAV processing
 without optional host-audio dependencies. The facade selects cache realization
-through MLX's cold `native::state_capabilities`; the example supplies policy and
+through MLX's cold `native::state_capabilities`; the CLI supplies policy and
 budgets. Fallible `ExecutionContext::cpu` and `accelerator` constructors keep native
 device creation in the backend.
+
+`eredu-media::audio::system` gates CPAL capture/playback behind `system-audio`.
+Bounded callback queues, scalar format conversion and host resampling depend on
+no native inference runtime. The CLI drives file and system PCM through the same
+controlled-session adapter; native completion, rollback and neural state remain
+in their existing owners.
+
+`eredu-checkpoint::quantization` owns bounded transformation targets, cold output
+metadata and pending prepared-source publication. Architecture preparation selects
+eligible matrices and execution precision before residency admission. The MLX
+backend realizes the retained plan through its generic bounded quantizer and
+prepared-checkpoint cache, then publishes exact encoded storage after completion.
+Restricted views preserve that preparation authority and deny unrelated reads;
+transformed reads fail until publication. No family branch selects quantization
+inside the backend.
 
 VoiceChat retains selected host integer payloads during their bounded hash-validation
 pass and reports their canonical host storage separately from learned weights.
