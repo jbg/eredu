@@ -1,5 +1,6 @@
 //! Application-owned PCM I/O and options over the shared controlled speech session.
 
+mod display;
 mod events;
 mod host;
 mod load;
@@ -53,7 +54,7 @@ pub struct Args {
     /// Record source PCM accepted by the session as mono 16 kHz float32 WAV.
     #[arg(long)]
     record_input: Option<PathBuf>,
-    /// Hide incremental input transcription, shown on stderr by default.
+    /// Hide input transcription, grouped on stderr by default.
     #[arg(long)]
     no_transcription: bool,
     /// Save committed mono 22.05 kHz float32 speech to a new WAV.

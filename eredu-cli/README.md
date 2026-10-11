@@ -205,10 +205,20 @@ other devices. Headphones avoid acoustic feedback. First Ctrl-C closes capture
 and drains the response tail; a second Ctrl-C cancels. Queue storage is bounded
 by `--audio-buffer-ms`; capture overflow reports a continuity error.
 
-Input transcription appears on stderr as incremental `heard:` fragments by
-default. It uses the model's existing perception output and requires no additional
-inference. `--no-transcription` hides it. The transcription is the model's speech
-recognition output, not an explanation of its response.
+In an interactive terminal, conversation text appears on stderr as separate
+`Heard:` and `Agent:` lines. Token fragments are joined into readable chunks;
+transcription is flushed after an 800 ms pause, at a turn boundary or at shutdown.
+Long chunks are split at word boundaries where available, with a 240-byte limit.
+Agent text is flushed at sentence and turn boundaries. Redirected stdout preserves the raw
+streaming agent text for scripts; transcription remains on stderr.
+
+Transcription is shown by default. It uses the model's existing perception output
+and requires no additional inference. `--no-transcription` hides it. The
+transcription is the model's speech recognition output, not an explanation of its
+response. The model can initiate an agent turn without recognized user speech;
+transcription is not an admission gate for generated responses. The backbone
+consumes audio features directly, so a response preceding transcript text does
+not imply that the model has received no audio.
 
 For microphone diagnostics, use `--record-input microphone.wav` to save the
 resampled source audio accepted by the session as mono 16 kHz float32 WAV.
@@ -216,6 +226,13 @@ The recording excludes injected silence and response-tail padding. The CLI repor
 the selected microphone device and native format at startup, and accepted sample
 count, RMS level and peak level at shutdown. Background dialogue can reach the
 model even when the operator is silent.
+
+To distinguish live capture from model behavior, record a run with
+`--record-input microphone.wav --events microphone.jsonl`, then listen to the
+recording and replay it with the same model/precision options plus
+`--input microphone.wav --offline --no-playback --events replay.jsonl`.
+JSONL preserves individual text deltas and source-frame attribution regardless
+of terminal grouping.
 
 On-load quantization targets eligible backbone/readout, function-head and causal
 speech-transformer projections, uses the bounded prepared-checkpoint cache, and
@@ -240,10 +257,10 @@ eredu realtime --config voicechat.json --input conversation.wav \
 ```
 
 Input WAV must be mono 16 kHz; output is mono 22.05 kHz float32. Output paths must
-be new. Agent text is written to stdout; diagnostics, warm execution percentiles
-and input transcription are written to stderr. JSONL records committed text,
-transcription, tools, turns, wall time and invocation execution time. Execution
-timing excludes input pacing and output delivery; it does not measure complete
+be new. Redirected agent text is written to stdout; terminal conversation text,
+diagnostics and warm execution percentiles are written to stderr. JSONL records
+committed text, transcription, tools, turns, wall time and invocation execution
+time. Execution timing excludes input pacing and output delivery; it does not measure complete
 microphone-to-speaker latency.
 
 Run `eredu realtime --help` for the complete option list.

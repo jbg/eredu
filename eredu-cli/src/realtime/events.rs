@@ -1,7 +1,8 @@
+use super::display::Display;
 use anyhow::Result;
 use serde_json::Value;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     time::Instant,
 };
 
@@ -12,10 +13,12 @@ pub struct Events {
     live: u64,
     timings: Vec<f64>,
     limit: u64,
-    show_transcription: bool,
+    display: Display<io::Stderr>,
+    interactive: bool,
 }
 impl Events {
     pub fn new(sink: Box<dyn Write>, limit: u64, show_transcription: bool) -> Result<Self> {
+        let interactive = io::stdout().is_terminal() && io::stderr().is_terminal();
         Ok(Self {
             sink,
             start: Instant::now(),
@@ -23,7 +26,8 @@ impl Events {
             live: 0,
             timings: Vec::new(),
             limit,
-            show_transcription,
+            display: Display::new(io::stderr(), show_transcription, interactive),
+            interactive,
         })
     }
     pub fn summary(&self) {
@@ -58,17 +62,13 @@ impl Events {
                 }
             }
         }
-        if value["event"] == "agent_text" {
+        if !self.interactive && value["event"] == "agent_text" {
             if let Some(text) = value["text"].as_str() {
                 print!("{text}");
                 io::stdout().flush()?;
             }
         }
-        if self.show_transcription && value["event"] == "transcription" {
-            if let Some(text) = value["text"].as_str().filter(|text| !text.is_empty()) {
-                eprintln!("heard: {text}");
-            }
-        }
+        self.display.observe(&value)?;
         serde_json::to_writer(&mut self.sink, &value)?;
         self.sink.write_all(b"\n")?;
         self.pending.clear();
@@ -90,6 +90,7 @@ impl Write for Events {
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.display.finish()?;
         self.sink.flush()
     }
 }
