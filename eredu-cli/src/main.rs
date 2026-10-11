@@ -1,3 +1,4 @@
+mod common;
 mod memory;
 #[cfg(feature = "realtime")]
 mod realtime;
@@ -35,27 +36,29 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
-        inspect_local_model, local_device_plan, reset_local_allocator_peak, LoadedModel,
-        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
-        LocalRuntimeConfiguration, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeGenerationRequest, TextDecoder, TextModelError,
+        benchmark_local_expert_cache, discover_local_hardware, inspect_local_model,
+        local_device_plan, reset_local_allocator_peak, LoadedModel, LocalDevice,
+        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
+        TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
 };
 use eredu_backend_mlx::MlxBackendFactory;
+#[cfg(test)]
+use eredu_core::QuantizationRequest;
 use eredu_core::{
     residency::CacheEvictionPolicy, speculative::SpeculativeStats, speculative_decoding_telemetry,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, DeviceCapabilities, DevicePlan,
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
     ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
     HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, QuantizationRequest,
-    ResidencyPlan, SemanticEvent, SessionCapabilities, SpeculativeSchedulerOptions,
-    TextGenerationConfig, TimingTelemetry, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, SemanticEvent,
+    SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
+    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -232,12 +235,11 @@ impl From<CacheEvictionPolicy> for ExpertCacheEviction {
 
 /// Generate text with a model supported by eredu.
 #[derive(Debug, Clone, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None,
+    group(clap::ArgGroup::new("text_model").args(["model"]).required(true)))]
 struct Cli {
-    /// Model directory, GGUF file, or cached Hugging Face model identifier.
-    /// Append `:QUANT` to select a cached GGUF quantization.
-    #[arg(short, long, value_name = "PATH_OR_ID")]
-    model: String,
+    #[command(flatten)]
+    common: common::CommonOptions,
 
     /// Automatically select a single-device execution plan. Defaults to quick.
     #[arg(long, value_enum, value_name = "MODE", default_value = "quick")]
@@ -287,14 +289,6 @@ struct Cli {
     #[arg(long, value_name = "PATH_OR_ID")]
     draft_model: Option<String>,
 
-    /// Main model execution device: `cpu` or `gpu:N`.
-    #[arg(long, default_value_t = CliDevice::default(), value_name = "DEVICE")]
-    device: CliDevice,
-
-    /// Process-global MLX allocator-cache limit in bytes; zero disables caching.
-    #[arg(long, value_name = "BYTES")]
-    mlx_cache_limit_bytes: Option<u64>,
-
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
     speculative_draft_tokens: usize,
@@ -317,10 +311,6 @@ struct Cli {
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
-
-    /// Cached Hugging Face revision (a ref such as `main` or a commit hash).
-    #[arg(long, value_name = "REVISION")]
-    revision: Option<String>,
 
     /// Require target and draft GGUFs from one cached repository commit.
     #[arg(long)]
@@ -351,17 +341,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = MemoryPolicy::Warn)]
     memory_policy: MemoryPolicy,
 
-    /// Sampling temperature. Defaults to the checkpoint; zero selects greedy decoding.
-    #[arg(short = 't', long, value_name = "FLOAT")]
-    temperature: Option<f32>,
-
     /// Keep only the K most likely tokens. Defaults to the checkpoint; zero disables it.
     #[arg(long, value_name = "K")]
     top_k: Option<i32>,
-
-    /// Nucleus probability. Defaults to the checkpoint's declared value.
-    #[arg(long, value_name = "FLOAT")]
-    top_p: Option<f32>,
 
     /// Minimum-probability fraction. Defaults to the checkpoint's declared value.
     #[arg(long, value_name = "FLOAT")]
@@ -380,10 +362,6 @@ struct Cli {
     #[arg(long, default_value_t = 0.1, value_name = "FLOAT")]
     mirostat_eta: f32,
 
-    /// Penalty for repeating a token. Defaults to the checkpoint, then 1 (disabled).
-    #[arg(long, value_name = "FLOAT")]
-    repeat_penalty: Option<f32>,
-
     /// Penalty history length. Defaults to the checkpoint, then 64; -1 means all.
     #[arg(long, value_name = "TOKENS")]
     repeat_last_n: Option<i32>,
@@ -396,34 +374,10 @@ struct Cli {
     #[arg(long, value_name = "FLOAT")]
     presence_penalty: Option<f32>,
 
-    /// Random seed used when temperature is non-zero.
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
-
     /// Maximum tokens per eligible text prefill pass; zero disables chunking.
     /// Media, observations, distributed and speculative paths retain a full pass.
     #[arg(long, default_value_t = 512, value_name = "TOKENS")]
     prefill_chunk_size: usize,
-
-    /// Quantize eligible dense weights to this bit width while loading.
-    #[arg(long, value_name = "BITS")]
-    quantize: Option<i32>,
-
-    /// Encoding used for load-time quantization. MXFP4 requires --quantize 4.
-    #[arg(long, value_enum, default_value_t = LoadQuantizationMode::Affine)]
-    quantization_mode: LoadQuantizationMode,
-
-    /// Number of adjacent weights sharing quantization parameters.
-    #[arg(long, default_value_t = 64, value_name = "WEIGHTS")]
-    quantization_group_size: i32,
-
-    /// Keep repeated model layers on the host and use a bounded device window.
-    #[arg(long)]
-    layerwise_host: bool,
-
-    /// Stream ordinary execution layers through bounded disk, host, and device caches.
-    #[arg(long)]
-    dense_disk_stream: bool,
 
     /// Dense-stream host lookahead; use zero with a zero host budget.
     #[arg(long, default_value_t = 2, value_name = "LAYERS")]
@@ -436,18 +390,6 @@ struct Cli {
     /// Cache routed experts independently for any supported MoE model.
     #[arg(long)]
     expert_cache: bool,
-
-    /// Maximum repeated layers resident on the execution device.
-    #[arg(long, default_value_t = 1, value_name = "LAYERS")]
-    device_layer_window: usize,
-
-    /// Optional logical device parameter budget in bytes.
-    #[arg(long, value_name = "BYTES")]
-    device_budget_bytes: Option<u64>,
-
-    /// Optional logical host parameter budget in bytes.
-    #[arg(long, value_name = "BYTES")]
-    host_budget_bytes: Option<u64>,
 
     /// Optional logical device budget for cached routed experts.
     #[arg(long, value_name = "BYTES")]
@@ -472,10 +414,6 @@ struct Cli {
     /// Measure cold prefill, repeated prefill, and one cached decode separately.
     #[arg(long)]
     expert_cache_benchmark: bool,
-
-    /// Maximum simultaneously cached SafeTensors shards or GGUF readers.
-    #[arg(long, default_value_t = 4, value_name = "SHARDS")]
-    cached_shards: usize,
 
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
@@ -532,11 +470,11 @@ struct Cli {
 impl Cli {
     fn generation_overrides(&self) -> GenerationConfigOverrides {
         GenerationConfigOverrides {
-            temperature: self.temperature,
+            temperature: self.common.temperature,
             top_k: self.top_k,
-            top_p: self.top_p,
+            top_p: self.common.top_p,
             min_p: self.min_p,
-            repetition_penalty: self.repeat_penalty,
+            repetition_penalty: self.common.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
             frequency_penalty: self.frequency_penalty,
             presence_penalty: self.presence_penalty,
@@ -621,20 +559,20 @@ impl AutomaticCliOverrides {
 
     fn restore(&self, args: &mut Cli, original: &Cli) {
         if self.contains("mlx_cache_limit_bytes") {
-            args.mlx_cache_limit_bytes = original.mlx_cache_limit_bytes;
+            args.common.mlx_cache_limit_bytes = original.common.mlx_cache_limit_bytes;
         }
         if self.contains("quantize") {
-            args.quantize = original.quantize;
+            args.common.quantize = original.common.quantize;
         }
         if self.contains("quantization_mode") {
-            args.quantization_mode = original.quantization_mode;
+            args.common.quantization_mode = original.common.quantization_mode;
         }
         if self.contains("quantization_group_size") {
-            args.quantization_group_size = original.quantization_group_size;
+            args.common.quantization_group_size = original.common.quantization_group_size;
         }
         if self.contains("layerwise_host") || self.contains("dense_disk_stream") {
-            args.layerwise_host = original.layerwise_host;
-            args.dense_disk_stream = original.dense_disk_stream;
+            args.common.layerwise_host = original.common.layerwise_host;
+            args.common.dense_disk_stream = original.common.dense_disk_stream;
         }
         if self.contains("dense_host_lookahead") {
             args.dense_host_lookahead = original.dense_host_lookahead;
@@ -643,13 +581,13 @@ impl AutomaticCliOverrides {
             args.dense_background_queue = original.dense_background_queue;
         }
         if self.contains("device_layer_window") {
-            args.device_layer_window = original.device_layer_window;
+            args.common.device_layer_window = original.common.device_layer_window;
         }
         if self.contains("device_budget_bytes") {
-            args.device_budget_bytes = original.device_budget_bytes;
+            args.common.device_budget_bytes = original.common.device_budget_bytes;
         }
         if self.contains("host_budget_bytes") {
-            args.host_budget_bytes = original.host_budget_bytes;
+            args.common.host_budget_bytes = original.common.host_budget_bytes;
         }
         if self.contains("expert_cache") {
             args.expert_cache = original.expert_cache;
@@ -673,7 +611,7 @@ impl AutomaticCliOverrides {
             args.expert_cache_benchmark = original.expert_cache_benchmark;
         }
         if self.contains("cached_shards") {
-            args.cached_shards = original.cached_shards;
+            args.common.cached_shards = original.common.cached_shards;
         }
         if self.contains("draft_model") {
             args.speculative_draft_tokens = original.speculative_draft_tokens;
@@ -963,36 +901,9 @@ fn use_semantic_generation(
     }
 }
 
+#[cfg(test)]
 fn requested_load_quantization(args: &Cli) -> Result<Option<QuantizationRequest>> {
-    parse_load_quantization(
-        args.quantize,
-        args.quantization_mode,
-        args.quantization_group_size,
-    )
-}
-
-fn parse_load_quantization(
-    bits: Option<i32>,
-    mode: LoadQuantizationMode,
-    group_size: i32,
-) -> Result<Option<QuantizationRequest>> {
-    match (bits, mode) {
-        (Some(bits), LoadQuantizationMode::Affine) => {
-            eredu_checkpoint::AffineQuantization::new(group_size, bits)?;
-            Ok(Some(QuantizationRequest::Affine {
-                group_size: u32::try_from(group_size)?,
-                bits: u8::try_from(bits)?,
-            }))
-        }
-        (Some(4), LoadQuantizationMode::Mxfp4) => Ok(Some(QuantizationRequest::MxFp4)),
-        (Some(_), LoadQuantizationMode::Mxfp4) => {
-            bail!("--quantization-mode mxfp4 requires --quantize 4")
-        }
-        (None, LoadQuantizationMode::Mxfp4) => {
-            bail!("--quantization-mode requires --quantize")
-        }
-        (None, LoadQuantizationMode::Affine) => Ok(None),
-    }
+    args.common.quantization_request()
 }
 
 const AUTO_DEVICE_FALLBACK_BYTES: u64 = 4 << 30;
@@ -1536,8 +1447,11 @@ fn automatic_plan_with_overrides(
     ExecutionPlanReport,
     eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>,
 )> {
-    let request = AutomaticPlanRequest::new(model_path, device_plan(args.device)?)
-        .with_prior_telemetry(prior_telemetry.iter().cloned());
+    let request = AutomaticPlanRequest::new(
+        model_path,
+        device_plan(args.common.device.unwrap_or_default())?,
+    )
+    .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
         .plan_retained_with_overrides(
             &MlxBackendFactory::default(),
@@ -1912,23 +1826,23 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
 fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
     match plan.weight_transformation() {
         WeightTransformationPlan::PreserveCheckpoint => {
-            args.quantize = None;
-            args.quantization_mode = LoadQuantizationMode::Affine;
+            args.common.quantize = None;
+            args.common.quantization_mode = LoadQuantizationMode::Affine;
         }
         WeightTransformationPlan::Affine { bits, group_size } => {
-            args.quantize = Some(bits);
-            args.quantization_mode = LoadQuantizationMode::Affine;
-            args.quantization_group_size = group_size;
+            args.common.quantize = Some(bits);
+            args.common.quantization_mode = LoadQuantizationMode::Affine;
+            args.common.quantization_group_size = group_size;
         }
         WeightTransformationPlan::MxFp4 => {
-            args.quantize = Some(4);
-            args.quantization_mode = LoadQuantizationMode::Mxfp4;
+            args.common.quantize = Some(4);
+            args.common.quantization_mode = LoadQuantizationMode::Mxfp4;
         }
         _ => bail!("unsupported weight transformation plan"),
     }
-    args.cached_shards = plan.max_cached_shards();
-    args.layerwise_host = false;
-    args.dense_disk_stream = false;
+    args.common.cached_shards = plan.max_cached_shards();
+    args.common.layerwise_host = false;
+    args.common.dense_disk_stream = false;
     match plan.residency() {
         ResidencyPlan::FullyResident => {}
         ResidencyPlan::LayerwiseHost {
@@ -1936,10 +1850,10 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             device_budget_bytes,
             host_budget_bytes,
         } => {
-            args.layerwise_host = true;
-            args.device_layer_window = *device_layer_window;
-            args.device_budget_bytes = *device_budget_bytes;
-            args.host_budget_bytes = *host_budget_bytes;
+            args.common.layerwise_host = true;
+            args.common.device_layer_window = *device_layer_window;
+            args.common.device_budget_bytes = *device_budget_bytes;
+            args.common.host_budget_bytes = *host_budget_bytes;
         }
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes,
@@ -1947,9 +1861,9 @@ fn apply_automatic_plan(args: &mut Cli, plan: &ExecutionPlan) -> Result<()> {
             host_lookahead,
             background_queue,
         } => {
-            args.dense_disk_stream = true;
-            args.device_budget_bytes = Some(*device_budget_bytes);
-            args.host_budget_bytes = Some(*host_budget_bytes);
+            args.common.dense_disk_stream = true;
+            args.common.device_budget_bytes = Some(*device_budget_bytes);
+            args.common.host_budget_bytes = Some(*host_budget_bytes);
             args.dense_host_lookahead = *host_lookahead;
             args.dense_background_queue = *background_queue;
         }
@@ -1998,7 +1912,8 @@ fn automatic_report_with_cache(
     prior_telemetry: &[ExecutionTelemetry],
 ) -> Result<ExecutionPlanReport> {
     if let Some(path) = cache_path {
-        let observations = automatic_observations(model_path, args.device)?;
+        let observations =
+            automatic_observations(model_path, args.common.device.unwrap_or_default())?;
         let key = automatic_cache_key(model_path, &observations)?;
         if prior_telemetry.is_empty() {
             if let Some(mut cached) = cached_automatic_report(path, &key)? {
@@ -2098,9 +2013,12 @@ fn main() -> Result<()> {
     let original_args = args.clone();
     validate_args(&args)?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
-        &args.model,
+        args.common
+            .model
+            .as_deref()
+            .expect("text command requires --model"),
         args.draft_model.as_deref(),
-        args.revision.as_deref(),
+        args.common.revision.as_deref(),
     )?;
     if let Some(draft) = &resolved_draft {
         validate_artifact_pair(&resolved_model, draft, args.require_same_revision)?;
@@ -2117,18 +2035,19 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to read exact trial plan {}", path.display()))?;
             let plan: ExecutionPlan = serde_json::from_slice(&bytes)
                 .with_context(|| format!("failed to parse exact trial plan {}", path.display()))?;
-            if plan.device() != &device_plan(args.device)? {
+            if plan.device() != &device_plan(args.common.device.unwrap_or_default())? {
                 bail!(
                     "exact trial plan device {}:{} does not match --device {}",
                     plan.device().backend(),
                     plan.device().device(),
-                    args.device
+                    args.common.device.unwrap_or_default()
                 );
             }
             let plan = if automatic_overrides.is_empty() {
                 plan
             } else {
-                let observations = automatic_observations(&model_path, args.device)?;
+                let observations =
+                    automatic_observations(&model_path, args.common.device.unwrap_or_default())?;
                 automatic_overrides.apply_to_plan(
                     &plan,
                     &original_args,
@@ -2155,7 +2074,11 @@ fn main() -> Result<()> {
                             "performance overrides are supported by automatic quick execution and plan reporting, not --auto benchmark"
                         );
                     }
-                    let heuristic = automatic_plan(&model_path, args.device, &automatic_feedback)?;
+                    let heuristic = automatic_plan(
+                        &model_path,
+                        args.common.device.unwrap_or_default(),
+                        &automatic_feedback,
+                    )?;
                     let benchmark = benchmark_automatic_plans(
                         &model_path,
                         heuristic,
@@ -2211,7 +2134,10 @@ fn main() -> Result<()> {
                     )?;
                     retained_automatic_inspection = Some(inspection);
                     if let Some(path) = &args.auto_cache {
-                        let observations = automatic_observations(&model_path, args.device)?;
+                        let observations = automatic_observations(
+                            &model_path,
+                            args.common.device.unwrap_or_default(),
+                        )?;
                         let key = automatic_cache_key(&model_path, &observations)?;
                         write_auto_plan_cache(path, key, report.clone(), None)?;
                     }
@@ -2237,15 +2163,8 @@ fn main() -> Result<()> {
                 .as_ref()
                 .map(|_| discover_local_hardware())
         });
-    if let Some(bytes) = args
-        .mlx_cache_limit_bytes
-        .filter(|_| args.estimate_memory_tokens.is_none())
-    {
-        let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
-        configure_local_runtime(
-            &LocalRuntimeConfiguration::default().with_allocator_cache_limit(bytes),
-        )
-        .context("failed to set the local allocator-cache limit")?;
+    if args.estimate_memory_tokens.is_none() {
+        args.common.configure_runtime()?;
     }
     let prompt = if args.estimate_memory_tokens.is_some() {
         String::new()
@@ -2291,8 +2210,8 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- Eredu MLX diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
-        eprintln!("device: {}", args.device);
-        if let Some(bytes) = args.mlx_cache_limit_bytes {
+        eprintln!("device: {}", args.common.device.unwrap_or_default());
+        if let Some(bytes) = args.common.mlx_cache_limit_bytes {
             eprintln!("mlx_cache_limit: {}", format_bytes(bytes as usize));
         }
         if let Some(path) = &draft_model_path {
@@ -2459,7 +2378,7 @@ fn main() -> Result<()> {
             max_new_tokens: Some(max_tokens),
             ..generation_overrides
         },
-        seed: args.seed,
+        seed: args.common.seed.unwrap_or(0),
         strategy: if args.mirostat_v2 {
             eredu::api::TextSamplingStrategy::MirostatV2 {
                 tau: args.mirostat_tau,
@@ -2621,7 +2540,7 @@ fn main() -> Result<()> {
         );
     } else {
         let config = TextGenerationConfig::new(resolved_generation)
-            .with_seed(args.seed)
+            .with_seed(args.common.seed.unwrap_or(0))
             .with_prefill_chunk_policy(
                 std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
                     eredu::api::PrefillChunkPolicy::Unchunked,
@@ -2872,23 +2791,25 @@ fn cli_execution_plan(
     draft_model: Option<&Path>,
     embedded_mtp: bool,
 ) -> Result<ExecutionPlan> {
-    let residency = if args.dense_disk_stream {
+    let residency = if args.common.dense_disk_stream {
         let defaults = DenseDiskStreamLoadOptions::default();
         ResidencyPlan::DenseDiskStream {
             device_budget_bytes: args
+                .common
                 .device_budget_bytes
                 .unwrap_or(defaults.device_budget_bytes()),
             host_budget_bytes: args
+                .common
                 .host_budget_bytes
                 .unwrap_or(defaults.host_budget_bytes()),
             host_lookahead: args.dense_host_lookahead,
             background_queue: args.dense_background_queue,
         }
-    } else if args.layerwise_host {
+    } else if args.common.layerwise_host {
         ResidencyPlan::LayerwiseHost {
-            device_layer_window: args.device_layer_window,
-            device_budget_bytes: args.device_budget_bytes,
-            host_budget_bytes: args.host_budget_bytes,
+            device_layer_window: args.common.device_layer_window,
+            device_budget_bytes: args.common.device_budget_bytes,
+            host_budget_bytes: args.common.host_budget_bytes,
         }
     } else {
         ResidencyPlan::FullyResident
@@ -2916,19 +2837,7 @@ fn cli_execution_plan(
     } else {
         DraftingPlan::Disabled
     };
-    let transformation = match (args.quantize, args.quantization_mode) {
-        (None, _) => WeightTransformationPlan::PreserveCheckpoint,
-        (Some(bits), LoadQuantizationMode::Affine) => WeightTransformationPlan::Affine {
-            bits,
-            group_size: args.quantization_group_size,
-        },
-        (Some(4), LoadQuantizationMode::Mxfp4) => WeightTransformationPlan::MxFp4,
-        (Some(bits), LoadQuantizationMode::Mxfp4) => {
-            return Err(anyhow::anyhow!(
-                "MXFP4 transformation requires exactly 4 bits, got {bits}"
-            ));
-        }
-    };
+    let transformation = args.common.weight_transformation()?;
     let expert_cache = args.expert_cache.then_some(ExpertCachePlan::new(
         args.expert_cache_device_budget_bytes,
         args.expert_cache_host_budget_bytes,
@@ -2936,18 +2845,20 @@ fn cli_execution_plan(
         args.expert_cache_prefill_bank_bytes,
         args.expert_cache_eviction.into(),
     ));
-    Ok(ExecutionPlan::fully_resident(device_plan(args.device)?)
-        .with_topology(
-            eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
-                .expect("the singleton topology is valid"),
-        )
-        .with_residency(residency)
-        .with_weight_transformation(transformation)
-        .with_max_cached_shards(args.cached_shards)
-        .with_expert_cache(expert_cache)
-        .with_drafting(drafting)
-        .with_required_device_capabilities(DeviceCapabilities::new(true, false, false))
-        .with_required_session_capabilities(SessionCapabilities::default()))
+    Ok(
+        ExecutionPlan::fully_resident(device_plan(args.common.device.unwrap_or_default())?)
+            .with_topology(
+                eredu_core::topology::ParallelTopology::new(1, 1, 1, 1)
+                    .expect("the singleton topology is valid"),
+            )
+            .with_residency(residency)
+            .with_weight_transformation(transformation)
+            .with_max_cached_shards(args.common.cached_shards)
+            .with_expert_cache(expert_cache)
+            .with_drafting(drafting)
+            .with_required_device_capabilities(DeviceCapabilities::new(true, false, false))
+            .with_required_session_capabilities(SessionCapabilities::default()),
+    )
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -3027,6 +2938,7 @@ fn validate_args(args: &Cli) -> Result<()> {
         );
     }
     if args
+        .common
         .temperature
         .is_some_and(|value| !value.is_finite() || value < 0.0)
     {
@@ -3036,6 +2948,7 @@ fn validate_args(args: &Cli) -> Result<()> {
         bail!("--top-k must be non-negative");
     }
     if args
+        .common
         .top_p
         .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
     {
@@ -3047,7 +2960,7 @@ fn validate_args(args: &Cli) -> Result<()> {
     {
         bail!("--min-p must be between zero and one");
     }
-    if args.mirostat_v2 && args.temperature == Some(0.0) {
+    if args.mirostat_v2 && args.common.temperature == Some(0.0) {
         bail!("--mirostat-v2 requires --temperature greater than zero");
     }
     if !args.mirostat_tau.is_finite() || args.mirostat_tau <= 0.0 {
@@ -3057,6 +2970,7 @@ fn validate_args(args: &Cli) -> Result<()> {
         bail!("--mirostat-eta must be a finite number greater than zero");
     }
     if args
+        .common
         .repeat_penalty
         .is_some_and(|value| !value.is_finite() || value <= 0.0)
     {
@@ -3074,20 +2988,7 @@ fn validate_args(args: &Cli) -> Result<()> {
     {
         bail!("frequency and presence penalties must be finite numbers");
     }
-    requested_load_quantization(args)?;
-    if args.layerwise_host && args.quantize.is_some() {
-        bail!(
-            "--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization"
-        );
-    }
-    if args.dense_disk_stream && args.quantize.is_some() {
-        bail!(
-            "--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights"
-        );
-    }
-    if args.dense_disk_stream && args.layerwise_host {
-        bail!("--dense-disk-stream conflicts with --layerwise-host");
-    }
+    args.common.validate()?;
     if args.expert_cache_benchmark && !args.expert_cache {
         bail!("--expert-cache-benchmark requires --expert-cache");
     }
@@ -3099,15 +3000,6 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.expert_cache_prefill_bank_bytes > args.expert_cache_scratch_bytes {
         bail!("--expert-cache-prefill-bank-bytes cannot exceed --expert-cache-scratch-bytes");
-    }
-    if args.device_layer_window == 0 {
-        bail!("--device-layer-window must be greater than zero");
-    }
-    if args.cached_shards == 0 {
-        bail!("--cached-shards must be greater than zero");
-    }
-    if args.revision.is_some() && Path::new(&args.model).exists() {
-        bail!("--revision can only be used with a Hugging Face model identifier");
     }
     if args.raw && args.thinking != ThinkingMode::Auto {
         bail!(
@@ -3638,8 +3530,50 @@ mod tests {
             .unwrap();
         assert!(matches.subcommand().is_none());
         let text = super::Cli::from_arg_matches(&matches).unwrap();
-        assert_eq!(text.model, "test-model");
-        assert_eq!(text.quantize, Some(8));
+        assert_eq!(text.common.model.as_deref(), Some("test-model"));
+        assert_eq!(text.common.quantize, Some(8));
+        let controls = [
+            "--model",
+            "test-model",
+            "--revision",
+            "pinned",
+            "--device",
+            "cpu",
+            "--mlx-cache-limit-bytes",
+            "0",
+            "--quantize",
+            "8",
+            "--quantization-group-size",
+            "32",
+            "--cached-shards",
+            "7",
+            "--device-layer-window",
+            "2",
+            "--seed",
+            "17",
+            "--temperature",
+            "0.7",
+            "--top-p",
+            "0.9",
+            "--repeat-penalty",
+            "1.2",
+        ];
+        let text_matches = super::cli_command()
+            .try_get_matches_from(["eredu"].into_iter().chain(controls))
+            .unwrap();
+        let audio_matches = super::cli_command()
+            .try_get_matches_from(["eredu", "realtime"].into_iter().chain(controls))
+            .unwrap();
+        let text_common = super::common::CommonOptions::from_arg_matches(&text_matches).unwrap();
+        let audio_common = super::common::CommonOptions::from_arg_matches(
+            audio_matches.subcommand_matches("realtime").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(text_common, audio_common);
+        assert_eq!(
+            text_common.weight_transformation().unwrap(),
+            audio_common.weight_transformation().unwrap()
+        );
         let audio = super::cli_command()
             .try_get_matches_from(["eredu", "realtime", "--list-audio-devices"])
             .unwrap();
@@ -3663,6 +3597,34 @@ mod tests {
         assert!(super::cli_command()
             .try_get_matches_from(["eredu", "realtime", "--offline"])
             .is_err());
+        assert!(super::cli_command()
+            .try_get_matches_from([
+                "eredu",
+                "realtime",
+                "--config",
+                "voicechat.json",
+                "--layerwise-host",
+            ])
+            .is_err());
+        assert!(super::cli_command()
+            .try_get_matches_from([
+                "eredu",
+                "realtime",
+                "--config",
+                "voicechat.json",
+                "--layerwise-host",
+                "--backbone-device-bytes",
+                "1048576",
+                "--backbone-host-bytes",
+                "1048576",
+                "--speech-device-bytes",
+                "1048576",
+                "--speech-host-bytes",
+                "1048576",
+                "--quantize",
+                "8",
+            ])
+            .is_ok());
         assert!(super::cli_command()
             .try_get_matches_from(["eredu", "hello"])
             .is_err());
@@ -4056,10 +4018,10 @@ mod tests {
             });
 
         apply_automatic_plan(&mut args, &plan).unwrap();
-        assert!(args.layerwise_host);
-        assert!(!args.dense_disk_stream);
+        assert!(args.common.layerwise_host);
+        assert!(!args.common.dense_disk_stream);
         assert!(args.expert_cache);
-        assert_eq!(args.device_budget_bytes, Some(1 << 30));
+        assert_eq!(args.common.device_budget_bytes, Some(1 << 30));
         assert_eq!(args.expert_cache_device_budget_bytes, Some(256 << 20));
         assert_eq!(args.speculative_draft_tokens, 3);
         assert!(!args.disable_speculative_lookahead);
@@ -4080,13 +4042,16 @@ mod tests {
                 group_size: 128,
             });
         apply_automatic_plan(&mut args, &plan).unwrap();
-        assert_eq!(args.quantize, Some(4));
-        assert_eq!(args.quantization_group_size, 128);
+        assert_eq!(args.common.quantize, Some(4));
+        assert_eq!(args.common.quantization_group_size, 128);
 
         plan = plan.with_weight_transformation(WeightTransformationPlan::MxFp4);
         apply_automatic_plan(&mut args, &plan).unwrap();
-        assert_eq!(args.quantize, Some(4));
-        assert_eq!(args.quantization_mode, super::LoadQuantizationMode::Mxfp4);
+        assert_eq!(args.common.quantize, Some(4));
+        assert_eq!(
+            args.common.quantization_mode,
+            super::LoadQuantizationMode::Mxfp4
+        );
     }
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFile {
@@ -4603,10 +4568,8 @@ mod tests {
             Some(QuantizationRequest::MxFp4)
         );
 
-        let invalid_mxfp4 = Cli {
-            quantize: Some(3),
-            ..mxfp4
-        };
+        let mut invalid_mxfp4 = mxfp4;
+        invalid_mxfp4.common.quantize = Some(3);
         assert!(validate_args(&invalid_mxfp4)
             .unwrap_err()
             .to_string()
@@ -4688,8 +4651,8 @@ mod tests {
         } else {
             CliDevice::Cpu
         };
-        assert_eq!(defaults.device, expected_default);
-        assert!(device_plan(defaults.device).is_ok());
+        assert_eq!(defaults.common.device.unwrap_or_default(), expected_default);
+        assert!(device_plan(defaults.common.device.unwrap_or_default()).is_ok());
         assert_eq!(
             defaults.speculative_draft_device,
             SpeculativeDraftDevice::Target
@@ -4698,7 +4661,7 @@ mod tests {
         let cpu_target =
             Cli::try_parse_from(["eredu", "--model", "model-id", "--device", "cpu", "prompt"])
                 .unwrap();
-        assert_eq!(cpu_target.device, CliDevice::Cpu);
+        assert_eq!(cpu_target.common.device, Some(CliDevice::Cpu));
         validate_args(&cpu_target).unwrap();
     }
 
@@ -4761,14 +4724,37 @@ mod tests {
 
     #[test]
     fn validates_dense_stream_residency_conflicts() {
-        for arguments in [
-            vec!["--dense-disk-stream", "--layerwise-host"],
-            vec!["--dense-disk-stream", "--quantize", "4"],
-        ] {
-            let mut command = vec!["eredu", "--model", "model-id"];
-            command.extend(arguments);
-            command.push("prompt");
-            assert!(validate_args(&Cli::try_parse_from(command).unwrap()).is_err());
+        let args = Cli::try_parse_from([
+            "eredu",
+            "--model",
+            "model-id",
+            "--dense-disk-stream",
+            "--layerwise-host",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&args).is_err());
+        for residency in ["--dense-disk-stream", "--layerwise-host"] {
+            let args = Cli::try_parse_from([
+                "eredu",
+                "--model",
+                "model-id",
+                residency,
+                "--quantize",
+                "8",
+                "prompt",
+            ])
+            .unwrap();
+            validate_args(&args).unwrap();
+            assert_eq!(
+                cli_execution_plan(&args, None, false)
+                    .unwrap()
+                    .weight_transformation(),
+                WeightTransformationPlan::Affine {
+                    bits: 8,
+                    group_size: 64
+                }
+            );
         }
     }
 

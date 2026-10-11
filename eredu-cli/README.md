@@ -102,7 +102,8 @@ eredu --model /path/to/model --quantize 4 \
 Large models can use host-layerwise or dense disk-streamed weight residency.
 Supported mixture-of-experts models can use an independent expert cache. These
 policies accept explicit host and device budgets and trade transfer or I/O work
-for a smaller resident parameter set.
+for a smaller resident parameter set. Eligible on-load quantization composes with
+these residency policies; exact architecture/backend admission checks support.
 
 See [Model loading, quantization, and memory](https://github.com/jbg/eredu/blob/main/doc/model-loading.md) for
 the policy contracts and accounting model.
@@ -169,7 +170,33 @@ MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
   --seconds 60 --output speech.wav --events events.jsonl
 ```
 
-The command-buffer settings in this example identify the measured M3 Ultra
+Cached official repositories can be passed directly:
+
+```sh
+eredu realtime --model nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
+  --base-assets nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
+  --quantize 8 --speech-weights f16 --speech-compute f16
+```
+
+`--base-assets` supplies `config.json`, `tokenizer.json` and
+`tokenizer_config.json` from the base model. VoiceChat supplies the backbone
+weights. The validated revision is `6533e8de2c68e4536bf7c411d7a3ce5734111476`. If these
+files are missing from the cache, download only the assets:
+
+```sh
+hf download nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
+  config.json tokenizer.json tokenizer_config.json \
+  --revision 6533e8de2c68e4536bf7c411d7a3ce5734111476
+```
+
+The resulting snapshot directory is also accepted by `--base-assets`.
+`--official-assets` defaults to the `--model` repository for direct model requests.
+Text and realtime commands share model/revision, device, allocator cache,
+quantization, sampling and common residency argument definitions and normalization.
+Omitted sampling controls preserve each command's defaults or supplied configuration.
+Both commands default to four cached checkpoint readers.
+
+The command-buffer settings above identify the measured M3 Ultra
 configuration; other hardware can need different batching.
 
 The default microphone and speaker are selected automatically. Use exact names

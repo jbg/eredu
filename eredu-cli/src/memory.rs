@@ -36,7 +36,7 @@ pub(super) fn report(
     )?;
     let input = eredu_core::InputTokenCount::text(input_tokens);
     let mut options = GenerationMemoryOptions::for_local_device(input, plan.device())?;
-    if let Some(cache_limit) = args.mlx_cache_limit_bytes {
+    if let Some(cache_limit) = args.common.mlx_cache_limit_bytes {
         // Cold explicit overrides describe the proposed policy without changing
         // process-global allocator state. Loaded reports sample the actual policy.
         options.backend_overhead =

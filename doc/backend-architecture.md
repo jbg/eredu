@@ -8627,6 +8627,24 @@ canonical arrays remain valid through ordinary projection fallback. Encoded sour
 leases cover direct reads; existing completion owners retain native initialization
 storage until safe publication.
 
+Quantized text, speech and independently addressable parameter banks publish
+through the same `PreparedQuantizedSource` contract. Neutral plans declare exact
+output metadata before native conversion; the MLX realization consumes that plan,
+uses the bounded prepared cache and validates the encoded catalog at publication.
+Immediate native preparation and retained cold sources share this realization.
+Architecture-owned task selection and speech component eligibility remain distinct
+from the generic conversion and publication mechanism.
+Native quantized-text coverage compares two cached decode steps after prefill
+across resident, host-layerwise and disk-streamed policies with a `1e-5` logits tolerance.
+Affine and MXFP4 family fixtures exercise exact output admission; prepared-cache
+coverage verifies canonical values and encoded-file reuse.
+
+Runtime `execution_plan_layer_residency` normalizes resident, host-layerwise and
+disk-streamed policies for both complete text plans and independent speech owners.
+The CLI shares argument definitions, transformation normalization and allocator
+configuration across text and realtime. Speech-specific asset, conversation and
+per-provider budget policy remains above those mechanisms.
+
 Cache admission serializes publication and eviction using a directory lock.
 Only cache-owned content-addressed filenames participate in cleanup and eviction;
 unrelated files in a configured directory remain untouched.

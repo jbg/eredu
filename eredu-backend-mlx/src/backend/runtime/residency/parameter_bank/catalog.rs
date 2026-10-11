@@ -399,13 +399,7 @@ fn quantize_selected_entry_catalog_once(
         max_working_set_bytes.min(packed_catalog_bytes),
         targets,
     )?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
-        Arc::clone(&source),
-        plan,
-        source_stream,
-    )?);
-    let report = transformed.report().clone();
-    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = transformed;
+    let (store, report) = prepare_quantized_source(source, plan, source_stream)?;
     let mut rebuilt = Vec::with_capacity(units.len());
     for (identity, unit) in units {
         let mut bindings = Vec::new();

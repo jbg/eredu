@@ -496,14 +496,11 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    crate::backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
-    Ok((transformed, report))
+    )
 }
 
 /// Builds a bounded packed overlay for one fully resident neutral module tree.
@@ -613,14 +610,11 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    crate::backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
-    Ok((transformed, report))
+    )
 }
 
 /// Builds a bounded packed overlay for an exact set of selected replicated-text tasks.
@@ -726,14 +720,11 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    crate::backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
-    Ok((transformed, report))
+    )
 }
 
 /// Builds a bounded packed overlay from architecture-selected realtime tasks.
@@ -854,14 +845,11 @@ where
         .collect::<Result<Vec<_>, eredu_checkpoint::store::StoreError>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    crate::backend::runtime::checkpoint::bounded_quantization::prepare_quantized_source(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
-    Ok((transformed, report))
+    )
 }
 
 fn bounded_quantization_working_set(

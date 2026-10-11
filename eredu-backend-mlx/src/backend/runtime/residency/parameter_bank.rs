@@ -30,7 +30,7 @@ use crate::{
     backend::error::Error,
     backend::nn::shared::MlxNeuralBackend,
     backend::runtime::checkpoint::bounded_quantization::{
-        BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
+        prepare_quantized_source, BoundedQuantizationPlan, BoundedQuantizationTarget,
     },
     backend::runtime::residency::manager::{ResidencyError, ResidencyManager, ResidentTransfer},
 };

@@ -25,10 +25,8 @@ use eredu_architectures::voicechat::{
     schedule::ScheduleLimits,
 };
 use eredu_backend_mlx::native::ExecutionContext;
-use eredu_core::{residency::OffloadConfig, scheduler::RequestId};
-use eredu_runtime::{
-    CacheResidencyPolicy, DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions,
-};
+use eredu_core::{scheduler::RequestId, ResidencyPlan};
+use eredu_runtime::{execution_plan_layer_residency, CacheResidencyPolicy, ResidencyDiagnostics};
 use serde::Deserialize;
 
 /// A local request. Relative artifact paths resolve against this JSON file's directory.
@@ -253,24 +251,24 @@ impl Config {
     }
 
     fn residency(&self, cached_shards: usize) -> Result<VoiceChatResidencyPolicy> {
-        let host = |device, host, depth| -> Result<_> {
-            Ok(LayerWeightResidency::LayerwiseHost(
-                LayerwiseLoadOptions::new(OffloadConfig::new(Some(device), Some(host), depth)?)
-                    .with_max_cached_shards(cached_shards),
-            ))
+        let host = |device, host, depth| ResidencyPlan::LayerwiseHost {
+            device_layer_window: depth,
+            device_budget_bytes: Some(device),
+            host_budget_bytes: Some(host),
         };
-        let disk = |device, host| -> Result<_> {
+        let disk = |device, host| {
             let slots = usize::from(host != 0);
-            Ok(LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(device, host, slots, slots)?
-                    .with_max_cached_shards(cached_shards),
-            ))
+            ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: device,
+                host_budget_bytes: host,
+                host_lookahead: slots,
+                background_queue: slots,
+            }
         };
         let (backbone, speech) = match self.parameter_residency {
-            ParameterResidency::Resident => (
-                LayerWeightResidency::FullyResident,
-                LayerWeightResidency::FullyResident,
-            ),
+            ParameterResidency::Resident => {
+                (ResidencyPlan::FullyResident, ResidencyPlan::FullyResident)
+            }
             ParameterResidency::Host {
                 backbone_device_bytes,
                 backbone_host_bytes,
@@ -278,8 +276,8 @@ impl Config {
                 speech_host_bytes,
                 depth,
             } => (
-                host(backbone_device_bytes, backbone_host_bytes, depth)?,
-                host(speech_device_bytes, speech_host_bytes, depth)?,
+                host(backbone_device_bytes, backbone_host_bytes, depth),
+                host(speech_device_bytes, speech_host_bytes, depth),
             ),
             ParameterResidency::Disk {
                 backbone_device_bytes,
@@ -287,10 +285,16 @@ impl Config {
                 speech_device_bytes,
                 speech_host_bytes,
             } => (
-                disk(backbone_device_bytes, backbone_host_bytes)?,
-                disk(speech_device_bytes, speech_host_bytes)?,
+                disk(backbone_device_bytes, backbone_host_bytes),
+                disk(speech_device_bytes, speech_host_bytes),
             ),
         };
+        let normalize = |plan: &ResidencyPlan| {
+            execution_plan_layer_residency(plan, cached_shards, ResidencyDiagnostics::default())
+                .map(|residency| residency.layers())
+        };
+        let backbone = normalize(&backbone)?;
+        let speech = normalize(&speech)?;
         let speech = SpeechResidencyPolicy::new(
             SpeechProvider::ALL
                 .into_iter()

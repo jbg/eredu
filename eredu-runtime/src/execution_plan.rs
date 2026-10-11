@@ -80,6 +80,50 @@ pub fn execution_plan_quantization(
     Ok(Some(request))
 }
 
+/// Normalizes ordinary layer residency for any independently loaded parameter owner.
+/// No device resources are acquired; native support remains an exact selection fact.
+pub fn execution_plan_layer_residency(
+    residency: &ResidencyPlan,
+    max_cached_shards: usize,
+    diagnostics: ResidencyDiagnostics,
+) -> Result<OrdinaryWeightResidency, ExecutionPlanLoadError> {
+    if max_cached_shards == 0 {
+        return Err(NormalizedLoadRequestError::ZeroCachedShards.into());
+    }
+    match residency {
+        ResidencyPlan::FullyResident => Ok(OrdinaryWeightResidency::FullyResident),
+        ResidencyPlan::LayerwiseHost {
+            device_layer_window,
+            device_budget_bytes,
+            host_budget_bytes,
+        } => Ok(OrdinaryWeightResidency::LayerwiseHost(
+            LayerwiseLoadOptions::new(OffloadConfig::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *device_layer_window,
+            )?)
+            .with_max_cached_shards(max_cached_shards)
+            .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
+        )),
+        ResidencyPlan::DenseDiskStream {
+            device_budget_bytes,
+            host_budget_bytes,
+            host_lookahead,
+            background_queue,
+        } => Ok(OrdinaryWeightResidency::DenseDiskStream(
+            DenseDiskStreamLoadOptions::new(
+                *device_budget_bytes,
+                *host_budget_bytes,
+                *host_lookahead,
+                *background_queue,
+            )?
+            .with_max_cached_shards(max_cached_shards)
+            .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
+        )),
+        _ => return Err(ExecutionPlanLoadError::Unsupported("residency")),
+    }
+}
+
 impl NormalizedLoadRequest {
     /// Derives all portable load policy from a plan and optional complete rank request.
     ///
@@ -101,38 +145,11 @@ impl NormalizedLoadRequest {
             }
             _ => {}
         }
-        let ordinary = match plan.residency() {
-            ResidencyPlan::FullyResident => OrdinaryWeightResidency::FullyResident,
-            ResidencyPlan::LayerwiseHost {
-                device_layer_window,
-                device_budget_bytes,
-                host_budget_bytes,
-            } => OrdinaryWeightResidency::LayerwiseHost(
-                LayerwiseLoadOptions::new(OffloadConfig::new(
-                    *device_budget_bytes,
-                    *host_budget_bytes,
-                    *device_layer_window,
-                )?)
-                .with_max_cached_shards(plan.max_cached_shards())
-                .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
-            ),
-            ResidencyPlan::DenseDiskStream {
-                device_budget_bytes,
-                host_budget_bytes,
-                host_lookahead,
-                background_queue,
-            } => OrdinaryWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(
-                    *device_budget_bytes,
-                    *host_budget_bytes,
-                    *host_lookahead,
-                    *background_queue,
-                )?
-                .with_max_cached_shards(plan.max_cached_shards())
-                .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
-            ),
-            _ => return Err(ExecutionPlanLoadError::Unsupported("residency")),
-        };
+        let ordinary = execution_plan_layer_residency(
+            plan.residency(),
+            plan.max_cached_shards(),
+            diagnostics,
+        )?;
         let residency = match plan.expert_cache() {
             Some(bank) => WeightResidency::with_independent_parameter_banks(
                 ordinary,

@@ -697,6 +697,86 @@ fn heterogeneous_generic_handoff_executes_selected_load_time_transforms() {
 }
 
 #[test]
+fn load_time_quantized_text_matches_across_layer_residencies() {
+    let (stream, weights_stream) = execution_streams();
+    let mut config = lfm2_config();
+    config["hidden_size"] = 32.into();
+    config["intermediate_size"] = 32.into();
+    config["num_key_value_heads"] = 1.into();
+    config["block_auto_adjust_ff_dim"] = false.into();
+    let root = tiny_heterogeneous_artifact(config);
+    let mut reference: Option<Vec<f32>> = None;
+    for residency in [
+        eredu_core::ResidencyPlan::FullyResident,
+        eredu_core::ResidencyPlan::LayerwiseHost {
+            device_layer_window: 1,
+            device_budget_bytes: Some(1 << 20),
+            host_budget_bytes: Some(1 << 20),
+        },
+        eredu_core::ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: 1 << 20,
+            host_budget_bytes: 1 << 20,
+            host_lookahead: 1,
+            background_queue: 1,
+        },
+    ] {
+        let plan = eredu_core::ExecutionPlan::fully_resident(
+            eredu_core::DevicePlan::new("mlx", "cpu:0").unwrap(),
+        )
+        .with_residency(residency)
+        .with_weight_transformation(eredu_core::WeightTransformationPlan::Affine {
+            bits: 8,
+            group_size: 32,
+        });
+        let request = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
+            &plan,
+            eredu_runtime::ResidencyDiagnostics::default(),
+            None,
+        )
+        .unwrap();
+        let options = crate::MlxLoadRequest::from_normalized(request);
+        let inspection = eredu_architectures::configuration::inspect_artifact(root.path()).unwrap();
+        let plan = eredu_core::plan_model_preparation(
+            inspection,
+            options.normalized().preparation_policy().unwrap(),
+            eredu_core::SessionCapabilities::default(),
+        )
+        .unwrap();
+        let model = materialize_model_plan(plan, options, &stream, &weights_stream).unwrap();
+        assert!(model.materialization_report().unwrap().transformed_weights > 0);
+        let mut executable = model.into_executable();
+        let generic = executable.erased_mut();
+        let prompt = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let parts = [input::token_ids_part(&prompt).unwrap()];
+        generic
+            .prefill(input::ModelInput::new(&parts), &stream)
+            .unwrap()
+            .evaluated()
+            .unwrap();
+        let mut values = Vec::new();
+        for id in [3_u32, 4] {
+            values.extend_from_slice(
+                generic
+                    .decode(&Array::from_slice(&[id], &[1, 1]), &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .as_slice::<f32>(),
+            );
+        }
+        assert!(values.iter().all(|v| v.is_finite()) && values.iter().any(|v| v.abs() > 1e-12));
+        if let Some(reference) = &reference {
+            assert_eq!(values.len(), reference.len());
+            for (actual, expected) in values.iter().zip(reference) {
+                assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+            }
+        } else {
+            reference = Some(values);
+        }
+    }
+}
+
+#[test]
 fn public_handoff_executes_selected_load_time_transform() {
     let (stream, weights_stream) = execution_streams();
     for (model_type, request) in [

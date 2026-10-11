@@ -228,7 +228,8 @@ pub use execution::{
     ExecutionUnitLayoutError, ReadyGroupState,
 };
 pub use execution_plan::{
-    execution_plan_quantization, ExecutionPlanLoadError, ResidencyDiagnostics,
+    execution_plan_layer_residency, execution_plan_quantization, ExecutionPlanLoadError,
+    ResidencyDiagnostics,
 };
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,

@@ -57,11 +57,33 @@ mod tests;
 pub fn realize_prepared_source(
     source: &eredu_checkpoint::store::SharedCheckpointSource,
     stream: &Stream,
-) -> Result<(), Error> {
+) -> Result<Option<WeightMaterializationReport>, Error> {
     if let Some((input, plan)) = source.preparation() {
         realize_prepared_source(&input, stream)?;
         let output = Arc::new(BoundedQuantizedWeightStore::create(input, plan, stream)?);
+        let report = output.report().clone();
         source.publish_preparation(output)?;
+        return Ok(Some(report));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Admits and realizes one bounded transformation through the shared source contract.
+/// Exact output metadata is checked before native conversion and again at publication.
+pub fn prepare_quantized_source(
+    input: eredu_checkpoint::store::SharedCheckpointSource,
+    plan: BoundedQuantizationPlan,
+    stream: &Stream,
+) -> Result<
+    (
+        eredu_checkpoint::store::SharedCheckpointSource,
+        WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let source: eredu_checkpoint::store::SharedCheckpointSource =
+        Arc::new(eredu_checkpoint::quantization::PreparedQuantizedSource::new(input, plan)?);
+    let report = realize_prepared_source(&source, stream)?
+        .expect("new admitted transformation requires realization");
+    Ok((source, report))
 }
