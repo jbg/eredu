@@ -33,5 +33,6 @@ pub(crate) mod rope;
 pub(crate) mod selective_scan;
 /// Backend-neutral architecture operators specialized to MLX.
 pub mod shared;
+mod sparse_q8;
 /// Shared tensor and attention-mask helpers.
 pub mod tensor;

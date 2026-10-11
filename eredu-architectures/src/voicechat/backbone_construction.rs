@@ -42,7 +42,9 @@ pub enum BackboneConstructionError {
     #[error("VoiceChat backbone construction requires one target group")]
     Schedule,
     /// Constructed slots differ from the exact retained recipe identities.
-    #[error("VoiceChat {unit:?} parameter identities differ: missing {missing:?}, unexpected {unexpected:?}")]
+    #[error(
+        "VoiceChat {unit:?} parameter identities differ: missing {missing:?}, unexpected {unexpected:?}"
+    )]
     Parameters {
         /// Unit whose declaration disagrees.
         unit: BackboneUnit,
@@ -318,5 +320,6 @@ pub(super) fn prepare_bindings<T: 'static, M: Parameterized<T>>(
     )?);
     let recipes = AtomicRecipeSet::new_with_aliases(source.as_ref(), recipes, aliases)?;
     let bindings = bindings_from_recipe_set(source.as_ref(), recipes)?;
+    let bindings = eredu_runtime::apply_parameter_storage_layouts(module, bindings);
     Ok((source, bindings))
 }

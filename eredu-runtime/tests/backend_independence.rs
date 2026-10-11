@@ -240,6 +240,7 @@ fn fake_parameter_metadata(id: &str) -> eredu_nn::ParameterMetadata {
         linear_companion: None,
         linear_companion_of: None,
         linear_row_layout: eredu_nn::LinearRowLayout::Contiguous,
+        storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
     }
 }
 
@@ -4362,10 +4363,12 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         let described = session
             .describe_prepared_resources(&prepared_resource_query())
             .unwrap();
-        assert!(described.allocations.iter().any(|allocation| allocation
-            .uses
-            .iter()
-            .any(|usage| usage.role == eredu_core::resources::ResourceRole::MutableState)));
+        assert!(described.allocations.iter().any(|allocation| {
+            allocation
+                .uses
+                .iter()
+                .any(|usage| usage.role == eredu_core::resources::ResourceRole::MutableState)
+        }));
         assert_eq!(
             described,
             session

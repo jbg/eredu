@@ -303,10 +303,10 @@ pub use parallel::{
     TensorPlacement,
 };
 pub use parameter::{
-    bind_materialized_unit, bind_materialized_unit_excluding, bindings_from_recipe_set,
-    build_exact_replicated_text_bindings, build_module_binding_plan, materialize_bindings,
-    materialize_selected_bindings, preflight_bindings, select_bindings, BindingPlan,
-    BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
+    apply_parameter_storage_layouts, bind_materialized_unit, bind_materialized_unit_excluding,
+    bindings_from_recipe_set, build_exact_replicated_text_bindings, build_module_binding_plan,
+    materialize_bindings, materialize_selected_bindings, preflight_bindings, select_bindings,
+    BindingPlan, BindingPlanError, MaterializedUnit, ModuleBindingPlan, ModuleBindingPlanError,
     ParameterBatchBudget, ParameterBindingTarget, ParameterOrchestrationError, PlannedBinding,
     RecipeBindingError, SelectedBindingPlan,
 };

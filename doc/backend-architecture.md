@@ -8569,6 +8569,31 @@ explicit neutral location and byte budget. External cache cleanup can remove
 unused entries between processes; misses reconstruct them from the original
 prepared source.
 
+Exact-zero projection inputs are an optional architecture-declared hint in
+`LinearFormatSpec`; the hint permits neither pruning nor approximate arithmetic.
+MLX selects a reusable affine Q8 matrix-vector mechanism for supported contracting
+F32 projections. Its 32-lane accumulation follows generic QMV arithmetic and skips
+packed words whose four inputs are exactly zero. Nonfinite companions still
+propagate NaNs; native fast-QMV widths, batched inputs, narrower arithmetic and
+unsupported parameter layouts retain ordinary projection execution.
+
+`ParameterStorageLayout` and `WeightBinding` carry optional immutable matrix
+storage preferences without changing logical geometry, source authority or byte
+charges. The neutral prepared cache provides byte-preserving matrix transposition
+with bounded encoded reads and two host tiles within a 64 MiB materialization
+working set. Prepared-source views retain their producer's explicit cache policy.
+Capacity insufficient for this optional layout retains canonical preparation.
+Both direct parameter materialization and residency-managed loading initialize
+final MLX storage from the prepared transpose and expose a logical transpose view;
+cross-stream copies preserve physical order. Parameters,
+leases and sparse projection kernels share one native weight allocation rather
+than retaining a separate packed-layout cache. File representations occupy the
+same bounded prepared-cache budget; canonical prepared files can coexist with
+transposed files until ordinary eviction. Parameter edits and host-restored
+canonical arrays remain valid through ordinary projection fallback. Encoded source
+leases cover direct reads; existing completion owners retain native initialization
+storage until safe publication.
+
 Cache admission serializes publication and eviction using a directory lock.
 Only cache-owned content-addressed filenames participate in cleanup and eviction;
 unrelated files in a configured directory remain untouched.

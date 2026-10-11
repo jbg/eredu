@@ -344,6 +344,7 @@ pub struct WeightBinding {
     recipe: Option<DerivedWeightRecipe>,
     quantization_companions: Option<QuantizationCompanionBindings>,
     expected_bytes: u64,
+    storage_layout: eredu_nn::ParameterStorageLayout,
 }
 
 /// Exact local outputs created by one load-time packed-weight transform.
@@ -382,6 +383,17 @@ impl QuantizationCompanionBindings {
 }
 
 impl WeightBinding {
+    /// Selects an optional physical layout without changing source or byte accounting.
+    pub fn with_storage_layout(mut self, layout: eredu_nn::ParameterStorageLayout) -> Self {
+        self.storage_layout = layout;
+        self
+    }
+
+    /// Preferred immutable storage, retaining canonical logical geometry.
+    pub const fn storage_layout(&self) -> eredu_nn::ParameterStorageLayout {
+        self.storage_layout
+    }
+
     /// Creates a direct binding with a stable local name and selected size.
     pub fn new(
         name: impl Into<String>,
@@ -404,6 +416,7 @@ impl WeightBinding {
             recipe: None,
             quantization_companions: None,
             expected_bytes,
+            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
         })
     }
 
@@ -425,6 +438,7 @@ impl WeightBinding {
             recipe: Some(recipe),
             quantization_companions: None,
             expected_bytes,
+            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
         })
     }
 
@@ -447,6 +461,7 @@ impl WeightBinding {
             recipe: None,
             quantization_companions: None,
             expected_bytes,
+            storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
         })
     }
 
@@ -2045,7 +2060,9 @@ pub enum ResidencyDeclarationError {
         name: String,
     },
     /// Alias and resolved owner disagreed on materialized byte geometry.
-    #[error("weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}")]
+    #[error(
+        "weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}"
+    )]
     BindingAliasByteMismatch {
         /// Alias identity.
         alias: String,

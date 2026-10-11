@@ -400,6 +400,13 @@ impl CheckpointSource for MemoryWeightStore {
 
 /// Object-safe cold-path checkpoint source used by generic materializers.
 pub trait CheckpointSource: Send + Sync {
+    /// Shared policy for additional immutable prepared representations.
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        None
+    }
+
     /// Inference cache bound to this immutable catalog and authorization view.
     /// Returning a cache promises metadata and provenance remain fixed, and
     /// every returned lease/read batch is checked against that same catalog.
@@ -675,6 +682,12 @@ impl PreparedCheckpointSource {
 }
 
 impl CheckpointSource for PreparedCheckpointSource {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.source.prepared_cache_policy()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(self.source.recipe_cache().unwrap_or(&self.recipes))
     }
@@ -1052,6 +1065,12 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.source.prepared_cache_policy()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.source.recipe_cache().map(|_| &self.recipes)
     }
@@ -1172,6 +1191,12 @@ impl ResolvedCheckpointSource {
 }
 
 impl CheckpointSource for ResolvedCheckpointSource {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&crate::prepared_cache::PreparedCheckpointCachePolicy> {
+        self.source.prepared_cache_policy()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.source.recipe_cache().map(|_| &self.recipes)
     }

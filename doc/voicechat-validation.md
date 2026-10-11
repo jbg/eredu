@@ -1540,6 +1540,75 @@ per-frame records, waveform comparisons, source snapshots and binary hashes.
 quantization benchmark edits restore byte-for-byte. The append binary SHA-256 is
 `800048f6d4d950f48859070e125805d5afcc0c26628a8b615fdf1c09c1ff9046`.
 
+### Exact-zero Q8 projection with prepared storage
+
+The ReLU-squared backbone MLP declares an exact-zero input hint on its down
+projection. The generic MLX affine Q8 mechanism skips packed words with four zero
+inputs while retaining F32 generic-QMV accumulation and nonfinite-companion
+behavior. Unsupported arithmetic, geometry and layouts use ordinary projection.
+Optional matrix storage preferences flow through ordinary parameter bindings,
+prepared-checkpoint policy and residency materialization. A logical transpose view
+and the projection kernel share one resident allocation per parameter. Prepared
+disk variants share the producer's existing bounded cache and eviction policy.
+
+Released-checkpoint measurements dated 2026-10-11 use the M3 Ultra 80-core GPU,
+256 GiB unified memory, resident Metal execution and the accepted Q8/group-64
+backbone, output-head and 196 causal-TTS projection weights. Backbone and causal
+TTS arithmetic and quantization companions remain F32; other speech/perception
+execution uses F16. Command-buffer limits are 25 operations and 256 MiB. The
+checkpoint revision is `443794ea956ef0065f001967ffd00e77f519cb39`. The input,
+seed 0 and silence tail match the transaction-safe append measurement above.
+Three controls and three candidates each run 996 live frames (79.68 seconds),
+excluding the first 10 from warm statistics. Controls disable only the exact-zero
+hint. No profiling or concurrent builds run during these measured conversations.
+
+| Measurement | Ordinary Q8 | Exact-zero Q8 |
+| --- | ---: | ---: |
+| Pooled warm mean (ms) | 66.793 | 65.774 |
+| Pooled warm p95 (ms) | 68.268 | 67.220 |
+| Pooled warm p99 (ms) | 68.579 | 67.476 |
+| Mean budget remaining, 80 ms frame (ms) | 13.207 | 14.226 |
+| Warm frames above 80 ms | 0 / 2,958 | 0 / 2,958 |
+| Mean process peak footprint (GiB) | 20.927 | 21.130 |
+| Mean warm-cache model load (seconds) | 24.929 | 26.805 |
+| Mean first live frame (ms) | 92.336 | 91.279 |
+
+The mean saving is **1.019 ms/frame (1.53%)**, increasing mean headroom by
+**7.72%**. Every candidate run is faster than every control. Peak process footprint
+increases by 0.203 GiB; this measurement includes temporary work and native
+allocation caching and does not attribute that overhead to a particular buffer.
+Warm loading costs another 1.876 seconds. Startup frames exceed 80 ms in both
+paths; the headroom figures describe warm execution.
+
+The 75 prepared layout entries occupy 1.840 GiB on disk, including packed weights
+and companions. Canonical and transposed files coexist under the same 32 GiB
+budget; total prepared storage is 31.117 GiB. All warm reloads reuse identical
+entries without growing the cache. Cold preparation also preserves output, but
+its timing and memory are excluded because a control compilation ran concurrently.
+
+All six measured runs and the cold-preparation run match the accepted waveform
+and semantic events exactly. Waveform SHA-256 is
+`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
+This evidence covers one utterance and seed, not arbitrary dialogue histories.
+Focused fixtures check independent dequantized arithmetic, signed zeros,
+nonfinite companions, strided input, fallback, bounded byte-preserving preparation,
+cache reuse/capacity fallback, cross-stream loading and shared backing storage.
+Portable architecture and backend builds pass without native features.
+
+```sh
+cargo test --offline -p eredu-checkpoint \
+  bounded_matrix_layout_preserves_bytes_and_reuses_prepared_source -- --test-threads=1
+cargo test --offline --release -p eredu-backend-mlx --no-default-features \
+  --features accelerate,audio,metal --lib sparse_q8_matches_independent_equation_and_retains_fallbacks \
+  -- --test-threads=1
+```
+
+Reproduction artifacts reside in `/private/tmp/eredu-sparse-production`: `REPORT.md`,
+`results.json`, `build.py`, `run.py`, `measure.py`, benchmark patches, binary hashes,
+per-frame records, waveforms, event comparisons and cache inventories. The temporary
+precision/quantization harness preserves parameter storage preferences and restores
+source files byte-for-byte after each build.
+
 ### Released-checkpoint tool round trip
 
 The tool-round-trip measurement dated 2026-10-05 uses the resident Metal WAV

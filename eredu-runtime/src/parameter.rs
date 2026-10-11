@@ -326,6 +326,7 @@ pub struct ParameterBindingTarget {
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
     logical_targets: BTreeMap<String, String>,
+    storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
 }
 
 impl ModuleBindingPlan {
@@ -347,7 +348,13 @@ impl ModuleBindingPlan {
                     .logical_targets
                     .get(binding.name())
                     .expect("module binding declaration retains every target");
+                let layout = self
+                    .storage_layouts
+                    .get(binding.name())
+                    .copied()
+                    .unwrap_or_default();
                 binding
+                    .with_storage_layout(layout)
                     .with_logical_target(target)
                     .map_err(ModuleBindingPlanError::from)
             })
@@ -376,12 +383,15 @@ where
 {
     struct Collector<'a, P> {
         parameters: BTreeMap<String, &'a P>,
+        storage_layouts: BTreeMap<String, eredu_nn::ParameterStorageLayout>,
         duplicate: Option<String>,
     }
 
     impl<'a, P: 'a> ParameterVisitor<'a, P> for Collector<'a, P> {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'a P) {
             let name = metadata.id.as_str().to_owned();
+            self.storage_layouts
+                .insert(name.clone(), metadata.storage_layout);
             if self.parameters.insert(name.clone(), parameter).is_some() {
                 self.duplicate = Some(name);
             }
@@ -390,6 +400,7 @@ where
 
     let mut collector = Collector {
         parameters: BTreeMap::new(),
+        storage_layouts: BTreeMap::new(),
         duplicate: None,
     };
     module.visit_parameters(&mut collector);
@@ -453,6 +464,7 @@ where
             permitted_dtype_conversions,
         )?,
         logical_targets,
+        storage_layouts: collector.storage_layouts,
     })
 }
 
@@ -703,6 +715,7 @@ where
 
     BindingPlan::with_explicit_exceptions(declarations, shared_source_keys, conversions)?
         .build_bindings(source)
+        .map(|bindings| apply_parameter_storage_layouts(module, bindings))
         .map_err(Into::into)
 }
 
@@ -1096,18 +1109,28 @@ fn materialize_validated_plan<B: ParameterBackend>(
 ) -> Result<MaterializedUnit<B>, ParameterOrchestrationError<B::ParameterError>> {
     let mut weights = BTreeMap::new();
     for binding in plan.owners() {
-        let materialization = match binding.recipe() {
-            Some(recipe) => B::materialize_recipe(recipe, source, context),
-            None => {
-                let lease = source.acquire_lease(TensorReadRequest {
-                    key: binding.checkpoint_key().to_owned(),
-                    selection: binding.selection().clone(),
-                    policy: ReadPolicy::RequireBounded,
-                })?;
-                B::materialize(lease, context)
+        let materialization =
+            if binding.storage_layout() != eredu_nn::ParameterStorageLayout::Canonical {
+                B::materialize_recipe_with_layout(
+                    &binding.source_recipe(),
+                    source,
+                    binding.storage_layout(),
+                    context,
+                )
+            } else {
+                match binding.recipe() {
+                    Some(recipe) => B::materialize_recipe(recipe, source, context),
+                    None => {
+                        let lease = source.acquire_lease(TensorReadRequest {
+                            key: binding.checkpoint_key().to_owned(),
+                            selection: binding.selection().clone(),
+                            policy: ReadPolicy::RequireBounded,
+                        })?;
+                        B::materialize(lease, context)
+                    }
+                }
             }
-        }
-        .map_err(ParameterOrchestrationError::Backend)?;
+            .map_err(ParameterOrchestrationError::Backend)?;
         let weight = B::finish_materialization(materialization)
             .map_err(ParameterOrchestrationError::Backend)?;
         let id = ParameterId::new(binding.name()).map_err(|error| {
@@ -1380,4 +1403,32 @@ mod batch_budget_tests {
         assert!(!oversized.try_push(1));
         assert!(!oversized.try_push(0));
     }
+}
+
+/// Applies backend-selected immutable storage preferences from a module's neutral
+/// topology. Source authority, equations, logical shapes and byte charges stay fixed.
+pub fn apply_parameter_storage_layouts<P: 'static, M: Parameterized<P>>(
+    module: &M,
+    bindings: Vec<WeightBinding>,
+) -> Vec<WeightBinding> {
+    struct Layouts(BTreeMap<String, eredu_nn::ParameterStorageLayout>);
+    impl<'a, P: 'a> ParameterVisitor<'a, P> for Layouts {
+        fn visit(&mut self, metadata: ParameterMetadata, _: &'a P) {
+            self.0
+                .insert(metadata.id.as_str().to_owned(), metadata.storage_layout);
+        }
+    }
+    let mut layouts = Layouts(BTreeMap::new());
+    module.visit_parameters(&mut layouts);
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let layout = layouts
+                .0
+                .get(binding.name())
+                .copied()
+                .unwrap_or(binding.storage_layout());
+            binding.with_storage_layout(layout)
+        })
+        .collect()
 }

@@ -231,24 +231,28 @@ pub(super) fn prepare_from_disk(
     for batch in batches {
         let binding = match batch {
             BindingReadBatch::Direct { bindings, reads } => {
-                let inputs = DirectRecipeRead::materialize_many(reads).map_err(|source| {
-                    ResidencyError::Recipe {
-                        binding: "<parameter batch>".into(),
-                        source,
-                    }
-                })?;
+                let inputs =
+                    DirectRecipeRead::materialize_many(reads, source_stream).map_err(|source| {
+                        ResidencyError::Recipe {
+                            binding: "<parameter batch>".into(),
+                            source,
+                        }
+                    })?;
                 // Arm the enclosing recovery owner before any stream operation.
                 retained.retained_arrays.extend(inputs.iter().cloned());
                 for (binding, input) in bindings.into_iter().zip(inputs) {
                     let output = if source_stream == execution_stream {
                         input
                     } else {
-                        input
-                            .copy(execution_stream)
-                            .map_err(|source| ResidencyError::Recipe {
-                                binding: binding.name().to_owned(),
-                                source: WeightRecipeError::Mlx(source),
-                            })?
+                        crate::backend::runtime::checkpoint::recipe::copy_parameter_storage(
+                            &input,
+                            binding.storage_layout(),
+                            execution_stream,
+                        )
+                        .map_err(|source| ResidencyError::Recipe {
+                            binding: binding.name().to_owned(),
+                            source: WeightRecipeError::Mlx(source),
+                        })?
                     };
                     retained.retained_arrays.push(output.clone());
                     arrays.insert(binding.name().to_owned(), output);
@@ -527,23 +531,33 @@ pub(super) fn prepare_direct_units(
             return Ok(());
         }
         let arrays =
-            DirectRecipeRead::materialize_many(std::mem::take(reads)).map_err(|source| {
-                ResidencyError::Recipe {
+            DirectRecipeRead::materialize_many(std::mem::take(reads), &state.source_stream)
+                .map_err(|source| ResidencyError::Recipe {
                     binding: "<residency batch>".into(),
                     source,
-                }
-            })?;
+                })?;
         retained.retained_arrays.extend(arrays.iter().cloned());
         for ((id, name), input) in std::mem::take(owners).into_iter().zip(arrays) {
             let output = if state.source_stream == state.device_stream {
                 input
             } else {
-                input
-                    .copy(&state.device_stream)
-                    .map_err(|source| ResidencyError::Recipe {
-                        binding: name.clone(),
-                        source: WeightRecipeError::Mlx(source),
-                    })?
+                let binding = state
+                    .control
+                    .unit(&id)
+                    .ok_or(ResidencyError::StatePoisoned)?
+                    .bindings()
+                    .iter()
+                    .find(|binding| binding.name() == name)
+                    .ok_or(ResidencyError::StatePoisoned)?;
+                crate::backend::runtime::checkpoint::recipe::copy_parameter_storage(
+                    &input,
+                    binding.storage_layout(),
+                    &state.device_stream,
+                )
+                .map_err(|source| ResidencyError::Recipe {
+                    binding: name.clone(),
+                    source: WeightRecipeError::Mlx(source),
+                })?
             };
             retained.retained_arrays.push(output.clone());
             result
@@ -571,13 +585,15 @@ pub(super) fn prepare_direct_units(
         let mut candidates = Vec::new();
         for binding in unit.bindings() {
             let recipe = binding.source_recipe();
-            let read =
-                DirectRecipeRead::prepare(&recipe, sources.source(id)).map_err(|source| {
-                    ResidencyError::Recipe {
-                        binding: binding.name().into(),
-                        source,
-                    }
-                })?;
+            let read = DirectRecipeRead::prepare_with_layout(
+                &recipe,
+                sources.source(id),
+                binding.storage_layout(),
+            )
+            .map_err(|source| ResidencyError::Recipe {
+                binding: binding.name().into(),
+                source,
+            })?;
             let Some(read) = read else {
                 candidates.clear();
                 break;

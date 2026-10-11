@@ -587,6 +587,17 @@ impl std::fmt::Display for ParameterId {
     }
 }
 
+/// Preferred physical storage of an immutable matrix. Logical geometry and values
+/// remain unchanged; materializers may retain canonical storage when unsupported.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum ParameterStorageLayout {
+    /// Ordinary row-major storage.
+    #[default]
+    Canonical,
+    /// Contiguous transposed storage exposed through a logical matrix view.
+    TransposedMatrix,
+}
+
 /// Complete logical declaration for one parameter slot.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParameterSpec {
@@ -604,6 +615,8 @@ pub struct ParameterSpec {
     pub linear_companion_of: Option<ParameterId>,
     /// Exact independent row-block origins of this primary linear weight.
     pub linear_row_layout: LinearRowLayout,
+    /// Backend-selected immutable storage preference; never changes logical values.
+    pub storage_layout: ParameterStorageLayout,
 }
 
 impl ParameterSpec {
@@ -617,6 +630,7 @@ impl ParameterSpec {
             linear_companion: None,
             linear_companion_of: None,
             linear_row_layout: LinearRowLayout::Contiguous,
+            storage_layout: ParameterStorageLayout::Canonical,
         })
     }
 }
@@ -647,6 +661,8 @@ pub struct ParameterMetadata {
     pub linear_companion_of: Option<ParameterId>,
     /// Exact independent row-block origins retained from construction.
     pub linear_row_layout: LinearRowLayout,
+    /// Backend-selected immutable storage preference; never changes logical values.
+    pub storage_layout: ParameterStorageLayout,
 }
 
 impl ParameterMetadata {
@@ -660,6 +676,7 @@ impl ParameterMetadata {
             linear_companion: spec.linear_companion,
             linear_companion_of: spec.linear_companion_of.clone(),
             linear_row_layout: spec.linear_row_layout,
+            storage_layout: spec.storage_layout,
         }
     }
 }
@@ -813,9 +830,22 @@ pub struct LinearFormatSpec {
     affine_bias: Option<ParameterSpec>,
     row_layout: LinearRowLayout,
     compute_element: Option<TensorElementType>,
+    exact_zero_inputs: bool,
 }
 
 impl LinearFormatSpec {
+    /// Offers an optimization hint for inputs with substantial exact-zero sparsity.
+    /// This does not authorize pruning, approximation, or changing the equation.
+    pub fn with_exact_zero_inputs(mut self) -> Self {
+        self.exact_zero_inputs = true;
+        self
+    }
+
+    /// Whether the architecture offers exact-zero input sparsity.
+    pub const fn exact_zero_inputs(&self) -> bool {
+        self.exact_zero_inputs
+    }
+
     /// Requests floating projection inputs in this precision through `LinearSpec`,
     /// restoring the caller's floating precision after the projection. Parameters,
     /// accumulator precision and bias arithmetic retain their mechanism's policy.
@@ -849,6 +879,7 @@ impl LinearFormatSpec {
             affine_bias: None,
             row_layout: LinearRowLayout::Contiguous,
             compute_element: None,
+            exact_zero_inputs: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -865,6 +896,7 @@ impl LinearFormatSpec {
             affine_bias: None,
             row_layout: LinearRowLayout::Contiguous,
             compute_element: None,
+            exact_zero_inputs: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -888,6 +920,7 @@ impl LinearFormatSpec {
             affine_bias: Some(affine_bias),
             row_layout: LinearRowLayout::Contiguous,
             compute_element: None,
+            exact_zero_inputs: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -6288,6 +6321,7 @@ mod parameter_topology_tests {
                 linear_companion: None,
                 linear_companion_of: None,
                 linear_row_layout: LinearRowLayout::Contiguous,
+                storage_layout: ParameterStorageLayout::Canonical,
             },
             1,
         );

@@ -192,16 +192,20 @@ pub fn materialize_module_bindings(
     for batch in plan_binding_reads(store, plan.owners())? {
         let (names, materialization) = match batch {
             BindingReadBatch::Direct { bindings, reads } => {
-                let inputs = DirectRecipeRead::materialize_many(reads)?;
+                let inputs = DirectRecipeRead::materialize_many(reads, source_stream)?;
                 let mut prepared = WeightMaterialization::prepare_retained(inputs, Vec::new())?;
                 for index in 0..prepared.inputs().len() {
                     let input = &prepared.inputs()[index];
+                    let binding = bindings[index];
                     let output = if source_stream == execution_stream {
                         input.clone()
                     } else {
-                        input
-                            .copy(execution_stream)
-                            .map_err(WeightRecipeError::from)?
+                        super::recipe::copy_parameter_storage(
+                            input,
+                            binding.storage_layout(),
+                            execution_stream,
+                        )
+                        .map_err(WeightRecipeError::from)?
                     };
                     prepared.retain_output(output);
                 }

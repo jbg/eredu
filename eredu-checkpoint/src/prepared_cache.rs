@@ -215,7 +215,7 @@ fn hash_recipe_leaves(
                             _ => {
                                 return Err(invalid(
                                     "prepared fingerprint requires dense GGUF source storage",
-                                ))
+                                ));
                             }
                         }
                     }
@@ -632,6 +632,61 @@ mod tests {
         writer.finish().unwrap()
     }
     #[test]
+    fn bounded_matrix_layout_preserves_bytes_and_reuses_prepared_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = policy(temp.path(), 4096);
+        let source = write(&policy, &"a".repeat(64));
+        let recipe = crate::recipe::DerivedWeightRecipe::source("weight", TensorSelection::Full);
+        // One column per tile: both input and output fit a sixteen-byte bound.
+        let transposed = prepare_transposed_matrix(source.as_ref(), &recipe, &policy, 16)
+            .unwrap()
+            .unwrap();
+        let read = |source: &dyn CheckpointSource| {
+            let lease = source
+                .acquire_lease(TensorReadRequest {
+                    key: "matrix".into(),
+                    selection: TensorSelection::Full,
+                    policy: ReadPolicy::RequireBounded,
+                })
+                .unwrap();
+            assert_eq!(lease.output_shape(), &[4, 2]);
+            lease.encoded_bytes().unwrap().to_vec()
+        };
+        let expected: Vec<_> = [0.5f32, 4.5, 1.5, 5.5, 2.5, 6.5, 3.5, 7.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(read(transposed.as_ref()), expected);
+        let entries = || {
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                .count()
+        };
+        assert_eq!(entries(), 2);
+        let reloaded = prepare_transposed_matrix(source.as_ref(), &recipe, &policy, 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read(reloaded.as_ref()), expected);
+        assert_eq!(entries(), 2);
+        assert!(
+            prepare_transposed_matrix(source.as_ref(), &recipe, &policy, 15)
+                .unwrap()
+                .is_none()
+        );
+        let small = PreparedCheckpointCachePolicy {
+            directory: temp.path().into(),
+            max_bytes: 16,
+        };
+        assert!(
+            prepare_transposed_matrix(source.as_ref(), &recipe, &small, 16)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn content_identity_and_bounded_persisted_reads_survive_reload() {
         let temp = tempfile::tempdir().unwrap();
         let policy = policy(temp.path(), 4096);
@@ -832,5 +887,114 @@ mod tests {
             policy.prepare(&key, &layout(), 16).unwrap(),
             PreparedCheckpointEntry::Cached(_)
         ));
+    }
+}
+
+/// Prepares a byte-preserving matrix transpose under the ordinary cache policy.
+/// Only encoded recipes are supported. Two host tiles fit `max_working_set_bytes`;
+/// final native allocations and logical views remain the materializer's concern.
+/// Unsupported geometry or insufficient optional cache capacity returns `None`.
+pub fn prepare_transposed_matrix(
+    source: &dyn CheckpointSource,
+    recipe: &crate::recipe::DerivedWeightRecipe,
+    policy: &PreparedCheckpointCachePolicy,
+    max_working_set_bytes: u64,
+) -> Result<Option<SharedCheckpointSource>, StoreError> {
+    use crate::{recipe::RecipeDtype, store::TensorSelection};
+    let metadata = recipe.infer(source).map_err(|e| invalid(e.to_string()))?;
+    let [rows, columns] = metadata.shape.as_slice() else {
+        return Ok(None);
+    };
+    let (rows, columns) = (*rows, *columns);
+    let dtype = match metadata.dtype {
+        RecipeDtype::U8 => Dtype::U8,
+        RecipeDtype::I8 => Dtype::I8,
+        RecipeDtype::U16 => Dtype::U16,
+        RecipeDtype::I16 => Dtype::I16,
+        RecipeDtype::U32 => Dtype::U32,
+        RecipeDtype::I32 => Dtype::I32,
+        RecipeDtype::U64 => Dtype::U64,
+        RecipeDtype::I64 => Dtype::I64,
+        RecipeDtype::F16 => Dtype::F16,
+        RecipeDtype::BF16 => Dtype::BF16,
+        RecipeDtype::F32 => Dtype::F32,
+        RecipeDtype::F64 => Dtype::F64,
+        _ => return Ok(None),
+    };
+    let scalar_bytes = dtype.bitsize() / 8;
+    let column_bytes = rows
+        .checked_mul(scalar_bytes)
+        .ok_or_else(|| invalid("transpose column overflow"))?;
+    if column_bytes == 0 || columns == 0 || column_bytes as u64 > max_working_set_bytes / 2 {
+        return Ok(None);
+    }
+    let row_bytes = columns
+        .checked_mul(scalar_bytes)
+        .ok_or_else(|| invalid("transpose row overflow"))?;
+    if row_bytes as u64 > max_working_set_bytes {
+        return Ok(None);
+    }
+    let tile_columns = usize::try_from(max_working_set_bytes / 2 / column_bytes as u64)
+        .unwrap_or(usize::MAX)
+        .min(columns);
+    let selected = |start, end| {
+        recipe
+            .select_bounded(
+                source,
+                TensorSelection::Range {
+                    axis: 1,
+                    start,
+                    end,
+                },
+            )
+            .map_err(|e| invalid(e.to_string()))
+    };
+    // Establish support before admitting a writer or reading payloads.
+    if selected(0, tile_columns)?
+        .prepare_encoded_read(source)
+        .map_err(|e| invalid(e.to_string()))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let key = prepared_checkpoint_recipe_key(
+        source,
+        std::slice::from_ref(recipe),
+        b"encoded-matrix-transpose-v1",
+        max_working_set_bytes,
+    )?;
+    let layout = PreparedTensorLayout {
+        name: "matrix".into(),
+        dtype,
+        shape: vec![columns, rows],
+    };
+    let entry = match policy.prepare(&key, &[layout], max_working_set_bytes / 2) {
+        Err(StoreError::PreparedCacheCapacity { .. }) => return Ok(None),
+        entry => entry?,
+    };
+    match entry {
+        PreparedCheckpointEntry::Cached(source) => Ok(Some(source)),
+        PreparedCheckpointEntry::Vacant(mut writer) => {
+            for start in (0..columns).step_by(tile_columns) {
+                let count = tile_columns.min(columns - start);
+                let mut input = vec![0u8; column_bytes * count];
+                let read = selected(start, start + count)?
+                    .prepare_encoded_read(source)
+                    .map_err(|e| invalid(e.to_string()))?
+                    .ok_or_else(|| invalid("encoded transpose support changed"))?;
+                read.read_into(&mut input)?;
+                let mut output = vec![0u8; input.len()];
+                for column in 0..count {
+                    for row in 0..rows {
+                        let from = (row * count + column) * scalar_bytes;
+                        let to = (column * rows + row) * scalar_bytes;
+                        output[to..to + scalar_bytes]
+                            .copy_from_slice(&input[from..from + scalar_bytes]);
+                    }
+                }
+                writer.write("matrix", (start * column_bytes) as u64, &output)?;
+            }
+            Ok(Some(writer.finish()?))
+        }
     }
 }

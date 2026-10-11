@@ -43,10 +43,17 @@ impl<B: NeuralBackend> DenseMlp<B> {
                         .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
                         .transpose()
                         .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.weight_quantization_for(&weight).into(),
-                    )?,
+                    format: {
+                        let format = crate::linear_format::standard_linear_format(
+                            &weight,
+                            args.weight_quantization_for(&weight).into(),
+                        )?;
+                        if field == "down_proj" {
+                            format.with_exact_zero_inputs()
+                        } else {
+                            format
+                        }
+                    },
                 },
                 context,
             )

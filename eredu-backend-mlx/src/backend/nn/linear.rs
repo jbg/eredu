@@ -171,9 +171,27 @@ pub struct PhysicalLinear {
     pub mode: QuantizationMode,
     /// Checkpoint-native GGUF format, when values remain block encoded.
     pub gguf: Option<WeightQuantization>,
+    /// Portable exact-zero input hint; permits no approximate pruning.
+    pub exact_zero_inputs: bool,
 }
 
 impl PhysicalLinear {
+    /// Geometry where the sparse generic-QMV arithmetic has measured utility.
+    /// Widths selecting MLX's differently ordered fast QMV retain that mechanism.
+    pub(crate) fn prefers_transposed_storage(&self) -> bool {
+        cfg!(all(feature = "metal", not(feature = "cuda")))
+            && self.exact_zero_inputs
+            && self.bits == 8
+            && self.group_size == 64
+            && self.gguf.is_none()
+            && self.mode == QuantizationMode::Affine
+            && self.input_dimensions >= 4096
+            && self.output_dimensions >= 1024
+            && self.output_dimensions <= 65536
+            && self.input_dimensions > self.output_dimensions
+            && self.input_dimensions % 512 != 0
+    }
+
     /// Allocates unloaded backend parameters for one typed neutral format.
     pub fn unloaded(
         input_dimensions: i32,
@@ -312,6 +330,7 @@ impl PhysicalLinear {
             bits: affine.map_or(0, WeightQuantization::bits),
             mode,
             gguf: quantization.filter(|value| value.gguf_iquant().is_some()),
+            exact_zero_inputs: false,
         })
     }
 
@@ -371,17 +390,38 @@ impl PhysicalLinear {
             )?
             .linear(input, true, stream)?
         } else if let Some(scales) = self.scales.as_ref() {
-            let output = quantized_matmul_with_mode(
-                input,
-                self.weight.as_ref(),
-                scales,
-                self.biases.as_ref().as_ref(),
-                true,
-                self.group_size,
-                self.bits,
-                self.mode,
-                stream,
-            )?;
+            let sparse = if self.prefers_transposed_storage() {
+                self.biases
+                    .as_ref()
+                    .as_ref()
+                    .map(|biases| {
+                        super::sparse_q8::project(
+                            input,
+                            self.weight.as_ref(),
+                            scales,
+                            biases,
+                            stream,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let output = match sparse {
+                Some(output) => output,
+                None => quantized_matmul_with_mode(
+                    input,
+                    self.weight.as_ref(),
+                    scales,
+                    self.biases.as_ref().as_ref(),
+                    true,
+                    self.group_size,
+                    self.bits,
+                    self.mode,
+                    stream,
+                )?,
+            };
             #[cfg(feature = "projection-profiling")]
             super::projection_profile::affine::record(
                 input,

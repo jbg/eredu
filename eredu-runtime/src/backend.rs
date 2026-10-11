@@ -82,6 +82,18 @@ pub trait ParameterBackend: NeuralBackend {
         context: &Self::MaterializationContext,
     ) -> Result<Self::Materialization, Self::ParameterError>;
 
+    /// Lowers an optional physical storage preference while preserving the recipe's
+    /// logical geometry and values. Backends may retain ordinary canonical storage.
+    fn materialize_recipe_with_layout(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+        layout: eredu_nn::ParameterStorageLayout,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError> {
+        let _ = layout;
+        Self::materialize_recipe(recipe, source, context)
+    }
+
     /// Borrows the native weight retained by an in-flight materialization.
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight;
 

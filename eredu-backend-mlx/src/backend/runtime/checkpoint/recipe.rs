@@ -99,6 +99,8 @@ pub(crate) struct DirectRecipeRead {
     shape: Vec<i32>,
     dtype: Dtype,
     read: eredu_checkpoint::recipe::EncodedRecipeRead,
+    transposed: bool,
+    _prepared_source: Option<eredu_checkpoint::store::SharedCheckpointSource>,
 }
 
 impl DirectRecipeRead {
@@ -133,11 +135,55 @@ impl DirectRecipeRead {
                     .ok_or(WeightRecipeError::InvalidMxFp4LogicalShape)?;
                 *last /= 2;
             }
-            Ok(Some(Self { shape, dtype, read }))
+            Ok(Some(Self {
+                shape,
+                dtype,
+                read,
+                transposed: false,
+                _prepared_source: None,
+            }))
         }
     }
 
-    pub(crate) fn materialize_many(reads: Vec<Self>) -> Result<Vec<Array>, WeightRecipeError> {
+    pub(crate) fn prepare_with_layout(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+        layout: eredu_nn::ParameterStorageLayout,
+    ) -> Result<Option<Self>, WeightRecipeError> {
+        if layout == eredu_nn::ParameterStorageLayout::TransposedMatrix && !cfg!(feature = "cuda") {
+            let default_policy =
+                eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy::default();
+            let policy = source.prepared_cache_policy().unwrap_or(&default_policy);
+            if let Some(prepared) = eredu_checkpoint::prepared_cache::prepare_transposed_matrix(
+                source,
+                recipe,
+                policy,
+                64 * 1024 * 1024,
+            )? {
+                let storage = DerivedWeightRecipe::source(
+                    "matrix",
+                    eredu_checkpoint::store::TensorSelection::Full,
+                );
+                if let Some(mut read) = Self::prepare(&storage, prepared.as_ref())? {
+                    read.transposed = true;
+                    read._prepared_source = Some(prepared);
+                    return Ok(Some(read));
+                }
+            }
+        }
+        Self::prepare(recipe, source)
+    }
+
+    pub(crate) fn materialize_many(
+        reads: Vec<Self>,
+        stream: &Stream,
+    ) -> Result<Vec<Array>, WeightRecipeError> {
+        let layouts: Vec<_> = reads.iter().map(|r| r.transposed).collect();
+        // Pins remain live through the direct encoded reads, including unwinding.
+        let _pins: Vec<_> = reads
+            .iter()
+            .filter_map(|r| r._prepared_source.clone())
+            .collect();
         let (specifications, reads): (Vec<_>, Vec<_>) = reads
             .into_iter()
             .map(|value| ((value.shape, value.dtype), value.read))
@@ -146,10 +192,21 @@ impl DirectRecipeRead {
             .iter()
             .map(|(shape, dtype)| (shape.as_slice(), *dtype))
             .collect::<Vec<_>>();
-        Array::try_init_many_with(&specifications, |outputs| {
+        let arrays = Array::try_init_many_with(&specifications, |outputs| {
             eredu_checkpoint::recipe::EncodedRecipeRead::read_many_into(reads, outputs)
                 .map_err(WeightRecipeError::CheckpointStore)
-        })
+        })?;
+        arrays
+            .into_iter()
+            .zip(layouts)
+            .map(|(array, transposed)| {
+                if transposed {
+                    Ok(array.transpose(stream)?)
+                } else {
+                    Ok(array)
+                }
+            })
+            .collect()
     }
 }
 
@@ -179,7 +236,7 @@ pub(crate) fn plan_binding_reads<'a>(
             direct_source = binding.source_recipe();
             &direct_source
         };
-        let read = DirectRecipeRead::prepare(recipe, source)?;
+        let read = DirectRecipeRead::prepare_with_layout(recipe, source, binding.storage_layout())?;
         if read.is_none() || !budget.try_push(binding.expected_bytes()) {
             if !group.is_empty() {
                 batches.push(BindingReadBatch::Direct {
@@ -556,7 +613,7 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
         if let Some(read) = DirectRecipeRead::prepare(self, store)? {
-            let output = DirectRecipeRead::materialize_many(vec![read])?
+            let output = DirectRecipeRead::materialize_many(vec![read], context.source_stream())?
                 .pop()
                 .expect("one output");
             return Ok(PendingWeightRecipe {
@@ -956,3 +1013,17 @@ pub enum WeightRecipeError {
 
 #[cfg(test)]
 mod tests;
+
+/// Copies final storage on the destination stream while preserving a selected
+/// physical matrix layout. Only the returned logical view survives publication.
+pub(crate) fn copy_parameter_storage(
+    input: &Array,
+    layout: eredu_nn::ParameterStorageLayout,
+    stream: &Stream,
+) -> Result<Array, safemlx::error::Exception> {
+    if layout == eredu_nn::ParameterStorageLayout::TransposedMatrix && input.ndim() == 2 {
+        input.transpose(stream)?.copy(stream)?.transpose(stream)
+    } else {
+        input.copy(stream)
+    }
+}

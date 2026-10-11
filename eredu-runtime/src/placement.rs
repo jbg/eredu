@@ -603,7 +603,8 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
                 selection,
                 expected_bytes,
             )?
-            .with_logical_target(logical_target)?;
+            .with_logical_target(logical_target)?
+            .with_storage_layout(binding.storage_layout());
             if let Some(companions) = companions {
                 placed = placed.with_quantization_companions(
                     companions.scale(),
@@ -643,7 +644,8 @@ fn apply_binding_placements<C: RecipeCatalog + ?Sized>(
         }
         let expected_bytes = recipe.infer(source)?.byte_len();
         let mut placed = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?
-            .with_logical_target(logical_target)?;
+            .with_logical_target(logical_target)?
+            .with_storage_layout(binding.storage_layout());
         if let Some(companions) = companions {
             placed = placed.with_quantization_companions(
                 companions.scale(),
@@ -790,7 +792,9 @@ pub enum BindingPlacementError {
         rank: usize,
     },
     /// A semantic boundary is not exactly representable in packed storage.
-    #[error("semantic boundary {boundary} on axis {axis} ({semantic}) is not aligned to stored width {stored}")]
+    #[error(
+        "semantic boundary {boundary} on axis {axis} ({semantic}) is not aligned to stored width {stored}"
+    )]
     UnalignedBoundary {
         /// Selected axis.
         axis: usize,

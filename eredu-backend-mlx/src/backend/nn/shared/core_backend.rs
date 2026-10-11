@@ -64,6 +64,29 @@ impl ParameterBackend for MlxNeuralBackend {
         Ok(prepared.submit_outputs(vec![output])?)
     }
 
+    fn materialize_recipe_with_layout(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: eredu_nn::ParameterStorageLayout,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError> {
+        use crate::backend::runtime::checkpoint::{
+            recipe::{copy_parameter_storage, DirectRecipeRead},
+            store::WeightMaterialization,
+        };
+        let Some(read) = DirectRecipeRead::prepare_with_layout(recipe, source, layout)? else {
+            return Self::materialize_recipe(recipe, source, context);
+        };
+        let inputs = DirectRecipeRead::materialize_many(vec![read], context.source_stream())?;
+        let prepared = WeightMaterialization::prepare_retained(inputs, Vec::new())?;
+        let output = if context.source_stream() == context.execution_stream() {
+            prepared.inputs()[0].clone()
+        } else {
+            copy_parameter_storage(&prepared.inputs()[0], layout, context.execution_stream())?
+        };
+        Ok(prepared.submit_outputs(vec![output])?)
+    }
+
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
         MlxTensor::ref_cast(materialization.output())
     }
@@ -143,14 +166,32 @@ impl NeuralBackend for MlxNeuralBackend {
     type ParallelContext = Group;
 
     fn linear(spec: LinearSpec, context: &Stream) -> Result<MlxLinear, ComputeError> {
-        let module = compute(common::linear::PhysicalLinear::unloaded(
+        let mut module = compute(common::linear::PhysicalLinear::unloaded(
             spec.input,
             spec.output,
             spec.bias.is_some(),
             spec.format.encoding(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
+        module.exact_zero_inputs = spec.format.exact_zero_inputs()
+            && spec
+                .format
+                .compute_element()
+                .is_none_or(|element| element == eredu_nn::TensorElementType::F32);
+        let mut topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
+        if module.prefers_transposed_storage()
+            && context
+                .get_device()
+                .and_then(|d| d.get_type())
+                .map_err(ComputeError::backend_source)?
+                == safemlx::DeviceType::Gpu
+        {
+            for (local, parameter) in &mut topology {
+                if matches!(local.as_str(), "weight" | "scales" | "biases") {
+                    parameter.storage_layout = eredu_nn::ParameterStorageLayout::TransposedMatrix;
+                }
+            }
+        }
         Ok(MlxLinear {
             compute_element: spec.format.compute_element(),
             module,
@@ -1069,14 +1110,32 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
     ) -> Result<MlxLinear, ComputeError> {
         range.validate_global_rows(spec.output)?;
         let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
-        let module = compute(common::linear::PhysicalLinear::unloaded(
+        let mut module = compute(common::linear::PhysicalLinear::unloaded(
             spec.input,
             local,
             spec.bias.is_some(),
             spec.format.encoding(),
             context,
         ))?;
-        let topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
+        module.exact_zero_inputs = spec.format.exact_zero_inputs()
+            && spec
+                .format
+                .compute_element()
+                .is_none_or(|element| element == eredu_nn::TensorElementType::F32);
+        let mut topology = parameter_topology(&module, spec.weight, spec.bias, &spec.format)?;
+        if module.prefers_transposed_storage()
+            && context
+                .get_device()
+                .and_then(|d| d.get_type())
+                .map_err(ComputeError::backend_source)?
+                == safemlx::DeviceType::Gpu
+        {
+            for (local, parameter) in &mut topology {
+                if matches!(local.as_str(), "weight" | "scales" | "biases") {
+                    parameter.storage_layout = eredu_nn::ParameterStorageLayout::TransposedMatrix;
+                }
+            }
+        }
         Ok(MlxLinear {
             compute_element: spec.format.compute_element(),
             module,

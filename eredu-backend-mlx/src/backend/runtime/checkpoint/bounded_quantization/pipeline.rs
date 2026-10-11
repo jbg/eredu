@@ -18,6 +18,7 @@ pub struct BoundedQuantizedWeightStore {
     materialized_source_keys: BTreeSet<String>,
     materialized_source_shards: BTreeSet<PathBuf>,
     report: WeightMaterializationReport,
+    cache: eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy,
 }
 
 impl std::fmt::Debug for BoundedQuantizedWeightStore {
@@ -136,6 +137,7 @@ impl BoundedQuantizedWeightStore {
                     transformed_keys,
                     materialized_source_keys,
                     materialized_source_shards,
+                    cache: plan.cache.clone(),
                     report: WeightMaterializationReport {
                         admitted_working_set_bytes: plan.max_working_set_bytes,
                         transformed_weights: plan.targets.len(),
@@ -193,6 +195,7 @@ impl BoundedQuantizedWeightStore {
             materialized_source_keys,
             materialized_source_shards,
             report,
+            cache: plan.cache,
         })
     }
 
@@ -208,6 +211,12 @@ impl BoundedQuantizedWeightStore {
 }
 
 impl CheckpointSource for BoundedQuantizedWeightStore {
+    fn prepared_cache_policy(
+        &self,
+    ) -> Option<&eredu_checkpoint::prepared_cache::PreparedCheckpointCachePolicy> {
+        Some(&self.cache)
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.source
             .source_keys()

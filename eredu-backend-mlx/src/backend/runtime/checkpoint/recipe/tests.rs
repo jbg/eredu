@@ -729,3 +729,106 @@ fn selected_decoded_gguf_source_binds_as_f32_and_retains_physical_read_bound() {
         512
     );
 }
+
+#[test]
+fn transposed_prepared_storage_survives_cross_stream_binding_without_a_replica() {
+    use eredu_checkpoint::{prepared_cache::PreparedCheckpointCachePolicy, store::*};
+    struct Source {
+        store: SafetensorsWeightStore,
+        policy: PreparedCheckpointCachePolicy,
+    }
+    impl CheckpointSource for Source {
+        fn prepared_cache_policy(&self) -> Option<&PreparedCheckpointCachePolicy> {
+            Some(&self.policy)
+        }
+        fn source_keys(&self) -> Vec<String> {
+            self.store.source_keys()
+        }
+        fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.store.source_metadata(key)
+        }
+        fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            self.store.acquire_lease(request)
+        }
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            self.store.source_diagnostics()
+        }
+        fn prepare_encoded_read(
+            &self,
+            requests: &[TensorReadRequest],
+        ) -> Result<Option<EncodedReadBatch>, StoreError> {
+            self.store.prepare_encoded_read(requests)
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let values = [1f32, 2., 3., 4., 5., 6.];
+    let bytes: Vec<_> = values.into_iter().flat_map(f32::to_le_bytes).collect();
+    let path = directory.path().join("source.safetensors");
+    serialize_to_file(
+        [(
+            "weight",
+            TensorView::new(SafeDtype::F32, vec![2, 3], &bytes).unwrap(),
+        )],
+        None,
+        &path,
+    )
+    .unwrap();
+    let source = Source {
+        store: SafetensorsWeightStore::open(path).unwrap(),
+        policy: PreparedCheckpointCachePolicy {
+            directory: directory.path().join("cache"),
+            max_bytes: 4096,
+        },
+    };
+    let binding = eredu_runtime::WeightBinding::new("weight", "weight", TensorSelection::Full, 24)
+        .unwrap()
+        .with_storage_layout(eredu_nn::ParameterStorageLayout::TransposedMatrix);
+    let source_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let destination = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let arrays = crate::backend::runtime::checkpoint::binding::materialize_module_bindings(
+        &source,
+        &[binding],
+        &source_stream,
+        &destination,
+    )
+    .unwrap();
+    let logical = &arrays["weight"];
+    assert_eq!(logical.shape(), &[2, 3]);
+    assert_eq!(logical.strides(), &[1, 2]);
+    assert_eq!(
+        logical.evaluated().unwrap().try_to_vec::<f32>().unwrap(),
+        values
+    );
+    use eredu_runtime::ParameterBackend;
+    let context = MlxParameterMaterializationContext::new(&source_stream, &destination);
+    let materialization =
+        crate::backend::nn::shared::MlxNeuralBackend::materialize_recipe_with_layout(
+            &DerivedWeightRecipe::source("weight", TensorSelection::Full),
+            &source,
+            eredu_nn::ParameterStorageLayout::TransposedMatrix,
+            &context,
+        )
+        .unwrap();
+    let direct =
+        crate::backend::nn::shared::MlxNeuralBackend::finish_materialization(materialization)
+            .unwrap();
+    assert_eq!(direct.as_array().strides(), &[1, 2]);
+    assert_eq!(
+        direct
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap(),
+        values
+    );
+    let physical = logical.transpose(&destination).unwrap();
+    physical.evaluated().unwrap();
+    let storage = safemlx::inspect_storage(&[logical, &physical]).unwrap();
+    assert_eq!(storage.backings.len(), 1);
+    assert_eq!(storage.values, [Some(0), Some(0)]);
+    assert_eq!(
+        physical.evaluated().unwrap().as_slice::<f32>(),
+        &[1., 4., 2., 5., 3., 6.]
+    );
+}
