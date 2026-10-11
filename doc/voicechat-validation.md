@@ -18,8 +18,8 @@ evidence; complete-model residency/parallel execution has no complete VoiceChat
 validation results. The WAV example completes the pinned released checkpoint on
 Metal with speech, text, transcription and drain, as recorded below. Independent
 complete-model numerical parity and speech quality remain unvalidated. No
-hardware latency claim follows from storage admission or the unoptimized
-execution measurement.
+hardware latency claim follows from storage admission alone; resident performance
+measurements have the explicit precision, workload and timing scope below.
 
 ## WAV and recorded tool responses
 
@@ -225,1400 +225,72 @@ The WAV contains 698,552 contiguous float32 samples at 22.05 kHz, including an
 eight-sample codec tail: 31.68036 seconds, all finite, absolute peak 0.18182363,
 RMS 0.0078710742 and no samples outside [-1,1]. Its SHA-256 is
 `79a27903f6875dd642c57f6dcaf4c7238f9f6ce3d02923e89d81772a9fe6a4ac`.
-The dev-profile run takes 172.39 seconds including startup; maximum process RSS is
-123,601,731,584 bytes and peak process footprint is 125,483,392,336 bytes. These
-are observations, not real-time performance or minimum-residency claims; a test
-build and a brief scalar-kernel check overlap execution. `run-summary.json` and
-`run-2.log` retain the output checks and process measurements.
-
-The resident release-profile performance measurement on 2026-10-08 uses the
-same pinned checkpoint, configuration, input and 200-frame silence tail on an
-M3 Ultra with 80 GPU cores and 256 GB unified memory. Both measured executables
-use ordered Metal RVQ lookup fusion, retained codebook norms, bounded immutable
-character conditioning and shared immutable frame-state roots. Parameters, five
-active refinement slots and sampling policy are unchanged. The 421,888-byte
-derived-tensor allowance is included in cold device admission. The current
-implementation additionally fuses F32 single-step selective recurrence updates
-and packs agent/function IDs for joint evaluation and transfer. Projection uses
-MLX's ordinary reduction order; explicit snapshots/forks retain physical isolation.
-The unoptimized pinned commit `d5683bb3a454a627b1023713a053d0a0d5a3c74a`
-measures 217.079 ms per warmed frame in the separate retained baseline artifact.
-
-| Full-path resident Metal measurement | Ordinary scan/readbacks | Fused update/grouped IDs |
-| --- | ---: | ---: |
-| Mean warmed 80 ms frame | 170.446 ms | 169.122 ms |
-| p95 warmed frame | 174.779 ms | 173.792 ms |
-| Warmed real-time factor, lower is better | 2.131 | 2.114 |
-| Warmed deadline misses | 386 / 386 | 386 / 386 |
-| Process wall time including startup and drain | 77.77 s | 76.12 s |
-| Peak process footprint | 98.463 GB | 98.445 GB |
-
-Warmed statistics exclude the first ten of 396 live frames and include input
-processing, inference, transaction preparation, GPU completion, host output and
-publication. No builds or tests overlap this complete paired measurement. The
-mean falls by 1.325 ms (0.78%), giving 1.008x throughput; 367 of 386 matched
-warmed frames are faster, with a median difference of 1.228 ms. This is a modest
-full-path result from one pair, not isolated recurrence or readback timing. An
-initial unpaired fused run measures 189.471 ms/frame with identical output; the
-variation limits inference about gains across machine states. The current paired
-mean exceeds the deadline by 89.122 ms and requires another 2.114x throughput
-improvement (52.70% lower latency) for sustained real-time processing. It is not
-a system microphone/speaker or acoustic echo-cancellation measurement. Maximum
-process RSS is 44,987,269,120 bytes before and 44,968,296,448 bytes after. Neither
-paired run swaps.
-
-The complete 698,552-sample float32 WAV is byte-for-byte identical to the baseline,
-with SHA-256 `79a27903f6875dd642c57f6dcaf4c7238f9f6ce3d02923e89d81772a9fe6a4ac`.
-All 1,421 published events match after removal of instrumentation timestamps. This
-is local regression parity, not an independent full-session NVIDIA comparison.
-
-External `/private/tmp/eredu-voicechat-mamba` contains `REPORT.md`, `VALIDATION.md`,
-the source patch, preserved before/after executables, WAVs, event logs, process
-logs, per-frame summaries and `comparison.json`. `before.*` and `after-clean.*`
-retain the paired measurement above; `after.*` retains the slower unpaired run.
-External `/private/tmp/eredu-voicechat-state-sharing` retains the separate candidate
-sharing comparison: 191.737 to 170.731 ms/frame, with byte-identical speech.
-That 21.006 ms full-path effect is not an isolated copy-kernel measurement; the
-earlier approximately 24 ms outside execution includes completion and other work.
-External `/private/tmp/eredu-voicechat-fusion` retains the codebook/conditioning
-comparison against the unoptimized commit. Its `timing.patch` wraps the event
-writer with monotonic publication timestamps and a load timer; it adds no GPU
-wait or model decision. Timing instrumentation is absent from the example source.
-
-```sh
-CARGO_INCREMENTAL=0 cargo build --release --offline -p eredu --no-default-features \
-  --features mlx,audio,metal --example voicechat_wav
-/usr/bin/time -l target/release/examples/voicechat_wav \
-  --config /private/tmp/eredu-voicechat-reference/voicechat.json \
-  --input /private/tmp/eredu-voicechat-reference/input-general.wav \
-  --output /private/tmp/eredu-voicechat-mamba/after-clean.wav \
-  --events /private/tmp/eredu-voicechat-mamba/after-clean.jsonl \
-  --chunk-samples 640 --tail-frames 200 --max-steps 2000
-cargo test --offline -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --test codebook_fusion -- --test-threads=1
-cargo test --offline -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --test selective_scan_fusion -- --test-threads=1
-cargo test --offline -p eredu-architectures --test reference_numeric \
-  -- voicechat_channel_decision voicechat_dynamic_channel_policy \
-  voicechat_channel_coordination_owner_policy_rollback_and_replay --test-threads=1
-cargo test --offline -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --lib -- mlx_selective_scan_chunk_boundaries \
-  coupled_native_execution failed_and_unwinding_voicechat --test-threads=1
-cargo test --offline -p eredu-architectures --test reference_numeric voicechat_rvq
-cargo test --offline -p eredu-architectures --lib character_cache
-cargo test --offline -p eredu-architectures --lib \
-  retained_execution_cache_cannot_consume_parameter_capacity_twice
-```
-
-A separate resident on-load affine quantization experiment on the same M3 Ultra,
-pinned checkpoint and full conversation fixture uses group size 64 and the existing
-bounded native quantizer. The experimental architecture projection declares packed
-Nemotron parameter slots and retained recipes; the backend packs 122 matrices with a
-64 MiB conversion working-set bound. Norms, convolutions, activations, caches and
-all speech-provider weights remain F32. No converted checkpoint file is generated.
-The public speech loader does not expose this experimental request. The experiment
-retains conservative F32 cold admission and does not establish a production quantized
-residency or capability contract.
-
-| Resident on-load experiment, in run order | F32 control | 8-bit backbone | 4-bit backbone | F32 control |
-| --- | ---: | ---: | ---: | ---: |
-| Mean warmed 80 ms frame | 189.058 ms | 137.189 ms | 131.452 ms | 168.662 ms |
-| p95 warmed frame | 194.142 ms | 141.125 ms | 136.080 ms | 173.427 ms |
-| Warmed real-time factor | 2.363 | 1.715 | 1.643 | 2.108 |
-| Backbone parameter storage | 35.553 GB | 10.006 GB | 5.563 GB | 35.553 GB |
-| Startup, including on-load packing | 9.875 s | 81.991 s | 77.765 s | 8.470 s |
-| Peak process RSS | 44.977 GB | 32.117 GB | 23.548 GB | 44.982 GB |
-
-All runs have 396 live frames, 386 warmed observations, 698,552 output samples
-and zero swaps. Builds and tests do not overlap the sequential runs. The F32
-control variation limits precise speedup attribution: 8-bit reduces latency by
-18.7–27.4% against the controls, and 4-bit by 22.1–30.5%. All warmed frames still
-miss the deadline. The 8-bit mean exceeds it by 57.189 ms, requiring another
-1.715x throughput (41.69% less latency). The 4-bit gap is 51.452 ms, requiring
-1.643x throughput (39.14% less latency). The 5.737 ms difference between quantized
-runs is smaller than the F32 control variation. These measurements support a
-substantial bandwidth benefit from backbone quantization, without establishing
-real-time performance or the effect of quantizing the remaining speech matrices.
-
-The transformed dense matrices total 35,544,104,960 bytes; packed outputs are
-9,996,779,520 bytes at 8-bit and 5,553,766,400 bytes at 4-bit. Another 8,804,352
-backbone bytes remain dense. The backbone accounts for approximately 80% of
-learned storage; the speech providers retain approximately 8.827 GB. Process
-peaks include the retained in-memory packed source overlay, native weights,
-conversion work and mapped source pages, rather than just packed parameter bytes.
-
-Both F32 controls reproduce the complete baseline WAV and all 1,421 events after
-removing timestamps. RNNT transcription is identical across all four runs, and
-all waveforms have finite samples with no samples outside [-1,1]. The 8-bit
-response remains coherent for the fixture: “Yes, the sky appears blue due to
-Rayleigh scattering.” The 4-bit response contains an unrelated fragment about a
-“popular dish” and a malformed continuation before correctly answering the sky
-question. This is visible response degradation. Neither quantized output is
-asserted equivalent to F32, and this fixture is not a broad quality or perceptual
-speech evaluation. The 8-bit run has the same active/inactive-agent frame counts
-as F32; the 4-bit conversation trajectory differs.
-
-External `/private/tmp/eredu-voicechat-quantization` retains `REPORT.md`, the
-reproducible experimental loader/timing patch, preserved executable, release
-build log, original source inputs, run/analysis scripts, all four WAVs and event
-logs, native conversion telemetry, process logs and `comparison.json`. The
-experimental source is restored after building; the preserved executable is
-used for all four runs. `REPORT.md` records commands, revisions, hashes and
-quality limitations. The fixture does not exercise microphone/speaker hardware
-or acoustic echo cancellation.
-
-The selective on-load 8-bit experiment on 2026-10-09 extends packing to the
-independent function head and causal EAR-TTS projections, keeping the backbone
-8-bit in every run. It uses the same pinned checkpoint, resident Metal execution,
-group size 64 and 64 MiB bounded converter. Architecture-owned retained recipes and
-linear format declarations include exact affine companions; native materialization
-packs them before ordinary provider construction. The full function vocabulary,
-greedy decision policy, guidance lanes, state and completion paths remain intact.
-Character encoding, MoG, perception, codec, activations, caches and norms remain F32.
-These switches are experimental, with conservative F32 cold admission; the public
-loader exposes no additional production quantization contract.
-
-| Selective experiment | Backbone-only control after | + 8-bit function head | + 8-bit causal TTS |
-| --- | ---: | ---: | ---: |
-| Mean warmed 80 ms frame | 137.123 ms | 134.776 ms | 126.446 ms |
-| p95 warmed frame | 141.845 ms | 139.391 ms | 130.778 ms |
-| Warmed real-time factor | 1.714 | 1.685 | 1.581 |
-| Function-head storage | 2.349 GB | 0.661 GB | 0.661 GB |
-| Causal-TTS storage | 2.379 GB | 2.379 GB | 0.669 GB |
-| Startup, including packing | 81.945 s | 98.013 s | 97.899 s |
-| Peak process RSS | 33.452 GB | 32.066 GB | 30.515 GB |
-
-Run order is an initial backbone-only control (157.501 ms), function-head packing,
-combined function-head/TTS packing and the repeated backbone-only control above.
-The initial control uses the earlier benchmark build; its 20.378 ms difference
-prevents attributing its full difference to quantization. All later runs use the
-same final binary. Relative to the later control, the measured function-head saving
-is 2.347 ms (1.71%); adding causal TTS saves another 8.330 ms versus the head-only
-run. The combined comparison is 10.677 ms (7.79%) or 1.084x throughput, rather than
-an isolated component GPU measurement. All 386 warmed intervals still miss the
-80 ms deadline. The combined mean gap is 46.446 ms, requiring another 1.581x
-throughput or 36.73% latency reduction. Sequential runs have no overlapping builds
-or tests. These local comparisons do not establish repeatability across workloads.
-
-The function matrix packs 2,348,810,240 bytes to 660,602,880 bytes. The 196 causal-TTS
-projections pack 2,378,170,368 bytes to 668,860,416 bytes, retaining another 536,832
-F32 bytes. Their combined incremental parameter saving is 3,397,517,312 bytes.
-Native conversion uses two in-flight tiles and produces no checkpoint file.
-
-Both controls and the function-head run reproduce the same 1,418 semantic events
-excluding wall measurement and the same complete WAV, SHA256
-`4fd9b2e18cd783b6374d52da04d619db2c08c2bc87bc411b088a80a0044bc7c0`.
-The TTS run preserves those events, transcription, agent text, turn boundaries and
-698,552 output samples, but changes the waveform, SHA256
-`8b26df28ebbf05e711a32967d27d86a40825adc900fa7a9cbc63e69167ea1c81`.
-All samples remain finite and inside [-1,1]. RMS changes from 0.0067413 to 0.0059829;
-peak changes from 0.137963 to 0.165811. These checks establish neither perceptual
-speech equivalence nor absence of quality degradation. MoG and perception packing,
-microphone/speaker hardware and acoustic echo cancellation are not measured.
-
-The 8-bit-backbone tool fixture compares F32 and 8-bit function heads with F32
-TTS. Both reproduce all 1,005 semantic events and the exact 460,412-sample WAV,
-SHA256 `dfcc5e63a916d1d0cde0100de9aac44a025902b3f03da3f6f521320a840e7089`.
-The call is `generate_random_number` with `{"min":1,"max":50}` at audio time
-10,560 ms; the scripted result arrives at 11,360 ms and the answer is “Your random
-number is twenty.” No script entries or results remain unused. The 166 warmed
-live-audio intervals measure 136.248 ms with the F32 head and 132.681 ms with the
-8-bit head (3.566 ms saving); p95 is 140.094 and 135.651 ms respectively. These
-intervals exclude non-live tool-processing invocations. This single call establishes
-fixture parity, not broad function-channel accuracy; quantized TTS has no tool-fixture
-or perceptual quality comparison here.
-
-External `/private/tmp/eredu-voicechat-function-quantization` retains `REPORT.md`,
-the combined experimental patch, exact source originals, successful release build
-log, preserved executable, independent switches in `run.sh`, analysis and comparison
-scripts, native conversion/process logs, WAVs, JSONL events and pairwise quality
-reports. Source inputs are restored after building. The preserved final binary
-SHA256 is `71c13382d7831e286f977d599c384602acd6f944e300671be239dee01c077000`.
-Reproduction uses the same Metal/audio release command above and
-`run.sh NAME HEAD_BITS FIXTURE [TTS_BITS]`, with each added component set to `f32`
-or `8` and `FIXTURE` set to `general` or `tool`. `REPORT.md` records commands,
-pinned revisions, hashes and limitations.
-
-The mixed-precision measurement on 2026-10-09 uses the same checkpoint and M3
-Ultra, resident Metal release execution, and one preserved executable. The backbone
-and function head use the experimental 8-bit bindings in every run; causal TTS
-remains dense. `VoiceChatStartOptions::speech_precision` selects a portable
-`SpeechPrecision { weights, compute }`, defaulting to F32. The WAV example accepts
-`speech_weights` and `speech_compute` as `f32`, `f16` or `bf16`. Narrow compute
-requires matching narrow weight storage. For example, `"speech_weights":"f16",
-"speech_compute":"f32"` selects narrow matrices with F32 arithmetic;
-`"speech_compute":"f16"` also narrows projection/convolution inputs and perception
-convolution weights. Norms, residuals, retained histories/KV state, recurrent
-transcription, mixture readout/banks, RVQ scoring and codec remain F32.
-
-| Speech weights / compute | Mean warmed 80 ms frame | p95 frame | Real-time factor |
-| --- | ---: | ---: | ---: |
-| F32 / F32, first control | 136.376 ms | 143.186 ms | 1.705 |
-| F16 / F32 | 132.881 ms | 137.457 ms | 1.661 |
-| BF16 / F32 | 132.849 ms | 138.310 ms | 1.661 |
-| F16 / F16 | 129.991 ms | 135.295 ms | 1.625 |
-| BF16 / BF16 | 144.693 ms | 149.494 ms | 1.809 |
-| F32 / F32, repeated control | 135.041 ms | 139.582 ms | 1.688 |
-
-Sequential runs have no overlapping builds or tests. Timing uses completed
-live-frame publication intervals and includes preparation, execution, GPU
-completion and host/event work; statistics discard the first ten intervals and
-retain 386. F16 compute saves 5.050–6.386 ms (3.74–4.68%) against the two controls.
-Narrow matrices alone save about 2.2–3.5 ms; their F16/BF16 timings are tied here.
-BF16 compute regresses by 8.3–9.7 ms. All warmed intervals still miss the deadline.
-The best mean gap is 49.991 ms, requiring another 1.625x throughput or 38.46%
-latency reduction. These sequential controls quantify drift, not confidence
-intervals or broad workload repeatability. The separate 126.446 ms selective
-8-bit causal-TTS result above is faster than dense F16 compute; this sweep does
-not establish an improvement over that configuration or test packed TTS together
-with narrow compute.
-
-Exact converted parameter bindings save 2,402,156,544 bytes for narrow matrices
-with F32 compute, or 2,553,869,824 bytes when perception convolutions also narrow.
-Causal-TTS parameter storage decreases from 2,378,707,200 to 1,189,622,016 bytes.
-Converted binding sizes and conversion peaks enter admission before materialization;
-the independent experimental 8-bit switches retain conservative F32 admission.
-
-All four general mixed-precision runs preserve the same 1,418 semantic events,
-transcription, agent text, turns, audio timing and 698,552 output samples, excluding
-only wall timestamps. Both F32 controls reproduce the same complete WAV.
-Narrow profiles change the waveform; samples remain finite and inside [-1,1].
-The tool fixture preserves all 1,005 semantic events, the exact tool arguments
-and audio-time delivery, final answer and 460,412 output samples. F32/F32 measures
-134.126 ms mean (137.664 ms p95); F16/F16 measures 127.768 ms (131.612 ms p95), a
-6.359 ms or 4.74% improvement over 166 warmed live-audio intervals. All miss their
-deadlines. The tool waveform changes. These checks establish fixture parity, not
-perceptual equivalence, speech quality or broad function accuracy. Listening,
-external ASR, microphone/speaker hardware and echo cancellation are unmeasured.
-
-Focused native conformance uses the existing nonzero coupled fixture with F16/F32,
-F16/F16 and BF16/BF16 profiles. Explicit and scheduled publication agree on output,
-retained caches, RNG and clocks; snapshot restoration and fork continuation replay
-identically, rejected incomplete input leaves completion unsubmitted, and codec
-completion is preserved. Independent projection rounding checks cover F16 and BF16
-inputs, ordinary/observed projection and singleton row reduction with F32 outputs.
-Row-parallel observer failure/unwind and bias-once coverage passes. Cold perception
-selection checks converted byte accounting, F32 norms, convolution policy and
-two-rank shard geometry. Native multi-rank precision execution and performance are
-unvalidated. Portable facade and native Metal/audio WAV compiler checks pass.
-
-External `/private/tmp/eredu-voicechat-mixed-precision` retains `REPORT.md`, exact
-build inputs, `benchmark.patch`, configs, release build log, run/analysis scripts,
-WAVs, JSONL records, latency/memory statistics and pairwise quality comparisons.
-The executable SHA256 is
-`20951c58aae2102d500965de536b9470402d38aa92beb4725721d0414068b4ca`.
-`run.sh NAME PRECISION [FIXTURE]` selects `f32`, `f16-weights`, `bf16-weights`,
-`f16-compute` or `bf16-compute`, and `general` or `tool`. Experimental quantization
-and timing source changes are restored after building. The persistent loader
-exposes the speech precision policy without benchmark switches.
-
-The combined quantization/mixed-precision measurement on 2026-10-09 retains
-8-bit backbone, function-head and all 196 causal-TTS projections, group size 64,
-with the same 64 MiB bounded converter. Eligible perception, character-encoder and
-MoG projections plus perception convolutions use F16. Quantized TTS has separate
-F32-input/F32-companion and F16-input/F16-companion variants. TTS packing consumes
-the original F32 source recipe directly, removing the narrow-storage cast before
-quantization; both variants retain identical packed-weight byte counts. Norms,
-residuals, attention/perception caches, recurrent accumulation/transcription,
-mixture prediction/banks, RVQ scoring and codec stay F32.
-
-| Combined experiment | Mean warmed 80 ms frame | p95 frame | Real-time factor |
-| --- | ---: | ---: | ---: |
-| 8-bit control, repeated | 127.057 ms | 131.807 ms | 1.588 |
-| F16 remaining speech/perception, F32 quantized TTS | 123.930 ms | 128.739 ms | 1.549 |
-| Same combination, repeat | 123.860 ms | 128.219 ms | 1.548 |
-| F16 remaining speech/perception and quantized TTS inputs/companions | 131.309 ms | 172.522 ms | 1.641 |
-
-One preserved release executable runs all seven measurements sequentially, with
-no overlapping builds/tests. General statistics retain 386 completed live-frame
-intervals after discarding ten; the timing includes GPU completion and host/event
-work. The initial quantized control measures 147.503 ms, 20.446 ms slower than
-the repeated control despite identical events and complete waveform. Its difference
-has no precision attribution. Against the stable repeated control, the two fastest
-combination runs save 3.127–3.197 ms (2.46–2.52%). The F16-input quantized-TTS run
-has large early delays and no demonstrated additional performance win; their cause
-is unmeasured. The fastest repeat remains 43.860 ms above budget, requiring another
-1.548x throughput or 35.41% latency reduction. All warmed frames miss the deadline.
-Sequential local comparisons establish no statistical confidence interval.
-
-F16 storage outside packed causal TTS saves another 1,364,784,640 parameter bytes.
-Causal TTS, including F32 norms, occupies 669,397,248 bytes with F32 affine
-companions or 632,238,336 bytes with F16 companions. All seven runs report zero
-swaps. Experimental quantization retains conservative floating cold admission;
-these results introduce no production on-load quantization capability contract.
-
-Both combined conversation variants preserve all 1,418 semantic events and
-698,552 output samples. The fastest repeat reproduces the exact combined waveform.
-Both controls reproduce the earlier selective 8-bit TTS WAV. The tool control and
-fastest combination preserve all 1,005 semantic events, exact arguments/delivery,
-final answer and 460,412 output samples, with no unused or undelivered script
-results. The 166 warmed tool intervals measure 125.807 ms mean (129.229 ms p95)
-for the quantized control and 123.254 ms (126.993 ms p95) for the combination:
-2.553 ms or 2.03% saving. The 8-bit TTS tool control also preserves the prior
-F32-TTS tool events. All audio remains finite and inside [-1,1], but mixed precision
-changes the waveform relative to quantized controls. User listening evaluation
-accepts the fastest combined waveform. External ASR, microphone/speaker hardware
-and echo cancellation remain unmeasured.
-
-External `/private/tmp/eredu-voicechat-combined-precision` retains `REPORT.md`,
-`benchmark.patch`, exact source originals/hashes, configs, scripts, successful
-release build log, conversion/process telemetry, WAVs, JSONL events and quality/
-latency comparisons. Executable SHA256 is
-`3b6ec61acedb1e162d6061cf5913394592b3a74079d4c8b4733c02cc0d971af0`.
-All seven experimental source inputs are restored byte-for-byte and hash-verified.
-`run.sh NAME SPEECH_PRECISION FIXTURE TTS_COMPUTE` uses `f32` or `f16-compute`,
-`general` or `tool`, and `f32` or `f16` respectively. `sweep.py` selects the faster
-combination for the tool fixture; `repeat-best.py` repeats that configuration.
-`REPORT.md` records commands, pinned revisions, timing policy and limitations.
-
-The accepted combined configuration also has released-checkpoint packed-projection
-replay and complete-conversation comparisons on the M3 Ultra. Native kernel traces
-show that two-row causal TTS already uses MLX's weight-reusing affine vector path.
-Forcing that selection preserves projection outputs and establishes no additional
-speedup. Pre-padded layouts make several large single-row projections 33–51%
-faster in isolated warmed replay. A guarded partial-tile kernel uses the original
-matrices and preserves close numerical agreement, but retains little of that
-isolated benefit. Representative replay is not direct full-frame GPU attribution;
-its padded matmul timing excludes activation padding and parameter retention.
-
-| Packed-projection comparison | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Ordinary control before | 125.318 ms | 130.716 ms |
-| Guarded partial-tile kernel | 125.337 ms | 130.494 ms |
-| Padded matrices and activations | 125.276 ms | 129.747 ms |
-| Ordinary control after | 124.088 ms | 128.546 ms |
-
-Each sequential run has 386 warmed intervals after discarding ten. The candidates
-and final control use one preserved binary; the initial control uses the preceding
-benchmark binary. The candidates establish no useful end-to-end improvement:
-their differences from the initial control are smaller than the control spread,
-and both are slower than the same-binary final control. Every warmed interval
-misses its deadline. All 1,418 semantic events and complete WAV bytes match the
-accepted combined audio, and all runs report zero swaps. Neither candidate is a
-production execution mechanism. External
-`/private/tmp/eredu-voicechat-packed-projections` retains `REPORT.md`, exact source
-snapshots/restoration hashes, generic native instrumentation and kernel patches,
-commands, binaries, kernel traces, raw replay/phase/frame timings, WAVs and quality
-comparisons. The final ordinary critical-path spans are 24.600 ms input,
-43.920 ms backbone/heads/decisions, 21.461 ms conditioning/causal TTS, and
-25.388 ms speech refinement/render submission. These host spans include queued
-work through existing synchronization points and are not isolated GPU timings.
-
-Complete execution profiling of the accepted combined precision configuration on
-M3 Ultra uses the same general conversation, 396 live frames and 386 warmed
-intervals. The final same-binary control with profiling disabled averages
-124.145 ms per 80 ms frame (p95 130.019 ms, p99 131.659 ms); all warmed intervals
-miss the deadline. Throughput is 0.644 times realtime. The mean gap is 44.145 ms,
-requiring a 35.56% wall-time reduction to reach the deadline. Startup/on-load
-conversion takes 102.484 seconds and is excluded from frame latency; the control
-reports zero swaps.
-
-Portable host timing without added GPU fences gives 25.294 ms for
-input/perception/RNNT, 43.924 ms for backbone/heads/decisions, 21.689 ms for
-character conditioning/causal TTS and 25.450 ms for refinement/codec submission.
-Execution assembly adds 0.024 ms; candidate/preflight/submission around execution
-adds 2.118 ms, completion/observation/commit adds 6.373 ms and publication/other
-work adds 0.112 ms, totaling 124.984 ms. These spans include queued work through
-existing synchronization points; the time outside execution is not a copy-only
-budget.
-
-A finalized Metal System Trace and CPU sampling window covers 213 complete late
-frames. The process-attributed GPU interval union is 87.410 ms/frame, 67.5% of
-traced wall time, with 248.643 distinct command buffers/frame. Inclusive native
-progress stacks account for 23.498 sampled ms/frame and overlap recovery and GPU
-work. Relative-position construction accounts for 9.559 sampled ms/frame,
-confirmed by direct clocks at 9.512 ms/frame across 24 perception layers.
-
-Separate intrusive timing at actual native submissions includes asynchronously
-submitted speech work. Its GPU regional duration sum is 90.081 ms/frame:
-41.747 ms backbone/heads, 11.280 ms perception/RNNT, 0.062 ms character,
-23.037 ms causal TTS, 7.475 ms MoG prediction/latent work, 0.566 ms random draws,
-0.994 ms RVQ and 4.920 ms codec/render. The main 28-layer causal transformer
-accounts for 22.503 ms. Existing native kernel-selection evidence shows a median
-2,478 kernel requests/frame in the warmed speech regions; counts do not establish
-individual kernel durations. Fine-fenced diagnostics expose 32.805 ms in Mamba
-input projections and dense MLP blocks (including normalization, activation and
-residual work), 1.155 ms in fused recurrence, 1.014 ms in perception position
-projections and 1.755 ms in perception K/V projections.
-
-GPU regional sums, traced unions, CPU samples and host spans use different
-profiling modes and are not additive savings estimates. Host logging averages
-124.984 ms, Instruments 128.470 ms, native-submission timing 141.314 ms and fine
-fences 223.938 ms; intrusive timings do not represent ordinary wall performance.
-All runs preserve all 1,418 semantic events after excluding wall clocks and the
-complete accepted WAV bytes. All 23 temporarily instrumented source files match
-their original hashes. External `/private/tmp/eredu-voicechat-full-profile`
-retains `REPORT.md`, plots, finalized `complete.trace`, exact source snapshots,
-restoration hashes, binaries, reproduction scripts, raw timings and quality
-comparisons. The profile covers offline serial PCM execution; live mic/speaker,
-echo cancellation, external tool-service latency and individual shader durations
-are outside its evidence.
-
-Perception caches the single-frame relative-position table and its projection in
-each parameter owner. The position equation and attention arithmetic are
-unchanged. Larger chunks bypass this fixed-size cache; parameter mutation and
-precision changes invalidate projected values, context/dtype changes rebuild
-constants and cloned owners start cold. These immutable values are separate from
-causal state and snapshots. Cold admission reserves 27,721,728 additional bytes
-for the released 24-layer geometry, separately from parameter pools.
-
-Same-binary complete-conversation comparisons with accepted combined precision
-use sequential uncached/cached/uncached runs and 386 warmed frames each:
-
-| Position cache comparison | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Uncached control before | 144.606 ms | 149.084 ms |
-| Cached positions and projections | 113.440 ms | 118.624 ms |
-| Uncached control after | 124.003 ms | 128.622 ms |
-
-Caching saves 10.564 ms/frame (8.52%) against the faster control;
-the first control is anomalously slow and is excluded from the savings claim.
-The final control agrees with the preceding profiling-disabled 124.145 ms control
-and a fresh preserved-binary calibration (123.865 ms, p95 128.865 ms). Throughput
-is 0.705 times realtime and the remaining mean gap is 33.440 ms. All warmed intervals miss the deadline.
-All 1,418 semantic events and complete accepted WAV bytes match. Thirteen existing
-neutral perception tests cover pinned outputs, retries, snapshots, bounded units
-and TP/PP; the focused nonzero position regression checks projection reuse and
-rebinding against a fresh owner. The native Metal/audio release build passes.
-External `/private/tmp/eredu-voicechat-position-cache` retains `REPORT.md`, exact
-implementation/benchmark patches, hashes, commands, binary, timings, events, WAVs
-and quality comparisons. The benchmark-only bypass and on-load quantization edits
-are restored to their implementation hashes; no bypass flag is retained in source.
-
-Resident serial-group execution uses the caller's executor and defers group
-submissions to the surrounding forward completion. Eligibility is portable:
-every group must lie on one dependency chain, and the parameter policy must
-explicitly guarantee retained unit storage. Branched graphs, bounded policies
-and parallel execution retain exact group submission boundaries. Unit and group
-hooks, policy completion/abort, candidate state and final publication still use
-the shared drivers; no runtime feature flag controls this mechanism.
-
-With the accepted combined precision and cached perception positions, complete
-serial PCM conversation measurements on the same M3 Ultra use 386 warmed frames:
-
-| Resident chain comparison | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Preserved control before | 113.287 ms | 118.458 ms |
-| Deferred resident chain | 98.345 ms | 102.575 ms |
-| Preserved control after | 113.219 ms | 118.545 ms |
-
-Against the faster control, batching saves 14.874 ms/frame (13.14%). Throughput
-is 0.813 times realtime, real-time factor is 1.229, and the remaining mean gap
-is 18.345 ms; another 18.65% reduction is needed to reach 80 ms without scheduling
-headroom. All 386 warmed intervals still miss the deadline. All 1,418 semantic
-events and the complete accepted WAV bytes match, with SHA-256
-`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
-The neutral resident-chain regression checks repeated values, state and group
-order against ordinary execution, eliminates intermediate submissions, and
-preserves branched scheduling. Pinned MoG resident/bounded numerical parity and
-selected-bank failure/RNG retry coverage pass. Six native VoiceChat lifecycle
-tests cover preparation and frame failure/unwind, retained owners, host delivery,
-virtual continuation and publication. The explicit Metal mixed-precision test
-confirms controlled and scheduled cached publication parity. The Metal/audio
-release build passes. External `/private/tmp/eredu-completion-optimisation` retains the report,
-reproduction scripts, binary hashes, exact benchmark and implementation patches,
-logs, complete events and WAVs. All seven temporary on-load quantization source
-edits match their implementation hashes after the build. This measures offline
-serial inference; live audio scheduling and echo cancellation are not measured.
-
-Generic Metal F32 RMS and `InputProducts` rotary fusion preserves the accepted
-conversation under the same combined precision and resident serial execution.
-RMS keeps its ordered reduction and separate F32 square, then applies
-normalization and gain across the threadgroup. Rotary retains precise
-trigonometric functions, separate product rounding and runtime sequence extents.
-These native operators consume existing neutral specifications; family equations,
-cache state, RNG and completion ownership retain their existing contracts.
-
-Complete-conversation measurements on the same M3 Ultra use 386 warmed frames:
-
-| Generic speech operator comparison | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Preserved committed control before | 98.286 ms | 102.432 ms |
-| Fused RMS and rotary | 88.264 ms | 92.618 ms |
-| Preserved committed control after | 98.315 ms | 102.448 ms |
-
-Against the faster bracketing control, fusion saves 10.021 ms/frame (10.20%).
-Throughput is 0.906 times realtime, real-time factor is 1.103, and the mean
-remaining gap is 8.264 ms; another 9.36% reduction reaches 80 ms without scheduling
-headroom. The p99 is 95.127 ms and maximum 95.582 ms. All 386 warmed intervals
-still miss the deadline. All 1,418 semantic events and the complete accepted
-698,552-sample WAV bytes match, with SHA-256
-`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
-This combined end-to-end measurement does not attribute isolated operator or
-shader durations. Microphone/speaker scheduling and echo cancellation are not
-measured.
-
-Four focused Metal tests pass: independently computed grouped RMS values across
-strided rows and widths 17/72/1152 with reduction tails; learned-offset RMS
-input-precision and F32 scale boundaries; strided rotary pairs, partial tails and
-F32 position rounding beyond `2^24`; and controlled/scheduled mixed-precision
-cached publication. Reproducible native validation uses:
-
-```sh
-cargo test --offline --release -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --lib -- fused_grouped_rms fused_input_products_rotary \
-  mlx_learned_offset_rms_preserves_precision_and_float32_scale_arithmetic \
-  coupled_mixed_precision_matches_controlled_and_scheduled_cached_publication \
-  --include-ignored --nocapture
-cargo check --offline -p eredu-backend-mlx --no-default-features
-```
-
-The Metal/audio release build and non-Metal fallback compiler check pass.
-External `/private/tmp/eredu-speech-fusion` retains reproduction scripts, the
-report, exact benchmark and implementation patches, binaries and hashes, complete
-logs, events and WAVs. All seven temporary on-load quantization source edits
-match their implementation hashes after the build.
-
-Full-conversation backbone projection comparisons retain native affine 8-bit
-weights. The historical intrusive profile identifies 16.096 ms GPU/frame in 27
-Mamba input projections and 16.709 ms in 25 dense MLP blocks, including their
-normalization, activation and residual work. The 32.805 ms union identifies a
-candidate subset; it is not a promised saving or a current shader-duration
-measurement.
-
-The same pinned checkpoint, corpus and accepted combined precision execute 396
-live frames, with 386 warmed intervals after discarding the first ten. Each run
-executes the complete conversation across successive model weights and cached
-states. Loading and prefill are excluded; hot single-projection replay is not
-used to select an implementation. Six generic packed-matvec layouts compare
-indexed and pointer-based traversal, each with 8/16/32 output rows per 64-thread
-group. Ordered F32 affine arithmetic is retained, and aligned native fast paths
-remain selected. Three precision configurations replace selected Q8 source
-weights with F16 weights using F32 projection arithmetic; normalization and
-recurrent accumulation remain F32.
-
-| Backbone comparison | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Native steady controls, range | 88.278–88.478 ms | 92.349–93.016 ms |
-| Indexed rows 8 / 16 / 32 | 108.680 / 89.453 / 90.315 ms | 113.623 / 93.586 / 94.540 ms |
-| Indexed rows 8 repeat | 108.694 ms | 113.767 ms |
-| Pointer rows 8 / 16 / 32 | 88.687 / 88.998 / 89.757 ms | 92.931 / 93.297 / 94.074 ms |
-| F16 Mamba input weights | 91.900 ms | 96.105 ms |
-| F16 dense MLP up/down weights | 93.082 ms | 97.117 ms |
-| Both F16 selections | 96.436 ms | 100.368 ms |
-
-None improves complete-conversation latency. An initial same-binary dense
-control measures 108.284 ms, whereas its repeated unchanged configuration
-measures 88.369 ms. The cause is unmeasured; that initial control is not used to
-claim an optimization gain. Native throughput remains approximately 0.904–0.906
-times realtime, with an 8.278–8.478 ms mean gap and another 9.38–9.58% reduction
-required to reach 80 ms without scheduling headroom. All 386 warmed intervals
-miss the deadline in every configuration. No live audio scheduling measurement
-or isolated kernel attribution is implied.
-
-All six packed layouts, the repeated indexed layout, and the input-only and
-MLP-only F16 selections preserve all 1,418 semantic events and the complete
-accepted WAV bytes. The combined F16 selection changes the answer to
-“the sky appears blue due to a phenomenon called Rayleigh scattering,” producing
-1,421 events and different audio. First lexical divergence is at invocation 162,
-12,880 ms audio. Its longer wording changes the workload, so the combined timing
-does not isolate precision overhead. Retained backbone binding requests are
-10,005,583,872 bytes for Q8, 12,403,494,912 for F16 inputs, 13,078,863,872 for F16
-MLPs, and 15,476,774,912 for both. These are parameter binding bytes, not measured
-GPU traffic or total process memory.
-
-Both generic kernel implementations pass focused Metal numerical comparisons
-against native bit patterns and independent dequantized expectations, including
-strided activations, nonzero affine companions and partial reduction tails.
-External `/private/tmp/eredu-backbone-projections` retains `REPORT.md`,
-`comparison.json`, pinned binary hashes, exact source/benchmark patches,
-reproduction scripts, build/test logs, full event streams and WAVs. Restoration
-manifests confirm all temporary source edits are restored. The production tree
-contains neither these candidate kernels nor their experiment flags; native
-8-bit selection and existing architecture/backend ownership remain unchanged.
-
-Generic Metal grouped F32 RMS distributes its sixteen independent cascade
-accumulator chains across a 32-thread SIMD group. Each chain retains the CPU
-cascade's local addition/carry order; ordered SIMD exchanges retain its component
-merge and tail order. The separate F32 square, precise reciprocal square root,
-normalization product and learned-gain product retain their rounding boundaries.
-Group and offset semantics remain neutral specifications. This mechanism changes
-neither model equations nor RNG, cache, rollback or completion ownership, and
-requires no feature flag. Weightless RMS and ordinary row sums retain their
-scalar-per-row mechanism.
-
-The same pinned checkpoint, corpus and accepted on-load Q8/mixed-precision
-configuration provide complete-conversation validation on the M3 Ultra. Each run
-contains 396 live frames and 386 warmed intervals after discarding the first ten.
-Loading and prefill are excluded. All 1,418 semantic events and the complete
-698,552-sample WAV match the accepted bytes, with SHA-256
-`369f1334dea5e5d06fc450c03c06eb446a8eb673b60cc1e173e35b2641c1d282`.
-
-| Grouped RMS comparison | Mean 80 ms frame | p95 frame | p99 frame | Maximum |
-| --- | ---: | ---: | ---: | ---: |
-| Preserved control before | 88.316 ms | 92.285 ms | 94.727 ms | 95.370 ms |
-| Grouped RMS only | 69.667 ms | 74.130 ms | 76.143 ms | 76.996 ms |
-| Preserved final control | 88.217 ms | 92.505 ms | 94.506 ms | 95.464 ms |
-| Grouped RMS only, repeat | 69.588 ms | 73.998 ms | 76.098 ms | 77.428 ms |
-
-Against the fastest control and slower retained run, the reduction is
-18.549 ms/frame (21.03%). Throughput is 1.148 times realtime, with real-time factor
-0.871. Mean headroom is 10.333 ms (12.92% of the 80 ms budget). All 772 warmed
-intervals across both retained runs meet the deadline. The slowest observed frame
-leaves 2.572 ms of headroom. These figures do not establish performance at longer
-conversation histories.
-
-Exact GPU/CPU bit comparisons cover signed, varying-magnitude row sums at widths
-1/7/17/255/257/4095/4097/65537, including partial vectors/chains and carries into
-all three upper cascade levels. Independently computed grouped RMS comparisons
-cover strided rows, learned offset and widths 17/72/1152. The retained
-grouped-only mechanism passes the carry/tail and strided-group regressions. Reproducible focused native validation uses:
-
-```sh
-cargo test --offline --release -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --lib -- \
-  parallel_cascade_matches_cpu_addition_order_at_carries_and_tails \
-  fused_grouped_rms_handles_strided_rows_groups_and_reduction_tails --nocapture
-```
-
-A dependent 112-operation chain at width 1152 measures 4.73–4.74 ms GPU time for
-the parallel variants versus 10.27 ms for the scalar cascade. The narrow
-16-row/72-column chain is essentially unchanged. Extending the per-row
-threadgroup strategy to weightless RMS and row sums measures 89.03–89.13 ms/frame
-for the complete conversation, despite the isolated chain improvement. Those
-extensions are absent from the production tree. These measurements do not
-attribute isolated shader durations or distinguish the two extension costs.
-
-External `/private/tmp/eredu-rms-parallel` retains the report, comparison data,
-exact implementation/benchmark patches, reproduction scripts, binary/source
-hashes, numerical logs, full event streams and WAVs. Restoration manifests
-confirm all temporary on-load quantization and profiling source edits are restored.
-This measures offline serial inference; live microphone/speaker scheduling and
-echo cancellation are not measured.
-
-The pinned native MLX command encoder exposes process-level batching through
-`MLX_MAX_OPS_PER_BUFFER` and `MLX_MAX_MB_PER_BUFFER`, read during device
-initialization. The Ultra defaults are 50 encoded operations and 50 MiB of
-unique input buffers. Either threshold can trigger a commit after a primitive;
-these are batching triggers rather than strict command-buffer size limits.
-Per-primitive completion handlers and input retention remain intact.
-
-A full-conversation sweep with the same grouped-RMS binary, accepted precision
-recipe and pinned fixture varies resource thresholds across 128/256/512/1024 MiB
-at 50 operations, and operation thresholds across 10/25/50/100/200/500 at
-512 MiB, with additional 25-operation/256 MiB runs. All 1,418 semantic events
-and accepted WAV bytes remain exact in all fifteen unprofiled sweep runs.
-
-| Native batching selection | Mean 80 ms frame | p95 frame |
-| --- | ---: | ---: |
-| Four default controls | 69.606 / 69.693 / 69.670 / 69.588 ms | 73.944 / 74.048 / 74.136 / 73.807 ms |
-| 50 operations / 512 MiB | 69.364 ms | 73.662 ms |
-| 25 operations / 256 MiB, two runs | 68.885 / 69.078 ms | 73.544 / 74.091 ms |
-| 10 operations / 512 MiB | 70.305 ms | 74.350 ms |
-| 500 operations / 512 MiB | 70.995 ms | 75.289 ms |
-
-The confirmed 25-operation/256 MiB selection averages 68.982 ms, versus
-69.640 ms across four controls: 0.658 ms (0.94%) less mean wall time.
-Mean headroom is 11.018 ms (13.77% of the frame budget), or 1.160 times realtime.
-All 772 selected warmed intervals meet the deadline; the maximum is 76.889 ms.
-The p95 ranges overlap, so these runs do not establish a tail-latency gain.
-The selection is an explicit workload-specific launch override; native global
-defaults remain unchanged. No new portable API, model-specific backend policy
-or feature flag is required:
-
-```sh
-MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 <voicechat-command>
-```
-
-Bounded warmed Metal traces observe 142.737 command buffers/frame at default
-and 230.023 at the selected setting. Counts range over 142–145 and 230–231
-within 57 and 43 complete observed frames respectively. Agent-active counts
-are 143.286 and 230.024, so the different conversation windows do not explain
-the increase. The faster unprofiled setting increases command-buffer count;
-its gain is consistent with timely GPU supply, rather than fewer submissions.
-The traces do not isolate the cause. Profiling strongly perturbs the selected
-run, so trace wall times are excluded from performance comparisons.
-
-The existing Metal controlled/scheduled cached-publication test passes at
-500 operations / 512 MiB. No completion, rollback or resource-retention code
-changes. External `/private/tmp/eredu-mlx-batching` retains `REPORT.md`,
-`comparison.json`, reproduction scripts, binary and artifact hashes, full event
-streams/WAVs, native traces and per-frame command-buffer counts. These timings
-exclude loading and prefill, use 386 warmed intervals per run, and do not
-establish live I/O scheduling or longer-history performance.
-
-Explicit attention retains the physical K/V head axis. Native batched products
-broadcast a singleton RHS axis over contiguous query-head groups, avoiding
-expanded K/V storage. Equal-head products consume native batch strides directly
-without forced contiguous preparation. BF16 prepared products retain physical
-RHS banks and map query groups onto those banks with the existing reduction
-order. Blockwise attention uses the same grouped product. Native memory facts
-price physical heads and blockwise F32 conversion; portable conservative scratch
-allowances remain unchanged. InputScores scale, mask, softmax and probability
-rounding boundaries, cache snapshots, rollback and completion ownership remain
-unchanged. No feature flag or new public API is required.
-
-The released speech transformers have sixteen query heads and sixteen K/V heads.
-They receive no head-replication saving. Contiguous preparation can already alias
-contiguous inputs, so removing it does not establish a particular byte-traffic
-reduction. Complete-conversation measurements use the same pinned corpus,
-accepted precision recipe and 386 warmed intervals per run:
-
-| Shared K/V layout selection | Mean 80 ms frame | p95 frame | Maximum |
-| --- | ---: | ---: | ---: |
-| Fresh preserved control, default batching | 69.711 ms | 74.374 ms | 79.894 ms |
-| Shared layouts, initial default run | 69.409 ms | 73.568 ms | 77.516 ms |
-| Retained implementation, default batching | 69.271 ms | 73.809 ms | 76.585 ms |
-| Retained implementation, 25 operations / 256 MiB | 68.873 ms | 73.083 ms | 78.648 ms |
-
-The final default comparison saves 0.441 ms/frame (0.63%). The combined batching
-selection leaves 11.127 ms mean headroom (13.91% of the budget), or 1.162 times
-realtime. All warmed intervals in these four runs meet their deadline; all
-1,418 semantic events and accepted WAV bytes remain exact. These measurements
-show a modest gain for this equal-head checkpoint; the single combined run does
-not establish an additional gain over the prior batching selection.
-
-Independent scalar fixtures cover nonzero grouped attention with two batches,
-six query heads, two K/V heads, strided sequence origins and unequal key/value
-widths on CPU and Metal. Published BF16 attention and contiguous/paged
-InputScores references pass, as does controlled/scheduled cached publication.
-A BF16 allocator fixture with eight query heads, two K/V heads, 128 queries,
-1,024 keys, key width 64 and value width 256 measures 22,159,424 bytes peak for
-shared preparation versus 37,883,968 for separately prepared query tiles:
-41.51% less with exact output. This measures grouped-attention preparation,
-rather than whole-model memory use.
-
-External `/private/tmp/eredu-speech-attention` retains `REPORT.md`, comparison
-data, source/binary hashes, restoration manifests, reproduction commands,
-native test logs and complete event streams/WAVs. Score-fusion experiments
-preserve complete output but provide no end-to-end benefit; their code and
-plumbing are absent from production. Timings exclude loading and prefill and
-do not establish microphone/speaker scheduling or longer-history performance.
-
-The native tests cover ordered F32 rounding, strided code views, signed gather
-indices, PAD, synchronous and completion-owned invalid-index rejection, and
-batched/per-depth norm parity at `[31, 1024, 512]` geometry. Neutral tests cover
-cache flags, provider identity changes, eviction, failed work, long-row bypass,
-cache admission, parameter rebinding, bounded and tensor-parallel RVQ execution,
-first-tie behavior, retries and retained RNG. The independent spoken-text fixture
-also passes. These fourteen focused tests supplement the complete local WAV
-comparison; they do not certify native distributed performance.
-
-Selective recurrence fixtures compare cold zero-state and multiple cached updates
-against the independent scalar recurrence within `2e-5 * (1 + abs(expected))`.
-Fused GPU carry and output match ordinary GPU prefill exactly across two batch
-lanes, three heads, state widths 1/7/128 and strided vectors. Predecessor carry
-remains unchanged. Grouped decision fixtures preserve ID order, scalar shape
-errors and domain rejection. Ten focused tests additionally cover channel policy,
-owner/follower rollback and replay, controlled/ordinary coupled parity, native
-failure/unwind retention and prefill chunk boundaries. Native Metal/audio and
-no-default-feature compiler checks pass.
-
-
-The shared Metal scalar activation regression checks sigmoid and SiLU across
-scalar, singleton and vector inputs without changing the exponential arithmetic:
+The retained fixture records output checks in `run-summary.json` and
+`run-2.log`. It establishes released-checkpoint execution through the public
+session, not independent complete-model reference parity or perceptual quality.
+
+### Speech precision and cache contracts
+
+`VoiceChatStartOptions::speech_precision` selects the portable
+`SpeechPrecision { weights, compute }` policy, defaulting to F32. The WAV example
+accepts `speech_weights` and `speech_compute` as `f32`, `f16` or `bf16`. Narrow
+compute requires matching narrow weight storage. `"speech_weights":"f16",
+"speech_compute":"f32"` selects eligible narrow weights with F32 arithmetic;
+`"speech_compute":"f16"` also narrows projection/convolution execution and
+perception convolution weights. Normalization, residuals, retained perception
+histories/TTS K/V state, recurrent transcription, mixture readout/banks, RVQ scoring
+and codec execution remain F32. Selected precision participates in state identity
+and ordinary controlled/scheduled execution. Bindings account for selected storage
+and conversion workspace before materialization.
+
+The nonzero native coupled fixture covers F16/F32, F16/F16 and BF16/BF16 policies.
+Explicit and scheduled publication agree on outputs, caches, RNG and clocks;
+snapshot restoration and fork continuation replay identically. Rejected incomplete
+input leaves completion unsubmitted, and codec completion remains part of the
+same transaction. Cold precision fixtures check converted byte accounting,
+normalization/convolution policy and tensor-parallel shard geometry. Native
+multi-rank mixed-precision performance is outside this validation scope.
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features \
-  --features audio,metal --lib native_pointwise_scalar_and_singleton_preserve_shape_and_rounding
+  --features audio,metal --lib \
+  coupled_mixed_precision_matches_controlled_and_scheduled_cached_publication
 ```
 
-Separate original NVIDIA backbone execution on the same released weights produces
-finite hidden states and both heads for prefill and three full-history extensions.
-External `REFERENCE.md`, `reference-backbone-recompute.json` and
-`reference-backbone-recompute.npz` retain commands, source hashes and tensors.
-It uses PyTorch 2.11.0, Transformers 4.56.0, the upstream Mamba CPU RMSNorm
-reference and removal of the unconditional CUDA stream context. It does not alter
-the backbone equations. The original cached CPU path fails on a missing
-`conv_kernel_size` attribute; full-history recomputation supplies the reference.
-These tensors have no numerical comparison with Eredu and establish no
-tolerance or parity result. Complete NVIDIA speech comparison,
-released-weight snapshots and distributed/residency comparisons remain unvalidated.
-
-### Allocator and prepared-checkpoint memory
-
 VoiceChat component and speech-provider realization use the ordinary allocator
-policy: 1/32 of currently available memory, capped at 8 GiB, with the shared
-256 MiB fallback. Explicit and preserved-native choices remain authoritative.
+policy: 1/32 of available memory at initialization, capped at 8 GiB, with the shared
+256 MiB fallback. Explicit and preserved-native choices are authoritative.
 Completed binding and fixed prompt/silence preparation trim unused buffers;
 inference retains reusable buffers. Final executable retirement trims after
 nested owners finish ordinary-host destruction, preserving unresolved completion
 roots. The generic bounded quantizer persists encoded tiles through the neutral
-prepared-checkpoint cache and existing bounded SafeTensors leases, eliminating
-complete packed host payload vectors. The default prepared-file budget is 32 GiB;
-active source leases prevent eviction. `doc/backend-architecture.md` describes
-location, identity, integrity, publication and budget contracts.
+prepared-checkpoint cache and bounded SafeTensors leases. Its default prepared-file
+budget is 32 GiB; active source leases prevent eviction. Location, identity,
+integrity, publication and budget contracts are described in
+[backend architecture](backend-architecture.md).
 
-The M3 Ultra comparison uses the pinned checkpoint and accepted experimental
-8-bit/group-64 backbone/function/causal-TTS recipe, F16 remaining speech/perception
-weights with F32 arithmetic, F32 quantized TTS inputs/companions, and 25-operation /
-256 MiB batching. Each run contains 996 live frames (79.68 s audio); 986 warmed
-intervals exclude loading, prefill, drain and the first ten live frames. Native
-memory probes and 250 ms macOS footprint sampling run without vmmap pauses or
-concurrent native compilation.
-
-| Long-conversation source/cache realization | Peak process footprint | Load | Warm mean frame | p95 | Frames above 80 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Memory-backed packed sources, explicit 8 GiB allocator control | 36.205 GiB | 98.379 s | 74.207 ms | 84.590 ms | 118 |
-| Persisted packed sources, cold conversion, adaptive allocator | 22.773 GiB | 125.155 s | 74.097 ms | 84.806 ms | 117 |
-| Persisted packed sources, reused cache, adaptive allocator | 22.501 GiB | 24.914 s | 74.092 ms | 84.766 ms | 117 |
-
-The matched cold run reduces peak footprint by 13.432 GiB (37.10%). Three packed
-sources contain 11,326,242,816 payload bytes (10.548 GiB), without permanent host
-vectors. Fresh preparation includes source-content fingerprinting, file writes
-and checksum work; reuse performs no native quantization tiles. Automatically
-selected allocator limits are about 7.24 GiB with `ManagedDefault` provenance.
-Unused native cache is zero after completed startup preparation. After session
-drop and ordinary retirement, live and cached MLX counters are both exactly zero.
-File-backed pages remain subject to operating-system caching, separate from those
-counters. Legitimate history growth and the remaining late-frame deadline misses
-remain; mean throughput does not certify hard realtime or microphone/speaker
-pacing.
-
-Both persisted-source runs reproduce all 3,818 semantic events and full accepted
-WAV bytes exactly. The WAV SHA-256 is
-`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
-External `/private/tmp/eredu-memory-cache` retains `REPORT.md`, `comparison.json`,
-reproduction/build scripts, source/binary hashes, restoration manifests, full
-WAV/JSONL output, sampled memory and per-frame latency. Native bounded-quantization,
-retirement/completion and controlled/scheduled publication checks pass; neutral
-cache coverage includes selected-content identity, bounded reload reads, lease
-capacity, eviction, reduced-budget hits, unrelated-file protection, corruption
-repair and incomplete-write cleanup. The portable facade check passes.
-
-### Cooperative ordered FP32 softmax
-
-The generic Metal last-axis FP32 softmax uses one SIMD group per row, parallel
-maximum selection and normalization, and four ordered exponential sum chains.
-It retains the pinned exponential and `(s0+s2)+(s1+s3)` merge. Runtime width and
-row-count inputs permit growing attention histories to reuse the shader. These
-mechanisms preserve InputScores scaling/masking and existing resource retention;
-no family equations or selection policy enter the backend.
-
-The 2026-10-10 M3 Ultra comparison uses the same pinned checkpoint, accepted
-experimental Q8/group-64 and mixed-precision recipe, adaptive allocator,
-prepared-checkpoint reuse and 25-operation / 256 MiB batching described above.
-Four sequential fresh-process conversations execute 996 live frames (79.68 s),
-with 986 measured intervals excluding the first ten, loading, prefill and drain.
-Profiling collectors are disabled and no build or other GPU workload overlaps.
-
-| Softmax realization | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Serial, first process | 86.212 ms | 104.673 ms | 112.370 ms | 121.922 ms | 600 / 986 |
-| Cooperative, first process | 68.579 ms | 71.850 ms | 72.102 ms | 72.375 ms | 0 / 986 |
-| Cooperative, repeat | 68.581 ms | 71.860 ms | 72.146 ms | 72.666 ms | 0 / 986 |
-| Serial, warmed final control | 74.217 ms | 84.812 ms | 92.358 ms | 93.837 ms | 121 / 986 |
-
-Against the warmed final control, the cooperative repeat saves 5.635 ms/frame
-(7.59% latency), with 11.419 ms mean headroom (14.27% of the 80 ms budget) and
-1.1665 times realtime throughput. The final 200 frames average 71.573 ms instead
-of 81.065 ms, saving 9.492 ms. The repeat's p95 margin is 8.140 ms and its smallest
-measured margin is 7.334 ms. Both cooperative processes avoid the first serial
-process's late-history cliff. These observations do not attribute every cold
-serial delay to shader compilation, establish an unbounded-history guarantee, or
-measure microphone/speaker pacing or echo cancellation.
-
-All four runs match all 3,818 semantic events (excluding wall clocks) and full
-accepted WAV bytes exactly, SHA-256
-`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
-Peak process footprints are 22.425 GiB for both cooperative runs and
-22.416–22.435 GiB for serial controls; this comparison shows no meaningful
-footprint increase. Prepared-cache load times are 24.93–25.04 s.
-
-Native compatibility coverage compares frozen serial arithmetic across widths
-4–4,097, SIMD tails, strided inputs, signed zeros, NaNs, infinities and masked
-rows. The independent PyTorch InputScores fixture passes for contiguous and
-bounded paged attention. Controlled/scheduled mixed-precision VoiceChat cached
-publication parity also passes. Reproduction scripts, complete outputs, source
-patches, binary hashes and restoration manifests reside in
-`/private/tmp/eredu-parallel-softmax`, including `REPORT.md` and `comparison.json`.
-
-### Additional MoG and perception Q8 selections
-
-The 2026-10-10 M3 Ultra experiment uses the same pinned checkpoint, accepted
-Q8/mixed-precision recipe, prepared cache and batching policy as the cooperative
-softmax comparison. Separate selections pack nine MoG trunk gate/up/down
-matrices and 96 perception feed-forward matrices as affine Q8/group-64 with F32
-companions. The accepted config selects F16 speech weights and compute; the
-causal-TTS benchmark override selects F32 compute separately. MoG/perception
-retain F16 projection input preparation and F32 component boundaries,
-normalization, recurrent/residual accumulation, state and sensitive math. F32
-companions promote packed matmul execution back to F32, so this comparison
-changes effective projection execution/output precision as well as storage.
-
-Six sequential unprofiled conversations execute 996 live frames each, with
-986 measured intervals excluding the first ten, loading, prefill and drain.
-Both prepared-cache repeats report zero quantization source tiles/read bytes.
-
-| Selection | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Control before | 68.623 ms | 71.898 ms | 72.205 ms | 73.888 ms | 0 / 986 |
-| Control after | 68.626 ms | 71.841 ms | 72.132 ms | 72.337 ms | 0 / 986 |
-| MoG Q8, first | 82.673 ms | 86.120 ms | 86.405 ms | 87.313 ms | 887 / 986 |
-| MoG Q8, cache repeat | 82.444 ms | 86.058 ms | 86.516 ms | 86.785 ms | 857 / 986 |
-| Perception Q8, first | 100.858 ms | 104.168 ms | 104.678 ms | 107.443 ms | 986 / 986 |
-| Perception Q8, cache repeat | 101.067 ms | 104.299 ms | 104.633 ms | 105.290 ms | 986 / 986 |
-
-Against the two-control mean, repeated MoG Q8 adds 13.819 ms/frame and perception
-Q8 adds 32.443 ms. Fenced GPU profiles localize the regressions: MoG prediction
-increases from 4.377 to 16.959 ms/frame and perception from 10.433 to 36.537 ms;
-unchanged regions remain essentially flat. These frontier intervals include
-stalls and profiling fences, so they are not individual shader durations or
-additive wall savings. Neither selection is retained or combined.
-
-Short fenced kernel-selection diagnostics confirm nine F32 affine wide-QMV
-requests per MoG call and 96 F32 affine fast-QMV requests per perception call;
-the corresponding accepted projections use F16 dense GEMM. Diagnostics stop
-after 30 application advances and do not contribute to the complete-conversation
-timing or quality tables. Kernel names establish dispatch, not individual shader
-durations or a decomposition of dequantization, occupancy and memory costs.
-
-Selected weight storage falls 43.75% including F32 companions, saving
-41,803,776 bytes for MoG and 352,321,536 for perception. Whole-process peak
-footprints are 22.412–22.415 GiB for controls, 22.392–22.393 GiB for MoG and
-22.034–22.038 GiB for perception. All runs match 3,818 semantic events after
-excluding wall clocks. Controls and perception match accepted WAV bytes exactly;
-MoG changes the waveform reproducibly, with finite, in-range samples. These
-comparisons do not establish broad perceptual or transcription quality.
-
-Portable architecture declarations select recipes and exact parameter formats;
-generic backend materialization uses the existing bounded quantizer and prepared
-cache. All temporary benchmark source changes are restored byte-for-byte. No
-production framework or feature flag is retained. Full outputs, profiles,
-quality comparisons, source patches, hashes, restoration manifests and
-reproduction scripts reside in `/private/tmp/eredu-remaining-q8`, including
-`REPORT.md` and `comparison.json`.
-
-### Narrow execution of existing Q8 backbone projections
-
-The 2026-10-10 resident M3 Ultra experiment retains the accepted Q8/group-64
-backbone packing and selects F16 projection inputs plus F16 affine scales/biases
-for either 27 Mamba input matrices or 50 dense-MLP up/down matrices. Projection
-outputs return to F32 before convolution/recurrence, ReLU-square activation,
-normalization, residual accumulation and persistent state. Unselected execution
-and the accepted speech precision/cache/batching policies remain unchanged.
-
-Seven sequential unprofiled conversations execute 996 live frames each, with
-986 measured intervals excluding the first ten, loading, prefill and drain.
-
-| Selection | Mean frame | p95 | p99 | Maximum | Frames above 80 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Control before | 68.300 ms | 71.911 ms | 72.222 ms | 72.488 ms | 0 / 986 |
-| Mamba input F16, first | 68.527 ms | 71.747 ms | 72.035 ms | 72.449 ms | 0 / 986 |
-| Dense MLP F16, first | 68.659 ms | 71.899 ms | 72.183 ms | 72.443 ms | 0 / 986 |
-| Control after | 68.616 ms | 71.910 ms | 72.228 ms | 72.437 ms | 0 / 986 |
-| Mamba input F16, cache repeat | 68.405 ms | 71.680 ms | 71.975 ms | 72.527 ms | 0 / 986 |
-| Dense MLP F16, cache repeat | 68.712 ms | 72.085 ms | 72.387 ms | 73.222 ms | 0 / 986 |
-| Final control | 68.707 ms | 72.114 ms | 72.528 ms | 72.960 ms | 0 / 986 |
-
-Controls average 68.541 ms, with a 0.407 ms spread. Mamba-input candidates average
-68.466 ms and MLP candidates 68.686 ms: changes of -0.075 and +0.144 ms versus
-controls. These differences do not establish a meaningful mean-latency gain.
-Neither selection is retained or combined; BF16 is not evaluated.
-
-Native affine QMV uses F32 products and accumulation even with narrow
-inputs/companions. Narrow API dtype does not supply half-precision matrix
-acceleration. Selected companion storage saves 171,279,360 bytes for Mamba inputs
-or 219,520,000 bytes for MLPs from the 10,005,583,872-byte accepted backbone
-binding. Q8 primary traffic remains unchanged and projection casts add work;
-individual shader costs are not measured. Cache repeats report zero preparation
-source tiles/read bytes. First preparation obeys the 64 MiB working-set bound
-with two in-flight tiles, and is excluded from frame statistics.
-
-Two short fenced dispatch diagnostics confirm 27 or 50 F16 Q8 kernel requests
-per backbone call for the respective selections, across ten measured calls each.
-They stop after 30 application advances and are excluded from full-conversation
-timing/quality tables. Request names verify narrow dispatch; they do not measure
-shader durations.
-
-All seven runs match all 3,818 accepted semantic events after excluding wall
-clocks and the full accepted WAV bytes exactly. This fixture parity does not
-establish hidden-tensor identity or broad language/tool quality. The release
-benchmark build passes and all temporary source edits are restored byte-for-byte.
-Portable declarations select precision and companion identities; generic native
-materialization consumes them through the existing bounded prepared cache. No
-production policy, framework or benchmark flag is retained. Source patches,
-hashes, restoration manifests, full outputs and reproduction scripts reside in
-`/private/tmp/eredu-backbone-narrow`, including `REPORT.md` and `comparison.json`.
-
-### Tail-capable fast Q8 matvec
-
-The 2026-10-10 M3 Ultra resident comparison uses the accepted Q8/group-64
-backbone/head/causal-TTS recipe, F16 speech/perception execution and existing
-cache/batching policies. A generic MLX backend prototype implements eight values
-per lane, four output rows per SIMD group and guarded 256-value blocks for widths
-that miss native fast-QMV alignment. It does not pad weights or expand caches.
-Family construction and state/completion policy remain unchanged.
-
-Four sequential unprofiled conversations execute 996 live frames each, with
-986 warmed intervals excluding the first ten, loading, prefill and drain.
-
-| Selection | Mean frame (ms) | p95 (ms) | p99 (ms) | Maximum (ms) | Frames above 80 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Control before | 68.680 | 71.967 | 72.261 | 73.833 | 0 / 986 |
-| Tail kernel, first | 68.498 | 71.776 | 72.060 | 72.313 | 0 / 986 |
-| Tail kernel, repeat | 68.546 | 71.797 | 72.098 | 72.350 | 0 / 986 |
-| Control after | 68.720 | 72.165 | 72.690 | 72.919 | 0 / 986 |
-
-Controls average 68.700 ms and candidates 68.522 ms: a 0.178 ms/frame (0.259%)
-observed reduction. Mean headroom against 80 ms grows from 11.300 to 11.478 ms.
-This small difference does not establish a worthwhile production gain; ordinary
-native QMV remains selected. The result does not evaluate every possible tail
-kernel or a physical zero-padding strategy.
-
-A focused GPU fixture with strided, nonzero inputs checks widths 2112, 4352,
-4480 and 15680. Outputs match native zero-padded fast Q8 bit-for-bit and independent
-F64 dequantized dot products within `5e-5 * (1 + abs(reference))`. Different
-reduction grouping permits F32 rounding differences in other inputs.
-
-Short fenced diagnostics confirm replacement of all 89 generic backbone Q8
-requests, including 27 Mamba-input and 50 dense-MLP projections; 31 existing fast
-requests remain. Both output heads select the prototype. Across 20 measured warm
-frames, fenced backbone GPU time is 24.504 versus 24.083 ms. These coarse intervals
-include profiling fences/frontier work and do not establish shader durations or
-additive wall savings.
-
-All four conversations match the 3,818 accepted semantic events after excluding
-wall clocks and accepted WAV bytes exactly. This fixture does not establish
-hidden-tensor identity or broad quality. The focused native test and release
-benchmark build pass; all temporary edits are restored byte-for-byte. No custom
-kernel, production framework or selector flag is retained. Source patches, hashes,
-restoration manifests, full outputs and reproduction scripts reside in
-`/private/tmp/eredu-q8-fast-tail`, including `REPORT.md` and `comparison.json`.
-
-### Captured affine projection replay
-
-The 2026-10-10 M3 Ultra diagnostic uses the same accepted Q8/group-64 and speech
-precision/cache/batching recipe. A profiling-enabled WAV run captures advance 22
-with limits of 2,048 invocations and 32 GiB of conservative operand payload, then
-replays after drain. It retains 318 affine invocations across 11 native layout
-classes, preserving distinct real parameter identities for rotating-weight replay.
-This diagnostic changes graph retention and synchronization; its conversation
-latency and memory are not ordinary performance measurements.
-
-One timing process uses five warm samples after a separate first sample and an
-unreported warmup. A separate selection process verifies the same class geometry
-and native pipeline requests; selection-run times are excluded. Native replay
-matches all captured output bits. Zero-padded fast-Q8 replay reports finite outputs
-and maximum scaled error about `7.55e-6`; these are projection comparisons rather
-than full-model padded-execution parity.
-
-| Class | Invocations | Rotating buffer-duration sum ms/projection | Rotating wall ms/projection | Invocation-weighted wall ms | Padded rotating wall change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Mamba input, 22656 × 4480 | 27 | 0.256 | 0.157 | 4.228 | +1.08% |
-| MLP up, 15680 × 4480 | 25 | 0.199 | 0.113 | 2.832 | +0.98% |
-| MLP down, 4480 × 15680 | 25 | 0.196 | 0.114 | 2.860 | -0.56% |
-
-Negative change means faster. Wall time includes graph construction and completion.
-These weighted wall values rank investigation candidates; they are not additive
-whole-model attribution. Native Metal timing sums command-buffer intervals that
-can overlap and include waits; the sum can exceed wall time and is not elapsed GPU
-execution time. Batching changes can reduce the sum without reducing wall time. Repeating one matrix
-shows apparent native fast-path gains of roughly 35–47% for these classes, which
-vanish on rotation through the actual weights. Cache/working-set effects are a
-strong candidate explanation, but resource batching also changes. Nominal parameter
-payload/time is not measured DRAM bandwidth or evidence of hardware saturation.
-
-The full captured conversation matches all 3,818 accepted semantic events excluding
-wall clocks and the accepted WAV bytes exactly. Focused native fixtures cover
-bounded capture cancellation/overflow, distinct-weight rotation, strided nonzero
-inputs with an independent F64 oracle, and padded replay. A small Metal export
-fixture covers timing interoperability, nesting rejection, existing-path protection,
-explicit finish and drop retry. Released-weight Metal export is not part of these
-control runs. CPU profiling compilation, the profiling-enabled WAV compiler check
-and five portable WAV-driver behavior tests pass. The report tool rejects incomplete
-selection markers before publishing a summary.
-
-The nondefault `projection-profiling` feature owns native collection/replay and
-optional Metal export; the application selects capture advancement and output.
-Temporary benchmark recipe edits restore byte-for-byte. Source, recipe patches,
-binary hashes, full outputs, dispatch evidence, native capability probe and commands
-reside in `/private/tmp/eredu-gpu-profile`, including `REPORT.md`,
-`released-profile.json`, `verified-summary.json` and `released-quality.json`.
-See [affine diagnostics](projection-baseline.md#affine-projection-diagnostics)
-for the current API, controls and measurement limits.
-
-### Generic Q8 split-K validation
-
-The 2026-10-10 M3 Ultra experiment uses the same accepted Q8/group-64,
-F16 speech/perception and F32-sensitive arithmetic recipe, pinned checkpoint,
-seed-zero input and warmed prepared cache as the affine replay above. The generic
-backend prototype partitions the input dimension into 2/4/8/16 group-aligned
-ranges, writes F32 partial vectors and reduces them in a second GPU kernel.
-It reuses packed weights without padding or conversion. Final graph roots retain
-partial storage; there is no intermediate host readback or completion boundary.
-Independent F64 fixtures with strided inputs and nonzero affine companions cover
-five widths and four partition counts; all 20 cases pass at
-`5e-5 * (1 + abs(reference))` tolerance. Split-K changes F32 reduction order.
-
-Two real-operand captures replay the 318 invocations at advance 22 with ten warm
-samples per phase. Summed command-buffer durations appear to improve 32–47% for
-some classes, but their intervals overlap/include waits and exceed elapsed wall
-time. They are not elapsed GPU execution time. For MLP down, native replay records
-approximately 0.194 ms/projection from those intervals versus 0.114 ms total wall;
-two-partition replay records 0.103 ms from intervals versus 0.122 ms total wall.
-Across both captures, rotating-weight wall time increases approximately 9–10%
-for Mamba output and 7% for MLP down. Graph construction grows from approximately
-0.2 µs to 7 µs per projection. Extra partial storage and a reduction launch do not
-reduce packed-weight traffic. These results do not establish hardware saturation.
-The report ranks wall time and flags native timing sums exceeding it.
-
-Ordinary full conversations use one binary with the selector disabled for the two
-bracketing controls. The long-K selector uses `K >= 8192` and
-`4096 <= N <= 16384`, covering 52 projections per backbone frame. The broader
-selector uses `K >= 4096` and the same output range, covering 85. Both use two
-partitions; unsupported geometry and multi-vector prefill retain native dispatch.
-There are 996 live 80 ms frames; the warm statistics exclude the first ten,
-loading, prefill and drain.
-
-| Run | Warm mean ms/frame | Headroom ms | p99 ms | Warm deadline misses |
-| --- | ---: | ---: | ---: | ---: |
-| Control before | 68.598 | 11.402 | 72.108 | 0 |
-| Long K | 69.219 | 10.781 | 72.777 | 0 |
-| Mid and long K | 69.452 | 10.548 | 73.283 | 0 |
-| Control after | 68.886 | 11.114 | 72.970 | 0 |
-
-The control mean is 68.742 ms/frame with 11.258 ms headroom. Candidates cost
-0.477 and 0.710 ms/frame relative to that mean. Controls differ by 0.289 ms,
-so the exact regression magnitude is noisy; neither candidate beats either
-control. All four outputs match the accepted WAV bytes and 3,818 semantic events
-excluding wall clocks exactly. This fixture is not a broad quality evaluation.
-A separate 24-chunk selection trace verifies 1,020 partial-kernel requests and
-1,020 reduction requests across twelve backbone frames, exactly 85 each per frame.
-Selection-run timings are excluded from the ordinary controls.
-
-No split-K kernel or selector is retained. Temporary sources restore byte-for-byte.
-Numerical fixtures, replay/full-conversation binaries, source/recipe patches,
-hashes, restoration manifests, dispatch counts, complete outputs and reproducible
-scripts reside in `/private/tmp/eredu-q8-split-k`, including `REPORT.md` and
-`comparison.json`. Native timer documentation and affine diagnostics describe
-buffer-duration sums separately from elapsed wall time.
-
-### History-dependent attention/cache profiling
-
-The accepted Q8 backbone/function/causal-TTS, F32 causal execution and F16 speech
-configuration on the M3 Ultra has two ordinary 79.68-second conversation controls
-at **68.624 and 68.636 ms/frame**, excluding the first ten live intervals
-(986 warm intervals each). Their mean is **68.630 ms/frame**, with
-**11.370 ms headroom** against the 80 ms cadence and no warm deadline
-misses. Both controls and both operand-capture conversations reproduce all
-1,756,952 speech samples and 3,818 semantic events exactly against the accepted
-reference, excluding wall clocks. Controls average 65.895 ms at frames 50–150
-and 71.675 ms at frames 850–950: **5.780 ms history growth**.
-
-Bounded captures at application advances 200 and 1,000 execute live frames 100
-and 804. All 28 causal attention layers have two guidance rows, 16 heads, width
-72 and F32 operands; history lengths are 137 and 841. Each operation replay
-retains all actual layer operands and checks exact output bits. Ten warm samples
-follow one reported first sample and one unreported warmup. Median times are:
-
-| Isolated native operation | Early wall ms | Late wall ms | Early interval union ms | Late interval union ms | Early span ms | Late span ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| K append (28 calls) | 1.023 | 4.044 | 0.084 | 0.670 | 0.355 | 1.955 |
-| V append (28 calls) | 1.006 | 4.066 | 0.082 | 0.669 | 0.362 | 1.954 |
-| QK product (28 calls) | 0.371 | 0.597 | 0.056 | 0.276 | 0.056 | 0.276 |
-| PV product (28 calls) | 0.325 | 0.603 | 0.038 | 0.293 | 0.038 | 0.293 |
-
-K/V append replay wall time totals **2.029 → 8.110 ms**, versus **0.696 → 1.200 ms**
-for the two attention products. The late K/V append logical input/output payload
-is **828 MiB**, versus **420 MiB** for the products. These are logical work estimates,
-not measured DRAM traffic. Capture retains additional roots and can inhibit donation;
-independent replay changes allocation, cache reuse and overlap. Summing these classes
-does not attribute ordinary frame time or promise an 8.110 ms end-to-end saving.
-All operation samples report zero missing GPU timestamps. The sum/union/span
-statistics distinguish overlapping buffer intervals and their gaps; each can retain
-buffer waits and none measures individual shader compute time.
-
-Separate six-second post-load Metal System Trace/Time Profiler captures share
-30 complete early live frames (126–155) and 29 complete late frames (884–912).
-Direct frame-publication Unix timestamps align the trace epoch. Neither trace
-adds per-operator evaluation fences. Trace instrumentation perturbs execution:
-
-| Trace observation (ms/frame unless specified) | Early | Late |
-| --- | ---: | ---: |
-| Frame wall time | 69.854 | 74.918 |
-| Scheduled Compute interval union | 56.729 | 60.333 |
-| Wall time outside Compute interval union | 13.125 | 14.586 |
-| Distinct Metal command buffers/frame | 229.633 | 229.000 |
-| Sampled CPU graph evaluation (inclusive) | 24.400 | 25.586 |
-| Sampled CPU Metal encoding (inclusive) | 14.433 | 14.276 |
-| Sampled CPU progress (inclusive) | 1.133 | 1.172 |
-
-Trace wall growth is **5.064 ms**: **3.603 ms** more scheduled Compute activity and
-**1.461 ms** more wall time outside that interval union. Compute intervals are
-scheduled GPU activity, not individual shader durations or occupancy counters.
-CPU stack categories overlap; their inclusive weights are not additive savings.
-The stable buffer count and progress samples favor history-dependent memory/work
-rather than increasing submission count. Sampled allocator stacks are about
-2.9 ms/frame in both windows; the trace does not establish allocation alone as
-the source of the history penalty.
-
-Full-attention device caches and sliding caches before their first retention crop
-use a generic transaction-safe append mechanism: private chunked capacity retains
-immutable visible prefixes and reserves unused suffix slots once. Sliding capacity
-is clipped to the declared retention limit; cropped caches use immutable
-concatenation. Divergence, truncation and explicit snapshots preserve rollback
-and independent continuation. Cache policy and capacity/residency accounting remain
-shared infrastructure; native buffer operations belong in the backend. Ordinary
-attention consumes the prefix's native matrix strides. Legacy overwriting caches
-retain physical transaction isolation. The measured 5.780 ms early/late penalty
-identifies a workload effect, not guaranteed recoverable headroom. Individual shader
-durations and measured DRAM bandwidth remain unavailable in this evidence.
-
-Artifacts and reproducible scripts are under
-`/private/tmp/eredu-attention-critical/`: `REPORT.md`, `benchmark.patch`,
-`benchmark-source/`, `voicechat_wav`, profiles/replay summaries, ordinary controls,
-`early.trace`, `late.trace`, direct clock logs and exported CPU/GPU records.
-The binary SHA-256 is
-`9495604c4db25a2db319854f65d880d720bbae693662fa8ee3dde8d304249ebb`.
-All temporary benchmark source changes restore byte-for-byte. The interval-union
-fixtures, safe CPU timing tests, multi-buffer Metal timing test, bounded collector
-fixture and CPU-only profiling feature check pass. CUDA timing summary is implemented
-but has no native CUDA validation on this Mac.
-
-### Transaction-safe append capacity
-
-The resident device K/V cache uses private 128-position append capacity, including
+Resident device K/V caches reserve private 128-position append capacity, including
 sliding caches before their first retention crop. Published prefix elements remain
-immutable. Reservations are never refunded on discard or construction failure;
+immutable. Reservations are not refunded on discard or construction failure;
 branches, truncation and explicit snapshots preserve independent continuation.
 Cropped sliding caches retain immutable concatenation and absolute-position/window
-semantics. Existing neutral cache policies select storage, and capacity admission
-and snapshot charges include private padding. This implementation introduces no
-model-family branch, portable backend dependency or feature flag.
-
-Released-checkpoint measurements dated 2026-10-10 use the M3 Ultra 80-core GPU,
-256 GiB unified memory, resident Metal execution, Q8 backbone/function/causal-TTS
-weights, F32 causal execution and F16 speech/perception execution. Command-buffer
-limits are 25 operations and 256 MiB. The pinned checkpoint, utterance and seed match
-the history-growth profile above. Four ordinary runs use the order control,
-append, append, control, with 996 live frames (79.68 seconds), excluding the first
-10 from warm statistics. Controls use immutable concatenation with identical
-host-view safety fixes and accepted quantization/precision settings.
-
-| Measurement | Concatenation | Private append |
-| --- | ---: | ---: |
-| Mean frame time, two runs (ms) | 68.590 | 66.856 |
-| Mean per-run p95 (ms) | 71.910 | 68.316 |
-| Mean budget remaining, 80 ms frame (ms) | 11.410 | 13.144 |
-| Early frames 50–150 (ms) | 65.833 | 65.579 |
-| Late frames 850–950 (ms) | 71.619 | 68.126 |
-| Mean process peak footprint (GiB) | 22.575 | 20.927 |
-| Frames above 80 ms, both runs | 0 / 1,972 | 0 / 1,972 |
-
-Individual control means are 68.534 and 68.647 ms; append means are 66.867 and
-66.845 ms. The mean saving is **1.734 ms/frame (2.53%)**, increasing average
-headroom by **15.2%**. The late-window saving is **3.492 ms**. Early-to-late growth
-falls from 5.785 to 2.547 ms; attention work still grows with history. Mean process
-peak footprint falls by 1.649 GiB; this is a process measurement including native
-allocation caching and temporary work, not a measurement of K/V payload alone.
-Private spare payload is at most 127 positions per cache: for 28 speech layers,
-batch 2, 16 heads and width 72 at F32, both K and V total at most 62.508 MiB.
-
-All four runs produce exactly the accepted 1,756,952 F32 audio samples and all
-3,818 semantic events, excluding wall timestamps. Waveform SHA-256 is
-`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
-This is one utterance/seed with silence afterward, not a broad dialogue quality
-or arbitrary-duration latency guarantee.
-
-The extended 159.68-second comparison uses 1,996 live frames (1,986 warm), the
-same input followed by more silence, and the existing long concatenation control
-from this investigation. It is one pair, with the control measured earlier rather
-than interleaved with the final append run:
-
-| Extended measurement | Concatenation | Private append |
-| --- | ---: | ---: |
-| Mean frame time (ms) | 71.844 | 68.475 |
-| p95 (ms) | 77.564 | 71.448 |
-| Mean budget remaining (ms) | 8.156 | 11.525 |
-| Late frames 1850–1950 (ms) | 77.566 | 71.512 |
-| Maximum frame time (ms) | 79.691 | 75.916 |
-| Process peak footprint (GiB) | 23.613 | 23.421 |
-| Frames above 80 ms | 0 / 1,986 | 0 / 1,986 |
-
-The extended mean saving is 3.369 ms (4.69%), adding 41.3% to mean headroom;
-the late-window saving is 6.054 ms. All 3,520,952 samples and 7,818 semantic events
-match exactly. Waveform SHA-256 is
-`d1074bd2cab12ea1c61fcedab2ebf06ec89c674c8ae0705319c64780a5174650`.
-These measurements precede the speech layers' first sliding retention crop;
-performance after that crop is not measured here. Sliding transition correctness
-is checked with a small-window fixture.
-
-CPU/Metal buffer tests cover actual backing reuse, delayed discarded updates,
-truncation, growth, cross-stream completion, held immutable host borrows and
-rejection of graph replay. Cache tests compare sliding truncation, multi-token
-updates and retention transitions with ordinary concatenation. Five snapshot
-isolation tests, three joint lifecycle tests and eight joint integration tests
-cover rollback, atomic publication, copy budgets and completion-held admission.
-The restored backend builds with Metal and profiling enabled. CUDA uses an
-immutable-copy fallback and has no native CUDA validation on this Mac.
-
-Reproduction artifacts reside in `/private/tmp/eredu-prefix-append`: `build.py`,
-`run.py`, `batch-final.py`, `compare-final.py`, `long.py`, benchmark patches,
-per-frame records, waveform comparisons, source snapshots and binary hashes.
-`final-results.json` contains the four ordinary-run comparisons and
-`final-long-results.json` contains the extended pair. Temporary
-quantization benchmark edits restore byte-for-byte. The append binary SHA-256 is
-`800048f6d4d950f48859070e125805d5afcc0c26628a8b615fdf1c09c1ff9046`.
-
-### Exact-zero Q8 projection with prepared storage
+semantics. Neutral cache policies select storage, and capacity admission and
+snapshot charges include private padding. CPU/Metal buffer fixtures cover backing
+reuse, delayed discarded updates, truncation, growth, cross-stream completion,
+immutable host borrows and graph-replay rejection. Cache fixtures compare sliding
+truncation, multi-token updates and retention transitions with ordinary
+concatenation. Joint lifecycle, integration and snapshot fixtures cover rollback,
+atomic publication, copy budgets and completion-held admission. CUDA uses an
+immutable-copy fallback; native CUDA execution is outside the Mac validation scope.
 
 The ReLU-squared backbone MLP declares an exact-zero input hint on its down
-projection. The generic MLX affine Q8 mechanism skips packed words with four zero
-inputs while retaining F32 generic-QMV accumulation and nonfinite-companion
-behavior. Unsupported arithmetic, geometry and layouts use ordinary projection.
-Optional matrix storage preferences flow through ordinary parameter bindings,
-prepared-checkpoint policy and residency materialization. A logical transpose view
-and the projection kernel share one resident allocation per parameter. Prepared
-disk variants share the producer's existing bounded cache and eviction policy.
-
-Released-checkpoint measurements dated 2026-10-11 use the M3 Ultra 80-core GPU,
-256 GiB unified memory, resident Metal execution and the accepted Q8/group-64
-backbone, output-head and 196 causal-TTS projection weights. Backbone and causal
-TTS arithmetic and quantization companions remain F32; other speech/perception
-execution uses F16. Command-buffer limits are 25 operations and 256 MiB. The
-checkpoint revision is `443794ea956ef0065f001967ffd00e77f519cb39`. The input,
-seed 0 and silence tail match the transaction-safe append measurement above.
-Three controls and three candidates each run 996 live frames (79.68 seconds),
-excluding the first 10 from warm statistics. Controls disable only the exact-zero
-hint. No profiling or concurrent builds run during these measured conversations.
-
-| Measurement | Ordinary Q8 | Exact-zero Q8 |
-| --- | ---: | ---: |
-| Pooled warm mean (ms) | 66.793 | 65.774 |
-| Pooled warm p95 (ms) | 68.268 | 67.220 |
-| Pooled warm p99 (ms) | 68.579 | 67.476 |
-| Mean budget remaining, 80 ms frame (ms) | 13.207 | 14.226 |
-| Warm frames above 80 ms | 0 / 2,958 | 0 / 2,958 |
-| Mean process peak footprint (GiB) | 20.927 | 21.130 |
-| Mean warm-cache model load (seconds) | 24.929 | 26.805 |
-| Mean first live frame (ms) | 92.336 | 91.279 |
-
-The mean saving is **1.019 ms/frame (1.53%)**, increasing mean headroom by
-**7.72%**. Every candidate run is faster than every control. Peak process footprint
-increases by 0.203 GiB; this measurement includes temporary work and native
-allocation caching and does not attribute that overhead to a particular buffer.
-Warm loading costs another 1.876 seconds. Startup frames exceed 80 ms in both
-paths; the headroom figures describe warm execution.
-
-The 75 prepared layout entries occupy 1.840 GiB on disk, including packed weights
-and companions. Canonical and transposed files coexist under the same 32 GiB
-budget; total prepared storage is 31.117 GiB. All warm reloads reuse identical
-entries without growing the cache. Cold preparation also preserves output, but
-its timing and memory are excluded because a control compilation ran concurrently.
-
-All six measured runs and the cold-preparation run match the accepted waveform
-and semantic events exactly. Waveform SHA-256 is
-`6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
-This evidence covers one utterance and seed, not arbitrary dialogue histories.
-Focused fixtures check independent dequantized arithmetic, signed zeros,
-nonfinite companions, strided input, fallback, bounded byte-preserving preparation,
-cache reuse/capacity fallback, cross-stream loading and shared backing storage.
-Portable architecture and backend builds pass without native features.
-
-```sh
-cargo test --offline -p eredu-checkpoint \
-  bounded_matrix_layout_preserves_bytes_and_reuses_prepared_source -- --test-threads=1
-cargo test --offline --release -p eredu-backend-mlx --no-default-features \
-  --features accelerate,audio,metal --lib sparse_q8_matches_independent_equation_and_retains_fallbacks \
-  -- --test-threads=1
-```
-
-Reproduction artifacts reside in `/private/tmp/eredu-sparse-production`: `REPORT.md`,
-`results.json`, `build.py`, `run.py`, `measure.py`, benchmark patches, binary hashes,
-per-frame records, waveforms, event comparisons and cache inventories. The temporary
-precision/quantization harness preserves parameter storage preferences and restores
-source files byte-for-byte after each build.
+projection. The generic affine Q8 mechanism skips packed words with four zero
+inputs while retaining F32 QMV accumulation and nonfinite-companion behavior.
+Unsupported arithmetic, geometry and layouts use ordinary projection. Matrix
+storage preferences flow through parameter bindings, prepared-checkpoint policy
+and residency materialization. Logical transpose views and projection kernels
+share one resident allocation per parameter; prepared disk variants share the
+bounded cache and eviction policy.
 
 ### Fused FP32 gated arithmetic
 
@@ -1651,11 +323,15 @@ CARGO_INCREMENTAL=0 cargo test --offline -p eredu-backend-mlx \
 CARGO_INCREMENTAL=0 cargo check --offline -p eredu-backend-mlx --no-default-features
 ```
 
-Released-checkpoint measurements dated 2026-10-11 use the same M3 Ultra 80-core GPU,
-256 GiB memory, official checkpoint revision, accepted Q8/F16 precision recipe,
-input, seed and command-buffer limits as the exact-zero projection measurement
-above. Four controls disable only the two gated fast paths; three candidates enable
-both. Each conversation runs 996 live frames (79.68 seconds), excluding its first
+Released-checkpoint measurements dated 2026-10-11 use the M3 Ultra 80-core GPU,
+256 GiB unified memory and resident Metal execution. The checkpoint revision and
+input match the single-device fixture above. The performance recipe uses affine
+Q8/group64 backbone/readout, function-head and 196 causal-TTS projection weights
+with F32 arithmetic and companions; remaining eligible speech/perception execution
+uses F16. Seed is zero, input chunks contain 640 samples and the response tail is
+800 frames. MLX command-buffer limits are 25 operations and 256 MiB. Four controls
+disable only the two gated fast paths; three fused runs enable both. Each
+conversation runs 996 live frames (79.68 seconds), excluding its first
 10 intervals from warm statistics. No profiling or compilation overlaps inference.
 
 | Measurement | Ordinary gated operators | Fused gated operators |
@@ -1668,18 +344,48 @@ both. Each conversation runs 996 live frames (79.68 seconds), excluding its firs
 | Warm frames above 80 ms | 0 / 3,944 | 0 / 2,958 |
 
 The mean saving is **1.235 ms/frame (1.88%)**, increasing mean headroom by
-**8.64%**. Each candidate mean is below every control mean. The candidate means
+**8.64%**. Each fused-run mean is below every control mean. The fused-run means
 are 64.433, 64.667 and 64.300 ms/frame. All seven conversations match the accepted
 waveform and every semantic event exactly; waveform SHA-256 is
 `6cedc9b561f2fc98690678bd9bd61a9d099b3b010cc41ebef1f55df8a84b3884`.
 These measurements cover the retained utterance and seed; they do not establish
 arbitrary dialogue histories or live microphone/speaker scheduling.
 
+Mean warm-cache loading is 26.926 seconds and mean peak process footprint is
+21.093 GiB for the fused runs. Footprint includes weights, state, activations,
+native allocation caching and process overhead; it is separate from parameter
+admission accounting.
+
+The performance fixture supplies its Q8 preparation recipe through an external
+measurement harness using the ordinary bounded quantizer and prepared cache.
+`EREDU_BENCH_*` variables are harness inputs, not public WAV configuration fields.
+The ordinary loader accepts official floating and admitted community affine
+sources through the same preparation path.
+
 Reproduction artifacts reside in `/private/tmp/eredu-gated-fusion`: `REPORT.md`,
 `results.json`, `build.py`, `run.py`, `measure.py`, source snapshots, benchmark
 patches, restoration checks, binary hashes, per-frame records, waveforms and
 semantic comparisons. The temporary accepted quantization preparation harness
 restores source files byte-for-byte after each build.
+
+The retained fused benchmark executable has SHA-256
+`66801a0ca1b23c64902bf9537901eb791112c7011e5a77bd858e7b2faafcc4c0`.
+The harness builds with the following command and invokes the retained binary
+with its preparation inputs:
+
+```sh
+cargo build --offline --release -p eredu --no-default-features \
+  --features mlx,audio,metal,projection-profiling --example voicechat_wav
+EREDU_BENCH_QUANT_BITS=8 EREDU_BENCH_FUNCTION_BITS=8 \
+EREDU_BENCH_TTS_BITS=8 EREDU_BENCH_TTS_COMPUTE=f32 \
+EREDU_PREPARED_CHECKPOINT_CACHE=/private/tmp/eredu-memory-cache/prepared \
+MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
+  /private/tmp/eredu-gated-fusion/candidate-voicechat_wav \
+  --config /private/tmp/eredu-memory-cache/long.json \
+  --input /private/tmp/eredu-voicechat-reference/input-general.wav \
+  --output speech.wav --events events.jsonl \
+  --chunk-samples 640 --tail-frames 800 --max-steps 2000
+```
 
 ### Released-checkpoint tool round trip
 
@@ -1732,11 +438,8 @@ The waveform contains 605,060 contiguous finite float32 samples, including an
 eight-sample codec tail: 27.44036 seconds at 22.05 kHz, absolute peak 0.14620356,
 RMS 0.0065569352 and no samples outside [-1,1]. SHA-256 is
 `c4a832224bd4d52cca0c5ed7e0a555b12fa62c7d0583f2610e03b57bc9b1ba78`.
-The run takes 143.53 seconds including startup, with maximum RSS
-105,873,637,376 bytes and peak process footprint 109,433,154,920 bytes. A unit-test
-build overlaps this unoptimized run; these are process measurements, not a
-real-time performance claim. `run-tool-summary.json` and `run-tool-2.log` retain
-event assertions, waveform statistics and resource measurements.
+`run-tool-summary.json` and `run-tool-2.log` retain event assertions and
+waveform statistics.
 
 Long prompts use the shared selective scan's existing chunk size (128 for the
 released backbone). MLX evaluates recurrent carry and each chunk's output roots
@@ -1797,10 +500,8 @@ sample reaches full scale. SHA-256 is
 `speech-tool-ack-serialization.wav` contains the exact 2.96 seconds of Tool-frame
 PCM for listening, SHA-256
 `9a9c6e5905033ddaed226ff0d600b8c51ddef7a80afa1015367942dac0c7dff7`.
-The dev-profile run takes 99.04 seconds including startup, with maximum RSS
-80,435,118,080 bytes and peak process footprint 83,998,025,376 bytes. These are
-process observations, not real-time latency claims. `run-tool-ack-summary.json`
-retains the checks and measurements. Nonzero PCM establishes speech publication,
+`run-tool-ack-summary.json` retains the checks and waveform measurements.
+Nonzero PCM establishes speech publication,
 not intelligibility or independent NVIDIA numerical parity; random phrase
 selection is not exercised.
 
@@ -1852,10 +553,7 @@ The full WAV has 885,536 contiguous finite float32 samples, including its
 eight-sample codec tail, at 22.05 kHz (40.1603628 seconds). Peak magnitude is
 0.19940870, RMS is 0.0078732340, and no sample reaches full scale. SHA-256 is
 `471ea5e9b685ae796312a02d7f2feb85a1adbba10a0855d7f23e9e994f560368`.
-The dev-profile process takes 197.82 seconds including startup, with maximum RSS
-152,063,737,856 bytes and peak footprint 155,645,964,000 bytes. These measurements
-do not establish real-time latency. `run-tool-random-summary.json` retains
-per-call, waveform and resource evidence. This run establishes repeated tool
+`run-tool-random-summary.json` retains per-call and waveform evidence. This run establishes repeated tool
 response and acknowledgement publication; it does not establish phrase
 intelligibility, Python random-sequence parity, or independent numerical parity.
 Automatic initial-reminder selection is outside this recorded path.
@@ -1912,10 +610,8 @@ samples. WAV SHA-256 is
 Drain commits at 20,800 ms with 260 audio frames and 944 backbone positions;
 no script entry or response remains undelivered.
 
-The dev-profile process takes 105.54 seconds including startup, with maximum RSS
-86,479,323,136 bytes and peak footprint 90,027,669,352 bytes. These measurements
-are not a real-time latency claim. `run-tool-reminder-summary.json` records event
-ordering, audio metrics and artifact hashes. This run establishes automatic
+`run-tool-reminder-summary.json` records event ordering, audio metrics and
+artifact hashes. This run establishes automatic
 reminder publication and early-result gating through the public session; phrase
 intelligibility, independent NVIDIA numerical parity and native distributed
 execution are not established by it.
@@ -1966,10 +662,8 @@ The WAV SHA-256 is
 `dfcc5e63a916d1d0cde0100de9aac44a025902b3f03da3f6f521320a840e7089`;
 the JSONL SHA-256 is
 `d3123a39b37e0fca6c40dc0c1ede8e883d88a5c3bc009a46a76e56a1a6663166`.
-`run-tool-generic-loading-summary.json` retains these comparisons. Process
-observations are 106.79 seconds including startup, 86,494,806,016 bytes maximum
-RSS and 90,079,033,192 bytes peak footprint. Concurrent compilation makes this
-unsuitable for latency comparison. This is loading/output consistency evidence,
+`run-tool-generic-loading-summary.json` retains these comparisons. This is
+loading/output consistency evidence,
 not independent NVIDIA numerical parity or native distributed validation.
 
 ```sh
@@ -2021,10 +715,8 @@ The output has 414,548 contiguous finite float32 samples, including the
 eight-sample codec tail, at 22.05 kHz (18.8003628 seconds). Peak magnitude is
 0.14620356, RMS is 0.0079215961, and no sample reaches full scale. WAV SHA-256 is
 `b63f93d3ca741e9cb819071589745919018be406febf2a497dbf80cc8e0e8f2e`.
-The dev-profile process takes 113.31 seconds including startup, with maximum RSS
-80,441,901,056 bytes and peak footprint 84,007,167,600 bytes; these are not
-real-time latency measurements. `run-tool-late-summary.json` and
-`run-tool-late.log` retain the event, waveform and process evidence. The result
+`run-tool-late-summary.json` and `run-tool-late.log` retain event and waveform
+evidence. The result
 arrives before the default timeout, so this run does not validate timeout speech
 or independent numerical parity.
 
@@ -2080,9 +772,7 @@ float32 output samples include the eight-sample codec tail, are all finite, have
 absolute peak 0.14620356 and RMS 0.0064277738, and have no samples outside [-1,1].
 WAV SHA-256 is
 `1e27d8ce456699fd0202661f7bf51b8826c8acf8c86e4a0e1ab35ee2d3b7ae2e`.
-The dev-profile process takes 162.23 seconds including startup, with maximum RSS
-115,548,651,520 bytes and peak footprint 119,112,878,328 bytes. Portable test
-compilation overlaps the run; these are not performance guarantees. External
+External
 `input-tool-interruption.metadata.json`, `run-tool-handoff-summary.json`,
 `analyze-handoff.py` and `run-tool-handoff.log` retain provenance,
 frontier/late-ticket checks, waveform metrics and measurements.
@@ -2945,32 +1635,16 @@ a declaration whose bit width disagrees with the physical catalog. Quantization
 covers 9,473,228,800 logical backbone/embedding/output-head parameters; speech and
 perception source weights remain BF16. No load-time quantization is applied.
 
-On the 80-core M3 Ultra with 256 GiB unified memory, the release WAV driver processes
-the same mono 16 kHz input fixture (249,734 samples, SHA256
+The retained compatibility fixtures use the M3 Ultra 80-core GPU with 256 GiB
+unified memory and the pinned mono 16 kHz input (249,734 samples, SHA-256
 `481f422a961fb160ddeba9824d55cb7c190c57acb7dc1730a2d595fd078dcb04`), followed by
-800 response-tail frames. Each complete timeline has 996 live frames, or 79.68
-seconds. Resident runs use seed 0, the helpful-assistant prompt, no tools, a
-640-sample input chunk, and the ordinary prepared cache. MLX buffer limits are
-25 operations and 256 MiB. Reported frame times include execution, completion and
-WAV/event publication; loading and the first ten live frames are excluded. Only
-sequential runs without concurrent builds or downloads enter the table. Repeated
-rows pool 986 measured frames per run. Speech columns describe eligible floating
-weight storage and projection/convolution arithmetic; backbone recurrent and
-normalization arithmetic remains F32.
-
-| Checkpoint | Speech weights / arithmetic | Runs | Mean ms | Headroom vs 80 ms | p95 ms | p99 ms | Max ms | Frames over 80 ms | Peak process GiB |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Q8 | F32 / F32 | 1 | 76.47 | 3.53 ms | 78.27 | 78.68 | 80.57 | 1 / 986 | 24.10 |
-| Q8 | F16 / F32 | 1 | 74.34 | 5.66 ms | 75.85 | 76.49 | 134.48 | 1 / 986 | 21.86 |
-| Q8 | F16 / F16 | 2 | 71.33 | 8.67 ms | 72.68 | 72.94 | 75.00 | 0 / 1,972 | 21.82 |
-| Q8 | BF16 / BF16 | 1 | 80.80 | -0.80 ms | 82.22 | 82.57 | 83.96 | 755 / 986 | 21.81 |
-| Q4 | F16 / F16 | 2 | 66.27 | 13.73 ms | 67.66 | 67.98 | 69.82 | 0 / 1,972 | 17.26 |
-
-Q8 F16/F16 means are 71.25 and 71.41 ms; Q4 means are 66.08 and 66.45 ms.
-Peak process footprint includes native state, activations, retained storage and
-allocator overhead, and is separate from the parameter admission ledger. The
-published checkpoints have different quantization coverage from measurements
-that also quantize causal TTS, so those timings are not an identical-weight control.
+800 response-tail frames. Each timeline contains 996 live frames (79.68 seconds).
+Resident execution uses seed zero, the helpful-assistant prompt, no tools,
+640-sample input chunks and the ordinary prepared cache. Eligible speech weights
+and arithmetic use F32/F32, F16/F32, F16/F16 or BF16/BF16 policies; backbone
+recurrent and normalization arithmetic remain F32. These fixtures establish
+admission, execution and output repeatability for the retained formats and
+precision policies.
 
 Q8 F16/F32 produces byte-identical waveform and committed events to the Q8
 F32/F32 run. Both transcribe `o do you know what color the sky is` and answer
@@ -2995,7 +1669,8 @@ this evidence.
 
 Reproduction uses the ordinary configuration above with `source.path` set to the
 downloaded repository directory and `speech_weights` / `speech_compute` set to the
-table's policy. The conservative measured choice is `"f16"` / `"f32"`.
+selected policy. The `"f16"` / `"f32"` policy preserves the Q8 F32/F32 fixture's
+waveform and committed events.
 
 ```sh
 hf download mlx-community/NemotronLabs-VoiceChat-11B-8bit \
@@ -3009,11 +1684,8 @@ MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
   --chunk-samples 640 --tail-frames 800 --max-steps 2000
 ```
 
-The timing capture wraps the example's JSONL writer with an `Instant` timestamp
-at complete-record publication. That measurement wrapper is outside production
-source; the example's ordinary JSONL schema retains audio timestamps only.
-Pinned catalogs, full shard hashes, timing records, configuration files, audio and
-the captured binary digest are retained in `/private/tmp/eredu-mlx-compat` on the
+Pinned catalogs, full shard hashes, configuration files, audio, committed event
+records and binary digests are retained in `/private/tmp/eredu-mlx-compat` on the
 validation host.
 
 ## Release contract
@@ -3075,9 +1747,11 @@ residency or parallel execution policy.
 modules and exposes independently constructible perception, RNNT, function-head,
 character/TTS, MoG and codec units. `PreparedSpeechConstruction` admits only units
 whose component sources are retained and pairs each unloaded module with its
-canonical bindings. Perception, TTS and codec F16/BF16 recipes include an explicit
-F32 execution cast; materialization bounds include its overlapping input and
-output storage. RNNT and function-head recipes retain their component precision.
+canonical bindings. Default preparation converts perception, TTS and codec
+F16/BF16 recipes to F32 execution; selected speech precision can retain eligible
+narrow perception/TTS weights and arithmetic. Materialization bounds include
+overlapping conversion input/output storage. RNNT and function-head recipes retain
+their component precision.
 These factories do not allocate session state or select a full-graph residency
 or parallel policy.
 
@@ -3186,8 +1860,11 @@ Causal padding on both convolution axes gives frequency extents
 `128 → 65 → 33 → 17`; the output affine flattens channels before frequency.
 Each layer retains normalized attention inputs and post-GLU convolution carry.
 Relative-position attention, causal masks, layer normalization and half-weight
-feed-forward residuals follow the pinned equations. Perception requires float32
-parameters and inputs, matching the streaming wrapper. One invocation supplies
+feed-forward residuals follow the pinned equations. Perception requires F32
+boundary activations and parameters matching its selected `SpeechPrecision`.
+Eligible projections/convolutions support F16/BF16; normalization, residuals and
+streaming histories retain F32. The default matches the streaming wrapper's F32
+policy. One invocation supplies
 both unprojected RNNT features and projected Nemotron features, with candidate
 caches returned only after both branches succeed.
 
@@ -3196,8 +1873,8 @@ Subsampling, each Conformer block and the modality projection have separate
 parameter leases; no learned perception parameters are pinned as static modules.
 The final group's retained forward context captures raw encoder features for
 RNNT. Cold prepared bindings restrict source authority to learned perception
-inputs and apply the architecture's F32 execution recipes, including F16 storage
-conversion. The shared PCM/RNNT and startup-silence compositions accept this
+inputs and apply the architecture's selected precision recipes and bounded
+storage conversions. The shared PCM/RNNT and startup-silence compositions accept this
 provider-backed execution.
 
 Perception TP2 component checks use the same pinned NVIDIA fixture for full
@@ -4889,7 +3566,8 @@ cargo check -p eredu --no-default-features
 
 Perception, frontend and host streaming tests cover independent outputs/caches,
 both initial phases, rollover, arbitrary PCM chunking, snapshots, backpressure,
-explicit partial finish and mixed-precision rejection. Shared coverage includes
+explicit partial finish and rejection of precision inconsistent with the selected
+policy. Shared coverage includes
 leading-Slaney extraction and host processing without optional audio features;
 compiler checks cover the portable facade. Independent GPU perception numerics
 are unvalidated; CPU Ring component evidence is described in the perception
@@ -4996,8 +3674,8 @@ establish native coordinated execution or released-weight conversation parity.
 MLX CPU component coverage stores the same nonzero parameters as F32 and F16
 SafeTensors and selects resident, host-layerwise and disk-streamed policies. F32
 uses the independent tolerance above; F16 compares identical stored precision
-across policies. The prepared provider selects dense F32 execution and charges
-its widened storage, while retaining encoded storage and conservative conversion
+across policies. In this dense fixture, the prepared provider selects F32 execution
+and charges its widened storage, while retaining encoded storage and conservative conversion
 peak accounting separately. Source views exclude neighboring heads; malformed
 hidden width fails before reads. Missing role/weight and mismatched checkpoint
 geometry are rejected before native construction. These component checks do not
@@ -5063,8 +3741,8 @@ Pinned-header admission retains the exact restricted source, selected row recipe
 and encoded/conversion overhead without reading payloads. Matching retained
 selection is reused without slicing twice. Cold physical-format coverage admits
 balanced affine weight/scale/bias rows for TP1 and TP2 and rejects an opposite-rank
-scale even when its shape matches. This format check does not claim native packed
-affine execution through the dedicated dense F32 prepared head.
+scale even when its shape matches. This cold-format check does not establish
+native distributed affine execution or released-checkpoint distributed parity.
 
 ```sh
 CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric -- \

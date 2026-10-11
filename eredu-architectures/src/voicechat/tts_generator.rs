@@ -496,7 +496,7 @@ impl<
     }
 
     /// Finishes a new or partial frame by repeating the controlled transition.
-    /// No second autoregressive invocation or sampling engine is introduced.
+    /// Reuses the frame's autoregressive result and caller-supplied sampling.
     pub fn generate_frame<F>(
         &mut self,
         frame: &TtsFrame<B::Tensor>,

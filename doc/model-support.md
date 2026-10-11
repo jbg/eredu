@@ -107,7 +107,8 @@ components have neutral and MLX CPU numerical coverage. Bounded host PCM/mel
 processing follows the pinned rolling-window schedule and explicit PCM precision.
 Cold speech construction validates component geometry and builds individual
 unloaded units with retained parameter bindings; perception, TTS and codec
-half-precision weights have explicit F32 execution recipes and conversion bounds.
+preparation defaults to F32 execution recipes and conversion bounds. The portable
+speech precision policy also selects eligible F16/BF16 weights and arithmetic.
 Prepared speech materialization binds those units through shared completion
 handling and consumes them into the perception/RNNT, TTS and codec components
 used by the coupled executor. The resulting aggregate retains its bound speech
@@ -120,7 +121,7 @@ policy.
 Perception also executes through the shared resident, host-layerwise and
 disk-streamed providers: subsampling, each Conformer block and the final projection
 are separate units with no pinned learned parameters. Cold binding plans retain
-only their exact source inputs and account for F32 execution conversions. PCM,
+only their exact source inputs and account for selected precision conversions. PCM,
 RNNT and startup-silence composition accept this same provider-backed perception;
 raw encoder features and the language projection come from one traversal.
 Neutral and MLX CPU tests compare streaming outputs and caches across residency
@@ -143,13 +144,13 @@ transaction's cache branch and retains its exact key/value roots through unit
 completion; character execution is stateless. TTS generation, sampling, speech
 rendering and coupled execution accept these selected transformer providers.
 Cold bindings retain exact component sources and select bounded conversion to
-F32 execution weights.
+weights in the admitted format and selected speech precision.
 MoG also uses resident, host-layerwise and disk-streamed providers. Each residual
 block, the final-normalization/logits head and the selected-component bank are
 separate units. Prediction does not acquire the selected bank in bounded execution;
 selected evaluation consumes retained guided hidden values and explicit Gaussian
 draws without repeating the prediction stack. Cold bindings retain only exact MoG
-source inputs and account for F32 execution conversions. TTS generation, RVQ
+source inputs and account for selected precision conversions. TTS generation, RVQ
 refinement, speech sampling/rendering and coupled execution accept the same MoG
 provider contract. Its tensor-parallel execution shards residual MLP projections
 and the large selected-component bank's low-rank dimension through shared placement
@@ -214,9 +215,10 @@ The function head also has resident, host-layerwise and disk-streamed providers
 with one independently leased projection and no static learned head in its graph.
 Input shape, hidden width and floating dtype are checked before acquisition.
 Generic coupled readout uses the same normalized Nemotron tensor for agent and
-function logits, without repeating the backbone traversal. Dedicated prepared
-bindings select dense F32 execution and account for conversion storage;
-ordinary unit construction retains its admitted head representation.
+function logits, without repeating the backbone traversal. Prepared function-head
+bindings retain the admitted dense or affine matrix format, use F32 floating
+weights/companions and account for conversion storage. Ordinary unit construction
+consumes the same formats and companion bindings.
 Balanced vocabulary sharding executes through these same providers and shared
 gathering, including uneven row ranges. Exact communicator preflight precedes
 acquisition, and retained source recipes account for local output storage and

@@ -251,10 +251,11 @@ MoG and codec units through ordinary neural mechanisms. Transformer and convolut
 stacks expose individual blocks; codec codebook depths are separate units.
 `PreparedSpeechConstruction` restricts that catalog to retained component roles
 and returns each module with its exact parameter projection. Missing roles and
-invalid indices fail before module construction. Perception, TTS and codec
-half-precision recipes receive explicit F32 execution casts with input/output
-overlap included in materialization bounds; RNNT and function-head precision
-remain governed by their component equations.
+invalid indices fail before module construction. Default perception, TTS and codec
+preparation selects F32 execution, with input/output conversion overlap included
+in materialization bounds. The portable speech precision policy selects eligible
+narrow perception/TTS weights and arithmetic; RNNT and function-head precision
+are governed by their component equations.
 
 `SpeechConstructionPlan::assemble_with` consumes those units into
 `LearnedSpeechComponents`, preserving the bound parameter objects. The prepared
@@ -287,8 +288,9 @@ are excluded from learned-unit parameter binding.
 construction retains this cold preparation alongside its host assets. Execution
 uses the shared media frontend to extract all 101 centered mel rows, then runs
 fresh causal perception and compacts only the first projected frame. Perception
-remains Float32; the result is cast to the selected backbone precision. RNNT and
-live session state are not supplied to this preparation. The retained coefficient
+uses the selected speech precision with F32 boundary features; the result is cast
+to the selected backbone precision. RNNT and live session state are not supplied
+to this preparation. The retained coefficient
 copy contains 133,184 payload bytes; temporary PCM and mel payloads occupy 64,000
 and 51,712 bytes, respectively, in addition to media tables and neural workspace.
 MLX's `MlxVoiceChatExecution::prepare_silence` invokes this architecture method
@@ -341,8 +343,10 @@ and projection groups. Subsampling, each Conformer block and the final projectio
 are independently materialized execution units; the graph has no learned static
 parameters. Resident `Perception` and provider-backed `LayerwisePerception` use
 these same equations through the ordinary runtime traversal. The pinned streaming
-wrapper keeps perception arithmetic in float32; component execution rejects mixed
-precision.
+wrapper's F32 policy is the default. The portable speech precision policy also
+supports eligible F16/BF16 projections and convolutions while retaining F32
+normalization, residuals and streaming histories; component execution rejects
+parameters or boundary activations that disagree with its selected policy.
 
 `ResidentRuntime::from_units` adopts already-bound modules after checking graph
 group and unit counts, preserving their parameters without constructing replacement
@@ -480,15 +484,16 @@ A local failure retains its original source, and acquired peer leases remain
 owned by ordinary abort/completion handling. These checks protect the head's
 collectives; they do not guard operations inside the Nemotron backbone.
 
-The dedicated prepared function-head path restricts source authority to its exact
-recipes and selects dense F32 execution, including bounded conversion storage.
+Prepared function-head bindings restrict source authority to exact recipes and
+retain the admitted dense or affine matrix format. Floating weights and affine
+companions use F32, with bounded conversion storage included in admission.
 Selected output storage uses local vocabulary rows; source conversion workspace
 and encoded storage remain charged separately. A matching retained tensor
 selection is reused without applying its row slice again; a different communicator
 selection is rejected before payload reads. These component entry points do not
 select a complete distributed VoiceChat session.
-That selection is distinct from the existing resident speech-construction policy,
-which preserves the function head's admitted representation and arithmetic.
+Resident speech construction and bounded providers consume the same retained
+matrix format and companion bindings.
 `PreparedSpeechProviders` retains exact plans for all eleven speech providers before
 binding. Its architecture-owned visitor orders construction and consumes providers
 through `SpeechConstructionPlan::assemble_providers`, also used by resident unit
@@ -1148,14 +1153,16 @@ classifier-free guidance, selected low-rank Gaussian mean and noise equations.
 and logits head, and a selected-component bank containing residual/scale projections
 and low-rank means. `MogExecution::predict` executes only the residual and prediction
 groups; `selected` leases only the component bank and consumes the retained prediction
-without rerunning those groups. Dense F32 parameters use ordinary backend mechanisms;
-only the selected mixture is multiplied. The shared resident and layerwise traversals
-retain prediction, decisions, draws and all moment outputs through unit completion.
+without rerunning those groups. Selected dense parameters use ordinary backend
+mechanisms; only the selected mixture is multiplied. The shared resident and
+layerwise traversals retain prediction, decisions, draws and all moment outputs
+through unit completion.
 
 `PreparedMogBindings` validates the symbolic parameter topology against exact retained
 recipes without reading payloads or allocating native modules. Its restricted source
-excludes neighboring TTS/RVQ parameters and declares bounded conversion to F32 execution
-weights. `materialize_voicechat_mog` consumes this plan through existing MLX resident,
+excludes neighboring TTS/RVQ parameters and declares bounded conversion to selected
+speech projection precision, with F32 normalization and component banks.
+`materialize_voicechat_mog` consumes this plan through existing MLX resident,
 host-layerwise or disk-streamed policies. No learned weights belong to the static role.
 The host policy can lease one unit; disk residency charges the streamer's actual
 within-group transfer window, independently of other groups. These are component
@@ -1559,7 +1566,8 @@ unit. It has no learned static parameters. The shared decoder's
 inventing vocabulary parameters; speech maps those groups to its own execution
 units. `PreparedTtsTransformerBindings` checks admitted shapes and recipes without
 native allocation or payload reads, retains only the selected stack's physical
-inputs, and selects bounded conversion to ordinary F32 execution parameters.
+inputs, and selects bounded conversion to the admitted matrix format and portable
+speech precision policy, with F32 normalization and state.
 MLX consumes that plan through the existing resident, host-layerwise or
 disk-streamed policy, without checkpoint naming or equation dispatch.
 
@@ -9080,8 +9088,8 @@ Application tooling selects capture advancement and replay/output policy. The
 backend supplies generic native collection and replay; it owns no VoiceChat
 configuration or family equations. The safe native wrapper owns process-wide
 Metal export, nesting rejection and cleanup through MLX's existing capture API.
-No new neutral inference capability, unsafe-code exception, native dependency in
-portable crates or public application error parameter is introduced. See
+Diagnostics use the existing native wrapper safety boundary and neutral public
+failure contract; portable crates contain no native diagnostic dependency. See
 [projection diagnostics](projection-baseline.md#affine-projection-diagnostics).
 The safe native completion timer reports command-buffer interval sum, union,
 span, valid interval count and missing timestamps. Union removes overlap; span

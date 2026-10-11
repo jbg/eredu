@@ -1869,11 +1869,12 @@ Provider errors retain their original source through `BackendFailure` and follow
 the enclosing invocation's completion/discard boundary. Publication and tool-call
 commit belong to the enclosing session transaction.
 
-The dedicated prepared head selects dense F32 execution and charges conversion
-storage, independently of the admitted representation retained by existing
-ordinary unit construction. Tensor-parallel providers validate exact vocabulary
-ownership against communicator rank and degree before acquisition and gather
-complete logits through the shared traversal. Input and gathered output remain
+Prepared head bindings retain the admitted dense or affine matrix format, use
+F32 floating weights/companions and charge bounded conversion storage. Ordinary
+and bounded construction consume those same bindings. Tensor-parallel providers
+validate exact vocabulary ownership against communicator rank and degree before
+acquisition and gather complete logits through the shared traversal. Input and
+gathered output remain
 completion roots until the head lease is released. Projection consumes no RNG and
 does not advance a model or conversation frontier. Native TP construction retains
 bounded failure authority and validates the declared vocabulary-gather capacity.

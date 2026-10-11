@@ -164,7 +164,7 @@ impl ConcatKeyValueCache {
     }
 
     // Published prefixes remain immutable for reserved-suffix and concatenating
-    // caches. Legacy overwriting capacity needs physical isolation.
+    // caches. Overwriting storage needs physical isolation.
     pub(crate) fn has_immutable_roots(&self) -> bool {
         self.append_only || self.step <= 1
     }

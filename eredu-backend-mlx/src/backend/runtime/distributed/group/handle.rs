@@ -95,7 +95,7 @@ impl Group {
     }
 
     /// Agrees local preparation before any peer enters a dependent data collective.
-    /// Legacy groups without a retained authority preserve their ordinary behavior.
+    /// Groups without retained authority return their local success directly.
     pub(crate) fn agree_local_phase(
         &self,
         descriptor: [u64; 8],
