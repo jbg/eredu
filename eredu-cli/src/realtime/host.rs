@@ -16,6 +16,10 @@ use std::{
 pub struct HostIo {
     file: Option<WavReader<BufReader<File>>>,
     wav: Option<WavWriter<BufWriter<File>>>,
+    input_recording: Option<WavWriter<BufWriter<File>>>,
+    accepted_samples: u64,
+    input_energy: f64,
+    input_peak: f32,
     #[cfg(feature = "system-audio")]
     microphone: Option<SystemAudioInput>,
     #[cfg(feature = "system-audio")]
@@ -32,6 +36,7 @@ impl HostIo {
     pub fn new(
         file: Option<WavReader<BufReader<File>>>,
         wav: Option<WavWriter<BufWriter<File>>>,
+        input_recording: Option<WavWriter<BufWriter<File>>>,
         args: &Args,
         stop: Arc<AtomicUsize>,
         max_seconds: f64,
@@ -59,11 +64,24 @@ impl HostIo {
         let start = Instant::now();
         #[cfg(feature = "system-audio")]
         if let Some(microphone) = &microphone {
+            let format = microphone.configuration();
+            eprintln!(
+                "microphone: {:?}, {} Hz, {} channels, {} -> mono {} Hz",
+                format.device,
+                format.sample_rate,
+                format.channels,
+                format.sample_format,
+                format.output_sample_rate
+            );
             microphone.start()?;
         }
         Ok(Self {
             file,
             wav,
+            input_recording,
+            accepted_samples: 0,
+            input_energy: 0.0,
+            input_peak: 0.0,
             #[cfg(feature = "system-audio")]
             microphone,
             #[cfg(feature = "system-audio")]
@@ -93,6 +111,23 @@ impl HostIo {
                 Ok(())
             })
             .transpose();
+        let recording: Result<_> = self
+            .input_recording
+            .take()
+            .map(|wav| -> Result<()> {
+                let mut file = wav.finish()?;
+                file.flush()?;
+                Ok(())
+            })
+            .transpose();
+        let rms = (self.input_energy / self.accepted_samples.max(1) as f64).sqrt();
+        eprintln!(
+            "input audio: {} source samples accepted, RMS={:.6} ({:.1} dBFS), peak={:.6}",
+            self.accepted_samples,
+            rms,
+            20.0 * rms.log10(),
+            self.input_peak
+        );
         #[cfg(feature = "system-audio")]
         let playback = if let Some(speaker) = &mut self.speaker {
             let result = if success {
@@ -112,6 +147,7 @@ impl HostIo {
         };
         eprintln!("speaker underrun samples: {}", self.underruns);
         wav?;
+        recording?;
         playback?;
         Ok(())
     }
@@ -153,6 +189,17 @@ impl AudioIo for HostIo {
             return Ok(microphone.read(buffer)?);
         }
         anyhow::bail!("no audio input configured")
+    }
+    fn accepted_input(&mut self, samples: &[f32]) -> Result<()> {
+        if let Some(recording) = &mut self.input_recording {
+            recording.write_samples(samples)?;
+        }
+        self.accepted_samples += samples.len() as u64;
+        for &sample in samples {
+            self.input_energy += f64::from(sample).powi(2);
+            self.input_peak = self.input_peak.max(sample.abs());
+        }
+        Ok(())
     }
     fn write(&mut self, samples: &[f32]) -> Result<()> {
         if let Some(wav) = &mut self.wav {

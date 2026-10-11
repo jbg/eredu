@@ -50,6 +50,12 @@ pub struct Args {
     /// Mono 16 kHz WAV input. Omit to use the microphone.
     #[arg(long)]
     input: Option<PathBuf>,
+    /// Record source PCM accepted by the session as mono 16 kHz float32 WAV.
+    #[arg(long)]
+    record_input: Option<PathBuf>,
+    /// Hide incremental input transcription, shown on stderr by default.
+    #[arg(long)]
+    no_transcription: bool,
     /// Save committed mono 22.05 kHz float32 speech to a new WAV.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -339,11 +345,15 @@ pub fn run(args: Args) -> Result<()> {
             "input plus response tail exceeds --max-frames"
         );
     }
-    let paths = [args.output.as_ref(), args.events.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|p| destination(p))
-        .collect::<Result<Vec<_>>>()?;
+    let paths = [
+        args.output.as_ref(),
+        args.events.as_ref(),
+        args.record_input.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| destination(p))
+    .collect::<Result<Vec<_>>>()?;
     for path in &paths {
         ensure!(
             !path.try_exists()?,
@@ -352,8 +362,8 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
     ensure!(
-        paths.len() != 2 || paths[0] != paths[1],
-        "speech and events must have different paths"
+        paths.iter().collect::<std::collections::HashSet<_>>().len() == paths.len(),
+        "speech, input recording and events must have different paths"
     );
     #[cfg(feature = "projection-profiling")]
     if let Some(path) = &args.projection_profile {
@@ -409,9 +419,15 @@ pub fn run(args: Args) -> Result<()> {
         .as_ref()
         .map(|p| -> Result<_> { Ok(WavWriter::new(BufWriter::new(output_file(p)?), 22_050)?) })
         .transpose()?;
+    let input_recording = args
+        .record_input
+        .as_ref()
+        .map(|p| -> Result<_> { Ok(WavWriter::new(BufWriter::new(output_file(p)?), 16_000)?) })
+        .transpose()?;
     let mut io = host::HostIo::new(
         input,
         waveform,
+        input_recording,
         &args,
         stop,
         (config.max_frames - reserved_frames) as f64 * 0.08,
@@ -422,7 +438,7 @@ pub fn run(args: Args) -> Result<()> {
         .map(|p| output_file(p).map(|f| Box::new(BufWriter::new(f)) as Box<dyn Write>))
         .transpose()?
         .unwrap_or_else(|| Box::new(std::io::sink()));
-    let mut events = events::Events::new(event_file, config.max_frames)?;
+    let mut events = events::Events::new(event_file, config.max_frames, !args.no_transcription)?;
     let options = run::RunOptions {
         chunk_samples: args.chunk_samples,
         tail_frames: args.tail_frames,

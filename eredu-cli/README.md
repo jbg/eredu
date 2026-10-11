@@ -205,6 +205,18 @@ other devices. Headphones avoid acoustic feedback. First Ctrl-C closes capture
 and drains the response tail; a second Ctrl-C cancels. Queue storage is bounded
 by `--audio-buffer-ms`; capture overflow reports a continuity error.
 
+Input transcription appears on stderr as incremental `heard:` fragments by
+default. It uses the model's existing perception output and requires no additional
+inference. `--no-transcription` hides it. The transcription is the model's speech
+recognition output, not an explanation of its response.
+
+For microphone diagnostics, use `--record-input microphone.wav` to save the
+resampled source audio accepted by the session as mono 16 kHz float32 WAV.
+The recording excludes injected silence and response-tail padding. The CLI reports
+the selected microphone device and native format at startup, and accepted sample
+count, RMS level and peak level at shutdown. Background dialogue can reach the
+model even when the operator is silent.
+
 On-load quantization targets eligible backbone/readout, function-head and causal
 speech-transformer projections, uses the bounded prepared-checkpoint cache, and
 keeps sensitive floating operations intact. `--quantize-components` selects a
@@ -228,9 +240,10 @@ eredu realtime --config voicechat.json --input conversation.wav \
 ```
 
 Input WAV must be mono 16 kHz; output is mono 22.05 kHz float32. Output paths must
-be new. Agent text is written to stdout; diagnostics and warm execution percentiles
-are written to stderr. JSONL records committed text, transcription, tools, turns,
-wall time and invocation execution time. Execution timing excludes input pacing
-and output delivery; it does not measure complete microphone-to-speaker latency.
+be new. Agent text is written to stdout; diagnostics, warm execution percentiles
+and input transcription are written to stderr. JSONL records committed text,
+transcription, tools, turns, wall time and invocation execution time. Execution
+timing excludes input pacing and output delivery; it does not measure complete
+microphone-to-speaker latency.
 
 Run `eredu realtime --help` for the complete option list.

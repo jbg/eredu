@@ -12,9 +12,10 @@ pub struct Events {
     live: u64,
     timings: Vec<f64>,
     limit: u64,
+    show_transcription: bool,
 }
 impl Events {
-    pub fn new(sink: Box<dyn Write>, limit: u64) -> Result<Self> {
+    pub fn new(sink: Box<dyn Write>, limit: u64, show_transcription: bool) -> Result<Self> {
         Ok(Self {
             sink,
             start: Instant::now(),
@@ -22,6 +23,7 @@ impl Events {
             live: 0,
             timings: Vec::new(),
             limit,
+            show_transcription,
         })
     }
     pub fn summary(&self) {
@@ -60,6 +62,11 @@ impl Events {
             if let Some(text) = value["text"].as_str() {
                 print!("{text}");
                 io::stdout().flush()?;
+            }
+        }
+        if self.show_transcription && value["event"] == "transcription" {
+            if let Some(text) = value["text"].as_str().filter(|text| !text.is_empty()) {
+                eprintln!("heard: {text}");
             }
         }
         serde_json::to_writer(&mut self.sink, &value)?;

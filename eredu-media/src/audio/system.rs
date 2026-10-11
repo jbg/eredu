@@ -113,8 +113,24 @@ fn capacity(rate: u32, milliseconds: u32) -> Result<usize, SystemAudioError> {
     Ok((rate as usize * milliseconds as usize).div_ceil(1000))
 }
 
+/// Selected native microphone format and its delivered mono rate.
+#[derive(Debug, Clone)]
+pub struct AudioInputConfiguration {
+    /// Exact selected host device name.
+    pub device: String,
+    /// Native interleaved channel count, averaged to mono.
+    pub channels: u16,
+    /// Native samples per second per channel.
+    pub sample_rate: u32,
+    /// Host scalar representation, reported for diagnostics.
+    pub sample_format: String,
+    /// Mono samples per second delivered to callers.
+    pub output_sample_rate: u32,
+}
+
 /// Bounded microphone capture converted to a caller-selected mono sample rate.
 pub struct SystemAudioInput {
+    configuration: AudioInputConfiguration,
     stream: cpal::Stream,
     queue: Consumer<f32>,
     overflow: Arc<AtomicU64>,
@@ -142,6 +158,13 @@ impl SystemAudioInput {
         let overflow = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let format = supported.sample_format();
+        let configuration = AudioInputConfiguration {
+            device: device_name(&device)?,
+            channels: supported.channels(),
+            sample_rate: rate,
+            sample_format: format!("{format:?}"),
+            output_sample_rate: sample_rate,
+        };
         let config = supported.into();
         macro_rules! build {
             ($t:ty) => {
@@ -171,6 +194,7 @@ impl SystemAudioInput {
             _ => return Err(SystemAudioError::Invalid("unsupported input sample format")),
         }?;
         Ok(Self {
+            configuration,
             stream,
             queue,
             overflow,
@@ -180,6 +204,10 @@ impl SystemAudioInput {
             stopped: false,
             flushed: false,
         })
+    }
+    /// Returns the actual selected format without acquiring another stream.
+    pub fn configuration(&self) -> &AudioInputConfiguration {
+        &self.configuration
     }
     /// Starts microphone capture.
     pub fn start(&self) -> Result<(), SystemAudioError> {

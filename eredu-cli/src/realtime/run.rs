@@ -162,6 +162,10 @@ struct PendingResponse {
 pub trait AudioIo {
     fn read(&mut self, buffer: &mut [f32]) -> Result<Option<usize>>;
     fn write(&mut self, samples: &[f32]) -> Result<()>;
+    /// Observes source samples accepted by the session, excluding injected silence.
+    fn accepted_input(&mut self, _samples: &[f32]) -> Result<()> {
+        Ok(())
+    }
     fn clock(&self, recorded: Duration) -> Duration {
         recorded
     }
@@ -443,6 +447,7 @@ fn drive_with_io<S: Session, H: AudioIo>(
                 }
                 if consumed < filled {
                     let accepted = session.submit_pcm(&buffer[consumed..filled])?;
+                    io.accepted_input(&buffer[consumed..consumed + accepted])?;
                     consumed += accepted;
                     source_samples = source_samples
                         .checked_add(accepted as u64)
@@ -1009,6 +1014,7 @@ mod tests {
             reads: usize,
             offset: usize,
             output: Vec<f32>,
+            recorded: Vec<f32>,
             interrupted: bool,
             fail: bool,
         }
@@ -1031,6 +1037,10 @@ mod tests {
                 self.output.extend_from_slice(samples);
                 Ok(())
             }
+            fn accepted_input(&mut self, samples: &[f32]) -> Result<()> {
+                self.recorded.extend_from_slice(samples);
+                Ok(())
+            }
             fn interrupt(&mut self) -> Result<()> {
                 self.interrupted = true;
                 Ok(())
@@ -1042,6 +1052,7 @@ mod tests {
                 reads: 0,
                 offset: 0,
                 output: Vec::new(),
+                recorded: Vec::new(),
                 interrupted: false,
                 fail,
             };
@@ -1066,6 +1077,10 @@ mod tests {
                 assert!(io.interrupted);
                 assert_eq!(fixture.cancellations.len(), 1);
             } else {
+                assert_eq!(
+                    io.recorded,
+                    (1..=1301).map(|i| i as f32).collect::<Vec<_>>()
+                );
                 result.unwrap();
                 assert_eq!(
                     &fixture.consumed[..1301],
