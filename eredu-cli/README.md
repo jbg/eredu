@@ -216,9 +216,62 @@ default. The reference is PCM actually sent to the speaker, including playback
 silence, clipping, underruns and interruptions. Cancellation runs in 10 ms host
 frames after microphone resampling, while capture stays live for user barge-in.
 `--no-echo-cancellation` disables it, for example when comparing headphone input.
-File input and `--no-playback` do not use echo cancellation. No automatic gain
-control or background-noise suppression is applied. Cancellation needs time to
+File input and `--no-playback` do not use echo cancellation. Automatic gain
+control is disabled. Cancellation needs time to
 adapt to the acoustic path; it does not guarantee removal of all speaker leakage.
+
+Push-to-talk, noise suppression and speech admission are opt-in. They configure
+host input processing; the ordinary controlled conversation driver continues to
+receive timed PCM, including silence when input is muted.
+
+- `--push-to-talk` or `--push-to-talk toggle` starts muted. Tap Space to alternate
+  between listening and muted; do not hold it in toggle mode because ordinary
+  terminals can report autorepeat as repeated presses. `--ptt-key enter` or a
+  single ASCII letter/digit selects a different key. PTT requires interactive
+  stdin, stdout and stderr.
+- `--push-to-talk hold` admits capture while the key is held. Unix terminals must
+  support keyboard-enhancement key-release events; unsupported terminals report
+  an error before model loading. Windows console key-release events are native.
+  Terminal focus loss closes admission when reported. The CLI restores terminal
+  mode on normal exit, cancellation and errors. Ctrl-C retains its two-stage
+  close/cancel behavior. Permission follows captured samples through buffering;
+  the echo/noise filters continue operating on real microphone PCM while muted.
+- `--noise-suppression` enables WebRTC moderate suppression. Choose `off`, `low`,
+  `moderate`, `high` or `very-high` explicitly to compare strengths. It operates
+  after microphone resampling, in the same processor as echo cancellation, and
+  works with `--no-playback` or `--no-echo-cancellation`. It is microphone-only;
+  stronger suppression can distort speech and does not identify the intended speaker.
+- `--speech-admission` enables a sustained-level gate for microphone or WAV input.
+  `--speech-threshold-dbfs` sets the opening RMS level after filtering (default
+  `-40`), and `--speech-hysteresis-db` sets the reduction in closing level (default
+  `6`). `--speech-min-ms` rejects shorter peaks (default `80`);
+  `--speech-preroll-ms` retains preceding audio (default `160`);
+  `--speech-hangover-ms` retains quieter endings (default `300`). Pre-roll and
+  hangover use whole 10 ms windows. Admission adds pre-roll plus minimum-duration
+  lookahead, 240 ms with these settings, and preserves the exact source sample
+  count at shutdown. Rejected windows become silence. Distant speech above the
+  threshold still passes; this is level admission, not speaker recognition.
+
+These options combine, so speech admission can reject quiet material while PTT
+is open. Tune the threshold using `--record-input` with admission disabled and
+separate quiet-background and normal-speaking recordings; a whole-session RMS
+includes silence and cannot identify a useful speech threshold by itself.
+
+`--system-prompt` overrides the conversation's system prompt, including one from
+`--config`, without changing input processing. Prompts must contain ASCII text.
+For example:
+
+```sh
+eredu realtime \
+  --model nvidia/NVIDIA-NemotronLabs-VoiceChat-11B \
+  --base-assets nvidia/NVIDIA-Nemotron-Nano-9B-v2 \
+  --quantize 8 --speech-weights f16 --speech-compute f16 \
+  --noise-suppression moderate --speech-admission --speech-threshold-dbfs -35 \
+  --system-prompt 'You are a helpful voice assistant. Wait silently until the user makes a clear request addressed to you. Do not respond to background conversation or incomplete fragments. If a request is unclear, ask a brief clarifying question.'
+```
+
+Add `--push-to-talk` for manual admission. Prompt instructions are an experiment;
+the model may not follow them reliably and they do not replace audio admission.
 
 In an interactive terminal, conversation text appears on stderr as separate
 `Heard:` and `Agent:` lines. Token fragments are joined into readable chunks;
@@ -236,8 +289,9 @@ consumes audio features directly, so a response preceding transcript text does
 not imply that the model has received no audio.
 
 For microphone diagnostics, use `--record-input microphone.wav` to save the
-resampled, echo-processed source audio accepted by the session as mono 16 kHz
+resampled and filtered source audio accepted by the session as mono 16 kHz
 float32 WAV.
+The recording includes PTT/admission silence in place of rejected input.
 The recording excludes injected silence and response-tail padding. The CLI reports
 the selected microphone device and native format at startup, and accepted sample
 count, RMS level and peak level at shutdown. Background dialogue can reach the

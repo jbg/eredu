@@ -4,6 +4,8 @@ mod display;
 mod events;
 mod host;
 mod load;
+#[cfg(feature = "system-audio")]
+mod ptt;
 mod run;
 
 use super::{resolve_model, CachedGgufRole, CliDevice};
@@ -26,6 +28,46 @@ enum QuantizedComponent {
     Backbone,
     FunctionHead,
     Tts,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PushToTalk {
+    Toggle,
+    Hold,
+}
+
+#[derive(Debug, Default, Clone, Copy, ValueEnum)]
+enum NoiseSuppression {
+    #[default]
+    Off,
+    Low,
+    Moderate,
+    High,
+    VeryHigh,
+}
+#[cfg(feature = "system-audio")]
+impl NoiseSuppression {
+    fn processing(self) -> eredu_media::audio::processing::NoiseSuppression {
+        use eredu_media::audio::processing::NoiseSuppression as Level;
+        match self {
+            Self::Off => Level::Off,
+            Self::Low => Level::Low,
+            Self::Moderate => Level::Moderate,
+            Self::High => Level::High,
+            Self::VeryHigh => Level::VeryHigh,
+        }
+    }
+}
+
+fn admission_level(value: &str) -> std::result::Result<f32, String> {
+    let level: f32 = value
+        .parse()
+        .map_err(|_| "expected a dBFS level".to_owned())?;
+    if level.is_finite() && (-100.0..=0.0).contains(&level) {
+        Ok(level)
+    } else {
+        Err("speech threshold must be finite and in -100..=0 dBFS".into())
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -78,6 +120,33 @@ pub struct Args {
     /// Disable acoustic echo cancellation for live microphone/speaker input.
     #[arg(long, conflicts_with_all = ["input", "no_playback"])]
     no_echo_cancellation: bool,
+    /// Optional PTT: tap the key to toggle, or hold it in a key-release-capable terminal.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "toggle", conflicts_with = "input")]
+    push_to_talk: Option<PushToTalk>,
+    /// PTT key: space, enter, or a single ASCII letter/digit.
+    #[arg(long, default_value = "space", requires = "push_to_talk")]
+    ptt_key: String,
+    /// WebRTC noise suppression strength; stronger settings can distort speech.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "moderate", default_value = "off", conflicts_with = "input")]
+    noise_suppression: NoiseSuppression,
+    /// Admit sustained microphone/WAV levels; replace rejected windows with silence.
+    #[arg(long)]
+    speech_admission: bool,
+    /// RMS opening threshold after echo/noise processing, in dBFS.
+    #[arg(long, default_value = "-40", allow_hyphen_values = true, value_parser = admission_level, requires = "speech_admission")]
+    speech_threshold_dbfs: f32,
+    /// Difference between opening and closing levels, in dB.
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=40), requires = "speech_admission")]
+    speech_hysteresis_db: u32,
+    /// Sustained duration required to open admission, in milliseconds.
+    #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u32).range(10..=1000), requires = "speech_admission")]
+    speech_min_ms: u32,
+    /// Audio retained before admitted speech; adds lookahead, in milliseconds.
+    #[arg(long, default_value_t = 160, value_parser = clap::value_parser!(u32).range(0..=1000), requires = "speech_admission")]
+    speech_preroll_ms: u32,
+    /// Audio retained after the level falls below the closing threshold, in milliseconds.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(0..=2000), requires = "speech_admission")]
+    speech_hangover_ms: u32,
     /// Process file input without wall-clock pacing; requires --input --no-playback.
     #[arg(long, requires_all = ["input", "no_playback"])]
     offline: bool,
@@ -299,6 +368,10 @@ pub fn run(args: Args) -> Result<()> {
         #[cfg(not(feature = "system-audio"))]
         anyhow::bail!("device enumeration requires the `system-audio` feature");
     }
+    #[cfg(feature = "system-audio")]
+    if let Some(mode) = args.push_to_talk {
+        ptt::validate(mode, &args.ptt_key)?;
+    }
     args.common.validate()?;
     ensure!(
         args.chunk_samples > 0 && args.chunk_samples <= 1_048_576 && args.max_steps > 0,
@@ -442,7 +515,12 @@ pub fn run(args: Args) -> Result<()> {
         .map(|p| output_file(p).map(|f| Box::new(BufWriter::new(f)) as Box<dyn Write>))
         .transpose()?
         .unwrap_or_else(|| Box::new(std::io::sink()));
-    let mut events = events::Events::new(event_file, config.max_frames, !args.no_transcription)?;
+    let mut events = events::Events::new(
+        event_file,
+        config.max_frames,
+        !args.no_transcription,
+        args.push_to_talk.is_some(),
+    )?;
     let options = run::RunOptions {
         chunk_samples: args.chunk_samples,
         tail_frames: args.tail_frames,
@@ -460,11 +538,16 @@ pub fn run(args: Args) -> Result<()> {
             }),
     };
     eprintln!(
-        "{}; Ctrl-C closes input and drains the response, a second Ctrl-C cancels",
+        "{}; Ctrl-C closes input and drains the response, a second Ctrl-C cancels{}",
         if args.input.is_none() {
             "microphone ready"
         } else {
             "WAV input ready"
+        },
+        if args.push_to_talk.is_some() {
+            "\r"
+        } else {
+            ""
         }
     );
     let result = run::run_io(&mut session, &mut io, &mut events, options, scripts);

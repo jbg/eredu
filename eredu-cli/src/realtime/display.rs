@@ -3,6 +3,31 @@
 use serde_json::Value;
 use std::io::{self, Write};
 
+/// Preserve readable terminal lines while PTT disables the terminal's NL-to-CRLF translation.
+pub struct TerminalLines<W> {
+    pub out: W,
+    pub raw: bool,
+}
+impl<W: Write> Write for TerminalLines<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !self.raw {
+            return self.out.write(bytes);
+        }
+        for part in bytes.split_inclusive(|&b| b == b'\n') {
+            if let Some(line) = part.strip_suffix(b"\n") {
+                self.out.write_all(line)?;
+                self.out.write_all(b"\r\n")?;
+            } else {
+                self.out.write_all(part)?;
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 const LINE_BYTES: usize = 240;
 const PAUSE_MS: u64 = 800;
 

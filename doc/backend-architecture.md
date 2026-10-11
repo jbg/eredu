@@ -236,12 +236,20 @@ no native inference runtime. The CLI drives file and system PCM through the same
 controlled-session adapter; native completion, rollback and neural state remain
 in their existing owners.
 
-`eredu-media::audio::echo` owns optional host WebRTC AEC3 processing, independent
-of model families and accelerator runtimes. System-audio duplex construction
+`eredu-media::audio::processing` owns optional host WebRTC echo cancellation and
+noise suppression, independent of model families and accelerator runtimes. One
+capture processor handles both filters, with or without a playback reference.
+System-audio duplex construction
 connects capture and actual native playback through bounded timestamped reference
 queues; callbacks only convert/copy PCM and update counters. Resampling and echo
-processing run on the capture reader. The CLI chooses whether a live device pair
-uses cancellation; it does not own the filter or its synchronization mechanism.
+processing run on the capture reader. Capture permission follows source samples
+through resampling and processing; filtering continues while delivery is muted.
+`audio::admission` owns bounded level admission with pre-roll and hangover. It
+returns rejected windows as silence and preserves source duration at EOF. The
+CLI owns terminal PTT controls, selects filter/admission configuration and applies
+the same admission mechanism to microphone or WAV input. It does not own filter
+equations or playback-reference synchronization. The controlled speech-session
+driver and model state advance normally during muted input.
 The safe external host-library wrapper retains its own FFI boundary; repository
 crates retain `unsafe_code = "forbid"`.
 

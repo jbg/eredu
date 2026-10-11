@@ -1,4 +1,4 @@
-use super::display::Display;
+use super::display::{Display, TerminalLines};
 use anyhow::Result;
 use serde_json::Value;
 use std::{
@@ -13,11 +13,16 @@ pub struct Events {
     live: u64,
     timings: Vec<f64>,
     limit: u64,
-    display: Display<io::Stderr>,
+    display: Display<TerminalLines<io::Stderr>>,
     interactive: bool,
 }
 impl Events {
-    pub fn new(sink: Box<dyn Write>, limit: u64, show_transcription: bool) -> Result<Self> {
+    pub fn new(
+        sink: Box<dyn Write>,
+        limit: u64,
+        show_transcription: bool,
+        raw_terminal: bool,
+    ) -> Result<Self> {
         let interactive = io::stdout().is_terminal() && io::stderr().is_terminal();
         Ok(Self {
             sink,
@@ -26,7 +31,14 @@ impl Events {
             live: 0,
             timings: Vec::new(),
             limit,
-            display: Display::new(io::stderr(), show_transcription, interactive),
+            display: Display::new(
+                TerminalLines {
+                    out: io::stderr(),
+                    raw: raw_terminal,
+                },
+                show_transcription,
+                interactive,
+            ),
             interactive,
         })
     }

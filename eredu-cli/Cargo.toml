@@ -14,7 +14,7 @@ readme = "README.md"
 [features]
 default = ["mlx", "metal", "realtime", "system-audio"]
 realtime = ["eredu/audio", "dep:eredu-media"]
-system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc"]
+system-audio = ["realtime", "eredu-media/system-audio", "dep:ctrlc", "dep:crossterm"]
 projection-profiling = ["realtime", "eredu/projection-profiling"]
 mlx = ["eredu/mlx", "dep:eredu-backend-mlx"]
 metal = ["mlx", "eredu/metal"]
@@ -43,6 +43,7 @@ serde.workspace = true
 serde_json.workspace = true
 eredu-media = { workspace = true, features = ["audio"], optional = true }
 ctrlc = { version = "3.5", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

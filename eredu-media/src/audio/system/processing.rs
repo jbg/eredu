@@ -1,7 +1,7 @@
 //! Timestamped playback-reference delivery; all DSP runs on the capture reader.
 
 use super::{PcmResampler, StampedSample, SystemAudioError};
-use crate::audio::echo::EchoCanceller;
+use crate::audio::processing::{CaptureProcessingConfig, CaptureProcessor};
 use cpal::{FromSample, Sample};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
@@ -69,6 +69,7 @@ impl RenderTap {
             let sample = StampedSample {
                 value: f32::from_sample(frame[0]),
                 at_ns: first_ns + i as u64 * 1_000_000_000 / u64::from(self.rate),
+                admitted: true,
             };
             if self.queue.push(sample).is_err() && self.enabled.load(Ordering::Acquire) {
                 self.overflow.fetch_add(1, Ordering::Relaxed);
@@ -77,10 +78,9 @@ impl RenderTap {
     }
 }
 
-pub(super) struct EchoInput {
-    reference: RenderReference,
-    render_resampler: PcmResampler,
-    canceller: EchoCanceller,
+pub(super) struct CaptureInput {
+    reference: Option<(RenderReference, PcmResampler)>,
+    canceller: CaptureProcessor,
     capture: VecDeque<f32>,
     render: VecDeque<f32>,
     rate: u32,
@@ -88,13 +88,12 @@ pub(super) struct EchoInput {
     processed: u64,
 }
 
-impl EchoInput {
-    pub fn new(reference: RenderReference, rate: u32) -> Result<Self, SystemAudioError> {
+impl CaptureInput {
+    pub fn new(rate: u32, config: CaptureProcessingConfig) -> Result<Self, SystemAudioError> {
         Ok(Self {
-            render_resampler: PcmResampler::new(reference.rate, rate)?,
-            reference,
-            canceller: EchoCanceller::new(rate)
-                .map_err(|e| SystemAudioError::Echo(e.to_string()))?,
+            reference: None,
+            canceller: CaptureProcessor::new(rate, config)
+                .map_err(|e| SystemAudioError::Processing(e.to_string()))?,
             capture: VecDeque::new(),
             render: VecDeque::new(),
             rate,
@@ -103,10 +102,19 @@ impl EchoInput {
         })
     }
 
+    pub fn attach_reference(&mut self, reference: RenderReference) -> Result<(), SystemAudioError> {
+        let resampler = PcmResampler::new(reference.rate, self.rate)?;
+        self.reference = Some((reference, resampler));
+        Ok(())
+    }
+
     pub fn check(&self) -> Result<(), SystemAudioError> {
-        let lost = self.reference.overflow.load(Ordering::Acquire);
+        let lost = self
+            .reference
+            .as_ref()
+            .map_or(0, |(r, _)| r.overflow.load(Ordering::Acquire));
         if lost != 0 {
-            return Err(SystemAudioError::Echo(format!(
+            return Err(SystemAudioError::Processing(format!(
                 "playback reference overflow: {lost} samples"
             )));
         }
@@ -114,24 +122,27 @@ impl EchoInput {
     }
 
     pub fn stop_reference(&self) {
-        self.reference.enabled.store(false, Ordering::Release);
+        if let Some((reference, _)) = &self.reference {
+            reference.enabled.store(false, Ordering::Release);
+        }
     }
 
     fn analyze_until(&mut self, capture_end_ns: u64) -> Result<(), SystemAudioError> {
         self.check()?;
+        let Some((reference, resampler)) = &mut self.reference else {
+            return Ok(());
+        };
         let frame_len = self.canceller.frame_samples();
         let mut native = [0.0; 1024];
         loop {
             let mut count = 0;
             while count < native.len()
-                && self
-                    .reference
+                && reference
                     .queue
                     .peek()
                     .is_ok_and(|s| s.at_ns <= capture_end_ns)
             {
-                native[count] = self
-                    .reference
+                native[count] = reference
                     .queue
                     .pop()
                     .expect("single reference reader")
@@ -141,13 +152,12 @@ impl EchoInput {
             if count == 0 {
                 break;
             }
-            self.render
-                .extend(self.render_resampler.push(&native[..count])?);
+            self.render.extend(resampler.push(&native[..count])?);
             while self.render.len() >= frame_len {
                 let frame: Vec<_> = self.render.drain(..frame_len).collect();
                 self.canceller
                     .analyze_render(&frame)
-                    .map_err(|e| SystemAudioError::Echo(e.to_string()))?;
+                    .map_err(|e| SystemAudioError::Processing(e.to_string()))?;
             }
         }
         Ok(())
@@ -176,7 +186,7 @@ impl EchoInput {
         self.analyze_until(end_ns)?;
         self.canceller
             .process_capture(frame)
-            .map_err(|e| SystemAudioError::Echo(e.to_string()))?;
+            .map_err(|e| SystemAudioError::Processing(e.to_string()))?;
         self.processed += frame.len() as u64;
         Ok(())
     }
@@ -194,7 +204,7 @@ impl EchoInput {
     }
 }
 
-impl Drop for EchoInput {
+impl Drop for CaptureInput {
     fn drop(&mut self) {
         self.stop_reference();
     }
@@ -203,25 +213,59 @@ impl Drop for EchoInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_reference(reference: RenderReference) -> CaptureInput {
+        let mut input = CaptureInput::new(
+            16_000,
+            CaptureProcessingConfig {
+                echo_cancellation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        input.attach_reference(reference).unwrap();
+        input
+    }
     #[test]
     fn reference_is_bounded_timestamped_and_stops_with_capture() {
         let (mut tap, reference) = reference(16_000, 4, Instant::now());
         tap.capture(&[8192_i16, 8192, 0, 0, -16384, -16384], 2, 1_000_000);
-        let mut input = EchoInput::new(reference, 16_000).unwrap();
-        assert_eq!(input.reference.queue.pop().unwrap().value, 0.25);
-        let silent = input.reference.queue.pop().unwrap();
+        let mut input = with_reference(reference);
+        assert_eq!(
+            input
+                .reference
+                .as_mut()
+                .unwrap()
+                .0
+                .queue
+                .pop()
+                .unwrap()
+                .value,
+            0.25
+        );
+        let silent = input.reference.as_mut().unwrap().0.queue.pop().unwrap();
         assert_eq!((silent.value, silent.at_ns), (0.0, 1_062_500));
-        assert_eq!(input.reference.queue.pop().unwrap().value, -0.5);
+        assert_eq!(
+            input
+                .reference
+                .as_mut()
+                .unwrap()
+                .0
+                .queue
+                .pop()
+                .unwrap()
+                .value,
+            -0.5
+        );
         let mut output = input.push_capture(&[0.0; 161], 0).unwrap();
         output.extend(input.finish().unwrap());
         assert_eq!(output.len(), 161); // Final frame padding never enters model PCM.
         input.stop_reference();
         tap.capture(&[0.5_f32; 20], 1, 0);
-        assert!(input.reference.queue.pop().is_err());
+        assert!(input.reference.as_mut().unwrap().0.queue.pop().is_err());
         assert!(input.check().is_ok());
         let (mut tap, reference) = super::reference(16_000, 1, Instant::now());
         tap.capture(&[0.0_f32; 2], 1, 0);
-        assert!(EchoInput::new(reference, 16_000).unwrap().check().is_err());
+        assert!(with_reference(reference).check().is_err());
     }
 
     #[test]
@@ -236,7 +280,7 @@ mod tests {
             })
             .collect();
         let (mut tap, reference) = reference(native_rate, 8192, Instant::now());
-        let mut echo = EchoInput::new(reference, 16_000).unwrap();
+        let mut echo = with_reference(reference);
         let mut microphone = PcmResampler::new(native_rate, 16_000).unwrap();
         let mut before = Vec::new();
         let mut after = Vec::new();

@@ -15,8 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod echo;
+mod processing;
 mod resample;
+use crate::audio::processing::{CaptureProcessingConfig, NoiseSuppression};
 pub use resample::PcmResampler;
 
 /// Host-device, queue or resampling failure, independent of inference backends.
@@ -37,9 +38,9 @@ pub enum SystemAudioError {
     /// Output cannot accept more samples within its bounded queue.
     #[error("speaker queue remains full")]
     OutputFull,
-    /// Acoustic echo processing or playback-reference continuity failure.
-    #[error("audio echo cancellation: {0}")]
-    Echo(String),
+    /// Capture filtering or playback-reference continuity failure.
+    #[error("audio capture processing: {0}")]
+    Processing(String),
 }
 
 /// Enumerated host device name and directions.
@@ -138,7 +139,9 @@ pub struct SystemAudioInput {
     stream: cpal::Stream,
     queue: Consumer<StampedSample>,
     origin: Instant,
-    echo: Option<echo::EchoInput>,
+    processing: Option<processing::CaptureInput>,
+    capture_enabled: Arc<AtomicBool>,
+    permissions: CapturePermissions,
     overflow: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
     resampler: PcmResampler,
@@ -147,11 +150,30 @@ pub struct SystemAudioInput {
     flushed: bool,
 }
 impl SystemAudioInput {
-    /// Opens the selected/default input device. Capture begins only at `start`.
+    /// Opens the selected/default input device with optional noise suppression.
+    /// Capture begins only at `start`. Filtering uses 16, 32 or 48 kHz output;
+    /// suppression off retains the ordinary resampler's full rate range.
     pub fn new(
         name: Option<&str>,
         sample_rate: u32,
         queue_ms: u32,
+        noise_suppression: NoiseSuppression,
+    ) -> Result<Self, SystemAudioError> {
+        Self::open(
+            name,
+            sample_rate,
+            queue_ms,
+            CaptureProcessingConfig {
+                noise_suppression,
+                ..Default::default()
+            },
+        )
+    }
+    fn open(
+        name: Option<&str>,
+        sample_rate: u32,
+        queue_ms: u32,
+        processing: CaptureProcessingConfig,
     ) -> Result<Self, SystemAudioError> {
         let device = select_device(name, true)?;
         let supported = device.default_input_config().map_err(device_error)?;
@@ -173,6 +195,7 @@ impl SystemAudioInput {
         };
         let config = supported.into();
         let origin = Instant::now();
+        let capture_enabled = Arc::new(AtomicBool::new(true));
         macro_rules! build {
             ($t:ty) => {
                 input_stream::<$t>(
@@ -183,6 +206,7 @@ impl SystemAudioInput {
                     overflow.clone(),
                     failed.clone(),
                     origin,
+                    capture_enabled.clone(),
                 )
             };
         }
@@ -206,7 +230,15 @@ impl SystemAudioInput {
             stream,
             queue,
             origin,
-            echo: None,
+            processing: if processing.echo_cancellation
+                || processing.noise_suppression != NoiseSuppression::Off
+            {
+                Some(processing::CaptureInput::new(sample_rate, processing)?)
+            } else {
+                None
+            },
+            capture_enabled,
+            permissions: CapturePermissions::new(rate, sample_rate),
             overflow,
             failed,
             resampler: PcmResampler::new(rate, sample_rate)?,
@@ -219,6 +251,11 @@ impl SystemAudioInput {
     pub fn configuration(&self) -> &AudioInputConfiguration {
         &self.configuration
     }
+    /// Enables or silences captured PCM at its source position. Filtering still
+    /// consumes the real signal so echo/noise estimation remains active.
+    pub fn set_capture_enabled(&self, enabled: bool) {
+        self.capture_enabled.store(enabled, Ordering::Release);
+    }
     /// Starts microphone capture.
     pub fn start(&self) -> Result<(), SystemAudioError> {
         self.stream.play().map_err(device_error)
@@ -227,7 +264,7 @@ impl SystemAudioInput {
     pub fn stop(&mut self) -> Result<(), SystemAudioError> {
         self.stream.pause().map_err(device_error)?;
         self.stopped = true;
-        if let Some(echo) = &self.echo {
+        if let Some(echo) = &self.processing {
             echo.stop_reference();
         }
         Ok(())
@@ -249,6 +286,7 @@ impl SystemAudioInput {
                             first_ns = v.at_ns;
                         }
                         native[count] = v.value;
+                        self.permissions.native.push_back(v.admitted);
                         count += 1;
                     }
                     Err(_) => break,
@@ -256,7 +294,8 @@ impl SystemAudioInput {
             }
             if count != 0 {
                 let samples = self.resampler.push(&native[..count])?;
-                if let Some(echo) = &mut self.echo {
+                self.permissions.convert(samples.len());
+                if let Some(echo) = &mut self.processing {
                     self.pending.extend(echo.push_capture(&samples, first_ns)?);
                 } else {
                     self.pending.extend(samples);
@@ -264,7 +303,8 @@ impl SystemAudioInput {
             }
             if self.stopped && self.queue.slots() == 0 && !self.flushed {
                 let samples = self.resampler.finish()?;
-                if let Some(echo) = &mut self.echo {
+                self.permissions.convert(samples.len());
+                if let Some(echo) = &mut self.processing {
                     self.pending.extend(echo.push_capture(&samples, first_ns)?);
                     self.pending.extend(echo.finish()?);
                 } else {
@@ -275,7 +315,17 @@ impl SystemAudioInput {
         }
         let count = buffer.len().min(self.pending.len());
         for value in &mut buffer[..count] {
-            *value = self.pending.pop_front().unwrap();
+            let sample = self.pending.pop_front().unwrap();
+            *value = if self
+                .permissions
+                .converted
+                .pop_front()
+                .expect("one permission per processed sample")
+            {
+                sample
+            } else {
+                0.0
+            };
         }
         Ok(if count != 0 || self.flushed {
             Some(count)
@@ -285,7 +335,7 @@ impl SystemAudioInput {
     }
     /// Reports callback errors or continuity loss to the application thread.
     pub fn check(&self) -> Result<(), SystemAudioError> {
-        if let Some(echo) = &self.echo {
+        if let Some(echo) = &self.processing {
             echo.check()?;
         }
         if self.failed.load(Ordering::Acquire) {
@@ -305,6 +355,42 @@ impl SystemAudioInput {
 struct StampedSample {
     value: f32,
     at_ns: u64,
+    admitted: bool,
+}
+
+// Keep admission attached to the captured samples across resampling and the
+// processor's 10 ms buffering, rather than applying the latest key state to old PCM.
+struct CapturePermissions {
+    native: std::collections::VecDeque<bool>,
+    converted: std::collections::VecDeque<bool>,
+    from: u64,
+    to: u64,
+    native_start: u64,
+    emitted: u64,
+}
+impl CapturePermissions {
+    fn new(from: u32, to: u32) -> Self {
+        Self {
+            native: Default::default(),
+            converted: Default::default(),
+            from: u64::from(from),
+            to: u64::from(to),
+            native_start: 0,
+            emitted: 0,
+        }
+    }
+    fn convert(&mut self, count: usize) {
+        for _ in 0..count {
+            let source = self.emitted * self.from / self.to;
+            while self.native_start < source {
+                self.native.pop_front().expect("captured permission");
+                self.native_start += 1;
+            }
+            self.converted
+                .push_back(*self.native.front().expect("captured permission"));
+            self.emitted += 1;
+        }
+    }
 }
 
 /// Opens ordinary capture/playback with a shared timestamped speaker reference
@@ -316,14 +402,24 @@ pub fn duplex(
     input_rate: u32,
     output_rate: u32,
     queue_ms: u32,
+    noise_suppression: NoiseSuppression,
 ) -> Result<(SystemAudioInput, SystemAudioOutput), SystemAudioError> {
-    let mut input = SystemAudioInput::new(input_name, input_rate, queue_ms)?;
+    let mut input = SystemAudioInput::open(
+        input_name,
+        input_rate,
+        queue_ms,
+        CaptureProcessingConfig {
+            echo_cancellation: true,
+            noise_suppression,
+        },
+    )?;
     let (output, reference) =
         SystemAudioOutput::open(output_name, output_rate, queue_ms, Some(input.origin))?;
-    input.echo = Some(echo::EchoInput::new(
-        reference.expect("requested playback reference"),
-        input_rate,
-    )?);
+    input
+        .processing
+        .as_mut()
+        .expect("AEC configured")
+        .attach_reference(reference.expect("requested playback reference"))?;
     Ok((input, output))
 }
 
@@ -335,6 +431,7 @@ fn input_stream<T: SizedSample + Send + 'static>(
     overflow: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
     origin: Instant,
+    capture_enabled: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, SystemAudioError>
 where
     f32: FromSample<T>,
@@ -357,6 +454,7 @@ where
                     &failed,
                     start.as_nanos() as u64,
                     sample_rate,
+                    capture_enabled.load(Ordering::Acquire),
                 );
             },
             move |_| {
@@ -374,6 +472,7 @@ fn capture<T: Sample>(
     failed: &AtomicBool,
     first_ns: u64,
     sample_rate: u32,
+    admitted: bool,
 ) where
     f32: FromSample<T>,
 {
@@ -391,6 +490,7 @@ fn capture<T: Sample>(
             .push(StampedSample {
                 value: sample,
                 at_ns: first_ns + i as u64 * 1_000_000_000 / u64::from(sample_rate),
+                admitted,
             })
             .is_err()
         {
@@ -441,7 +541,7 @@ impl SystemAudioOutput {
         sample_rate: u32,
         queue_ms: u32,
         reference_origin: Option<Instant>,
-    ) -> Result<(Self, Option<echo::RenderReference>), SystemAudioError> {
+    ) -> Result<(Self, Option<processing::RenderReference>), SystemAudioError> {
         let device = select_device(name, false)?;
         let supported = device.default_output_config().map_err(device_error)?;
         let rate = supported.sample_rate();
@@ -466,7 +566,7 @@ impl SystemAudioOutput {
         let config = supported.into();
         let (tap, reference) = match reference_origin {
             Some(origin) => {
-                let (tap, reference) = echo::reference(rate, max_queued, origin);
+                let (tap, reference) = processing::reference(rate, max_queued, origin);
                 (Some(tap), Some(reference))
             }
             None => (None, None),
@@ -730,7 +830,7 @@ fn output_stream<T: SizedSample + FromSample<f32> + Send + 'static>(
     channels: usize,
     queue: Consumer<PlaybackSample>,
     state: Arc<PlaybackState>,
-    mut tap: Option<echo::RenderTap>,
+    mut tap: Option<processing::RenderTap>,
 ) -> Result<cpal::Stream, SystemAudioError>
 where
     f32: FromSample<T>,
@@ -766,6 +866,50 @@ where
 mod tests {
     use super::*;
     #[test]
+    fn captured_ptt_permissions_follow_pcm_through_conversion_and_processor_buffering() {
+        for (from, to) in [(48_000, 16_000), (16_000, 48_000)] {
+            let mut resampler = PcmResampler::new(from, to).unwrap();
+            let mut permissions = CapturePermissions::new(from, to);
+            let mut processor = processing::CaptureInput::new(
+                to,
+                CaptureProcessingConfig {
+                    noise_suppression: NoiseSuppression::Low,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            let mut masks = Vec::new();
+            for start in (0..from as usize).step_by(137) {
+                let end = (start + 137).min(from as usize);
+                permissions
+                    .native
+                    .extend((start..end).map(|i| i >= from as usize / 4 && i < from as usize / 2));
+                let samples = resampler.push(&vec![0.1; end - start]).unwrap();
+                permissions.convert(samples.len());
+                let samples = processor.push_capture(&samples, 0).unwrap();
+                for _ in &samples {
+                    masks.push(permissions.converted.pop_front().unwrap());
+                }
+                output.extend(samples);
+            }
+            let samples = resampler.finish().unwrap();
+            permissions.convert(samples.len());
+            let mut samples = processor.push_capture(&samples, 0).unwrap();
+            samples.extend(processor.finish().unwrap());
+            for _ in &samples {
+                masks.push(permissions.converted.pop_front().unwrap());
+            }
+            output.extend(samples);
+            assert_eq!(output.len(), to as usize);
+            assert_eq!(masks.len(), to as usize);
+            assert!(masks[..to as usize / 4].iter().all(|v| !v));
+            assert!(masks[to as usize / 4..to as usize / 2].iter().all(|v| *v));
+            assert!(masks[to as usize / 2..].iter().all(|v| !v));
+            assert!(permissions.converted.is_empty());
+        }
+    }
+    #[test]
     fn capture_downmixes_integer_pcm_and_reports_continuity_loss() {
         let (mut producer, mut consumer) = RingBuffer::new(2);
         let overflow = AtomicU64::new(0);
@@ -778,6 +922,7 @@ mod tests {
             &failed,
             0,
             48_000,
+            true,
         );
         assert_eq!(consumer.pop().unwrap().value, 0.125);
         assert_eq!(consumer.pop().unwrap().value, 0.25);
@@ -791,6 +936,7 @@ mod tests {
             &failed,
             0,
             48_000,
+            true,
         );
         assert!(failed.load(Ordering::Relaxed));
         assert!(consumer.pop().is_err());

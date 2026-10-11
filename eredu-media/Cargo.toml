@@ -13,8 +13,8 @@ readme = "README.md"
 default = []
 image = ["dep:image"]
 audio = ["dep:rustfft"]
-system-audio = ["audio", "echo-cancellation", "dep:cpal", "dep:rtrb", "dep:rubato"]
-echo-cancellation = ["audio", "dep:webrtc-audio-processing"]
+system-audio = ["audio", "audio-processing", "dep:cpal", "dep:rtrb", "dep:rubato"]
+audio-processing = ["audio", "dep:webrtc-audio-processing"]
 
 [lints]
 workspace = true
