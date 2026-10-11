@@ -252,6 +252,7 @@ mod tests {
 /// contract declares no full VoiceChat execution capability.
 pub struct PreparedFunctionHeadBindings {
     dimensions: FunctionHeadDimensions,
+    format: eredu_nn::LinearFormatSpec,
     layout: ExecutionUnitLayout,
     source: SharedCheckpointSource,
     units: Vec<Vec<WeightBinding>>,
@@ -287,11 +288,17 @@ impl PreparedFunctionHeadBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, FunctionHeadPreparationError> {
-        let description = function_head_parameter_description(
-            dimensions,
-            &eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-                .map_err(ChannelError::from)?,
-        )?;
+        let weight = "stt_model.function_head.weight";
+        let primary = parameters
+            .get(weight)
+            .filter(|p| p.component == Component::FunctionHead)
+            .ok_or_else(|| SpeechParameterError::MissingParameter {
+                component: Component::FunctionHead,
+                name: weight.into(),
+            })?;
+        let format = crate::linear_format::standard_linear_format(weight, primary.linear_format)
+            .map_err(ChannelError::from)?;
+        let description = function_head_parameter_description(dimensions, &format)?;
         let layout = description.unit_layout().clone();
         let mut selected_parameter = None;
         let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
@@ -326,8 +333,8 @@ impl PreparedFunctionHeadBindings {
                     return Err(FunctionHeadPreparationError::Geometry(name.into()));
                 }
                 let mut parameter = parameter.clone();
-                // This provider explicitly selects F32 dense execution. The ordinary
-                // resident channel path retains its independent native dtype policy.
+                // Floating parameters use F32 arithmetic; packed matrix storage
+                // retains its admitted encoding and ordinary companion bindings.
                 if matches!(parameter.output.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
                     parameter.recipe = eredu_checkpoint::recipe::DerivedWeightRecipe::Cast {
                         input: Box::new(parameter.recipe),
@@ -343,8 +350,10 @@ impl PreparedFunctionHeadBindings {
                     .ok_or(RecipeError::ArithmeticOverflow(
                         "function head execution peak bytes",
                     ))?;
-                selected_parameter = Some(parameter.clone());
-                if parameter.output.dtype != RecipeDtype::F32 {
+                if name == weight {
+                    selected_parameter = Some(parameter.clone());
+                }
+                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32) {
                     return Err(FunctionHeadPreparationError::Geometry(name.into()));
                 }
                 unit_recipes[ordinal].insert(name.into(), parameter.recipe);
@@ -385,6 +394,7 @@ impl PreparedFunctionHeadBindings {
             .collect::<Result<_, FunctionHeadPreparationError>>()?;
         Ok(Self {
             dimensions,
+            format,
             layout,
             source,
             units,
@@ -407,8 +417,7 @@ impl PreparedFunctionHeadBindings {
                 "function-head component selection requires a tensor-only topology".into(),
             ));
         }
-        let format = eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-            .map_err(ChannelError::from)?;
+        let format = self.format.clone();
         let description = function_head_parameter_description(self.dimensions, &format)?;
         let layout = eredu_runtime::derive_partitioned_local_layout(&description, topology)
             .map_err(FunctionHeadPreparationError::Parallel)?;
@@ -434,8 +443,7 @@ impl PreparedFunctionHeadBindings {
                 "function-head bindings already have a tensor partition".into(),
             ));
         }
-        let format = eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-            .map_err(ChannelError::from)?;
+        let format = self.format.clone();
         super::function_head_layered::function_head_parallel_range(
             self.dimensions,
             &format,
@@ -446,7 +454,11 @@ impl PreparedFunctionHeadBindings {
             .into_iter()
             .map(|unit| place_weight_bindings(unit, self.source.as_ref(), layout))
             .collect::<Result<_, _>>()?;
-        self.parameter.recipe = self.units[0][0].source_recipe();
+        self.parameter.recipe = self.units[0]
+            .iter()
+            .find(|b| b.name() == "stt_model.function_head.weight")
+            .expect("validated primary function weight")
+            .source_recipe();
         self.parameter.output = self.parameter.recipe.infer(self.source.as_ref())?;
         self.parameter.materialization_peak_bytes = self
             .parameter
@@ -492,6 +504,7 @@ impl PreparedFunctionHeadBindings {
         self,
     ) -> (
         FunctionHeadDimensions,
+        eredu_nn::LinearFormatSpec,
         Option<LocalModelLayout>,
         ExecutionUnitLayout,
         SharedCheckpointSource,
@@ -499,6 +512,7 @@ impl PreparedFunctionHeadBindings {
     ) {
         (
             self.dimensions,
+            self.format,
             self.local_layout,
             self.layout,
             self.source,

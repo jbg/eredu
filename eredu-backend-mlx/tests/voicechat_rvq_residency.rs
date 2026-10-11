@@ -115,6 +115,7 @@ fn prepared(dimensions: RvqDimensions, source: SharedCheckpointSource) -> Prepar
             (
                 name.clone(),
                 ParameterAdmission {
+                    linear_format: eredu_checkpoint::LinearFormat::Dense,
                     name,
                     component: Component::Tts,
                     artifact: PhysicalArtifactId::Primary,

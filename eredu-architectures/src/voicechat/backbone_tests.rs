@@ -197,10 +197,17 @@ fn released_gguf_backbone_recipes_pass_normalized_catalog_admission_without_read
         assert_eq!(prepared.parameters().len(), 341);
         assert_eq!(prepared.static_recipes().len(), 3);
         let projected = &prepared.parameters()["model.layers.0.mamba.A_log"];
-        assert_eq!(
-            projected.recipe,
-            admitted.parameters()["stt_model.llm.layers.0.mixer.A_log"].recipe
-        );
+        let original = &admitted.parameters()["stt_model.llm.layers.0.mixer.A_log"];
+        let expected = if original.output.dtype == RecipeDtype::F32 {
+            original.recipe.clone()
+        } else {
+            DerivedWeightRecipe::Cast {
+                input: Box::new(original.recipe.clone()),
+                dtype: RecipeDtype::F32,
+            }
+        };
+        assert_eq!(projected.recipe, expected);
+        assert_eq!(projected.output.dtype, RecipeDtype::F32);
     }
 }
 

@@ -112,7 +112,12 @@ impl SpeechPrecision {
                 }
                 let recipe = binding.source_recipe();
                 let output = recipe.infer(source.as_ref())?;
-                if !self.narrows(
+                if !matches!(
+                    output.dtype,
+                    eredu_checkpoint::recipe::RecipeDtype::F32
+                        | eredu_checkpoint::recipe::RecipeDtype::F16
+                        | eredu_checkpoint::recipe::RecipeDtype::BF16
+                ) || !self.narrows(
                     binding.logical_target().unwrap_or(binding.name()),
                     output.shape.len(),
                 ) || output.dtype == self.weights.recipe()
@@ -124,13 +129,7 @@ impl SpeechPrecision {
                     dtype: self.weights.recipe(),
                 };
                 let bytes = recipe.infer(source.as_ref())?.byte_len();
-                let target = binding.logical_target().map(str::to_owned);
-                let mut replacement =
-                    eredu_runtime::WeightBinding::from_recipe(binding.name(), recipe, bytes)?;
-                if let Some(target) = target {
-                    replacement = replacement.with_logical_target(target)?;
-                }
-                *binding = replacement;
+                *binding = binding.clone().with_source_recipe(recipe, bytes)?;
             }
         }
         Ok(())

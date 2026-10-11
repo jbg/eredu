@@ -71,7 +71,7 @@ impl PreparedBackboneParameters {
     /// payload reads. Only the selected component's exact physical inputs remain
     /// visible, retaining source guards and any original storage transformations.
     pub fn from_parameters(
-        args: ModelArgs,
+        mut args: ModelArgs,
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, BackbonePreparationError> {
@@ -82,7 +82,26 @@ impl PreparedBackboneParameters {
                 "VoiceChat backbone requires one target group".into(),
             ));
         }
-        let parameters = project_parameters(&args, parameters)?;
+        let parameters = project_parameters(&args, parameters)?
+            .into_iter()
+            .map(|(name, parameter)| {
+                super::parameters::execution_parameter(&parameter, &source)
+                    .map(|parameter| (name, parameter))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        // The admitted physical matrix formats are construction authority for
+        // dense and quantized inputs alike, including mixed checkpoint policies.
+        args.quantized_weight_configs = Some(
+            parameters
+                .iter()
+                .filter_map(|(name, parameter)| {
+                    parameter
+                        .linear_format
+                        .weight_quantization()
+                        .map(|format| (name.clone(), format))
+                })
+                .collect(),
+        );
         let mut catalog = BTreeMap::new();
         for (name, parameter) in &parameters {
             let output = parameter.recipe.infer(source.as_ref())?;
@@ -100,7 +119,7 @@ impl PreparedBackboneParameters {
                 dtype => {
                     return Err(BackbonePreparationError::Configuration(format!(
                         "unsupported backbone output dtype {dtype:?} for {name}"
-                    )))
+                    )));
                 }
             };
             catalog.insert(
@@ -196,17 +215,19 @@ pub(crate) fn project_parameters(
         .iter()
         .filter(|(_, p)| p.component == Component::Backbone)
     {
-        let conventional = match name.as_str() {
-            "stt_model.embed_tokens.weight" => "backbone.embeddings.weight".to_owned(),
-            "stt_model.lm_head.weight" => "lm_head.weight".to_owned(),
-            _ => format!(
+        let conventional = if let Some(suffix) = name.strip_prefix("stt_model.embed_tokens.") {
+            format!("backbone.embeddings.{suffix}")
+        } else if let Some(suffix) = name.strip_prefix("stt_model.lm_head.") {
+            format!("lm_head.{suffix}")
+        } else {
+            format!(
                 "backbone.{}",
                 name.strip_prefix("stt_model.llm.").ok_or_else(|| {
                     BackbonePreparationError::Configuration(format!(
                         "unknown backbone identity {name}"
                     ))
                 })?
-            ),
+            )
         };
         let runtime = nemotron_h::checkpoint::normalized_parameter_key(&conventional, args)
             .map_err(BackbonePreparationError::Configuration)?;

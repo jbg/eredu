@@ -149,7 +149,7 @@ pub(in crate::voicechat) fn official_parameters() -> BTreeMap<String, ParameterA
         }
     }
     let catalog = Catalog(checkpoint::tests::official());
-    let plan = checkpoint::safetensors_plan(&config()).unwrap();
+    let plan = checkpoint::safetensors_plan(&config(), &BTreeMap::new()).unwrap();
     resolve_safetensors_plan(&catalog.0, &plan).unwrap();
     let bytes = catalog
         .0
@@ -157,7 +157,15 @@ pub(in crate::voicechat) fn official_parameters() -> BTreeMap<String, ParameterA
         .iter()
         .map(|(key, value)| (key.clone(), value.encoded_byte_len))
         .collect();
-    admit_recipes(&config(), None, &catalog, &bytes, &BTreeMap::new()).unwrap()
+    admit_recipes(
+        &config(),
+        None,
+        &catalog,
+        &bytes,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap()
 }
 
 #[test]

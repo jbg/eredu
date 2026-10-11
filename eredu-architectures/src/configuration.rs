@@ -1521,7 +1521,7 @@ fn resolve_safetensors_architecture(
         SafetensorsModelConfig::NemotronH(args) => crate::nemotron_h::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::VoiceChat(args) => {
-            crate::voicechat::checkpoint::safetensors_plan(args)
+            crate::voicechat::checkpoint::safetensors_plan(args, &args.linear_formats)
                 .map_err(|error| invalid_configuration(kind, error))?
         }
         SafetensorsModelConfig::Moshi(args) => crate::moshi::safetensors_plan(args)

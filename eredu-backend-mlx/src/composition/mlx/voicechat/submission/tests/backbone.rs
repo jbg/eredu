@@ -117,6 +117,7 @@ pub(super) fn function(
     let parameters = BTreeMap::from([(
         name.into(),
         ParameterAdmission {
+            linear_format: eredu_checkpoint::LinearFormat::Dense,
             name: name.into(),
             component: Component::FunctionHead,
             artifact: PhysicalArtifactId::Primary,

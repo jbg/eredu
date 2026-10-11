@@ -659,6 +659,7 @@ fn independent_parameter_metadata() -> ParameterMetadata {
         linear_companion: None,
         linear_companion_of: None,
         linear_row_layout: eredu_nn::LinearRowLayout::Contiguous,
+        storage_layout: eredu_nn::ParameterStorageLayout::Canonical,
     }
 }
 

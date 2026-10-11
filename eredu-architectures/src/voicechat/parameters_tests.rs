@@ -59,6 +59,7 @@ fn fixtures() -> (SharedCheckpointSource, BTreeMap<String, ParameterAdmission>) 
         (
             name.into(),
             ParameterAdmission {
+                linear_format: eredu_checkpoint::LinearFormat::Dense,
                 name: name.into(),
                 component: Component::Tts,
                 artifact: PhysicalArtifactId::Primary,
@@ -229,6 +230,7 @@ fn speech_parameter_units_normalize_execution_precision_without_replacing_source
             shape: vec![2],
         };
         let parameter = ParameterAdmission {
+            linear_format: eredu_checkpoint::LinearFormat::Dense,
             name: name.into(),
             component,
             artifact: PhysicalArtifactId::Primary,

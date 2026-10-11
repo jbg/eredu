@@ -75,13 +75,11 @@ pub fn component_for_key(key: &str) -> Option<Component> {
     if key.starts_with("stt_model.perception.") {
         Some(Component::Perception)
     } else if key.starts_with("stt_model.llm.")
-        || matches!(
-            key,
-            "stt_model.embed_tokens.weight" | "stt_model.lm_head.weight"
-        )
+        || key.starts_with("stt_model.embed_tokens.")
+        || key.starts_with("stt_model.lm_head.")
     {
         Some(Component::Backbone)
-    } else if key == "stt_model.function_head.weight" {
+    } else if key.starts_with("stt_model.function_head.") {
         Some(Component::FunctionHead)
     } else if key.starts_with("stt_model.rnnt_decoder.") || key.starts_with("stt_model.rnnt_joint.")
     {
@@ -106,29 +104,127 @@ pub fn component_for_key(key: &str) -> Option<Component> {
     }
 }
 
-/// Strict official SafeTensors catalog, including integer and preprocessing buffers.
-pub fn safetensors_plan(config: &VoiceChatConfig) -> Result<SafetensorsCheckpointPlan, String> {
+/// Strict released SafeTensors catalog, including affine companions and host buffers.
+pub fn safetensors_plan(
+    config: &VoiceChatConfig,
+    formats: &BTreeMap<String, eredu_checkpoint::LinearFormat>,
+) -> Result<SafetensorsCheckpointPlan, String> {
     config.validate().map_err(|e| e.to_string())?;
     SafetensorsCheckpointPlan::new(
-        "VoiceChat 11B official SafeTensors",
+        "VoiceChat 11B SafeTensors",
         released_catalog()
             .into_iter()
             .map(|t| {
-                SafetensorsTensorConstraint::required(
-                    t.key,
-                    t.shape,
-                    if t.integer {
-                        StoredDtypeConstraint::Exact(StoredDtype::I64)
-                    } else {
-                        StoredDtypeConstraint::Floating
-                    },
-                )
+                if t.integer {
+                    Ok(vec![SafetensorsTensorConstraint::required(
+                        t.key,
+                        t.shape,
+                        StoredDtypeConstraint::Exact(StoredDtype::I64),
+                    )])
+                } else {
+                    eredu_checkpoint::schema::matrix_for_linear_format(
+                        t.key.clone(),
+                        std::iter::empty::<String>(),
+                        t.shape,
+                        formats
+                            .get(&t.key)
+                            .copied()
+                            .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
             })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .flatten()
             .collect(),
         Vec::new(),
         CatalogPolicy::strict(),
     )
     .map_err(|e| e.to_string())
+}
+
+pub(crate) fn validate_linear_formats(
+    formats: &BTreeMap<String, eredu_checkpoint::LinearFormat>,
+) -> Result<(), String> {
+    let eligible: std::collections::BTreeSet<_> = released_catalog()
+        .into_iter()
+        .filter(|t| t.quantized && t.shape.len() == 2 && t.key.ends_with(".weight"))
+        .map(|t| t.key)
+        .collect();
+    for (name, format) in formats {
+        if !eligible.contains(name)
+            || !matches!(
+                format,
+                eredu_checkpoint::LinearFormat::Dense | eredu_checkpoint::LinearFormat::Affine(_)
+            )
+        {
+            return Err(format!("unsupported physical projection format for {name}"));
+        }
+        format.validate().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Normalizes explicit per-module affine declarations into canonical weight names.
+/// Geometry and companions are admitted by the same matrix schema as dense input.
+pub fn configured_formats(
+    source: &serde_json::Value,
+) -> Result<BTreeMap<String, eredu_checkpoint::LinearFormat>, String> {
+    let Some(declarations) = source
+        .get("quantization")
+        .or_else(|| source.pointer("/mlx_conversion/quantization/modules"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let object = declarations
+        .as_object()
+        .ok_or("quantization declarations must be an object")?;
+    let eligible: std::collections::BTreeSet<_> = released_catalog()
+        .into_iter()
+        .filter(|t| t.quantized && t.shape.len() == 2 && t.key.ends_with(".weight"))
+        .map(|t| t.key)
+        .collect();
+    object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "bits" | "group_size" | "mode"))
+        .map(|(module, declaration)| {
+            let name = format!("{module}.weight");
+            if !eligible.contains(&name) {
+                return Err(format!("unknown affine projection {module}"));
+            }
+            let format: eredu_checkpoint::AffineQuantization =
+                serde_json::from_value(declaration.clone()).map_err(|e| e.to_string())?;
+            format.validate().map_err(|e| e.to_string())?;
+            Ok((name, eredu_checkpoint::LinearFormat::Affine(format)))
+        })
+        .collect()
+}
+
+/// Retains physical formats for architecture-declared ordinary projection matrices.
+/// Missing tensors remain ordinary schema errors; no payload is read.
+pub fn safetensors_formats(
+    config: &VoiceChatConfig,
+    catalog: &dyn eredu_checkpoint::validation::SafetensorsCatalog,
+) -> Result<BTreeMap<String, eredu_checkpoint::LinearFormat>, String> {
+    config.validate().map_err(|e| e.to_string())?;
+    let keys: std::collections::BTreeSet<_> = catalog.keys().into_iter().collect();
+    released_catalog()
+        .into_iter()
+        .filter(|t| {
+            !t.integer
+                && t.quantized
+                && t.shape.len() == 2
+                && t.key.ends_with(".weight")
+                && keys.contains(&t.key)
+        })
+        .map(|t| {
+            eredu_checkpoint::schema::infer_matrix_linear_format(catalog, &t.key, &t.shape)
+                .map(|format| (t.key, format))
+                .map_err(|e| e.to_string())
+        })
+        .collect()
 }
 
 /// Strict GGUF physical plan. Quantized convolutions are admitted as storage,
@@ -1070,7 +1166,7 @@ pub(in crate::voicechat) mod tests {
     #[test]
     fn pinned_official_header_admits_all_components_and_rejects_corruption() {
         let original = official();
-        let plan = safetensors_plan(&config()).unwrap();
+        let plan = safetensors_plan(&config(), &BTreeMap::new()).unwrap();
         assert_eq!(
             validate_safetensors_plan(&original, &plan),
             CheckpointValidation::Exact

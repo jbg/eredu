@@ -177,10 +177,7 @@ fn materialize(
     detached_preparation(
         Vec::<Array>::new(),
         || {
-            let (dimensions, local_layout, layout, source, units) = prepared.into_parts();
-            let format =
-                eredu_nn::LinearFormatSpec::unscaled(eredu_checkpoint::LinearFormat::Dense)
-                    .map_err(BackendFailure::from_error)?;
+            let (dimensions, format, local_layout, layout, source, units) = prepared.into_parts();
             let mut architecture = match local_layout.as_ref() {
                 Some(local) => FunctionHeadArchitecture::<MlxNeuralBackend>::new_parallel(
                     dimensions, format, local,

@@ -192,11 +192,21 @@ containers. Opening a role does not rediscover a directory or duplicate a store
 shared with another role.
 
 VoiceChat's portable admission module uses these declarations for perception,
-backbone, function head, TTS, codec and RNNT parameters. It parses the nested NeMo
-configuration declaratively and normalizes the pinned upstream defaults; Python
+backbone, function head, TTS, codec and RNNT parameters. It parses nested NeMo and
+component-based inference configurations into one released equation contract and
+normalizes the pinned upstream defaults; Python
 `_target_` strings are inert. Exact auxiliary assets, canonical source recipes,
 integer-buffer values and embedded GGUF tokenizer declarations are validated
-before retention succeeds. GGUF storage schemas distinguish exact integer types
+before retention succeeds. The checkpoint crate derives ordinary affine matrix
+formats from logical geometry, U32 packing and group companion shapes. VoiceChat
+uses the same strict matrix schema for dense and packed SafeTensors input,
+including atomic scales/biases admission and agreement with explicit configuration
+declarations. Architecture preparation retains these formats for existing
+Nemotron, function-head and speech construction; native bindings do not select a
+checkpoint family or reconstruct quantization policy. Sensitive backbone vectors
+use explicit F32 recipes, while packed projection storage remains encoded. All
+materializations consume the ordinary prepared-checkpoint cache and residency
+contracts. GGUF storage schemas distinguish exact integer types
 from explicit allowed floating/block encodings. GGUF header admission accepts an explicit
 quantized representation before deriving logical names, so quantized buffers and
 rank-three convolutions do not require linear-weight naming. The generic GGUF

@@ -123,9 +123,13 @@ impl PreparedTtsTransformerBindings {
         source: SharedCheckpointSource,
         parameters: &BTreeMap<String, ParameterAdmission>,
     ) -> Result<Self, TtsTransformerPreparationError> {
-        // This selected path executes ordinary F32 projections after bounded
-        // recipe conversion, independently of the checkpoint storage format.
-        let config = config.with_formats(BTreeMap::new());
+        let config = config.with_formats(
+            parameters
+                .iter()
+                .filter(|(_, p)| p.component == Component::Tts)
+                .map(|(name, p)| (name.clone(), p.linear_format))
+                .collect(),
+        );
         let description = tts_transformer_parameter_description(&config)?;
         let layout = description.unit_layout().clone();
         let mut unit_recipes = vec![BTreeMap::new(); layout.len()];
@@ -160,7 +164,7 @@ impl PreparedTtsTransformerBindings {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
                 let parameter = execution_parameter(parameter, &source)?;
-                if parameter.output.dtype != RecipeDtype::F32 {
+                if !matches!(parameter.output.dtype, RecipeDtype::F32 | RecipeDtype::U32) {
                     return Err(TtsTransformerPreparationError::Geometry(name.into()));
                 }
                 unit_recipes[ordinal].insert(name.into(), parameter.recipe);

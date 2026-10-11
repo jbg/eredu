@@ -155,6 +155,7 @@ pub fn prepared(
             (
                 name.clone(),
                 ParameterAdmission {
+                    linear_format: eredu_checkpoint::LinearFormat::Dense,
                     name,
                     component: Component::Perception,
                     artifact: PhysicalArtifactId::Primary,

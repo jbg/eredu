@@ -9,7 +9,7 @@ Prepared speech materialization binds individual learned units and consumes them
 into the components used by the coupled executor, retaining their bound weights.
 `eredu_codec::ear` supplies finite STFT/ConvNeXt waveform encoding and the
 ConvNeXt/ISTFT code-to-waveform decoder. The shared architecture registry
-recognizes the official nested NeMo configuration and complete
+recognizes nested NeMo and component-based VoiceChat configurations and complete
 `nemotron_voicechat` GGUF metadata as realtime VoiceChat. Generic realtime
 preparation retains the sources used to construct a single-device speech
 session. MLX CPU has RNNT, perception, channel-boundary, cached TTS, character
@@ -72,6 +72,17 @@ state, activations and process overhead are separate.
   "seed": 0
 }
 ```
+
+`source.format="safetensors"` accepts the official dense tensors and released
+community affine matrices through one admission and construction path. Matrix
+packing and group geometry determine each format; strict admission checks every
+scale/bias companion and any explicit per-module declaration. Packed matrices
+remain encoded through the ordinary parameter providers and prepared-checkpoint
+cache. Nested NeMo and component-based inference configurations normalize to the
+same released equations; unknown equation overrides are rejected. Community
+sources use the same pinned `official_assets` and `base_assets` above for auxiliary
+configuration, RNNT tokenization and prompt preparation. They require no on-load
+quantization or alternate native loader.
 
 Artifact paths resolve relative to the configuration file. `source.format="gguf"`
 accepts one complete container. `source.format="split_gguf"` requires `perception`,
@@ -2854,6 +2865,95 @@ cargo test -p eredu-backend-mlx --no-default-features --test dense_sampling dens
 cargo test -p eredu-backend-mlx --no-default-features --lib mixed_realtime_observation_preserves_values_and_rejects_reshaped_payloads
 cargo test -p eredu-backend-mlx --no-default-features --lib mixed_realtime_channels_materialize_exact_native_values
 ```
+
+## MLX Community SafeTensors validation
+
+The shared SafeTensors path admits these pinned community artifacts:
+
+| Repository | Revision | Physical matrices |
+| --- | --- | --- |
+| `mlx-community/NemotronLabs-VoiceChat-11B-8bit` | `446fc83f6cde720e7fd9ad7e29d7acb3adbb8967` | 123 affine Q8/group64 |
+| `mlx-community/NemotronLabs-VoiceChat-11B-mlx-8bit` | `ea8e66e303e50babacd640f38c1e3a9312e1b622` | Same three weight shards as the Q8 artifact above |
+| `mlx-community/NemotronLabs-VoiceChat-11B-4bit` | `dffd203fef7a380081da89479c55848e50b98413` | 123 affine Q4/group64 |
+
+The complete Q8 and Q4 downloads are verified against the sizes and SHA256
+digests in each pinned Hugging Face LFS catalog. Both contain all 1,632 released
+primary identities plus 246 scale/bias companions. Metadata admission accepts
+both published configuration forms, preserves the released equations, and rejects
+a declaration whose bit width disagrees with the physical catalog. Quantization
+covers 9,473,228,800 logical backbone/embedding/output-head parameters; speech and
+perception source weights remain BF16. No load-time quantization is applied.
+
+On the 80-core M3 Ultra with 256 GiB unified memory, the release WAV driver processes
+the same mono 16 kHz input fixture (249,734 samples, SHA256
+`481f422a961fb160ddeba9824d55cb7c190c57acb7dc1730a2d595fd078dcb04`), followed by
+800 response-tail frames. Each complete timeline has 996 live frames, or 79.68
+seconds. Resident runs use seed 0, the helpful-assistant prompt, no tools, a
+640-sample input chunk, and the ordinary prepared cache. MLX buffer limits are
+25 operations and 256 MiB. Reported frame times include execution, completion and
+WAV/event publication; loading and the first ten live frames are excluded. Only
+sequential runs without concurrent builds or downloads enter the table. Repeated
+rows pool 986 measured frames per run. Speech columns describe eligible floating
+weight storage and projection/convolution arithmetic; backbone recurrent and
+normalization arithmetic remains F32.
+
+| Checkpoint | Speech weights / arithmetic | Runs | Mean ms | Headroom vs 80 ms | p95 ms | p99 ms | Max ms | Frames over 80 ms | Peak process GiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q8 | F32 / F32 | 1 | 76.47 | 3.53 ms | 78.27 | 78.68 | 80.57 | 1 / 986 | 24.10 |
+| Q8 | F16 / F32 | 1 | 74.34 | 5.66 ms | 75.85 | 76.49 | 134.48 | 1 / 986 | 21.86 |
+| Q8 | F16 / F16 | 2 | 71.33 | 8.67 ms | 72.68 | 72.94 | 75.00 | 0 / 1,972 | 21.82 |
+| Q8 | BF16 / BF16 | 1 | 80.80 | -0.80 ms | 82.22 | 82.57 | 83.96 | 755 / 986 | 21.81 |
+| Q4 | F16 / F16 | 2 | 66.27 | 13.73 ms | 67.66 | 67.98 | 69.82 | 0 / 1,972 | 17.26 |
+
+Q8 F16/F16 means are 71.25 and 71.41 ms; Q4 means are 66.08 and 66.45 ms.
+Peak process footprint includes native state, activations, retained storage and
+allocator overhead, and is separate from the parameter admission ledger. The
+published checkpoints have different quantization coverage from measurements
+that also quantize causal TTS, so those timings are not an identical-weight control.
+
+Q8 F16/F32 produces byte-identical waveform and committed events to the Q8
+F32/F32 run. Both transcribe `o do you know what color the sky is` and answer
+`Hi! How can I help you today?Yes, the sky appears blue due to Rayleigh scattering.`
+F16/F16 preserves that assistant text but transcribes `o the sky is`; its repeated
+runs have identical waveform and events. Q4 repeats are also identical, but include
+unrelated and malformed assistant text before answering the question. Every run
+produces 1,756,952 finite float samples without clipping. These checks establish
+repeatability and the observed fixture behavior, not broad perceptual or language
+quality. Independent complete-model reference parity remains unvalidated.
+
+The official NVIDIA F32 source retains exact regression parity through the same
+loader: the 396-frame fixture produces 698,552 samples with WAV SHA256
+`79a27903f6875dd642c57f6dcaf4c7238f9f6ce3d02923e89d81772a9fe6a4ac` and identical
+committed events. Focused neutral tests reject malformed affine packing and missing
+companions, and reject changed component equations. Affine function-head tests use
+independent nonzero expected logits through resident, host and disk execution and
+preserve companions during TP2 partitioning. Existing GGUF backbone admission tests
+pass with F32 sensitive-vector recipes. Native test consumers and the backend without
+native features compile; a native distributed Q4/Q8 execution run is not part of
+this evidence.
+
+Reproduction uses the ordinary configuration above with `source.path` set to the
+downloaded repository directory and `speech_weights` / `speech_compute` set to the
+table's policy. The conservative measured choice is `"f16"` / `"f32"`.
+
+```sh
+hf download mlx-community/NemotronLabs-VoiceChat-11B-8bit \
+  --revision 446fc83f6cde720e7fd9ad7e29d7acb3adbb8967 \
+  --local-dir /models/voicechat-community-8bit
+cargo build --release -p eredu --no-default-features --features mlx,audio,metal \
+  --example voicechat_wav
+MLX_MAX_OPS_PER_BUFFER=25 MLX_MAX_MB_PER_BUFFER=256 \
+  target/release/examples/voicechat_wav --config voicechat-community.json \
+  --input input-general.wav --output speech.wav --events events.jsonl \
+  --chunk-samples 640 --tail-frames 800 --max-steps 2000
+```
+
+The timing capture wraps the example's JSONL writer with an `Instant` timestamp
+at complete-record publication. That measurement wrapper is outside production
+source; the example's ordinary JSONL schema retains audio timestamps only.
+Pinned catalogs, full shard hashes, timing records, configuration files, audio and
+the captured binary digest are retained in `/private/tmp/eredu-mlx-compat` on the
+validation host.
 
 ## Release contract
 

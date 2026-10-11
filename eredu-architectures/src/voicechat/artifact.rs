@@ -85,6 +85,8 @@ pub enum AdmissionError {
 pub struct ParameterAdmission {
     /// Canonical released identity.
     pub name: String,
+    /// Physical projection format; companions and non-matrix parameters are dense.
+    pub linear_format: eredu_checkpoint::LinearFormat,
     /// Architecture component owning the parameter.
     pub component: Component,
     /// Physical source authority used by its recipe.
@@ -112,10 +114,25 @@ pub struct AdmittedVoiceChatSource {
 }
 
 impl AdmittedVoiceChatSource {
-    /// Admits the complete official SafeTensors catalog using retained shard identities.
+    /// Admits the released dense or affine SafeTensors catalog and retained shards.
     pub fn safetensors(path: &Path, config: &VoiceChatConfig) -> Result<Self, AdmissionError> {
         let catalog = SafetensorsMetadataCatalog::discover(path)?;
-        let plan = checkpoint::safetensors_plan(config).map_err(AdmissionError::InvalidArtifact)?;
+        let formats = checkpoint::safetensors_formats(config, &catalog)
+            .map_err(AdmissionError::InvalidArtifact)?;
+        for (name, declared) in &config.linear_formats {
+            if formats
+                .get(name)
+                .copied()
+                .unwrap_or(eredu_checkpoint::LinearFormat::Dense)
+                != *declared
+            {
+                return Err(AdmissionError::InvalidArtifact(format!(
+                    "declared projection format disagrees with physical storage for {name}"
+                )));
+            }
+        }
+        let plan = checkpoint::safetensors_plan(config, &formats)
+            .map_err(AdmissionError::InvalidArtifact)?;
         let resolution =
             resolve_safetensors_plan(&catalog, &plan).map_err(AdmissionError::Schema)?;
         let bytes = catalog
@@ -123,7 +140,7 @@ impl AdmittedVoiceChatSource {
             .iter()
             .map(|(k, v)| (k.clone(), v.encoded_byte_len))
             .collect();
-        let parameters = admit_recipes(config, None, &catalog, &bytes, &BTreeMap::new())?;
+        let parameters = admit_recipes(config, None, &catalog, &bytes, &BTreeMap::new(), &formats)?;
         Ok(Self {
             config: config.clone(),
             physical: PhysicalArtifactPreparation::Safetensors {
@@ -216,6 +233,7 @@ impl AdmittedVoiceChatSource {
             &catalog,
             &bytes,
             &conversion_workspace,
+            &BTreeMap::new(),
         )?;
         Ok(Self {
             config: config.clone(),
@@ -241,9 +259,25 @@ fn admit_recipes(
     catalog: &impl RecipeCatalog,
     bytes: &BTreeMap<String, u64>,
     conversion_workspace: &BTreeMap<String, u64>,
+    formats: &BTreeMap<String, eredu_checkpoint::LinearFormat>,
 ) -> Result<BTreeMap<String, ParameterAdmission>, AdmissionError> {
-    checkpoint::canonical_recipes(config, layout)
-        .map_err(AdmissionError::InvalidArtifact)?
+    let mut recipes =
+        checkpoint::canonical_recipes(config, layout).map_err(AdmissionError::InvalidArtifact)?;
+    for (name, format) in formats {
+        if let eredu_checkpoint::LinearFormat::Affine(_) = format {
+            let prefix = name
+                .strip_suffix(".weight")
+                .expect("declared projection matrix");
+            for suffix in ["scales", "biases"] {
+                let companion = format!("{prefix}.{suffix}");
+                recipes.insert(
+                    companion.clone(),
+                    DerivedWeightRecipe::source(companion, TensorSelection::Full),
+                );
+            }
+        }
+    }
+    recipes
         .into_iter()
         .map(|(name, recipe)| {
             let output = recipe.infer(catalog)?;
@@ -287,6 +321,10 @@ fn admit_recipes(
             Ok((
                 name.clone(),
                 ParameterAdmission {
+                    linear_format: formats
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
                     name,
                     component,
                     artifact: PhysicalArtifactId::Primary,
@@ -405,7 +443,9 @@ impl VoiceChatArtifactPlan {
         assets: PreparedVoiceChatAssets,
         max_cached_readers: usize,
     ) -> Result<RetainedVoiceChatArtifacts, AdmissionError> {
-        if VoiceChatConfig::from_value(assets.configuration())? != self.config {
+        let mut asset_config = VoiceChatConfig::from_value(assets.configuration())?;
+        asset_config.linear_formats = self.config.linear_formats.clone();
+        if asset_config != self.config {
             return Err(AdmissionError::InvalidArtifact(
                 "retained assets disagree with admitted configuration".into(),
             ));
@@ -635,7 +675,7 @@ fn read_integer_range(
             _ => {
                 return Err(StoreError::Internal(
                     "integer source converted to non-dense storage".into(),
-                ))
+                ));
             }
         }
     } else {

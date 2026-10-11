@@ -217,6 +217,7 @@ fn native_backbone_residency_preserves_prefill_cached_dual_logits_and_hybrid_sta
             (
                 name.clone(),
                 ParameterAdmission {
+                    linear_format: eredu_checkpoint::LinearFormat::Dense,
                     name: name.clone(),
                     component: Component::Backbone,
                     artifact: PhysicalArtifactId::Primary,

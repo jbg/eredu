@@ -290,17 +290,23 @@ pub struct VoiceChatConfig {
     pub rnnt: RnntConfig,
     pub tokens: TokenPolicy,
     pub speaker_name: String,
+    /// Exact physical projection formats declared by a checkpoint document.
+    #[serde(skip)]
+    pub linear_formats: std::collections::BTreeMap<String, eredu_checkpoint::LinearFormat>,
 }
 
 impl VoiceChatConfig {
-    /// Read the official NeMo document; a Hugging Face `model_type` is unnecessary.
+    /// Read a declarative inference document; nested NeMo needs no `model_type`.
     pub fn from_json(source: &str) -> Result<Self, ConfigError> {
         Self::from_value(&serde_json::from_str(source)?)
     }
 
     /// Normalize declarative source fields and reject changes to the release.
     pub fn from_value(source: &Value) -> Result<Self, ConfigError> {
-        let config = normalize(source)?;
+        let document = source_document(source)?;
+        let mut config = normalize(&document)?;
+        config.linear_formats = super::checkpoint::configured_formats(source)
+            .map_err(|reason| invalid("quantization", reason))?;
         config.validate()?;
         Ok(config)
     }
@@ -311,6 +317,8 @@ impl VoiceChatConfig {
     /// Runtime sampling and conversational overrides belong to session policy,
     /// rather than modifying the admitted checkpoint's architecture contract.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        super::checkpoint::validate_linear_formats(&self.linear_formats)
+            .map_err(|reason| invalid("quantization", reason))?;
         let release = normalize(&serde_json::from_str(RELEASED)?)?;
         compare(
             "",
@@ -433,6 +441,329 @@ fn known_fields(source: &Value, path: &str, names: &[&str]) -> Result<(), Config
         }
     }
     Ok(())
+}
+
+/// Projects compact component documents onto the same release normalization used
+/// by NeMo artifacts. Omitted release fields use explicit architecture defaults;
+/// every supplied equation/geometry field remains subject to exact validation.
+fn document_field(document: &mut Value, path: &str, value: Value) {
+    let (parent, field) = path.rsplit_once('/').expect("component field pointer");
+    document
+        .pointer_mut(parent)
+        .expect("release component")
+        .as_object_mut()
+        .expect("release component object")
+        .insert(field.into(), value);
+}
+
+fn source_document(source: &Value) -> Result<Value, ConfigError> {
+    if source.get("text_config").is_none() {
+        return Ok(source.clone());
+    }
+    known_fields(
+        source,
+        "",
+        &[
+            "mlx_runtime_config_version",
+            "model_type",
+            "architectures",
+            "text_config",
+            "audio_config",
+            "tts_config",
+            "codec_config",
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+            "silence_token_id",
+            "rnnt_blank_id",
+            "input_sample_rate",
+            "output_sample_rate",
+            "frame_duration",
+            "function_channel_weight",
+            "source_revision",
+            "base_tokenizer_revision",
+            "speaker",
+            "rnnt_vocabulary",
+            "quantization",
+            "quantization_config",
+        ],
+    )?;
+    equals(source, "/model_type", json!("nemotron_voicechat"))?;
+    equals(source, "/mlx_runtime_config_version", json!(2))?;
+    // These are the complete published Nemotron-H inference fields. Unknown
+    // equation overrides must not disappear during document projection.
+    let text = json!({"model_type":"nemotron_h", "vocab_size":131072, "hidden_size":4480,
+        "intermediate_size":15680, "num_hidden_layers":56, "max_position_embeddings":131072,
+        "num_attention_heads":40, "num_key_value_heads":8, "attention_bias":false,
+        "mamba_num_heads":128, "mamba_head_dim":80, "mamba_proj_bias":false,
+        "ssm_state_size":128, "conv_kernel":4, "n_groups":8, "mlp_bias":false,
+        "layer_norm_epsilon":1e-5, "use_bias":false, "use_conv_bias":true,
+        "hybrid_override_pattern":"M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-", "head_dim":128});
+    compare("/text_config", &text, at(source, "/text_config")?)?;
+    known_fields(
+        source,
+        "/text_config",
+        &text
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )?;
+    known_fields(
+        source,
+        "/audio_config",
+        &[
+            "preprocessor",
+            "encoder",
+            "decoder",
+            "joint",
+            "output_dim",
+            "max_symbols",
+        ],
+    )?;
+    known_fields(
+        source,
+        "/audio_config/decoder",
+        &[
+            "pred_hidden",
+            "pred_rnn_layers",
+            "t_max",
+            "dropout",
+            "vocab_size",
+            "blank_as_pad",
+        ],
+    )?;
+    known_fields(
+        source,
+        "/audio_config/joint",
+        &[
+            "joint_hidden",
+            "activation",
+            "dropout",
+            "encoder_hidden",
+            "pred_hidden",
+            "num_classes",
+        ],
+    )?;
+    known_fields(
+        source,
+        "/tts_config",
+        &[
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "sliding_window",
+            "latent_size",
+            "num_quantizers",
+            "codebook_size",
+            "num_delay_speech_tokens",
+            "exponent",
+            "disable_eos_prediction",
+            "use_gated_fusion_for_text_audio",
+            "use_subword_flag_emb",
+            "use_bos_eos_emb",
+            "use_audio_prompt_frozen_projection",
+            "character_encoder",
+            "mog_head",
+            "guidance_scale",
+            "top_p",
+            "noise_scale",
+            "audio_prompt_duration",
+        ],
+    )?;
+    known_fields(
+        source,
+        "/codec_config",
+        &[
+            "sample_rate",
+            "base_channels",
+            "channel_multipliers",
+            "downsample_rates",
+            "blocks_per_stage",
+            "block_kernel_size",
+            "latent_dim",
+            "n_fft",
+            "hop_length",
+            "num_quantizers",
+            "codebook_size",
+        ],
+    )?;
+    for (path, value) in [
+        ("/bos_token_id", json!(1)),
+        ("/eos_token_id", json!(2)),
+        ("/pad_token_id", json!(12)),
+        ("/silence_token_id", json!(11)),
+        ("/rnnt_blank_id", json!(1024)),
+        ("/audio_config/max_symbols", json!(10)),
+    ] {
+        equals(source, path, value)?;
+    }
+    let mut out: Value = serde_json::from_str(RELEASED)?;
+    let mappings = [
+        ("/input_sample_rate", "/data/source_sample_rate"),
+        ("/output_sample_rate", "/data/target_sample_rate"),
+        ("/frame_duration", "/data/frame_length"),
+        ("/speaker", "/model/inference_speaker_name"),
+        (
+            "/function_channel_weight",
+            "/model/stt/model/duplex_function_channel_weight",
+        ),
+        (
+            "/audio_config/preprocessor",
+            "/model/stt/model/perception/preprocessor",
+        ),
+        (
+            "/audio_config/encoder",
+            "/model/stt/model/perception/encoder",
+        ),
+        (
+            "/audio_config/output_dim",
+            "/model/stt/model/perception/output_dim",
+        ),
+        (
+            "/audio_config/decoder/vocab_size",
+            "/_rnnt_merge_info/rnnt_vocab_size",
+        ),
+        (
+            "/audio_config/decoder/vocab_size",
+            "/_rnnt_merge_info/decoder_config/vocab_size",
+        ),
+        (
+            "/audio_config/decoder/blank_as_pad",
+            "/_rnnt_merge_info/decoder_config/blank_as_pad",
+        ),
+        (
+            "/audio_config/joint/num_classes",
+            "/_rnnt_merge_info/joint_config/num_classes",
+        ),
+        (
+            "/rnnt_vocabulary",
+            "/_rnnt_merge_info/joint_config/vocabulary",
+        ),
+        (
+            "/tts_config/character_encoder",
+            "/model/speech_generation/model/tts_config/cas_config/backbone_config/encoder",
+        ),
+        (
+            "/tts_config/mog_head",
+            "/model/speech_generation/model/tts_config/mog_head_config",
+        ),
+        (
+            "/tts_config/guidance_scale",
+            "/model/speech_generation/model/inference_guidance_scale",
+        ),
+        (
+            "/tts_config/top_p",
+            "/model/speech_generation/model/inference_top_p_or_k",
+        ),
+        (
+            "/tts_config/noise_scale",
+            "/model/speech_generation/model/inference_noise_scale",
+        ),
+        (
+            "/tts_config/audio_prompt_duration",
+            "/model/speech_generation/data/audio_prompt_duration",
+        ),
+    ];
+    for (from, to) in mappings {
+        document_field(&mut out, to, at(source, from)?.clone());
+    }
+    // The published compact encoder expresses one context as a list of contexts.
+    let contexts = at(source, "/audio_config/encoder/att_context_size")?;
+    if contexts
+        .as_array()
+        .is_some_and(|x| x.len() == 1 && x[0].is_array())
+    {
+        *out.pointer_mut("/model/stt/model/perception/encoder/att_context_size")
+            .unwrap() = contexts[0].clone();
+    }
+    for key in ["pred_hidden", "pred_rnn_layers", "t_max", "dropout"] {
+        document_field(
+            &mut out,
+            &format!("/_rnnt_merge_info/decoder_config/prednet/{key}"),
+            at(source, &format!("/audio_config/decoder/{key}"))?.clone(),
+        );
+    }
+    for key in [
+        "joint_hidden",
+        "activation",
+        "dropout",
+        "encoder_hidden",
+        "pred_hidden",
+    ] {
+        document_field(
+            &mut out,
+            &format!("/_rnnt_merge_info/joint_config/jointnet/{key}"),
+            at(source, &format!("/audio_config/joint/{key}"))?.clone(),
+        );
+    }
+    for key in [
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "sliding_window",
+    ] {
+        document_field(
+            &mut out,
+            &format!("/model/speech_generation/model/tts_config/backbone_config/{key}"),
+            at(source, &format!("/tts_config/{key}"))?.clone(),
+        );
+    }
+    for key in [
+        "latent_size",
+        "num_quantizers",
+        "codebook_size",
+        "num_delay_speech_tokens",
+        "exponent",
+        "disable_eos_prediction",
+        "use_gated_fusion_for_text_audio",
+        "use_subword_flag_emb",
+        "use_bos_eos_emb",
+        "use_audio_prompt_frozen_projection",
+    ] {
+        document_field(
+            &mut out,
+            &format!("/model/speech_generation/model/tts_config/{key}"),
+            at(source, &format!("/tts_config/{key}"))?.clone(),
+        );
+    }
+    for (from, to) in [
+        ("base_channels", "base_hidden_size"),
+        ("channel_multipliers", "channel_mult"),
+        ("downsample_rates", "rates"),
+        ("blocks_per_stage", "num_blocks"),
+        ("block_kernel_size", "kernel_size"),
+        ("latent_dim", "latent_size"),
+        ("n_fft", "n_fft"),
+        ("hop_length", "hop_length"),
+        ("num_quantizers", "num_quantizers"),
+        ("codebook_size", "codebook_size"),
+    ] {
+        document_field(
+            &mut out,
+            &format!("/model/speech_generation/model/codec_config/{to}"),
+            at(source, &format!("/codec_config/{from}"))?.clone(),
+        );
+    }
+    equals(
+        source,
+        "/codec_config/sample_rate",
+        at(source, "/output_sample_rate")?.clone(),
+    )?;
+    if let (Some(q), Some(other)) = (
+        source.get("quantization"),
+        source.get("quantization_config"),
+    ) {
+        compare("quantization_config", q, other)?;
+    }
+    Ok(out)
 }
 
 fn normalize(source: &Value) -> Result<VoiceChatConfig, ConfigError> {
@@ -913,12 +1244,41 @@ fn normalize(source: &Value) -> Result<VoiceChatConfig, ConfigError> {
         rnnt,
         tokens,
         speaker_name: read(source, "/model/inference_speaker_name")?,
+        linear_formats: std::collections::BTreeMap::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_document_retains_release_equations_and_rejects_overrides() {
+        let source: Value =
+            serde_json::from_str(include_str!("fixtures/community-inference-config.json")).unwrap();
+        let config = VoiceChatConfig::from_value(&source).unwrap();
+        let official = VoiceChatConfig::from_json(RELEASED).unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(official).unwrap()
+        );
+        assert_eq!(config.linear_formats.len(), 123);
+        for (path, replacement) in [
+            ("/tts_config/head_dim", json!(64)),
+            ("/audio_config/encoder/d_model", json!(512)),
+            ("/text_config/layer_norm_epsilon", json!(1e-6)),
+            ("/codec_config/downsample_rates", json!([7, 7, 8])),
+            ("/rnnt_vocabulary/0", json!("changed")),
+            ("/silence_token_id", json!(12)),
+        ] {
+            let mut changed = source.clone();
+            *changed.pointer_mut(path).unwrap() = replacement;
+            assert!(VoiceChatConfig::from_value(&changed).is_err(), "{path}");
+        }
+        let mut changed = source;
+        changed["tts_config"]["rope_theta"] = json!(1234);
+        assert!(VoiceChatConfig::from_value(&changed).is_err());
+    }
 
     #[test]
     fn nested_release_resolves_numerically_material_defaults() {

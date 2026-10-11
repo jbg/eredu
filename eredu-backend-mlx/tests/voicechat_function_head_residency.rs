@@ -111,6 +111,7 @@ fn parameters(source: &SharedCheckpointSource) -> BTreeMap<String, ParameterAdmi
             (
                 name.clone(),
                 ParameterAdmission {
+                    linear_format: eredu_checkpoint::LinearFormat::Dense,
                     name,
                     component: Component::FunctionHead,
                     artifact: PhysicalArtifactId::Primary,
@@ -191,7 +192,7 @@ fn native_function_head_residency_preserves_forced_logits_and_casts_after_reject
             2 * execution_bytes
         );
         assert_eq!(plan.parameter().conversion_workspace_bytes, 0);
-        let (_, _, layout, restricted, units) = plan.into_parts();
+        let (_, _, _, layout, restricted, units) = plan.into_parts();
         assert_eq!(layout.len(), 1);
         assert_eq!(units.len(), 1);
         assert_eq!(binding_bytes(&units[0]).unwrap(), execution_bytes);
@@ -299,7 +300,7 @@ fn function_head_preparation_rejects_missing_wrong_role_and_wrong_shape_without_
         matches!(prepare(&parameters), Err(FunctionHeadPreparationError::Geometry(name)) if name == key)
     );
     parameters.insert(key.into(), saved);
-    let (_, _, _, restricted, _) = prepare(&parameters).unwrap().into_parts();
+    let (_, _, _, _, restricted, _) = prepare(&parameters).unwrap().into_parts();
     assert!(matches!(
         restricted.source_metadata("unrelated.weight"),
         Err(StoreError::UnauthorizedTensor { .. })
@@ -309,3 +310,91 @@ fn function_head_preparation_rejects_missing_wrong_role_and_wrong_shape_without_
 
 #[path = "voicechat_function_head_residency/parallel.rs"]
 mod parallel;
+
+#[test]
+fn affine_function_head_preserves_companions_across_residency_and_partitioning() {
+    for (bits, columns, packed, bytes) in [(4, 8, 0x33333333, 160), (8, 16, 0x03030303, 288)] {
+        assert_affine_function_head(bits, columns, packed, bytes);
+    }
+}
+
+fn assert_affine_function_head(bits: i32, columns: usize, packed: u32, bytes: u64) {
+    use eredu_checkpoint::{AffineQuantization, LinearFormat};
+    use eredu_core::{ParallelRankTopology, ParallelTopology};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("affine.safetensors");
+    let weight: Vec<u8> = (0..4 * columns)
+        .flat_map(|_| packed.to_le_bytes())
+        .collect();
+    let scales: Vec<u8> = [0.5f32, 1., 2., 4.]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let biases: Vec<u8> = [-1f32, -2., -3., -8.]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    serialize_to_file(
+        [
+            (
+                "stt_model.function_head.weight",
+                TensorView::new(Dtype::U32, vec![4, columns], &weight).unwrap(),
+            ),
+            (
+                "stt_model.function_head.scales",
+                TensorView::new(Dtype::F32, vec![4, 1], &scales).unwrap(),
+            ),
+            (
+                "stt_model.function_head.biases",
+                TensorView::new(Dtype::F32, vec![4, 1], &biases).unwrap(),
+            ),
+        ],
+        None,
+        &path,
+    )
+    .unwrap();
+    let source: SharedCheckpointSource = Arc::new(SafetensorsWeightStore::open(&path).unwrap());
+    let mut parameters = parameters(&source);
+    parameters
+        .get_mut("stt_model.function_head.weight")
+        .unwrap()
+        .linear_format = LinearFormat::Affine(AffineQuantization::new(64, bits).unwrap());
+    let dimensions = FunctionHeadDimensions::new(64, 4).unwrap();
+    let prepare = || {
+        PreparedFunctionHeadBindings::from_parameters(dimensions, source.clone(), &parameters)
+            .unwrap()
+    };
+    let (_, _, _, _, _, units) = prepare().into_parts();
+    assert_eq!(binding_bytes(&units[0]).unwrap(), bytes);
+    for rank in 0..2 {
+        let topology =
+            ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), rank).unwrap();
+        let (local, _) = prepare().select_parallel(topology).unwrap();
+        let (_, _, _, _, _, units) = local.into_parts();
+        assert_eq!(binding_bytes(&units[0]).unwrap(), bytes / 2);
+        assert_eq!(units[0].len(), 3);
+    }
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let weights = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let hidden = MlxTensor::full_f32(1., &[1, 1, 64], &stream).unwrap();
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+        )),
+        LayerWeightResidency::DenseDiskStream(
+            DenseDiskStreamLoadOptions::new(1 << 20, 0, 0, 0).unwrap(),
+        ),
+    ] {
+        let (mut head, metadata) =
+            materialize_voicechat_function_head(prepare(), residency, &weights, &stream).unwrap();
+        assert_eq!(metadata.layer_parameter_bytes(), bytes);
+        let actual = head
+            .project(&hidden, &stream)
+            .unwrap()
+            .to_f32_vec(&stream)
+            .unwrap();
+        // q=3, one affine group: each row is respectively 0.5,1,3,4.
+        assert_eq!(actual, [32., 64., 192., 256.]);
+    }
+}

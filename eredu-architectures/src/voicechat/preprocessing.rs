@@ -125,7 +125,7 @@ fn read_float_range(
             _ => {
                 return Err(StoreError::Internal(
                     "non-floating host preprocessing coefficients".into(),
-                ))
+                ));
             }
         };
         (dtype, tensor.data.as_slice())
@@ -143,7 +143,7 @@ fn read_float_range(
         _ => {
             return Err(StoreError::Internal(
                 "non-floating host preprocessing coefficients".into(),
-            ))
+            ));
         }
     };
     if bytes.len() != range.len() * width {
@@ -218,6 +218,7 @@ mod tests {
             parameters.insert(
                 name.into(),
                 ParameterAdmission {
+                    linear_format: eredu_checkpoint::LinearFormat::Dense,
                     name: name.into(),
                     component: Component::Perception,
                     artifact: PhysicalArtifactId::Primary,

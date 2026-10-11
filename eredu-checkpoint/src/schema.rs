@@ -238,6 +238,53 @@ pub enum MatrixConstraintError {
     MissingBlockScaleName { name: String },
 }
 
+/// Resolves dense or affine matrix storage from exact catalog geometry. The
+/// architecture supplies logical dimensions; packed columns determine bit width,
+/// and scale columns determine group size. Ordinary schema validation still
+/// admits all matrix and companion types, shapes and ownership atomically.
+pub fn infer_matrix_linear_format(
+    catalog: &dyn crate::validation::SafetensorsCatalog,
+    name: &str,
+    logical_shape: &[usize],
+) -> Result<LinearFormat, MatrixConstraintError> {
+    let fail = |detail: String| MatrixConstraintError::Invalid { detail };
+    let metadata = catalog.metadata(name).map_err(fail)?;
+    if metadata.stored_dtype != StoredDtype::U32 {
+        return Ok(LinearFormat::Dense);
+    }
+    let input = *logical_shape
+        .last()
+        .ok_or_else(|| MatrixConstraintError::Scalar { name: name.into() })?;
+    let packed = metadata.shape.last().copied().unwrap_or(0);
+    let prefix = name.strip_suffix(".weight").unwrap_or(name);
+    let scale = catalog
+        .metadata(&format!("{prefix}.scales"))
+        .map_err(fail)?;
+    let groups = scale.shape.last().copied().unwrap_or(0);
+    let packed_bits = packed
+        .checked_mul(32)
+        .ok_or_else(|| fail(format!("matrix {name:?} packing overflows")))?;
+    if logical_shape.len() < 2
+        || input == 0
+        || groups == 0
+        || !packed_bits.is_multiple_of(input)
+        || !input.is_multiple_of(groups)
+        || metadata.shape.len() != logical_shape.len()
+        || metadata.shape[..metadata.shape.len() - 1] != logical_shape[..logical_shape.len() - 1]
+        || scale.shape.len() != logical_shape.len()
+        || scale.shape[..scale.shape.len() - 1] != logical_shape[..logical_shape.len() - 1]
+    {
+        return Err(fail(format!(
+            "matrix {name:?} has inconsistent affine packing or groups"
+        )));
+    }
+    let bits = i32::try_from(packed_bits / input).map_err(|e| fail(e.to_string()))?;
+    let group = i32::try_from(input / groups).map_err(|e| fail(e.to_string()))?;
+    crate::AffineQuantization::new(group, bits)
+        .map(LinearFormat::Affine)
+        .map_err(|e| fail(format!("matrix {name:?}: {e}")))
+}
+
 /// Builds a matrix constraint and every companion required by its complete
 /// physical format.
 ///
@@ -714,7 +761,9 @@ pub enum CheckpointPlanError {
     ShapeOverflow { key: String },
     #[error("checkpoint tensor {key:?} has invalid required element count {element_count}")]
     InvalidElementCount { key: String, element_count: usize },
-    #[error("checkpoint tensor {key:?} canonical shape contains {shape_elements} elements, but its required element count is {element_count}")]
+    #[error(
+        "checkpoint tensor {key:?} canonical shape contains {shape_elements} elements, but its required element count is {element_count}"
+    )]
     ElementCountMismatch {
         key: String,
         shape_elements: usize,
@@ -1037,6 +1086,74 @@ checkpoint_plan!(GgufCheckpointPlan, GgufTensorConstraint);
 mod tests {
     use super::*;
     use crate::{BlockFp8Format, BlockFp8ScaleEncoding};
+
+    #[test]
+    fn affine_matrix_admission_derives_packing_and_rejects_incomplete_companions() {
+        use crate::validation::{
+            resolve_safetensors_plan, CatalogTensorMetadata, SafetensorsCatalog,
+        };
+        use std::collections::BTreeMap;
+        struct Catalog(BTreeMap<String, CatalogTensorMetadata>);
+        impl SafetensorsCatalog for Catalog {
+            fn keys(&self) -> Vec<String> {
+                self.0.keys().cloned().collect()
+            }
+            fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+                self.0.get(key).cloned().ok_or_else(|| key.into())
+            }
+        }
+        for bits in [4, 8] {
+            let mut catalog = Catalog(BTreeMap::from([
+                (
+                    "projection.weight".into(),
+                    CatalogTensorMetadata {
+                        shape: vec![3, 64 * bits / 32],
+                        stored_dtype: StoredDtype::U32,
+                    },
+                ),
+                (
+                    "projection.scales".into(),
+                    CatalogTensorMetadata {
+                        shape: vec![3, 1],
+                        stored_dtype: StoredDtype::F32,
+                    },
+                ),
+                (
+                    "projection.biases".into(),
+                    CatalogTensorMetadata {
+                        shape: vec![3, 1],
+                        stored_dtype: StoredDtype::F32,
+                    },
+                ),
+            ]));
+            let format =
+                infer_matrix_linear_format(&catalog, "projection.weight", &[3, 64]).unwrap();
+            assert_eq!(
+                format,
+                LinearFormat::Affine(crate::AffineQuantization::new(64, bits as i32).unwrap())
+            );
+            let constraints = matrix_for_linear_format(
+                "projection.weight",
+                std::iter::empty::<String>(),
+                vec![3, 64],
+                format,
+                None,
+            )
+            .unwrap();
+            let plan = SafetensorsCheckpointPlan::new(
+                "projection",
+                constraints,
+                Vec::new(),
+                CatalogPolicy::strict(),
+            )
+            .unwrap();
+            resolve_safetensors_plan(&catalog, &plan).unwrap();
+            catalog.0.remove("projection.biases");
+            assert!(resolve_safetensors_plan(&catalog, &plan).is_err());
+            catalog.0.get_mut("projection.scales").unwrap().shape = vec![3, 3];
+            assert!(infer_matrix_linear_format(&catalog, "projection.weight", &[3, 64]).is_err());
+        }
+    }
 
     #[test]
     fn block_fp8_matrix_declares_exact_weight_scale_geometry_and_dtype() {

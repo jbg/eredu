@@ -163,17 +163,20 @@ pub(super) fn execution_parameter(
     source: &SharedCheckpointSource,
 ) -> Result<ParameterAdmission, RecipeError> {
     let mut parameter = parameter.clone();
-    // RNNT deliberately consumes its joint parameter dtype, and the function
-    // head follows the Nemotron channel precision. The remaining learned speech
-    // components require F32 parameters at their neural execution boundary.
-    let requires_float32 = matches!(
-        parameter.component,
-        Component::Perception
-            | Component::Tts
-            | Component::CodecEncoder
-            | Component::CodecDecoder
-            | Component::CodecQuantizer
-    );
+    // Sensitive backbone normalization, convolution and recurrent parameters
+    // accumulate in F32. Projection matrices retain their admitted format.
+    // RNNT consumes its joint parameter dtype; other learned speech components
+    // require F32 at their boundary before the selected projection precision.
+    let requires_float32 = (parameter.component == Component::Backbone
+        && parameter.output.shape.len() != 2)
+        || matches!(
+            parameter.component,
+            Component::Perception
+                | Component::Tts
+                | Component::CodecEncoder
+                | Component::CodecDecoder
+                | Component::CodecQuantizer
+        );
     if requires_float32 && matches!(parameter.output.dtype, RecipeDtype::F16 | RecipeDtype::BF16) {
         parameter.recipe = DerivedWeightRecipe::Cast {
             input: Box::new(parameter.recipe),
