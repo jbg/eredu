@@ -683,6 +683,7 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
         SafetensorsModelConfig::NemotronH(c) => nemotron(g, c),
         SafetensorsModelConfig::DeepSeekV3(c) => deepseek_v3(g, c),
         SafetensorsModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
+        SafetensorsModelConfig::DiffusionGemma(c) => diffusion_gemma(g, c),
         SafetensorsModelConfig::Gemma4(c) => gemma(g, c),
         SafetensorsModelConfig::MuseGlimmer(c) => muse(g, c),
         SafetensorsModelConfig::Inkling(c) => inkling(g, c),
@@ -710,6 +711,7 @@ pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
         GgufModelConfig::VoiceChat(c) => super::voicechat::describe(g, c),
         GgufModelConfig::DeepSeekV3(c) => deepseek_v3(g, c),
         GgufModelConfig::DeepSeekV4(c) => deepseek_v4(g, c),
+        GgufModelConfig::DiffusionGemma(c) => diffusion_gemma(g, c),
         GgufModelConfig::Gemma4(c) => gemma(g, c),
         GgufModelConfig::MuseGlimmer(c) => muse(g, c),
         GgufModelConfig::Inkling(c) => inkling(g, c),
@@ -1387,6 +1389,120 @@ fn contained_ff(g: &mut Builder, layer: usize, attrs: Option<MoeAttributes>) {
         None,
     );
     g.get_mut(&id).moe = attrs;
+}
+
+fn diffusion_gemma(g: &mut Builder, c: &crate::diffusion_gemma::FamilyConfig) {
+    let text = &c.text;
+    let width = text.hidden_size as usize;
+    g.node(
+        "text.embedding",
+        ArchitectureNodeKind::Embedding,
+        None,
+        Some("model.decoder.embed_tokens"),
+        Some(width),
+    );
+    g.node(
+        "assembly",
+        ArchitectureNodeKind::Sum,
+        None,
+        None,
+        Some(width),
+    );
+    g.edge("text.embedding", "assembly", ArchitectureEdgeKind::Data);
+    let mut previous = "assembly".to_owned();
+    g.node(
+        "context",
+        ArchitectureNodeKind::Encoder,
+        None,
+        None,
+        Some(width),
+    );
+    g.node(
+        "refinement",
+        ArchitectureNodeKind::DecoderBlock,
+        None,
+        Some("model.decoder.self_conditioning"),
+        Some(width),
+    );
+    g.edge("context", "text.embedding", ArchitectureEdgeKind::Data);
+    g.edge("refinement", "text.embedding", ArchitectureEdgeKind::Data);
+    for (i, policy) in text.layer_schedule.iter().enumerate() {
+        let block = format!("decoder.{i}");
+        g.node(
+            &block,
+            ArchitectureNodeKind::DecoderBlock,
+            None,
+            Some(&format!("model.decoder.layers.{i}")),
+            Some(width),
+        );
+        g.get_mut(&block).layer_index = Some(i);
+        g.decoder_execution(&block, i);
+        g.edge(&previous, &block, ArchitectureEdgeKind::Data);
+        contained_attention(
+            g,
+            i,
+            attention(
+                text.num_attention_heads,
+                policy.num_key_value_heads.get() as i32,
+                policy.head_dim.get() as i32,
+                policy.attention,
+            ),
+        );
+        let sparse = policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe;
+        contained_ff(
+            g,
+            i,
+            sparse.then(|| {
+                let mut routing = moe(
+                    text.num_experts.expect("validated experts"),
+                    text.top_k_experts.expect("validated top k"),
+                    0,
+                    false,
+                    RoutingScoreTransform::SelectedSoftmax,
+                );
+                routing.normalization = Some(RoutingNormalization::None);
+                routing
+            }),
+        );
+        if sparse {
+            g.node(
+                &format!("{block}.dense_feed_forward"),
+                ArchitectureNodeKind::FeedForward,
+                Some(&block),
+                None,
+                None,
+            );
+        }
+        super::components::gemma4::unit_at(g, text, i, "model.decoder");
+        g.attach_parameters(
+            &block,
+            &format!("model.encoder.language_model.layers.{i}.layer_scalar"),
+        );
+        previous = block;
+    }
+    let group = &mut g.descriptor.layer_groups[0];
+    group.id = "shared_text".into();
+    group.label = "Shared context and refinement layers".into();
+    group.weight_sharing = LayerWeightSharing::SharedAcrossPasses;
+    group.passes.push(ArchitectureExecutionPass {
+        index: 1,
+        executions: group.passes[0].executions.clone(),
+    });
+    g.output(
+        &previous,
+        "model.decoder.norm",
+        if text.tie_word_embeddings {
+            "model.decoder.embed_tokens"
+        } else {
+            "lm_head"
+        },
+        width,
+        text.vocab_size as usize,
+    );
+    super::components::gemma4::readout_at(g, text, "model.decoder");
+    if c.vision.is_some() {
+        media(g, "vision");
+    }
 }
 
 fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {

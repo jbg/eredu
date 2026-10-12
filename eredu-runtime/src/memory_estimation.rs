@@ -839,10 +839,12 @@ pub(crate) fn memory_uncertainties(
                     ) {
                         uncertainties.push(format!("{prefix}: FP32 gated-delta output is included; selected scan scratch and lazy state-version retention upper bound unavailable"));
                     }
-                    if let crate::execution_topology::FeedForwardTopology::Unknown { reason } =
-                        &layer.feed_forward
-                    {
-                        uncertainties.push(format!("{prefix}: {reason}"));
+                    for branch in layer.feed_forward.components() {
+                        if let crate::execution_topology::FeedForwardTopology::Unknown { reason } =
+                            branch
+                        {
+                            uncertainties.push(format!("{prefix}: {reason}"));
+                        }
                     }
                 }
             } else if let Some(g) = &execution.workspace {

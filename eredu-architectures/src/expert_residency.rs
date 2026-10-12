@@ -2027,6 +2027,96 @@ pub enum ExpertResidencyCatalogError {
     DuplicateIdentity(ParameterBankKey),
 }
 
+/// Builds independently resident gated-product members from architecture-owned
+/// unit identities and resolved checkpoint projections. Shared invocation count
+/// does not affect either the cache key or the admitted byte geometry.
+pub(crate) fn gated_product_residency_catalog<C, I>(
+    catalog: &C,
+    owner: ExecutionGroupId,
+    bank: usize,
+    experts: usize,
+    banks: I,
+) -> Result<ExpertResidencyCatalog, String>
+where
+    C: RecipeCatalog + ?Sized,
+    I: IntoIterator<
+        Item = Result<
+            (
+                usize,
+                String,
+                eredu_checkpoint::expert::GatedProductExpertRecipes,
+            ),
+            String,
+        >,
+    >,
+{
+    if experts == 0 {
+        return Err("gated-product residency requires a positive expert count".into());
+    }
+    let mut units = Vec::new();
+    for entry in banks {
+        let (unit, path, recipes) = entry?;
+        let outputs =
+            eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &recipes)?;
+        for expert in 0..experts {
+            let selection = TensorSelection::Range {
+                axis: 0,
+                start: expert,
+                end: expert.checked_add(1).ok_or("expert index overflow")?,
+            };
+            let mut parameters = Vec::new();
+            for (binding, target) in [
+                ("gate_up_proj", &recipes.target_gate_up),
+                ("down_proj", &recipes.target_down),
+            ] {
+                let has_companions = ["_scales", "_biases"]
+                    .iter()
+                    .any(|suffix| outputs.contains_key(&format!("{target}{suffix}")));
+                for suffix in ["", "_scales", "_biases"] {
+                    let name = format!("{target}{suffix}");
+                    let Some(recipe) = outputs.get(&name) else {
+                        continue;
+                    };
+                    let recipe = recipe
+                        .select_bounded(catalog, selection.clone())
+                        .map_err(|error| error.to_string())?;
+                    let role = if suffix.is_empty() && !has_companions {
+                        ExpertParameterRole::quantizable_projection(
+                            format!("{binding}_scales"),
+                            format!("{binding}_biases"),
+                        )
+                    } else {
+                        ExpertParameterRole::Preserved
+                    };
+                    parameters.push(
+                        ExpertParameterRecipe::new(
+                            format!("{binding}{suffix}"),
+                            name,
+                            recipe,
+                            role,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+            units.push(
+                ExpertResidencyUnit::new(
+                    ParameterBankKey::new(bank, unit, expert),
+                    owner.clone(),
+                    unit,
+                    &path,
+                    ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    ExpertResidencyCatalog::new(units)
+        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

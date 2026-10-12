@@ -128,10 +128,10 @@ impl GenerationLifecycle {
         Ok(())
     }
 
-    /// Completes a prompt prefix after native completion and record delivery,
-    /// retaining prediction zero until the final chunk samples its first token.
-    pub fn complete_prefill(&mut self) -> Result<(), ExecutionControlError> {
-        if self.status() != GenerationStatus::Running || self.boundary.prediction != 0 {
+    /// Completes context or refinement work after settlement and record delivery,
+    /// preserving the authoritative committed-token position.
+    pub fn complete_progress(&mut self) -> Result<(), ExecutionControlError> {
+        if self.status() != GenerationStatus::Running {
             return Err(self.invalid(GenerationStatus::Paused));
         }
         self.boundary.status = GenerationStatus::Paused;

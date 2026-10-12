@@ -282,6 +282,7 @@ fn continuation_fixture(
     let state = |position| ContinuationMemoryPlan {
         current_positions: position,
         additional_input_tokens: additional,
+        query_tokens: 1,
         current_state: MemoryBytes::estimated(0, 100_000, "retained capacity"),
         peak_state: MemoryBytes::estimated(0, 100_000 + additional * 100, "native capacity growth"),
     };
@@ -402,6 +403,7 @@ fn use_generic_topology(request: &mut GenerationMemoryRequest) {
     for domain in &mut request.domains {
         for execution in &mut domain.executions {
             execution.execution_topology = Some(TextExecutionTopology {
+                iterative: None,
                 hidden_size: 32,
                 vocabulary_size: 128,
                 selected_parameter_promotion_bytes: None,
@@ -757,6 +759,7 @@ fn embedded_continuation_fixture(
         target: ContinuationMemoryPlan {
             current_positions: 17,
             additional_input_tokens: extra,
+            query_tokens: 1,
             current_state: MemoryBytes::estimated(0, 100_000, "installed target capacity"),
             peak_state: MemoryBytes::estimated(
                 0,

@@ -115,7 +115,10 @@ fn vision_config(
             .and_then(MetadataValue::as_str)
             .unwrap_or("gelu_pytorch_tanh")
             .to_owned(),
+        input_score_arithmetic: false,
         standardize: optional_bool(metadata, "clip.vision.standardize")?.unwrap_or(false),
+        use_clipped_linears: optional_bool(metadata, "clip.vision.use_clipped_linears")?
+            .unwrap_or(true),
         rope_parameters: Some(HashMap::from([(
             "rope_theta".into(),
             RopeValue::Float(

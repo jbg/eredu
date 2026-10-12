@@ -51,6 +51,19 @@ impl MlxKeyValueLayerState {
 }
 
 impl KeyValueCache for MlxKeyValueLayerState {
+    fn attention_with_transient(
+        &mut self,
+        request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless layer has no retained attention context",
+            )),
+            Self::Device(cache) => cache.attention_with_transient(request, stream),
+            Self::Paged(cache) => cache.attention_with_transient(request, stream),
+        }
+    }
     fn memory_retained_positions(&self) -> Option<u64> {
         match self {
             Self::Stateless => None,

@@ -2387,6 +2387,7 @@ fn main() -> Result<()> {
         } else {
             eredu::api::TextSamplingStrategy::Standard
         },
+        ..Default::default()
     };
     if memory::requested(&args) {
         match memory::report_loaded(

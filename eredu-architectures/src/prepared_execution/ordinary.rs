@@ -99,9 +99,12 @@ impl<B: NeuralBackend, D, P> sealed::Sealed for ReplicatedRoute<'_, B, D, P> {}
 impl<B, D, P, C, E, F> PreparedExecutionRoute<SelectedReplicatedTextRealization, C, E, F>
     for ReplicatedRoute<'_, B, D, P>
 where
-    B: eredu_nn::BlockwiseAttentionBackend,
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend,
     D: ReplicatedTextProfileDispatcher<B, Output = E, Error = F>,
-    <D::AttentionState as LayerRuntimeState<B>>::LayerState: eredu_nn::AttentionCache<B::Tensor>,
+    <D::AttentionState as LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor> + eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     <D::ComponentState as LayerRuntimeState<B>>::LayerState:
         eredu_runtime::RuntimeStateComponents<B>,
     <D::AttentionComponentState as LayerRuntimeState<B>>::LayerState:
@@ -278,6 +281,7 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
+        + eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: LayerRuntimeState<B>,
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
@@ -412,7 +416,7 @@ where
         + Clone
         + 'static,
     S: LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,

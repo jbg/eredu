@@ -471,14 +471,17 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
         vec![1, 2],
     )
     .unwrap();
-    let result = <crate::backend::MlxBackend as TextGenerationBackend>::submit_text_prefill(
+    let result = <crate::backend::MlxBackend as TextGenerationBackend>::submit_text_operation(
         &mut runtime,
-        prompt,
-        &eredu_core::TokenFilter::All,
+        eredu_core::PendingTextInput::Prefill(prompt),
+        Some(&eredu_core::TokenSamplingDecision::new(
+            eredu_core::TokenFilter::All,
+        )),
         &mut state,
     );
     let error = match result {
-        Err(error) => error,
+        Err(eredu_core::TextOperationError::Backend(error)) => error,
+        Err(error) => panic!("unexpected physical-operation policy error: {error}"),
         Ok(_) => panic!("non-finite candidate capture must fail explicitly"),
     };
     assert!(error.to_string().contains("finite"), "{error}");

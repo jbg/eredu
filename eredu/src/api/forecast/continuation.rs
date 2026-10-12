@@ -46,19 +46,24 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     options: &GenerationForecastOptions,
     trace: Option<TraceLimits>,
 ) -> Result<ContinuationForecast, GenerationForecastError> {
-    if !matches!(pending, Some(PendingTextInput::Decode(_))) {
+    if !matches!(
+        pending,
+        Some(PendingTextInput::Decode(_) | PendingTextInput::Continue)
+    ) {
         return Err(GenerationForecastError::UnsupportedContinuation(
-            "requires an advanced ordinary continuation with a pending decode token".into(),
+            "requires an advanced continuation with retained physical input authority".into(),
         ));
     }
     let inputs = B::continuation_input_tokens(
+        runtime,
+        B::sampling_state(state),
         pending.as_ref().map(|p| match p {
             PendingTextInput::Prefill(p) => PendingTextInput::Prefill(*p),
             PendingTextInput::Decode(t) => PendingTextInput::Decode(*t),
+            PendingTextInput::Continue => PendingTextInput::Continue,
         }),
         additional_tokens,
     )
-    .filter(|n| *n == additional_tokens)
     .ok_or_else(|| {
         GenerationForecastError::UnsupportedContinuation(
             "backend cannot bound the pending decode input".into(),
@@ -77,12 +82,16 @@ pub(crate) fn continuation_forecast<B: ContinuationForecastBackend + TextSnapsho
     let assumptions = profile.loaded.geometry.assumptions.clone();
     let mut forecast = loaded_forecast(
         profile.loaded,
-        InputTokenCount::text(1),
+        InputTokenCount::text(profile.plan.query_tokens),
         0,
         eredu_core::PrefillChunkPolicy::Unchunked,
         ForecastExecutionContract {
             full_pass_reason: None,
-            logits: LogitsWorkspace::FinalPosition,
+            logits: if profile.plan.query_tokens > 1 {
+                LogitsWorkspace::EveryPosition
+            } else {
+                LogitsWorkspace::FinalPosition
+            },
         },
         options,
     )?;

@@ -33,6 +33,17 @@ fn retained_tensor(array: &Array) -> &MlxTensor {
 
 /// A per-layer attention key/value cache.
 pub trait KeyValueCache {
+    /// Reads retained history followed by transient KV without appending or
+    /// evicting context. Visibility comes from the complete explicit mask.
+    fn attention_with_transient(
+        &mut self,
+        _request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<Array, Exception> {
+        Err(Exception::custom(
+            "cache has no read-only transient attention mechanism",
+        ))
+    }
     /// Retained history extent for descriptive append geometry, when available.
     fn memory_retained_positions(&self) -> Option<u64> {
         None

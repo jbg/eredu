@@ -587,10 +587,10 @@ fn ordinary_generation_prefill_revalidates_exact_core_session_admission() {
             .unwrap();
     let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
     let before = crate::tests::support::path_instrumentation::snapshot().forwards;
-    let error = match MlxBackend::submit_text_prefill(
+    let error = match MlxBackend::submit_text_operation(
         &mut runtime,
-        prompt,
-        &TokenFilter::All,
+        eredu_core::PendingTextInput::Prefill(prompt),
+        Some(&eredu_core::TokenSamplingDecision::new(TokenFilter::All)),
         &mut state,
     ) {
         Err(error) => error,
@@ -603,9 +603,14 @@ fn ordinary_generation_prefill_revalidates_exact_core_session_admission() {
     );
     runtime.session_mut().capabilities = admitted;
     let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2]).unwrap();
-    MlxBackend::submit_text_prefill(&mut runtime, prompt, &TokenFilter::All, &mut state)
-        .unwrap()
-        .wait()
-        .unwrap();
+    MlxBackend::submit_text_operation(
+        &mut runtime,
+        eredu_core::PendingTextInput::Prefill(prompt),
+        Some(&eredu_core::TokenSamplingDecision::new(TokenFilter::All)),
+        &mut state,
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
     runtime.synchronize().unwrap();
 }

@@ -103,6 +103,9 @@ where
         eredu_core::ControlledTextGenerationError::Preparation(error) => {
             PreparedChatError::Backend(error)
         }
+        eredu_core::ControlledTextGenerationError::Operation(error) => {
+            PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
+        }
     }
 }
 
@@ -137,6 +140,15 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         (eredu_core::TextGenerationConfig, NonZeroUsize),
         eredu_core::generation::GenerationError,
     > {
+        if B::supports_block_refinement(&self.runtime)
+            && (settings.overrides.has_sampling_overrides()
+                || !matches!(
+                    settings.strategy,
+                    eredu_core::TextSamplingStrategy::Standard
+                ))
+        {
+            return Err(eredu_core::generation::GenerationError::RequiresCausalConditionalScores);
+        }
         let resolved = resolve_generation_config(
             self.checkpoint_generation_config.as_ref(),
             settings.overrides,
@@ -147,7 +159,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             .unwrap_or_else(|| NonZeroUsize::new(256).expect("256 is non-zero"));
         let config = eredu_core::TextGenerationConfig::new(resolved)
             .with_seed(settings.seed)
-            .with_prefill_chunk_policy(settings.prefill);
+            .with_prefill_chunk_policy(settings.prefill)
+            .with_refinement_policy(settings.refinement)
+            .with_draft_events(settings.draft_events);
         let config = match settings.strategy {
             eredu_core::TextSamplingStrategy::Standard => config,
             eredu_core::TextSamplingStrategy::MirostatV2 { tau, eta } => {
@@ -324,23 +338,21 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         )
         .map_err(map_controlled_generation_error)?;
         generator.set_cancellation_token(cancellation.clone());
-        let (on_token, delivery_failure, capture_enabled) =
+        let (on_token, delivery_failure) =
             if let Some((plan, intervention, on_token, delivery_failure)) = capture {
-                let enabled =
-                    !plan.is_empty() || intervention.as_ref().is_some_and(|p| !p.is_empty());
                 if let Some(intervention) = intervention {
                     generator.enable_interventions(plan, intervention)?;
                 } else {
                     generator.enable_capture(plan)?;
                 }
-                (Some(on_token), Some(delivery_failure), enabled)
+                (Some(on_token), Some(delivery_failure))
             } else {
                 generator.finish_text_preparation(
                     Stage::Instrumentation,
                     Ok(()),
                     PreparedChatError::Backend,
                 )?;
-                (None, None, false)
+                (None, None)
             };
         let ready = generator.finish_text_preparation_cancellable(
             Stage::Delivery,
@@ -358,7 +370,6 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             generator,
             on_token,
             delivery_failure,
-            capture_enabled,
             generation_started,
             time_to_first_token: None,
         };
@@ -577,6 +588,13 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         // One vote for the entire batch: a failure in a later lane must not leave
         // peers waiting for a per-lane vote or executing an earlier lane.
         let host = (|| {
+            if B::generation_score_kind(&self.runtime)
+                != eredu_core::refinement::PredictionScoreKind::CausalConditional
+            {
+                return Err(PreparedChatSpeculativeError::Generation(
+                    eredu_core::generation::GenerationError::RequiresCausalConditionalScores,
+                ));
+            }
             scheduler.validate()?;
             lanes
                 .into_iter()

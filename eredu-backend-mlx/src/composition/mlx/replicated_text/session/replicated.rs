@@ -257,7 +257,47 @@ where
     P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
     fn supports_chunked_prefill(&self) -> bool {
-        !P::present() && A::supports_chunked_prefill()
+        !P::present()
+            && A::supports_chunked_prefill()
+            && self.session.prefill_chunking_support().is_ok()
+    }
+
+    fn block_refinement_geometry(
+        &self,
+    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
+        self.session.block_refinement_geometry()
+    }
+
+    fn refine_block_with_observer(
+        &mut self,
+        canvas: &Array,
+        feedback: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        let canvas = MlxTensor::from_array(canvas.clone());
+        let feedback = feedback.cloned().map(MlxTensor::from_array);
+        let input =
+            A::block_refinement_input(&canvas, feedback.as_ref(), None).ok_or_else(|| {
+                Error::ArchitectureModel("causal execution has no tentative-block equation".into())
+            })?;
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
+        self.session
+            .sequence_output_with_observer(
+                input,
+                eredu_runtime::ExpertPass::Decode,
+                stream,
+                &mut observer,
+            )
+            .map(MlxTensor::into_array)
+            .map_err(|error| {
+                Error::after_replicated_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })
     }
 
     fn projects_final_prefill_position(&self) -> bool {
@@ -466,7 +506,7 @@ where
             return Err(Error::Other(Box::new(error)));
         }
         let tokens = MlxTensor::from_array(tokens.clone());
-        let result = self.session.sequence_logits(
+        let result = self.session.sequence_output(
             A::text_input(&tokens, None),
             if prefill {
                 eredu_runtime::ExpertPass::Prefill

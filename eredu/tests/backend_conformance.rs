@@ -65,6 +65,9 @@ const QWEN_TEMPLATE: &str =
 const NO_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX;
 const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
+#[path = "backend_conformance/iterative.rs"]
+mod iterative;
+
 #[path = "backend_conformance/control.rs"]
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
@@ -111,6 +114,7 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 struct MockSession {
+    iterative: bool,
     retention_forecast: bool,
     retention_failure: bool,
     retention_claims: std::sync::Arc<
@@ -229,6 +233,7 @@ impl BackendProvider for MockBackend {
         eredu_core::SessionAdmission::new(model.capabilities())
             .validate(SessionCapabilities::new(true, true, false))?;
         Ok(MockSession {
+            iterative: false,
             retention_forecast: false,
             retention_failure: false,
             retention_claims: Default::default(),
@@ -415,6 +420,28 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
+    fn supports_block_refinement(runtime: &ModelRuntime<Self>) -> bool {
+        runtime.session().iterative
+    }
+    fn text_operation_kind(
+        runtime: &ModelRuntime<Self>,
+        _: &eredu_core::PendingTextInput<Vec<u32>, MockToken>,
+        state: &Self::TextGenerationState,
+    ) -> eredu_core::TextOperationKind {
+        use eredu_core::{
+            refinement::{GenerationPhase, PredictionScoreKind},
+            TextOperationKind,
+        };
+        if !runtime.session().iterative {
+            return TextOperationKind::Decision(PredictionScoreKind::CausalConditional);
+        }
+        match state.sampling.physical % 5 {
+            0 => TextOperationKind::Progress(GenerationPhase::Context),
+            1 | 2 => TextOperationKind::Progress(GenerationPhase::Refinement),
+            _ => TextOperationKind::Decision(PredictionScoreKind::RefinementPosition),
+        }
+    }
+
     fn agree_text_preparation(
         _: &ModelRuntime<Self>,
         stage: eredu_core::run_preparation::TextPreparationStage,
@@ -531,6 +558,9 @@ impl TextGenerationBackend for MockBackend {
                 temperature: config.sampling().temperature,
                 seed: (config.sampling().temperature > 0.0).then_some(config.seed()),
                 prediction: 0,
+                physical: 0,
+                iterative_first: 0,
+                draft_events: config.draft_events(),
             },
             ..Default::default()
         })
@@ -544,45 +574,68 @@ impl TextGenerationBackend for MockBackend {
         Ok(prompt_token_ids)
     }
 
-    fn submit_text_prefill(
+    fn submit_text_operation(
         runtime: &mut ModelRuntime<Self>,
-        prompt: Self::Prompt,
-        filter: &TokenFilter,
+        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-        preparation::forward();
-        let sequence = prompt.len();
-        let submission = runtime.prefill(prompt)?;
-        let output = state.observe(
-            eredu_core::capture::CapturePhase::Prefill,
-            sequence,
-            submission.output,
-        )?;
+    ) -> Result<
+        Submission<
+            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
+            Self::TextCompletion,
+        >,
+        eredu_core::TextOperationError<Self::Error>,
+    > {
+        if runtime.session().iterative {
+            return iterative::submit(runtime, input, decision, state);
+        }
+        let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
+        let filter = decision.filter();
+        if matches!(&input, eredu_core::PendingTextInput::Continue) {
+            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
+        }
+        let submission =
+            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                match input {
+                    eredu_core::PendingTextInput::Prefill(prompt) => {
+                        preparation::forward();
+                        let sequence = prompt.len();
+                        let submission = runtime.prefill(prompt)?;
+                        let output = state.observe(
+                            eredu_core::capture::CapturePhase::Prefill,
+                            sequence,
+                            submission.output,
+                        )?;
+                        Ok(Submission {
+                            output: MockToken(if submission.output == 999 {
+                                999
+                            } else {
+                                apply_filter(output, filter)
+                            }),
+                            completion: submission.completion,
+                        })
+                    }
+                    eredu_core::PendingTextInput::Decode(token) => {
+                        preparation::forward();
+                        let submission = runtime.decode(token.0)?;
+                        let output = state.observe(
+                            eredu_core::capture::CapturePhase::Decode,
+                            1,
+                            submission.output,
+                        )?;
+                        Ok(Submission {
+                            output: MockToken(apply_filter(output, filter)),
+                            completion: submission.completion,
+                        })
+                    }
+                    eredu_core::PendingTextInput::Continue => {
+                        unreachable!("continuation is rejected before causal submission")
+                    }
+                }
+            };
+        let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
         Ok(Submission {
-            output: MockToken(if submission.output == 999 {
-                999
-            } else {
-                apply_filter(output, filter)
-            }),
-            completion: submission.completion,
-        })
-    }
-
-    fn submit_text_decode(
-        runtime: &mut ModelRuntime<Self>,
-        token: Self::Token,
-        filter: &TokenFilter,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-        preparation::forward();
-        let submission = runtime.decode(token.0)?;
-        let output = state.observe(
-            eredu_core::capture::CapturePhase::Decode,
-            1,
-            submission.output,
-        )?;
-        Ok(Submission {
-            output: MockToken(apply_filter(output, filter)),
+            output: eredu_core::TextOperationOutput::Token(submission.output),
             completion: submission.completion,
         })
     }

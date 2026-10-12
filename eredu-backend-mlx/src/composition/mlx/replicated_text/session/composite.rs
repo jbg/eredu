@@ -234,9 +234,30 @@ where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
 {
+    prepare_composite_input::<A>(admission, processor, input, true)
+}
+
+fn prepare_composite_input<A>(
+    admission: &A::AdmissionConfig,
+    processor: &eredu_runtime::SelectedProcessorExecution,
+    input: input::ModelInput<'_>,
+    cacheable: bool,
+) -> Result<
+    (
+        eredu_runtime::PreparedModelInput<MlxTensor>,
+        eredu_architectures::media_plan::AdmittedCompositeInput<A::InputPartPlan>,
+        Option<eredu_runtime::PreparedInputCacheIdentity>,
+    ),
+    Error,
+>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+{
     validate_composite_input_selection(processor, input)?;
     let supplied_cache_identity = input.cache_identity().cloned();
-    let text_fingerprint = if supplied_cache_identity.is_none()
+    let text_fingerprint = if cacheable
+        && supplied_cache_identity.is_none()
         && input.parts.iter().all(|part| {
             part.modality() == eredu_core::InputModality::Text
                 && matches!(part.payload(), input::InputPayload::TokenIds(_))
@@ -246,12 +267,24 @@ where
             let input::InputPayload::TokenIds(value) = part.payload() else {
                 unreachable!("text-only token payload checked above")
             };
+            let dtype = value.dtype();
             let value = value.evaluated()?;
-            tokens.extend_from_slice(
-                value
-                    .try_as_slice::<u32>()
-                    .map_err(|error| Error::Other(Box::new(error)))?,
-            );
+            if dtype == safemlx::Dtype::Uint32 {
+                tokens.extend_from_slice(
+                    value
+                        .try_as_slice::<u32>()
+                        .map_err(|error| Error::Other(Box::new(error)))?,
+                );
+            } else {
+                for token in value
+                    .try_as_slice::<i32>()
+                    .map_err(|error| Error::Other(Box::new(error)))?
+                {
+                    tokens.push(u32::try_from(*token).map_err(|_| {
+                        Error::ArchitectureModel("negative text token identity".into())
+                    })?);
+                }
+            }
         }
         Some(eredu_core::cache::prompt_cache_token_fingerprint(&tokens))
     } else {
@@ -668,11 +701,58 @@ where
     P: CompositePredictionCapability<A, D> + 'static,
 {
     fn supports_chunked_prefill(&self) -> bool {
-        !P::present() && (A::supports_chunked_text_prefill() || self.supports_retained_prefill())
+        !P::present()
+            && self.session.prefill_chunking_support().is_ok()
+            && (A::supports_chunked_text_prefill() || self.supports_retained_prefill())
     }
 
     fn supports_retained_prefill(&self) -> bool {
         A::supports_retained_prefill() && self.session.prefill_chunking_support().is_ok()
+    }
+
+    fn block_refinement_geometry(
+        &self,
+    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
+        A::block_refinement_geometry(&self.admission)
+    }
+
+    fn refine_block_with_observer(
+        &mut self,
+        canvas: &Array,
+        feedback: Option<&Array>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        if A::block_refinement_geometry(&self.admission).is_none() {
+            return Err(Error::ArchitectureModel(
+                "causal execution has no tentative-block equation".into(),
+            ));
+        }
+        let part = input::token_ids_part(canvas)?;
+        let input = input::ModelInput::new(std::slice::from_ref(&part));
+        let (prepared, admitted, _) =
+            prepare_composite_input::<A>(&self.admission, &self.processor, input, false)?;
+        let feedback = feedback.cloned().map(MlxTensor::from_array);
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::ArchitectureModel)?
+            .with_refinement(feedback.as_ref());
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let before = self.session.successful_state_restoration_generation();
+        self.session
+            .sequence_output_with_observer(
+                paired,
+                eredu_runtime::ExpertPass::Decode,
+                stream,
+                &mut observer,
+            )
+            .map(MlxTensor::into_array)
+            .map_err(|error| {
+                Error::after_replicated_model_call(
+                    error,
+                    before,
+                    self.session.successful_state_restoration_generation(),
+                )
+            })
     }
 
     fn projects_final_prefill_position(&self) -> bool {
@@ -976,7 +1056,7 @@ where
             PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
         let output = self.with_native_prediction_target_state(cache, |session| {
             session
-                .sequence_logits(
+                .sequence_output(
                     paired,
                     if prefill {
                         eredu_runtime::ExpertPass::Prefill

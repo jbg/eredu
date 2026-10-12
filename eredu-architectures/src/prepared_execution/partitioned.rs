@@ -55,7 +55,7 @@ where
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend,
     S: LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     VF: FnOnce(PreparedPartitionResources<C>) -> V,
@@ -155,7 +155,7 @@ where
         + eredu_nn::HyperNeuralBackend
         + 'static,
     S: LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: LayerRuntimeState<B>,
@@ -290,7 +290,7 @@ where
         + eredu_nn::HyperNeuralBackend
         + 'static,
     S: LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_runtime::RuntimeAppendStreams<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,

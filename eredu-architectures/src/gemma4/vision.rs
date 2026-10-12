@@ -8,8 +8,9 @@ use eredu_nn::{
     multimodal::{
         multi_axis_rotary_embeddings, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     },
-    Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, Parameterized, Tensor,
+    AttentionArithmetic, AttentionRequest, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, Parameter,
+    ParameterSpec, Parameterized, Tensor, TensorElementType,
 };
 use serde::Deserialize;
 
@@ -50,9 +51,15 @@ pub struct VisionConfig {
     /// Exact supported gated activation spelling.
     #[serde(default = "default_hidden_activation")]
     pub hidden_activation: String,
+    /// Whether attention rounds scores and probabilities to the input precision.
+    #[serde(default)]
+    pub input_score_arithmetic: bool,
     /// Whether pooled encoder output uses learned standardization.
     #[serde(default)]
     pub standardize: bool,
+    /// Whether projections carry learned input and output clipping bounds.
+    #[serde(default = "default_clipped_linears")]
+    pub use_clipped_linears: bool,
     /// Optional rotary base metadata.
     #[serde(default)]
     pub rope_parameters: Option<HashMap<String, RopeValue>>,
@@ -69,6 +76,10 @@ pub struct VisionConfig {
 
 fn default_hidden_activation() -> String {
     "gelu_pytorch_tanh".into()
+}
+
+fn default_clipped_linears() -> bool {
+    true
 }
 
 impl VisionConfig {
@@ -162,24 +173,32 @@ impl VisionConfig {
     }
 }
 
-/// Architecture-specific projection clipped by four learned scalar bounds.
+/// Atomic learned input and output clipping bounds.
 #[derive(Debug, Clone, Parameterized)]
-#[parameterized(tensor = "B::Tensor")]
-pub struct ClippedLinear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    /// Ordinary general linear operator.
-    pub linear: B::Linear,
+#[parameterized(tensor = "T")]
+pub struct ClipBounds<T: Tensor> {
     /// Minimum input value.
-    pub input_min: Parameter<B::Tensor>,
+    pub input_min: Parameter<T>,
     /// Maximum input value.
-    pub input_max: Parameter<B::Tensor>,
+    pub input_max: Parameter<T>,
     /// Minimum output value.
-    pub output_min: Parameter<B::Tensor>,
+    pub output_min: Parameter<T>,
     /// Maximum output value.
-    pub output_max: Parameter<B::Tensor>,
+    pub output_max: Parameter<T>,
 }
 
-impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
-    /// Builds one unloaded clipped projection under its checkpoint prefix.
+/// Media projection with an optional, complete set of learned clipping bounds.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct MediaLinear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    /// Ordinary general linear operator.
+    pub linear: B::Linear,
+    /// Learned clipping selected by the artifact's equations.
+    pub bounds: Option<ClipBounds<B::Tensor>>,
+}
+
+impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MediaLinear<B> {
+    /// Builds one unloaded optionally clipped projection under its checkpoint prefix.
     pub fn new(
         config: &VisionConfig,
         prefix: &str,
@@ -193,16 +212,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
             input,
             output,
             config.linear_format_for(&weight_name, input),
+            config.use_clipped_linears,
             context,
         )
     }
 
-    /// Builds a clipped projection from an already-normalized physical format.
+    /// Builds a projection from an already-normalized physical format.
     pub fn from_format(
         prefix: &str,
         input: i32,
         output: i32,
         format: LinearFormat,
+        clipped: bool,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let parameter = |suffix: &str| {
@@ -222,10 +243,16 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
                 },
                 context,
             )?,
-            input_min: parameter("input_min")?,
-            input_max: parameter("input_max")?,
-            output_min: parameter("output_min")?,
-            output_max: parameter("output_max")?,
+            bounds: clipped
+                .then(|| {
+                    Ok::<_, Error>(ClipBounds {
+                        input_min: parameter("input_min")?,
+                        input_max: parameter("input_max")?,
+                        output_min: parameter("output_min")?,
+                        output_max: parameter("output_max")?,
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -235,12 +262,21 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let input = input.clip(self.input_min.as_ref(), self.input_max.as_ref(), context)?;
-        self.linear.forward(&input, context)?.clip(
-            self.output_min.as_ref(),
-            self.output_max.as_ref(),
-            context,
-        )
+        match &self.bounds {
+            Some(bounds) => {
+                let input = input.clip(
+                    bounds.input_min.as_ref(),
+                    bounds.input_max.as_ref(),
+                    context,
+                )?;
+                self.linear.forward(&input, context)?.clip(
+                    bounds.output_min.as_ref(),
+                    bounds.output_max.as_ref(),
+                    context,
+                )
+            }
+            None => self.linear.forward(input, context),
+        }
     }
 }
 
@@ -272,27 +308,30 @@ pub struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
-    fn new(config: &VisionConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        let weight = "model.vision_tower.patch_embedder.input_proj.weight";
+    fn new(
+        config: &VisionConfig,
+        root: &str,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let weight = format!("{root}.patch_embedder.input_proj.weight");
         Ok(Self {
             input_projection: B::linear(
                 LinearSpec {
                     input: 3 * config.patch_size * config.patch_size,
                     output: config.hidden_size,
-                    weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
+                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
                     format: crate::linear_format::standard_linear_format(
-                        weight,
-                        config.linear_format_for(weight, 3 * config.patch_size * config.patch_size),
+                        &weight,
+                        config
+                            .linear_format_for(&weight, 3 * config.patch_size * config.patch_size),
                     )?,
                 },
                 context,
             )?,
             position_table: Parameter::unloaded(
-                ParameterSpec::trainable(
-                    "model.vision_tower.patch_embedder.position_embedding_table",
-                )
-                .map_err(Error::backend)?,
+                ParameterSpec::trainable(format!("{root}.patch_embedder.position_embedding_table"))
+                    .map_err(Error::backend)?,
                 &[2, config.position_embedding_size, config.hidden_size],
                 context,
             )?,
@@ -321,11 +360,36 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
         let positions = x_table
             .take_axis(&x, 0, context)?
             .add(&y_table.take_axis(&y, 0, context)?, context)?
-            .multiply(input.position_valid, context)?;
+            .multiply(
+                &input.position_valid.cast_float(
+                    self.position_table
+                        .as_ref()
+                        .element_type()
+                        .ok_or_else(|| Error::backend("unknown vision position precision"))?,
+                    context,
+                )?,
+                context,
+            )?;
         let patches = input
             .patches
+            .subtract(
+                &B::Tensor::full_f32(0.5, &[1], context)?.cast_float(
+                    input
+                        .patches
+                        .element_type()
+                        .ok_or_else(|| Error::backend("unknown vision patch precision"))?,
+                    context,
+                )?,
+                context,
+            )?
             .multiply_scalar(2.0, context)?
-            .add(&B::Tensor::full_f32(-1.0, &[1], context)?, context)?;
+            .cast_float(
+                self.position_table
+                    .as_ref()
+                    .element_type()
+                    .ok_or_else(|| Error::backend("unknown vision working precision"))?,
+                context,
+            )?;
         self.input_projection
             .forward(&patches, context)?
             .add(&positions, context)
@@ -338,13 +402,15 @@ struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     query_heads: i32,
     #[parameter(skip)]
+    input_score_arithmetic: bool,
+    #[parameter(skip)]
     key_value_heads: i32,
     #[parameter(skip)]
     head_dim: i32,
-    query: ClippedLinear<B>,
-    key: ClippedLinear<B>,
-    value: ClippedLinear<B>,
-    output: ClippedLinear<B>,
+    query: MediaLinear<B>,
+    key: MediaLinear<B>,
+    value: MediaLinear<B>,
+    output: MediaLinear<B>,
     query_norm: B::Normalization,
     key_norm: B::Normalization,
 }
@@ -353,46 +419,52 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
     fn new(
         config: &VisionConfig,
         layer: usize,
+        root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}.self_attn");
+        let prefix = format!("{root}.encoder.layers.{layer}.self_attn");
         let norm = |field: &str| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.head_dim,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
+                NormalizationConstructionSpec {
+                    groups: None,
+                    dimensions: config.head_dim,
+                    epsilon: config.rms_norm_eps,
+                    scale: NormalizationScale::LearnedOffset {
+                        weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+                            .map_err(Error::backend)?,
+                        offset: 0.0,
+                    },
+                },
                 context,
             )
         };
         Ok(Self {
             query_heads: config.num_attention_heads,
+            input_score_arithmetic: config.input_score_arithmetic,
             key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
-            query: ClippedLinear::new(
+            query: MediaLinear::new(
                 config,
                 &format!("{prefix}.q_proj"),
                 config.hidden_size,
                 config.num_attention_heads * config.head_dim,
                 context,
             )?,
-            key: ClippedLinear::new(
+            key: MediaLinear::new(
                 config,
                 &format!("{prefix}.k_proj"),
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
                 context,
             )?,
-            value: ClippedLinear::new(
+            value: MediaLinear::new(
                 config,
                 &format!("{prefix}.v_proj"),
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
                 context,
             )?,
-            output: ClippedLinear::new(
+            output: MediaLinear::new(
                 config,
                 &format!("{prefix}.o_proj"),
                 config.num_attention_heads * config.head_dim,
@@ -442,9 +514,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
         let key = apply_two_axis_rotary(&key, cosine, sine, context)?
             .transpose_axes(&[0, 2, 1, 3], context)?;
         let value = value.transpose_axes(&[0, 2, 1, 3], context)?;
-        let output = B::attention(query, key, value, 1.0, Some(key_mask), context)?
-            .transpose_axes(&[0, 2, 1, 3], context)?
-            .reshape(&[batch, sequence, -1], context)?;
+        let output = B::attention_with_sinks(
+            AttentionRequest {
+                arithmetic: if self.input_score_arithmetic {
+                    AttentionArithmetic::InputScores
+                } else {
+                    AttentionArithmetic::Fused
+                },
+                queries: query,
+                keys: key,
+                values: value,
+                scale: 1.0,
+                softcap: None,
+                mask: Some(key_mask),
+                sinks: None,
+            },
+            context,
+        )?
+        .transpose_axes(&[0, 2, 1, 3], context)?
+        .reshape(&[batch, sequence, -1], context)?;
         self.output.forward(&output, context)
     }
 }
@@ -452,34 +540,35 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 struct VisionMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    gate: ClippedLinear<B>,
-    up: ClippedLinear<B>,
-    down: ClippedLinear<B>,
+    gate: MediaLinear<B>,
+    up: MediaLinear<B>,
+    down: MediaLinear<B>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
     fn new(
         config: &VisionConfig,
         layer: usize,
+        root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}.mlp");
+        let prefix = format!("{root}.encoder.layers.{layer}.mlp");
         Ok(Self {
-            gate: ClippedLinear::new(
+            gate: MediaLinear::new(
                 config,
                 &format!("{prefix}.gate_proj"),
                 config.hidden_size,
                 config.intermediate_size,
                 context,
             )?,
-            up: ClippedLinear::new(
+            up: MediaLinear::new(
                 config,
                 &format!("{prefix}.up_proj"),
                 config.hidden_size,
                 config.intermediate_size,
                 context,
             )?,
-            down: ClippedLinear::new(
+            down: MediaLinear::new(
                 config,
                 &format!("{prefix}.down_proj"),
                 config.intermediate_size,
@@ -494,7 +583,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gate = B::Tensor::gelu(&self.gate.forward(input, context)?, context)?;
+        let gate = B::gelu_approximate(self.gate.forward(input, context)?, context)?;
         let up = self.up.forward(input, context)?;
         self.down.forward(&gate.multiply(&up, context)?, context)
     }
@@ -519,21 +608,35 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+        Self::new_at(config, layer, "model.vision_tower", context)
+    }
+
+    /// Declares the same vision equations under an architecture-owned tower root.
+    pub(crate) fn new_at(
+        config: &VisionConfig,
+        layer: usize,
+        root: &str,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let prefix = format!("{root}.encoder.layers.{layer}");
         let norm = |field: &str| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
+                NormalizationConstructionSpec {
+                    groups: None,
+                    dimensions: config.hidden_size,
+                    epsilon: config.rms_norm_eps,
+                    scale: NormalizationScale::LearnedOffset {
+                        weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
+                            .map_err(Error::backend)?,
+                        offset: 0.0,
+                    },
+                },
                 context,
             )
         };
         Ok(Self {
-            attention: VisionAttention::new(config, layer, context)?,
-            mlp: VisionMlp::new(config, layer, context)?,
+            attention: VisionAttention::new(config, layer, root, context)?,
+            mlp: VisionMlp::new(config, layer, root, context)?,
             input_norm: norm("input_layernorm")?,
             post_attention_norm: norm("post_attention_layernorm")?,
             pre_feed_forward_norm: norm("pre_feedforward_layernorm")?,
@@ -609,8 +712,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_at(config, "model.vision_tower", context)
+    }
+
+    /// Declares pinned vision parameters under their exact architecture root.
+    pub(crate) fn new_at(
+        config: VisionConfig,
+        root: &str,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         config.validate().map_err(Error::backend)?;
-        let patch_embedder = PatchEmbedder::new(&config, context)?;
+        let patch_embedder = PatchEmbedder::new(&config, root, context)?;
         let parameter = |name: &str| {
             Parameter::unloaded(
                 ParameterSpec::trainable(name).map_err(Error::backend)?,
@@ -620,8 +732,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         };
         let (standardization_bias, standardization_scale) = if config.standardize {
             (
-                Some(parameter("model.vision_tower.std_bias")?),
-                Some(parameter("model.vision_tower.std_scale")?),
+                Some(parameter(&format!("{root}.std_bias"))?),
+                Some(parameter(&format!("{root}.std_scale"))?),
             )
         } else {
             (None, None)
@@ -706,6 +818,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let element = hidden
+            .element_type()
+            .ok_or_else(|| Error::backend("unknown pooled vision precision"))?;
         let kernel = self.config.pooling_kernel_size;
         let mut pooled = Vec::with_capacity(state.grid_extents.len());
         for (batch, (height, width)) in state.grid_extents.iter().copied().enumerate() {
@@ -732,23 +847,48 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                     ],
                     context,
                 )?;
-            let item = B::Tensor::mean_axis(&item, 4, false, context)?;
-            pooled.push(B::Tensor::mean_axis(&item, 2, false, context)?.reshape(
+            // Average each spatial cell as a weighted FP32 product, rounding
+            // once to the tower precision before magnitude scaling.
+            let item = item
+                .transpose_axes(&[0, 1, 3, 2, 4, 5], context)?
+                .reshape(
+                    &[
+                        pooled_height * pooled_width,
+                        kernel * kernel,
+                        self.config.hidden_size,
+                    ],
+                    context,
+                )?
+                .cast_float(TensorElementType::F32, context)?;
+            let weights = B::Tensor::full_f32(
+                1.0 / (kernel * kernel) as f32,
+                &[1, kernel * kernel],
+                context,
+            )?;
+            pooled.push(B::Tensor::matmul(&weights, &item, context)?.reshape(
                 &[1, pooled_height * pooled_width, self.config.hidden_size],
                 context,
             )?);
         }
         let mut hidden = B::Tensor::concatenate(&pooled, 1, context)?
+            .cast_float(element, context)?
+            .cast_float(TensorElementType::F32, context)?
             .multiply_scalar((self.config.hidden_size as f32).sqrt(), context)?;
         if let (Some(bias), Some(scale)) = (
             self.standardization_bias.as_ref(),
             self.standardization_scale.as_ref(),
         ) {
             hidden = hidden
-                .subtract(bias.as_ref(), context)?
-                .multiply(scale.as_ref(), context)?;
+                .subtract(
+                    &bias.as_ref().cast_float(TensorElementType::F32, context)?,
+                    context,
+                )?
+                .multiply(
+                    &scale.as_ref().cast_float(TensorElementType::F32, context)?,
+                    context,
+                )?;
         }
-        Ok(hidden)
+        hidden.cast_float(element, context)
     }
 }
 
@@ -825,6 +965,11 @@ fn apply_two_axis_rotary<T: Tensor>(
     sine: &T,
     context: &T::Context,
 ) -> Result<T, Error> {
+    let element = input
+        .element_type()
+        .ok_or_else(|| Error::backend("unknown vision rotary precision"))?;
+    let cosine = cosine.cast_float(element, context)?;
+    let sine = sine.cast_float(element, context)?;
     let half = input.dim(3) / 2;
     let quarter = half / 2;
     let mut output = Vec::with_capacity(2);

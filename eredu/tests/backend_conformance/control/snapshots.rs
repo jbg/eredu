@@ -70,15 +70,25 @@ use observed_mock::Sampling;
 impl TextSnapshotBackend for MockBackend {
     type SamplingState = Sampling;
     fn continuation_input_tokens(
+        runtime: &ModelRuntime<Self>,
+        _: &Self::SamplingState,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
         predictions: u64,
     ) -> Option<u64> {
         if predictions == 0 {
             return Some(0);
         }
+        if runtime.session().iterative {
+            let prompt = match input? {
+                PendingTextInput::Prefill(prompt) => prompt.len() as u64,
+                PendingTextInput::Decode(_) | PendingTextInput::Continue => 0,
+            };
+            return prompt.checked_add(predictions)?.checked_add(2);
+        }
         match input? {
             PendingTextInput::Prefill(prompt) => (prompt.len() as u64).checked_add(predictions - 1),
             PendingTextInput::Decode(_) => Some(predictions),
+            PendingTextInput::Continue => None,
         }
     }
     fn estimate_sampling_growth(
@@ -125,7 +135,7 @@ impl TextSnapshotBackend for MockBackend {
         let bytes = match input {
             Some(PendingTextInput::Prefill(ids)) => 24 + ids.len() as u64 * 4,
             Some(PendingTextInput::Decode(_)) => 4,
-            None => 0,
+            None | Some(PendingTextInput::Continue) => 0,
         };
         Ok(Some(SnapshotEstimate {
             retained_bytes: bytes,
@@ -139,6 +149,7 @@ impl TextSnapshotBackend for MockBackend {
         Ok(input.map(|input| match input {
             PendingTextInput::Prefill(ids) => PendingTextInput::Prefill(ids.clone()),
             PendingTextInput::Decode(token) => PendingTextInput::Decode(token.clone()),
+            PendingTextInput::Continue => PendingTextInput::Continue,
         }))
     }
     fn capture_run(state: &observed_mock::State) -> Option<&CaptureSession> {
@@ -263,6 +274,8 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
             .unwrap();
         assert_eq!(saved.token_ids(), [first]);
         assert_eq!(saved.metadata().output.next_prediction, 1);
+        assert_eq!(saved.metadata().position.execution_step, 1);
+        assert_eq!(saved.metadata().position.committed_tokens, 1);
         let from = records.len();
         session
             .run(|r| {
@@ -281,6 +294,7 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
                 ControlFlow::Continue(())
             })
             .unwrap();
+        assert_eq!(session.position(), saved.metadata().position);
         assert_eq!(session.output_checkpoint().epoch, 1);
         assert_eq!(session.next_prediction(), 1);
         assert!(session.emitted_bytes() > bytes);
@@ -314,6 +328,7 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
             .unwrap();
         assert_eq!(session.status(), GenerationStatus::Prepared);
         assert!(session.token_ids().is_empty());
+        assert_eq!(session.position(), initial.metadata().position);
         session
             .restore(&terminal, |r| {
                 records.push(r);

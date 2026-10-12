@@ -84,6 +84,11 @@ where
         self.inner.cancellation = Some(cancellation);
     }
 
+    /// Independent physical-work and authoritative-output coordinates.
+    pub fn position(&self) -> crate::refinement::GenerationPosition {
+        self.inner.position
+    }
+
     /// Remaining ordinary token allowance, independent of facade EOS policy.
     pub fn remaining_tokens(&self) -> Option<usize> {
         self.inner.remaining_tokens
@@ -207,6 +212,31 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         }
     }
 
+    /// Advances one physical operation, including context and tentative refinement.
+    /// Progress leaves the commitment controller unchanged. Drain its completed
+    /// records before advancing or composing a snapshot boundary.
+    pub fn advance_operation<C: TokenFilterController>(
+        &mut self,
+        state: &mut TextGenerationContinuation<B, C>,
+    ) -> Result<Option<TextAdvancement<B::Token>>, TextContinuationError<B::Error, C::Error>> {
+        self.validate(state)?;
+        state.require_quiescent()?;
+        state.failed = true;
+        state.records_drained = false;
+        match state.inner.next_physical_committed(self.runtime) {
+            None => {
+                state.failed = false;
+                state.records_drained = true;
+                Ok(None)
+            }
+            Some(Ok(advance)) => {
+                state.failed = false;
+                Ok(Some(advance))
+            }
+            Some(Err(error)) => Err(TextContinuationError::Generation(error)),
+        }
+    }
+
     /// Completes at most one nonfinal prefill chunk without sampling or querying
     /// the constraint controller. True leaves an independently snapshotable
     /// pending prompt after draining its completed captures; false performs no
@@ -219,6 +249,12 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         state.require_quiescent()?;
         state.failed = true;
         state.records_drained = false;
+        if state.inner.position.execution_step == u64::MAX {
+            return Err(ControlledTextGenerationError::Operation(
+                TextOperationPolicyError::PositionOverflow,
+            )
+            .into());
+        }
         let advanced = state
             .inner
             .advance_prefill(self.runtime)
@@ -331,7 +367,12 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         &self.state.inner.controller
     }
 
-    /// Remaining model-prediction allowance, including any pending input.
+    /// Independent physical-work and authoritative-output coordinates.
+    pub fn position(&self) -> crate::refinement::GenerationPosition {
+        self.state.inner.position
+    }
+
+    /// Remaining commitment allowance at this quiescent boundary.
     pub fn remaining_tokens(&self) -> Option<usize> {
         self.state.inner.remaining_tokens
     }
@@ -377,10 +418,12 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         controller: C,
         pending: Option<PendingTextInput<B::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
+        position: crate::refinement::GenerationPosition,
     ) {
         self.state.inner.controller = controller;
         self.state.inner.step = pending;
         self.state.inner.remaining_tokens = remaining_tokens;
+        self.state.inner.position = position;
     }
 
     /// Constructs a child continuation from independently prepared components.
@@ -392,6 +435,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         controller: C,
         pending: Option<PendingTextInput<B::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
+        position: crate::refinement::GenerationPosition,
     ) -> TextGenerationContinuation<B, C> {
         TextGenerationContinuation {
             owner: Arc::clone(&self.state.owner),
@@ -402,6 +446,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
                 step: pending,
                 completions: Vec::new(),
                 remaining_tokens,
+                position,
                 prefill: self.state.inner.prefill,
                 cancellation: None,
             },

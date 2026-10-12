@@ -97,6 +97,11 @@ impl Executable {
     }
 
     pub fn speculative_capability(&self) -> SpeculativeCapability {
+        if self.erased().block_refinement_geometry().is_some() {
+            return SpeculativeCapability::IncompatibleScores {
+                score_kind: eredu_core::refinement::PredictionScoreKind::RefinementPosition,
+            };
+        }
         if self.erased().has_embedded_prediction() {
             return SpeculativeCapability::Ready {
                 draft_source: SpeculativeDraftSource::Embedded,

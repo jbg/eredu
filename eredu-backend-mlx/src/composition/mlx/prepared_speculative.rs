@@ -780,6 +780,14 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
         V: SpeculativeGenerationVisitor,
     {
+        if <MlxBackend<'_> as eredu_core::TextGenerationBackend>::generation_score_kind(
+            self.runtime,
+        ) != eredu_core::refinement::PredictionScoreKind::CausalConditional
+        {
+            return Err(
+                eredu_core::generation::GenerationError::RequiresCausalConditionalScores.into(),
+            );
+        }
         let drafting = request.take_drafting();
         let lanes = request.take_lanes();
         match drafting {

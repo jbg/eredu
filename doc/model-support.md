@@ -76,6 +76,7 @@ projector.
 | Gemma 2 | text | yes | `gemma2` | alternating sliding/full GQA, four RMSNorms, GELU and attention/output soft caps; [validation status](gemma2-validation.md) |
 | Gemma 4 | text, image, video, audio | yes | `gemma4` + projector | dense and MoE variants, shared-KV and media towers |
 | Gemma 4 assistant | text draft model | yes | `gemma4_assistant` | external multi-token prediction |
+| DiffusionGemma | text, image, video | yes | `diffusion-gemma` (text only) | shared context/refinement stack, soft feedback, controlled block generation and constrained finalization; [validation](diffusion-gemma-validation.md) |
 | K2 Horizon | text | yes | `k2-horizon` | dense, MoE and MoVA; independently addressable value/feed-forward experts, grouped RMSNorm, YaRN, IFM reasoning/tools and external drafting; [validation](k2-horizon-validation.md) |
 | Kimi Linear | text | yes | `kimi-linear` | KDA/MLA hybrid layers, dense and routed/shared experts |
 | LFM2 / LFM2.5 | text | yes | `lfm2`, `lfm2moe` | causal-convolution/attention hybrid, dense and MoE |
@@ -85,6 +86,16 @@ projector.
 | Moshi | realtime codec tokens | yes | no | temporal/depth generation without a codec dependency |
 | PersonaPlex | realtime speech tokens | yes | no | transformed model layout, voice and text conditioning |
 | NemotronLabs VoiceChat | realtime PCM speech, text, transcription, tools | yes | `nemotron_voicechat`; explicit split component bundle and companion | single-device controlled/iterator session; [validation](voicechat-validation.md) |
+
+DiffusionGemma uses the ordinary loading and generation entry points. Its
+`refinement` request setting controls the iterative schedule; `draft_events`
+enables replaceable tentative blocks in observed delivery. Final token constraints
+apply separately at each committed position. Causal sampling overrides and
+likelihood-ratio speculative verification reject refinement position scores with
+`RequiresCausalConditionalScores`. Resident, host-layerwise and disk-streamed
+execution share the same layer units and authoritative context. The published
+SafeTensors release includes vision; its published GGUF contains text parameters
+and reconstructs the tokenizer from explicit BPE merges.
 
 NemotronLabs VoiceChat uses the shared family registry and realtime loading
 entry points for pinned official SafeTensors, complete GGUF and split GGUF artifacts.

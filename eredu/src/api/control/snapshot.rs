@@ -45,6 +45,8 @@ pub struct GenerationSnapshotMetadata {
     pub pending_forced_token: Option<u32>,
     /// Prepared, paused, or normally completed state preserved by restoration.
     pub status: GenerationStatus,
+    /// Logical execution coordinates restored with the complete continuation.
+    pub position: eredu_core::refinement::GenerationPosition,
     /// Delivered prefix paired with incremental semantic buffers.
     pub output: GenerationOutputCheckpoint,
     /// Complete charged logical native/controller/host state, excluding shared
@@ -203,6 +205,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             configuration_identity: self.delivery.configuration_identity,
             pending_forced_token: self.pending_forced_token(),
             status: self.status(),
+            position: self.position(),
             output: self.output_checkpoint(),
             retained_bytes: 0,
         };
@@ -341,6 +344,15 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             .expect("validated lifecycle restore");
         self.delivery.epoch = self.lifecycle.epoch();
         self.delivery.prediction = self.next_prediction();
+        if let Some(event) = self.delivery.drafts.clear() {
+            self.delivery.send(
+                ObservedGenerationEvent::Draft {
+                    event,
+                    position: self.state.position(),
+                },
+                &mut emit,
+            );
+        }
         self.delivery.send(
             ObservedGenerationEvent::Restored {
                 snapshot_id: snapshot.metadata.snapshot_id.clone(),

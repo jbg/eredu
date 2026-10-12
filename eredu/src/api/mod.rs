@@ -44,6 +44,7 @@ mod memory_estimation;
 pub use memory_estimation::*;
 mod forecast;
 pub use forecast::*;
+mod draft;
 mod loaded;
 mod observed;
 mod parameters;
@@ -65,6 +66,7 @@ pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 pub use observed::{
     ObservedGenerationEvent, ObservedGenerationRecord, PreparedObservedGeneration, TraceLimits,
+    GENERATION_SCHEMA_VERSION,
 };
 
 pub use portable::{

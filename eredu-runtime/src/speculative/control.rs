@@ -668,6 +668,9 @@ where
             crate::execution_control::SamplingOverrideError::Invalid(reason) => {
                 SpeculativeControlError::Invalid(reason)
             }
+            crate::execution_control::SamplingOverrideError::RequiresCausalConditionalScores => {
+                SpeculativeControlError::Invalid("sampling requires causal conditional scores")
+            }
             crate::execution_control::SamplingOverrideError::Backend(e) => {
                 SpeculativeControlError::backend(e)
             }

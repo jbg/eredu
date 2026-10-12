@@ -472,6 +472,9 @@ where
 
     let mut source_keys = BTreeSet::new();
     let mut select_constraint = |constraint: &T| {
+        if constraint.role() == TensorRole::ArtifactMetadata {
+            return;
+        }
         if let Some(key) = std::iter::once(constraint.key())
             .chain(constraint.aliases().iter().map(String::as_str))
             .find(|key| catalog.contains_key(*key))
@@ -933,6 +936,47 @@ mod tests {
         policy: CatalogPolicy,
     ) -> SafetensorsCheckpointPlan {
         SafetensorsCheckpointPlan::new("test", common, groups, policy).unwrap()
+    }
+
+    #[test]
+    fn artifact_metadata_is_validated_without_granting_a_parameter_source() {
+        let catalog = BTreeMap::from([
+            safe("weight", &[2, 2], StoredDtype::F32),
+            safe("frequencies", &[2], StoredDtype::F32),
+        ]);
+        let mut metadata = SafetensorsTensorConstraint::required(
+            "frequencies",
+            vec![2],
+            StoredDtypeConstraint::Floating,
+        );
+        metadata.role = TensorRole::ArtifactMetadata;
+        let plan = safe_plan(
+            vec![
+                SafetensorsTensorConstraint::required(
+                    "weight",
+                    vec![2, 2],
+                    StoredDtypeConstraint::Floating,
+                ),
+                metadata,
+            ],
+            Vec::new(),
+            CatalogPolicy::strict(),
+        );
+        let resolve = |catalog| {
+            resolve_catalog(
+                catalog,
+                &plan.identity,
+                &plan.common_tensors,
+                &plan.layout_groups,
+                &plan.catalog_policy,
+                Vec::new(),
+            )
+        };
+        let resolved = resolve(&catalog).unwrap();
+        assert_eq!(resolved.source_keys(), &BTreeSet::from(["weight".into()]));
+        let mut malformed = catalog.clone();
+        malformed.get_mut("frequencies").unwrap().shape = vec![3];
+        assert!(resolve(&malformed).is_err());
     }
 
     #[test]

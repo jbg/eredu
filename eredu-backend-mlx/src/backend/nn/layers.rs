@@ -1,11 +1,9 @@
 //! Activation functions.
 
-use std::f32::consts::PI;
-
 use safemlx::{
     array,
     error::{Exception, Result as MlxResult},
-    ops::{erf, exp, maximum, r#where, sqrt, tanh},
+    ops::{erf, exp, maximum, r#where, tanh},
     Array, Stream,
 };
 
@@ -107,20 +105,38 @@ pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array
 pub fn gelu_approximate(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array> {
     let stream = stream.as_ref();
     let x = x.as_ref();
-    array!(0.5).multiply(x, stream)?.multiply(
-        array!(1.0).add(
-            tanh(
-                sqrt(array!(2.0 / PI), stream)?.multiply(
-                    x.add(
-                        array!(0.044715).multiply(x.power(array!(3), stream)?, stream)?,
-                        stream,
-                    )?,
-                    stream,
-                )?,
-                stream,
-            )?,
+    if matches!(
+        x.dtype(),
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
+    ) {
+        return gelu_approximate(x.as_dtype(safemlx::Dtype::Float32, stream)?, stream)?
+            .as_dtype(x.dtype(), stream);
+    }
+    let inner = x
+        .multiply(x, stream)?
+        .multiply(x, stream)?
+        .multiply(array!(0.044715f32), stream)?
+        .add(x, stream)?
+        .multiply(
+            array!((2.0f64 / std::f64::consts::PI).sqrt() as f32),
+            stream,
+        )?;
+    // Match the FP32 vector tanh saturation used by the tensor GELU reference.
+    // The tail differs by at most one tanh ULP but cancellation in 1+tanh
+    // makes that rounding visible even after a reduced-precision output cast.
+    let saturation = array!(8.664339742f32);
+    let hyperbolic = r#where(
+        inner.gt(&saturation, stream)?,
+        array!(1.0f32),
+        r#where(
+            inner.lt(saturation.negative(stream)?, stream)?,
+            array!(-1.0f32),
+            tanh(&inner, stream)?,
             stream,
         )?,
         stream,
-    )
+    )?;
+    array!(0.5f32)
+        .multiply(x, stream)?
+        .multiply(hyperbolic.add(array!(1.0f32), stream)?, stream)
 }

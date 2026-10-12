@@ -801,6 +801,21 @@ pub struct GenerationConfigOverrides {
     pub max_new_tokens: Option<usize>,
 }
 
+impl GenerationConfigOverrides {
+    /// Whether this request explicitly configures conditional-score sampling.
+    pub fn has_sampling_overrides(&self) -> bool {
+        self.do_sample.is_some()
+            || self.temperature.is_some()
+            || self.top_k.is_some()
+            || self.top_p.is_some()
+            || self.min_p.is_some()
+            || self.repetition_penalty.is_some()
+            || self.repeat_last_n.is_some()
+            || self.frequency_penalty.is_some()
+            || self.presence_penalty.is_some()
+    }
+}
+
 /// Fully resolved and validated generation settings.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedGenerationConfig {
@@ -956,6 +971,9 @@ pub enum SemanticEvent {
 /// Invalid backend-neutral generation configuration or state transition.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GenerationError {
+    /// Conditional samplers cannot consume iterative position scores.
+    #[error("sampling settings require causal conditional scores; use the refinement policy for iterative execution")]
+    RequiresCausalConditionalScores,
     /// A token was committed after termination.
     #[error("generation has already finished")]
     AlreadyFinished,

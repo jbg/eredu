@@ -177,6 +177,30 @@ pub(crate) fn from_config(
     use CompositeSequenceExtent::{Decoder, DecoderMultiple, Fixed};
     let mut plan = CompositePartitionBoundaries::default();
     match config {
+        CompositeConfig::Diffusion(args) => {
+            if let Some(vision) = &args.vision {
+                let factor = vision
+                    .pooling_kernel_size
+                    .checked_mul(vision.pooling_kernel_size)
+                    .ok_or("image patch expansion overflows")?;
+                plan = plan.with_boundary(
+                    0,
+                    0,
+                    CompositePartitionBoundary::fixed(
+                        hidden(vision.hidden_size, false)?,
+                        DecoderMultiple(factor),
+                    ),
+                )?;
+                plan = plan.with_boundary(
+                    0,
+                    1,
+                    CompositePartitionBoundary::fixed(
+                        hidden(args.text.hidden_size, false)?,
+                        Decoder,
+                    ),
+                )?;
+            }
+        }
         CompositeConfig::Gemma4(args) => {
             for (group, width) in [
                 (0, args.vision.as_ref().map(|vision| vision.hidden_size)),

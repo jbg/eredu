@@ -21,6 +21,9 @@ use std::{
     time::Instant,
 };
 
+/// Version of attributed generation events, independently of tensor-capture records.
+pub const GENERATION_SCHEMA_VERSION: u32 = 2;
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -150,19 +153,32 @@ pub enum ObservedGenerationEvent {
         /// Absolute prediction that would execute next.
         next_prediction: u64,
     },
-    /// One completed nonfinal prompt chunk; no token or semantic text commits.
-    PrefillProgress {
+    /// One completed context or refinement operation without authoritative commitment.
+    Progress {
+        /// Physical phase and tentative block state.
+        progress: eredu_core::TextProgress,
+        /// Independent completed-work and authoritative-output coordinates.
+        position: eredu_core::refinement::GenerationPosition,
         /// Physical chunk geometry and captures, if observation was requested.
         captures: Option<CapturedStep>,
         /// Wall time of this completed prefix and capture settlement.
         step_seconds: f64,
     },
+    /// Replaceable tentative output, independently budgeted and never parsed
+    /// as authoritative text or a tool call.
+    Draft {
+        /// Branch/epoch reconciliation of the active tentative block.
+        event: eredu_core::refinement::DraftEvent,
+        /// Completed physical and committed-output coordinates.
+        position: eredu_core::refinement::GenerationPosition,
+    },
     /// Captures from an operation that failed before a token was committed.
     CaptureFailure {
         /// Index of the unsuccessful prediction attempt.
         prediction_index: u64,
-        /// Input positions used by the failed forward operation.
-        input_range: [u64; 2],
+        /// Causal input span when applicable. Iterative captures carry their
+        /// physical invocation geometry in the retained capture records.
+        input_range: Option<[u64; 2]>,
         /// Completed host values and structured capture failures, with budgets.
         captures: CapturedStep,
         /// Elapsed attempt time before failure.
@@ -177,18 +193,23 @@ pub enum ObservedGenerationEvent {
         /// Root sampler seed; observation does not draw from it.
         seed: u64,
     },
-    /// One constraint-committed prediction and captures from its causal forward pass.
+    /// One constraint-committed prediction with explicitly declared score semantics.
     Token {
         /// Canonical token identifier, including special/EOS tokens.
         token_id: u32,
+        /// Meaning of the scores used for this commitment.
+        score_kind: eredu_core::refinement::PredictionScoreKind,
+        /// Independent completed-work and authoritative-output coordinates.
+        position: eredu_core::refinement::GenerationPosition,
         /// This decision was restricted to one validated canonical token by
         /// execution control. Ordinary callers always emit false.
         #[serde(default, skip_serializing_if = "is_false")]
         forced: bool,
-        /// Zero is predicted by prefill; later values are decode predictions.
+        /// Absolute authoritative commitment index, independent of physical steps.
         prediction_index: u64,
-        /// Half-open input positions covered by this forward pass.
-        input_range: [u64; 2],
+        /// Half-open causal input span. Refinement finalization has no causal
+        /// forward span; its score kind and block coordinates describe attribution.
+        input_range: Option<[u64; 2]>,
         /// All current observed-generation outputs are committed, single-rank values.
         committed: bool,
         /// Rank owning these complete values. Partitioned capture is rejected.
@@ -232,6 +253,9 @@ struct Delivery<F> {
     failure: Option<CaptureError>,
     closed: bool,
     prediction: u64,
+    drafts: super::draft::DraftJournal,
+    position: eredu_core::refinement::GenerationPosition,
+    iterative: bool,
 }
 
 impl<F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>> Delivery<F> {
@@ -335,6 +359,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         plan: CapturePlan,
         request: CaptureRequestShape,
     ) -> Result<(AdmittedCapturePlan, Option<String>), PreparedChatError> {
+        let bounds = B::text_capture_invocation_bounds(&self.runtime, request)?;
         let (admitted, artifact_identity) = if plan.selections.is_empty() {
             let catalog = eredu_core::ObservationCatalog {
                 schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
@@ -346,17 +371,30 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 points: Vec::new(),
                 capture: Default::default(),
             };
-            let admitted = plan.admit(&catalog, &support, &support.capture, request)?;
+            let admitted = match bounds {
+                Some(bounds) => {
+                    plan.admit_invocations(&catalog, &support, &support.capture, bounds)?
+                }
+                None => plan.admit(&catalog, &support, &support.capture, request)?,
+            };
             (admitted, None)
         } else {
             let discovery = self.capture_discovery()?;
             (
-                plan.admit(
-                    &discovery.catalog,
-                    &discovery.support,
-                    &discovery.support.capture,
-                    request,
-                )?,
+                match bounds {
+                    Some(bounds) => plan.admit_invocations(
+                        &discovery.catalog,
+                        &discovery.support,
+                        &discovery.support.capture,
+                        bounds,
+                    )?,
+                    None => plan.admit(
+                        &discovery.catalog,
+                        &discovery.support,
+                        &discovery.support.capture,
+                        request,
+                    )?,
+                },
                 Some(discovery.artifact_identity),
             )
         };
@@ -528,7 +566,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let started = Instant::now();
         let prompt_length = prepared.prompt_token_ids.len() as u64;
         let template = ObservedGenerationRecord {
-            schema_version: CAPTURE_SCHEMA_VERSION,
+            schema_version: GENERATION_SCHEMA_VERSION,
             run_id: new_identity("run"),
             artifact_identity: prepared.artifact_identity,
             parameter_overlay_id: prepared.parameter_overlay_id,
@@ -552,6 +590,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             failure: None,
             closed: false,
             prediction: 0,
+            drafts: super::draft::DraftJournal::new(prepared.settings.draft_events),
+            position: Default::default(),
+            iterative: B::supports_block_refinement(&self.runtime),
         });
         delivery
             .borrow_mut()
@@ -563,15 +604,30 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let mut on_token = |kind: super::request::GenerationStepKind, captures, step_seconds| {
             let mut delivery = delivery.borrow_mut();
             let index = delivery.prediction;
-            let input_range = if index == 0 {
-                [0, prompt_length]
-            } else {
-                [prompt_length + index - 1, prompt_length + index]
-            };
-            let token_id = match kind {
-                super::request::GenerationStepKind::Token(token) => token,
-                super::request::GenerationStepKind::Prefill => {
-                    delivery.send(ObservedGenerationEvent::PrefillProgress {
+            let input_range = (!delivery.iterative).then(|| {
+                if index == 0 {
+                    [0, prompt_length]
+                } else {
+                    [prompt_length + index - 1, prompt_length + index]
+                }
+            });
+            let (token_id, score_kind, position) = match kind {
+                super::request::GenerationStepKind::Token {
+                    token,
+                    score_kind,
+                    position,
+                } => (token, score_kind, position),
+                super::request::GenerationStepKind::Progress {
+                    mut progress,
+                    position,
+                } => {
+                    delivery.position = position;
+                    if let Some(event) = delivery.drafts.progress(&mut progress, position, 0) {
+                        delivery.send(ObservedGenerationEvent::Draft { event, position });
+                    }
+                    delivery.send(ObservedGenerationEvent::Progress {
+                        progress,
+                        position,
                         captures,
                         step_seconds,
                     });
@@ -590,8 +646,14 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 }
             };
             delivery.prediction += 1;
+            delivery.position = position;
+            if let Some(event) = delivery.drafts.clear() {
+                delivery.send(ObservedGenerationEvent::Draft { event, position });
+            }
             delivery.send(ObservedGenerationEvent::Token {
                 token_id,
+                score_kind,
+                position,
                 forced: false,
                 prediction_index: index,
                 input_range,
@@ -635,6 +697,10 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             mode,
         );
         let mut delivery = delivery.into_inner();
+        if let Some(event) = delivery.drafts.clear() {
+            let position = delivery.position;
+            delivery.send(ObservedGenerationEvent::Draft { event, position });
+        }
         match &result {
             Ok(output) => delivery.send(ObservedGenerationEvent::Completed {
                 reason: output.finish_reason,

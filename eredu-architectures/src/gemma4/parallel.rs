@@ -732,12 +732,22 @@ pub fn local_block_args(
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<ModelArgs, ParallelPlanError> {
+    local_block_args_at(args, layer, layout, "model.language_model.layers")
+}
+
+/// Derives shared block geometry under the owning architecture's logical root.
+pub(crate) fn local_block_args_at(
+    args: &ModelArgs,
+    layer: usize,
+    layout: &LocalModelLayout,
+    layer_root: &str,
+) -> Result<ModelArgs, ParallelPlanError> {
     let policy = args
         .layer_policy(layer)
         .ok_or_else(|| invalid(format!("Gemma 4 layer {layer} is out of range")))?;
-    let root = format!("model.language_model.layers.{layer}");
+    let root = format!("{layer_root}.{layer}");
     let tensor_at = |layer: usize, suffix: &str| {
-        let root = format!("model.language_model.layers.{layer}");
+        let root = format!("{layer_root}.{layer}");
         layout
             .tensor(&format!("{root}.{suffix}.weight"))
             .or_else(|| layout.tensor(&format!("{root}.{suffix}")))
@@ -844,13 +854,21 @@ fn local_axis(
 pub fn static_parameter_groups(
     args: &ModelArgs,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    static_parameter_groups_at(args, "model.language_model")
+}
+
+/// Declares shared vocabulary/readout placement under an architecture-owned root.
+pub(crate) fn static_parameter_groups_at(
+    args: &ModelArgs,
+    root: &str,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let hidden = dim(args.hidden_size)?;
     let vocab = dim(args.vocab_size)?;
     let mut groups = vec![group(
-        "model.language_model.embed_tokens",
+        format!("{root}.embed_tokens"),
         ParameterRole::Vocabulary,
         [(
-            "model.language_model.embed_tokens.weight".into(),
+            format!("{root}.embed_tokens.weight"),
             vec![vocab, hidden],
             MemberSharding::Balanced { axis: 0 },
         )],
@@ -861,9 +879,9 @@ pub fn static_parameter_groups(
             .checked_mul(args.num_hidden_layers())
             .ok_or_else(|| invalid("Gemma per-layer embedding width overflow"))?;
         groups.push(replicated(
-            "model.language_model.per_layer_embedding",
+            format!("{root}.per_layer_embedding"),
             [(
-                "model.language_model.embed_tokens_per_layer.weight".into(),
+                format!("{root}.embed_tokens_per_layer.weight"),
                 vec![
                     dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
                     combined,
@@ -871,23 +889,23 @@ pub fn static_parameter_groups(
             )],
         )?);
         groups.push(replicated(
-            "model.language_model.per_layer_projection",
+            format!("{root}.per_layer_projection"),
             [(
-                "model.language_model.per_layer_model_projection.weight".into(),
+                format!("{root}.per_layer_model_projection.weight"),
                 vec![combined, hidden],
             )],
         )?);
         groups.push(replicated(
-            "model.language_model.per_layer_projection_norm",
+            format!("{root}.per_layer_projection_norm"),
             [(
-                "model.language_model.per_layer_projection_norm.weight".into(),
+                format!("{root}.per_layer_projection_norm.weight"),
                 vec![per_layer],
             )],
         )?);
     }
     groups.push(replicated(
-        "model.language_model.norm",
-        [("model.language_model.norm.weight".into(), vec![hidden])],
+        format!("{root}.norm"),
+        [(format!("{root}.norm.weight"), vec![hidden])],
     )?);
     if !args.tie_word_embeddings {
         groups.push(group(
@@ -910,10 +928,19 @@ pub fn layer_parameter_groups(
     args: &ModelArgs,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    layer_parameter_groups_at(args, layer, "model.language_model.layers")
+}
+
+/// Declares shared block placement under an architecture-owned logical root.
+pub(crate) fn layer_parameter_groups_at(
+    args: &ModelArgs,
+    layer: usize,
+    layer_root: &str,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let policy = args
         .layer_policy(layer)
         .ok_or_else(|| invalid(format!("Gemma 4 layer {layer} is out of range")))?;
-    let root = format!("model.language_model.layers.{layer}");
+    let root = format!("{layer_root}.{layer}");
     let attention = format!("{root}.self_attn");
     let hidden = dim(args.hidden_size)?;
     let head_dim = dim(policy.head_dim.get() as i32)?;

@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn completed_prefill_chunks_are_snapshotable_without_advancing_prediction() {
+fn completed_physical_progress_is_snapshotable_without_advancing_commitment() {
     let mut lifecycle = GenerationLifecycle::default();
-    assert!(lifecycle.complete_prefill().is_err());
+    assert!(lifecycle.complete_progress().is_err());
     for _ in 0..2 {
         lifecycle.begin_prediction().unwrap();
-        lifecycle.complete_prefill().unwrap();
+        lifecycle.complete_progress().unwrap();
         assert_eq!(lifecycle.status(), GenerationStatus::Paused);
         assert_eq!(lifecycle.next_prediction(), 0);
         assert_eq!(lifecycle.finish_reason(), None);
@@ -15,7 +15,10 @@ fn completed_prefill_chunks_are_snapshotable_without_advancing_prediction() {
     lifecycle.begin_prediction().unwrap();
     lifecycle.complete_prediction(None).unwrap();
     lifecycle.begin_prediction().unwrap();
-    assert!(lifecycle.complete_prefill().is_err());
+    lifecycle.complete_progress().unwrap();
+    assert_eq!(lifecycle.next_prediction(), 1);
+    lifecycle.checkpoint().unwrap();
+    assert!(lifecycle.complete_progress().is_err());
 }
 
 #[test]

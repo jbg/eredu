@@ -1,0 +1,200 @@
+//! Portable policy and progress records for iterative token-block generation.
+
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
+
+/// Validated entropy-bounded refinement controls, independent of model geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RefinementOptions", into = "RefinementOptions")]
+pub struct RefinementConfig {
+    options: RefinementOptions,
+}
+
+/// Request or artifact values accepted by entropy-bounded refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RefinementOptions {
+    /// Maximum decoder invocations for each block.
+    pub max_denoising_steps: u32,
+    /// Initial logit temperature.
+    pub t_max: f32,
+    /// Lower endpoint of the linear temperature schedule.
+    pub t_min: f32,
+    /// Joint mutual-information upper bound used for position acceptance.
+    pub entropy_bound: f32,
+    /// Mean entropy must be strictly below this threshold for early stopping.
+    pub confidence_threshold: f32,
+    /// Number of preceding identical argmax predictions required for stopping.
+    pub stability_threshold: u32,
+}
+
+impl Default for RefinementOptions {
+    fn default() -> Self {
+        Self {
+            max_denoising_steps: 48,
+            t_max: 0.8,
+            t_min: 0.4,
+            entropy_bound: 0.1,
+            confidence_threshold: 0.005,
+            stability_threshold: 1,
+        }
+    }
+}
+
+/// A refinement request rejected before execution or random draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RefinementPolicyError {
+    /// No decoder invocation is allowed.
+    #[error("refinement requires at least one denoising step")]
+    ZeroSteps,
+    /// Temperatures must be finite, positive and ordered.
+    #[error("refinement temperatures must be finite and satisfy 0 < t_min <= t_max")]
+    Temperature,
+    /// Entropy thresholds must be finite and strictly positive.
+    #[error("refinement entropy thresholds must be finite and positive")]
+    Entropy,
+    /// The requested iteration is outside the selected schedule.
+    #[error("refinement iteration lies outside the selected schedule")]
+    Iteration,
+}
+
+impl TryFrom<RefinementOptions> for RefinementConfig {
+    type Error = RefinementPolicyError;
+
+    fn try_from(options: RefinementOptions) -> Result<Self, Self::Error> {
+        if options.max_denoising_steps == 0 {
+            return Err(RefinementPolicyError::ZeroSteps);
+        }
+        if !options.t_min.is_finite()
+            || !options.t_max.is_finite()
+            || options.t_min <= 0.0
+            || options.t_max < options.t_min
+        {
+            return Err(RefinementPolicyError::Temperature);
+        }
+        if [options.entropy_bound, options.confidence_threshold]
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(RefinementPolicyError::Entropy);
+        }
+        Ok(Self { options })
+    }
+}
+
+impl From<RefinementConfig> for RefinementOptions {
+    fn from(config: RefinementConfig) -> Self {
+        config.options
+    }
+}
+
+impl Default for RefinementConfig {
+    fn default() -> Self {
+        RefinementOptions::default()
+            .try_into()
+            .expect("the default refinement policy is valid")
+    }
+}
+
+impl RefinementConfig {
+    /// Returns the immutable validated controls.
+    pub const fn options(self) -> RefinementOptions {
+        self.options
+    }
+
+    /// Maximum decoder invocations for each block.
+    pub const fn steps(self) -> NonZeroU32 {
+        // Construction and deserialization both validate this invariant.
+        NonZeroU32::new(self.options.max_denoising_steps).unwrap()
+    }
+
+    /// Temperature for a zero-based completed-step count.
+    ///
+    /// The remaining-step schedule uses N, N-1, ..., 1. Its final invocation
+    /// therefore remains one schedule increment above the lower endpoint.
+    pub fn temperature(self, completed: u32) -> Result<f32, RefinementPolicyError> {
+        let remaining = self
+            .options
+            .max_denoising_steps
+            .checked_sub(completed)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(RefinementPolicyError::Iteration)?;
+        Ok(self.options.t_min
+            + (self.options.t_max - self.options.t_min)
+                * (remaining as f32 / self.options.max_denoising_steps as f32))
+    }
+}
+
+/// Meaning of a reported prediction score.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionScoreKind {
+    /// Probability conditioned on the committed causal prefix.
+    CausalConditional,
+    /// Position score conditioned on a complete tentative block.
+    RefinementPosition,
+    /// Refinement score restricted by the evolving committed output constraints.
+    ConstrainedFinalization,
+}
+
+/// Physical operation completed by a generation advancement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationPhase {
+    /// Encode prompt or authoritative committed context.
+    Context,
+    /// Revise tentative candidates without changing retained context.
+    Refinement,
+    /// Finalize and commit one candidate position.
+    Finalization,
+}
+
+/// Independent execution and output coordinates of an iterative generation run.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenerationPosition {
+    /// Completed physical advancement count.
+    pub execution_step: u64,
+    /// Current block index.
+    pub block: u64,
+    /// Completed refinement invocations in the current block.
+    pub iteration: u32,
+    /// Total authoritative generated token commitments.
+    pub committed_tokens: u64,
+}
+
+/// A replaceable tentative block, separate from committed semantic output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftRevision {
+    /// Independent branch identity.
+    pub branch: u64,
+    /// Monotone output reconciliation epoch, never restored backwards.
+    pub epoch: u64,
+    /// Block containing these tentative positions.
+    pub block: u64,
+    /// Revision within the current epoch and block.
+    pub revision: u32,
+    /// Generated-token position at which the block begins.
+    pub committed_start: u64,
+    /// Complete replacement token IDs for the active draft.
+    pub token_ids: Vec<u32>,
+}
+
+/// Tentative-output lifecycle. These events never enter the committed parser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftEvent {
+    /// Replace the entire active tentative block.
+    Updated {
+        /// Complete revision and identity.
+        draft: DraftRevision,
+    },
+    /// Remove the active tentative block from this branch and epoch.
+    Cleared {
+        /// Independent branch identity.
+        branch: u64,
+        /// Monotone reconciliation epoch.
+        epoch: u64,
+        /// Block whose draft is removed.
+        block: u64,
+    },
+}

@@ -44,12 +44,31 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B>
         format: eredu_checkpoint::LinearFormat,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_at_with_format(
+            args,
+            &format!("model.{component}"),
+            input_size,
+            epsilon,
+            format,
+            context,
+        )
+    }
+
+    /// Declares a shared projector at its exact family parameter root.
+    pub(crate) fn new_at_with_format(
+        args: &ModelArgs,
+        root: &str,
+        input_size: i32,
+        epsilon: f32,
+        format: eredu_checkpoint::LinearFormat,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         if input_size <= 0 || !epsilon.is_finite() || epsilon <= 0.0 {
             return Err(Error::backend(
                 "invalid Gemma 4 modality projector geometry",
             ));
         }
-        let weight = format!("model.{component}.embedding_projection.weight");
+        let weight = format!("{root}.embedding_projection.weight");
         Ok(Self {
             projection: B::linear(
                 LinearSpec {

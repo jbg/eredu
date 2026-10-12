@@ -32,6 +32,23 @@ where
     /// Forms the architecture-owned borrowed input for one text pass.
     fn text_input<'a>(tokens: &'a B::Tensor, mask: Option<&'a B::Tensor>) -> Self::Input<'a>;
 
+    /// Complete iterative score geometry when authoritative context and tentative
+    /// block invocations share parameters and retained state.
+    fn block_refinement_geometry(
+        &self,
+    ) -> Option<crate::generation::refinement::architecture::BlockRefinementGeometry> {
+        None
+    }
+
+    /// Forms a tentative invocation. Causal architectures have no such equation.
+    fn block_refinement_input<'a>(
+        _canvas: &'a B::Tensor,
+        _feedback: Option<&'a B::Tensor>,
+        _mask: Option<&'a B::Tensor>,
+    ) -> Option<Self::Input<'a>> {
+        None
+    }
+
     /// Whether consecutive causal text passes preserve the same state and
     /// positions as one complete prompt. Families opt in after validating
     /// incremental state updates, masks, and numerical parity.
@@ -51,13 +68,16 @@ where
 pub enum ReplicatedTextOutputSelection {
     /// Selects the final position on the architecture's sequence axis.
     LastSequencePosition,
+    /// Retains every position for an iterative block invocation.
+    AllSequencePositions,
 }
 
 impl ReplicatedTextOutputSelection {
     /// Returns the mechanical sequence-axis index requested from a backend tensor.
-    pub const fn sequence_index(self) -> i32 {
+    pub const fn sequence_index(self) -> Option<i32> {
         match self {
-            Self::LastSequencePosition => -1,
+            Self::LastSequencePosition => Some(-1),
+            Self::AllSequencePositions => None,
         }
     }
 }
@@ -1190,6 +1210,7 @@ impl ReplicatedTextContractError {
 pub struct ReplicatedTextRequirements {
     execution_topology: Option<crate::execution_topology::TextExecutionTopology>,
     chunked_prefill: bool,
+    block_refinement: Option<crate::generation::refinement::architecture::BlockRefinementGeometry>,
     floating_state_source: Option<TensorDtype>,
     architecture_identity: String,
     /// Optional neural operations required by the architecture equations.
@@ -1217,6 +1238,21 @@ pub struct ReplicatedTextRequirements {
 }
 
 impl ReplicatedTextRequirements {
+    /// Retains architecture-owned iterative geometry before mechanism selection.
+    pub fn with_block_refinement(
+        mut self,
+        geometry: crate::generation::refinement::architecture::BlockRefinementGeometry,
+    ) -> Self {
+        self.block_refinement = Some(geometry);
+        self
+    }
+    /// Iterative invocation geometry; absent for causal conditional execution.
+    pub const fn block_refinement(
+        &self,
+    ) -> Option<crate::generation::refinement::architecture::BlockRefinementGeometry> {
+        self.block_refinement
+    }
+
     /// Projects this target's exact state contract for shared cold admission.
     pub fn state_requirements(&self) -> StateRealizationRequirements {
         StateRealizationRequirements {
@@ -1362,6 +1398,7 @@ impl ReplicatedTextRequirements {
         Ok(Self {
             execution_topology: None,
             chunked_prefill: false,
+            block_refinement: None,
             floating_state_source: None,
             architecture_identity,
             operators,

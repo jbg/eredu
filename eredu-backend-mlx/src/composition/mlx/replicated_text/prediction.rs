@@ -888,6 +888,23 @@ pub(crate) trait ErasedPrefillCursor {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn block_refinement_geometry(
+        &self,
+    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
+        None
+    }
+
+    fn refine_block_with_observer(
+        &mut self,
+        _canvas: &Array,
+        _feedback: Option<&Array>,
+        _stream: &Stream,
+        _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        Err(Error::ArchitectureModel(
+            "causal execution has no tentative-block equation".into(),
+        ))
+    }
     fn projects_final_prefill_position(&self) -> bool {
         false
     }

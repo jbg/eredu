@@ -1121,17 +1121,19 @@ where
     }
 }
 
+/// Physical progress stays outside committed decoding and termination.
+pub(crate) enum SourceAdvancement {
+    Progress,
+    Token(u32),
+    Finished,
+}
+
 /// Architecture-independent source of sampled, grammar-committed token ids.
 pub(crate) trait CommittedTokenSource {
     type Error;
 
-    /// Completes one nonsampling prompt chunk. False preserves the ordinary
-    /// token-producing step; true yields a quiescent boundary to the caller.
-    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
-        Ok(false)
-    }
-
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
+    /// Completes one physical operation and yields before the next operation.
+    fn advance(&mut self) -> Result<SourceAdvancement, Self::Error>;
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
 
@@ -1285,15 +1287,11 @@ impl CommittedGenerationCursor {
             self.finish_reason = Some(FinishReason::Cancelled);
             return Ok(());
         }
-        if source
-            .advance_prefill()
-            .map_err(CommittedGenerationError::Source)?
-        {
-            return Ok(());
-        }
-        let token_id = source
-            .next_token()
-            .map_err(CommittedGenerationError::Source)?;
+        let token_id = match source.advance().map_err(CommittedGenerationError::Source)? {
+            SourceAdvancement::Progress => return Ok(()),
+            SourceAdvancement::Token(token) => Some(token),
+            SourceAdvancement::Finished => None,
+        };
         let Some(token_id) = token_id else {
             if self.sequence.observe_cancellation(cancellation) {
                 pipeline.cancel(emit);
@@ -1377,8 +1375,8 @@ mod tests {
         drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
         FinishReason, GenerationCancellationToken, JsonFragmentBuffer, PartialPatternBuffer,
         PatternKind, PatternPiece, ProtocolParser, RawTokenDecoder, SemanticEvent,
-        SemanticEventSink, SemanticStream, StopMatcher, TokenDecoderBackend, ToolRuntimeParser,
-        Utf8Buffer, Utf8BufferError,
+        SemanticEventSink, SemanticStream, SourceAdvancement, StopMatcher, TokenDecoderBackend,
+        ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
     };
 
     const REASONING_START: &str = "<r>";
@@ -1947,9 +1945,12 @@ mod tests {
     impl CommittedTokenSource for SyntheticModel {
         type Error = Infallible;
 
-        fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+        fn advance(&mut self) -> Result<SourceAdvancement, Self::Error> {
             self.next_calls.set(self.next_calls.get() + 1);
-            Ok(self.tokens.pop_front())
+            Ok(self
+                .tokens
+                .pop_front()
+                .map_or(SourceAdvancement::Finished, SourceAdvancement::Token))
         }
 
         fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
@@ -2059,9 +2060,9 @@ mod tests {
         struct CancelDuringPrefill(GenerationCancellationToken);
         impl CommittedTokenSource for CancelDuringPrefill {
             type Error = Infallible;
-            fn next_token(&mut self) -> Result<Option<u32>, Infallible> {
+            fn advance(&mut self) -> Result<SourceAdvancement, Infallible> {
                 self.0.cancel();
-                Ok(None)
+                Ok(SourceAdvancement::Finished)
             }
             fn grammar_is_complete(&mut self) -> Result<bool, Infallible> {
                 Ok(false)
@@ -2405,15 +2406,12 @@ mod tests {
         }
         impl CommittedTokenSource for PrefixSource {
             type Error = Infallible;
-            fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
-                if self.remaining == 0 {
-                    return Ok(false);
+            fn advance(&mut self) -> Result<SourceAdvancement, Self::Error> {
+                if self.remaining > 0 {
+                    self.remaining -= 1;
+                    return Ok(SourceAdvancement::Progress);
                 }
-                self.remaining -= 1;
-                Ok(true)
-            }
-            fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
-                self.source.next_token()
+                self.source.advance()
             }
             fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
                 self.source.grammar_is_complete()

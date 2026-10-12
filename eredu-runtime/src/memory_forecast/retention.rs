@@ -296,6 +296,7 @@ mod tests {
     }
     fn topology() -> TextExecutionTopology {
         TextExecutionTopology {
+            iterative: None,
             hidden_size: 4,
             vocabulary_size: 4,
             layers: vec![],

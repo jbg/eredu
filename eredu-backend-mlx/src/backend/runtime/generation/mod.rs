@@ -2,5 +2,6 @@
 
 mod backend;
 mod dense;
+mod refinement;
 
 pub use backend::MlxSamplingBackend;

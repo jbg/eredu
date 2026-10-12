@@ -142,6 +142,77 @@ impl GatedExpertProjectionFamilyRecipes {
     }
 }
 
+/// Preserves encoded companions while assembling the selected expert bank.
+pub fn gated_product_materialization_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    bank: &GatedProductExpertRecipes,
+) -> Result<std::collections::BTreeMap<String, DerivedWeightRecipe>, String> {
+    fn companion<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        weight: &DerivedWeightRecipe,
+        bias: bool,
+    ) -> Result<Option<DerivedWeightRecipe>, String> {
+        let (axis, inputs, stack) = match weight {
+            DerivedWeightRecipe::Source {
+                key,
+                selection: TensorSelection::Full,
+            } => {
+                let prefix = key.strip_suffix(".weight").unwrap_or(key);
+                let names = if bias {
+                    vec![format!("{key}_biases"), format!("{prefix}.biases")]
+                } else {
+                    vec![
+                        format!("{key}_scale_inv"),
+                        format!("{key}_scales"),
+                        format!("{prefix}.weight_scale_inv"),
+                        format!("{prefix}.scale"),
+                        format!("{prefix}.scales"),
+                    ]
+                };
+                return Ok(names
+                    .into_iter()
+                    .find(|name| catalog.tensor_metadata(name).is_ok())
+                    .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full)));
+            }
+            DerivedWeightRecipe::Stack { axis, inputs } => (*axis, inputs, true),
+            DerivedWeightRecipe::Concatenate { axis, inputs } => (*axis, inputs, false),
+            _ => {
+                return Err("expert companion requires the selected full-source bank layout".into())
+            }
+        };
+        let mapped = inputs
+            .iter()
+            .map(|input| companion(catalog, input, bias))
+            .collect::<Result<Vec<_>, _>>()?;
+        if mapped.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let inputs = mapped
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "encoded expert bank has an incomplete companion family".to_string())?;
+        Ok(Some(if stack {
+            DerivedWeightRecipe::Stack { axis, inputs }
+        } else {
+            DerivedWeightRecipe::Concatenate { axis, inputs }
+        }))
+    }
+    let mut outputs = std::collections::BTreeMap::new();
+    for (target, weight) in [
+        (&bank.target_gate_up, &bank.gate_up),
+        (&bank.target_down, &bank.down),
+    ] {
+        outputs.insert(target.clone(), weight.clone());
+        for (suffix, bias) in [("scales", false), ("biases", true)] {
+            if let Some(recipe) = companion(catalog, weight, bias)? {
+                recipe.infer(catalog).map_err(|error| error.to_string())?;
+                outputs.insert(format!("{target}_{suffix}"), recipe);
+            }
+        }
+    }
+    Ok(outputs)
+}
+
 /// Selects a complete physical layout and validates its canonical recipes.
 pub fn resolve_gated_product_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,

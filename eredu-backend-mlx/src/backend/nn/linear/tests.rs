@@ -86,11 +86,12 @@ fn row_parallel_observer_error_or_unwind_preserves_bias_and_retry() {
                 calls: 0,
             };
             let result = catch_unwind(AssertUnwindSafe(|| {
-                linear.forward_row_parallel_with_input_observer(
+                linear.forward_row_parallel_with_compute(
                     &input,
                     &group,
                     &stream,
                     Some(&mut observer),
+                    None,
                 )
             }));
             match stop {
@@ -115,11 +116,12 @@ fn row_parallel_observer_error_or_unwind_preserves_bias_and_retry() {
                 calls: 0,
             };
             let retried = linear
-                .forward_row_parallel_with_input_observer(
+                .forward_row_parallel_with_compute(
                     &input,
                     &group,
                     &stream,
                     Some(&mut observer),
+                    None,
                 )
                 .unwrap();
             assert_eq!(observer.calls, 1);
@@ -160,11 +162,12 @@ fn ordinary_and_row_parallel_observers_apply_bias_once_or_leave_absence_unchange
                 .forward_with_input_observer(&input, &stream, Some(&mut observer))
                 .unwrap();
             let parallel = linear
-                .forward_row_parallel_with_input_observer(
+                .forward_row_parallel_with_compute(
                     &input,
                     &group,
                     &stream,
                     Some(&mut observer),
+                    None,
                 )
                 .unwrap();
             assert_eq!(observer.calls, 2);

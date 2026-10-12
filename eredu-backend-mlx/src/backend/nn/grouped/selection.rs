@@ -526,17 +526,15 @@ impl TopKGroupSelector {
         let epsilon = self
             .input_rms_epsilon
             .expect("selector input scale requires an RMS epsilon");
-        let variance = mean_axis(&flat.square(stream)?, -1, true, stream)?;
-        let normalized = flat.multiply(
-            rsqrt(variance.add(Array::from_f32(epsilon), stream)?, stream)?,
-            stream,
-        )?;
+        let normalized = super::super::normalization::weightless_rms(&flat, epsilon, stream)?;
         let scaled = normalized.multiply(scale, stream)?;
         if self.input_inverse_sqrt_dimensions {
-            scaled.multiply(
-                Array::from_f32((self.input_dims as f32).sqrt().recip()),
-                stream,
-            )
+            scaled
+                .multiply(
+                    Array::from_f32((self.input_dims as f32).sqrt().recip()),
+                    stream,
+                )?
+                .as_dtype(scaled.dtype(), stream)
         } else {
             Ok(scaled)
         }
@@ -593,6 +591,19 @@ impl TopKGroupSelector {
 /// Partition from the largest end directly. Selecting the upper suffix of an
 /// ascending partition has different cutoff behavior when routing scores tie.
 fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array, Exception> {
+    let indices = partition_indices(scores, count, stream)?;
+    let selected = take_along_axis(scores, &indices, -1, stream)?;
+    let order = safemlx::ops::argsort_axis(
+        &selected.multiply(Array::from_f32(-1.0), stream)?,
+        -1,
+        stream,
+    )?;
+    // Selected-probability normalization and slot reductions consume ranked
+    // scores. A partition chooses the same set but does not define this order.
+    take_along_axis(&indices, &order, -1, stream)
+}
+
+fn partition_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array, Exception> {
     let descending = scores.multiply(Array::from_f32(-1.0), stream)?;
     let indices = argpartition_axis(&descending, count - 1, -1, stream)?
         .try_index_device((.., ..count), stream)?;
@@ -641,6 +652,11 @@ pub(crate) fn weighted_group_sum(
     let weights = gather_selection_values(top_k_weights, plan, stream)?
         .try_index_device((.., NewAxis), stream)?;
     let weighted = current.multiply(weights, stream)?;
+    let weighted = if reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
+        weighted.as_dtype(current.dtype(), stream)?
+    } else {
+        weighted
+    };
 
     // Each selection index is unique, so restore the group-major rows with a
     // collision-free scatter and reduce the original top-k slots in their
@@ -722,9 +738,8 @@ fn sequential_group_reduction_rounds_in_group_order_independently_of_topk_order(
     for ids in [[2i32, 0, 1], [1, 2, 0], [0, 1, 2]] {
         let ids = Array::from_slice(&ids, &[1, 3]);
         let plan = super::super::grouping::group_by_id(&ids, stream).unwrap();
-        let weights = Array::from_slice(&[1.0f32; 3], &[1, 3])
-            .as_dtype(Dtype::Bfloat16, stream)
-            .unwrap();
+        // Router probabilities remain FP32 while expert outputs are BF16.
+        let weights = Array::from_slice(&[1.0f32; 3], &[1, 3]);
         // BF16 rounds 256 + 1 back to 256 before adding -256. In score
         // order the first two permutations would instead produce one.
         let output = weighted_group_sum(
@@ -804,4 +819,24 @@ fn native_partition_matches_value_only_cpu_on_repeated_scores() {
             "width {width}, count {count}"
         );
     }
+}
+
+#[test]
+fn topk_selection_returns_ranked_scores_before_normalization() {
+    let execution =
+        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let values: Vec<_> = (0..128)
+        .map(|i| ((i * 47) % 128) as f32 * 0.03125)
+        .collect();
+    let scores = Array::from_slice(&values, &[1, 128]);
+    let selected = largest_indices(&scores, 8, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .try_to_vec::<u32>()
+        .unwrap();
+    let mut expected: Vec<_> = (0..128u32).collect();
+    expected.sort_by(|a, b| values[*b as usize].total_cmp(&values[*a as usize]));
+    assert_eq!(selected, expected[..8]);
 }

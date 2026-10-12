@@ -194,6 +194,20 @@ pub fn describe_text_workspace(
         .execution_topology
         .as_ref()
         .ok_or_else(|| invalid("module topology unavailable"))?;
+    // The envelope includes a whole-canvas invocation even when the current
+    // commitment horizon ends within its first block.
+    let invocation_query = topology
+        .iterative
+        .as_ref()
+        .map_or(query, |iteration| query.max(iteration.query_rows));
+    let positions = add(
+        positions,
+        topology
+            .iterative
+            .as_ref()
+            .map_or(0, |iteration| iteration.query_rows),
+    )?;
+    let query = invocation_query;
     if topology.hidden_size == 0
         || topology.vocabulary_size == 0
         || topology.output_invocations == 0
@@ -261,6 +275,40 @@ pub fn describe_text_workspace(
         ),
         global.clone(),
     )?;
+    if let Some(iteration) = &topology.iterative {
+        if iteration.query_rows == 0
+            || iteration.intermediate_size == 0
+            || iteration.score_buffer_copies == 0
+        {
+            return Err(invalid("iterative invocation dimensions must be positive"));
+        }
+        schedule.allocation("iterative-scores", MemoryBytes::estimated(0,
+            product(&[request.batch_size, iteration.query_rows, topology.vocabulary_size, 4, iteration.score_buffer_copies])?,
+            "whole-canvas feedback, processed scores and categorical-noise buffers; eight FP32 copies is a calibrated retention envelope"), global.clone())?;
+        for projection_topology in &iteration.conditioning {
+            schedule.allocation(
+                "feedback-projection",
+                MemoryBytes::estimated(
+                    0,
+                    product(&[rows, projection_topology.output, upper_scalar])?,
+                    "feedback projection output before the shared stack",
+                ),
+                global.clone(),
+            )?;
+        }
+        schedule.allocation(
+            "feedback-transform",
+            MemoryBytes::estimated(
+                0,
+                add(
+                    product(&[rows, iteration.intermediate_size, upper_scalar, 2])?,
+                    product(&[rows, topology.hidden_size, upper_scalar, 4])?,
+                )?,
+                "soft embedding, feedback normalization and gated-product intermediates",
+            ),
+            global.clone(),
+        )?;
+    }
     let mut max_layer = 0u64;
     let mut attention_scratch = MemoryBytes::exact(0);
     let mut transient_pending = BTreeSet::new();
@@ -585,28 +633,29 @@ pub fn describe_text_workspace(
                 transient_pending.insert(index);
             }
         }
-        match &layer.feed_forward {
-            FeedForwardTopology::Gated {
-                intermediate_size,
-                projections,
-            } => {
-                transient_pending.insert(index);
-                for (projection_index, p) in projections.iter().enumerate() {
+        for branch in layer.feed_forward.components() {
+            match branch {
+                FeedForwardTopology::Gated {
+                    intermediate_size,
+                    projections,
+                } => {
+                    transient_pending.insert(index);
+                    for (projection_index, p) in projections.iter().enumerate() {
+                        schedule.allocation(
+                            "feed-forward-projection",
+                            MemoryBytes::estimated(
+                                output_bytes(&projection(p, rows, scalar))?,
+                                product(&[rows, p.output, upper_scalar])?,
+                                "gated feed-forward projection; final output remains owner-held",
+                            ),
+                            if projection_index + 1 == projections.len() {
+                                hold.clone()
+                            } else {
+                                transient.clone()
+                            },
+                        )?;
+                    }
                     schedule.allocation(
-                        "feed-forward-projection",
-                        MemoryBytes::estimated(
-                            output_bytes(&projection(p, rows, scalar))?,
-                            product(&[rows, p.output, upper_scalar])?,
-                            "gated feed-forward projection; final output remains owner-held",
-                        ),
-                        if projection_index + 1 == projections.len() {
-                            hold.clone()
-                        } else {
-                            transient.clone()
-                        },
-                    )?;
-                }
-                schedule.allocation(
                     "gated-product",
                     MemoryBytes::estimated(
                         0,
@@ -615,64 +664,82 @@ pub fn describe_text_workspace(
                     ),
                     transient.clone(),
                 )?;
-            }
-            FeedForwardTopology::Routed {
-                experts,
-                selected,
-                intermediate_size,
-                router,
-                projections,
-            } => {
-                charge(
-                    &mut schedule,
-                    "router-projection",
-                    output_bytes(&projection(router, rows, scalar))?,
-                    product(&[rows, *experts, upper_scalar])?,
-                )?;
-                // Router scores/probabilities, selection indices, sorted routes
-                // and weighted reduction are a mechanism-wide planning envelope.
-                charge(
-                    &mut schedule,
-                    "expert-routing",
-                    0,
-                    add(
-                        product(&[rows, *experts, 8])?,
-                        product(&[rows, *selected, 16])?,
-                    )?,
-                )?;
-                for p in projections {
-                    let invocation = MechanismInvocation::ExpertDispatch {
-                        rows,
-                        experts: *experts,
-                        selected: *selected,
-                        input: p.input,
-                        output: p.output,
-                        format: p.format,
-                        element: scalar,
-                    };
-                    let output = output_bytes(&invocation)?;
+                }
+                FeedForwardTopology::Routed {
+                    experts,
+                    selected,
+                    intermediate_size,
+                    router,
+                    projections,
+                } => {
                     charge(
                         &mut schedule,
-                        "expert-projection",
-                        output,
-                        product(&[
+                        "router-projection",
+                        output_bytes(&projection(router, rows, scalar))?,
+                        product(&[rows, *experts, upper_scalar])?,
+                    )?;
+                    // Router scores/probabilities, selection indices, sorted routes
+                    // and weighted reduction are a mechanism-wide planning envelope.
+                    charge(
+                        &mut schedule,
+                        "expert-routing",
+                        0,
+                        add(
+                            product(&[rows, *experts, 8])?,
+                            product(&[rows, *selected, 16])?,
+                        )?,
+                    )?;
+                    for p in projections {
+                        let invocation = MechanismInvocation::ExpertDispatch {
                             rows,
-                            *selected,
-                            add(p.input, mul(p.output, 2)?)?,
-                            upper_scalar,
-                        ])?,
+                            experts: *experts,
+                            selected: *selected,
+                            input: p.input,
+                            output: p.output,
+                            format: p.format,
+                            element: scalar,
+                        };
+                        let output = output_bytes(&invocation)?;
+                        charge(
+                            &mut schedule,
+                            "expert-projection",
+                            output,
+                            product(&[
+                                rows,
+                                *selected,
+                                add(p.input, mul(p.output, 2)?)?,
+                                upper_scalar,
+                            ])?,
+                        )?;
+                    }
+                    charge(
+                        &mut schedule,
+                        "expert-gated-product",
+                        0,
+                        product(&[rows, *selected, *intermediate_size, upper_scalar, 2])?,
                     )?;
                 }
-                charge(
-                    &mut schedule,
-                    "expert-gated-product",
-                    0,
-                    product(&[rows, *selected, *intermediate_size, upper_scalar, 2])?,
-                )?;
+                FeedForwardTopology::Additive { .. } => unreachable!("components returns leaves"),
+                FeedForwardTopology::Unknown { reason } => schedule.allocation(
+                    "feed-forward",
+                    MemoryBytes::unknown(reason),
+                    hold.clone(),
+                )?,
             }
-            FeedForwardTopology::Unknown { reason } => {
-                schedule.allocation("feed-forward", MemoryBytes::unknown(reason), hold.clone())?
-            }
+        }
+        if let FeedForwardTopology::Additive { branches } = &layer.feed_forward {
+            let _ = branches;
+            charge(
+                &mut schedule,
+                "feed-forward-addition",
+                0,
+                product(&[
+                    rows,
+                    topology.hidden_size,
+                    upper_scalar,
+                    layer.feed_forward.components().len() as u64 - 1,
+                ])?,
+            )?;
         }
         let mut layer_upper = 0;
         for event in &schedule.plan.events[layer_start..] {
@@ -705,7 +772,7 @@ pub fn describe_text_workspace(
     schedule.global_allocation("attention-scratch", attention_scratch, global.clone())?;
     let logits_rows = mul(
         mul(request.batch_size, topology.output_invocations)?,
-        if execution.logits == LogitsWorkspace::EveryPosition {
+        if topology.iterative.is_some() || execution.logits == LogitsWorkspace::EveryPosition {
             query
         } else {
             1
@@ -1020,6 +1087,18 @@ fn explicit_attention(
 }
 
 fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityError> {
+    fn validate_branches(branch: &FeedForwardTopology) -> Result<(), CapabilityError> {
+        if let FeedForwardTopology::Additive { branches } = branch {
+            if branches.len() < 2 {
+                return Err(invalid("additive feed-forward requires multiple branches"));
+            }
+            for branch in branches {
+                validate_branches(branch)?;
+            }
+        }
+        Ok(())
+    }
+
     let check_projections = |projections: &[ProjectionTopology],
                              input: u64,
                              output: u64|
@@ -1112,46 +1191,50 @@ fn validate_topology(topology: &TextExecutionTopology) -> Result<(), CapabilityE
                 check_projections(projections, topology.hidden_size, topology.hidden_size)?;
             }
         }
-        match &layer.feed_forward {
-            FeedForwardTopology::Gated {
-                intermediate_size,
-                projections,
-            } => {
-                if *intermediate_size == 0 {
-                    return Err(invalid("gated intermediate width must be positive"));
+        validate_branches(&layer.feed_forward)?;
+        for branch in layer.feed_forward.components() {
+            match branch {
+                FeedForwardTopology::Gated {
+                    intermediate_size,
+                    projections,
+                } => {
+                    if *intermediate_size == 0 {
+                        return Err(invalid("gated intermediate width must be positive"));
+                    }
+                    check_projections(projections, topology.hidden_size, topology.hidden_size)?;
+                    if projections
+                        .last()
+                        .is_some_and(|p| p.input != *intermediate_size)
+                    {
+                        return Err(invalid(
+                            "gated output projection disagrees with intermediate width",
+                        ));
+                    }
                 }
-                check_projections(projections, topology.hidden_size, topology.hidden_size)?;
-                if projections
-                    .last()
-                    .is_some_and(|p| p.input != *intermediate_size)
-                {
-                    return Err(invalid(
-                        "gated output projection disagrees with intermediate width",
-                    ));
+                FeedForwardTopology::Routed {
+                    experts,
+                    selected,
+                    intermediate_size,
+                    router,
+                    projections,
+                } => {
+                    if *experts == 0
+                        || *selected == 0
+                        || selected > experts
+                        || *intermediate_size == 0
+                        || router.input != topology.hidden_size
+                        || router.output != *experts
+                    {
+                        return Err(invalid("expert selection and router geometry disagree"));
+                    }
+                    check_projections(projections, topology.hidden_size, topology.hidden_size)?;
                 }
-            }
-            FeedForwardTopology::Routed {
-                experts,
-                selected,
-                intermediate_size,
-                router,
-                projections,
-            } => {
-                if *experts == 0
-                    || *selected == 0
-                    || selected > experts
-                    || *intermediate_size == 0
-                    || router.input != topology.hidden_size
-                    || router.output != *experts
-                {
-                    return Err(invalid("expert selection and router geometry disagree"));
+                FeedForwardTopology::Additive { .. } => unreachable!("components returns leaves"),
+                FeedForwardTopology::Unknown { reason } if reason.trim().is_empty() => {
+                    return Err(invalid("missing mechanism coverage requires a reason"))
                 }
-                check_projections(projections, topology.hidden_size, topology.hidden_size)?;
+                FeedForwardTopology::Unknown { .. } => {}
             }
-            FeedForwardTopology::Unknown { reason } if reason.trim().is_empty() => {
-                return Err(invalid("missing mechanism coverage requires a reason"))
-            }
-            FeedForwardTopology::Unknown { .. } => {}
         }
     }
     Ok(())

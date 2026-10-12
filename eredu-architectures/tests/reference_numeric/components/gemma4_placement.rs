@@ -28,7 +28,7 @@ fn fixture(sparse: bool) -> serde_json::Value {
     })
 }
 
-fn image_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
+pub(super) fn image_input() -> eredu_runtime::PreparedModelInput<NumericTensor> {
     use eredu_core::{InputExtent, InputMetadataKey, InputModality};
     use eredu_runtime::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
     PreparedModelInput::new(

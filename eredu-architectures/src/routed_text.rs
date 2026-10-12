@@ -670,6 +670,83 @@ fn k2_horizon_args(
     }
 }
 
+pub(crate) fn diffusion_args(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+) -> Option<&crate::diffusion_gemma::FamilyConfig> {
+    match (
+        inspection.architecture_plan().safetensors_architecture(),
+        inspection.architecture_plan().gguf_plan(),
+    ) {
+        (Some(plan), None) => match plan.model() {
+            crate::configuration::SafetensorsModelConfig::DiffusionGemma(config) => Some(config),
+            _ => None,
+        },
+        (None, Some(plan)) => match plan.model() {
+            crate::configuration::GgufModelConfig::DiffusionGemma(config) => Some(config),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn prepare_diffusion_text_architecture<B, S>(
+    inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    selected: SelectedRoutedTextRealization,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedRoutedTextArchitecture<crate::diffusion_gemma::model::TextModel<B>>, String>
+where
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
+{
+    let crate::replicated_text::ReplicatedTextExecutionClass::Routed(expected) =
+        crate::replicated_text::replicated_text_execution_class(inspection)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("iterative routed construction requires grouped-bank selection".into());
+    };
+    validate_selected_routed_handoff(&expected, &selected).map_err(|error| error.to_string())?;
+    crate::replicated_text::validate_store_handoff(
+        expected.text(),
+        store.as_ref(),
+        crate::replicated_text::StoreHandoffScope::Primary,
+    )?;
+    let config = diffusion_args(inspection).ok_or("missing admitted diffusion geometry")?;
+    let mut target = config.clone();
+    target.text.weight_quantization = None;
+    target.text.quantized_weights = None;
+    let formats = crate::replicated_text::selected_formats(selected.text());
+    target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let identity = target.architecture_fingerprint();
+    let capability =
+        crate::capability::diffusion_gemma(&target).map_err(|error| error.to_string())?;
+    let source_architecture = crate::replicated_text::selected_uses_transform(selected.text())
+        .then(|| crate::diffusion_gemma::model::TextModel::<B>::new(config.clone(), context))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let architecture = crate::diffusion_gemma::model::TextModel::<B>::new(target, context)
+        .map_err(|error| error.to_string())?;
+    if expected.text().block_refinement()
+        != eredu_runtime::ReplicatedTextArchitecture::<B, S>::block_refinement_geometry(
+            &architecture,
+        )
+    {
+        return Err("selected refinement geometry differs from constructed text equations".into());
+    }
+    prepare_routed_architecture_handoff::<B, S, _>(
+        architecture,
+        source_architecture,
+        expected,
+        selected,
+        None,
+        capability,
+        "diffusion_gemma".into(),
+        identity,
+        context,
+    )
+}
+
 fn prepare_k2_horizon_routed_text_architecture<B, S>(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
     selected: SelectedRoutedTextRealization,
@@ -1824,11 +1901,24 @@ where
         + eredu_nn::BlockwiseAttentionBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::CompressedAttentionCache<B::Tensor>,
     V: RoutedTextArchitectureVisitor<B, S>,
 {
     visitor.construction_started();
+    if diffusion_args(inspection).is_some() {
+        let prepared = prepare_diffusion_text_architecture::<B, S>(
+            inspection,
+            selected,
+            store.clone(),
+            context,
+        )
+        .map_err(RoutedTextDispatchError::Architecture)?;
+        return visitor
+            .visit(prepared, store)
+            .map_err(RoutedTextDispatchError::Backend);
+    }
     if k2_horizon_args(inspection).is_some() {
         let prepared = prepare_k2_horizon_routed_text_architecture::<B, S>(
             inspection,
@@ -2836,6 +2926,16 @@ pub fn routed_text_requirements(
 fn derive_routed_text_requirements(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
 ) -> Result<RoutedTextRequirements, RoutedTextRequirementsError> {
+    if diffusion_args(inspection).is_some() {
+        return match crate::replicated_text::diffusion_execution_requirements(inspection)
+            .map_err(|error| RoutedTextRequirementsError::Invalid(error.to_string()))?
+        {
+            crate::replicated_text::ReplicatedTextExecutionClass::Routed(requirements) => {
+                Ok(requirements)
+            }
+            _ => Err(RoutedTextRequirementsError::Ineligible),
+        };
+    }
     let architecture = inspection.architecture_plan();
     if architecture.has_processor() || architecture.gguf_media_projector().is_some() {
         return Err(RoutedTextRequirementsError::Ineligible);

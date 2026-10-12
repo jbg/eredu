@@ -181,23 +181,31 @@ pub(crate) fn refine(
             }
             T::Unknown { .. } => {}
         }
-        match &layer.feed_forward {
-            F::Gated { projections, .. } => {
-                for p in projections {
-                    visit(p, rows, true)?;
+        for branch in layer.feed_forward.components() {
+            match branch {
+                F::Gated { projections, .. } => {
+                    for p in projections {
+                        visit(p, rows, true)?;
+                    }
                 }
-            }
-            F::Routed {
-                router,
-                projections,
-                ..
-            } => {
-                visit(router, rows, true)?;
-                for p in projections {
-                    visit(p, rows, false)?;
+                F::Routed {
+                    router,
+                    projections,
+                    ..
+                } => {
+                    visit(router, rows, true)?;
+                    for p in projections {
+                        visit(p, rows, false)?;
+                    }
                 }
+                F::Unknown { .. } => {}
+                F::Additive { .. } => unreachable!("components returns leaves"),
             }
-            F::Unknown { .. } => {}
+        }
+    }
+    if let Some(iteration) = &topology.iterative {
+        for projection in &iteration.conditioning {
+            visit(projection, rows.max(iteration.query_rows), true)?;
         }
     }
     visit(
@@ -241,6 +249,7 @@ mod tests {
             parameter: "shared".into(),
         };
         TextExecutionTopology {
+            iterative: None,
             hidden_size: 128,
             vocabulary_size: 128,
             layers: vec![TextLayerTopology {

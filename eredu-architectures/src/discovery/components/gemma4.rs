@@ -44,10 +44,14 @@ fn post_norm(
 }
 
 pub(in crate::discovery) fn unit(g: &mut Builder, c: &ModelArgs, layer: usize) {
+    unit_at(g, c, layer, "model.language_model");
+}
+
+pub(in crate::discovery) fn unit_at(g: &mut Builder, c: &ModelArgs, layer: usize, root: &str) {
     let policy = c.layer_policy(layer).expect("admitted Gemma layer");
     let sparse = policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe;
     let block = format!("decoder.{layer}");
-    let path = format!("model.language_model.layers.{layer}");
+    let path = format!("{root}.layers.{layer}");
     let attention = format!("{block}.attention");
     let ffn = format!("{block}.feed_forward");
     let dense = if sparse {
@@ -166,7 +170,7 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &ModelArgs, layer: usize) {
         layer
     };
     let published = c.layer_policy(publisher).expect("Gemma publisher");
-    let source_ap = format!("model.language_model.layers.{publisher}.self_attn");
+    let source_ap = format!("{root}.layers.{publisher}.self_attn");
     let head_rows = |sharing| ComponentRowMapping::HeadRows {
         offset: 0,
         component_head_width: dim,
@@ -414,8 +418,11 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &ModelArgs, layer: usize) {
 }
 
 pub(in crate::discovery) fn readout(g: &mut Builder, c: &ModelArgs) {
+    readout_at(g, c, "model.language_model");
+}
+
+pub(in crate::discovery) fn readout_at(g: &mut Builder, c: &ModelArgs, root: &str) {
     let width = c.hidden_size as usize;
-    let root = "model.language_model";
     g.attach_parameters("text.embedding", &format!("{root}.embed_tokens"));
     let weight = if c.tie_word_embeddings {
         format!("{root}.embed_tokens.weight")

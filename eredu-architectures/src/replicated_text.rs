@@ -612,6 +612,9 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReplicatedTextIneligibility {
+    /// The architecture alternates authoritative context and tentative refinement.
+    #[error("architecture requires iterative block-refinement execution")]
+    BlockRefinement,
     /// The architecture uses routed computation.
     #[error("architecture requires routed execution")]
     Routed,
@@ -899,13 +902,18 @@ where
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
+    let output = if requirements.block_refinement().is_some() {
+        eredu_runtime::ReplicatedTextOutputSelection::AllSequencePositions
+    } else {
+        eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition
+    };
     let contract =
         eredu_runtime::prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
             &architecture,
             source_architecture.as_ref(),
             selected,
             &prompt_cache_architecture_identity,
-            eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+            output,
             addressable_parameters,
             context,
         )?;
@@ -1097,6 +1105,7 @@ where
         | EligibleConfig::GptOss(_)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
+        | EligibleConfig::DiffusionGemma(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -1857,6 +1866,7 @@ where
         | EligibleConfig::GptOss(_)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
+        | EligibleConfig::DiffusionGemma(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -2231,6 +2241,68 @@ where
     }
 }
 
+/// Constructs an iterative stack under its independently selected read-only
+/// context mechanism, preserving ordinary parameter and completion ownership.
+fn visit_replicated_block_refinement_architecture<B, S, V>(
+    plan: &ArtifactArchitecturePlan,
+    selected: SelectedReplicatedTextRealization,
+    store: eredu_checkpoint::store::SharedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    mut visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
+    V: ReplicatedTextArchitectureVisitor<B, S>,
+{
+    let config = match (plan.safetensors_architecture(), plan.gguf_plan()) {
+        (Some(plan), None) => match plan.model() {
+            SafetensorsModelConfig::DiffusionGemma(config) => config,
+            _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
+        },
+        (None, Some(plan)) => match plan.model() {
+            GgufModelConfig::DiffusionGemma(config) => config,
+            _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
+        },
+        _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
+    };
+    let requirements = selected.requirements().clone();
+    validate_plan_identity(&requirements, &EligibleConfig::DiffusionGemma(config))
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
+        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor.construction_started();
+    let source = selected_uses_transform(&selected)
+        .then(|| crate::diffusion_gemma::model::TextModel::<B>::new(config.clone(), context))
+        .transpose()
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let mut target = config.clone();
+    target.text.weight_quantization = None;
+    target.text.quantized_weights = None;
+    let formats = selected_formats(&selected);
+    target.text.quantized_weight_configs = (!formats.is_empty()).then_some(formats);
+    let identity = target.architecture_fingerprint();
+    let capability = crate::capability::diffusion_gemma(&target)
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let architecture = crate::diffusion_gemma::model::TextModel::<B>::new(target, context)
+        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+    let prepared = prepare_architecture_handoff::<B, S, _>(
+        architecture,
+        source,
+        requirements,
+        selected,
+        capability,
+        "diffusion_gemma".into(),
+        identity,
+        context,
+    )
+    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    visitor
+        .visit(prepared, store)
+        .map_err(ReplicatedTextDispatchError::Backend)
+}
+
 /// Dispatches one selected replicated-text architecture through its exact typed state profile.
 pub fn dispatch_replicated_text_architecture<B, D>(
     plan: &ArtifactArchitecturePlan,
@@ -2240,9 +2312,12 @@ pub fn dispatch_replicated_text_architecture<B, D>(
     dispatcher: D,
 ) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
 where
-    B: eredu_nn::BlockwiseAttentionBackend,
+    B: eredu_nn::BlockwiseAttentionBackend
+        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::DistributedNeuralBackend,
     D: ReplicatedTextProfileDispatcher<B>,
-    <D::AttentionState as LayerRuntimeState<B>>::LayerState: AttentionCache<B::Tensor>,
+    <D::AttentionState as LayerRuntimeState<B>>::LayerState:
+        AttentionCache<B::Tensor> + eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     <D::ComponentState as LayerRuntimeState<B>>::LayerState:
         eredu_runtime::RuntimeStateComponents<B>,
     <D::AttentionComponentState as LayerRuntimeState<B>>::LayerState:
@@ -2252,6 +2327,19 @@ where
     <D::CompressedComponentState as LayerRuntimeState<B>>::LayerState:
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
+    if selected.requirements().block_refinement().is_some() {
+        return visit_replicated_block_refinement_architecture::<
+            B,
+            D::AttentionState,
+            D::AttentionVisitor,
+        >(
+            plan,
+            selected,
+            store,
+            context,
+            dispatcher.into_attention_visitor(),
+        );
+    }
     let eligible = eligible_config(plan)?;
     let ordinary = matches!(
         eligible,
@@ -2477,6 +2565,7 @@ enum EligibleConfig<'a> {
     GptOss(&'a crate::gpt_oss::ModelArgs),
     DeepSeekV3(&'a crate::deepseek::V3Args),
     DeepSeekV4(&'a crate::deepseek::V4Args),
+    DiffusionGemma(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
     MuseGlimmer(&'a crate::muse_glimmer::DecoderConfig),
@@ -2490,6 +2579,7 @@ impl EligibleConfig<'_> {
     ) -> Result<Option<eredu_runtime::execution_topology::TextExecutionTopology>, eredu_nn::Error>
     {
         let topology = match self {
+            Self::DiffusionGemma(args) => crate::diffusion_gemma::topology::text(args)?,
             Self::Llama(args) => crate::decoder::topology::text(*args)?,
             Self::Nanbeige(args) => crate::decoder::topology::text(*args)?,
             Self::Gemma2(args) => crate::decoder::topology::text(*args)?,
@@ -2505,6 +2595,10 @@ impl EligibleConfig<'_> {
 
     fn supports_chunked_prefill(&self) -> bool {
         match self {
+            Self::DiffusionGemma(args) => {
+                args.encoder_attention
+                    == crate::diffusion_gemma::EncoderAttention::CausalWithVisionSpans
+            }
             Self::Llama(_)
             | Self::Nanbeige(_)
             | Self::Qwen(_)
@@ -2555,6 +2649,14 @@ impl EligibleConfig<'_> {
             Self::QwenVl(args) => crate::qwen::vl::PipelineBoundarySchema::from_args(args)
                 .wire_schema()
                 .map_err(|error| error.to_string()),
+            Self::DiffusionGemma(args) => if args.vision.is_some() {
+                crate::diffusion_gemma::composite::BoundarySchema::new(args.text.hidden_size)
+                    .wire_schema()
+            } else {
+                crate::diffusion_gemma::boundary::TextBoundarySchema::new(args.text.hidden_size)
+                    .wire_schema()
+            }
+            .map_err(|error| error.to_string()),
             Self::Gemma4(args) => {
                 let width = if args.text.hidden_size_per_layer_input > 0 {
                     eredu_core::balanced_contiguous_range(
@@ -2699,9 +2801,16 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(args) => {
                 for layer in 0..self.unit_count()? {
                     let expert = crate::deepseek::v4_expert_recipes(source, args, layer)?;
-                    extend(crate::deepseek::checkpoint::expert_materialization_recipes(
-                        source, &expert,
-                    )?)?;
+                    extend(
+                        eredu_checkpoint::expert::gated_product_materialization_recipes(
+                            source, &expert,
+                        )?,
+                    )?;
+                }
+            }
+            Self::DiffusionGemma(args) => {
+                for ordinal in 0..args.text.num_hidden_layers() {
+                    extend(crate::diffusion_gemma::unit_recipes(source, args, ordinal)?)?;
                 }
             }
             Self::Gemma4(args) => {
@@ -2821,6 +2930,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => crate::gpt_oss::prompt_cache_architecture_fingerprint(args),
             Self::DeepSeekV3(args) => crate::deepseek::v3_architecture_fingerprint(args),
             Self::DeepSeekV4(args) => crate::deepseek::v4_architecture_fingerprint(args),
+            Self::DiffusionGemma(args) => args.architecture_fingerprint(),
             Self::Gemma4(args) => args.architecture_fingerprint(),
             Self::Inkling(args) => args.architecture_fingerprint(),
             Self::MuseGlimmer(args) => args.architecture_fingerprint(),
@@ -2832,6 +2942,9 @@ impl EligibleConfig<'_> {
     }
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
+        if matches!(self, Self::DiffusionGemma(_)) {
+            return crate::diffusion_gemma::canonical_safetensors_target(name);
+        }
         if matches!(self, Self::MuseGlimmer(_)) {
             return crate::muse_glimmer::checkpoint::canonical_safetensors_target(name);
         }
@@ -2925,6 +3038,7 @@ impl EligibleConfig<'_> {
             | Self::GptOss(_)
             | Self::DeepSeekV3(_)
             | Self::DeepSeekV4(_)
+            | Self::DiffusionGemma(_)
             | Self::Gemma4(_)
             | Self::Inkling(_)
             | Self::MuseGlimmer(_)
@@ -3012,6 +3126,8 @@ impl EligibleConfig<'_> {
             }
             Self::DeepSeekV3(_) => crate::operator_requirements::DEEPSEEK_V3,
             Self::DeepSeekV4(_) => crate::operator_requirements::DEEPSEEK_V4,
+            Self::DiffusionGemma(_) => crate::operator_requirements::GEMMA4
+                .union(NeuralOperatorCapabilities::WEIGHTED_EMBEDDING),
             Self::Gemma4(_) => crate::operator_requirements::GEMMA4,
             Self::Inkling(_) => crate::operator_requirements::INKLING,
             Self::MuseGlimmer(_) => crate::operator_requirements::MUSE_GLIMMER,
@@ -3034,6 +3150,7 @@ impl EligibleConfig<'_> {
             }
             Self::DeepSeekV3(_) => crate::decoder::TARGET_EXECUTION_GROUP,
             Self::DeepSeekV4(_) => crate::decoder::TARGET_EXECUTION_GROUP,
+            Self::DiffusionGemma(_) => crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP,
             Self::Gemma4(_) => crate::gemma4::model::TEXT_EXECUTION_GROUP,
             Self::Inkling(_) => crate::inkling::model::TEXT_EXECUTION_GROUP,
             Self::MuseGlimmer(_) => crate::muse_glimmer::model::TEXT_EXECUTION_GROUP,
@@ -3045,6 +3162,7 @@ impl EligibleConfig<'_> {
     fn group_transport(&self) -> eredu_runtime::ArchitectureGroupTransport {
         match self {
             Self::DeepSeekV4(_) => crate::deepseek::v4::target_group_transport(),
+            Self::DiffusionGemma(_) => crate::diffusion_gemma::model::text_transport(),
             _ => crate::transport::decoder(),
         }
     }
@@ -3063,6 +3181,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => args.num_hidden_layers,
             Self::DeepSeekV3(args) => args.num_hidden_layers,
             Self::DeepSeekV4(args) => args.num_hidden_layers,
+            Self::DiffusionGemma(args) => return Ok(args.text.num_hidden_layers()),
             Self::Gemma4(args) => {
                 return [
                     args.vision
@@ -3152,6 +3271,9 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(args) => {
                 crate::deepseek::v4::state_layout(args).map_err(|error| error.to_string())
             }
+            Self::DiffusionGemma(args) => {
+                crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
+            }
             Self::Gemma4(args) => {
                 crate::gemma4::state_layout(&args.text).map_err(|error| error.to_string())
             }
@@ -3215,6 +3337,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => args.weight_quantization_for(name),
             Self::DeepSeekV3(args) => return args.linear_format_for(name),
             Self::DeepSeekV4(args) => return args.linear_format_for(name),
+            Self::DiffusionGemma(args) => return args.text.linear_format_for(name),
             Self::Gemma4(args) => {
                 if name.starts_with("model.vision_") {
                     return args.vision.as_ref().map_or(LinearFormat::Dense, |config| {
@@ -3452,6 +3575,31 @@ impl EligibleConfig<'_> {
                 }
                 Ok(shapes)
             }
+            Self::DiffusionGemma(args) => {
+                // Logical matrix geometry is independent of its packed storage.
+                let dense = args.with_checkpoint_formats(HashMap::new());
+                let mut groups = crate::diffusion_gemma::parallel::static_parameter_groups(&dense)
+                    .map_err(|error| error.to_string())?;
+                for layer in 0..args.text.num_hidden_layers() {
+                    groups.extend(
+                        crate::diffusion_gemma::parallel::layer_parameter_groups(&dense, layer)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok(groups
+                    .into_iter()
+                    .flat_map(|group| group.members().to_vec())
+                    .filter(|member| {
+                        let name = member.target();
+                        member.global_shape().len() >= 2
+                            && name != "model.decoder.embed_tokens.weight"
+                            && (name.ends_with(".weight")
+                                || name.ends_with(".gate_up_proj")
+                                || name.ends_with(".down_proj"))
+                    })
+                    .map(|member| (member.target().to_owned(), member.global_shape().to_vec()))
+                    .collect())
+            }
             Self::Gemma4(args) => {
                 let mut shapes = family_linear_parameter_shapes(
                     crate::gemma4::safetensors_plan(args).map_err(|error| error.to_string())?,
@@ -3655,6 +3803,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => crate::decoder::Config::parameter_root(*args),
             Self::DeepSeekV3(_) => "model",
             Self::DeepSeekV4(_) => "",
+            Self::DiffusionGemma(_) => "model.decoder",
             Self::Gemma4(_) => "model.language_model",
             Self::Inkling(_) | Self::MuseGlimmer(_) | Self::QwenCompositeHybrid(_) => "model",
             Self::QwenVl(args) => &args.text.parameter_root,
@@ -3675,6 +3824,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::DeepSeekV3(args) => args.tie_word_embeddings,
             Self::DeepSeekV4(args) => args.tie_word_embeddings,
+            Self::DiffusionGemma(args) => args.text.tie_word_embeddings,
             Self::Gemma4(args) => args.text.tie_word_embeddings,
             Self::Inkling(_) => false,
             Self::MuseGlimmer(args) => args.tie_word_embeddings,
@@ -3703,6 +3853,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(args) => (args.vocab_size, args.hidden_size),
             Self::DeepSeekV3(args) => (args.vocab_size, args.hidden_size),
             Self::DeepSeekV4(args) => (args.vocab_size, args.hidden_size),
+            Self::DiffusionGemma(args) => (args.text.vocab_size, args.text.hidden_size),
             Self::Gemma4(args) => (args.text.vocab_size, args.text.hidden_size),
             Self::Inkling(args) => (args.text_config.vocab_size, args.text_config.hidden_size),
             Self::MuseGlimmer(args) => (args.vocab_size, args.hidden_size),
@@ -3734,6 +3885,7 @@ impl EligibleConfig<'_> {
             | Self::QwenHybrid(_)
             | Self::DeepSeekV3(_)
             | Self::DeepSeekV4(_)
+            | Self::DiffusionGemma(_)
             | Self::Gemma4(_)
             | Self::Inkling(_)
             | Self::MuseGlimmer(_)
@@ -3760,6 +3912,7 @@ impl EligibleConfig<'_> {
             Self::GptOss(_) => format!("{}.embed_tokens.weight", self.parameter_root()),
             Self::DeepSeekV3(_) => "model.embed_tokens.weight".into(),
             Self::DeepSeekV4(_) => "embed.weight".into(),
+            Self::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
             Self::Gemma4(_) => "model.language_model.embed_tokens.weight".into(),
             Self::Inkling(_) | Self::MuseGlimmer(_) | Self::QwenCompositeHybrid(_) => {
                 "model.embed_tokens.weight".into()
@@ -4104,9 +4257,100 @@ pub fn replicated_text_requirements(
 fn derive_replicated_text_requirements(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
 ) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
+    if let Some(config) = crate::routed_text::diffusion_args(inspection) {
+        return if config.has_sparse_moe_layers() || config.vision.is_some() {
+            Err(ReplicatedTextIneligibility::BlockRefinement.into())
+        } else {
+            diffusion_text_requirements(inspection, config)
+        };
+    }
     let plan = inspection.architecture_plan();
     let config = eligible_config(plan)?;
     replicated_text_requirements_for_config(inspection, config)
+}
+
+pub(crate) fn diffusion_text_requirements(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+    config: &crate::diffusion_gemma::FamilyConfig,
+) -> Result<ReplicatedTextRequirements, ReplicatedTextRequirementsError> {
+    let geometry = eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
+        canvas_length: config.canvas_length,
+        vocabulary_size: std::num::NonZeroU32::new(config.text.vocab_size as u32)
+            .expect("validated vocabulary"),
+    };
+    replicated_text_requirements_for_config(inspection, EligibleConfig::DiffusionGemma(config))
+        .map(|requirements| requirements.with_block_refinement(geometry))
+}
+
+pub(crate) fn diffusion_execution_requirements(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) -> Result<ReplicatedTextExecutionClass, ReplicatedTextRequirementsError> {
+    let artifact = inspection.architecture_plan();
+    let config = match (artifact.safetensors_architecture(), artifact.gguf_plan()) {
+        (Some(plan), _) => match plan.model() {
+            SafetensorsModelConfig::DiffusionGemma(config) => config,
+            _ => {
+                return Err(ReplicatedTextRequirementsError::Ineligible(
+                    ReplicatedTextIneligibility::BlockRefinement,
+                ))
+            }
+        },
+        (_, Some(plan)) => match plan.model() {
+            GgufModelConfig::DiffusionGemma(config) => config,
+            _ => {
+                return Err(ReplicatedTextRequirementsError::Ineligible(
+                    ReplicatedTextIneligibility::BlockRefinement,
+                ))
+            }
+        },
+        _ => {
+            return Err(ReplicatedTextRequirementsError::Ineligible(
+                ReplicatedTextIneligibility::BlockRefinement,
+            ))
+        }
+    };
+    if config.vision.is_some() {
+        return composite_text_requirements(inspection)
+            .map(ReplicatedTextExecutionClass::Composite);
+    }
+    let text = diffusion_text_requirements(inspection, config)?;
+    if !config.has_sparse_moe_layers() {
+        return Ok(ReplicatedTextExecutionClass::Replicated(text));
+    }
+    let invalid = |error: String| ReplicatedTextRequirementsError::InvalidArchitecture(error);
+    let source = artifact::catalog(inspection)?;
+    let owner =
+        eredu_runtime::ExecutionGroupId::new(crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP)
+            .map_err(|error| invalid(error.to_string()))?;
+    let mut specs = BTreeMap::new();
+    for (layer, policy) in config.text.layer_schedule.iter().enumerate() {
+        if policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
+            let spec = crate::gemma4::text::expert_bank_spec_at(
+                &config.text,
+                &format!("model.decoder.layers.{layer}.experts.switch_glu"),
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+            specs.insert((owner.clone(), layer), spec);
+        }
+    }
+    let plan = crate::ExpertRealizationPlan::balanced(
+        config.text.num_experts.unwrap_or_default() as usize,
+        replicated_expert_topology().map_err(invalid)?,
+        specs,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let catalog = crate::diffusion_gemma::expert_residency_catalog(source.as_ref(), config)
+        .map_err(invalid)?;
+    crate::routed_text::gated_routed_text_requirements(
+        text,
+        owner,
+        plan,
+        catalog,
+        config.text.top_k_experts.unwrap_or_default() as usize,
+        source.as_ref(),
+    )
+    .map(ReplicatedTextExecutionClass::Routed)
+    .map_err(|error| invalid(error.to_string()))
 }
 
 pub(crate) fn k2_horizon_replicated_text_requirements(
@@ -4431,8 +4675,10 @@ fn prediction_extension_recipes(
                 let expert = crate::deepseek::v4_expert_recipes(source, args, target + depth)
                     .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
                 extend(
-                    crate::deepseek::checkpoint::expert_materialization_recipes(source, &expert)
-                        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+                    eredu_checkpoint::expert::gated_product_materialization_recipes(
+                        source, &expert,
+                    )
+                    .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
                 )?;
             }
         }
@@ -4916,6 +5162,9 @@ fn safetensors_eligible_config(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        SafetensorsModelConfig::DiffusionGemma(_) => {
+            Err(ReplicatedTextIneligibility::BlockRefinement)
+        }
         SafetensorsModelConfig::Qwen4Exp(_, _) => Err(ReplicatedTextIneligibility::Routed),
         SafetensorsModelConfig::Nanbeige(args) => Ok(EligibleConfig::Nanbeige(args)),
         SafetensorsModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
@@ -4984,6 +5233,7 @@ fn gguf_eligible_config(
     architecture: &crate::configuration::GgufArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        GgufModelConfig::DiffusionGemma(_) => Err(ReplicatedTextIneligibility::BlockRefinement),
         GgufModelConfig::VoiceChat(_) => Err(ReplicatedTextIneligibility::Realtime),
         GgufModelConfig::Qwen4Exp(_) => Err(ReplicatedTextIneligibility::Routed),
         GgufModelConfig::Llama(args) => Ok(EligibleConfig::Llama(args)),
@@ -5088,6 +5338,7 @@ fn ordinary_eligible_config(
         | EligibleConfig::GptOss(_)
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
+        | EligibleConfig::DiffusionGemma(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -5402,6 +5653,26 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
     if let Some(owner) = composite {
         return owner;
     }
+    if matches!(config, EligibleConfig::DiffusionGemma(_)) {
+        if let Some(owner) = execution_unit(
+            "model.encoder.vision_tower.encoder.layers.",
+            crate::diffusion_gemma::composite::VISION_EXECUTION_GROUP,
+        ) {
+            return owner;
+        }
+        if let Some(rest) = name.strip_prefix("model.encoder.language_model.layers.") {
+            if let Some(unit) = rest
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                return ReplicatedTextParameterOwner::ExecutionUnit {
+                    group: config.execution_group().into(),
+                    unit,
+                };
+            }
+        }
+    }
     let layer_prefix = if matches!(config, EligibleConfig::DeepSeekV4(_)) {
         "layers.".into()
     } else {
@@ -5467,7 +5738,21 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
     }
     let embedding = config.embedding_name();
     let embedding_prefix = embedding.strip_suffix("weight").unwrap_or(&embedding);
-    let role = if matches!(config, EligibleConfig::Gemma4(_)) {
+    let role = if matches!(config, EligibleConfig::DiffusionGemma(_)) {
+        if name.starts_with("model.decoder.self_conditioning.") {
+            "conditioning"
+        } else if name.starts_with("model.encoder.vision_tower.") {
+            "vision"
+        } else if name.starts_with("model.encoder.embed_vision.") {
+            "vision_projection"
+        } else if name == embedding || name.starts_with(embedding_prefix) {
+            "embedding"
+        } else if name.starts_with("lm_head.") {
+            "output"
+        } else {
+            "norm"
+        }
+    } else if matches!(config, EligibleConfig::Gemma4(_)) {
         if name.starts_with("model.vision_tower.") {
             "vision"
         } else if name.starts_with("model.embed_vision.") {
@@ -6406,6 +6691,7 @@ where
 }
 
 pub(crate) enum CompositeConfig<'a> {
+    Diffusion(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
     Muse(&'a crate::muse_glimmer::DecoderConfig),
@@ -6416,6 +6702,7 @@ pub(crate) enum CompositeConfig<'a> {
 impl CompositeConfig<'_> {
     fn requirement_config(&self) -> EligibleConfig<'_> {
         match self {
+            Self::Diffusion(args) => EligibleConfig::DiffusionGemma(args),
             Self::Gemma4(args) => EligibleConfig::Gemma4(args),
             Self::Inkling(args) => EligibleConfig::Inkling(args),
             Self::Muse(args) => EligibleConfig::MuseGlimmer(args),
@@ -6426,6 +6713,7 @@ impl CompositeConfig<'_> {
 
     fn architecture_identity(&self) -> String {
         match self {
+            Self::Diffusion(args) => args.architecture_fingerprint(),
             Self::Gemma4(args) => args.architecture_fingerprint(),
             Self::Inkling(args) => args.architecture_fingerprint(),
             Self::Muse(args) => args.architecture_fingerprint(),
@@ -6438,6 +6726,7 @@ impl CompositeConfig<'_> {
 
     fn input_modalities(&self) -> InputModalities {
         match self {
+            Self::Diffusion(args) => args.input_modalities(),
             Self::Gemma4(args) => args.input_modalities(),
             Self::Inkling(args) => args.input_modalities(),
             Self::Muse(args) => InputModalities {
@@ -6457,6 +6746,7 @@ impl CompositeConfig<'_> {
 
     fn routed(&self) -> bool {
         match self {
+            Self::Diffusion(args) => args.has_sparse_moe_layers(),
             Self::Gemma4(args) => args.text.num_experts.is_some_and(|count| count > 0),
             Self::Inkling(args) => args.text_config.has_sparse_moe_layers(),
             Self::Muse(args) => args.num_experts > 0,
@@ -6467,6 +6757,9 @@ impl CompositeConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
+            Self::Diffusion(args) => {
+                crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
+            }
             Self::Gemma4(args) => {
                 crate::gemma4::state_layout(&args.text).map_err(|error| error.to_string())
             }
@@ -6515,6 +6808,23 @@ impl CompositeConfig<'_> {
             request_optional: true,
         };
         let (graph, counts, transports) = match self {
+            Self::Diffusion(args) => {
+                let (graph, _) = crate::diffusion_gemma::composite::graph(args)
+                    .map_err(|error| error.to_string())?;
+                (
+                    graph,
+                    vec![
+                        args.vision
+                            .as_ref()
+                            .map_or(0, |v| v.num_hidden_layers as usize),
+                        args.text.num_hidden_layers(),
+                    ],
+                    vec![
+                        crate::diffusion_gemma::composite::vision_transport(),
+                        crate::diffusion_gemma::model::text_transport(),
+                    ],
+                )
+            }
             Self::Gemma4(args) => {
                 let graph = ExecutionGraph::new(
                     vec![
@@ -6725,6 +7035,9 @@ pub(crate) fn composite_config(
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
+        (Some(SafetensorsModelConfig::DiffusionGemma(args)), None) if args.vision.is_some() => {
+            Some(CompositeConfig::Diffusion(args))
+        }
         (Some(SafetensorsModelConfig::Gemma4(args)), None) => Some(CompositeConfig::Gemma4(args)),
         (Some(SafetensorsModelConfig::Inkling(args)), None) => Some(CompositeConfig::Inkling(args)),
         (Some(SafetensorsModelConfig::MuseGlimmer(args)), None) => {
@@ -6752,6 +7065,11 @@ pub(crate) fn partitioned_boundary_schema(
     if let Some(config) = composite_config(inspection.architecture_plan())? {
         return config
             .requirement_config()
+            .partitioned_boundary_schema(topology)
+            .map_err(ReplicatedTextRequirementsError::InvalidArchitecture);
+    }
+    if let Some(config) = crate::routed_text::diffusion_args(inspection) {
+        return EligibleConfig::DiffusionGemma(config)
             .partitioned_boundary_schema(topology)
             .map_err(ReplicatedTextRequirementsError::InvalidArchitecture);
     }
@@ -6838,7 +7156,9 @@ fn composite_processor_requirements(
                 Primitive::TensorF32,
                 Primitive::TensorI32,
             ],
-            CompositeConfig::Gemma4(_) | CompositeConfig::QwenVl(_) => vec![
+            CompositeConfig::Diffusion(_)
+            | CompositeConfig::Gemma4(_)
+            | CompositeConfig::QwenVl(_) => vec![
                 Primitive::RgbResizeBicubic,
                 Primitive::RgbNormalize,
                 Primitive::TensorF32,
@@ -7048,6 +7368,48 @@ fn composite_routed_requirements(
     }
     let recipe_source = artifact::catalog(inspection)?;
     let (owner_group, plan, catalog, routes_per_token) = match config {
+        CompositeConfig::Diffusion(args) => {
+            let owner = eredu_runtime::ExecutionGroupId::new(
+                crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            let mut specs = BTreeMap::new();
+            for (layer, policy) in args.text.layer_schedule.iter().enumerate() {
+                if policy.feed_forward == crate::gemma4::FeedForwardPolicy::DenseWithSparseMoe {
+                    specs.insert(
+                        (owner.clone(), layer),
+                        crate::gemma4::text::expert_bank_spec_at(
+                            &args.text,
+                            &format!("model.decoder.layers.{layer}.experts.switch_glu"),
+                        )
+                        .map_err(|error| {
+                            ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                        })?,
+                    );
+                }
+            }
+            let plan = crate::ExpertRealizationPlan::balanced(
+                args.text.num_experts.unwrap() as usize,
+                replicated_expert_topology()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+                specs,
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            let catalog =
+                crate::diffusion_gemma::expert_residency_catalog(recipe_source.as_ref(), args)
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
+            (
+                owner,
+                plan,
+                catalog,
+                args.text.top_k_experts.unwrap() as usize,
+            )
+        }
+
         CompositeConfig::QwenVl(args) => {
             let plan =
                 crate::qwen::replicated_expert_realization_plan(&args.text).map_err(|error| {
@@ -7197,7 +7559,7 @@ fn derive_composite_text_requirements(
         .state_layout()
         .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?;
     let processor = composite_processor_requirements(inspection.architecture_plan(), &config)?;
-    let execution = replicated_text_requirements_for_structure(
+    let mut execution = replicated_text_requirements_for_structure(
         inspection,
         config.requirement_config(),
         Some((
@@ -7207,6 +7569,14 @@ fn derive_composite_text_requirements(
             state_layout.clone(),
         )),
     )?;
+    if let CompositeConfig::Diffusion(args) = &config {
+        execution = execution.with_block_refinement(
+            eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
+                canvas_length: args.canvas_length,
+                vocabulary_size: std::num::NonZeroU32::new(args.text.vocab_size as u32).unwrap(),
+            },
+        );
+    }
     let routed = composite_routed_requirements(inspection, &config, execution.clone())?;
     let partition_boundaries =
         crate::composite_partitioned::composite_partition_boundaries(&config)
@@ -7333,7 +7703,11 @@ where
         source_architecture.as_ref(),
         selected,
         &prompt_cache_architecture_identity,
-        eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+        if A::block_refinement_geometry(&admission).is_some() {
+            eredu_runtime::ReplicatedTextOutputSelection::AllSequencePositions
+        } else {
+            eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition
+        },
         context,
     )?;
     Ok(PreparedCompositeTextArchitecture {
@@ -7418,7 +7792,7 @@ pub fn visit_composite_text_architecture<B, S, V>(
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S>,
@@ -7454,6 +7828,7 @@ where
         state: std::marker::PhantomData,
     };
     match config {
+        CompositeConfig::Diffusion(args) => construction.diffusion(args),
         CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
         CompositeConfig::Gemma4(args) => construction.gemma4(args),
         CompositeConfig::Muse(args) => construction.muse(args),
@@ -7483,7 +7858,7 @@ impl<B, S, V> CompositeTextConstruction<'_, B, S, V>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
     S: LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S>,
@@ -7573,6 +7948,39 @@ where
             capability,
             effective_model_type,
             cache_identity,
+        )
+    }
+
+    #[inline(never)]
+    fn diffusion(
+        self,
+        args: &crate::diffusion_gemma::FamilyConfig,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+    where
+        S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
+    {
+        let capability = crate::capability::diffusion_gemma(args)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self
+            .has_transform
+            .then(|| {
+                crate::diffusion_gemma::composite::Model::<B>::new(
+                    args.with_checkpoint_formats(self.source_formats.clone()),
+                    self.context,
+                )
+            })
+            .transpose()
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = args.with_checkpoint_formats(self.target_formats.clone());
+        let identity = target.architecture_fingerprint();
+        let architecture = crate::diffusion_gemma::composite::Model::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(
+            architecture,
+            source,
+            capability,
+            "diffusion_gemma".into(),
+            identity,
         )
     }
 
@@ -7856,11 +8264,12 @@ where
                 cache_identity
             )
         }
-        CompositeConfig::Gemma4(_) | CompositeConfig::Muse(_) | CompositeConfig::QwenVl(_) => {
-            Err(ReplicatedTextDispatchError::Architecture(
-                "composite architecture does not admit an embedded prediction extension".into(),
-            ))
-        }
+        CompositeConfig::Diffusion(_)
+        | CompositeConfig::Gemma4(_)
+        | CompositeConfig::Muse(_)
+        | CompositeConfig::QwenVl(_) => Err(ReplicatedTextDispatchError::Architecture(
+            "composite architecture does not admit an embedded prediction extension".into(),
+        )),
     }
 }
 
@@ -8030,6 +8439,9 @@ pub fn replicated_text_execution_class(
     match replicated_text_requirements(inspection) {
         Ok(requirements) => Ok(ReplicatedTextExecutionClass::Replicated(requirements)),
         Err(ReplicatedTextRequirementsError::Ineligible(reason)) => {
+            if reason == ReplicatedTextIneligibility::BlockRefinement {
+                return diffusion_execution_requirements(inspection);
+            }
             if reason == ReplicatedTextIneligibility::CompositeInput {
                 match composite_text_requirements(inspection) {
                     Ok(requirements) => {

@@ -104,6 +104,9 @@ impl<E: std::error::Error + Send + Sync + 'static>
                     ControlledTextGenerationError::Preparation(error) => {
                         ControlledTextGenerationError::Preparation(error)
                     }
+                    ControlledTextGenerationError::Operation(error) => {
+                        ControlledTextGenerationError::Operation(error)
+                    }
                 })
             }
         })
@@ -116,6 +119,9 @@ impl<E: std::error::Error + Send + Sync + 'static> From<SamplingOverrideError<E>
     fn from(error: SamplingOverrideError<E>) -> Self {
         Self::Sampling(match error {
             SamplingOverrideError::Invalid(reason) => SamplingOverrideError::Invalid(reason),
+            SamplingOverrideError::RequiresCausalConditionalScores => {
+                SamplingOverrideError::RequiresCausalConditionalScores
+            }
             SamplingOverrideError::Backend(error) => {
                 SamplingOverrideError::Backend(BackendFailure::from_error(error))
             }
@@ -157,6 +163,8 @@ struct Delivery {
     closed: bool,
     failure: Option<CaptureError>,
     semantic_prefix: Vec<SemanticEvent>,
+    drafts: super::draft::DraftJournal,
+    iterative: bool,
 }
 impl Delivery {
     fn send(
@@ -199,27 +207,38 @@ impl Delivery {
     }
     fn token(
         &mut self,
-        token: Option<u32>,
+        token: Option<(
+            u32,
+            eredu_core::refinement::PredictionScoreKind,
+            eredu_core::refinement::GenerationPosition,
+        )>,
         forced: bool,
         captures: Option<CapturedStep>,
         seconds: f64,
         emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) {
         let prediction_index = self.prediction;
-        let input_range = if prediction_index == 0 {
-            [0, self.prompt_length]
-        } else {
-            [
-                self.prompt_length + prediction_index - 1,
-                self.prompt_length + prediction_index,
-            ]
-        };
+        let input_range = (!self.iterative).then(|| {
+            if prediction_index == 0 {
+                [0, self.prompt_length]
+            } else {
+                [
+                    self.prompt_length + prediction_index - 1,
+                    self.prompt_length + prediction_index,
+                ]
+            }
+        });
         match token {
-            Some(token_id) => {
+            Some((token_id, score_kind, position)) => {
+                if let Some(event) = self.drafts.clear() {
+                    self.send(ObservedGenerationEvent::Draft { event, position }, emit);
+                }
                 self.prediction += 1;
                 self.send(
                     ObservedGenerationEvent::Token {
                         token_id,
+                        score_kind,
+                        position,
                         forced,
                         prediction_index,
                         input_range,
@@ -257,37 +276,6 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     CommittedTokenSource for Source<'_, '_, B, F>
 {
     type Error = TextContinuationError<B::Error, ControlConstraintError>;
-    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
-        let started = Instant::now();
-        let result = self.state.advance_prefill(self.driver);
-        if matches!(result, Ok(false)) {
-            return result;
-        }
-        let captures = self.state.take_completed_step(self.driver);
-        let advanced = match result {
-            Ok(advanced) => advanced,
-            Err(error) => {
-                if let Ok(captures) = captures {
-                    let mut delivery = self.delivery.borrow_mut();
-                    let (delivery, emit) = &mut *delivery;
-                    delivery.token(None, false, captures, started.elapsed().as_secs_f64(), emit);
-                }
-                return Err(error);
-            }
-        };
-        let captures = captures?;
-        let mut delivery = self.delivery.borrow_mut();
-        let (delivery, emit) = &mut *delivery;
-        delivery.preparation_elapsed += started.elapsed();
-        delivery.send(
-            ObservedGenerationEvent::PrefillProgress {
-                captures,
-                step_seconds: started.elapsed().as_secs_f64(),
-            },
-            emit,
-        );
-        Ok(advanced)
-    }
     fn finish_step<T, E>(
         &mut self,
         local: Result<T, E>,
@@ -303,40 +291,60 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     fn delivery_failure(&self) -> Option<CaptureError> {
         self.delivery.borrow().0.failure.clone()
     }
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+    fn advance(&mut self) -> Result<SourceAdvancement, Self::Error> {
         let started = Instant::now();
-        let result = self.state.advance(self.driver);
-        if matches!(&result, Ok(Some(_))) {
-            let mut delivery = self.delivery.borrow_mut();
-            let delivery = &mut delivery.0;
-            if delivery.timing.time_to_first_token().is_none() {
-                delivery.timing =
-                    GenerationTiming::new(Some(delivery.preparation_elapsed + started.elapsed()));
-            }
-        }
-        let capture = self.state.take_completed_step(self.driver);
-        let token = match result {
-            Ok(token) => token.map(|token| token.token_id()),
+        let result = self.state.advance_operation(self.driver);
+        let captures = self.state.take_completed_step(self.driver);
+        let advancement = match result {
+            Ok(advancement) => advancement,
             Err(error) => {
-                if let Ok(capture) = capture {
+                if let Ok(captures) = captures {
                     let mut delivery = self.delivery.borrow_mut();
                     let (delivery, emit) = &mut *delivery;
-                    delivery.token(None, false, capture, started.elapsed().as_secs_f64(), emit);
+                    delivery.token(None, false, captures, started.elapsed().as_secs_f64(), emit);
                 }
                 return Err(error);
             }
         };
-        let capture = capture?;
+        let captures = captures?;
         let mut delivery = self.delivery.borrow_mut();
         let (delivery, emit) = &mut *delivery;
-        delivery.token(
-            token,
-            self.state.controller().last_committed_was_forced(),
-            capture,
-            started.elapsed().as_secs_f64(),
-            emit,
-        );
-        Ok(token)
+        match advancement {
+            None => Ok(SourceAdvancement::Finished),
+            Some(eredu_core::TextAdvancement::Progress(mut progress)) => {
+                delivery.preparation_elapsed += started.elapsed();
+                let position = self.state.position();
+                let epoch = delivery.epoch;
+                if let Some(event) = delivery.drafts.progress(&mut progress, position, epoch) {
+                    delivery.send(ObservedGenerationEvent::Draft { event, position }, emit);
+                }
+                delivery.send(
+                    ObservedGenerationEvent::Progress {
+                        progress,
+                        position: self.state.position(),
+                        captures,
+                        step_seconds: started.elapsed().as_secs_f64(),
+                    },
+                    emit,
+                );
+                Ok(SourceAdvancement::Progress)
+            }
+            Some(eredu_core::TextAdvancement::Token(token)) => {
+                if delivery.timing.time_to_first_token().is_none() {
+                    delivery.timing = GenerationTiming::new(Some(
+                        delivery.preparation_elapsed + started.elapsed(),
+                    ));
+                }
+                delivery.token(
+                    Some((token.token_id(), token.score_kind(), token.position())),
+                    self.state.controller().last_committed_was_forced(),
+                    captures,
+                    started.elapsed().as_secs_f64(),
+                    emit,
+                );
+                Ok(SourceAdvancement::Token(token.token_id()))
+            }
+        }
     }
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
         self.state
@@ -346,7 +354,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     }
 }
 
-/// One ordinary generation run with explicit, completed-token advancement.
+/// One generation run with explicit, completed physical advancement.
 /// It exclusively borrows its loaded model and retains incremental decoding,
 /// constraints, pending input and the backend's existing completion owner.
 /// Native objects remain thread-affine; `control_handle` may cross threads.
@@ -374,7 +382,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn status(&self) -> GenerationStatus {
         self.lifecycle.status()
     }
-    /// Next absolute model prediction (zero is prompt prefill).
+    /// Independent physical-work and authoritative-output coordinates.
+    pub fn position(&self) -> eredu_core::refinement::GenerationPosition {
+        self.state.position()
+    }
+
+    /// Next absolute authoritative token commitment.
     pub fn next_prediction(&self) -> u64 {
         self.lifecycle.next_prediction()
     }
@@ -521,7 +534,8 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         }
     }
 
-    /// Advances at most one committed prediction and synchronously delivers its
+    /// Advances one physical operation, committing at most one prediction, and delivers its
+    /// progress, drafts,
     /// captures and semantic events. A paused handle remains sticky for `run`;
     /// this explicit single-step request may still advance once. Callback Break
     /// permanently cancels and closes delivery, preserving ordinary semantics.
@@ -593,6 +607,15 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
                     PreparedChatError::MissingTerminalToken.into()
                 }
             };
+            if let Some(event) = self.delivery.drafts.clear() {
+                self.delivery.send(
+                    ObservedGenerationEvent::Draft {
+                        event,
+                        position: self.state.position(),
+                    },
+                    &mut emit,
+                );
+            }
             self.delivery.send(
                 ObservedGenerationEvent::Failed {
                     message: error.to_string(),
@@ -612,13 +635,22 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
                 } else if self.cursor.token_ids().len() == committed_before
                     && self.cursor.finish_reason().is_none()
                 {
-                    self.lifecycle.complete_prefill()?;
+                    self.lifecycle.complete_progress()?;
                 } else {
                     self.lifecycle
                         .complete_prediction(self.cursor.finish_reason())?;
                 }
             }
             if let Some(reason) = self.cursor.finish_reason() {
+                if let Some(event) = self.delivery.drafts.clear() {
+                    self.delivery.send(
+                        ObservedGenerationEvent::Draft {
+                            event,
+                            position: self.state.position(),
+                        },
+                        &mut emit,
+                    );
+                }
                 self.delivery.send(
                     ObservedGenerationEvent::Completed {
                         reason,
@@ -984,7 +1016,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             let delivery = Delivery {
                 configuration_identity,
                 template: ObservedGenerationRecord {
-                    schema_version: CAPTURE_SCHEMA_VERSION,
+                    schema_version: super::observed::GENERATION_SCHEMA_VERSION,
                     run_id: new_identity("run"),
                     artifact_identity: prepared.artifact_identity,
                     parameter_overlay_id: prepared.parameter_overlay_id,
@@ -1003,6 +1035,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 control,
                 sequence: 0,
                 epoch: 0,
+                drafts: super::draft::DraftJournal::new(prepared.settings.draft_events),
+                iterative: B::supports_block_refinement(&self.runtime),
                 prediction: 0,
                 prompt_length: prepared.prompt_token_ids.len() as u64,
                 prompt_token_ids: prepared.prompt_token_ids.clone().into(),

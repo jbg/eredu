@@ -156,21 +156,37 @@ impl TextGenerationBackend for StatefulBackend {
     fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> io::Result<Vec<u32>> {
         Ok(prompt)
     }
-    fn submit_text_prefill(
+    fn submit_text_operation(
         runtime: &mut ModelRuntime<Self>,
-        prompt: Vec<u32>,
-        _: &TokenFilter,
-        _: &mut (),
-    ) -> io::Result<Submission<Token, Pending>> {
-        runtime.prefill(prompt)
-    }
-    fn submit_text_decode(
-        runtime: &mut ModelRuntime<Self>,
-        token: Token,
-        _: &TokenFilter,
-        _: &mut (),
-    ) -> io::Result<Submission<Token, Pending>> {
-        runtime.decode(token.0)
+        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
+        _state: &mut Self::TextGenerationState,
+    ) -> Result<
+        Submission<
+            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
+            Self::TextCompletion,
+        >,
+        eredu_core::TextOperationError<Self::Error>,
+    > {
+        decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
+        if matches!(&input, eredu_core::PendingTextInput::Continue) {
+            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
+        }
+        let submission =
+            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                match input {
+                    eredu_core::PendingTextInput::Prefill(prompt) => runtime.prefill(prompt),
+                    eredu_core::PendingTextInput::Decode(token) => runtime.decode(token.0),
+                    eredu_core::PendingTextInput::Continue => {
+                        unreachable!("continuation is rejected before causal submission")
+                    }
+                }
+            };
+        let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
+        Ok(Submission {
+            output: eredu_core::TextOperationOutput::Token(submission.output),
+            completion: submission.completion,
+        })
     }
 }
 

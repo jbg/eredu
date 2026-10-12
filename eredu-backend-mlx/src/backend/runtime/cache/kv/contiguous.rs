@@ -474,6 +474,48 @@ impl ConcatKeyValueCache {
 }
 
 impl KeyValueCache for ConcatKeyValueCache {
+    fn attention_with_transient(
+        &mut self,
+        request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        request
+            .validate()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let transient_keys = request.keys.as_array();
+        let transient_values = request.values.as_array();
+        let (keys, values) = if self.length > 0 {
+            let retained_keys = self
+                .keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("retained cache has no keys"))?
+                .try_index_device((.., .., ..self.length, ..), stream)?;
+            let retained_values = self
+                .values
+                .as_ref()
+                .or_else(|| self.key_only.then_some(self.keys.as_ref()).flatten())
+                .ok_or_else(|| Exception::custom("retained cache has no values"))?
+                .try_index_device((.., .., ..self.length, ..), stream)?;
+            (
+                concatenate_axis(&[&retained_keys, transient_keys], -2, stream)?,
+                concatenate_axis(&[&retained_values, transient_values], -2, stream)?,
+            )
+        } else {
+            (transient_keys.clone(), transient_values.clone())
+        };
+        crate::backend::nn::attention::attention_with_softcap(
+            request.queries.as_array(),
+            &keys,
+            &values,
+            request.scale,
+            request.mask.map(MlxTensor::as_array),
+            request.sinks.map(MlxTensor::as_array),
+            request.softcap,
+            request.arithmetic,
+            stream,
+        )
+    }
+
     fn memory_retained_positions(&self) -> Option<u64> {
         u64::try_from(self.length).ok()
     }

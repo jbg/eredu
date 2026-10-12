@@ -9,8 +9,8 @@ use safemlx::{
     ops::{
         arange, argpartition_axis, concatenate_axis, gather_qmm_with_mode,
         indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
-        sigmoid, softmax_axis, sum_axis, zeros_dtype, QuantizationMode,
+        matmul, quantized_matmul_with_mode, quantized_packed_dimension, r#where, sigmoid,
+        softmax_axis, sum_axis, zeros_dtype, QuantizationMode,
     },
     Array, Dtype, Stream,
 };

@@ -326,6 +326,16 @@ fn tiny_gemma4() -> gemma4::ModelArgs {
         feed_forward: gemma4::FeedForwardPolicy::Dense,
     };
     gemma4::ModelArgs {
+        float32_normalization: false,
+        approximate_gelu: false,
+        attention_arithmetic: eredu_nn::AttentionArithmetic::Fused,
+        expert_reduction: eredu_nn::GroupReduction::Sum,
+        routing_arithmetic: eredu_nn::RoutingArithmetic::uniform(
+            eredu_nn::RoutingPrecision::Preserve,
+        ),
+        rotary_arithmetic: eredu_nn::RotaryArithmetic::Native,
+        routing_scoring: eredu_nn::GroupScoring::SelectedSoftmax,
+        normalize_selected_routes: false,
         model_type: "gemma4_unified".into(),
         hidden_size: 8,
         num_attention_heads: 2,

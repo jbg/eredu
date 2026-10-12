@@ -221,6 +221,7 @@ pub(crate) fn text_with_feed_forward<C: Config>(
         .collect::<Result<_, Error>>()?;
     let output = StaticModuleSpec::from_config(config).output_topology()?;
     Ok(TextExecutionTopology {
+        iterative: None,
         hidden_size: positive(config.hidden_size())?,
         vocabulary_size: positive(config.vocabulary_size())?,
         layers,

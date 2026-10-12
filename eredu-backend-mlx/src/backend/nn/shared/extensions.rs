@@ -376,6 +376,18 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
 
 macro_rules! impl_attention_cache {
     ($type:ty) => {
+        impl eredu_nn::ReadOnlyAttentionCache<MlxTensor> for $type {
+            fn attention_with_transient(
+                &mut self,
+                request: AttentionRequest<'_, MlxTensor>,
+                context: &Stream,
+            ) -> Result<MlxTensor, ComputeError> {
+                request.validate()?;
+                compute_tensor(KeyValueCache::attention_with_transient(
+                    self, request, context,
+                ))
+            }
+        }
         impl AttentionCache<MlxTensor> for $type {
             fn memory_retained_positions(&self) -> Option<u64> {
                 KeyValueCache::memory_retained_positions(self)

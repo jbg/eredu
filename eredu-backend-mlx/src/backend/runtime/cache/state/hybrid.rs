@@ -17,9 +17,17 @@ pub(crate) fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exceptio
             safemlx::DeviceType::Cpu, 0,
         ));
     }
-    let contiguous = COPY_STREAM.with(|stream| array.contiguous(false, stream))?;
+    let contiguous = COPY_STREAM.with(|stream| {
+        let array = match array.dtype() {
+            safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16 => {
+                array.as_dtype(safemlx::Dtype::Float32, stream)?
+            }
+            _ => array.clone(),
+        };
+        array.contiguous(false, stream)
+    })?;
     let evaluated = contiguous.evaluated()?;
-    match array.dtype() {
+    match contiguous.dtype() {
         safemlx::Dtype::Float32 => evaluated
             .try_to_vec::<f32>()
             .map_err(|error| Exception::custom(error.to_string())),
@@ -524,6 +532,23 @@ impl AttentionCache<MlxTensor> for MlxHybridLayerState {
         match self.attention.as_mut() {
             Some(MlxHybridAttentionState::KeyValue(cache)) => {
                 cache.relative_attention::<N>(request, stream)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no key/value attention cache",
+            )),
+        }
+    }
+}
+
+impl eredu_nn::ReadOnlyAttentionCache<MlxTensor> for MlxHybridLayerState {
+    fn attention_with_transient(
+        &mut self,
+        request: AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => {
+                eredu_nn::ReadOnlyAttentionCache::attention_with_transient(cache, request, stream)
             }
             _ => Err(ComputeError::backend(
                 "layer has no key/value attention cache",

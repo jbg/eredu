@@ -68,7 +68,8 @@ impl ModelConfigurationResolver for ModelConfigurations {
 
     fn sidecar_names(&self, plan: &Self::ArtifactPlan) -> &[&str] {
         match plan.model_kind() {
-            ModelKind::Gemma4
+            ModelKind::DiffusionGemma
+            | ModelKind::Gemma4
             | ModelKind::Qwen3Vl
             | ModelKind::Qwen3VlMoe
             | ModelKind::Qwen35
@@ -101,7 +102,8 @@ impl ModelConfigurationResolver for ModelConfigurations {
                 })?)?;
                 let (image, video) = if matches!(
                     kind,
-                    ModelKind::Gemma4
+                    ModelKind::DiffusionGemma
+                        | ModelKind::Gemma4
                         | ModelKind::Qwen3Vl
                         | ModelKind::Qwen3VlMoe
                         | ModelKind::Qwen35
@@ -208,6 +210,8 @@ pub enum ModelKind {
     DeepSeekV3,
     /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
     DeepSeekV4,
+    /// DiffusionGemma shared context and iterative block refinement.
+    DiffusionGemma,
     /// Gemma 4 text or unified multimodal architecture.
     Gemma4,
     /// OpenAI GPT-OSS sparse decoder.
@@ -271,9 +275,10 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
+        Self::DiffusionGemma,
         Self::Gemma4,
         Self::GptOss,
         Self::Inkling,
@@ -301,6 +306,7 @@ impl ModelKind {
         match self {
             Self::DeepSeekV3 => "deepseek_v3",
             Self::DeepSeekV4 => "deepseek_v4",
+            Self::DiffusionGemma => "diffusion_gemma",
             Self::Gemma4 => "gemma4",
             Self::GptOss => "gpt_oss",
             Self::Inkling => "inkling",
@@ -352,6 +358,7 @@ impl ModelKind {
         match model_type {
             "deepseek_v3" => Ok(Self::DeepSeekV3),
             "deepseek_v4" => Ok(Self::DeepSeekV4),
+            "diffusion_gemma" | "diffusion_gemma_text" => Ok(Self::DiffusionGemma),
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "inkling_mm_model" => Ok(Self::Inkling),
@@ -393,6 +400,8 @@ pub enum GgufArchitecture {
     GptOss,
     /// `inkling`.
     Inkling,
+    /// `diffusion-gemma`.
+    DiffusionGemma,
     /// `gemma4`.
     Gemma4,
     /// `llama`.
@@ -445,6 +454,7 @@ impl GgufArchitecture {
             "deepseek4" => Ok(Self::DeepSeek4),
             "gpt-oss" => Ok(Self::GptOss),
             "inkling" => Ok(Self::Inkling),
+            "diffusion-gemma" => Ok(Self::DiffusionGemma),
             "gemma4" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "mistral" => Ok(Self::Mistral),
@@ -478,6 +488,7 @@ impl GgufArchitecture {
             Self::DeepSeek4 => ModelKind::DeepSeekV4,
             Self::GptOss => ModelKind::GptOss,
             Self::Inkling => ModelKind::Inkling,
+            Self::DiffusionGemma => ModelKind::DiffusionGemma,
             Self::Gemma4 => ModelKind::Gemma4,
             Self::Llama | Self::Mistral => ModelKind::Llama,
             Self::Nanbeige => ModelKind::Nanbeige,
@@ -505,6 +516,7 @@ impl GgufArchitecture {
             Self::DeepSeek4 => "deepseek4",
             Self::GptOss => "gpt-oss",
             Self::Inkling => "inkling",
+            Self::DiffusionGemma => "diffusion-gemma",
             Self::Gemma4 => "gemma4",
             Self::Llama => "llama",
             Self::Gemma2 => "gemma2",
@@ -691,6 +703,8 @@ pub enum SafetensorsModelConfig {
     DeepSeekV3(crate::deepseek::V3Args),
     /// DeepSeek-V4 family geometry.
     DeepSeekV4(crate::deepseek::V4Args),
+    /// Shared context/refinement and optional image geometry.
+    DiffusionGemma(crate::diffusion_gemma::FamilyConfig),
     /// Gemma 4 family geometry.
     Gemma4(crate::gemma4::FamilyConfig),
     /// GPT-OSS family geometry.
@@ -748,6 +762,8 @@ pub enum GgufModelConfig {
     DeepSeekV3(crate::deepseek::V3Args),
     /// DeepSeek-V4 family geometry.
     DeepSeekV4(crate::deepseek::V4Args),
+    /// Shared context/refinement and optional image geometry.
+    DiffusionGemma(crate::diffusion_gemma::FamilyConfig),
     /// Gemma 4 family geometry.
     Gemma4(crate::gemma4::FamilyConfig),
     /// GPT-OSS family geometry.
@@ -786,6 +802,7 @@ impl SafetensorsModelConfig {
         match self {
             Self::DeepSeekV3(args) => args.n_routed_experts > 0,
             Self::DeepSeekV4(args) => args.n_routed_experts > 0,
+            Self::DiffusionGemma(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
@@ -813,6 +830,7 @@ impl GgufModelConfig {
         match self {
             Self::DeepSeekV3(args) => args.n_routed_experts > 0,
             Self::DeepSeekV4(args) => args.n_routed_experts > 0,
+            Self::DiffusionGemma(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::Gemma4(args) => matches!(args.text.num_experts, Some(count) if count > 0),
             Self::GptOss(args) => args.num_local_experts > 0,
             Self::Inkling(args) => args.text_config.n_routed_experts > 0,
@@ -1417,6 +1435,13 @@ fn resolve_safetensors_architecture(
         ModelKind::DeepSeekV4 => crate::deepseek::parse_v4_config(json)
             .map(SafetensorsModelConfig::DeepSeekV4)
             .map_err(|error| invalid_configuration(kind, error)),
+        ModelKind::DiffusionGemma => serde_json::to_vec(json)
+            .map_err(ArtifactError::from)
+            .and_then(|bytes| {
+                crate::diffusion_gemma::FamilyConfig::from_hf_json(&bytes)
+                    .map(SafetensorsModelConfig::DiffusionGemma)
+                    .map_err(|error| invalid_configuration(kind, error))
+            }),
         ModelKind::Gemma4 => serde_json::to_vec(json)
             .map_err(ArtifactError::from)
             .and_then(|bytes| {
@@ -1500,6 +1525,10 @@ fn resolve_safetensors_architecture(
         }
         SafetensorsModelConfig::DeepSeekV4(args) => crate::deepseek::v4_safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
+        SafetensorsModelConfig::DiffusionGemma(args) => {
+            crate::diffusion_gemma::safetensors_plan(args)
+                .map_err(|error| invalid_configuration(kind, error))?
+        }
         SafetensorsModelConfig::Gemma4(args) => crate::gemma4::safetensors_plan(args)
             .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::GptOss(args) => crate::gpt_oss::safetensors_plan(args)

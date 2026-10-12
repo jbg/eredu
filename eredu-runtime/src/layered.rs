@@ -866,6 +866,14 @@ where
     /// Concrete architecture or backend failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Meaning of the complete output for this invocation. Context-only outputs
+    /// return `None` and never enter the model-score observation seam.
+    fn output_score_kind(
+        _forward: &Self::ForwardContext,
+    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        Some(eredu_core::refinement::PredictionScoreKind::CausalConditional)
+    }
+
     /// Declares transport and physical placement semantics for one canonical group slot.
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
 

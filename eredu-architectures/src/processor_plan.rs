@@ -696,8 +696,10 @@ impl ArtifactArchitecturePlan {
         })?;
         let kind = architecture.model_kind();
         let processor = match kind {
-            ModelKind::Gemma4 => Gemma4ProcessorPlan::from_hf_json(model, image, video)?
-                .map(NormalizedProcessorPlan::Gemma4),
+            ModelKind::DiffusionGemma | ModelKind::Gemma4 => {
+                Gemma4ProcessorPlan::from_hf_json(model, image, video)?
+                    .map(NormalizedProcessorPlan::Gemma4)
+            }
             ModelKind::Inkling => {
                 InklingProcessorPlan::from_hf_json(model)?.map(NormalizedProcessorPlan::Inkling)
             }

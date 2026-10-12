@@ -98,6 +98,7 @@ where
             let plan = ContinuationMemoryPlan {
                 current_positions: native.current_positions,
                 additional_input_tokens: extra,
+                query_tokens: 1,
                 current_state: allowance(native.current_state_bytes, "installed native state and backing-capacity allowance; not measured distinct residency"),
                 peak_state: allowance(native.peak_state_bytes, "native continuation state/capacity envelope including speculative overshoot and interior peaks"),
             }.with_logical_state_bounds(&request)?;

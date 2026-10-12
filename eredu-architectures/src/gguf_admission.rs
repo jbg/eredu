@@ -36,6 +36,9 @@ fn canonical_tensor_mapping(
         GgufModelConfig::DeepSeekV4(_) => {
             checkpoint.translated_outputs(crate::deepseek::translate_v4_gguf_weight_name)
         }
+        GgufModelConfig::DiffusionGemma(_) => {
+            checkpoint.translated_outputs(crate::diffusion_gemma::translate_gguf_weight_name)
+        }
         GgufModelConfig::Gemma4(_) => {
             checkpoint.translated_outputs(crate::gemma4::translate_family_gguf_weight_name)
         }
@@ -74,6 +77,30 @@ fn canonical_tensor_mapping(
         }
     };
     mapping.map_err(|error| error.to_string())
+}
+
+fn checkpoint_linear_formats(
+    checkpoint: &Checkpoint,
+    translate: impl Fn(&str) -> String,
+) -> Result<HashMap<String, eredu_checkpoint::WeightQuantization>, String> {
+    let mut formats = HashMap::new();
+    for shard in checkpoint.shards() {
+        for tensor in shard
+            .tensors()
+            .iter()
+            .filter(|tensor| tensor.descriptor().dimensions.len() >= 2)
+        {
+            if let Some(format) = crate::linear_format::gguf_tensor_format(tensor, shard.endian())?
+                .weight_quantization()
+            {
+                let name = translate(&tensor.descriptor().name);
+                if formats.insert(name.clone(), format).is_some() {
+                    return Err(format!("duplicate GGUF matrix format {name:?}"));
+                }
+            }
+        }
+    }
+    Ok(formats)
 }
 
 // Derived expert banks and embeddings need their exact physical format before
@@ -165,6 +192,18 @@ fn resolve_family(
                 crate::deepseek::parse_v4_gguf(&metadata).map_err(|error| error.to_string())?;
             let plan = crate::deepseek::v4_gguf_plan(&args)?;
             Ok((GgufModelConfig::DeepSeekV4(args), plan, None))
+        }
+        GgufArchitecture::DiffusionGemma => {
+            let config =
+                crate::diffusion_gemma::FamilyConfig::from_gguf_metadata(checkpoint, &metadata)
+                    .map_err(|error| error.to_string())?;
+            let formats = checkpoint_linear_formats(
+                checkpoint,
+                crate::diffusion_gemma::translate_gguf_weight_name,
+            )?;
+            let config = config.with_checkpoint_formats(formats);
+            let plan = crate::diffusion_gemma::gguf_plan(&config)?;
+            Ok((GgufModelConfig::DiffusionGemma(config), plan, None))
         }
         GgufArchitecture::Gemma4 => {
             let names = checkpoint

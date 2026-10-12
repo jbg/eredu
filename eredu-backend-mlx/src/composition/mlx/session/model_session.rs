@@ -1,5 +1,6 @@
 use super::*;
 
+mod block_refinement;
 mod memory_forecast;
 mod partition_capture;
 mod speculative_capture;
@@ -713,6 +714,12 @@ impl MlxModelSession {
         };
         session.reset()?;
         Ok(session)
+    }
+
+    pub(super) fn block_refinement_geometry(
+        &self,
+    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
+        self.payload.model.erased().block_refinement_geometry()
     }
 
     pub(in crate::composition::mlx) fn floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
@@ -1765,6 +1772,44 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .capture()
     }
 
+    fn text_capture_invocation_bounds(
+        runtime: &ModelRuntime<Self>,
+        request: eredu_core::capture::CaptureRequestShape,
+    ) -> Result<
+        Option<eredu_core::capture::CaptureInvocationBounds>,
+        eredu_core::capture::CaptureError,
+    > {
+        use eredu_core::capture::*;
+        let Some(geometry) = runtime.session().block_refinement_geometry() else {
+            return Ok(None);
+        };
+        let frontier = runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .forecast_state_offset()
+            .map_err(|error| CaptureError::Invalid(error.to_string()))?
+            .ok_or_else(|| {
+                CaptureError::Unsupported("execution has no exact context frontier".into())
+            })?;
+        let frontier = u64::try_from(frontier)
+            .map_err(|_| CaptureError::Invalid("negative context frontier".into()))?;
+        let canvas = u64::from(geometry.canvas_length.get());
+        Ok(Some(CaptureInvocationBounds {
+            batch: request.batch,
+            max_sequence: request.prompt_tokens.max(canvas),
+            max_context: Some(
+                frontier
+                    .checked_add(request.prompt_tokens)
+                    .and_then(|n| n.checked_add(request.max_predictions))
+                    .and_then(|n| n.checked_add(canvas))
+                    .ok_or(CaptureError::Overflow)?,
+            ),
+            max_predictions: request.max_predictions,
+        }))
+    }
+
     fn configure_text_capture(
         runtime: &ModelRuntime<Self>,
         state: &mut Self::TextGenerationState,
@@ -1841,6 +1886,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     sampler,
                     next_prediction: 0,
                     parameter_epoch: None,
+                    refinement_seed: config.seed(),
+                    refinement_policy: config.refinement_policy().unwrap_or_default(),
+                    draft_events: config.draft_events(),
+                    refinement: None,
                 },
                 capture: None,
             })
@@ -1871,18 +1920,222 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         })
     }
 
-    fn submit_text_prefill(
+    fn supports_block_refinement(runtime: &ModelRuntime<Self>) -> bool {
+        runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .block_refinement_geometry()
+            .is_some()
+    }
+
+    fn text_operation_kind(
+        runtime: &ModelRuntime<Self>,
+        _: &eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        state: &Self::TextGenerationState,
+    ) -> eredu_core::TextOperationKind {
+        use eredu_core::refinement::{GenerationPhase, PredictionScoreKind};
+        if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .block_refinement_geometry()
+            .is_none()
+        {
+            return eredu_core::TextOperationKind::Decision(PredictionScoreKind::CausalConditional);
+        }
+        match state
+            .sampling
+            .refinement
+            .as_ref()
+            .map_or(GenerationPhase::Context, |state| state.phase())
+        {
+            GenerationPhase::Finalization => eredu_core::TextOperationKind::Decision(
+                PredictionScoreKind::ConstrainedFinalization,
+            ),
+            phase => eredu_core::TextOperationKind::Progress(phase),
+        }
+    }
+
+    fn submit_text_operation(
         runtime: &mut ModelRuntime<Self>,
-        prompt: Self::Prompt,
-        filter: &TokenFilter,
+        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
-        Self::submit_text_prefill_decision(
-            runtime,
-            prompt,
-            &eredu_core::TokenSamplingDecision::new(filter.clone()),
-            state,
-        )
+    ) -> Result<
+        Submission<
+            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
+            Self::TextCompletion,
+        >,
+        eredu_core::TextOperationError<Self::Error>,
+    > {
+        if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .block_refinement_geometry()
+            .is_some()
+        {
+            return Self::submit_block_refinement_operation(runtime, input, decision, state)
+                .map_err(eredu_core::TextOperationError::Backend);
+        }
+        let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
+        let filter = decision.filter();
+        if matches!(&input, eredu_core::PendingTextInput::Continue) {
+            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
+        }
+        let submission =
+            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                match input {
+                    eredu_core::PendingTextInput::Prefill(prompt) => {
+                        let prepared = runtime
+                            .session()
+                            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
+                        let stream = runtime.backend().stream().clone();
+                        let prepared = prepared.map(|()| prompt);
+                        if let Some(capture) = &mut state.capture {
+                            let capture_geometry = Some(capture.plan().request());
+                            if let Ok(prompt) = &prepared {
+                                if let Some(cursor) = prompt.prefill_cursor() {
+                                    let range = cursor.next_range();
+                                    if range.start != 0 || range.end != cursor.token_count() {
+                                        capture
+                                            .set_prefill_span(
+                                                eredu_core::capture::CapturePrefillSpan {
+                                                    start: range.start as u64,
+                                                    end: range.end as u64,
+                                                    total: cursor.token_count() as u64,
+                                                },
+                                            )
+                                            .map_err(Error::before_model_mutation)?;
+                                    }
+                                }
+                            }
+                            let (backend, session) = runtime.parts_mut();
+                            let public_output =
+                                session.payload.model.erased().partition_public_output();
+                            let submission = partition_capture::with_observer(
+                                session,
+                                capture,
+                                &stream,
+                                decision.capture_domain(),
+                                0,
+                                |session, observer| {
+                                    session.submit_prefill_result_with_observer(
+                                        backend,
+                                        prepared,
+                                        capture_geometry,
+                                        &mut eredu_runtime::BorrowedActivationObserver(observer),
+                                    )
+                                },
+                            )?;
+                            let submission = Submission {
+                                output: MlxModelOutput::new(
+                                    public_output.then(|| MlxTensor::from_array(submission.output)),
+                                ),
+                                completion: submission.completion,
+                            };
+                            return sample_text_submission(
+                                runtime.session(),
+                                submission,
+                                filter,
+                                state,
+                                stream,
+                            );
+                        }
+                        let submission = match prepared {
+                            // Keep the core's exact admission check and retained target proof
+                            // on the ordinary successful prefill path.
+                            Ok(prompt) => runtime.prefill(prompt)?,
+                            Err(error) => {
+                                let (backend, session) = runtime.parts_mut();
+                                let public_output =
+                                    session.payload.model.erased().partition_public_output();
+                                let submission = session.submit_prefill_result_with_observer(
+                                    backend,
+                                    Err(error),
+                                    None,
+                                    &mut eredu_runtime::NoopObserver,
+                                )?;
+                                Submission {
+                                    output: MlxModelOutput::new(
+                                        public_output
+                                            .then(|| MlxTensor::from_array(submission.output)),
+                                    ),
+                                    completion: submission.completion,
+                                }
+                            }
+                        };
+                        sample_text_submission(runtime.session(), submission, filter, state, stream)
+                    }
+                    eredu_core::PendingTextInput::Decode(token) => {
+                        let prepared = runtime
+                            .session()
+                            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
+                        let stream = runtime.backend().stream().clone();
+                        if let Some(capture) = &mut state.capture {
+                            let (backend, session) = runtime.parts_mut();
+                            let public_output =
+                                session.payload.model.erased().partition_public_output();
+                            let submission = partition_capture::with_observer(
+                                session,
+                                capture,
+                                &stream,
+                                decision.capture_domain(),
+                                state.sampling.next_prediction,
+                                |session, observer| {
+                                    session.submit_decode_with_observer(
+                                        backend,
+                                        || {
+                                            prepared?;
+                                            token
+                                                .value
+                                                .try_index_device((.., NewAxis), &stream)
+                                                .map_err(Into::into)
+                                        },
+                                        &mut eredu_runtime::BorrowedActivationObserver(observer),
+                                    )
+                                },
+                            )?;
+                            let submission = Submission {
+                                output: MlxModelOutput::new(
+                                    public_output.then(|| MlxTensor::from_array(submission.output)),
+                                ),
+                                completion: submission.completion,
+                            };
+                            return sample_text_submission(
+                                runtime.session(),
+                                submission,
+                                filter,
+                                state,
+                                stream,
+                            );
+                        }
+                        let (backend, session) = runtime.parts_mut();
+                        let submission = session.submit_decode_input(backend, || {
+                            prepared?;
+                            #[cfg(test)]
+                crate::tests::support::path_instrumentation::session_input_creation_attempt();
+                            token
+                                .value
+                                .try_index_device((.., NewAxis), &stream)
+                                .map_err(Into::into)
+                        })?;
+                        sample_text_submission(runtime.session(), submission, filter, state, stream)
+                    }
+                    eredu_core::PendingTextInput::Continue => {
+                        unreachable!("continuation is rejected before causal submission")
+                    }
+                }
+            };
+        let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
+        Ok(Submission {
+            output: eredu_core::TextOperationOutput::Token(submission.output),
+            completion: submission.completion,
+        })
     }
 
     fn prefill_text_prefix(
@@ -1891,6 +2144,16 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         max_tokens: std::num::NonZeroUsize,
         state: &mut Self::TextGenerationState,
     ) -> Result<bool, Error> {
+        if runtime
+            .session()
+            .payload
+            .model
+            .erased()
+            .block_refinement_geometry()
+            .is_some()
+        {
+            return Ok(false);
+        }
         if runtime
             .session()
             .payload
@@ -2033,152 +2296,6 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         } else {
             Ok(())
         }
-    }
-
-    fn submit_text_prefill_decision(
-        runtime: &mut ModelRuntime<Self>,
-        prompt: Self::Prompt,
-        decision: &eredu_core::TokenSamplingDecision<'_>,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
-        let prepared = runtime
-            .session()
-            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
-        let filter = decision.filter();
-        let stream = runtime.backend().stream().clone();
-        let prepared = prepared.map(|()| prompt);
-        if let Some(capture) = &mut state.capture {
-            let capture_geometry = Some(capture.plan().request());
-            if let Ok(prompt) = &prepared {
-                if let Some(cursor) = prompt.prefill_cursor() {
-                    let range = cursor.next_range();
-                    if range.start != 0 || range.end != cursor.token_count() {
-                        capture
-                            .set_prefill_span(eredu_core::capture::CapturePrefillSpan {
-                                start: range.start as u64,
-                                end: range.end as u64,
-                                total: cursor.token_count() as u64,
-                            })
-                            .map_err(Error::before_model_mutation)?;
-                    }
-                }
-            }
-            let (backend, session) = runtime.parts_mut();
-            let public_output = session.payload.model.erased().partition_public_output();
-            let submission = partition_capture::with_observer(
-                session,
-                capture,
-                &stream,
-                decision.capture_domain(),
-                0,
-                |session, observer| {
-                    session.submit_prefill_result_with_observer(
-                        backend,
-                        prepared,
-                        capture_geometry,
-                        &mut eredu_runtime::BorrowedActivationObserver(observer),
-                    )
-                },
-            )?;
-            let submission = Submission {
-                output: MlxModelOutput::new(
-                    public_output.then(|| MlxTensor::from_array(submission.output)),
-                ),
-                completion: submission.completion,
-            };
-            return sample_text_submission(runtime.session(), submission, filter, state, stream);
-        }
-        let submission = match prepared {
-            // Keep the core's exact admission check and retained target proof
-            // on the ordinary successful prefill path.
-            Ok(prompt) => runtime.prefill(prompt)?,
-            Err(error) => {
-                let (backend, session) = runtime.parts_mut();
-                let public_output = session.payload.model.erased().partition_public_output();
-                let submission = session.submit_prefill_result_with_observer(
-                    backend,
-                    Err(error),
-                    None,
-                    &mut eredu_runtime::NoopObserver,
-                )?;
-                Submission {
-                    output: MlxModelOutput::new(
-                        public_output.then(|| MlxTensor::from_array(submission.output)),
-                    ),
-                    completion: submission.completion,
-                }
-            }
-        };
-        sample_text_submission(runtime.session(), submission, filter, state, stream)
-    }
-
-    fn submit_text_decode(
-        runtime: &mut ModelRuntime<Self>,
-        token: Self::Token,
-        filter: &TokenFilter,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
-        Self::submit_text_decode_decision(
-            runtime,
-            token,
-            &eredu_core::TokenSamplingDecision::new(filter.clone()),
-            state,
-        )
-    }
-
-    fn submit_text_decode_decision(
-        runtime: &mut ModelRuntime<Self>,
-        token: Self::Token,
-        decision: &eredu_core::TokenSamplingDecision<'_>,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
-        let prepared = runtime
-            .session()
-            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
-        let filter = decision.filter();
-        let stream = runtime.backend().stream().clone();
-        if let Some(capture) = &mut state.capture {
-            let (backend, session) = runtime.parts_mut();
-            let public_output = session.payload.model.erased().partition_public_output();
-            let submission = partition_capture::with_observer(
-                session,
-                capture,
-                &stream,
-                decision.capture_domain(),
-                state.sampling.next_prediction,
-                |session, observer| {
-                    session.submit_decode_with_observer(
-                        backend,
-                        || {
-                            prepared?;
-                            token
-                                .value
-                                .try_index_device((.., NewAxis), &stream)
-                                .map_err(Into::into)
-                        },
-                        &mut eredu_runtime::BorrowedActivationObserver(observer),
-                    )
-                },
-            )?;
-            let submission = Submission {
-                output: MlxModelOutput::new(
-                    public_output.then(|| MlxTensor::from_array(submission.output)),
-                ),
-                completion: submission.completion,
-            };
-            return sample_text_submission(runtime.session(), submission, filter, state, stream);
-        }
-        let (backend, session) = runtime.parts_mut();
-        let submission = session.submit_decode_input(backend, || {
-            prepared?;
-            #[cfg(test)]
-            crate::tests::support::path_instrumentation::session_input_creation_attempt();
-            token
-                .value
-                .try_index_device((.., NewAxis), &stream)
-                .map_err(Into::into)
-        })?;
-        sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
 }
 

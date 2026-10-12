@@ -517,7 +517,7 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         let initial = run.snapshot(|_| ControlFlow::Continue(())).unwrap();
         let mut first_captures = Vec::new();
         run.step(|record| {
-            if let ObservedGenerationEvent::PrefillProgress {
+            if let ObservedGenerationEvent::Progress {
                 captures: Some(step),
                 ..
             } = record.generation.event

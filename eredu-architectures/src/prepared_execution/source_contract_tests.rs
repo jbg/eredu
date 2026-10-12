@@ -495,6 +495,7 @@ where
         + eredu_nn::HyperNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: eredu_runtime::LayerRuntimeState<B>,
@@ -563,6 +564,7 @@ where
         + eredu_nn::HyperNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     PS: eredu_runtime::LayerRuntimeState<B>,

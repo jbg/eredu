@@ -22,6 +22,7 @@ pub struct CaptureCheckpoint {
     prediction: u64,
     phase: CapturePhase,
     has_step: bool,
+    commitment_boundary: Option<u64>,
     prefill_progress: Option<CapturePrefillSpan>,
     usage: CaptureUsage,
 }
@@ -60,6 +61,7 @@ pub struct PreparedCaptureRestore<'a> {
     prediction: u64,
     phase: CapturePhase,
     has_step: bool,
+    commitment_boundary: Option<u64>,
     prefill_progress: Option<CapturePrefillSpan>,
 }
 
@@ -69,6 +71,7 @@ impl PreparedCaptureRestore<'_> {
         self.run.prediction = self.prediction;
         self.run.phase = self.phase;
         self.run.has_step = self.has_step;
+        self.run.commitment_boundary = self.commitment_boundary;
         self.run.prefill_progress = self.prefill_progress;
         self.run.capture_seconds = 0.0;
         self.run.transaction = None;
@@ -135,6 +138,7 @@ impl CaptureSession {
             prediction: self.prediction,
             phase: self.phase,
             has_step: self.has_step,
+            commitment_boundary: self.commitment_boundary,
             prefill_progress: self.prefill_progress,
             usage: self.ledger.total(),
         })
@@ -186,6 +190,7 @@ impl CaptureSession {
             prediction: checkpoint.prediction,
             phase: checkpoint.phase,
             has_step: checkpoint.has_step,
+            commitment_boundary: checkpoint.commitment_boundary,
             prefill_progress: checkpoint.prefill_progress,
         })
     }
@@ -255,6 +260,9 @@ impl CaptureCheckpoint {
     }
     /// Absolute next prediction; zero means prompt prefill has not executed.
     pub fn next_prediction(&self) -> u64 {
+        if let Some(boundary) = self.commitment_boundary {
+            return boundary;
+        }
         // begin_step requires prediction < max_predictions, hence this cannot overflow.
         if self
             .prefill_progress
@@ -385,6 +393,7 @@ impl CaptureCheckpoint {
         child.prediction = self.prediction;
         child.phase = self.phase;
         child.has_step = self.has_step;
+        child.commitment_boundary = self.commitment_boundary;
         child.prefill_progress = self.prefill_progress;
         Ok(child)
     }

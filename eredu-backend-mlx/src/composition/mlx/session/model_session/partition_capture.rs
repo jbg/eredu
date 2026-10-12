@@ -190,3 +190,26 @@ pub(super) fn with_observer<R>(
 
 #[cfg(test)]
 mod tests;
+
+/// Invocation admission failures enter the ordinary observer preparation
+/// agreement, before any rank mutates its model state.
+pub(super) fn with_invocation_observer<R>(
+    session: &mut MlxModelSession,
+    capture: &mut CaptureSession,
+    stream: &Stream,
+    prediction: u64,
+    invocation: Result<(CapturePhase, CaptureInvocationShape), CaptureError>,
+    submit: impl FnOnce(
+        &mut MlxModelSession,
+        &mut dyn RuntimeActivationObserver<MlxTensor, Error>,
+    ) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let admitted = invocation.and_then(|(phase, shape)| {
+        capture.set_commitment_boundary(prediction)?;
+        capture.begin_invocation(phase, prediction, shape, Default::default())
+    });
+    match admitted {
+        Ok(()) => with_observer(session, capture, stream, None, prediction, submit),
+        Err(error) => submit(session, &mut RejectedCapture(error)),
+    }
+}

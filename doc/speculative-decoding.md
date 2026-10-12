@@ -5,6 +5,12 @@ assistant model or multi-token-prediction (MTP) heads embedded in the target
 checkpoint. The target model always verifies proposals; accepted output has
 the same target distribution as the corresponding non-speculative path.
 
+Likelihood-ratio verification requires causal conditional target probabilities.
+Iterative block architectures such as DiffusionGemma report
+`SpeculativeCapability::IncompatibleScores` and reject this verification with
+`RequiresCausalConditionalScores` before proposal execution. Their tentative
+canvases use the independent refinement schedule and draft-event contract.
+
 Prepared chat, native tools, sampling penalties, stochastic acceptance,
 cancellation, and semantic events use the same generation pipeline with or
 without speculative decoding.

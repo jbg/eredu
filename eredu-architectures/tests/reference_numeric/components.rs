@@ -16,6 +16,8 @@ mod partition_sum;
 mod composite_banks;
 #[path = "components/composite_routed.rs"]
 mod composite_routed;
+#[path = "components/diffusion_gemma.rs"]
+mod diffusion_gemma;
 #[path = "components/gemma4_components.rs"]
 mod gemma4_components;
 #[path = "components/gemma4_placement.rs"]

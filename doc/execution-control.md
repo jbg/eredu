@@ -1,10 +1,37 @@
 # Execution control
 
-The ordinary text facade supports completed-token and prefill-chunk stepping, pause/resume, canonical
+The ordinary text facade supports completed physical stepping, pause/resume, canonical
 token forcing, temperature changes, explicit reseeding, reusable native snapshots,
 restoration and isolated serial branches. Complete snapshot support requires known
 costs for every state owner. Currently this includes the forbidden-tool constraint
 mode; active and automatic llguidance grammar modes explicitly reject snapshots.
+Context encoding and tentative refinement advance without querying the canonical
+constraint controller or parsing semantic text. Selecting operations use the
+current controller decision and commit one authoritative token. `Progress` records
+carry phase, block, iteration and independent execution coordinates; token records
+also declare the meaning of their scores. Causal conditional scores, refinement
+position scores and constrained finalization scores remain distinct. Generation
+records and execution-control metadata use schema version 2.
+
+Snapshots preserve the logical physical-step and committed-token coordinates,
+alongside backend phase state, sampler, pending input and constraint state.
+Restoration does not rewind output reconciliation epochs or refund capture,
+transport or copy budgets.
+
+For iterative generation, `step` completes one physical context, refinement or
+finalization operation. A progress-only step commits no token and remains a pause,
+snapshot and fork boundary. `draft_events` enables replaceable token-block updates;
+their branch, epoch, block and revision identify the active tentative output.
+Drafts clear before canonical delivery and on cancellation, failure, restoration
+or branch exchange. Snapshot replay preserves numerical state while advancing
+the output epoch, so consumers cannot mistake replayed drafts for older revisions.
+
+The `refinement` setting controls the trained iterative schedule. Causal sampling
+knob overrides and causal likelihood-ratio speculative verification reject
+noncausal target scores with `RequiresCausalConditionalScores`. Constrained
+finalization applies the evolving canonical constraints independently to each
+position. Explicit reseeding remains a prospective change to the retained stream.
+
 See the [LM Inspector integration guide](lm-inspector-execution-control.md) and
 the runnable [controlled generation example](../eredu/examples/controlled_generate.rs).
 
@@ -108,7 +135,7 @@ Ordinary and controlled generation share prompt chunking in the core driver.
 `PreparedChatGenerationSettings::prefill` select `PrefillChunkPolicy::Bounded`
 (512 tokens by default) or `Unchunked`. Each nonfinal chunk completes before the
 next begins and advances the model cache without sampling. Only the final chunk
-predicts a token. A controlled step can publish `PrefillProgress` and pause at a
+predicts a token. A controlled step can publish `Progress` and pause at a
 completed nonfinal chunk; it consumes no output token or controller decision.
 Snapshots and branches preserve pending input together with committed model state.
 The uninterrupted driver repeats the same operation until token production.
@@ -1297,7 +1324,7 @@ capacity, while assembly and lexical lookup operate on the current chunk. Oversi
 requests fail before native request construction or encoder execution.
 
 The pending native prompt retains the cursor. A controlled `step` can finish one
-nonfinal chunk and emit `PrefillProgress`. Cursor snapshots share immutable request
+nonfinal chunk and emit `Progress`. Cursor snapshots share immutable request
 proofs and completed encoder output while copying mutable model state. Restoring a
 completed prefix does not rerun its encoder. Complete-input prompt-cache identity
 publishes only after the final chunk commits; partial progress clears stale complete

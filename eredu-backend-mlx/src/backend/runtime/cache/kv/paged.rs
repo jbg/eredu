@@ -18,6 +18,13 @@ impl<T> KeyValueCache for &'_ mut T
 where
     T: KeyValueCache + ?Sized,
 {
+    fn attention_with_transient(
+        &mut self,
+        request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        T::attention_with_transient(self, request, stream)
+    }
     fn offset(&self) -> i32 {
         T::offset(self)
     }
@@ -271,6 +278,16 @@ impl LiveKeyValueCache {
 }
 
 impl KeyValueCache for LiveKeyValueCache {
+    fn attention_with_transient(
+        &mut self,
+        request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Resident(cache) => cache.attention_with_transient(request, stream),
+            Self::Paged(cache) => cache.attention_with_transient(request, stream),
+        }
+    }
     fn offset(&self) -> i32 {
         match self {
             Self::Resident(cache) => cache.offset(),
@@ -1207,6 +1224,27 @@ impl Default for PagedKeyValueCache {
 }
 
 impl KeyValueCache for PagedKeyValueCache {
+    fn attention_with_transient(
+        &mut self,
+        request: eredu_nn::AttentionRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        request
+            .validate()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.scan_attention(
+            request.queries.as_array(),
+            request.scale,
+            request.mask.map(MlxTensor::as_array),
+            request.sinks.map(MlxTensor::as_array),
+            request.softcap,
+            request.arithmetic,
+            None,
+            Some((request.keys.as_array(), request.values.as_array())),
+            stream,
+        )?
+        .ok_or_else(|| Exception::custom("read-only paged attention produced no output"))
+    }
     fn offset(&self) -> i32 {
         i32::try_from(self.offset).unwrap_or(i32::MAX)
     }
@@ -1237,7 +1275,7 @@ impl KeyValueCache for PagedKeyValueCache {
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         self.scan_attention(
-            queries, scale, mask, sinks, softcap, arithmetic, None, stream,
+            queries, scale, mask, sinks, softcap, arithmetic, None, None, stream,
         )
     }
 
@@ -1275,6 +1313,7 @@ impl KeyValueCache for PagedKeyValueCache {
             None,
             eredu_nn::AttentionArithmetic::Fused,
             Some(&kernel),
+            None,
             stream,
         )
     }
@@ -1354,6 +1393,7 @@ impl PagedKeyValueCache {
         softcap: Option<f32>,
         arithmetic: eredu_nn::AttentionArithmetic,
         relative: Option<&crate::backend::nn::relative_attention::RelativeAttentionKernel>,
+        transient: Option<(&Array, &Array)>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         if self.key_only {
@@ -1362,7 +1402,15 @@ impl PagedKeyValueCache {
             ));
         }
         let query_len = queries.dim(-2) as i64;
-        let query_start = self.offset - query_len;
+        let query_start = if transient.is_some() {
+            self.offset
+        } else {
+            self.offset - query_len
+        };
+        let context_end = self
+            .offset
+            .checked_add(transient.map_or(0, |(keys, _)| i64::from(keys.dim(-2))))
+            .ok_or_else(|| Exception::custom("read-only attention context extent overflow"))?;
         let visible_start = self
             .sliding_window
             .map_or(0, |window| (query_start - (window - 1) as i64).max(0));
@@ -1384,9 +1432,12 @@ impl PagedKeyValueCache {
             self.sliding_window,
             self.prefix_tokens as i64,
             sinks,
-            self.offset,
+            context_end,
             stream,
         )?;
+        if transient.is_some() {
+            accumulator.use_retained_context(visible_start)?;
+        }
         accumulator.set_softcap(softcap)?;
         accumulator.set_arithmetic(arithmetic)?;
         let mut scanned_blocks = 0u64;
@@ -1465,13 +1516,33 @@ impl PagedKeyValueCache {
                 }
                 accumulator.accumulate_with_bias(&block, bias.as_ref(), stream)?;
             }
+            if let Some((keys, values)) = transient {
+                let block = KeyValueAttentionBlock::unleased(
+                    self.offset,
+                    context_end,
+                    keys.clone(),
+                    values.clone(),
+                );
+                scratch = scratch.max(
+                    queries.dim(0) as u64
+                        * queries.dim(1) as u64
+                        * query_len as u64
+                        * (context_end - self.offset) as u64
+                        * 4,
+                );
+                scanned_blocks += 1;
+                scanned_bytes += block.bytes;
+                accumulator.accumulate_with_bias(&block, None, stream)?;
+            }
         }
         let output = accumulator.finish(stream)?;
         safemlx::transforms::eval([&output])?;
         // Every query in the submitted span has now consumed its visible keys.
         // Before this point, discarding by the final query's window would erase
         // keys needed by earlier queries in a multi-token attention call.
-        self.discard_sliding_history()?;
+        if transient.is_none() {
+            self.discard_sliding_history()?;
+        }
         self.manager
             .record_attention_scan(
                 self.global_layer,

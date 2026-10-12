@@ -4474,6 +4474,18 @@ fn production_replicated_text_constructor_executes_reference_mechanisms() {
         );
         assert_eq!(counters.snapshot().state_allocations, 2);
         assert_eq!(completions.borrow().len(), counters.snapshot().publications);
+        // Iterative invocations retain the complete ordered output instead of
+        // selecting the causal final position. Completion publishes this same value.
+        let complete = session
+            .sequence_output_with_observer(
+                &FakeTensor(vec![11, 17]),
+                eredu_runtime::ExpertPass::Decode,
+                &(),
+                &mut eredu_runtime::NoopObserver,
+            )
+            .unwrap();
+        assert_eq!(complete, FakeTensor(vec![11, 17, 5]));
+        assert_eq!(completions.borrow().last(), Some(&complete));
     }
 }
 

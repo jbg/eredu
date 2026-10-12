@@ -103,6 +103,7 @@ pub(crate) fn segmented_token_ingress_collectives(
 pub struct PreparedCompositeInput<'a, T, P> {
     prepared: &'a eredu_runtime::PreparedModelInput<T>,
     admitted: &'a AdmittedCompositeInput<P>,
+    refinement: Option<Option<&'a T>>,
 }
 
 impl<T, P> Clone for PreparedCompositeInput<'_, T, P> {
@@ -125,7 +126,23 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
         if prepared.len() != admitted.parts().len() {
             return Err("prepared composite part count differs from admission".into());
         }
-        Ok(Self { prepared, admitted })
+        Ok(Self {
+            prepared,
+            admitted,
+            refinement: None,
+        })
+    }
+
+    /// Selects a tentative-block invocation over already admitted token rows.
+    /// The outer option distinguishes context from refinement without feedback.
+    pub fn with_refinement(mut self, feedback: Option<&'a T>) -> Self {
+        self.refinement = Some(feedback);
+        self
+    }
+
+    /// Feedback authority for an explicit tentative-block invocation.
+    pub fn refinement(&self) -> Option<Option<&'a T>> {
+        self.refinement
     }
 
     /// Exact backend-native prepared tensor handles.
@@ -261,6 +278,12 @@ where
     B: NeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
 {
+    /// Iterative output geometry, selected independently from prepared media.
+    fn block_refinement_geometry(
+        _config: &Self::AdmissionConfig,
+    ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
+        None
+    }
     /// Prepared requests implement partial invocations with retained continuations.
     fn supports_retained_prefill() -> bool {
         false
@@ -279,6 +302,15 @@ where
     /// ordinary runtime session owns traversal, commitment and observation.
     type PrefillRequest: Clone
         + eredu_runtime::prefill::ChunkedPrefillRequest<PreparedCompositeArchitecture<Self>, B, S>;
+
+    /// Declares an invocation-specific publication width when it differs from
+    /// the selected output projection, such as an authoritative encoder result.
+    fn prepared_publication_width(
+        &self,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
 
     /// Maximum target invocation for an admitted request, when the architecture
     /// has a bounded continuation contract. `None` retains one invocation.
@@ -675,6 +707,12 @@ where
         Self: 'a,
         B::Tensor: 'a;
     type Error = A::Error;
+
+    fn output_score_kind(
+        forward: &Self::ForwardContext,
+    ) -> Option<eredu_core::refinement::PredictionScoreKind> {
+        A::output_score_kind(forward)
+    }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         self.inner.observation_hooks()

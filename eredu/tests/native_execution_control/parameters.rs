@@ -723,7 +723,7 @@ pub(super) fn parameter_decode_logits<
                         prefix.len() as u64 + prediction_index,
                     ]
                 };
-                assert_eq!(*input_range, expected_range);
+                assert_eq!(*input_range, Some(expected_range));
                 assert_eq!(step.records.len(), 1);
                 let capture = &step.records[0];
                 assert_eq!(capture.outcome, CaptureOutcome::Captured);

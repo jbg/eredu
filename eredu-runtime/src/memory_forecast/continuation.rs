@@ -19,6 +19,8 @@ pub struct ContinuationMemoryPlan {
     pub current_positions: u64,
     /// Inputs submitted for the requested additional predictions, counted once.
     pub additional_input_tokens: u64,
+    /// Maximum physical query rows per forward during this horizon.
+    pub query_tokens: u64,
     /// Installed logical payload floor through native retained-capacity allowance.
     pub current_state: MemoryBytes,
     /// Persistent-state envelope throughout the horizon, including the start.
@@ -54,11 +56,12 @@ impl ContinuationMemoryPlan {
                 .map(|d| d.executions.len())
                 .sum::<usize>()
                 != 1
-            || request.max_output_tokens != Some(self.additional_input_tokens)
+            || request.max_output_tokens.is_none()
+            || self.query_tokens == 0
         {
             return Err(CapabilityError::InvalidConfiguration {
                 field: "continuation forecast",
-                detail: "requires one ordinary decode lane and a matching finite input horizon"
+                detail: "requires one execution lane, positive query geometry and a finite commitment horizon"
                     .into(),
             });
         }
@@ -168,8 +171,14 @@ pub fn estimate_continuation_memory(
         };
         start.total = total(&start)?;
         let mut phases = vec![start];
-        if plan.additional_input_tokens > 0 {
-            let mut decode = phase(&without_copy, request, MemoryPhase::Decode, frontier, 1)?;
+        if request.forecast_output_tokens > 0 {
+            let mut decode = phase(
+                &without_copy,
+                request,
+                MemoryPhase::Decode,
+                frontier,
+                plan.query_tokens,
+            )?;
             if executes {
                 // The normalized plan includes logical endpoint/start floors;
                 // its native upper end covers capacity and interior peaks.

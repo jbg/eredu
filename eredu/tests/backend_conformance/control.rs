@@ -677,7 +677,7 @@ fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_bef
     assert!(records.iter().any(|r| matches!(
         &r.generation.event,
         ObservedGenerationEvent::Token {
-            input_range: [0, 3],
+            input_range: Some([0, 3]),
             forced: false,
             ..
         }

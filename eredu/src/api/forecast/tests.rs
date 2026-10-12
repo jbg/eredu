@@ -180,6 +180,7 @@ fn generic_topology_credits_resident_conversions_without_losing_promotion() {
         };
         profile.geometry.workspace = None;
         profile.geometry.execution_topology = Some(TextExecutionTopology {
+            iterative: None,
             hidden_size: 16,
             vocabulary_size: 32,
             output: projection(16, 32),

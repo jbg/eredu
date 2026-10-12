@@ -859,6 +859,7 @@ pub(crate) fn execution_topology(
     projection_input_normalizations
         .insert(output.parameter.clone(), vec![spec.normalization_weight]);
     Ok(TextExecutionTopology {
+        iterative: None,
         hidden_size: positive(args.hidden_size)?,
         vocabulary_size: positive(args.vocab_size)?,
         layers,

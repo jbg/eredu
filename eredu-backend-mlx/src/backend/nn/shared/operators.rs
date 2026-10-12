@@ -162,6 +162,35 @@ pub struct MlxEmbedding {
 }
 
 impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
+    fn weighted_sum(
+        &mut self,
+        coefficients: &MlxTensor,
+        context: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        let (coefficients, rows) = match &self.vocabulary_range {
+            Some(range) => {
+                if coefficients.shape().last().copied() != Some(range.global_vocabulary as i32) {
+                    return Err(ComputeError::backend(
+                        "partitioned weighted embedding requires full vocabulary coefficients",
+                    ));
+                }
+                let shape = coefficients.shape();
+                let flat = coefficients.reshape(&[-1, range.global_vocabulary as i32], context)?;
+                let local = compute(flat.as_array().try_index_device(
+                    (.., range.local.start as i32..range.local.end as i32),
+                    context,
+                ))?;
+                let mut shape = shape.to_vec();
+                *shape.last_mut().unwrap() = range.local.len() as i32;
+                (
+                    compute(local.reshape(&shape, context))?,
+                    range.local.len() as i32,
+                )
+            }
+            None => (coefficients.as_array().clone(), self.vocabulary),
+        };
+        compute_tensor(self.module.weighted_sum(&coefficients, rows, context))
+    }
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
         self.lookup(input, EmbeddingLookupPolicy::Strict, context)
     }
@@ -342,19 +371,9 @@ pub(super) fn mlx_weightless_rms_norm(
     context: &Stream,
 ) -> Result<Array, ComputeError> {
     eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
-    if let Some(output) = compute(super::super::normalization::f32_weightless_rms(
+    compute(super::super::normalization::weightless_rms(
         input, epsilon, context,
-    ))? {
-        return Ok(output);
-    }
-    let dtype = input.dtype();
-    let variance = compute(input.square(context))?;
-    let variance = compute(variance.mean_axis(-1, true, context))?;
-    let denominator = compute(variance.add(Array::from_f32(epsilon), context))?;
-    let denominator = compute(denominator.rsqrt(context))?;
-    compute(input.multiply(denominator, context))?
-        .as_dtype(dtype, context)
-        .map_err(ComputeError::backend)
+    ))
 }
 
 /// MLX RoPE variant selected from model metadata.

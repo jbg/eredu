@@ -186,6 +186,11 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                                 SamplingOverrideError::Invalid(reason) => {
                                     TextSnapshotError::Unsupported(reason)
                                 }
+                                SamplingOverrideError::RequiresCausalConditionalScores => {
+                                    TextSnapshotError::Unsupported(
+                                        "temperature overrides require causal conditional scores",
+                                    )
+                                }
                             })?;
                     }
                     let capture = B::capture_run(generation);
@@ -242,6 +247,8 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             control: GenerationControlHandle::default(),
                             sequence: 0,
                             epoch: 0,
+                            drafts: self.delivery.drafts.fork(),
+                            iterative: self.delivery.iterative,
                             prediction: snapshot.metadata.output.next_prediction,
                             prompt_length: self.delivery.prompt_length,
                             prompt_token_ids: std::sync::Arc::clone(&snapshot.prompt_token_ids),

@@ -345,6 +345,11 @@ pub enum SpeculativeDraftSource {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SpeculativeCapability {
+    /// Causal likelihood-ratio verification cannot consume this target's scores.
+    IncompatibleScores {
+        /// Actual semantics of the selected target distribution.
+        score_kind: crate::refinement::PredictionScoreKind,
+    },
     /// The model does not advertise executable draft weights.
     Unavailable,
     /// The target declares an interface for the stated draft source.
@@ -378,7 +383,7 @@ impl SpeculativeCapability {
             Self::Declared { draft_source }
             | Self::Ready { draft_source }
             | Self::Unsupported { draft_source, .. } => Some(*draft_source),
-            Self::Unavailable => None,
+            Self::Unavailable | Self::IncompatibleScores { .. } => None,
         }
     }
 

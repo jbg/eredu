@@ -18,6 +18,15 @@ fn copy_array(array: &Array, stream: &Stream) -> Result<Array, Error> {
 }
 
 impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend<'_> {
+    fn sampling_score_kind(
+        runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::refinement::PredictionScoreKind {
+        if runtime.session().block_refinement_geometry().is_some() {
+            eredu_core::refinement::PredictionScoreKind::ConstrainedFinalization
+        } else {
+            eredu_core::refinement::PredictionScoreKind::CausalConditional
+        }
+    }
     fn sampling_control_facts(
         state: &MlxTextGenerationState,
     ) -> eredu_runtime::execution_control::SamplingStateFacts {
@@ -27,7 +36,7 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend
                 state.sampling.sampler,
                 MlxTextSampler::MirostatV2(_)
             ),
-            has_rng: state.sampling.prng.is_some(),
+            has_rng: state.sampling.prng.is_some() || state.sampling.refinement.is_some(),
         }
     }
     fn install_sampling_override(
@@ -39,6 +48,12 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend
             Ok(request.reseed().map(RandomState::with_seed).transpose())
         })??;
         if let Some(random) = replacement {
+            if let Some(refinement) = &mut state.sampling.refinement {
+                refinement.replace_random(random.clone());
+            }
+            if let Some(seed) = request.reseed() {
+                state.sampling.refinement_seed = seed;
+            }
             state.sampling.prng = Some(random);
         }
         state.sampling.temperature = request.temperature();
@@ -77,11 +92,29 @@ impl TextSnapshotBackend for MlxBackend<'_> {
     type SamplingState = MlxTextSamplingState;
 
     fn continuation_input_tokens(
+        runtime: &ModelRuntime<Self>,
+        sampling: &MlxTextSamplingState,
         pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
         predictions: u64,
     ) -> Option<u64> {
         if predictions == 0 {
             return Some(0);
+        }
+        if let Some(geometry) = runtime.session().block_refinement_geometry() {
+            if let Some(block) = &sampling.refinement {
+                return block.continuation_context_tokens(predictions);
+            }
+            let PendingTextInput::Prefill(prompt) = pending? else {
+                return None;
+            };
+            let prompt =
+                with_text_prompt_array(prompt, |array| u64::try_from(array.shape()[1]).ok())
+                    .flatten()?;
+            let subsequent = predictions
+                .checked_sub(1)?
+                .checked_div(u64::from(geometry.canvas_length.get()))?
+                .checked_mul(u64::from(geometry.canvas_length.get()))?;
+            return prompt.checked_add(subsequent);
         }
         match pending? {
             PendingTextInput::Decode(token) if token.value.size() == 1 => Some(predictions),
@@ -106,17 +139,41 @@ impl TextSnapshotBackend for MlxBackend<'_> {
     }
 
     fn estimate_sampling_growth(
-        _: &ModelRuntime<Self>,
-        _: &MlxTextSamplingState,
+        runtime: &ModelRuntime<Self>,
+        sampling: &MlxTextSamplingState,
         predictions: u64,
     ) -> Result<Option<u64>, Error> {
         // Both ordinary samplers retain one u32 history entry per decision.
         // Reserve descriptors/materialization for a scalar pending token and a
         // two-u32 RNG key, including a key explicitly introduced by reseeding.
         // Stream/completion owners are shared; no array is allocated to estimate.
-        Ok(predictions
+        let causal = predictions
             .checked_mul(4)
-            .and_then(|bytes| bytes.checked_add(2 * (4096 + 16 + 2 * 8))))
+            .and_then(|bytes| bytes.checked_add(2 * (4096 + 16 + 2 * 8)));
+        let Some(geometry) = runtime.session().block_refinement_geometry() else {
+            return Ok(causal);
+        };
+        let canvas = u64::from(geometry.canvas_length.get());
+        let vocabulary = u64::from(geometry.vocabulary_size.get());
+        // Every block retains at most two full score matrices, one canvas,
+        // one argmax, bounded stability history and finalized scalar handles.
+        // These are immutable snapshot values; the next block replaces them.
+        Ok((|| {
+            let score_bytes = canvas
+                .checked_mul(vocabulary)?
+                .checked_mul(16)?
+                .checked_add(2 * (4096 + 128))?;
+            let history = u64::from(sampling.refinement_policy.options().stability_threshold)
+                .checked_add(3)?;
+            let tokens = canvas.checked_mul(8)?.checked_mul(history)?;
+            let scalar_handles = canvas.checked_mul(4096 + 128)?;
+            causal?
+                .checked_add(score_bytes)?
+                .checked_add(tokens)?
+                .checked_add(scalar_handles)?
+                .checked_add(history.checked_mul(4096 + 128)?)?
+                .checked_add(4096)
+        })())
     }
 
     fn sampling_state(state: &MlxTextGenerationState) -> &MlxTextSamplingState {
@@ -175,9 +232,30 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             if let Some(random) = &sampling.prng {
                 bytes = bytes.checked_add(array_storage(random.as_array())?)?;
             }
+            let mut copy_bytes = bytes;
+            if let Some(refinement) = &sampling.refinement {
+                let host = refinement.snapshot_host_bytes()?;
+                bytes = bytes.checked_add(host)?;
+                copy_bytes = copy_bytes.checked_add(host)?;
+                let mut retained = Some(bytes);
+                refinement.visit_retained_values(|value| {
+                    let storage = match value {
+                        eredu_runtime::generation::refinement::RefinementValue::Tokens(value)
+                        | eredu_runtime::generation::refinement::RefinementValue::Scores(value)
+                        | eredu_runtime::generation::refinement::RefinementValue::Mask(value) => {
+                            array_storage(value.as_array())
+                        }
+                        eredu_runtime::generation::refinement::RefinementValue::Random(value) => {
+                            array_storage(value.as_array())
+                        }
+                    };
+                    retained = retained.and_then(|bytes| bytes.checked_add(storage?));
+                });
+                bytes = retained?;
+            }
             Some(SnapshotEstimate {
                 retained_bytes: bytes,
-                copy_bytes: bytes,
+                copy_bytes,
             })
         })();
         Ok(estimate)
@@ -201,6 +279,10 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                     sampler: sampling.sampler.clone(),
                     next_prediction: sampling.next_prediction,
                     parameter_epoch: sampling.parameter_epoch,
+                    refinement_seed: sampling.refinement_seed,
+                    refinement_policy: sampling.refinement_policy,
+                    draft_events: sampling.draft_events,
+                    refinement: sampling.refinement.clone(),
                 })
             })())
         })?
@@ -211,7 +293,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
     ) -> Result<Option<SnapshotEstimate>, Error> {
         let bytes = match pending {
-            None => Some(0),
+            None | Some(PendingTextInput::Continue) => Some(0),
             Some(PendingTextInput::Decode(token)) if token.value.size() == 1 => {
                 array_storage(&token.value)
             }
@@ -261,6 +343,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             pending.as_ref().map(|input| match input {
                 PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(*prompt),
                 PendingTextInput::Decode(token) => PendingTextInput::Decode(*token),
+                PendingTextInput::Continue => PendingTextInput::Continue,
             }),
         )?
         .is_none()
@@ -274,6 +357,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             Ok((|| {
                 Ok(match pending {
                     None => None,
+                    Some(PendingTextInput::Continue) => Some(PendingTextInput::Continue),
                     Some(PendingTextInput::Decode(token)) => {
                         Some(PendingTextInput::Decode(MlxTextToken {
                             value: copy_array(&token.value, &stream)?,

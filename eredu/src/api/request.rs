@@ -19,7 +19,8 @@ use crate::runtime::chat::{
     ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport, ToolChoice,
 };
 use crate::runtime::generation::streaming::{
-    CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
+    CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, SourceAdvancement,
+    TokenDecoderBackend,
 };
 use std::collections::HashMap;
 
@@ -44,6 +45,11 @@ pub struct PreparedChatGenerationSettings {
     /// Prompt chunking for eligible ordinary text execution (default: 512 tokens).
     /// Media, bounded observations, and speculative execution retain their full pass.
     pub prefill: eredu_core::PrefillChunkPolicy,
+    /// Iterative canvas policy; absent selects the architecture's default schedule.
+    pub refinement: Option<eredu_core::refinement::RefinementConfig>,
+    /// Emits replaceable tentative blocks through bounded observed delivery.
+    /// Draft IDs never enter committed text, tool constraints, or semantic parsing.
+    pub draft_events: bool,
 }
 
 /// Explicit prompt source for semantic or text generation from a [`PreparedChat`].
@@ -556,8 +562,15 @@ pub(super) fn prepared_text_control_runtime(
 }
 
 pub(super) enum GenerationStepKind {
-    Token(u32),
-    Prefill,
+    Token {
+        token: u32,
+        score_kind: eredu_core::refinement::PredictionScoreKind,
+        position: eredu_core::refinement::GenerationPosition,
+    },
+    Progress {
+        progress: eredu_core::TextProgress,
+        position: eredu_core::refinement::GenerationPosition,
+    },
     Failed,
 }
 
@@ -570,7 +583,6 @@ where
         &'a mut dyn FnMut(GenerationStepKind, Option<eredu_core::capture::CapturedStep>, f64),
     >,
     pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
-    pub(super) capture_enabled: bool,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
 }
@@ -580,40 +592,6 @@ where
     B: eredu_core::TextGenerationBackend,
 {
     type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
-
-    fn advance_prefill(&mut self) -> Result<bool, Self::Error> {
-        let started = std::time::Instant::now();
-        let result = self.generator.advance_prefill();
-        if matches!(result, Ok(false)) {
-            return result;
-        }
-        let captures = self
-            .generator
-            .take_captured_step()
-            .map_err(eredu_core::ControlledTextGenerationError::Backend);
-        let advanced = match result {
-            Ok(advanced) => advanced,
-            Err(error) => {
-                if let (Some(callback), Ok(captures)) = (&mut self.on_token, captures) {
-                    callback(
-                        GenerationStepKind::Failed,
-                        captures,
-                        started.elapsed().as_secs_f64(),
-                    );
-                }
-                return Err(error);
-            }
-        };
-        let captures = captures?;
-        if let Some(callback) = &mut self.on_token {
-            callback(
-                GenerationStepKind::Prefill,
-                captures,
-                started.elapsed().as_secs_f64(),
-            );
-        }
-        Ok(advanced)
-    }
 
     fn finish_step<T, E>(
         &mut self,
@@ -636,47 +614,55 @@ where
         self.delivery_failure.and_then(|failure| failure())
     }
 
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
-        let started = self.on_token.as_ref().map(|_| std::time::Instant::now());
-        let result = self
-            .generator
-            .next()
-            .transpose()
-            .map(|token| token.map(|token| token.token_id()));
-        let token = match result {
-            Ok(token) => token,
+    fn advance(&mut self) -> Result<SourceAdvancement, Self::Error> {
+        let started = std::time::Instant::now();
+        let result = self.generator.advance_operation();
+        let advance = match result {
+            Ok(advance) => advance,
             Err(error) => {
-                if self.capture_enabled {
-                    if let (Some(callback), Ok(Some(capture))) =
-                        (&mut self.on_token, self.generator.take_captured_step())
-                    {
-                        callback(
-                            GenerationStepKind::Failed,
-                            Some(capture),
-                            started.unwrap().elapsed().as_secs_f64(),
-                        );
-                    }
+                if let (Some(callback), Ok(Some(capture))) =
+                    (&mut self.on_token, self.generator.take_captured_step())
+                {
+                    callback(
+                        GenerationStepKind::Failed,
+                        Some(capture),
+                        started.elapsed().as_secs_f64(),
+                    );
                 }
                 return Err(error);
             }
         };
-        if token.is_some() && self.time_to_first_token.is_none() {
-            self.time_to_first_token = Some(self.generation_started.elapsed());
-        }
-        // Readiness agreement requires a completed native boundary even when
-        // this run has no capture plan. Empty capture draining allocates none.
         let capture = self
             .generator
             .take_captured_step()
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
-        if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
-            callback(
-                GenerationStepKind::Token(token),
-                capture,
-                started.unwrap().elapsed().as_secs_f64(),
-            );
+        let (outcome, record) = match advance {
+            None => return Ok(SourceAdvancement::Finished),
+            Some(eredu_core::TextAdvancement::Progress(progress)) => (
+                SourceAdvancement::Progress,
+                GenerationStepKind::Progress {
+                    progress,
+                    position: self.generator.position(),
+                },
+            ),
+            Some(eredu_core::TextAdvancement::Token(token)) => {
+                if self.time_to_first_token.is_none() {
+                    self.time_to_first_token = Some(self.generation_started.elapsed());
+                }
+                (
+                    SourceAdvancement::Token(token.token_id()),
+                    GenerationStepKind::Token {
+                        token: token.token_id(),
+                        score_kind: token.score_kind(),
+                        position: token.position(),
+                    },
+                )
+            }
+        };
+        if let Some(callback) = &mut self.on_token {
+            callback(record, capture, started.elapsed().as_secs_f64());
         }
-        Ok(token)
+        Ok(outcome)
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {

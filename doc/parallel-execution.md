@@ -34,6 +34,7 @@ quantization, and residency request must still pass `inspect_model`.
 | GPT-OSS | TP, PP, EP | all pure, pairwise, and triple-axis combinations | native MXFP4 SafeTensors and type-39 GGUF |
 | Gemma 4 dense | TP, PP | TP, PP, TP+PP | SafeTensors and text-plus-projector GGUF |
 | Gemma 4 MoE | TP, PP, EP | all pure, pairwise, and triple-axis combinations | media towers and typed multimodal ingress included |
+| DiffusionGemma dense / MoE | TP, PP; EP for MoE | TP, PP, TP+PP; all expert-axis combinations for MoE | shared context/refinement parameters, local authoritative KV, individual vision-layer cuts; [neutral conformance and native validation limits](diffusion-gemma-validation.md) |
 | DeepSeek-V3 / R1 | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and DeepSeek2 GGUF |
 | DeepSeek-V4 | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and `deepseek4` GGUF; SafeTensors embedded MTP/DSpark and compressed prompt state included; base GGUF target only |
 | Kimi Linear | TP, PP, EP | all pure, pairwise, and triple-axis combinations | SafeTensors and `kimi-linear` GGUF |

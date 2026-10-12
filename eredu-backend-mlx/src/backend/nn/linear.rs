@@ -72,6 +72,61 @@ pub(crate) enum PhysicalEmbedding {
 }
 
 impl PhysicalEmbedding {
+    /// Weighted row access without retaining a fully dequantized packed table.
+    pub(crate) fn weighted_sum(
+        &mut self,
+        coefficients: &Array,
+        vocabulary: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if coefficients.ndim() == 0 || coefficients.dim(-1) != vocabulary || vocabulary <= 0 {
+            return Err(Exception::custom(
+                "weighted embedding requires a complete vocabulary axis",
+            ));
+        }
+        if let Self::Dense(embedding) = self {
+            return matmul(
+                coefficients.as_dtype(embedding.weight.dtype(), stream)?,
+                embedding.weight.as_ref(),
+                stream,
+            );
+        }
+        use safemlx::ops::indexing::TryIndexOp;
+        let shape = coefficients.shape();
+        let flat = coefficients.reshape(&[-1, vocabulary], stream)?;
+        let mut result: Option<Array> = None;
+        let mut output_dtype = None;
+        for start in (0..vocabulary).step_by(512) {
+            let end = (start + 512).min(vocabulary);
+            let ids = Array::arange::<i32, i32>(Some(start), end, None, stream)?;
+            let rows = self.forward(&ids, stream)?;
+            output_dtype = Some(rows.dtype());
+            // Round coefficients to table arithmetic once, then accumulate
+            // across blocks in FP32. Rounding each block's output changes the
+            // embedding with the chosen residency granularity.
+            let weights = flat
+                .try_index_device((.., start..end), stream)?
+                .as_dtype(rows.dtype(), stream)?
+                .as_dtype(Dtype::Float32, stream)?;
+            let contribution = matmul(weights, rows.as_dtype(Dtype::Float32, stream)?, stream)?;
+            let value = match result {
+                Some(previous) => previous.add(contribution, stream)?,
+                None => contribution,
+            };
+            // Completion bounds decoded rows and the accumulation graph to one
+            // block. The resulting embedding remains a native tensor.
+            safemlx::transforms::eval([&value])?;
+            result = Some(value);
+        }
+        let value = result
+            .ok_or_else(|| Exception::custom("weighted embedding has an empty vocabulary"))?;
+        let mut output_shape = shape.to_vec();
+        *output_shape.last_mut().unwrap() = value.dim(-1);
+        value
+            .as_dtype(output_dtype.unwrap(), stream)?
+            .reshape(&output_shape, stream)
+    }
+
     pub(crate) fn as_linear(&self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
         match self {
             Self::Dense(embedding) => embedding.as_linear(input, stream),
@@ -450,27 +505,7 @@ impl PhysicalLinear {
         Ok(output)
     }
 
-    /// Applies a row-sharded projection, reducing partials before adding its
-    /// optional replicated output bias exactly once.
-    pub fn forward_row_parallel(
-        &mut self,
-        input: &Array,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.forward_row_parallel_with_input_observer(input, group, stream, None)
-    }
-
-    pub(crate) fn forward_row_parallel_with_input_observer(
-        &mut self,
-        input: &Array,
-        group: &crate::backend::runtime::distributed::Group,
-        stream: &Stream,
-        observer: Option<&mut dyn NativeProjectionInputObserver>,
-    ) -> Result<Array, Exception> {
-        self.forward_row_parallel_with_compute(input, group, stream, observer, None)
-    }
-
+    /// Reduces row-sharded partials before adding a replicated output bias once.
     pub(crate) fn forward_row_parallel_with_compute(
         &mut self,
         input: &Array,

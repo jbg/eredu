@@ -9,7 +9,7 @@ use eredu_nn::{
 };
 use serde::Deserialize;
 
-use super::vision::ClippedLinear;
+use super::vision::MediaLinear;
 
 /// Invalid Gemma audio configuration.
 #[derive(Debug, thiserror::Error)]
@@ -307,8 +307,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleProjection<
 #[parameterized(tensor = "B::Tensor")]
 struct AudioFeedForward<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pre_norm: B::Normalization,
-    first: ClippedLinear<B>,
-    second: ClippedLinear<B>,
+    first: MediaLinear<B>,
+    second: MediaLinear<B>,
     post_norm: B::Normalization,
     #[parameter(skip)]
     residual_weight: f32,
@@ -363,10 +363,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioFeedForward<B> 
 #[parameterized(tensor = "B::Tensor")]
 struct LightConv1d<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pre_norm: B::Normalization,
-    linear_start: ClippedLinear<B>,
+    linear_start: MediaLinear<B>,
     depthwise_weight: Parameter<B::Tensor>,
     conv_norm: B::Normalization,
-    linear_end: ClippedLinear<B>,
+    linear_end: MediaLinear<B>,
     #[parameter(skip)]
     kernel_size: i32,
     #[parameter(skip)]
@@ -450,10 +450,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LightConv1d<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 struct AudioAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    query: ClippedLinear<B>,
-    key: ClippedLinear<B>,
-    value: ClippedLinear<B>,
-    output: ClippedLinear<B>,
+    query: MediaLinear<B>,
+    key: MediaLinear<B>,
+    value: MediaLinear<B>,
+    output: MediaLinear<B>,
     relative_key: B::Linear,
     per_dimension_scale: Parameter<B::Tensor>,
     #[parameter(skip)]
@@ -933,12 +933,13 @@ fn clipped<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     input: i32,
     output: i32,
     context: &<B::Tensor as Tensor>::Context,
-) -> Result<ClippedLinear<B>, Error> {
-    ClippedLinear::from_format(
+) -> Result<MediaLinear<B>, Error> {
+    MediaLinear::from_format(
         prefix,
         input,
         output,
         config.linear_format_for(&format!("{prefix}.linear.weight"), input),
+        true,
         context,
     )
 }

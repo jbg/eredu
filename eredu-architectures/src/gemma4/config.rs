@@ -94,6 +94,22 @@ impl LayerPolicy {
 /// Normalized Gemma 4 decoder configuration.
 #[derive(Debug, Clone)]
 pub struct ModelArgs {
+    /// Keep learned normalization products in FP32 until the final cast.
+    pub float32_normalization: bool,
+    /// Select tanh-approximated rather than exact GELU in dense branches.
+    pub approximate_gelu: bool,
+    /// Explicit attention score rounding boundaries.
+    pub attention_arithmetic: eredu_nn::AttentionArithmetic,
+    /// Weighted expert accumulation and rounding order.
+    pub expert_reduction: eredu_nn::GroupReduction,
+    /// Router projection, score and coefficient precision boundaries.
+    pub routing_arithmetic: eredu_nn::RoutingArithmetic,
+    /// Rotary multiplication and addition rounding boundaries.
+    pub rotary_arithmetic: eredu_nn::RotaryArithmetic,
+    /// Router score transform before expert selection.
+    pub routing_scoring: eredu_nn::GroupScoring,
+    /// Normalize the selected scores after gathering.
+    pub normalize_selected_routes: bool,
     /// Exact model identity (`gemma4` or `gemma4_unified`).
     pub model_type: String,
     /// Decoder hidden width.
@@ -141,6 +157,58 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
+    pub(crate) fn diffusion_geometry(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let mut source: ModelArgsSource = serde_json::from_slice(bytes)?;
+        if source.model_type != "diffusion_gemma_text" {
+            return Err(invalid(
+                "DiffusionGemma requires diffusion_gemma_text geometry",
+            ));
+        }
+        if source.num_kv_shared_layers != 0 || source.hidden_size_per_layer_input != 0 {
+            return Err(invalid(
+                "DiffusionGemma has independent layer KV and no per-layer input embeddings",
+            ));
+        }
+        source.enable_moe_block = source.num_experts.is_some();
+        source.attention_k_eq_v = true;
+        let mut args = normalize_geometry(source)?;
+        args.apply_diffusion_equations();
+        Ok(args)
+    }
+
+    pub(crate) fn apply_diffusion_equations(&mut self) {
+        self.float32_normalization = true;
+        self.approximate_gelu = true;
+        self.attention_arithmetic = eredu_nn::AttentionArithmetic::InputScores;
+        self.expert_reduction = eredu_nn::GroupReduction::SequentialGroupOrder;
+        self.routing_arithmetic = eredu_nn::RoutingArithmetic {
+            projection: eredu_nn::RoutingPrecision::Preserve,
+            scores: eredu_nn::RoutingPrecision::Float32,
+            coefficients: eredu_nn::RoutingPrecision::Float32,
+        };
+        self.rotary_arithmetic = eredu_nn::RotaryArithmetic::InputProducts;
+        self.routing_scoring = eredu_nn::GroupScoring::Softmax;
+        self.normalize_selected_routes = true;
+    }
+
+    pub(crate) fn normalization(
+        &self,
+        dimensions: i32,
+        weight: eredu_nn::ParameterSpec,
+    ) -> eredu_nn::NormalizationConstructionSpec {
+        let mut spec = eredu_nn::NormalizationConstructionSpec::learned(
+            dimensions,
+            self.rms_norm_eps,
+            weight.clone(),
+        );
+        if self.float32_normalization {
+            spec.scale = eredu_nn::NormalizationScale::LearnedOffset {
+                weight,
+                offset: 0.0,
+            };
+        }
+        spec
+    }
     /// Parses and validates a Hugging Face text configuration document.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
         normalize(serde_json::from_slice(bytes)?)
@@ -346,6 +414,26 @@ impl ModelArgs {
             "gemma4",
             [
                 ("model_type", self.model_type.clone()),
+                (
+                    "float32_normalization",
+                    self.float32_normalization.to_string(),
+                ),
+                ("approximate_gelu", self.approximate_gelu.to_string()),
+                (
+                    "attention_arithmetic",
+                    format!("{:?}", self.attention_arithmetic),
+                ),
+                ("expert_reduction", format!("{:?}", self.expert_reduction)),
+                (
+                    "routing_arithmetic",
+                    format!("{:?}", self.routing_arithmetic),
+                ),
+                ("rotary_arithmetic", format!("{:?}", self.rotary_arithmetic)),
+                ("routing_scoring", format!("{:?}", self.routing_scoring)),
+                (
+                    "normalize_selected_routes",
+                    self.normalize_selected_routes.to_string(),
+                ),
                 ("hidden_size", self.hidden_size.to_string()),
                 ("num_hidden_layers", self.num_hidden_layers().to_string()),
                 ("num_attention_heads", self.num_attention_heads.to_string()),
@@ -505,6 +593,10 @@ fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
             source.model_type
         )));
     }
+    normalize_geometry(source)
+}
+
+fn normalize_geometry(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
     let layers = usize::try_from(source.num_hidden_layers)
         .ok()
         .filter(|layers| *layers > 0)
@@ -613,6 +705,16 @@ fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
         }
     }
     Ok(ModelArgs {
+        float32_normalization: false,
+        approximate_gelu: false,
+        attention_arithmetic: eredu_nn::AttentionArithmetic::Fused,
+        expert_reduction: eredu_nn::GroupReduction::Sum,
+        routing_arithmetic: eredu_nn::RoutingArithmetic::uniform(
+            eredu_nn::RoutingPrecision::Preserve,
+        ),
+        rotary_arithmetic: eredu_nn::RotaryArithmetic::Native,
+        routing_scoring: eredu_nn::GroupScoring::SelectedSoftmax,
+        normalize_selected_routes: false,
         model_type: source.model_type,
         hidden_size: source.hidden_size,
         num_attention_heads: source.num_attention_heads,

@@ -53,7 +53,7 @@ pub use projector::{
 };
 pub use text::{Attention, AttentionInput, BlockInput, DenseBlock, SharedAttentionStates};
 pub use vision::{
-    ClippedLinear, PatchEmbedder, VisionConfig, VisionConfigError, VisionInput, VisionLayer,
+    MediaLinear, PatchEmbedder, VisionConfig, VisionConfigError, VisionInput, VisionLayer,
     VisionState, VisionStatic, VisionTower,
 };
 

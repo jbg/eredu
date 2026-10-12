@@ -205,24 +205,46 @@ impl TextGenerationBackend for Host {
     fn prepare_text_prompt(_: &Self, ids: Vec<u32>) -> io::Result<Vec<u32>> {
         Ok(ids)
     }
-    fn submit_text_prefill(
+    fn submit_text_operation(
         runtime: &mut ModelRuntime<Self>,
-        prompt: Vec<u32>,
-        filter: &TokenFilter,
-        state: &mut Generation,
-    ) -> io::Result<Submission<Token, Done>> {
-        let submitted = runtime.prefill(prompt)?;
-        sample(submitted.output, state, filter)
+        input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<
+        Submission<
+            eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
+            Self::TextCompletion,
+        >,
+        eredu_core::TextOperationError<Self::Error>,
+    > {
+        let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
+        let filter = decision.filter();
+        if matches!(&input, eredu_core::PendingTextInput::Continue) {
+            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
+        }
+        let submission =
+            || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                match input {
+                    eredu_core::PendingTextInput::Prefill(prompt) => {
+                        let submitted = runtime.prefill(prompt)?;
+                        sample(submitted.output, state, filter)
+                    }
+                    eredu_core::PendingTextInput::Decode(token) => {
+                        let submitted = runtime.decode(token)?;
+                        sample(submitted.output, state, filter)
+                    }
+                    eredu_core::PendingTextInput::Continue => {
+                        unreachable!("continuation is rejected before causal submission")
+                    }
+                }
+            };
+        let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
+        Ok(Submission {
+            output: eredu_core::TextOperationOutput::Token(submission.output),
+            completion: submission.completion,
+        })
     }
-    fn submit_text_decode(
-        runtime: &mut ModelRuntime<Self>,
-        token: Token,
-        filter: &TokenFilter,
-        state: &mut Generation,
-    ) -> io::Result<Submission<Token, Done>> {
-        let submitted = runtime.decode(token)?;
-        sample(submitted.output, state, filter)
-    }
+
     fn capture_discovery(_: &ModelRuntime<Self>) -> Result<CaptureDiscovery, CaptureError> {
         Ok(discovery())
     }
@@ -331,6 +353,8 @@ impl NativeTextStateBackend for Host {
 impl TextSnapshotBackend for Host {
     type SamplingState = Sampling;
     fn continuation_input_tokens(
+        _: &ModelRuntime<Self>,
+        _: &Self::SamplingState,
         input: Option<PendingTextInput<&Vec<u32>, &Token>>,
         predictions: u64,
     ) -> Option<u64> {

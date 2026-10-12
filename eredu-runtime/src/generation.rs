@@ -8,6 +8,8 @@ use eredu_core::{
 use eredu_nn::Tensor;
 
 mod memory;
+/// Iterative block sampling, independent of retained model context.
+pub mod refinement;
 pub use memory::sampling_invocation;
 
 /// Monomorphized causal model used by generation sessions.

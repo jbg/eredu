@@ -1008,6 +1008,22 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
     Ok(finish(args.model_type.clone(), gpt_oss_spec(args)?))
 }
 
+/// Derives shared-context state and input geometry for block refinement.
+/// Causal speculative verification requires conditional target probabilities;
+/// refinement position scores do not provide that distribution.
+pub fn diffusion_gemma(
+    args: &crate::diffusion_gemma::FamilyConfig,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    let mut spec = gemma4_spec(&args.text, args.input_modalities())?;
+    spec.4 = state_memory_layout(
+        crate::diffusion_gemma::state_layout(args),
+        args.text.hidden_size,
+        256,
+        EstimationCompleteness::Complete,
+    )?;
+    Ok(finish("diffusion_gemma_text".into(), spec))
+}
+
 /// Derives Gemma 4 capabilities from its complete normalized family policy.
 pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(with_speculative_draft_source(
@@ -1206,6 +1222,28 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::num::NonZeroU8;
+
+    #[test]
+    fn diffusion_context_forecast_retains_both_authoritative_cache_planes() {
+        let args = crate::diffusion_gemma::FamilyConfig::from_hf_json(include_bytes!(
+            "../tests/fixtures/diffusion_gemma/config.json"
+        ))
+        .unwrap();
+        let selected = diffusion_gemma(&args).unwrap();
+        let state = eredu_core::estimate_runtime_state(
+            selected.state_layout(),
+            eredu_core::InputTokenCount::text(3),
+            4,
+            1,
+            NonZeroU8::new(4).unwrap(),
+        )
+        .unwrap();
+        // The published stack has 25 local 8×256 and five full 2×512 histories.
+        // Both K and V remain authoritative for read-only canvas attention.
+        assert_eq!(state.bytes_per_position_per_batch, 40_960);
+        // Full histories allocate 256 positions; window histories retain seven.
+        assert_eq!(state.requested_state_bytes, 13_352_960);
+    }
 
     #[test]
     fn selected_partition_memory_uses_only_owned_layers_and_heads() {

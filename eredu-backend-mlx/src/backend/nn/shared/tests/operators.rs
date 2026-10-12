@@ -1539,3 +1539,201 @@ fn mlx_selective_scan_chunk_boundaries_preserve_outputs_and_cached_state() {
         close(&cached.state, &[0.78937973], 1e-6);
     }
 }
+
+#[test]
+fn weighted_embedding_matches_decoded_rows_for_dense_and_packed_tables() {
+    let execution = crate::backend::ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let export = |tensor: &MlxTensor| {
+        tensor
+            .as_array()
+            .clone()
+            .into_evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap()
+    };
+    let vocabulary = 517i32;
+    let width = 32i32;
+    let weights: Vec<_> = (0..vocabulary * width)
+        .map(|i| ((i % 37) as f32 - 18.0) * 0.03125)
+        .collect();
+    let coefficients: Vec<_> = (0..2 * vocabulary)
+        .map(|i| ((i % 13) + 1) as f32 / 4096.0)
+        .collect();
+    let input = MlxTensor::from_array(Array::from_slice(&coefficients, &[1, 2, vocabulary]));
+    for format in supported_embedding_formats() {
+        let mut table = embedding("table.weight", vocabulary, width, format, &weights, stream);
+        let ids = MlxTensor::from_array(
+            Array::arange::<i32, i32>(None, vocabulary, None, stream).unwrap(),
+        );
+        let decoded = table.forward(&ids, stream).unwrap();
+        let decoded = export(&decoded);
+        let expected: Vec<_> = coefficients
+            .chunks_exact(vocabulary as usize)
+            .flat_map(|row| {
+                let decoded = &decoded;
+                (0..width as usize).map(move |d| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(v, p)| p * decoded[v * width as usize + d])
+                        .sum::<f32>()
+                })
+            })
+            .collect();
+        let actual = export(&table.weighted_sum(&input, stream).unwrap());
+        for (a, e) in actual.into_iter().zip(expected) {
+            assert!((a - e).abs() < 2e-5, "weighted embedding {a} != {e}");
+        }
+    }
+}
+
+#[test]
+fn reduced_precision_weightless_norm_and_gelu_match_scalar_equations() {
+    fn bf16(value: f32) -> f32 {
+        let bits = value.to_bits();
+        f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+    }
+    let execution = crate::backend::ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let values: Vec<_> = [0.3f32, -0.7, 1.1, 0.2].into_iter().map(bf16).collect();
+    let input = Array::from_slice(&values, &[1, 4])
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+    let result = super::super::normalization::weightless_rms(&input, 1e-6, stream).unwrap();
+    assert_eq!(result.dtype(), Dtype::Bfloat16);
+    let result = result
+        .as_dtype(Dtype::Float32, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .try_to_vec::<f32>()
+        .unwrap();
+    let rms = (values.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / 4.0 + 1e-6).sqrt();
+    let expected: Vec<_> = values
+        .iter()
+        .map(|v| bf16((f64::from(*v) / rms) as f32))
+        .collect();
+    assert_eq!(result, expected);
+    let values = [-3.0f32, -1.75, -0.25, 0.5, 1.5, 4.0];
+    let input = Array::from_slice(&values, &[6])
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+    let result = super::super::layers::gelu_approximate(&input, stream).unwrap();
+    assert_eq!(result.dtype(), Dtype::Bfloat16);
+    let result = result
+        .as_dtype(Dtype::Float32, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .try_to_vec::<f32>()
+        .unwrap();
+    let expected: Vec<_> = values
+        .into_iter()
+        .map(|x| {
+            let x = f64::from(x);
+            bf16(
+                (0.5 * x
+                    * (1.0
+                        + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x))
+                            .tanh())) as f32,
+            )
+        })
+        .collect();
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn weighted_embedding_sums_uneven_vocabulary_ownership() {
+    use eredu_nn::VocabularyParallelRange;
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let (vocabulary, width) = (7i32, 3i32);
+    let weights: Vec<_> = (0..vocabulary * width)
+        .map(|i| (i as f32 - 9.0) * 0.0625)
+        .collect();
+    let coefficients: Vec<_> = (0..2 * vocabulary)
+        .map(|i| (i as f32 + 1.0) * 0.03125)
+        .collect();
+    let input = MlxTensor::from_array(Array::from_slice(&coefficients, &[1, 2, vocabulary]));
+    let mut total = vec![0.0f32; 2 * width as usize];
+    for local in [0usize..2, 2..7] {
+        let mut table = embedding(
+            "table.weight",
+            local.len() as i32,
+            width,
+            None,
+            &weights[local.start * width as usize..local.end * width as usize],
+            stream,
+        );
+        table.vocabulary = vocabulary;
+        table.vocabulary_range = Some(VocabularyParallelRange {
+            global_vocabulary: vocabulary as usize,
+            local,
+        });
+        let contribution = table
+            .weighted_sum(&input, stream)
+            .unwrap()
+            .as_array()
+            .clone()
+            .into_evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap();
+        for (sum, value) in total.iter_mut().zip(contribution) {
+            *sum += value;
+        }
+    }
+    let expected: Vec<_> = coefficients
+        .chunks_exact(vocabulary as usize)
+        .flat_map(|row| {
+            let weights = &weights;
+            (0..width as usize).map(move |d| {
+                row.iter()
+                    .enumerate()
+                    .map(|(v, p)| p * weights[v * width as usize + d])
+                    .sum::<f32>()
+            })
+        })
+        .collect();
+    assert_eq!(total, expected);
+}
+
+#[test]
+fn reduced_precision_gelu_preserves_vector_reference_tail_saturation() {
+    // PyTorch 2.14.1 CPU BF16, approximate="tanh", vector-sized input.
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let values = [
+        -4.96875f32,
+        -5.0,
+        -5.03125,
+        -5.0625,
+        -5.09375,
+        5.0625,
+        5.09375,
+    ];
+    let input = Array::from_slice(&values, &[7])
+        .as_dtype(Dtype::Bfloat16, stream)
+        .unwrap();
+    let result = super::super::layers::gelu_approximate(&input, stream)
+        .unwrap()
+        .as_dtype(Dtype::Float32, stream)
+        .unwrap()
+        .into_evaluated()
+        .unwrap()
+        .try_to_vec::<f32>()
+        .unwrap();
+    assert_eq!(
+        result,
+        [
+            -2.9616058e-7,
+            -2.9802322e-7,
+            -1.4994293e-7,
+            -0.0,
+            -0.0,
+            5.0625,
+            5.09375
+        ]
+    );
+}

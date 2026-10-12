@@ -153,6 +153,16 @@ pub enum PreparedInputPartPlan {
     },
 }
 
+impl PreparedInputPartPlan {
+    /// Exact decoder positions after architecture-owned media preparation.
+    pub const fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::Text { positions } | Self::Projected { positions, .. } => *positions,
+            Self::Media { shape } => shape.decoder_positions,
+        }
+    }
+}
+
 /// Architecture-derived geometry and conservative execution workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaShapePlan {
@@ -2844,7 +2854,9 @@ mod tests {
             position_embedding_size: 4,
             rms_norm_eps: 1e-5,
             hidden_activation: "gelu_pytorch_tanh".into(),
+            input_score_arithmetic: false,
             standardize: false,
+            use_clipped_linears: true,
             rope_parameters: None,
             weight_quantization: None,
             quantized_weights: None,

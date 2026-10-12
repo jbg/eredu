@@ -1,6 +1,7 @@
 use super::*;
 
 mod admission_failures;
+mod diffusion_gemma;
 mod execution;
 mod qwen4_exp;
 mod qwen4_exp_media;

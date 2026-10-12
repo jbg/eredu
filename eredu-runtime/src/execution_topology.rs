@@ -116,6 +116,11 @@ pub enum TokenMixerTopology {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FeedForwardTopology {
+    /// Independent branches whose hidden-width outputs are added.
+    Additive {
+        /// Branch equations in invocation order.
+        branches: Vec<FeedForwardTopology>,
+    },
     /// Split or fused gated product followed by an output projection.
     Gated {
         /// Width of the gated intermediate.
@@ -144,6 +149,34 @@ pub enum FeedForwardTopology {
 }
 
 impl FeedForwardTopology {
+    /// Visits leaf mechanisms in invocation order, preserving additive storage.
+    pub fn components(&self) -> Vec<&Self> {
+        match self {
+            Self::Additive { branches } => branches.iter().flat_map(Self::components).collect(),
+            _ => vec![self],
+        }
+    }
+
+    /// Applies selected materialization facts to every projection owner.
+    pub fn visit_projections_mut(&mut self, visitor: &mut impl FnMut(&mut ProjectionTopology)) {
+        match self {
+            Self::Additive { branches } => {
+                for branch in branches {
+                    branch.visit_projections_mut(visitor);
+                }
+            }
+            Self::Gated { projections, .. } => projections.iter_mut().for_each(visitor),
+            Self::Routed {
+                router,
+                projections,
+                ..
+            } => {
+                visitor(router);
+                projections.iter_mut().for_each(visitor);
+            }
+            Self::Unknown { .. } => {}
+        }
+    }
     /// Derives invocation geometry from the exact selector and expert construction specs.
     pub fn from_grouped_specs(
         selector: &eredu_nn::TopKGroupSelectorSpec,
@@ -153,11 +186,6 @@ impl FeedForwardTopology {
         selector.validate()?;
         if selector.selection().group_count() != bank.group_count() {
             return Err(Error::backend("selector and bank group counts disagree"));
-        }
-        if selector.input_transform().is_some() || selector.coefficient_scale().is_some() {
-            return Ok(Self::Unknown {
-                reason: "selector input transformation or learned coefficient module has no invocation topology".into(),
-            });
         }
         let eredu_nn::GatedProductGroupLayout::Packed { gate_up, down } = bank.layout() else {
             return Ok(Self::Unknown { reason: "independently materialized grouped parameters need invocation and reduction topology".into() });
@@ -223,9 +251,25 @@ pub struct TextLayerTopology {
     pub normalization_count: u64,
 }
 
+/// Whole-canvas operations retained alongside an ordinary shared text stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IterativeWorkspaceTopology {
+    /// Canvas rows evaluated together, independently of committed output count.
+    pub query_rows: u64,
+    /// Feedback projections applied before the residual stack.
+    pub conditioning: Vec<ProjectionTopology>,
+    /// Gated intermediate width of the feedback module.
+    pub intermediate_size: u64,
+    /// Calibrated simultaneous full-vocabulary FP32 score-buffer allowance.
+    pub score_buffer_copies: u64,
+}
+
 /// Ordinary construction topology for one target or prediction execution stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextExecutionTopology {
+    /// Optional whole-canvas feedback and sampling geometry.
+    #[serde(default)]
+    pub iterative: Option<IterativeWorkspaceTopology>,
     /// Residual stream width.
     pub hidden_size: u64,
     /// Output vocabulary width.
@@ -268,6 +312,28 @@ pub struct TextExecutionTopology {
 
 fn one_output_invocation() -> u64 {
     1
+}
+
+impl TextExecutionTopology {
+    /// Visits every projection, including feedback and additive feed-forward branches.
+    pub fn visit_projections_mut(&mut self, mut visit: impl FnMut(&mut ProjectionTopology)) {
+        visit(&mut self.output);
+        if let Some(iteration) = &mut self.iterative {
+            iteration.conditioning.iter_mut().for_each(&mut visit);
+        }
+        for layer in &mut self.layers {
+            layer.input_projections.iter_mut().for_each(&mut visit);
+            match &mut layer.mixer {
+                TokenMixerTopology::Attention { projections, .. }
+                | TokenMixerTopology::GatedDelta { projections, .. }
+                | TokenMixerTopology::GatedConvolution { projections, .. } => {
+                    projections.iter_mut().for_each(&mut visit);
+                }
+                TokenMixerTopology::Unknown { .. } => {}
+            }
+            layer.feed_forward.visit_projections_mut(&mut visit);
+        }
+    }
 }
 
 // Checkpoint formats deliberately have no frontend serde dependency. Preserve the

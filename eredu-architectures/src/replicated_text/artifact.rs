@@ -128,8 +128,29 @@ pub(super) fn normalize(
                         .map_or(architecture.tensor_mapping(), |projector| {
                             projector.primary_tensor_mapping()
                         });
+                    let metadata_sources = architecture
+                        .checkpoint()
+                        .common_tensors
+                        .iter()
+                        .chain(
+                            architecture
+                                .checkpoint()
+                                .layout_groups
+                                .iter()
+                                .flat_map(|group| &group.variants)
+                                .flat_map(|variant| &variant.tensors),
+                        )
+                        .filter(|tensor| {
+                            tensor.role == eredu_checkpoint::schema::TensorRole::ArtifactMetadata
+                        })
+                        .flat_map(|tensor| {
+                            std::iter::once(tensor.key.as_str())
+                                .chain(tensor.aliases.iter().map(String::as_str))
+                        })
+                        .collect::<BTreeSet<_>>();
                     let mut parameters = gguf_parameters(
                         primary_mapping,
+                        &metadata_sources,
                         checkpoint,
                         &config,
                         recipe_source.as_ref(),
@@ -150,6 +171,7 @@ pub(super) fn normalize(
                         parameters.extend(
                             gguf_parameters(
                                 projector_plan.tensor_mapping(),
+                                &BTreeSet::new(),
                                 companion.checkpoint(),
                                 &config,
                                 recipe_source.as_ref(),
@@ -519,6 +541,9 @@ pub(super) fn safetensors_parameters(
         .collect::<BTreeMap<_, _>>();
     let mut parameters = Vec::new();
     for constraint in constraints {
+        if constraint.role == eredu_checkpoint::schema::TensorRole::ArtifactMetadata {
+            continue;
+        }
         let canonical = config.canonical_parameter_name(&constraint.key, &constraint.aliases);
         let source = std::iter::once(&constraint.key)
             .chain(constraint.aliases.iter())
@@ -664,6 +689,7 @@ pub(super) fn safetensors_parameters(
 
 pub(super) fn gguf_parameters(
     tensor_mapping: &[eredu_gguf::TranslatedTensorLayout],
+    metadata_sources: &BTreeSet<&str>,
     checkpoint: &eredu_gguf::Checkpoint,
     config: &EligibleConfig<'_>,
     source_catalog: &(impl eredu_checkpoint::recipe::ArtifactCatalog + ?Sized),
@@ -688,6 +714,9 @@ pub(super) fn gguf_parameters(
     }
     let mut parameters = Vec::new();
     for mapping in tensor_mapping {
+        if metadata_sources.contains(mapping.physical_name.as_str()) {
+            continue;
+        }
         let Some((tensor, source_encoding)) = physical.get(mapping.physical_name.as_str()) else {
             return Err(ReplicatedTextRequirementsError::InvalidArtifact(format!(
                 "admitted GGUF mapping references absent tensor {:?}",

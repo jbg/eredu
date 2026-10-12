@@ -915,6 +915,7 @@ fn generic_topology() -> crate::execution_topology::TextExecutionTopology {
         normalization_count: 2,
     };
     TextExecutionTopology {
+        iterative: None,
         hidden_size: 32,
         vocabulary_size: 128,
         layers: vec![layer.clone(), layer],
@@ -1525,4 +1526,39 @@ fn recurrent_workspace_retains_known_output_and_unknown_scan_tail() {
     assert!(workspace.lower_bytes >= 8 * 16 * 128 * 4);
     assert_eq!(workspace.upper_bytes, None);
     assert_ne!(report.domains[0].fit, MemoryFit::LikelyFit);
+}
+
+#[test]
+fn iterative_forecast_includes_whole_canvas_after_zero_cache_growth() {
+    use crate::{
+        execution_topology::IterativeWorkspaceTopology,
+        memory_forecast::{estimate_continuation_memory, ContinuationMemoryPlan},
+    };
+    let mut request = request();
+    request.input = eredu_core::InputTokenCount::text(3);
+    request.max_output_tokens = Some(1);
+    request.forecast_output_tokens = 1;
+    let mut topology = generic_topology();
+    topology.iterative = Some(IterativeWorkspaceTopology {
+        query_rows: 16,
+        conditioning: Vec::new(),
+        intermediate_size: 64,
+        score_buffer_copies: 8,
+    });
+    request.domains[0].executions[0].execution_topology = Some(topology);
+    let plan = ContinuationMemoryPlan {
+        current_positions: 3,
+        additional_input_tokens: 0,
+        query_tokens: 16,
+        current_state: MemoryBytes::estimated(0, 1_000_000, "fixture cache capacity"),
+        peak_state: MemoryBytes::estimated(0, 1_000_000, "fixture cache capacity"),
+    };
+    let forecast = estimate_continuation_memory(&request, &plan).unwrap();
+    assert_eq!(forecast.requested_positions, 3);
+    let phases = &forecast.domains[0].phases;
+    assert_eq!(phases.len(), 2);
+    assert_eq!(phases[0].workspace, MemoryBytes::exact(0));
+    // A one-token output horizon still retains scores for all sixteen positions.
+    assert!(phases[1].workspace.upper_bytes.unwrap() >= 16 * 128 * 4 * 8);
+    assert!(phases[1].workspace.lower_bytes >= 16 * 128 * 4);
 }

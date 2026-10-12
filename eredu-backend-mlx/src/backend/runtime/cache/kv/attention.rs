@@ -34,6 +34,7 @@ pub struct BlockwiseAttentionAccumulator {
     arithmetic: eredu_nn::AttentionArithmetic,
     value_pass: bool,
     causal: bool,
+    retained_start: Option<i64>,
     explicit_mask: Option<Array>,
     query_start: i64,
     sliding_window: Option<i32>,
@@ -86,6 +87,7 @@ impl BlockwiseAttentionAccumulator {
             arithmetic: eredu_nn::AttentionArithmetic::Fused,
             value_pass: false,
             causal: true,
+            retained_start: None,
             explicit_mask: explicit_mask
                 .map(|mask| {
                     broadcast_to(mask, &[batch, query_heads, query_len, mask.dim(-1)], stream)
@@ -147,6 +149,14 @@ impl BlockwiseAttentionAccumulator {
         Ok(())
     }
 
+    /// Reads the logically retained suffix and any permanent prefix without
+    /// extending the sliding window across an uncommitted query span.
+    pub fn use_retained_context(&mut self, start: i64) -> Result<(), Exception> {
+        self.use_explicit_mask_only()?;
+        self.retained_start = Some(start);
+        Ok(())
+    }
+
     /// Retains the global softmax normalization and starts a second bounded
     /// scan, rounding normalized probabilities before their value products.
     pub fn begin_value_pass(&mut self) -> Result<(), Exception> {
@@ -185,6 +195,40 @@ impl BlockwiseAttentionAccumulator {
     }
 
     pub fn accumulate_with_bias(
+        &mut self,
+        block: &KeyValueAttentionBlock,
+        additive_bias: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if let Some(start) = self.retained_start {
+            // Physical pages can overlap discarded logical history. Split out
+            // only the permanent prefix and retained suffix before interpreting
+            // the caller's positional mask; transient positions are in suffix.
+            let prefix_end = block.end.min(self.prefix_tokens).min(start);
+            let suffix_start = block.start.max(start);
+            for (begin, end) in [(block.start, prefix_end), (suffix_start, block.end)] {
+                if begin >= end {
+                    continue;
+                }
+                let range = (begin - block.start) as i32..(end - block.start) as i32;
+                let keys = block
+                    .keys
+                    .try_index_device((.., .., range.clone(), ..), stream)?;
+                let values = block
+                    .values
+                    .try_index_device((.., .., range.clone(), ..), stream)?;
+                let bias = additive_bias
+                    .map(|bias| bias.try_index_device((.., .., .., range), stream))
+                    .transpose()?;
+                let part = KeyValueAttentionBlock::unleased(begin, end, keys, values);
+                self.accumulate_visible_with_bias(&part, bias.as_ref(), stream)?;
+            }
+            return Ok(());
+        }
+        self.accumulate_visible_with_bias(block, additive_bias, stream)
+    }
+
+    fn accumulate_visible_with_bias(
         &mut self,
         block: &KeyValueAttentionBlock,
         additive_bias: Option<&Array>,

@@ -2,11 +2,17 @@
 
 mod continuation;
 mod failure;
+mod steps;
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
     TextGenerationContinuation, TextGenerationDriver,
 };
 pub use failure::{BackendFailure, BackendFailureKind};
+use steps::PhysicalTextOutput;
+pub use steps::{
+    TextAdvancement, TextOperationError, TextOperationKind, TextOperationOutput,
+    TextOperationPolicyError, TextProgress,
+};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::Path};
@@ -1391,6 +1397,8 @@ pub struct TextGenerationConfig {
     seed: u64,
     strategy: TextSamplingStrategy,
     prefill: PrefillChunkPolicy,
+    refinement: Option<crate::refinement::RefinementConfig>,
+    draft_events: bool,
 }
 
 /// Bounds the number of prompt tokens processed together when the selected
@@ -1436,6 +1444,8 @@ impl TextGenerationConfig {
             seed: 0,
             strategy: TextSamplingStrategy::Standard,
             prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(512).unwrap()),
+            refinement: None,
+            draft_events: false,
         }
     }
 
@@ -1443,6 +1453,33 @@ impl TextGenerationConfig {
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
+    }
+
+    /// Overrides the iterative architecture's refinement policy. An absent value
+    /// selects its ordinary trained policy; causal execution rejects an override.
+    pub const fn with_refinement_policy(
+        mut self,
+        policy: Option<crate::refinement::RefinementConfig>,
+    ) -> Self {
+        self.refinement = policy;
+        self
+    }
+
+    /// Explicit iterative policy, independently of authoritative token sampling.
+    pub const fn refinement_policy(&self) -> Option<crate::refinement::RefinementConfig> {
+        self.refinement
+    }
+
+    /// Requests tentative IDs for bounded facade observation. Commitments and
+    /// semantic output are independent of this request.
+    pub const fn with_draft_events(mut self, enabled: bool) -> Self {
+        self.draft_events = enabled;
+        self
+    }
+
+    /// Whether tentative block observations are requested.
+    pub const fn draft_events(&self) -> bool {
+        self.draft_events
     }
 
     /// Selects prompt chunking for both ordinary and controlled generation.
@@ -1829,6 +1866,16 @@ pub trait TextGenerationBackend: BackendProvider {
         ))
     }
 
+    /// Exact bounds for independently shaped physical forwards. An absent value
+    /// selects ordinary causal prefill/decode geometry. This reads retained
+    /// executable facts without model work or native allocations.
+    fn text_capture_invocation_bounds(
+        _runtime: &ModelRuntime<Self>,
+        _request: crate::capture::CaptureRequestShape,
+    ) -> Result<Option<crate::capture::CaptureInvocationBounds>, crate::capture::CaptureError> {
+        Ok(None)
+    }
+
     /// Enables an immutable capture plan before the first submission. Implementations
     /// must validate it against this session and reject unsupported combinations.
     fn configure_text_capture(
@@ -1933,42 +1980,42 @@ pub trait TextGenerationBackend: BackendProvider {
         Ok(false)
     }
 
-    /// Submits prompt prefill followed by sampling one token.
-    fn submit_text_prefill(
-        runtime: &mut ModelRuntime<Self>,
-        prompt: Self::Prompt,
-        filter: &TokenFilter,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
-
-    /// Submits cached decode from the preceding token and samples its successor.
-    fn submit_text_decode(
-        runtime: &mut ModelRuntime<Self>,
-        token: Self::Token,
-        filter: &TokenFilter,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error>;
-
-    /// Prefill with optional exact capture provenance. Backends without domain
-    /// observation retain their existing submission behavior.
-    fn submit_text_prefill_decision(
-        runtime: &mut ModelRuntime<Self>,
-        prompt: Self::Prompt,
-        decision: &TokenSamplingDecision<'_>,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-        Self::submit_text_prefill(runtime, prompt, decision.filter(), state)
+    /// Declares the next physical operation without execution or controller queries.
+    fn supports_block_refinement(_runtime: &ModelRuntime<Self>) -> bool {
+        false
     }
 
-    /// Decode with the same pre-override domain contract as prefill.
-    fn submit_text_decode_decision(
-        runtime: &mut ModelRuntime<Self>,
-        token: Self::Token,
-        decision: &TokenSamplingDecision<'_>,
-        state: &mut Self::TextGenerationState,
-    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-        Self::submit_text_decode(runtime, token, decision.filter(), state)
+    /// Meaning of scores produced by the retained generation realization.
+    fn generation_score_kind(
+        runtime: &ModelRuntime<Self>,
+    ) -> crate::refinement::PredictionScoreKind {
+        if Self::supports_block_refinement(runtime) {
+            crate::refinement::PredictionScoreKind::RefinementPosition
+        } else {
+            crate::refinement::PredictionScoreKind::CausalConditional
+        }
     }
+
+    /// Declares the next physical operation without execution or controller queries.
+    fn text_operation_kind(
+        _runtime: &ModelRuntime<Self>,
+        _input: &PendingTextInput<Self::Prompt, Self::Token>,
+        _state: &Self::TextGenerationState,
+    ) -> TextOperationKind {
+        TextOperationKind::Decision(crate::refinement::PredictionScoreKind::CausalConditional)
+    }
+
+    /// Submits one declared operation. Progress receives no commitment decision;
+    /// selecting operations receive the current controller decision exactly once.
+    fn submit_text_operation(
+        runtime: &mut ModelRuntime<Self>,
+        input: PendingTextInput<Self::Prompt, Self::Token>,
+        decision: Option<&TokenSamplingDecision<'_>>,
+        state: &mut Self::TextGenerationState,
+    ) -> Result<
+        Submission<TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
+        TextOperationError<Self::Error>,
+    >;
 }
 
 /// Failure from backend preprocessing or backend-requested text encoding.
@@ -2068,6 +2115,8 @@ pub enum PendingTextInput<P, T> {
     Prefill(P),
     /// The preceding committed canonical token, before its successor is predicted.
     Decode(T),
+    /// Resume physical work retained by the generation state.
+    Continue,
 }
 
 impl<P, T> PendingTextInput<P, T> {
@@ -2076,6 +2125,7 @@ impl<P, T> PendingTextInput<P, T> {
         match self {
             Self::Prefill(prompt) => PendingTextInput::Prefill(prompt),
             Self::Decode(token) => PendingTextInput::Decode(token),
+            Self::Continue => PendingTextInput::Continue,
         }
     }
 }
@@ -2096,6 +2146,9 @@ where
     /// Portable constraint filtering or commitment failed.
     #[error("text generation constraint failed: {0}")]
     Controller(#[source] C),
+    /// A declared physical operation violated the neutral advancement contract.
+    #[error(transparent)]
+    Operation(#[from] TextOperationPolicyError),
 }
 
 /// One constraint-committed token and its backend-owned output handle.
@@ -2103,9 +2156,19 @@ where
 pub struct ControlledToken<T> {
     output: T,
     token_id: u32,
+    score_kind: crate::refinement::PredictionScoreKind,
+    position: crate::refinement::GenerationPosition,
 }
 
 impl<T> ControlledToken<T> {
+    /// Completed physical work and authoritative output coordinates.
+    pub const fn position(&self) -> crate::refinement::GenerationPosition {
+        self.position
+    }
+    /// Semantic meaning of scores associated with this committed token.
+    pub const fn score_kind(&self) -> crate::refinement::PredictionScoreKind {
+        self.score_kind
+    }
     /// Returns the committed canonical vocabulary id.
     pub fn token_id(&self) -> u32 {
         self.token_id
@@ -2143,6 +2206,7 @@ where
     completions: Vec<B::TextCompletion>,
     remaining_tokens: Option<usize>,
     prefill: PrefillChunkPolicy,
+    position: crate::refinement::GenerationPosition,
     cancellation: Option<crate::GenerationCancellationToken>,
 }
 
@@ -2159,6 +2223,18 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
+    /// Independent completed-work and authoritative-output coordinates.
+    pub fn position(&self) -> crate::refinement::GenerationPosition {
+        self.inner.position
+    }
+
+    /// Advances one physical operation using the same driver as the token iterator.
+    pub fn advance_operation(
+        &mut self,
+    ) -> Result<Option<TextAdvancement<B::Token>>, ControlledTextGenerationError<B::Error, C::Error>>
+    {
+        self.inner.next_physical_committed(self.runtime).transpose()
+    }
     /// Starts controlled generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,
@@ -2275,6 +2351,9 @@ where
     pub fn advance_prefill(
         &mut self,
     ) -> Result<bool, ControlledTextGenerationError<B::Error, C::Error>> {
+        if self.inner.position.execution_step == u64::MAX {
+            return Err(TextOperationPolicyError::PositionOverflow.into());
+        }
         self.inner
             .advance_prefill(self.runtime)
             .map_err(ControlledTextGenerationError::Backend)
@@ -2292,6 +2371,26 @@ where
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        let block_refinement = B::supports_block_refinement(runtime);
+        let admission = if config.refinement_policy().is_some() && !block_refinement {
+            Err(ControlledTextGenerationError::Operation(
+                TextOperationPolicyError::RequiresBlockRefinementArchitecture,
+            ))
+        } else if block_refinement
+            && matches!(config.strategy(), TextSamplingStrategy::MirostatV2 { .. })
+        {
+            Err(ControlledTextGenerationError::Operation(
+                TextOperationPolicyError::RequiresCausalConditionalScores,
+            ))
+        } else {
+            Ok(())
+        };
+        // Agree portable admission before configuring native state or drawing noise.
+        runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Sampling,
+            admission,
+            ControlledTextGenerationError::Preparation,
+        )?;
         let backend_state = B::start_text_generation(runtime.backend(), config)
             .map_err(ControlledTextGenerationError::Backend);
         let backend_state = runtime.finish_text_preparation(
@@ -2304,6 +2403,7 @@ where
             controller,
             step: Some(PendingTextInput::Prefill(prompt)),
             completions: Vec::new(),
+            position: crate::refinement::GenerationPosition::default(),
             remaining_tokens: config.sampling().max_new_tokens,
             prefill: config.prefill_chunk_policy(),
             cancellation: None,
@@ -2360,8 +2460,25 @@ where
         runtime: &mut ModelRuntime<B>,
     ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
     {
-        let token = match self.next_output(runtime)? {
-            Ok(token) => token,
+        loop {
+            match self.next_physical_committed(runtime)? {
+                Ok(TextAdvancement::Token(token)) => return Some(Ok(token)),
+                Ok(TextAdvancement::Progress(_)) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    fn next_physical_committed(
+        &mut self,
+        runtime: &mut ModelRuntime<B>,
+    ) -> Option<Result<TextAdvancement<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
+    {
+        let (token, score_kind) = match self.next_physical_output(runtime)? {
+            Ok(PhysicalTextOutput::Progress(progress)) => {
+                return Some(Ok(TextAdvancement::Progress(progress)))
+            }
+            Ok(PhysicalTextOutput::Token { token, score_kind }) => (token, score_kind),
             Err(error) => return Some(Err(error)),
         };
         let token_id = match token.token_id() {
@@ -2375,10 +2492,13 @@ where
             self.step = None;
             return Some(Err(ControlledTextGenerationError::Controller(error)));
         }
-        Some(Ok(ControlledToken {
+        self.position.committed_tokens += 1;
+        Some(Ok(TextAdvancement::Token(ControlledToken {
             output: token,
             token_id,
-        }))
+            score_kind,
+            position: self.position,
+        })))
     }
 
     /// Completes one nonfinal prefix, preserving the remaining prompt and all
@@ -2406,6 +2526,9 @@ where
         let advanced =
             B::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
         self.step = Some(PendingTextInput::Prefill(prompt));
+        if advanced {
+            self.position.execution_step += 1;
+        }
         Ok(advanced)
     }
 
@@ -2413,6 +2536,16 @@ where
         &mut self,
         runtime: &mut ModelRuntime<B>,
     ) -> Option<ControlledGenerationResult<B, C>> {
+        self.next_committed(runtime)
+            .map(|result| result.map(ControlledToken::into_output))
+    }
+
+    fn next_physical_output(
+        &mut self,
+        runtime: &mut ModelRuntime<B>,
+    ) -> Option<
+        Result<PhysicalTextOutput<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>,
+    > {
         if self.remaining_tokens == Some(0)
             || self
                 .cancellation
@@ -2422,53 +2555,81 @@ where
             self.step = None;
             return None;
         }
-        loop {
-            match self.advance_prefill(runtime) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
+        if self.position.execution_step == u64::MAX || self.position.committed_tokens == u64::MAX {
+            self.step = None;
+            return Some(Err(TextOperationPolicyError::PositionOverflow.into()));
+        }
+        match self.advance_prefill(runtime) {
+            Ok(true) => {
+                return Some(Ok(PhysicalTextOutput::Progress(TextProgress {
+                    phase: crate::refinement::GenerationPhase::Context,
+                    block: 0,
+                    iteration: 0,
+                    tentative_token_ids: None,
+                })))
             }
-            if self
-                .cancellation
-                .as_ref()
-                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
-            {
-                self.step = None;
-                return None;
-            }
+            Ok(false) => {}
+            Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
         }
         let step = self.step.take()?;
-        if matches!(step, PendingTextInput::Decode(_)) {
+        if matches!(
+            step,
+            PendingTextInput::Decode(_) | PendingTextInput::Continue
+        ) {
             if let Err(error) = self.resolve_completions_before_decode() {
                 return Some(Err(ControlledTextGenerationError::Backend(error)));
             }
         }
-        let decision = match self.controller.current_decision() {
-            Ok(decision) => decision,
-            Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
+        let kind = B::text_operation_kind(runtime, &step, &self.backend_state);
+        let decision = match kind {
+            TextOperationKind::Progress(_) => None,
+            TextOperationKind::Decision(_) => match self.controller.current_decision() {
+                Ok(decision) => Some(decision),
+                Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
+            },
         };
-        let submission = match step {
-            PendingTextInput::Prefill(prompt) => {
-                B::submit_text_prefill_decision(runtime, prompt, &decision, &mut self.backend_state)
-            }
-            PendingTextInput::Decode(token) => {
-                B::submit_text_decode_decision(runtime, token, &decision, &mut self.backend_state)
-            }
-        };
+        let submission =
+            B::submit_text_operation(runtime, step, decision.as_ref(), &mut self.backend_state);
         drop(decision);
         let submission = match submission {
             Ok(submission) => submission,
-            Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
+            Err(TextOperationError::Backend(error)) => {
+                return Some(Err(ControlledTextGenerationError::Backend(error)))
+            }
+            Err(TextOperationError::Policy(error)) => {
+                return Some(Err(ControlledTextGenerationError::Operation(error)))
+            }
         };
-        let token = submission.output;
         if let Err(error) = self.retain_completion(submission.completion) {
             return Some(Err(ControlledTextGenerationError::Backend(error)));
         }
-        self.step = Some(PendingTextInput::Decode(token.clone()));
-        if let Some(remaining_tokens) = &mut self.remaining_tokens {
-            *remaining_tokens -= 1;
+        match submission.output {
+            TextOperationOutput::Progress { pending, progress } => {
+                if kind != TextOperationKind::Progress(progress.phase) {
+                    return Some(Err(TextOperationPolicyError::OutcomeMismatch.into()));
+                }
+                self.position.execution_step += 1;
+                self.position.block = progress.block;
+                self.position.iteration = progress.iteration;
+                self.step = Some(pending);
+                Some(Ok(PhysicalTextOutput::Progress(progress)))
+            }
+            TextOperationOutput::Token(token) => {
+                if !matches!(kind, TextOperationKind::Decision(_)) {
+                    return Some(Err(TextOperationPolicyError::OutcomeMismatch.into()));
+                }
+                self.position.execution_step += 1;
+                self.step = Some(PendingTextInput::Decode(token.clone()));
+                if let Some(remaining_tokens) = &mut self.remaining_tokens {
+                    *remaining_tokens -= 1;
+                }
+                let TextOperationKind::Decision(score_kind) = kind else {
+                    unreachable!()
+                };
+                Some(Ok(PhysicalTextOutput::Token { token, score_kind }))
+            }
+            TextOperationOutput::Finished => None,
         }
-        Some(Ok(token))
     }
 }
 
@@ -2598,6 +2759,7 @@ where
     match error {
         ControlledTextGenerationError::Backend(error) => BackendFailure::from_error(error),
         ControlledTextGenerationError::Preparation(error) => error,
+        ControlledTextGenerationError::Operation(error) => BackendFailure::from_error(error),
         ControlledTextGenerationError::Controller(error) => match error {},
     }
 }
@@ -3118,28 +3280,48 @@ mod tests {
             Ok(prompt_token_ids)
         }
 
-        fn submit_text_prefill(
+        fn submit_text_operation(
             runtime: &mut ModelRuntime<Self>,
-            prompt: Self::Prompt,
-            filter: &TokenFilter,
+            input: crate::PendingTextInput<Self::Prompt, Self::Token>,
+            decision: Option<&crate::TokenSamplingDecision<'_>>,
             state: &mut Self::TextGenerationState,
-        ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-            let submission = runtime.prefill(prompt)?;
+        ) -> Result<
+            Submission<crate::TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
+            crate::TextOperationError<Self::Error>,
+        > {
+            let decision = decision.ok_or(crate::TextOperationPolicyError::MissingDecision)?;
+            let filter = decision.filter();
+            if matches!(&input, crate::PendingTextInput::Continue) {
+                return Err(crate::TextOperationPolicyError::UnsupportedContinuation.into());
+            }
+            let submission =
+                || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+                    match input {
+                        crate::PendingTextInput::Prefill(prompt) => {
+                            let submission = runtime.prefill(prompt)?;
+                            Ok(Submission {
+                                output: apply_mock_filter(
+                                    submission.output + state.0 + state.1 as u32,
+                                    filter,
+                                ),
+                                completion: submission.completion,
+                            })
+                        }
+                        crate::PendingTextInput::Decode(token) => {
+                            let submission = runtime.decode(token)?;
+                            Ok(Submission {
+                                output: apply_mock_filter(submission.output, filter),
+                                completion: submission.completion,
+                            })
+                        }
+                        crate::PendingTextInput::Continue => {
+                            unreachable!("continuation is rejected before causal submission")
+                        }
+                    }
+                };
+            let submission = submission().map_err(crate::TextOperationError::Backend)?;
             Ok(Submission {
-                output: apply_mock_filter(submission.output + state.0 + state.1 as u32, filter),
-                completion: submission.completion,
-            })
-        }
-
-        fn submit_text_decode(
-            runtime: &mut ModelRuntime<Self>,
-            token: Self::Token,
-            filter: &TokenFilter,
-            _: &mut Self::TextGenerationState,
-        ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
-            let submission = runtime.decode(token)?;
-            Ok(Submission {
-                output: apply_mock_filter(submission.output, filter),
+                output: crate::TextOperationOutput::Token(submission.output),
                 completion: submission.completion,
             })
         }
@@ -3335,6 +3517,230 @@ mod tests {
         fn is_complete(&mut self) -> Result<bool, Self::Error> {
             Ok(self.committed == self.tokens.len())
         }
+    }
+
+    struct PhasedMock;
+    impl BackendProvider for PhasedMock {
+        type ModelConfig = u32;
+        type Model = u32;
+        type Session = MockSession;
+        type Error = Infallible;
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor::new("phased_mock", "1")
+        }
+        fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Infallible> {
+            Mock.devices()
+        }
+        fn prepare_model(&self, config: u32) -> Result<PreparedModel<u32>, Infallible> {
+            Mock.prepare_model(config)
+        }
+        fn create_session(&self, model: PreparedModel<u32>) -> Result<MockSession, Infallible> {
+            Mock.create_session(model)
+        }
+    }
+    impl BackendSession<PhasedMock> for MockSession {
+        type PrefillInput = Vec<u32>;
+        type DecodeInput = u32;
+        type Output = u32;
+        type Completion = Done;
+        fn capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities::default()
+        }
+        fn prefill(
+            &mut self,
+            _: &PhasedMock,
+            input: Vec<u32>,
+        ) -> Result<Submission<u32, Done>, Infallible> {
+            <Self as BackendSession<Mock>>::prefill(self, &Mock, input)
+        }
+        fn decode(
+            &mut self,
+            _: &PhasedMock,
+            input: u32,
+        ) -> Result<Submission<u32, Done>, Infallible> {
+            <Self as BackendSession<Mock>>::decode(self, &Mock, input)
+        }
+        fn observe_output(
+            &self,
+            _: &PhasedMock,
+            output: &u32,
+        ) -> Result<ObservationSet, Infallible> {
+            <Self as BackendSession<Mock>>::observe_output(self, &Mock, output)
+        }
+    }
+    #[derive(Clone, Default)]
+    struct PhasedState {
+        context: u32,
+        iterations: u32,
+        block: u64,
+    }
+    impl TextGenerationBackend for PhasedMock {
+        type Prompt = Vec<u32>;
+        type Token = u32;
+        type TextGenerationState = PhasedState;
+        type TextCompletion = Done;
+        fn reset_session(_: &Self, session: &mut MockSession) -> Result<(), BackendFailure> {
+            Mock::reset_session(&Mock, session)
+        }
+        fn synchronize_session(_: &Self, session: &MockSession) -> Result<(), BackendFailure> {
+            Mock::synchronize_session(&Mock, session)
+        }
+        fn prepare_text_prompt(_: &Self, prompt: Vec<u32>) -> Result<Vec<u32>, Infallible> {
+            Ok(prompt)
+        }
+        fn start_text_generation(
+            _: &Self,
+            _: TextGenerationConfig,
+        ) -> Result<PhasedState, Infallible> {
+            Ok(PhasedState::default())
+        }
+        fn text_operation_kind(
+            _: &ModelRuntime<Self>,
+            input: &PendingTextInput<Vec<u32>, u32>,
+            state: &PhasedState,
+        ) -> TextOperationKind {
+            use crate::refinement::{GenerationPhase, PredictionScoreKind};
+            match input {
+                PendingTextInput::Prefill(_) | PendingTextInput::Decode(_) => {
+                    TextOperationKind::Progress(GenerationPhase::Context)
+                }
+                PendingTextInput::Continue if state.iterations < 2 => {
+                    TextOperationKind::Progress(GenerationPhase::Refinement)
+                }
+                PendingTextInput::Continue => {
+                    TextOperationKind::Decision(PredictionScoreKind::ConstrainedFinalization)
+                }
+            }
+        }
+        fn submit_text_operation(
+            runtime: &mut ModelRuntime<Self>,
+            input: PendingTextInput<Vec<u32>, u32>,
+            decision: Option<&TokenSamplingDecision<'_>>,
+            state: &mut PhasedState,
+        ) -> Result<
+            Submission<TextOperationOutput<Vec<u32>, u32>, Done>,
+            TextOperationError<Infallible>,
+        > {
+            use crate::refinement::GenerationPhase;
+            let phase = match input {
+                PendingTextInput::Prefill(prompt) => {
+                    assert!(decision.is_none());
+                    state.context = runtime.prefill(prompt).unwrap().wait().unwrap();
+                    state.iterations = 0;
+                    GenerationPhase::Context
+                }
+                PendingTextInput::Decode(token) => {
+                    assert!(decision.is_none());
+                    state.context = runtime.decode(token).unwrap().wait().unwrap();
+                    state.iterations = 0;
+                    GenerationPhase::Context
+                }
+                PendingTextInput::Continue if state.iterations < 2 => {
+                    assert!(decision.is_none());
+                    state.iterations += 1;
+                    GenerationPhase::Refinement
+                }
+                PendingTextInput::Continue => {
+                    let decision = decision.ok_or(TextOperationPolicyError::MissingDecision)?;
+                    let token =
+                        apply_mock_filter(state.context + state.iterations, decision.filter());
+                    state.block += 1;
+                    return Ok(Submission {
+                        output: TextOperationOutput::Token(token),
+                        completion: Done,
+                    });
+                }
+            };
+            Ok(Submission {
+                output: TextOperationOutput::Progress {
+                    pending: PendingTextInput::Continue,
+                    progress: TextProgress {
+                        phase,
+                        block: state.block,
+                        iteration: state.iterations,
+                        tentative_token_ids: None,
+                    },
+                },
+                completion: Done,
+            })
+        }
+    }
+
+    #[test]
+    fn physical_advancement_preserves_commitment_controller_and_ordinary_parity() {
+        use crate::refinement::{GenerationPhase, PredictionScoreKind};
+        let sampling = crate::resolve_generation_config(
+            None,
+            crate::GenerationConfigOverrides {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = TextGenerationConfig::new(sampling);
+        let controller = FixedController {
+            queries: 0,
+            tokens: vec![5, 8],
+            committed: 0,
+        };
+        let mut ordinary_runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let mut ordinary = ControlledTextGeneration::new(
+            &mut ordinary_runtime,
+            vec![1, 2],
+            config,
+            controller.clone(),
+        )
+        .unwrap();
+        let expected = ordinary
+            .by_ref()
+            .map(|token| token.unwrap().token_id())
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.inner.controller.queries, 2);
+        drop(ordinary);
+        let mut runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let mut driver = TextGenerationDriver::new(&mut runtime);
+        let mut state = driver.start(vec![1, 2], config, controller).unwrap();
+        let mut actual = Vec::new();
+        let mut phases = Vec::new();
+        while let Some(advance) = driver.advance_operation(&mut state).unwrap() {
+            match advance {
+                TextAdvancement::Progress(progress) => phases.push(progress.phase),
+                TextAdvancement::Token(token) => {
+                    assert_eq!(
+                        token.score_kind(),
+                        PredictionScoreKind::ConstrainedFinalization
+                    );
+                    actual.push(token.token_id());
+                    phases.push(GenerationPhase::Finalization);
+                }
+            }
+            assert_eq!(state.position().execution_step, phases.len() as u64);
+            assert_eq!(state.position().committed_tokens, actual.len() as u64);
+            assert_eq!(state.controller().queries, actual.len());
+            assert_eq!(state.controller().committed, actual.len());
+            assert!(matches!(
+                driver.advance_operation(&mut state),
+                Err(TextContinuationError::NotQuiescent)
+            ));
+            driver.take_completed_step(&mut state).unwrap();
+        }
+        assert_eq!(actual, [5, 8]);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            phases,
+            [
+                GenerationPhase::Context,
+                GenerationPhase::Refinement,
+                GenerationPhase::Refinement,
+                GenerationPhase::Finalization
+            ]
+            .repeat(2)
+        );
+        assert_eq!(driver.runtime().session().tokens, [1, 2, 5]);
+        assert_eq!(
+            driver.runtime().session().tokens,
+            ordinary_runtime.session().tokens
+        );
     }
 
     #[test]
@@ -3557,6 +3963,7 @@ mod tests {
                 },
                 Some(PendingTextInput::Prefill(pending.clone())),
                 Some(2),
+                boundary.position(),
             )
         };
         // The child shares only execution authority, with its own remaining cursor.

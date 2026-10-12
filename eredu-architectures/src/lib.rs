@@ -134,6 +134,8 @@ pub use routed_text::{
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;
+/// Shared-weight causal context encoding and iterative block refinement.
+pub mod diffusion_gemma;
 /// Shared gated-delta recurrence with explicit construction and arithmetic policy.
 pub mod gated_delta;
 /// Shared assembly for heterogeneous stateful text decoders.

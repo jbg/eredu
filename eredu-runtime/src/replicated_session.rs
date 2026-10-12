@@ -1800,6 +1800,13 @@ where
     A: ReplicatedTextArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
+    if selected.requirements().block_refinement() != architecture.block_refinement_geometry()
+        || source_architecture.is_some_and(|source| {
+            source.block_refinement_geometry() != architecture.block_refinement_geometry()
+        })
+    {
+        return Err("cold text invocation geometry differs from constructed architecture".into());
+    }
     if selected.requirements().supports_chunked_prefill() && !A::supports_chunked_prefill() {
         return Err(
             "cold chunked-prefill declaration disagrees with constructed architecture".into(),
@@ -1812,6 +1819,44 @@ where
         expected_prompt_cache_architecture_identity,
         architecture.text_output_selection(),
         addressable_parameters,
+        context,
+    )
+}
+
+/// Validates iterative geometry and the shared parameter/state construction proof.
+/// The source and executable retain every sequence position; causal output slicing
+/// is absent from this prepared contract.
+pub fn prepare_block_refinement_contract<A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    addressable_parameters: impl IntoIterator<Item = impl AsRef<str>>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, String>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: crate::generation::refinement::architecture::BlockRefinementArchitecture<B, S>,
+{
+    if selected.requirements().block_refinement() != Some(architecture.refinement_geometry())
+        || source_architecture.is_some_and(|source| {
+            source.refinement_geometry() != architecture.refinement_geometry()
+        })
+    {
+        return Err("cold block-refinement geometry differs from constructed architecture".into());
+    }
+    let names = addressable_parameters
+        .into_iter()
+        .map(|name| name.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    prepare_layered_text_contract_with_addressable_parameters::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        ReplicatedTextOutputSelection::AllSequencePositions,
+        names.iter().map(String::as_str),
         context,
     )
 }
@@ -2371,6 +2416,13 @@ where
         &self.driver
     }
 
+    /// Trained iterative geometry checked by the prepared construction contract.
+    pub fn block_refinement_geometry(
+        &self,
+    ) -> Option<crate::generation::refinement::architecture::BlockRefinementGeometry> {
+        self.selected.requirements().block_refinement()
+    }
+
     /// Traverses loaded parameter slots at a caller-established quiescent boundary.
     /// The visitor must prepare fallible work before publishing replacement handles.
     pub fn visit_loaded_parameters(
@@ -2447,24 +2499,90 @@ where
         })
     }
 
-    /// Runs an ordinary transaction and retains every sequence logit row for
-    /// independent-draft verification. Output publication, all-rank agreement,
-    /// state rollback and completion use the same lifecycle as ordinary decoding.
-    pub fn sequence_logits<'a>(
+    /// Runs a complete architecture invocation without causal row selection.
+    /// Output publication, all-rank agreement, state rollback and completion
+    /// use the same lifecycle as ordinary decoding.
+    pub fn sequence_output<'a>(
         &mut self,
         input: A::Input<'a>,
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let (output, checkpoint, forward_context) =
-            self.execute_input_with_observer(input, pass, context, &mut crate::NoopObserver)?;
-        self.publish(
-            output,
-            checkpoint,
-            forward_context,
+        self.sequence_output_with_observer(input, pass, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs a complete architecture invocation through the ordinary transaction.
+    /// Context outputs and position-score matrices preserve their architecture
+    /// semantics. This operation performs no causal slicing or token commitment.
+    pub fn sequence_output_with_observer<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.with_observation_transaction(observer, |session, observer| {
+            let (output, checkpoint, forward_context) =
+                session.execute_input_with_observer(input, pass, context, observer)?;
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })
+    }
+
+    /// Encodes authoritative context through the ordinary residency and completion transaction.
+    pub fn encode_block_context_with_observer<O>(
+        &mut self,
+        tokens: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: crate::generation::refinement::architecture::BlockRefinementArchitecture<B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.sequence_output_with_observer(
+            A::context_input(tokens, mask),
+            ExpertPass::Prefill,
             context,
-            &mut crate::NoopObserver,
+            observer,
         )
+    }
+
+    /// Refines a complete tentative canvas without selecting a causal final row.
+    /// The architecture preserves authoritative history and owns visibility.
+    pub fn refine_block_with_observer<O>(
+        &mut self,
+        canvas: &B::Tensor,
+        feedback: Option<&B::Tensor>,
+        mask: Option<&B::Tensor>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        A: crate::generation::refinement::architecture::BlockRefinementArchitecture<B, M::State>,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.sequence_output_with_observer(
+            A::refinement_input(canvas, feedback, mask),
+            pass,
+            context,
+            observer,
+        )
+    }
+
+    fn select_text_output(
+        &mut self,
+        output: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, M::Error> {
+        match self.output_selection.sequence_index() {
+            Some(index) => self.mechanisms.index_text_output(output, index, context),
+            None => Ok(output),
+        }
     }
 
     /// Runs prompt processing and selects the architecture-declared text output.
@@ -2859,8 +2977,7 @@ where
                     )?,
                 };
                 let output = session
-                    .mechanisms
-                    .index_text_output(output, session.output_selection.sequence_index(), context)
+                    .select_text_output(output, context)
                     .map_err(ReplicatedTextSessionError::Mechanism);
                 let agreement = D::agree_distributed_phase(
                     &mut session.execution,
@@ -3120,11 +3237,7 @@ where
                     context,
                     observer,
                 )?;
-            let sequence_index = session.output_selection.sequence_index();
-            let output = match session
-                .mechanisms
-                .index_text_output(output, sequence_index, context)
-            {
+            let output = match session.select_text_output(output, context) {
                 Ok(output) => output,
                 Err(error) => {
                     return session.rollback_failure(
@@ -3240,11 +3353,7 @@ where
             session.require_input_result_agreement(require_input_agreement)?;
             let (output, checkpoint, forward_context) = session
                 .execute_input_result_with_observer(input, ExpertPass::Decode, context, observer)?;
-            let sequence_index = session.output_selection.sequence_index();
-            let output = match session
-                .mechanisms
-                .index_text_output(output, sequence_index, context)
-            {
+            let output = match session.select_text_output(output, context) {
                 Ok(output) => output,
                 Err(error) => {
                     return session.rollback_failure(
@@ -3338,11 +3447,7 @@ where
                 context,
                 observer,
             )?;
-            let sequence_index = session.output_selection.sequence_index();
-            let output = match session
-                .mechanisms
-                .index_text_output(output, sequence_index, context)
-            {
+            let output = match session.select_text_output(output, context) {
                 Ok(output) => output,
                 Err(error) => {
                     return session.rollback_failure(
@@ -4385,7 +4490,11 @@ where
             }
             Err(error) => return self.rollback_failure(checkpoint, error, context),
         };
-        let observation = D::observe_output(&mut self.execution, &output, observer, context);
+        let observation = if A::output_score_kind(&forward_context).is_some() {
+            D::observe_output(&mut self.execution, &output, observer, context)
+        } else {
+            Ok(output.clone())
+        };
         let observation_agreed = match D::agree_distributed_phase(
             &mut self.execution,
             crate::DistributedExecutionPhase::OutputObservation,

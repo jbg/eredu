@@ -286,6 +286,7 @@ impl eredu_runtime::memory_forecast::ContinuationForecastBackend for MlxBackend<
             plan: eredu_runtime::memory_forecast::ContinuationMemoryPlan {
                 current_positions: position,
                 additional_input_tokens,
+                query_tokens: model.block_refinement_geometry().map_or(1, |geometry| u64::from(geometry.canvas_length.get())),
                 current_state: match current_bound {
                     Some(n) => MemoryBytes::estimated(0, n,
                         "installed native logical state/capacity and materialization allowance; not measured distinct backing"),

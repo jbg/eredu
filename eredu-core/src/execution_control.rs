@@ -73,7 +73,7 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
 }
 
 /// Version of execution-control metadata and lifecycle records.
-pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 2;
 
 /// Observable lifecycle of one controllable ordinary generation session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

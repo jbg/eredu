@@ -197,32 +197,7 @@ fn apply_selected_formats(
             projection.format = *format;
         }
     };
-    update(&mut topology.output);
-    for layer in &mut topology.layers {
-        layer.input_projections.iter_mut().for_each(&update);
-        match &mut layer.mixer {
-            TokenMixerTopology::Attention { projections, .. }
-            | TokenMixerTopology::GatedDelta { projections, .. }
-            | TokenMixerTopology::GatedConvolution { projections, .. } => {
-                projections.iter_mut().for_each(&update)
-            }
-            TokenMixerTopology::Unknown { .. } => {}
-        }
-        match &mut layer.feed_forward {
-            FeedForwardTopology::Gated { projections, .. } => {
-                projections.iter_mut().for_each(&update)
-            }
-            FeedForwardTopology::Routed {
-                projections,
-                router,
-                ..
-            } => {
-                projections.iter_mut().for_each(&update);
-                update(router);
-            }
-            FeedForwardTopology::Unknown { .. } => {}
-        }
-    }
+    topology.visit_projections_mut(update);
     let wider = tasks.iter().any(|task| {
         let dtype = task
             .derived_output()

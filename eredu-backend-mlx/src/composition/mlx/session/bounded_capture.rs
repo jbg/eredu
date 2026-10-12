@@ -597,16 +597,21 @@ pub(super) fn observer<'a>(
     domain: Option<CaptureTokenDomain<'a>>,
     prediction: u64,
 ) -> impl RuntimeActivationObserver<MlxTensor, Error> + 'a {
-    eredu_runtime::intervention::CaptureObserver::for_step(
-        capture,
-        NativeCapture {
-            partition: None,
-            stream,
-            domain,
-        },
-        prediction,
-        capture_error,
-    )
+    let native = NativeCapture {
+        partition: None,
+        stream,
+        domain,
+    };
+    if capture.plan().invocation_bounds().is_some() {
+        eredu_runtime::intervention::CaptureObserver::new(capture, native, capture_error)
+    } else {
+        eredu_runtime::intervention::CaptureObserver::for_step(
+            capture,
+            native,
+            prediction,
+            capture_error,
+        )
+    }
 }
 
 /// Portable policy failures remain directly discoverable in the public source

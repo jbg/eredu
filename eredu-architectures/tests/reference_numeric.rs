@@ -759,7 +759,9 @@ fn unsupported<T>(operation: &str) -> Result<T, Error> {
 impl Tensor for NumericTensor {
     type Context = NumericContext;
 
-    fn immutable_context_key(_: &NumericContext) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
+    fn immutable_context_key(
+        _: &NumericContext,
+    ) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
         // This eager scalar backend has one device and no context-dependent arithmetic.
         Ok(Some(eredu_nn::TensorContextKey::new([0, 0, 0])))
     }
@@ -2364,8 +2366,15 @@ impl LinearOperator<NumericTensor> for NumericLinear {
         input: &NumericTensor,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        if self.weight_metadata.id.as_str().ends_with("self_attn.linear_pos.weight") {
-            context.position_projection_calls.set(context.position_projection_calls.get() + 1);
+        if self
+            .weight_metadata
+            .id
+            .as_str()
+            .ends_with("self_attn.linear_pos.weight")
+        {
+            context
+                .position_projection_calls
+                .set(context.position_projection_calls.get() + 1);
         }
         linear(
             input,
@@ -2420,6 +2429,34 @@ impl Parameterized<NumericTensor> for NumericEmbedding {
 }
 
 impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
+    fn weighted_sum(
+        &mut self,
+        coefficients: &NumericTensor,
+        _context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        let table = self.execution_weight();
+        let range = self.vocabulary_range.as_ref();
+        let vocabulary = range.map_or(table.shape[0] as usize, |range| range.global_vocabulary);
+        if coefficients.shape.last().copied() != Some(vocabulary as i32) {
+            return Err(Error::backend(
+                "numeric weighted embedding vocabulary differs",
+            ));
+        }
+        let width = table.shape[1] as usize;
+        let mut shape = coefficients.shape.clone();
+        *shape.last_mut().unwrap() = width as i32;
+        let mut output = NumericTensor::zeros(shape);
+        for (position, scores) in coefficients.data.chunks_exact(vocabulary).enumerate() {
+            for local in 0..table.shape[0] as usize {
+                let global = range.map_or(local, |range| range.local.start + local);
+                for column in 0..width {
+                    output.data[position * width + column] +=
+                        scores[global] * table.data[local * width + column];
+                }
+            }
+        }
+        Ok(output)
+    }
     fn forward(
         &mut self,
         input: &NumericTensor,
@@ -7653,6 +7690,22 @@ impl AttentionCache<NumericTensor> for NumericCache {
             }
         } else {
             request
+        };
+        let physical_mask = request.mask.map(|mask| {
+            let axis = mask.shape.len() - 1;
+            if mask.shape[axis] > request.keys.shape[2] {
+                mask.axis_slice(
+                    axis,
+                    (mask.shape[axis] - request.keys.shape[2]) as usize,
+                    mask.shape[axis] as usize,
+                )
+            } else {
+                mask.clone()
+            }
+        });
+        let request = AttentionRequest {
+            mask: physical_mask.as_ref(),
+            ..request
         };
         request.validate()?;
         let query_offset = self.offset - request.queries.shape[2];
@@ -18289,7 +18342,13 @@ type NumericCompositePartitionObservedForward = dyn FnMut(
     &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
 ) -> Result<NumericTensor, Error>;
 
+type NumericCompositeRefinement = dyn FnMut(
+    &eredu_runtime::PreparedModelInput<NumericTensor>,
+    Option<&NumericTensor>,
+) -> Result<NumericTensor, Error>;
+
 struct NumericCompositePartitionExecutable {
+    refine: Box<NumericCompositeRefinement>,
     forward: Box<NumericCompositePartitionForward>,
     forward_observed: Box<NumericCompositePartitionObservedForward>,
     positions: Box<dyn Fn() -> Result<Vec<i32>, Error>>,
@@ -18297,6 +18356,13 @@ struct NumericCompositePartitionExecutable {
 }
 
 impl NumericCompositePartitionExecutable {
+    fn refine(
+        &mut self,
+        input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+        feedback: Option<&NumericTensor>,
+    ) -> Result<NumericTensor, Error> {
+        (self.refine)(input, feedback)
+    }
     fn forward(
         &mut self,
         input: &eredu_runtime::PreparedModelInput<NumericTensor>,
@@ -18540,9 +18606,31 @@ impl
         let context = self.context;
         let observed_context = context.clone();
         let observed_admission = admission.clone();
+        let refinement_admission = admission.clone();
+        let refinement_context = context.clone();
+        let refinement_session = std::rc::Rc::clone(&session);
         let invocation_world = self.world;
         let observed_world = Arc::clone(&invocation_world);
         Ok(NumericCompositePartitionExecutable {
+            refine: Box::new(move |input, feedback| {
+                if A::block_refinement_geometry(&refinement_admission).is_none() {
+                    return Err(Error::backend(
+                        "selected composite has no refinement invocation",
+                    ));
+                }
+                let admitted =
+                    A::admit_prepared_input(&refinement_admission, input, &NumericInputInspector)
+                        .map_err(Error::backend)?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(
+                    input, &admitted,
+                )
+                .map_err(Error::backend)?
+                .with_refinement(feedback);
+                refinement_session
+                    .borrow_mut()
+                    .sequence_output(paired, ExpertPass::Decode, &refinement_context)
+                    .map_err(|error| Error::backend(error.to_string()))
+            }),
             reset: Box::new(move || {
                 reset_session
                     .borrow_mut()
@@ -27389,6 +27477,18 @@ fn numeric_composite_parameter_description(
 ) -> eredu_runtime::ArchitectureParameterDescription {
     let context = NumericContext::default();
     match config["model_type"].as_str().expect("composite model type") {
+        "diffusion_gemma" => {
+            eredu_architectures::diffusion_gemma::composite::Model::<NumericBackend>::new(
+                eredu_architectures::diffusion_gemma::FamilyConfig::from_hf_json(
+                    &serde_json::to_vec(config).unwrap(),
+                )
+                .unwrap(),
+                &context,
+            )
+            .unwrap()
+            .parameter_description(&context)
+            .unwrap()
+        }
         "gemma4_unified" => {
             let mut family =
                 gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(config).unwrap()).unwrap();

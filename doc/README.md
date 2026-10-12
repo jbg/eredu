@@ -11,6 +11,8 @@ changes, archived APIs and exact revisions for applications pinned to old `main`
 
 - [Model and checkpoint support](model-support.md): supported families,
   modalities, artifact formats, and inspection.
+- [DiffusionGemma validation](diffusion-gemma-validation.md): shared-stack block
+  refinement, released SafeTensors/GGUF evidence, and reproduction commands.
 - [Model loading, quantization, and memory](model-loading.md): weight residency,
   cache residency, prompt caches, and memory accounting.
 - [Parallel execution](parallel-execution.md): tensor, pipeline, and expert

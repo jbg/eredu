@@ -10,6 +10,9 @@ pub(super) struct State {
 
 #[derive(Clone, Default)]
 pub(super) struct Sampling {
+    pub physical: u64,
+    pub iterative_first: u32,
+    pub draft_events: bool,
     pub temperature: f32,
     pub seed: Option<u64>,
     pub prediction: u64,

@@ -33,6 +33,7 @@ pub struct CaptureSession {
     owner: std::sync::Arc<()>,
     pub(crate) checkpoint_ready: bool,
     has_step: bool,
+    commitment_boundary: Option<u64>,
     pub(crate) invocation: Option<CaptureInvocationShape>,
     transaction: Option<(eredu_core::DistributedCommitEpoch, CaptureTransactionStatus)>,
     last_transaction_epoch: Option<eredu_core::DistributedCommitEpoch>,
@@ -56,12 +57,26 @@ enum CaptureTransactionStatus {
 }
 
 impl CaptureSession {
+    /// Supplies authoritative output cadence for architectures with physical
+    /// forwards between commitments. Capture invocation indices remain distinct;
+    /// snapshots retain this boundary without refunding capture consumption.
+    pub fn set_commitment_boundary(&mut self, next_prediction: u64) -> Result<(), CaptureError> {
+        if next_prediction > self.plan.request().max_predictions {
+            return Err(CaptureError::Invalid(
+                "commitment exceeds capture admission".into(),
+            ));
+        }
+        self.commitment_boundary = Some(next_prediction);
+        Ok(())
+    }
+
     /// Creates an unstarted capture run owning its admission and ledger.
     pub fn new(plan: AdmittedCapturePlan) -> Self {
         Self {
             owner: std::sync::Arc::new(()),
             checkpoint_ready: true,
             has_step: false,
+            commitment_boundary: None,
             invocation: None,
             transaction: None,
             last_transaction_epoch: None,

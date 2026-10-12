@@ -369,6 +369,7 @@ pub fn prepared_safetensors_floating_state_dtype_source(
     use crate::configuration::SafetensorsModelConfig;
 
     let parameter = match architecture.model() {
+        SafetensorsModelConfig::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
         SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::MuseGlimmer(_) => {
             "model.language_model.embed_tokens.weight".into()
         }
@@ -417,6 +418,7 @@ pub fn prepared_gguf_floating_state_dtype_source(
         }
         GgufModelConfig::DeepSeekV3(_)
         | GgufModelConfig::DeepSeekV4(_)
+        | GgufModelConfig::DiffusionGemma(_)
         | GgufModelConfig::Gemma4(_)
         | GgufModelConfig::GptOss(_)
         | GgufModelConfig::Inkling(_)
@@ -481,6 +483,12 @@ pub fn prepared_safetensors_capabilities(
                 true,
                 InputModalities::TEXT,
                 usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            ),
+            SafetensorsModelConfig::DiffusionGemma(family) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
+                true,
+                family.input_modalities(),
+                0,
             ),
             SafetensorsModelConfig::Gemma4(family) => {
                 let routed = family.text.num_experts.is_some();
@@ -653,6 +661,7 @@ pub fn prepared_gguf_capabilities(
 
     let architecture = plan.architecture();
     let routed = match plan.model() {
+        GgufModelConfig::DiffusionGemma(family) => family.text.num_experts.is_some(),
         GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
         GgufModelConfig::MuseGlimmer(args) => args.is_moe(),
         GgufModelConfig::DeepSeekV3(args) => args.has_sparse_moe_layers(),

@@ -6,7 +6,6 @@ use eredu_checkpoint::composite::{
     ArtifactComponentSchema, ArtifactRole, ComponentId, ComponentParameterCatalog,
     CompositeArtifactError, CompositeArtifactSchema, ProjectorCompatibility,
 };
-use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     expert::{
         resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
@@ -223,7 +222,14 @@ impl Gemma4ArtifactConfig {
 /// Native media components are appended from the same normalized family
 /// configuration, while residency remains a runtime concern.
 pub fn safetensors_plan(family: &FamilyConfig) -> Result<SafetensorsCheckpointPlan, String> {
-    let args = &family.text;
+    shared_safetensors_plan(&family.text, family.vision.as_ref(), family.audio.as_ref())
+}
+
+pub(crate) fn shared_safetensors_plan(
+    args: &ModelArgs,
+    vision: Option<&super::VisionConfig>,
+    audio: Option<&super::AudioConfig>,
+) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let layers = args.num_hidden_layers();
     let vocabulary = dimension(args.vocab_size, "vocabulary size")?;
@@ -280,10 +286,10 @@ pub fn safetensors_plan(family: &FamilyConfig) -> Result<SafetensorsCheckpointPl
     for layer in 0..layers {
         add_safetensors_layer(args, layer, hidden, &mut common, &mut groups)?;
     }
-    if let Some(vision) = &family.vision {
+    if let Some(vision) = vision {
         add_safetensors_vision(vision, hidden, &mut common)?;
     }
-    if let Some(audio) = &family.audio {
+    if let Some(audio) = audio {
         add_safetensors_audio(audio, hidden, &mut common)?;
     }
     let mut policy = CatalogPolicy::strict();
@@ -671,8 +677,10 @@ fn add_clipped_matrix(
         shape,
         config.linear_format_for(&weight, input as i32),
     )?;
-    for local in ["input_min", "input_max", "output_min", "output_max"] {
-        output.push(safe(format!("{prefix}.{local}"), Vec::new()));
+    if config.use_clipped_linears {
+        for local in ["input_min", "input_max", "output_min", "output_max"] {
+            output.push(safe(format!("{prefix}.{local}"), Vec::new()));
+        }
     }
     Ok(())
 }
@@ -1306,68 +1314,22 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     .ok_or_else(|| "Gemma 4 expert count must be positive".to_string())?;
     let owner_group = eredu_runtime::ExecutionGroupId::new(super::TEXT_EXECUTION_GROUP)
         .map_err(|error| error.to_string())?;
-    let mut units = Vec::new();
-    for layer in 0..args.num_hidden_layers() {
-        if args
-            .layer_policy(layer)
-            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::DenseWithSparseMoe)
-        {
-            continue;
-        }
-        let unit_path = released_layer_path(layer);
-        let bank = expert_recipes(catalog, args, layer)?;
-        for expert in 0..experts {
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert
-                    .checked_add(1)
-                    .ok_or_else(|| "Gemma 4 expert index overflowed".to_string())?,
-            };
-            let parameters = [
-                (
-                    "gate_up_proj",
-                    bank.target_gate_up.clone(),
-                    bank.gate_up.clone(),
-                ),
-                ("down_proj", bank.target_down.clone(), bank.down.clone()),
-            ]
-            .into_iter()
-            .map(|(binding, target, recipe)| {
-                let recipe = recipe
-                    .select_bounded(catalog, selection.clone())
-                    .map_err(|error| error.to_string())?;
-                let role = match binding {
-                    "gate_up_proj" => crate::ExpertParameterRole::quantizable_projection(
-                        "gate_up_proj_scales",
-                        "gate_up_proj_biases",
-                    ),
-                    "down_proj" => crate::ExpertParameterRole::quantizable_projection(
-                        "down_proj_scales",
-                        "down_proj_biases",
-                    ),
-                    _ => crate::ExpertParameterRole::Preserved,
-                };
-                crate::ExpertParameterRecipe::new(binding, target, recipe, role)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-            units.push(
-                crate::ExpertResidencyUnit::new(
-                    eredu_runtime::ParameterBankKey::new(0, layer, expert),
-                    owner_group.clone(),
-                    layer,
-                    &unit_path,
-                    crate::ExpertResidencyDistribution::ExpertParallel,
-                    parameters,
-                )
-                .map_err(|error| error.to_string())?,
-            );
-        }
-    }
-    crate::ExpertResidencyCatalog::new(units)
-        .and_then(|residency| residency.with_inferred_byte_geometry(catalog))
-        .map_err(|error| error.to_string())
+    let banks = (0..args.num_hidden_layers())
+        .filter(|&layer| {
+            args.layer_policy(layer)
+                .is_some_and(|policy| policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe)
+        })
+        .map(|layer| {
+            expert_recipes(catalog, args, layer)
+                .map(|recipes| (layer, released_layer_path(layer), recipes))
+        });
+    crate::expert_residency::gated_product_residency_catalog(
+        catalog,
+        owner_group,
+        0,
+        experts,
+        banks,
+    )
 }
 
 #[cfg(test)]
@@ -1574,5 +1536,15 @@ mod tests {
         assert!(decoder.contains_key(&format!("{root}.gate_up_proj")));
         assert!(decoder.contains_key(&format!("{root}.down_proj")));
         assert!(unit_recipes(&catalog, &family, 3).is_err());
+        let residency = expert_residency_catalog(&catalog, &family.text).unwrap();
+        assert_eq!(residency.units().len(), 4);
+        assert_eq!(
+            residency
+                .units()
+                .iter()
+                .map(|unit| unit.byte_len().unwrap())
+                .sum::<u64>(),
+            4 * 32 * 32 * 3 * 2
+        );
     }
 }

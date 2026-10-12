@@ -1,5 +1,119 @@
 # Language-model backend architecture
 
+The core text machine advances architecture-declared physical operations through
+`TextGenerationBackend::submit_text_operation`. Progress retains pending input
+without querying or committing the token controller. A selecting operation alone
+receives the current commitment decision. Native completion is retained before
+publication, and the ordinary iterator and controlled facade use this same machine.
+The shared facade streaming cursor parses only authoritative tokens; context and
+refinement progress drain their own captures and remain pause boundaries.
+Generation positions retain independent physical-step, block, iteration and
+committed-token coordinates. Complete continuation snapshots save and restore
+these logical coordinates while output epochs and resource consumption remain
+monotone. Generation-event and execution-control schemas are version 2.
+
+Tentative token IDs are opt-in request data. The facade owns draft revisions and
+reconciliation identities; they never enter the tokenizer, constraint controller,
+semantic parser or committed-token metrics. A draft clears before the block's
+first authoritative token, cancellation, failure, restore or branch exchange.
+Restoration advances the output epoch, and forks receive independent draft identities.
+Physical capture bounds cover the complete context and canvas separately from the
+committed prediction schedule; repeated refinement cannot refund capture budgets.
+
+Iterative token-block policy lives in `eredu-core::refinement` and
+`eredu-runtime::generation::refinement`. The portable engine owns temperature,
+entropy acceptance, confidence/stability stopping, feedback precision and RNG
+adoption. Native settlement precedes publication of a new iteration. Final
+candidates come from the last argmax prediction, independently of the noisy
+canvas retained for the next iteration. `BlockRefinementState` retains the explicit
+random stream, feedback, stopping history, finalization cursor and authoritative
+block. Context encoding consumes only finalized tokens. Position-wise constrained
+finalization preserves the final argmax when allowed, otherwise selects the
+highest-scoring currently admissible token from that position's final scores.
+The generic MLX adapter realizes these operations from architecture-declared
+geometry and inputs. It routes progress through the ordinary observation and
+completion owners and queries output constraints separately at each finalization
+position. Snapshot sampling state includes the active block and policy. Immutable
+canvases and feedback may share storage; retained-byte reservations include every
+value, while copy reservations account for mutable host state and native context.
+Future context-growth reservations include an already finalized partial block
+when a branch proceeds beyond it. `TextGenerationConfig::refinement_policy` and
+the facade's `refinement` setting select a validated iterative schedule independently
+of causal token-sampling temperature.
+`BlockRefinementArchitecture` supplies context and feedback inputs to the shared
+layered session. Cold requirements retain the positive canvas and vocabulary
+geometry. `prepare_block_refinement_contract` checks it against the constructed
+architecture and selects every sequence position. The session's observed context
+and refinement operations reuse ordinary rollback, residency and publication.
+Invocation output semantics suppress the model-score observation
+seam for context-only outputs; refinement retains all position scores.
+
+`ReadOnlyAttentionCache` borrows authoritative context history and attends with
+transient key/value projections without appending them. MLX contiguous and paged
+storage implement the same request; paged attention scans transient projections
+alongside retained pages without installing pages or advancing their frontier.
+Read-only scans clip physical page overhang to the logically retained suffix
+and permanent prefix; the sliding history bound does not clip the canvas.
+An explicit mask selects canvas visibility independently of the cache's append
+policy. The model owns that visibility and the positions used by rotary operators.
+
+`EmbeddingOperator::weighted_sum` consumes coefficients without sampling or
+normalizing them. MLX casts coefficients to embedding arithmetic and bounds
+packed-table decoding to 512 rows per block. Vocabulary-partitioned operators
+consume their owned coefficient columns; the neutral distributed operation sums
+the local contributions. DiffusionGemma declares shared text matrices, separate
+encoder/decoder residual scales and decoder self-conditioning in
+`eredu-architectures::diffusion_gemma`. Learned-normalization, GELU and attention
+rounding are explicit portable construction choices. Its text lifecycle traverses
+one shared unit per layer through the ordinary resident and bounded-runtime
+contracts. Context invocations append authoritative KV; refinement invocations
+borrow it. Shared Gemma parameter-placement functions accept architecture-owned
+roots; DiffusionGemma separately owns feedback units and encoder scale placement.
+Rank-local static construction includes only the retained ingress/readout roles.
+Shared vision and modality-projector construction also accept architecture-owned
+parameter roots; optional clipping remains an atomic projection policy.
+Vision equations preserve the working precision across patch scaling and rotary
+products. Learned normalization and spatial pooling use FP32 intermediates with
+one output cast; magnitude scaling and standardization occur in FP32. Explicit
+input-score attention arithmetic remains an architecture construction choice.
+Shared routed banks retain one expert ownership plan for both invocation phases;
+routed drivers pass the request's expert mechanism policy into the shared layers.
+Resident, bounded and tensor-parallel unit calls use the same component instrument,
+including intervention of the effective residual and sparse routing evidence.
+Readout instrumentation covers every canvas position without causal slicing.
+Its pipeline boundary carries the invocation phase and authoritative rotary
+frontier as exact I32 values; receiving stages validate that frontier against
+local context. The same shared layer equations and read-only cache request run
+under tensor parallelism and combined tensor/pipeline partitions.
+
+The image/text composition cuts the image tower into individual layer units.
+Composite text boundaries additionally transport each query row's image interval.
+Receiving stages reconstruct image-span visibility and intersect sliding attention
+with its history lower bound while retaining visibility inside the image span.
+Composite publication geometry follows the invocation: encoder hidden states
+and refinement position scores have distinct final axes. Expert transport bounds
+include the complete multi-rank fan-in and the return submission by its owner.
+Text and image parameter ownership, local K/V geometry and transport schemas live
+in the family; native adapters consume the retained construction and sources.
+
+Checkpoint constraints distinguish executable tensors, format companions and
+artifact metadata. Metadata tensors retain strict shape/encoding admission and
+source provenance, but produce no executable materialization task. Published
+rotary-frequency tables use this role when the equation derives frequencies from
+the admitted configuration. GGUF tokenizer reconstruction selects explicit BPE
+merges when present, with the declared whitespace and byte-fallback policy;
+score-based Unigram vocabularies retain their own mechanism.
+`eredu-checkpoint::expert` assembles selected expert banks and their encoded
+companions together; stacking and concatenation preserve every scale and bias.
+
+Cold invocation topology describes additive feed-forward branches and optional
+whole-canvas feedback projections. Format selection visits every projection.
+Forecasts include canvas scores, feedback and refinement scratch even when the
+requested commitment ends before the next context append. Parallel invocation
+and logical-state forecasts use a conservative unpartitioned envelope; parameter
+residency uses selected rank-local tasks and replicas. Offload staging and native
+collector limits remain explicit in the forecast's assumptions.
+
 The shared gated-delta mixer and shared/routed feed-forward construction live in
 `eredu-architectures::{gated_delta, shared_routed}`. Construction specs carry exact
 parameter identities, linear formats, local geometry, normalization epsilon,

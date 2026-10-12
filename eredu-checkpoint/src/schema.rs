@@ -440,11 +440,13 @@ pub enum TensorRequirement {
     Optional,
 }
 
-/// How failures for a constraint are classified.
+/// Executable ownership and failure classification of an admitted tensor.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum TensorRole {
     Tensor,
     Companion,
+    /// Validated artifact metadata with no executable parameter binding.
+    ArtifactMetadata,
 }
 
 /// Semantic role of one encoded-linear companion output.

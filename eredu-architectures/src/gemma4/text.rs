@@ -5,11 +5,10 @@ use std::collections::HashMap;
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AttentionStateSource, AttentionValueSource, Error,
-    GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, RotarySubspace, SelectorInputTransformSpec, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    GatedProductGroupLayout, GroupSelectionOperator, GroupedGatedProductSpec, GroupedNeuralBackend,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, Parameter, ParameterSpec,
+    Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace,
+    SelectorInputTransformSpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, ParameterProvider, ResidentExpertProvider, RoutedExpertRequest,
@@ -53,6 +52,8 @@ pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     policy: AttentionPolicy,
     #[parameter(skip)]
     state_source: AttentionStateSource,
+    #[parameter(skip)]
+    arithmetic: eredu_nn::AttentionArithmetic,
     /// Query projection.
     pub query: B::Linear,
     /// Key projection, absent for shared-state consumers.
@@ -67,6 +68,34 @@ pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub key_norm: Option<B::Normalization>,
     /// Partial or full rotary operator.
     pub rotary: B::Rotary,
+}
+
+/// Exact ordinary projection declaration shared by construction and cold topology.
+pub(crate) fn linear_spec(
+    args: &ModelArgs,
+    weight_name: &str,
+    input: i32,
+    output: i32,
+    bias: bool,
+) -> Result<LinearSpec, Error> {
+    Ok(LinearSpec {
+        input,
+        output,
+        weight: ParameterSpec::trainable(weight_name).map_err(Error::backend)?,
+        bias: bias
+            .then(|| {
+                ParameterSpec::trainable(format!(
+                    "{}.bias",
+                    weight_name.trim_end_matches(".weight")
+                ))
+            })
+            .transpose()
+            .map_err(Error::backend)?,
+        format: crate::linear_format::standard_linear_format(
+            weight_name,
+            args.linear_format_for(weight_name),
+        )?,
+    })
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
@@ -94,20 +123,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let linear = |field: &str, input: i32, output: i32| {
             let weight_name = format!("{prefix}.{field}.weight");
             B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
-                    bias: args
-                        .attention_bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
-                },
+                linear_spec(args, &weight_name, input, output, args.attention_bias)?,
                 context,
             )
         };
@@ -120,6 +136,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             rotary_dimensions: partial_dimensions,
             policy: policy.attention,
             state_source: policy.key_value,
+            arithmetic: args.attention_arithmetic,
             query: linear(
                 "q_proj",
                 args.hidden_size,
@@ -137,9 +154,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 args.hidden_size,
             )?,
             query_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
+                args.normalization(
                     head_dim,
-                    args.rms_norm_eps,
                     ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
                         .map_err(Error::backend)?,
                 ),
@@ -148,9 +164,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             key_norm: owns_state
                 .then(|| {
                     B::normalization(
-                        NormalizationConstructionSpec::learned(
+                        args.normalization(
                             head_dim,
-                            args.rms_norm_eps,
                             ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
                                 .map_err(Error::backend)?,
                         ),
@@ -160,7 +175,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 .transpose()?,
             rotary: B::rotary(
                 RotarySpec {
-                    arithmetic: eredu_nn::RotaryArithmetic::Native,
+                    arithmetic: args.rotary_arithmetic,
                     dimensions: partial_dimensions,
                     base: args.rope_theta_for(policy.attention),
                     traditional: false,
@@ -277,7 +292,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let attended = match cache {
             Some(cache) => cache.attention(
                 AttentionRequest {
-                    arithmetic: eredu_nn::AttentionArithmetic::Fused,
+                    arithmetic: self.arithmetic,
                     queries,
                     keys,
                     values,
@@ -351,6 +366,9 @@ fn partial_rotary_dimensions(
     head_dim: i32,
     scaling: Option<&std::collections::HashMap<String, crate::rotary::RopeValue>>,
 ) -> i32 {
+    // Proportional RoPE retains the full pair layout and zeroes frequencies
+    // outside its rotated fraction; shrinking the head changes both pairing
+    // and the frequency denominator.
     if matches!(
         scaling.and_then(|scaling| scaling.get("rope_type")),
         Some(crate::rotary::RopeValue::String(kind)) if kind == "proportional"
@@ -375,6 +393,8 @@ fn partial_rotary_dimensions(
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DenseMlp<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    #[parameter(skip)]
+    approximate_gelu: bool,
     /// GELU gate projection.
     pub gate: B::Linear,
     /// Multiplicative up projection.
@@ -395,20 +415,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         let linear = |field: &str, input, output| {
             let weight_name = format!("{prefix}.{field}.weight");
             B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
-                },
+                linear_spec(args, &weight_name, input, output, false)?,
                 context,
             )
         };
         Ok(Self {
+            approximate_gelu: args.approximate_gelu,
             gate: linear("gate_proj", args.hidden_size, intermediate)?,
             up: linear("up_proj", args.hidden_size, intermediate)?,
             down: linear("down_proj", intermediate, args.hidden_size)?,
@@ -423,7 +435,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
-        let gate = B::Tensor::gelu(&gate, context)?;
+        let gate = if self.approximate_gelu {
+            B::gelu_approximate(gate, context)?
+        } else {
+            B::Tensor::gelu(&gate, context)?
+        };
         let up = self.up.forward(input, context)?;
         let hidden = gate.multiply(&up, context)?;
         let hidden = instrumentation.apply("dense_feed_forward.units", hidden)?;
@@ -525,9 +541,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         let prefix = format!("{layer_root}.{layer}");
         let norm = |field: &str, dimensions| {
             B::normalization(
-                NormalizationConstructionSpec::learned(
+                args.normalization(
                     dimensions,
-                    args.rms_norm_eps,
                     ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
                         .map_err(Error::backend)?,
                 ),
@@ -553,38 +568,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         let media_width = args.hidden_size_per_layer_input;
         let sparse = policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe;
         let (router, experts) = if sparse {
-            let expert_count = args
-                .num_experts
-                .ok_or_else(|| Error::backend("Gemma 4 sparse block has no expert count"))?;
-            let top_k = args
-                .top_k_experts
-                .ok_or_else(|| Error::backend("Gemma 4 sparse block has no top-k count"))?;
-            let router_prefix = format!("{prefix}.router");
-            let router_weight = format!("{router_prefix}.proj.weight");
-            let selector = TopKGroupSelectorSpec::new(
-                args.hidden_size,
-                ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-                crate::linear_format::standard_linear_format(
-                    &router_weight,
-                    args.linear_format_for(&router_weight),
-                )?,
-                TopKGroupSelectionSpec::new(
-                    expert_count,
-                    top_k,
-                    GroupScoring::SelectedSoftmax,
-                    false,
-                )?,
-            )?
-            .with_input_transform(SelectorInputTransformSpec::new(
-                args.rms_norm_eps,
-                ParameterSpec::trainable(format!("{router_prefix}.scale"))
-                    .map_err(Error::backend)?,
-                true,
-            )?)
-            .with_coefficient_scale(
-                ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
-                    .map_err(Error::backend)?,
-            );
+            let selector = selector_spec(args, layer, layer_root)?;
             let router = B::top_k_group_selector(selector, context)?;
             let spec = match routed_spec {
                 Some(spec) => spec,
@@ -714,6 +698,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
             input,
             pass,
             None,
+            None,
             context,
             instrumentation,
             |experts, request| {
@@ -767,6 +752,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
             input,
             pass,
             Some(parallel),
+            None,
             context,
             instrumentation,
             |experts, request| {
@@ -827,11 +813,81 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         )
     }
 
+    /// Executes shared block parameters with an invocation-specific residual
+    /// scale. Encoder/decoder sharing does not duplicate the learned matrices.
+    pub fn forward_with_layer_scalar<C, P>(
+        &mut self,
+        input: BlockInput<'_, B::Tensor, C>,
+        scalar: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        P: ParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_inner(
+            input,
+            pass,
+            None,
+            Some(scalar),
+            context,
+            instrumentation,
+            |experts, request| {
+                provider
+                    .forward_grouped(experts, request, context)
+                    .map_err(Error::backend_source)
+            },
+        )
+    }
+
+    /// Executes the same invocation-specific scale with rank-local projections
+    /// and the retained distributed expert provider.
+    pub fn forward_parallel_with_layer_scalar<C, P>(
+        &mut self,
+        input: BlockInput<'_, B::Tensor, C>,
+        scalar: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        P: TensorParallelParameterProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_inner(
+            input,
+            pass,
+            Some(parallel),
+            Some(scalar),
+            context,
+            instrumentation,
+            |experts, request| {
+                let value = provider
+                    .forward_grouped_tensor_parallel(
+                        experts,
+                        request,
+                        B::parallel_size(parallel),
+                        context,
+                    )
+                    .map_err(Error::backend_source)?;
+                eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(value, parallel, context)
+            },
+        )
+    }
+
     fn forward_inner<C, F>(
         &mut self,
         input: BlockInput<'_, B::Tensor, C>,
         pass: ExpertPass,
         parallel: Option<&B::ParallelContext>,
+        scalar: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
         execute_experts: F,
@@ -981,7 +1037,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
             hidden = hidden.add(&media, context)?;
         }
         let hidden = instrumentation.apply("residual.before_scale", hidden)?;
-        let hidden = hidden.multiply(self.layer_scalar.as_ref(), context)?;
+        let format = hidden.element_type();
+        let hidden = hidden.multiply(scalar.unwrap_or(self.layer_scalar.as_ref()), context)?;
+        let hidden = match format {
+            Some(format) => hidden.cast_float(format, context)?,
+            None => hidden,
+        };
         instrumentation.apply("residual.scaled", hidden)
     }
 }
@@ -1004,7 +1065,7 @@ pub(crate) fn localized_expert_bank_spec(
     expert_bank_spec(args, layer)?.with_group_geometry(expert_count, intermediate_dimensions)
 }
 
-fn expert_bank_spec_at(
+pub(crate) fn expert_bank_spec_at(
     args: &ModelArgs,
     experts_prefix: &str,
 ) -> Result<GroupedGatedProductSpec, Error> {
@@ -1031,4 +1092,46 @@ fn expert_bank_spec_at(
             down: standard_expert_projection(&down_name, None, args.linear_format_for(&down_name))?,
         },
     )
+    .map(|spec| spec.with_reduction(args.expert_reduction))
+}
+
+/// Exact routing declaration consumed by ordinary sparse blocks.
+pub(crate) fn selector_spec(
+    args: &ModelArgs,
+    layer: usize,
+    layer_root: &str,
+) -> Result<TopKGroupSelectorSpec, Error> {
+    let expert_count = args
+        .num_experts
+        .ok_or_else(|| Error::backend("sparse layer has no expert count"))?;
+    let top_k = args
+        .top_k_experts
+        .ok_or_else(|| Error::backend("sparse layer has no selection width"))?;
+    let router_prefix = format!("{layer_root}.{layer}.router");
+    let router_weight = format!("{router_prefix}.proj.weight");
+    let selector = TopKGroupSelectorSpec::new(
+        args.hidden_size,
+        ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+        crate::linear_format::standard_linear_format(
+            &router_weight,
+            args.linear_format_for(&router_weight),
+        )?,
+        TopKGroupSelectionSpec::new(
+            expert_count,
+            top_k,
+            args.routing_scoring,
+            args.normalize_selected_routes,
+        )?,
+    )?
+    .with_arithmetic(args.routing_arithmetic)
+    .with_input_transform(SelectorInputTransformSpec::new(
+        args.rms_norm_eps,
+        ParameterSpec::trainable(format!("{router_prefix}.scale")).map_err(Error::backend)?,
+        true,
+    )?)
+    .with_coefficient_scale(
+        ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
+            .map_err(Error::backend)?,
+    );
+    Ok(selector)
 }

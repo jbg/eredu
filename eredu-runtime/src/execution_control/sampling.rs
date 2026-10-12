@@ -46,6 +46,13 @@ impl ValidatedSamplingOverride {
 /// Minimal native mechanism; ordinary sampling and snapshot state keep their
 /// existing owners. Errors must preserve the previous logical sampling state.
 pub trait TextSamplingControlBackend: TextGenerationBackend {
+    /// Statistical meaning of the selected commitment scores. Iterative position
+    /// finalization does not admit a causal sampler temperature override.
+    fn sampling_score_kind(
+        _runtime: &ModelRuntime<Self>,
+    ) -> eredu_core::refinement::PredictionScoreKind {
+        eredu_core::refinement::PredictionScoreKind::CausalConditional
+    }
     /// Side-effect-free facts for the installed sampling state.
     fn sampling_control_facts(state: &Self::TextGenerationState) -> SamplingStateFacts;
     /// Prepares any replacement key and proves completion through the existing
@@ -61,6 +68,9 @@ pub trait TextSamplingControlBackend: TextGenerationBackend {
 /// Invalid policy is rejected before any native operation or state change.
 #[derive(Debug, thiserror::Error)]
 pub enum SamplingOverrideError<E: std::error::Error + 'static> {
+    /// Position finalization has an architecture-controlled refinement schedule.
+    #[error("temperature overrides require causal conditional scores; use the refinement policy for iterative generation")]
+    RequiresCausalConditionalScores,
     /// Invalid or incompatible temperature/RNG policy.
     #[error("invalid sampling override: {0}")]
     Invalid(&'static str),
@@ -124,6 +134,12 @@ pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
         ));
     }
     let action = validate_sampling_override(B::sampling_control_facts(state), request)?;
+    if request.temperature.is_some()
+        && B::sampling_score_kind(runtime)
+            != eredu_core::refinement::PredictionScoreKind::CausalConditional
+    {
+        return Err(SamplingOverrideError::RequiresCausalConditionalScores);
+    }
     B::install_sampling_override(runtime, state, action).map_err(SamplingOverrideError::Backend)?;
     Ok(B::sampling_control_facts(state))
 }

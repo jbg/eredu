@@ -586,6 +586,7 @@ impl eredu::api::ContinuationForecastBackend for MockBackend {
                 plan: eredu::api::ContinuationMemoryPlan {
                     current_positions: position,
                     additional_input_tokens,
+                    query_tokens: 1,
                     current_state: MemoryBytes::estimated(
                         0,
                         4096 + 32 * position,
@@ -679,6 +680,7 @@ fn continuation_estimator_keeps_unknown_growth_and_checks_overflow() {
     let mut plan = ContinuationMemoryPlan {
         current_positions: 17,
         additional_input_tokens: 3,
+        query_tokens: 1,
         current_state: MemoryBytes::estimated(0, 65536, "retained backing after a longer prefix"),
         peak_state: MemoryBytes::unknown("unsupported native growth"),
     };
@@ -748,6 +750,7 @@ fn continuation_native_envelope_bounds_interior_remainder_state() {
     let plan = ContinuationMemoryPlan {
         current_positions: 17,
         additional_input_tokens: 7,
+        query_tokens: 1,
         current_state: MemoryBytes::estimated(0, 64, "allocated capacity"),
         peak_state: MemoryBytes::estimated(0, 128, "interior peak including retained capacity"),
     };
@@ -784,6 +787,7 @@ fn continuation_payload_floors_cover_installed_state_without_capacity_or_optiona
     let native = ContinuationMemoryPlan {
         current_positions: 39,
         additional_input_tokens: 2,
+        query_tokens: 1,
         current_state: MemoryBytes::estimated(0, 65536, "native installed capacity"),
         peak_state: MemoryBytes::estimated(0, 131072, "native growth envelope"),
     };

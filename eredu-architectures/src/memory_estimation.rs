@@ -36,36 +36,25 @@ pub fn selected_generation_memory_geometry(
             "ordinary module invocation topology is unavailable; persistent state remains described".into(),
         );
     }
+    let state = text.state().layout();
+    geometry.state_layout = StateMemoryLayout::new(
+        state.layers().clone(),
+        state.layer_prefix_offsets(),
+        geometry.state_layout.hidden_size,
+        geometry.state_layout.allocation_granularity,
+        geometry.state_layout.completeness,
+    )?;
     if execution.parallel_topology().is_some() {
-        geometry.state_layout = StateMemoryLayout::new(
-            eredu_core::LayerSchedule::empty(),
-            Vec::new(),
-            geometry.state_layout.hidden_size,
-            1,
-            geometry.state_layout.completeness,
-        )?;
-        geometry.execution_topology = None;
-        geometry
-            .assumptions
-            .push("rank-local invocation topology is unavailable".into());
-    } else {
-        let state = text.state().layout();
-        geometry.state_layout = StateMemoryLayout::new(
-            state.layers().clone(),
-            state.layer_prefix_offsets(),
-            geometry.state_layout.hidden_size,
-            geometry.state_layout.allocation_granularity,
-            geometry.state_layout.completeness,
-        )?;
+        geometry.assumptions.push(
+            "invocation workspace and logical state use an unpartitioned conservative envelope; selected parameter residency remains rank-local".into(),
+        );
     }
     if !matches!(
         text.state().policy(),
         eredu_runtime::CacheResidencyPolicy::Device
-    ) || !execution.bounded_residency_exclusions().is_empty()
-    {
-        geometry.execution_topology = None;
+    ) {
         geometry.assumptions.push(
-            "selected state or weight residency does not provide an invocation lifetime contract"
+            "logical cache payload excludes mechanism-specific offload staging and transport"
                 .into(),
         );
     }
@@ -82,32 +71,7 @@ pub fn selected_generation_memory_geometry(
                 projection.format = *format;
             }
         };
-        update(&mut topology.output);
-        for layer in &mut topology.layers {
-            layer.input_projections.iter_mut().for_each(&update);
-            match &mut layer.mixer {
-                TokenMixerTopology::Attention { projections, .. }
-                | TokenMixerTopology::GatedDelta { projections, .. }
-                | TokenMixerTopology::GatedConvolution { projections, .. } => {
-                    projections.iter_mut().for_each(&update)
-                }
-                TokenMixerTopology::Unknown { .. } => {}
-            }
-            match &mut layer.feed_forward {
-                FeedForwardTopology::Gated { projections, .. } => {
-                    projections.iter_mut().for_each(&update)
-                }
-                FeedForwardTopology::Routed {
-                    projections,
-                    router,
-                    ..
-                } => {
-                    projections.iter_mut().for_each(&update);
-                    update(router);
-                }
-                FeedForwardTopology::Unknown { .. } => {}
-            }
-        }
+        topology.visit_projections_mut(update);
         let nominal = text.state().floating_dtype().map(|d| d.bytes().get());
         let wider = text.materialization_tasks().iter().any(|task| {
             let dtype = task
@@ -178,6 +142,10 @@ pub fn generation_memory_geometry(
         | (None, Some(GgufModelConfig::DeepSeekV3(args))) => crate::capability::deepseek_v3(args)?,
         (Some(SafetensorsModelConfig::DeepSeekV4(args)), None)
         | (None, Some(GgufModelConfig::DeepSeekV4(args))) => crate::capability::deepseek_v4(args)?,
+        (Some(SafetensorsModelConfig::DiffusionGemma(args)), None)
+        | (None, Some(GgufModelConfig::DiffusionGemma(args))) => {
+            crate::capability::diffusion_gemma(args)?
+        }
         (Some(SafetensorsModelConfig::Gemma4(args)), None)
         | (None, Some(GgufModelConfig::Gemma4(args))) => crate::capability::gemma4(args)?,
         (Some(SafetensorsModelConfig::Gemma2(args)), None)

@@ -77,6 +77,7 @@ fn stack(
     layers: Vec<TextLayerTopology>,
 ) -> Result<TextExecutionTopology, Error> {
     Ok(TextExecutionTopology {
+        iterative: None,
         hidden_size: config.hidden_size as u64,
         vocabulary_size: config.vocab_size as u64,
         layers,

@@ -53,6 +53,8 @@ pub mod observation;
 pub mod realtime;
 /// Typed categorical and dense realtime channel declarations.
 pub mod realtime_channels;
+/// Iterative token-block generation policy and tentative-output records.
+pub mod refinement;
 /// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
 /// Neutral resource identities, placement, payload and allocation-capacity bounds.
@@ -108,11 +110,12 @@ pub use backend::{
     InspectableBackendSession, ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend,
     ModelRuntime, MultimodalPreparationBackend, MultimodalPreparationFailure, PendingTextInput,
     PrefillChunkPolicy, PreparedModel, SelectedModelPreparation, SessionCapabilities,
-    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextContinuationBoundary,
-    TextContinuationError, TextContinuationIdentity, TextDriverIdentity, TextGeneration,
-    TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation, TextGenerationDriver,
-    TextSamplingStrategy, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
-    TokenSamplingDecision, ValueDescriptor,
+    SessionCapabilityError, SpeculativeTokenFilterController, Submission, TextAdvancement,
+    TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
+    TextGeneration, TextGenerationBackend, TextGenerationConfig, TextGenerationContinuation,
+    TextGenerationDriver, TextOperationError, TextOperationKind, TextOperationOutput,
+    TextOperationPolicyError, TextProgress, TextSamplingStrategy, TokenFilter,
+    TokenFilterController, TokenFilterError, TokenOutput, TokenSamplingDecision, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, estimate_runtime_state_payload_lower_bound,

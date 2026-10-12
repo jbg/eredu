@@ -16,6 +16,12 @@ pub struct MlxTextSamplingState {
     pub(super) next_prediction: u64,
     /// Parameter version bound on first submission and preserved by snapshots.
     pub(super) parameter_epoch: Option<u64>,
+    pub(super) refinement_seed: u64,
+    pub(super) refinement_policy: eredu_core::refinement::RefinementConfig,
+    pub(super) draft_events: bool,
+    pub(super) refinement: Option<
+        eredu_runtime::generation::refinement::block::BlockRefinementState<MlxSamplingBackend>,
+    >,
 }
 
 #[derive(Clone)]

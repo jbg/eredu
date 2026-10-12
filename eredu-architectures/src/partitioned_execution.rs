@@ -1,6 +1,7 @@
 //! Architecture-owned admission and typed handoff for partitioned execution.
 
 mod deepseek_dense;
+mod diffusion;
 #[path = "partitioned_parameters.rs"]
 mod parameter_access;
 pub(crate) mod qwen4_exp;
@@ -576,7 +577,7 @@ where
     }
 }
 
-/// Exact invocation-independent contract for one published model output.
+/// Selected output-projection contract, with architecture-owned invocation widths.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PublicationValueDescriptor {
     output_width: i32,
@@ -918,6 +919,7 @@ where
     primary_ingress_collectives: Option<Vec<crate::composite_execution::CompositeTensorCollective>>,
     batch_size: i32,
     sequence_length: i32,
+    publication_shape: [i32; 3],
     forward: Option<eredu_runtime::LayeredForwardState<B::Tensor, A::ForwardContext>>,
     group_outputs: Vec<Option<B::Tensor>>,
     pending_group_boundaries: Vec<Option<(usize, ResolvedBoundaryWireSchema, Vec<B::Tensor>)>>,
@@ -1124,6 +1126,14 @@ where
             .ok_or_else(|| {
                 eredu_nn::Error::backend("composite primary invocation length is invalid")
             })?;
+        let width = self
+            .architecture
+            .inner()
+            .prepared_publication_width(input)
+            .map_err(eredu_nn::Error::backend)?
+            .unwrap_or(self.publication.output_width());
+        let publication_shape =
+            PublicationValueDescriptor::new(width)?.shape(batch_size, sequence_length)?;
         Ok(CompositePartitionPass {
             input: Some(input),
             group_activity,
@@ -1133,6 +1143,7 @@ where
             primary_ingress_collectives,
             batch_size,
             sequence_length,
+            publication_shape,
             forward: None,
             group_outputs: (0..self.units.len()).map(|_| None).collect(),
             pending_group_boundaries: (0..self.units.len()).map(|_| None).collect(),
@@ -1247,6 +1258,9 @@ where
                     "composite inactive pipeline wave is outside its selected group schedule",
                 )
             })?;
+            if operations.is_empty() {
+                return Ok(());
+            }
             let tensor_group = self.tensor_group.ok_or_else(|| {
                 eredu_nn::Error::backend(
                     "composite group collective wave has no selected tensor group",
@@ -2070,9 +2084,7 @@ where
         let forward = pass.forward.ok_or_else(|| {
             eredu_nn::Error::backend("composite partition executed no local group")
         })?;
-        let expected = self
-            .publication
-            .shape(pass.batch_size, pass.sequence_length)?;
+        let expected = pass.publication_shape;
         let output = match pass.final_output {
             Some(output) if output.shape() == expected => output,
             Some(output) => {
@@ -5969,6 +5981,10 @@ fn composite_partitioned_state_layout(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "composite artifact has no normalized family configuration".to_owned())?;
     match config {
+        crate::replicated_text::CompositeConfig::Diffusion(args) => {
+            crate::diffusion_gemma::parallel::tensor_state_layout(args, rank)
+                .map_err(|error| error.to_string())
+        }
         crate::replicated_text::CompositeConfig::Gemma4(args) => {
             let base = crate::gemma4::pipeline::tensor_state_layout(&args.text, rank)?;
             let units = args
@@ -6052,6 +6068,18 @@ fn direct_partitioned_state_layout(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     rank: ParallelRankTopology,
 ) -> Result<Option<eredu_runtime::StateLayout>, String> {
+    if let Some(config) = crate::routed_text::diffusion_args(inspection) {
+        let parameters = crate::diffusion_gemma::parallel::parameter_description(config)
+            .map_err(|error| error.to_string())?;
+        let layout = derive_partitioned_local_layout(&parameters, rank)?;
+        return crate::diffusion_gemma::parallel::local_geometry(
+            config,
+            &layout,
+            0..config.text.num_hidden_layers(),
+        )
+        .map(|geometry| Some(geometry.state_layout().clone()))
+        .map_err(|error| error.to_string());
+    }
     match (
         inspection
             .architecture_plan()
@@ -6443,19 +6471,18 @@ fn communication_manifest(
         } else {
             vec![activation_dtype.clone(), TensorDtype::F32, TensorDtype::I32]
         };
+        // An owner can receive every rank's routes and submit that complete
+        // fan-in again when returning expert results to their source ranks.
+        let owner_exchange_elements = exchange_elements
+            .max(packed_rows)
+            .checked_mul(topology.expert())
+            .ok_or_else(|| "expert exchange fan-in geometry overflowed".to_owned())?;
         let exchange = CommunicationOperationRequirement::tensors(
             CommunicationOperation::VariableAllToAll,
             exchange_dtypes,
-            CommunicationTensorLimits::new(
-                1,
-                2,
-                exchange_elements.max(packed_rows),
-                Some(packed_rows),
-            )
-            .and_then(|limits| {
-                limits.with_output_tensor_elements(exchange_elements.max(packed_rows))
-            })
-            .map_err(|error| error.to_string())?,
+            CommunicationTensorLimits::new(1, 2, owner_exchange_elements, Some(packed_rows))
+                .and_then(|limits| limits.with_output_tensor_elements(owner_exchange_elements))
+                .map_err(|error| error.to_string())?,
             true,
         )
         .map_err(|error| error.to_string())?;
@@ -8542,7 +8569,7 @@ where
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     V: PartitionedArchitectureVisitor<B, S>,
@@ -8570,6 +8597,10 @@ where
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::DiffusionGemma(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DiffusionGemma(args))) => {
+            diffusion::prepare_dense::<B, S, V>(args, selected, store, context, visitor)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args))) => {
             deepseek_dense::prepare::<B, S, V>(args, selected, store, context, visitor)
@@ -8766,7 +8797,7 @@ where
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     V: PartitionedArchitectureVisitor<B, S>,
@@ -9817,7 +9848,7 @@ where
         .map_err(DenseDecoderPartitionedDispatchError::Visitor)
 }
 
-fn validate_transform_parameter_space(
+pub(crate) fn validate_transform_parameter_space(
     source: &eredu_runtime::ArchitectureParameterDescription,
     target: &eredu_runtime::ArchitectureParameterDescription,
 ) -> Result<(), String> {
@@ -9883,6 +9914,10 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args))) => {
             args.vision.is_none() && !args.text.is_moe() && args.text.mtp_num_hidden_layers == 0
         }
+        (Some(crate::configuration::SafetensorsModelConfig::DiffusionGemma(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DiffusionGemma(args))) => {
+            args.vision.is_none() && !args.has_sparse_moe_layers()
+        }
         _ => false,
     }
 }
@@ -9921,6 +9956,10 @@ pub fn is_supported_routed_decoder_partition(plan: &ArtifactArchitecturePlan) ->
         }
         (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(args)), None) => {
             args.num_nextn_predict_layers == 0 && plan.prediction_extension().is_none()
+        }
+        (Some(crate::configuration::SafetensorsModelConfig::DiffusionGemma(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DiffusionGemma(args))) => {
+            args.vision.is_none() && args.has_sparse_moe_layers()
         }
         _ => false,
     }
@@ -10053,7 +10092,7 @@ where
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::BlockwiseAttentionBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + eredu_nn::CompressedAttentionCache<B::Tensor>
         + eredu_runtime::RuntimeStateComponents<B>,
     V: RoutedPartitionedProductionVisitor<B, S>,
@@ -10071,6 +10110,15 @@ where
         crate::replicated_text::StoreHandoffScope::Primary,
     )
     .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+    if let Some(config) = crate::routed_text::diffusion_args(inspection) {
+        return diffusion::prepare_routed::<B, S, _>(
+            config,
+            selected,
+            store,
+            context,
+            OrdinaryFamilyRoutedPartitionVisitor(visitor),
+        );
+    }
     match (
         inspection
             .architecture_plan()

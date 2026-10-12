@@ -60,6 +60,9 @@ pub fn routed_composite_partition_supported(
             })
     ) || matches!(
         composite_config(plan),
+        Ok(Some(CompositeConfig::Diffusion(args))) if args.has_sparse_moe_layers()
+    ) || matches!(
+        composite_config(plan),
         Ok(Some(CompositeConfig::QwenVl(args))) if args.text.is_moe()
     ) || matches!(
         composite_config(plan),
@@ -112,6 +115,7 @@ pub fn composite_partitioned_production_decision(
         );
     }
     match composite_config(plan) {
+        Ok(Some(CompositeConfig::Diffusion(_))) => CompositePartitionedProductionDecision::Resident,
         Ok(Some(CompositeConfig::Gemma4(_))) => CompositePartitionedProductionDecision::Resident,
         Ok(Some(CompositeConfig::QwenVl(_))) => CompositePartitionedProductionDecision::Resident,
         Ok(Some(CompositeConfig::Muse(args))) if !routed && !args.is_moe() => {
@@ -1554,7 +1558,7 @@ pub fn visit_authoritative_composite_partition<B, S, V>(
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState: AttentionCache<B::Tensor>
+    S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>
         + RuntimeStateComponents<B>
         + AuxiliaryConvolutionState<B::Tensor>,
     V: AuthoritativeCompositePartitionVisitor<B, S>,
@@ -1650,6 +1654,203 @@ where
     }
 
     match config {
+        CompositeConfig::Diffusion(source) => {
+            let args = source.with_checkpoint_formats(target_formats);
+            let description =
+                crate::diffusion_gemma::composite::Model::<B>::new(args.clone(), context).map_err(
+                    |error| CompositePartitionPreparationError::Architecture(error.to_string()),
+                )?;
+            let parameters = ArchitectureParameters::parameter_description(&description, context)
+                .map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            let rank = selected.requirements().topology();
+            let layout = derive_partitioned_local_layout(&parameters, rank)
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            let groups = selected.requirements().groups();
+            let text_units = groups
+                .iter()
+                .find(|group| {
+                    group.group().as_str() == crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP
+                })
+                .map(|group| group.units())
+                .unwrap_or(0..0);
+            let vision_units = groups
+                .iter()
+                .find(|group| {
+                    group.group().as_str()
+                        == crate::diffusion_gemma::composite::VISION_EXECUTION_GROUP
+                })
+                .map(|group| group.units())
+                .unwrap_or(0..0);
+            let text = crate::diffusion_gemma::parallel::local_geometry(
+                &args,
+                &layout,
+                text_units.clone(),
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let complete_state = crate::diffusion_gemma::parallel::tensor_state_layout(&args, rank)
+                .map_err(|error| {
+                    CompositePartitionPreparationError::Architecture(error.to_string())
+                })?;
+            let geometry = crate::diffusion_gemma::parallel::CompositeGeometry {
+                text,
+                vision_units: vision_units.clone(),
+                complete_state,
+            };
+            let mut architecture = crate::diffusion_gemma::composite::Model::<B>::new_parallel(
+                args.clone(),
+                geometry.clone(),
+                context,
+            )
+            .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
+            let realization = if routed {
+                Some(
+                    architecture
+                        .expert_realization_plan(rank)
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?
+                        .ok_or_else(|| {
+                            CompositePartitionPreparationError::Architecture(
+                                "selected routed shared stack has no expert realization".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            if let Some(realization) = &realization {
+                architecture = architecture
+                    .with_expert_realization(realization.clone())
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+            }
+            let routed_execution = realization
+                .clone()
+                .map(|plan| {
+                    let owners = plan
+                        .unit_specs()
+                        .keys()
+                        .map(|(_, unit)| (*unit, *unit))
+                        .collect();
+                    prepared_gated_composite_execution::<B, S, _>(
+                        &selected,
+                        &architecture,
+                        &layout,
+                        plan,
+                        owners,
+                        args.text.num_hidden_layers(),
+                        args.text.hidden_size as usize,
+                    )
+                })
+                .transpose()
+                .map_err(CompositePartitionPreparationError::Architecture)?;
+            let source_architecture =
+                if selected
+                    .base()
+                    .execution()
+                    .parameters()
+                    .iter()
+                    .any(|parameter| {
+                        matches!(
+                            parameter.lowering(),
+                            eredu_runtime::WeightLoweringKind::Transform
+                                | eredu_runtime::WeightLoweringKind::DerivedTransform
+                        )
+                    })
+                {
+                    let source_model =
+                        crate::diffusion_gemma::composite::Model::<B>::new(source.clone(), context)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    let source_parameters =
+                        source_model
+                            .parameter_description(context)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?;
+                    crate::partitioned_execution::validate_transform_parameter_space(
+                        &source_parameters,
+                        &parameters,
+                    )
+                    .map_err(CompositePartitionPreparationError::Architecture)?;
+                    let source_layout =
+                        crate::partitioned_execution::derive_partitioned_transform_source_layout(
+                            &source_parameters,
+                            &parameters,
+                            rank,
+                        )
+                        .map_err(CompositePartitionPreparationError::Architecture)?;
+                    let source_text = crate::diffusion_gemma::parallel::local_geometry(
+                        source,
+                        &source_layout,
+                        text_units,
+                    )
+                    .map_err(|error| {
+                        CompositePartitionPreparationError::Architecture(error.to_string())
+                    })?;
+                    if source_text.state_layout() != geometry.text.state_layout() {
+                        return Err(CompositePartitionPreparationError::Architecture(
+                            "transform source changes shared context geometry".into(),
+                        ));
+                    }
+                    let source_geometry = crate::diffusion_gemma::parallel::CompositeGeometry {
+                        text: source_text,
+                        vision_units,
+                        complete_state: geometry.complete_state.clone(),
+                    };
+                    let mut source_model =
+                        crate::diffusion_gemma::composite::Model::<B>::new_parallel(
+                            source.clone(),
+                            source_geometry,
+                            context,
+                        )
+                        .map_err(|error| {
+                            CompositePartitionPreparationError::Architecture(error.to_string())
+                        })?;
+                    if routed {
+                        let source_plan = source_model
+                            .expert_realization_plan(rank)
+                            .map_err(|error| {
+                                CompositePartitionPreparationError::Architecture(error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                CompositePartitionPreparationError::Architecture(
+                                    "source shared stack has no routed realization".into(),
+                                )
+                            })?;
+                        source_model =
+                            source_model
+                                .with_expert_realization(source_plan)
+                                .map_err(|error| {
+                                    CompositePartitionPreparationError::Architecture(
+                                        error.to_string(),
+                                    )
+                                })?;
+                    }
+                    Some((Box::new(source_model), source_layout))
+                } else {
+                    None
+                };
+            let capability = crate::capability::diffusion_gemma(&args).map_err(|error| {
+                CompositePartitionPreparationError::Architecture(error.to_string())
+            })?;
+            prepare!(
+                architecture,
+                parameters,
+                layout,
+                geometry,
+                capability,
+                "diffusion_gemma".to_owned(),
+                args.text.vocab_size,
+                |_| Ok::<(), String>(()),
+                routed_execution,
+                source_architecture
+            )
+        }
         CompositeConfig::Gemma4(source) => {
             let mut exact = source.clone();
             if let Some(audio) = exact.audio.as_mut() {
@@ -3275,11 +3476,12 @@ where
                 source_architecture
             )
         }
-        CompositeConfig::Gemma4(_) | CompositeConfig::Muse(_) | CompositeConfig::QwenVl(_) => {
-            Err(CompositePartitionPreparationError::Architecture(
-                "composite partition does not admit an embedded prediction extension".into(),
-            ))
-        }
+        CompositeConfig::Diffusion(_)
+        | CompositeConfig::Gemma4(_)
+        | CompositeConfig::Muse(_)
+        | CompositeConfig::QwenVl(_) => Err(CompositePartitionPreparationError::Architecture(
+            "composite partition does not admit an embedded prediction extension".into(),
+        )),
     }
 }
 

@@ -57,6 +57,8 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
     /// Upper bound on input tokens submitted by the next `predictions` decisions,
     /// including the pending prompt or last committed token exactly once.
     fn continuation_input_tokens(
+        _runtime: &ModelRuntime<Self>,
+        _sampling: &Self::SamplingState,
         _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
         _predictions: u64,
     ) -> Option<u64> {
@@ -196,6 +198,16 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     > {
         driver.advance(&mut self.state)
     }
+    /// Advances one physical operation through the ordinary generation machine.
+    pub fn advance_operation(
+        &mut self,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+    ) -> Result<
+        Option<eredu_core::TextAdvancement<B::Token>>,
+        eredu_core::TextContinuationError<B::Error, C::Error>,
+    > {
+        driver.advance_operation(&mut self.state)
+    }
     /// Completes one nonfinal prompt chunk through the ordinary driver.
     pub fn advance_prefill(
         &mut self,
@@ -223,6 +235,11 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     > {
         driver.quiescent(&mut self.state)
     }
+    /// Completed physical-work and authoritative-output coordinates.
+    pub fn position(&self) -> eredu_core::refinement::GenerationPosition {
+        self.state.position()
+    }
+
     /// Canonical logical constraint state.
     pub fn controller(&self) -> &C {
         self.state.controller()
@@ -265,6 +282,7 @@ pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterContro
     pending: Option<PendingTextInput<B::Prompt, B::Token>>,
     controller: C,
     remaining_tokens: Option<usize>,
+    position: eredu_core::refinement::GenerationPosition,
     capture: Option<CaptureCheckpoint>,
     host_bytes: u64,
     _reservation: SnapshotReservation,
@@ -302,6 +320,8 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             .checked_sub(self.next_prediction())
             .ok_or(TextSnapshotError::InconsistentState)?;
         let input = B::continuation_input_tokens(
+            runtime,
+            &self.sampling,
             self.pending.as_ref().map(PendingTextInput::as_ref),
             predictions,
         )
@@ -329,6 +349,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let identity = boundary.identity();
         let driver = boundary.driver_identity();
         let remaining_tokens = boundary.remaining_tokens();
+        let position = boundary.position();
         let (runtime, state, pending) = boundary.parts();
         let discovery = B::capture_run(state)
             .map(|_| B::capture_discovery(runtime))
@@ -387,6 +408,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             pending,
             controller,
             remaining_tokens,
+            position,
             capture,
             host_bytes,
             _reservation: reservation,
@@ -486,7 +508,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             restore.commit();
         }
         B::install_sampling_state(state, sampling);
-        boundary.install_host_state(controller, pending, self.remaining_tokens);
+        boundary.install_host_state(controller, pending, self.remaining_tokens, self.position);
         Ok(host)
     }
 
@@ -613,7 +635,13 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             B::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
         let mut generation = B::assemble_generation_state(sampling, capture);
         let host = prepare(runtime, &mut generation)?;
-        let state = boundary.fork_host_state(generation, controller, pending, Some(remaining));
+        let state = boundary.fork_host_state(
+            generation,
+            controller,
+            pending,
+            Some(remaining),
+            self.position,
+        );
         Ok((
             TextContinuationBranch {
                 continuation: ManagedTextContinuation {

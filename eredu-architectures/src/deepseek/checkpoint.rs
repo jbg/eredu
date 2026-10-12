@@ -593,7 +593,9 @@ pub fn v3_unit_recipes<C: RecipeCatalog + ?Sized>(
         && (layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe))
     {
         let expert = v3_expert_recipes(catalog, args, layer)?;
-        recipes.extend(expert_materialization_recipes(catalog, &expert)?);
+        recipes.extend(
+            eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, &expert)?,
+        );
     }
     Ok(recipes)
 }
@@ -669,75 +671,6 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
 
 /// Carries encoded companions through the same expert stacking and gate/up
 /// concatenation as their weights. Source spellings remain family-owned here.
-pub(crate) fn expert_materialization_recipes<C: RecipeCatalog + ?Sized>(
-    catalog: &C,
-    bank: &GatedProductExpertRecipes,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
-    fn companion<C: RecipeCatalog + ?Sized>(
-        catalog: &C,
-        weight: &DerivedWeightRecipe,
-        bias: bool,
-    ) -> Result<Option<DerivedWeightRecipe>, String> {
-        let (axis, inputs, stack) = match weight {
-            DerivedWeightRecipe::Source {
-                key,
-                selection: TensorSelection::Full,
-            } => {
-                let prefix = key.strip_suffix(".weight").unwrap_or(key);
-                let names = if bias {
-                    vec![format!("{key}_biases"), format!("{prefix}.biases")]
-                } else {
-                    vec![
-                        format!("{key}_scale_inv"),
-                        format!("{key}_scales"),
-                        format!("{prefix}.weight_scale_inv"),
-                        format!("{prefix}.scale"),
-                        format!("{prefix}.scales"),
-                    ]
-                };
-                return Ok(names
-                    .into_iter()
-                    .find(|name| catalog.tensor_metadata(name).is_ok())
-                    .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full)));
-            }
-            DerivedWeightRecipe::Stack { axis, inputs } => (*axis, inputs, true),
-            DerivedWeightRecipe::Concatenate { axis, inputs } => (*axis, inputs, false),
-            _ => {
-                return Err("expert companion requires the selected full-source bank layout".into())
-            }
-        };
-        let mapped = inputs
-            .iter()
-            .map(|input| companion(catalog, input, bias))
-            .collect::<Result<Vec<_>, _>>()?;
-        if mapped.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-        let inputs = mapped
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| "encoded expert bank has an incomplete companion family".to_string())?;
-        Ok(Some(if stack {
-            DerivedWeightRecipe::Stack { axis, inputs }
-        } else {
-            DerivedWeightRecipe::Concatenate { axis, inputs }
-        }))
-    }
-    let mut outputs = BTreeMap::new();
-    for (target, weight) in [
-        (&bank.target_gate_up, &bank.gate_up),
-        (&bank.target_down, &bank.down),
-    ] {
-        outputs.insert(target.clone(), weight.clone());
-        for (suffix, bias) in [("scales", false), ("biases", true)] {
-            if let Some(recipe) = companion(catalog, weight, bias)? {
-                recipe.infer(catalog).map_err(|error| error.to_string())?;
-                outputs.insert(format!("{target}_{suffix}"), recipe);
-            }
-        }
-    }
-    Ok(outputs)
-}
 
 fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), String> {
     let target_layers = count(args.num_hidden_layers, "V4 target layer count")?;
@@ -948,7 +881,7 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
 ) -> Result<(), String> {
     let owner_group =
         eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
-    let outputs = expert_materialization_recipes(catalog, bank)?;
+    let outputs = eredu_checkpoint::expert::gated_product_materialization_recipes(catalog, bank)?;
     for expert in 0..experts {
         let parameters = super::encoded_expert_residency::unit_parameters(
             catalog,
@@ -2087,7 +2020,9 @@ mod tests {
                 },
             )
             .unwrap();
-            let outputs = expert_materialization_recipes(&catalog, &bank).unwrap();
+            let outputs =
+                eredu_checkpoint::expert::gated_product_materialization_recipes(&catalog, &bank)
+                    .unwrap();
             assert_eq!(outputs.len(), 4);
             let scales = outputs["bank.gate_up_scales"].infer(&catalog).unwrap();
             assert_eq!(
@@ -2198,9 +2133,11 @@ mod tests {
                 "experts.1.w3.{}",
                 if mx { "scale" } else { "weight_scale_inv" }
             ));
-            assert!(expert_materialization_recipes(&catalog, &bank)
-                .unwrap_err()
-                .contains("incomplete companion"));
+            assert!(
+                eredu_checkpoint::expert::gated_product_materialization_recipes(&catalog, &bank)
+                    .unwrap_err()
+                    .contains("incomplete companion")
+            );
         }
     }
 

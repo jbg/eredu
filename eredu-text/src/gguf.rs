@@ -71,7 +71,7 @@ pub fn from_metadata(
         .unwrap_or_default();
 
     let mut tokenizer = match (architecture, model_type) {
-        ("gemma2" | "gemma4" | "gemma4_assistant" | "gemma4-assistant", _) => {
+        ("gemma2" | "gemma4" | "gemma4_assistant" | "gemma4-assistant" | "diffusion-gemma", _) => {
             build_gemma(tokens, metadata)?
         }
         ("llama", _) => build_llama(tokens, metadata)?,
@@ -225,6 +225,32 @@ fn build_gemma(
     tokens: &[String],
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<Tokenizer, Error> {
+    if let Some(merges) = metadata
+        .get("tokenizer.ggml.merges")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        let mut builder = BPE::builder()
+            .vocab_and_merges(vocab(tokens)?, parse_merges(merges)?)
+            .fuse_unk(true)
+            .byte_fallback(true);
+        if let Some(unknown) = special_token(metadata, tokens, "unknown_token_id")? {
+            builder = builder.unk_token(unknown);
+        }
+        let mut tokenizer = Tokenizer::new(builder.build()?);
+        let prefix = metadata_bool(metadata, "tokenizer.ggml.add_space_prefix")?.unwrap_or(false);
+        tokenizer.with_normalizer(Some(Replace::new(" ", "▁")?))?;
+        if prefix {
+            tokenizer.with_pre_tokenizer(Some(Metaspace::new('▁', PrependScheme::Always, false)));
+        } else {
+            tokenizer.with_pre_tokenizer(Some(Split::new(
+                SplitPattern::String(" ".into()),
+                SplitDelimiterBehavior::MergedWithPrevious,
+                false,
+            )?));
+        }
+        tokenizer.with_decoder(Some(gemma_decoder(prefix)?));
+        return Ok(tokenizer);
+    }
     let scores = required_scores(metadata, tokens.len())?;
     let vocabulary = tokens
         .iter()
@@ -784,7 +810,7 @@ mod tests {
 
     #[test]
     fn builds_gemma_unigram_tokenizer() {
-        for family in ["gemma2", "gemma4"] {
+        for family in ["gemma2", "gemma4", "diffusion-gemma"] {
             let metadata = sentencepiece_metadata(family);
             let loaded = from_metadata(&metadata).unwrap().unwrap();
             let encoding = loaded.tokenizer.encode("hi", false).unwrap();
@@ -827,6 +853,74 @@ mod tests {
             tokenizer.decode(encoding.get_ids(), false).unwrap(),
             "hi\nhi"
         );
+    }
+
+    #[test]
+    fn gemma_bpe_merges_preserve_cross_word_and_newline_tokens() {
+        let mut metadata = sentencepiece_metadata("diffusion-gemma");
+        metadata.remove("tokenizer.ggml.scores");
+        metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::String(
+                ["<unk>", "▁", "a", "b", "ab", "▁ab", "ab▁ab", "\n", "\n\n"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::String(
+                ["a b", "▁ ab", "ab ▁ab", "\n \n"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )),
+        );
+        metadata.insert(
+            "tokenizer.ggml.add_space_prefix".into(),
+            GgufMetadataValue::Bool(false),
+        );
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        let encoded = tokenizer.encode("ab ab\n\n", false).unwrap();
+        assert_eq!(encoded.get_ids(), [6, 8]);
+        assert_eq!(
+            tokenizer.decode(encoded.get_ids(), false).unwrap(),
+            "ab ab\n\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned published GGUF and official tokenizer JSON"]
+    fn released_diffusion_gemma_bpe_matches_official_tokenizer() {
+        let path = std::env::var_os("EREDU_DIFFUSION_GGUF").expect("GGUF path");
+        let root = std::path::PathBuf::from(
+            std::env::var_os("EREDU_DIFFUSION_CHECKPOINT").expect("official checkpoint path"),
+        );
+        let checkpoint = eredu_gguf::Checkpoint::open(path).unwrap();
+        let metadata = checkpoint
+            .metadata()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let actual = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        let expected = Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
+        for text in [
+            "Hello, world!",
+            "  leading  and trailing  ",
+            "line one\n\nline two\tend",
+            "España 日本語 👩‍💻",
+            "<bos><start_of_turn>user\nWhat is 2 + 2?<end_of_turn>\n",
+        ] {
+            let a = actual.encode(text, false).unwrap();
+            let b = expected.encode(text, false).unwrap();
+            assert_eq!(a.get_ids(), b.get_ids(), "{text:?}");
+            assert_eq!(
+                actual.decode(a.get_ids(), false).unwrap(),
+                expected.decode(b.get_ids(), false).unwrap(),
+                "{text:?}"
+            );
+        }
     }
 
     fn sentencepiece_metadata(architecture: &str) -> HashMap<String, GgufMetadataValue> {

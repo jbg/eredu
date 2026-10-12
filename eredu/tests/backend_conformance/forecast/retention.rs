@@ -59,6 +59,7 @@ pub(super) fn profile(runtime: &ModelRuntime<MockBackend>) -> LoadedMemoryProfil
         parameter: name.into(),
     };
     profile.geometry.execution_topology = Some(TextExecutionTopology {
+        iterative: None,
         hidden_size: 2,
         vocabulary_size: 2,
         layers: vec![TextLayerTopology {

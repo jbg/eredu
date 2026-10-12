@@ -18,7 +18,9 @@ pub use eredu_nn_macros::Parameterized;
 pub mod codebooks;
 
 mod indexed_attention;
+mod read_only_attention;
 pub use indexed_attention::{IndexedAttentionInput, LocalAttentionInput};
+pub use read_only_attention::{ReadOnlyAttentionCache, ReadOnlyCache};
 
 mod grouped_linear;
 mod grouped_units;
@@ -1532,6 +1534,18 @@ pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 
 /// Backend-native token embedding used by shared architectures.
 pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Forms an embedding from weights over vocabulary rows. The final input
+    /// axis equals the vocabulary; coefficients round to the materialized
+    /// embedding arithmetic before multiplication. This neither samples tokens
+    /// nor normalizes coefficients. Packed tables require bounded row access.
+    /// A vocabulary-partitioned table returns its local contribution, just as
+    /// lookup does; distributed composition sums contributions explicitly.
+    fn weighted_sum(&mut self, coefficients: &T, context: &T::Context) -> Result<T, Error> {
+        let _ = (coefficients, context);
+        Err(Error::backend(
+            "weighted embedding is not implemented by this backend",
+        ))
+    }
     /// Looks up token embeddings.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
     /// Looks up token embeddings under an explicit validation/sentinel policy.
@@ -1861,6 +1875,8 @@ impl RoutingArithmetic {
 }
 
 /// Learned normalization and scale applied before a selector projection.
+/// Weightless normalization uses FP32 for F16/BF16 inputs, then returns to the
+/// input type before scaling. Optional inverse-width scaling preserves that type.
 #[derive(Debug, Clone)]
 pub struct SelectorInputTransformSpec {
     /// Weightless RMS-normalization epsilon.
@@ -3941,8 +3957,10 @@ impl NeuralOperatorCapabilities {
     pub const SIN_COS: Self = Self(1 << 45);
     /// Forward real FFT returning separate F32 real and imaginary components.
     pub const RFFT: Self = Self(1 << 46);
+    /// Weighted vocabulary-row embedding, including packed tables.
+    pub const WEIGHTED_EMBEDDING: Self = Self(1 << 47);
     /// Every currently declared optional operation.
-    pub const ALL: Self = Self((1 << 47) - 1);
+    pub const ALL: Self = Self((1 << 48) - 1);
 
     /// Returns the union of two capability sets.
     pub const fn union(self, other: Self) -> Self {
@@ -3957,6 +3975,10 @@ impl NeuralOperatorCapabilities {
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
+            (
+                NeuralOperatorCapabilities::WEIGHTED_EMBEDDING,
+                "weighted_embedding",
+            ),
             (
                 NeuralOperatorCapabilities::ATTENTION_SOFTCAP,
                 "attention_softcap",
@@ -4460,6 +4482,7 @@ pub trait NeuralBackend: Sized + 'static {
     }
     /// Applies RMS normalization without a learned scale.
     /// The final feature axis must be nonempty, with finite, positive epsilon.
+    /// F16/BF16 reductions and normalization use FP32, with one final input-type cast.
     fn rms_norm_without_weight(
         input: &Self::Tensor,
         epsilon: f32,
@@ -4580,6 +4603,21 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Forms each rank's weighted vocabulary contribution and sums the complete
+    /// embedding. Coefficients contain the full, already-normalized vocabulary
+    /// distribution; every table selects its owned rows before multiplication.
+    fn vocabulary_parallel_weighted_sum(
+        embedding: &mut Self::Embedding,
+        coefficients: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        Self::sum_parallel(
+            embedding.weighted_sum(coefficients, context)?,
+            parallel,
+            context,
+        )
+    }
     /// Projects to local vocabulary rows and gathers complete logits.
     fn vocabulary_parallel_project(
         linear: &mut Self::Linear,
