@@ -84,7 +84,7 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
     for residency in [None, Some("--layerwise-host"), Some("--dense-disk-stream")] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_eredu"));
         command
-            .args(["--no-auto", "--device", "cpu", "--model"])
+            .args(["--no-auto", "--timing", "--device", "cpu", "--model"])
             .arg(root.path())
             .args(["--seed", "42", "--decisions"]);
         if residency == Some("--dense-disk-stream") {
@@ -116,6 +116,20 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for field in [
+            "prepare_seconds=",
+            "context_seconds=",
+            "refinement_seconds=",
+            "finish_seconds=",
+            "prompt_tokens=",
+            "canvas_tokens=32",
+        ] {
+            assert!(
+                stderr.contains(field),
+                "missing timing field {field}: {stderr}"
+            );
+        }
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["steps"], 2);
         assert_eq!(result["seed"], 42);

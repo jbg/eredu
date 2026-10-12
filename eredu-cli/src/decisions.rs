@@ -12,6 +12,7 @@ use std::{
     io::Read,
     ops::ControlFlow,
     path::Path,
+    time::Instant,
 };
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +270,9 @@ pub(crate) fn run<B: TextGenerationBackend>(
     model: &mut LoadedModel<B>,
     request: Request,
     seed_override: Option<u64>,
+    report_timing: bool,
 ) -> Result<Value> {
+    let started = Instant::now();
     let length = model
         .refinement_canvas_length()
         .context("the selected model does not support pinned block refinement")?
@@ -375,11 +378,19 @@ pub(crate) fn run<B: TextGenerationBackend>(
         }
         ControlFlow::Continue(())
     };
+    let prompt_tokens = prepared.prompt_token_ids().len();
+    let context_started = Instant::now();
+    let prepare_seconds = context_started.duration_since(started).as_secs_f64();
     let mut session =
         model.start_controlled_text(prepared, &[], Default::default(), &mut collect)?;
-    for _ in 0..=request.steps {
+    session.step(&mut collect)?;
+    let context_seconds = context_started.elapsed().as_secs_f64();
+    let refinement_started = Instant::now();
+    for _ in 0..request.steps {
         session.step(&mut collect)?;
     }
+    let refinement_seconds = refinement_started.elapsed().as_secs_f64();
+    let finish_started = Instant::now();
     session.cancel(&mut collect)?;
     drop(session);
     drop(collect);
@@ -409,6 +420,9 @@ pub(crate) fn run<B: TextGenerationBackend>(
         ensure!(label_mass.is_finite(), "invalid full-vocabulary label mass");
         value["label_mass"] = json!(label_mass.clamp(0.0, 1.0));
         answers.insert(question.id(), value);
+    }
+    if report_timing {
+        eprintln!("prepare_seconds={prepare_seconds:.3} context_seconds={context_seconds:.3} refinement_seconds={refinement_seconds:.3} finish_seconds={:.3} prompt_tokens={prompt_tokens} canvas_tokens={length}", finish_started.elapsed().as_secs_f64());
     }
     Ok(
         json!({"steps": request.steps, "seed": seed, "normalization": "allowed_labels", "answers": answers}),

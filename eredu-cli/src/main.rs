@@ -2268,7 +2268,12 @@ fn main() -> Result<()> {
     if let Some(request) = decision_request {
         let load_seconds = load_started.elapsed().as_secs_f64();
         let read_started = Instant::now();
-        let result = decisions::run(&mut model, request, args.common.seed)?;
+        let result = decisions::run(
+            &mut model,
+            request,
+            args.common.seed,
+            args.timing || args.verbose,
+        )?;
         if args.timing || args.verbose {
             eprintln!(
                 "load_seconds={load_seconds:.3} read_seconds={:.3}",

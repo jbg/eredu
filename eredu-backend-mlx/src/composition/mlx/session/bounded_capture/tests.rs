@@ -1024,3 +1024,46 @@ fn selected_position_scores_read_requested_row_and_reject_out_of_range() {
         .transform(&tensor, &invalid, &whole(&[1, 2, 3]))
         .is_err());
 }
+
+#[test]
+fn selected_scores_large_vocabulary_preserve_normalization_with_bounded_host_reads() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    // More than one batch and a partial chunk exercise both reduction boundaries.
+    let vocabulary = 1_048_579usize;
+    let mut values = vec![2000.0f32; vocabulary];
+    values[5] = 2004.0;
+    values[11] = 2003.0;
+    let tensor = MlxTensor::from_array(Array::from_slice(&values, &[1, vocabulary as i32]));
+    let native = NativeCapture {
+        partition: None,
+        stream: &stream,
+        domain: None,
+    };
+    HOST_READS.with(|reads| reads.set((0, 0)));
+    let CapturePayload::TokenScores(scores) = native.token_scores(&tensor, &[5, 11], None).unwrap()
+    else {
+        panic!()
+    };
+    let log_mass = ((vocabulary - 2) as f64 + 4.0f64.exp() + 3.0f64.exp()).ln();
+    assert!((scores.log_partition - (2000.0 + log_mass)).abs() < 1e-6);
+    for (score, delta, rank, alternative) in [
+        (&scores.scores[0], 4.0, 1, 11),
+        (&scores.scores[1], 3.0, 2, 5),
+    ] {
+        assert!((score.log_probability - (delta - log_mass)).abs() < 1e-6);
+        assert_eq!(score.rank, rank);
+        assert_eq!(
+            score.strongest_alternative.as_ref().unwrap().token_id,
+            alternative
+        );
+    }
+    let (total, largest) = HOST_READS.with(std::cell::Cell::get);
+    assert!(
+        largest <= CHUNK as usize,
+        "a reduction copied an unbounded host vector"
+    );
+    assert!(
+        total < 2048,
+        "score capture copied vocabulary-sized data to the host"
+    );
+}

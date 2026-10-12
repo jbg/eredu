@@ -42,15 +42,8 @@ impl NativeCapture<'_> {
         let maximum = scalar_f32(row.max(false, stream)?)?;
         let mut total = 0.0f64;
         let mut correction = 0.0f64;
-        for start in (0..vocabulary).step_by(CHUNK as usize) {
-            let end = start.saturating_add(CHUNK as i32).min(vocabulary);
-            let chunk = row.try_index_device(start..end, stream)?;
-            let sum = scalar_f32(
-                chunk
-                    .subtract(Array::from_f32(maximum as f32), stream)?
-                    .exp(stream)?
-                    .sum(false, stream)?,
-            )?;
+        let mut accumulate = |sum: f32| {
+            let sum = f64::from(sum);
             let next = total + sum;
             correction += if total.abs() >= sum.abs() {
                 (total - next) + sum
@@ -58,6 +51,37 @@ impl NativeCapture<'_> {
                 (sum - next) + total
             };
             total = next;
+        };
+        // Preserve F32 chunk reductions and compensated F64 aggregation, but
+        // transfer batches of chunk sums instead of synchronizing for each chunk.
+        // Host reads stay bounded by CHUNK, independently of vocabulary extent.
+        for start in (0..vocabulary).step_by((CHUNK * CHUNK) as usize) {
+            let end = start.saturating_add((CHUNK * CHUNK) as i32).min(vocabulary);
+            let complete = (end - start) / CHUNK as i32;
+            let boundary = start + complete * CHUNK as i32;
+            if complete > 0 {
+                let sums = row
+                    .try_index_device(start..boundary, stream)?
+                    .reshape(&[complete, CHUNK as i32], stream)?
+                    .subtract(Array::from_f32(maximum as f32), stream)?
+                    .exp(stream)?
+                    .sum_axis(1, false, stream)?;
+                #[cfg(test)]
+                record_host_read(complete as usize);
+                let sums = sums.evaluated()?;
+                for &sum in sums.as_slice::<f32>() {
+                    accumulate(sum);
+                }
+            }
+            if boundary < end {
+                let sum = scalar_f32(
+                    row.try_index_device(boundary..end, stream)?
+                        .subtract(Array::from_f32(maximum as f32), stream)?
+                        .exp(stream)?
+                        .sum(false, stream)?,
+                )?;
+                accumulate(sum as f32);
+            }
         }
         let log_mass = (total + correction).ln();
         let log_partition = maximum + log_mass;

@@ -183,6 +183,10 @@ Generation sampling flags, speculative drafting, ordinary prompt/tool options,
 and generation-specific memory/telemetry reports do not apply to decision reads
 and conflict with this mode. `--auto quick`, `--auto plan`, `--no-auto`, and
 `--timing` remain available; generation benchmarks do not measure decision reads.
+Timing output separates request preparation, context encoding, refinement and
+completion. Refinement timing includes score capture and sampler processing;
+context timing includes controlled-session setup. Prompt and canvas token counts
+help identify the amount of work performed.
 
 ## Native tool calls
 
