@@ -2240,7 +2240,8 @@ mod tests {
                 encoded_bytes: 1_000_000,
             };
             let plan = CapturePlan {
-                schema_version: 1,
+                schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: vec![CaptureSelection {
                     id: "selected".into(),
                     path: "units".into(),
@@ -2452,7 +2453,7 @@ mod tests {
             let mut ledger = CaptureLedger::new(&plan);
             let context = PartitionCaptureContext {
                 invocation: None,
-                artifact_identity: "source".into(),
+                artifact_identity: Some("source".into()),
                 execution_identity: "selected-world".into(),
                 run_identity: "run".into(),
                 overlay_identity: None,

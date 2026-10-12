@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "original-logits".into(),
             path: point.path.clone(),

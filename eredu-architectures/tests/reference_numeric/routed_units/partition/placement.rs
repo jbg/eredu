@@ -66,7 +66,8 @@ pub(super) fn plan(descriptor: &ArchitectureDescriptor) -> AdmittedCapturePlan {
         encoded_bytes: 1_000_000_000,
     };
     CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections,
         limits: CaptureLimits {
             per_step: usage,

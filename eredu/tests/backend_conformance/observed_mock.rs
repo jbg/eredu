@@ -2,6 +2,18 @@ use super::*;
 use eredu_core::capture::*;
 use eredu_core::intervention::*;
 
+thread_local! { static CONTENT_DISCOVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub(super) fn content_discovery() -> CaptureDiscovery {
+    CONTENT_DISCOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
+    discovery()
+}
+pub(super) fn reset_content_discovery_calls() {
+    CONTENT_DISCOVERY_CALLS.with(|calls| calls.set(0));
+}
+pub(super) fn content_discovery_calls() -> usize {
+    CONTENT_DISCOVERY_CALLS.with(std::cell::Cell::get)
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub sampling: Sampling,
@@ -85,7 +97,9 @@ pub(super) fn cost(shape: &[u64]) -> Result<CaptureUsage, CaptureError> {
 }
 
 pub(super) fn validate(plan: &AdmittedCapturePlan) -> Result<(), CaptureError> {
-    eredu_runtime::capture::validate_session(plan, &discovery(), |shape, _, _| cost(shape))
+    eredu_runtime::capture::validate_session(plan, &discovery().declarations(), |shape, _, _| {
+        cost(shape)
+    })
 }
 
 struct Mechanism;
@@ -402,7 +416,8 @@ pub(super) fn plan() -> CapturePlan {
         encoded_bytes: 1_000_000,
     };
     CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "summary".into(),
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

@@ -232,6 +232,7 @@ fn native_capture_forecasts_project_top_k_geometry_and_continuations() {
     };
     let mut capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "top-k".into(),
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

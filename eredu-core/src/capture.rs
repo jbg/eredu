@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Wire version for capture plans and records.
-pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
+pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
 
 /// Cold facts about a deferred observation source. Its borrowed prototype gives
 /// geometry only; it need not have the factory's actual element type.
@@ -353,11 +353,25 @@ pub struct CaptureLimits {
     pub on_limit: CaptureLimitPolicy,
 }
 
+/// Provenance requested for ordinary bounded observations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureProvenance {
+    /// Requests live session attribution without requesting content resolution.
+    #[default]
+    Session,
+    /// Requests content-exact source attribution for exported host records.
+    ContentExact,
+}
+
 /// Serializable request; only admission produces execution authority.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapturePlan {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
+    /// Session-bound by default; content-exact provenance is explicit.
+    #[serde(default)]
+    pub provenance: CaptureProvenance,
     /// Empty means none. There is deliberately no implicit capture-all mode.
     pub selections: Vec<CaptureSelection>,
     /// Mandatory storage, materialization, and export limits.
@@ -369,6 +383,7 @@ impl CapturePlan {
     pub fn none() -> Self {
         Self {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: CaptureProvenance::Session,
             selections: Vec::new(),
             limits: CaptureLimits {
                 per_step: CaptureUsage::default(),
@@ -798,7 +813,7 @@ impl AdmittedCapturePlan {
         }
     }
     /// Revalidates this same geometry authority against current selected discovery.
-    pub fn readmit(&self, discovery: &CaptureDiscovery) -> Result<Self, CaptureError> {
+    pub fn readmit(&self, discovery: &CaptureDeclarations) -> Result<Self, CaptureError> {
         self.plan.clone().admit_geometry(
             &discovery.catalog,
             &discovery.support,
@@ -1530,6 +1545,16 @@ pub struct CapturedStep {
     pub capture_seconds: f64,
 }
 
+/// Architecture and collector facts retained by one loaded execution.
+/// Reading these declarations does not resolve checkpoint content identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureDeclarations {
+    /// Architecture-declared points retained from preparation.
+    pub catalog: ObservationCatalog,
+    /// Support for the execution actually realized by the session.
+    pub support: ObservationSupportReport,
+}
+
 /// Retained discovery and exact source identity of the loaded session. Admission
 /// uses these facts rather than accepting an unrelated caller-supplied catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1540,4 +1565,14 @@ pub struct CaptureDiscovery {
     pub catalog: ObservationCatalog,
     /// Support for the execution actually realized by the session.
     pub support: ObservationSupportReport,
+}
+
+impl CaptureDiscovery {
+    /// Projects admission facts independently of content provenance.
+    pub fn declarations(&self) -> CaptureDeclarations {
+        CaptureDeclarations {
+            catalog: self.catalog.clone(),
+            support: self.support.clone(),
+        }
+    }
 }

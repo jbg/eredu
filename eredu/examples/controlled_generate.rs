@@ -88,6 +88,7 @@ pub fn run_example(
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "raw-logits".into(),
             path: target.clone(),

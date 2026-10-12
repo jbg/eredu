@@ -585,7 +585,8 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
         capture: CaptureCapabilities::default(),
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![],
         limits: CaptureLimits {
             per_step: CaptureUsage::default(),

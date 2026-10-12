@@ -31,6 +31,7 @@ fn check_speculative_control_delivery<'world>(
         options.capture = Some(
             CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: vec![CaptureSelection {
                     id: "sampling-budget".into(),
                     path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
@@ -108,8 +109,7 @@ fn check_speculative_control_delivery<'world>(
         assert_eq!(output.token_ids().len(), 1, "rank={rank} case={case}");
         assert!(runtime.synchronize().is_ok());
     } else {
-        let error = result
-            .expect_err("one failing controller must stop all peers");
+        let error = result.expect_err("one failing controller must stop all peers");
         let original: &(dyn std::error::Error + 'static) = match &failure {
             Some(error) => error,
             None => &error,

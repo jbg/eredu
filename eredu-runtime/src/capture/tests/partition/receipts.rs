@@ -8,7 +8,8 @@ use super::*;
 fn context(plan: &AdmittedCapturePlan) -> PartitionCaptureContext {
     PartitionCaptureContext {
         invocation: None,
-        artifact_identity: "artifact-exact".into(),
+        artifact_identity: (plan.plan().provenance == CaptureProvenance::ContentExact)
+            .then(|| "artifact-exact".into()),
         execution_identity: "execution-version-3".into(),
         run_identity: "branch-7".into(),
         overlay_identity: Some("overlay-coordinated-2".into()),
@@ -257,13 +258,18 @@ fn receipts_reject_wrong_senders_stale_context_duplicate_ordinals_and_replay() {
     )
     .remove(0);
     let original: PartitionCaptureProducerRecord = serde_json::from_slice(&bytes).unwrap();
-    for mutation in 0..19 {
+    for mutation in 0..20 {
         let mut ledger = CaptureLedger::new(&plan);
         let mut delivery = super::receipts::authority(&plan, &maps, &mut ledger).into_delivery();
         let mut changed = original.clone();
         match mutation {
             0 => changed.schema_version += 1,
-            1 => changed.context.artifact_identity.push('x'),
+            1 => changed
+                .context
+                .artifact_identity
+                .as_mut()
+                .unwrap()
+                .push('x'),
             2 => changed.context.execution_identity.push('x'),
             3 => changed.context.run_identity.push('x'),
             4 => changed.context.overlay_identity = None,
@@ -298,6 +304,7 @@ fn receipts_reject_wrong_senders_stale_context_duplicate_ordinals_and_replay() {
             16 => changed.fragments[0].record.payload = None,
             17 => changed.context.selection_index += 1,
             18 => changed.context.phase = CapturePhase::Decode,
+            19 => changed.context.artifact_identity = None,
             _ => unreachable!(),
         }
         let changed = serde_json::to_vec(&changed).unwrap();
@@ -533,4 +540,30 @@ fn deferred_skipped_producer_retains_its_outcome_without_fabricating_source_prec
         }) => assert_eq!(actual, outcome),
         other => panic!("deferred skip lost its attribution: {other:?}"),
     }
+}
+
+#[test]
+fn session_receipts_preserve_execution_binding_without_content_provenance() {
+    let (mut request, mut catalog, support, capabilities) = fixture(CaptureTransform::FullTensor);
+    request.provenance = CaptureProvenance::Session;
+    catalog.points[0].axes.as_mut().unwrap()[1].dimension = SymbolicDimension::Known(20);
+    let plan = admit(request, &catalog, &support, &capabilities).unwrap();
+    let maps = [ComponentCoordinateMap::range(20, 0..20).unwrap()];
+    let mut ledger = CaptureLedger::new(&plan);
+    let receipt = authority(&plan, &maps, &mut ledger);
+    let global = Value {
+        shape: vec![3, 20],
+        data: TensorObservationData::F32((0..60).map(|i| i as f32 * 0.25 - 3.0).collect()),
+    };
+    let bytes = encode_all(&plan, &receipt, &global, &maps, &mut ledger).remove(0);
+    let original: PartitionCaptureProducerRecord = serde_json::from_slice(&bytes).unwrap();
+    assert!(original.context.artifact_identity.is_none());
+    let mut delivery = receipt.into_delivery();
+    delivery.receive(0, &bytes, &mut ledger).unwrap();
+    let mut changed = original;
+    changed.context.run_identity.push('x');
+    let mut delivery = authority(&plan, &maps, &mut ledger).into_delivery();
+    assert!(delivery
+        .receive(0, &serde_json::to_vec(&changed).unwrap(), &mut ledger)
+        .is_err());
 }

@@ -69,7 +69,8 @@ fn fixture(
         encoded_bytes: 1_000_000,
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "preview".into(),
             path: "block.output".into(),
@@ -213,11 +214,11 @@ fn session_validation_rechecks_loaded_capture_capabilities_before_estimating() {
         calls.set(calls.get() + 1);
         Ok(CaptureUsage::default())
     };
-    validate_session(&admitted, &discovery, estimate).unwrap();
+    validate_session(&admitted, &discovery.declarations(), estimate).unwrap();
     assert!(calls.get() > 0);
     calls.set(0);
     discovery.catalog.points[0].node_id = "different-loaded-node".into();
-    assert!(validate_session(&admitted, &discovery, estimate).is_err());
+    assert!(validate_session(&admitted, &discovery.declarations(), estimate).is_err());
     assert_eq!(calls.get(), 0);
 }
 

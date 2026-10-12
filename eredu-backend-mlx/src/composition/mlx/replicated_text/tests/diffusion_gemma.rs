@@ -438,6 +438,7 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
         };
         let capture = CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: vec![CaptureSelection {
                 id: "shared-output".into(),
                 path: point.path.clone(),

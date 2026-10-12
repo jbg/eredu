@@ -145,7 +145,7 @@ fn summed_observer_prices_raw_terms_and_publishes_only_after_shared_completion()
                             .unwrap()
                             .identity();
                             let identity = PartitionCaptureIdentity::for_session(
-                                "artifact-exact".into(),
+                                Some("artifact-exact".into()),
                                 "sum-execution".into(),
                                 identity,
                                 Some("effective-overlay".into()),
@@ -252,7 +252,7 @@ fn summed_observer_prices_raw_terms_and_publishes_only_after_shared_completion()
                                     step.partitions[0].combination,
                                     PartitionCaptureCombination::SumF64ToF32
                                 );
-                                assert_eq!(step.partitions[0].schema_version, 3);
+                                assert_eq!(step.partitions[0].schema_version, 4);
                                 assert_eq!(step.partitions[0].producers, [0, 2, 3]);
                             }
                             let spent = session.ledger.total();

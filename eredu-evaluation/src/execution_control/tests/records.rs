@@ -84,7 +84,8 @@ pub(super) fn plans(mode: u8) -> (AdmittedCapturePlan, AdmittedInterventionPlan)
         max_predictions: 20,
     };
     let capture = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         limits: limits(),
         selections: if mode & 1 == 0 {
             vec![]

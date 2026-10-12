@@ -84,8 +84,14 @@ observations. Include them in score reconstruction alongside embedding, scalar
 component and bias terms; they do not imply a scalar decomposition of those operators.
 
 Declarations are cold architecture facts. Join their paths to
-`LoadedModel::capture_discovery()` and `intervention_discovery()` to check actual
-selected support. Missing component groups mean not described, never no components.
+`LoadedModel::capture_declarations()` to check selected observation support without
+hashing source files. `capture_discovery()` explicitly adds content-exact source
+provenance; `intervention_discovery()` requires it for editing authority. Capture
+schema 2 carries `CapturePlan::provenance`: `Session` is the default for live
+observation, and `ContentExact` resolves portable source attribution. Partition
+receipt schema 4 carries optional content attribution while execution, run,
+overlay, plan and forward-epoch binding remain mandatory.
+Missing component groups mean not described, never no components.
 `ComponentRowMapping::HeadRows` returns the complete query/key head needed for
 attention scores. Its optional `read_head_stride` supports fused interleaved head
 segments; `Blocked` maps individual channels within those segments. Use

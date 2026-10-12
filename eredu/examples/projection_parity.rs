@@ -33,6 +33,7 @@ fn capture_plan(positions: usize, speculative: bool) -> CapturePlan {
     };
     CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: if speculative {
             vec![selection("logits", true, true, 0)]
         } else {

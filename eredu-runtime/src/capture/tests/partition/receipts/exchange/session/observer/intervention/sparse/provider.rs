@@ -57,7 +57,7 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                         .unwrap()
                         .identity();
                         let identity = PartitionCaptureIdentity::for_session(
-                            "artifact-exact".into(),
+                            Some("artifact-exact".into()),
                             "prediction-execution".into(),
                             identity,
                             None,

@@ -205,6 +205,13 @@ impl PartitionCaptureReceiptPlan {
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
         context.validate()?;
+        if plan.plan().provenance == CaptureProvenance::ContentExact
+            && context.artifact_identity.is_none()
+        {
+            return Err(
+                invalid("content-exact capture requires receipt artifact provenance").into(),
+            );
+        }
         if context.capture_plan_identity != plan.identity() {
             return Err(invalid("partition receipt context changed the capture admission").into());
         }
@@ -1046,7 +1053,7 @@ fn receipt_identity(
         numbers(hash, &value.shape);
     }
     let mut hash = Sha256::new();
-    hash.update(b"eredu.partition.capture.receipt.v2");
+    hash.update(b"eredu.partition.capture.receipt.v4");
     word(
         &mut hash,
         match combination {
@@ -1055,12 +1062,15 @@ fn receipt_identity(
         },
     );
     for value in [
-        &context.artifact_identity,
         &context.execution_identity,
         &context.run_identity,
         &context.capture_plan_identity,
     ] {
         text(&mut hash, value);
+    }
+    word(&mut hash, u64::from(context.artifact_identity.is_some()));
+    if let Some(artifact) = &context.artifact_identity {
+        text(&mut hash, artifact);
     }
     word(&mut hash, u64::from(context.overlay_identity.is_some()));
     if let Some(value) = &context.overlay_identity {

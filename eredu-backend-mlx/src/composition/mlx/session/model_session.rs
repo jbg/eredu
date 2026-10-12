@@ -1699,7 +1699,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         if let Some(partition) = session.loaded_partition_capture()? {
             discovery = eredu_runtime::inspection::intervention_support(
                 discovery.points,
-                &partition.discovery,
+                &partition.content_discovery()?,
                 &mechanisms,
             );
         }
@@ -1747,18 +1747,37 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             state.capture.as_mut(),
             runtime.session().loaded_partition_capture()?,
         ) {
-            capture.ensure_partition_capture(
-                partition.identity(runtime.session().payload.parameter_state.active.as_deref())?,
-            )?;
+            capture.ensure_partition_capture(partition.identity(
+                capture.requires_content_identity(),
+                runtime.session().payload.parameter_state.active.as_deref(),
+            )?)?;
         }
         Ok(())
+    }
+
+    fn capture_declarations(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
+        if let Some(partition) = runtime.session().loaded_partition_capture()? {
+            return Ok(partition.declarations.clone());
+        }
+        runtime
+            .session()
+            .capture_discovery
+            .as_ref()
+            .map(|prepared| prepared.capture_declarations())
+            .ok_or_else(|| {
+                eredu_core::capture::CaptureError::Unsupported(
+                    "session has no retained capture catalog".into(),
+                )
+            })
     }
 
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
         if let Some(partition) = runtime.session().loaded_partition_capture()? {
-            return Ok(partition.discovery.clone());
+            return partition.content_discovery();
         }
         runtime
             .session()
@@ -1816,14 +1835,18 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         Self::validate_text_capture(runtime, &plan)?;
+        if plan.plan().provenance == eredu_core::capture::CaptureProvenance::ContentExact {
+            Self::capture_discovery(runtime)?;
+        }
         eredu_runtime::intervention::install_session(&mut state.capture, plan, None)?;
         if let (Some(capture), Some(partition)) = (
             &mut state.capture,
             runtime.session().loaded_partition_capture()?,
         ) {
-            capture.ensure_partition_capture(
-                partition.identity(Self::active_parameter_overlay(runtime))?,
-            )?;
+            capture.ensure_partition_capture(partition.identity(
+                capture.requires_content_identity(),
+                Self::active_parameter_overlay(runtime),
+            )?)?;
         }
         Ok(())
     }
@@ -1843,7 +1866,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         }
         eredu_runtime::capture::validate_session(
             plan,
-            &Self::capture_discovery(runtime)?,
+            &Self::capture_declarations(runtime)?,
             super::bounded_capture::estimate_shape,
         )
     }

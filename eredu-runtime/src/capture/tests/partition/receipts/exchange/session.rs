@@ -26,7 +26,7 @@ fn configured(plan: AdmittedCapturePlan, ranks: usize) -> CaptureSession {
     session
         .configure_partition_capture(
             PartitionCaptureIdentity::new(
-                "artifact-exact".into(),
+                Some("artifact-exact".into()),
                 "retained-execution".into(),
                 "coordinated-run".into(),
                 Some("effective-overlay".into()),
@@ -531,7 +531,7 @@ fn common_coordination_rejects_different_runs_quotas_or_selection_sets_before_so
                         session
                             .configure_partition_capture(
                                 PartitionCaptureIdentity::new(
-                                    "artifact-exact".into(),
+                                    Some("artifact-exact".into()),
                                     "retained-execution".into(),
                                     if rank == 0 && scenario == 0 {
                                         "another-run"

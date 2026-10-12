@@ -95,6 +95,7 @@ fn capture_plan(world_size: usize) -> SpeculativeActivationPlan {
         },
         captures: CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: CAPTURE_PATHS
                 .iter()
                 .map(|path| CaptureSelection {

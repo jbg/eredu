@@ -87,6 +87,7 @@ fn fixture() -> (SpeculativeActivationPlan, SpeculativeActivationDiscovery) {
         schema_version: SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
         captures: CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: crate::capture::CaptureProvenance::ContentExact,
             selections: vec![CaptureSelection {
                 id: "units".into(),
                 path: point.path.clone(),

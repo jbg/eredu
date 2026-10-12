@@ -122,7 +122,8 @@ fn sampled_conformance(root: &Path, routed: bool) {
                 max_predictions: 20,
             };
             let capture = CapturePlan {
-                schema_version: 1,
+                schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: if mode & 1 != 0 {
                     vec![CaptureSelection {
                         id: "raw-logits".into(),

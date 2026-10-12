@@ -23,7 +23,7 @@ mod routed;
 /// that arbitrary caller labels belong to a loaded model or to peer sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionCaptureIdentity {
-    artifact: String,
+    artifact: Option<String>,
     execution: String,
     run: String,
     setup: Option<crate::CommunicationSessionIdentity>,
@@ -35,7 +35,7 @@ pub struct PartitionCaptureIdentity {
 impl PartitionCaptureIdentity {
     /// Validates bounded identity storage and an exact nonempty participant world.
     pub fn new(
-        artifact: String,
+        artifact: Option<String>,
         execution: String,
         run: String,
         overlay: Option<String>,
@@ -44,8 +44,9 @@ impl PartitionCaptureIdentity {
         if world_size == 0 || u32::try_from(world_size).is_err() {
             return Err(invalid("invalid partition capture world"));
         }
-        for identity in [&artifact, &execution, &run]
+        for identity in [&execution, &run]
             .into_iter()
+            .chain(artifact.iter())
             .chain(overlay.iter())
         {
             if identity.is_empty() || identity.len() > 256 {
@@ -72,7 +73,7 @@ impl PartitionCaptureIdentity {
     /// steps and restores retain it; a new run receives a later session epoch.
     /// Native composition must supply this setup's actual model and overlay facts.
     pub fn for_session(
-        artifact: String,
+        artifact: Option<String>,
         execution: String,
         setup: crate::CommunicationSessionIdentity,
         overlay: Option<String>,
@@ -86,6 +87,25 @@ impl PartitionCaptureIdentity {
         )?;
         identity.setup = Some(setup);
         Ok(identity)
+    }
+
+    pub(in crate::capture) fn with_content_identity(
+        mut self,
+        artifact: &str,
+    ) -> Result<Self, CaptureError> {
+        if artifact.is_empty()
+            || artifact.len() > 256
+            || self
+                .artifact
+                .as_deref()
+                .is_some_and(|current| current != artifact)
+        {
+            return Err(invalid(
+                "partition content identity differs from snapshot provenance",
+            ));
+        }
+        self.artifact = Some(artifact.to_owned());
+        Ok(self)
     }
 
     fn bind_epoch(&mut self, epoch: DistributedCommitEpoch) {
@@ -106,8 +126,9 @@ impl PartitionCaptureIdentity {
     }
 
     pub(in crate::capture) fn heap_bytes(&self) -> Option<u64> {
-        [&self.artifact, &self.execution, &self.run]
+        [&self.execution, &self.run]
             .into_iter()
+            .chain(self.artifact.iter())
             .chain(self.overlay.iter())
             .try_fold(0u64, |sum, value| {
                 sum.checked_add(u64::try_from(value.len()).ok()?)
@@ -203,7 +224,10 @@ impl PartitionCaptureRun {
         self.identity.heap_bytes()
     }
     pub(in crate::capture) fn matches_artifact(&self, artifact: &str) -> bool {
-        self.identity.artifact == artifact
+        self.identity
+            .artifact
+            .as_deref()
+            .is_none_or(|content| content == artifact)
     }
     pub(in crate::capture) fn delivery_complete(&self, epoch: DistributedCommitEpoch) -> bool {
         self.coordinated
@@ -374,6 +398,11 @@ impl CaptureSession {
         &mut self,
         identity: PartitionCaptureIdentity,
     ) -> Result<(), CaptureError> {
+        if self.requires_content_identity() && identity.artifact.is_none() {
+            return Err(invalid(
+                "content-exact capture requires partition artifact provenance",
+            ));
+        }
         if self.partition.is_some()
             || self.has_step
             || self.records.is_some()

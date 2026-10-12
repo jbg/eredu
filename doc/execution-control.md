@@ -1,5 +1,15 @@
 # Execution control
 
+Live capture admission reads `CaptureDeclarations` without hashing checkpoint
+contents. Session-provenance records carry the loaded session and admitted plan,
+with absent artifact attribution. Explicit content-exact capture, intervention
+admission and capture snapshots resolve source identity. Snapshot restore and
+fork retain exact source checks, drained delivery and monotone budgets in either
+observation mode; snapshots may perform the first content-resolution pass.
+A child adding interventions receives content attribution from the newly admitted
+intervention plan, while its execution and epoch ownership remain separate.
+
+
 The ordinary text facade supports completed physical stepping, pause/resume, canonical
 token forcing, temperature changes, explicit reseeding, reusable native snapshots,
 restoration and isolated serial branches. Complete snapshot support requires known

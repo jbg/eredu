@@ -144,7 +144,7 @@ fn verify_live(device: DeviceType) {
             )
             .with_session_identity(
                 PartitionCaptureIdentity::for_session(
-                    "native-fixture".into(),
+                    Some("native-fixture".into()),
                     "native-grouped".into(),
                     transport.session_identity(),
                     None,

@@ -90,6 +90,7 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
             },
             captures: CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: paths
                     .iter()
                     .enumerate()

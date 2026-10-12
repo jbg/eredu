@@ -247,7 +247,7 @@ fn sum_authority_rejects_partial_coverage_disjoint_terms_and_forged_wire_equatio
         &mut ledger,
     );
     let mut forged: PartitionCaptureProducerRecord = serde_json::from_slice(&records[0]).unwrap();
-    assert_eq!(forged.schema_version, 3);
+    assert_eq!(forged.schema_version, 4);
     assert_eq!(forged.combination, PartitionCaptureCombination::SumF64ToF32);
     forged.combination = PartitionCaptureCombination::Disjoint;
     let mut delivery = authority.into_delivery();

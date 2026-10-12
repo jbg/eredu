@@ -35,7 +35,8 @@ fn provider_failure_capture(
         encoded_bytes: 512 << 20,
     };
     CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "input-before-provider".into(),
             path: "readout.embedding".into(),

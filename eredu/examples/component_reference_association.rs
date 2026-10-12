@@ -129,6 +129,7 @@ pub fn run<B: ParameterBackend>(
                 settings,
                 CapturePlan {
                     schema_version: CAPTURE_SCHEMA_VERSION,
+                    provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                     selections,
                     limits: CaptureLimits {
                         per_step: usage,

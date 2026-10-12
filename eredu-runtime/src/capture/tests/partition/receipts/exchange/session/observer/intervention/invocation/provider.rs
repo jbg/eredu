@@ -56,7 +56,7 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
                     .unwrap()
                     .identity();
                     let identity = PartitionCaptureIdentity::for_session(
-                        "artifact-exact".into(),
+                        Some("artifact-exact".into()),
                         "retained-prediction-execution".into(),
                         identity,
                         Some("effective-overlay".into()),

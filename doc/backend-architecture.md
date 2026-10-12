@@ -2628,11 +2628,18 @@ to four host workers, bounded by available CPU parallelism, with one 1 MiB read
 buffer and open file per worker. Logical member order and SHA-256 identity encoding
 are independent of scheduling; failures cancel unscheduled work and all active
 workers settle before the operation returns.
-`eredu-core::DeferredArtifactIdentity` shares and caches that result or failure. Model, external-assistant and Moshi source
+`eredu-core::DeferredArtifactIdentity` shares and caches that result or failure.
+Model, external-assistant and Moshi source
 preparation retain the pending identity without reading payloads for hashing.
 Architecture-owned discovery declarations carry it through native construction;
-explicit capture/intervention discovery resolves it on demand. Ordinary generation
-and trace-only requests do not resolve it. Backend adapters retain these neutral
+`CaptureDeclarations` carries admission facts without content resolution.
+`CaptureDiscovery` additionally resolves content-exact provenance on explicit
+request. `CapturePlan::provenance` selects session-bound observations or content-
+exact records; live score reads use session provenance. Facade requests retain
+opaque session admission and active overlay identity in both modes. Intervention
+admission and capture snapshot/fork validation independently require content-exact
+identity. Ordinary generation and session-bound traces/captures leave it pending.
+Backend adapters retain these neutral
 declarations and never reconstruct source membership or fingerprint files.
 Tensor loading reads selected ranges in execution order, so it is independent of
 the optional whole-file hashing pass, which also covers headers and unused bytes.

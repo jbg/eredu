@@ -197,7 +197,8 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
         encoded_bytes: 10_000_000,
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: discovery
             .catalog
             .points

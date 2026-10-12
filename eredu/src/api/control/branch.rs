@@ -221,7 +221,10 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                     let template = ObservedGenerationRecord {
                         schema_version: CAPTURE_SCHEMA_VERSION,
                         run_id: run_id.clone(),
-                        artifact_identity: snapshot.metadata.artifact_identity.clone(),
+                        artifact_identity: capture
+                            .and_then(|run| run.intervention_plan())
+                            .map(|plan| plan.artifact_identity().to_owned())
+                            .or_else(|| snapshot.metadata.artifact_identity.clone()),
                         parameter_overlay_id: B::active_parameter_overlay(runtime)
                             .map(str::to_owned),
                         session_id: session_id.clone(),

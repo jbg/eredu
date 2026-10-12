@@ -108,7 +108,7 @@ fn verify(device: DeviceType) {
     let plan = admission(geometry, 17, &slice);
     let context = PartitionCaptureContext {
         invocation: None,
-        artifact_identity: "native-fixture".into(),
+        artifact_identity: Some("native-fixture".into()),
         execution_identity: "tp-unit-columns".into(),
         run_identity: "provider".into(),
         overlay_identity: None,

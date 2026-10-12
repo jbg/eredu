@@ -114,7 +114,7 @@ impl CaptureSession {
                 "capture checkpoint requires a successful, drained record boundary".into(),
             ));
         }
-        let checked = self.plan.readmit(discovery)?;
+        let checked = self.plan.readmit(&discovery.declarations())?;
         if checked.identity() != self.plan.identity()
             || self
                 .partition
@@ -332,7 +332,7 @@ impl CaptureCheckpoint {
         };
         super::validate_continuation(
             &plan,
-            request.discovery,
+            &request.discovery.declarations(),
             self.next_prediction(),
             self.usage,
             estimate,
@@ -384,7 +384,14 @@ impl CaptureCheckpoint {
         // carries its inherited ledger, so removing controls cannot erase usage.
         let mut child = CaptureSession::new(plan);
         if let Some(identity) = &self.partition {
-            child.configure_partition_capture(identity.clone())?;
+            let identity = if child.requires_content_identity() || intervention.is_some() {
+                identity
+                    .clone()
+                    .with_content_identity(&self.artifact_identity)?
+            } else {
+                identity.clone()
+            };
+            child.configure_partition_capture(identity)?;
         }
         if let Some((plan, estimator)) = intervention {
             child.enable_interventions(plan, estimator)?;

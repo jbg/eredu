@@ -38,6 +38,7 @@ pub(super) fn admit(runtime: &ModelRuntime<MlxBackend<'_>>) -> AdmittedSpeculati
         },
         captures: CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: PATHS
                 .iter()
                 .map(|path| CaptureSelection {

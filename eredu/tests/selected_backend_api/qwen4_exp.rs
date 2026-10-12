@@ -467,6 +467,7 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         };
         let captures = CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: vec![CaptureSelection {
                 id: "across-image-boundary".into(),
                 path: "model.layers.0.input".into(),

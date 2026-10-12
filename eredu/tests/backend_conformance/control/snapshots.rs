@@ -1064,3 +1064,61 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
         .unwrap();
     assert_eq!(ordinary.token_ids, expected);
 }
+
+#[test]
+fn session_capture_fork_adds_content_exact_intervention_attribution() {
+    use eredu::api::GenerationBranchOptions;
+    let (mut model, chat, settings, _) = snapshot_setup();
+    let mut plan = observed_mock::plan();
+    plan.provenance = eredu_core::capture::CaptureProvenance::Session;
+    let prepared = model
+        .prepare_observed_chat(&chat, settings, plan, limits())
+        .unwrap();
+    let mut records = vec![];
+    let mut run = model
+        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .unwrap();
+    run.enable_snapshots(SnapshotLimits {
+        max_snapshots: 1,
+        max_branches: 1,
+        retained_bytes: 32_000_000,
+        cumulative_copy_bytes: 128_000_000,
+    })
+    .unwrap();
+    let saved = run.snapshot(collect(&mut records)).unwrap();
+    let mut branch = run
+        .fork(
+            &saved,
+            GenerationBranchOptions {
+                trace_limits: TraceLimits {
+                    per_record_bytes: 16384,
+                    total_bytes: 65536,
+                },
+                capture_limits: Some(observed_mock::plan().limits),
+                sampling: None,
+                intervention: Some(observed_mock::intervention_plan(1.0)),
+            },
+            collect(&mut records),
+        )
+        .unwrap();
+    let start = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record.generation.event,
+                ObservedGenerationEvent::BranchStarted { .. }
+            )
+        })
+        .unwrap();
+    let ObservedGenerationEvent::BranchStarted { lineage, .. } = &start.generation.event else {
+        unreachable!()
+    };
+    assert!(lineage.parent.artifact_identity.is_none());
+    assert_eq!(
+        start.generation.artifact_identity.as_deref(),
+        Some("conformance-mock-artifact")
+    );
+    assert!(start.generation.intervention_plan_id.is_some());
+    run.exchange(&mut branch, collect(&mut records)).unwrap();
+    run.step(collect(&mut records)).unwrap();
+}

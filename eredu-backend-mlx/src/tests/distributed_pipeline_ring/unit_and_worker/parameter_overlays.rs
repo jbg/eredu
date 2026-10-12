@@ -651,7 +651,8 @@ fn verify_active_parameter_capture_and_branches(
         encoded_bytes: 64 << 20,
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "edited-logits".into(),
             path: "model.logits".into(),

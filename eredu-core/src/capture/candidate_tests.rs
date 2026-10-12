@@ -30,7 +30,6 @@ fn old_candidate_json_defaults_to_explicitly_unknown_domain() {
         serde_json::from_str::<CaptureCandidates>(&json).unwrap(),
         candidates
     );
-    assert_eq!(CAPTURE_SCHEMA_VERSION, 1);
 }
 
 #[test]

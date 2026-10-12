@@ -615,6 +615,7 @@ fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
         };
         let capture = CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: vec![
                 CaptureSelection {
                     id: "prefill-logits".into(),

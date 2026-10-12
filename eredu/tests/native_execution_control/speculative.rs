@@ -217,6 +217,7 @@ fn speculative_control_artifacts(
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "logits".into(),
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

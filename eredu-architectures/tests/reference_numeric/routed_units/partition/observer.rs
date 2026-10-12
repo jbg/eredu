@@ -22,7 +22,7 @@ pub(super) fn run(
     session
         .configure_partition_capture(
             PartitionCaptureIdentity::new(
-                "prepared-numeric-fixture".into(),
+                Some("prepared-numeric-fixture".into()),
                 "retained-routed-selection".into(),
                 "capture-conformance".into(),
                 None,

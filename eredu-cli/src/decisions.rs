@@ -289,7 +289,7 @@ pub(crate) fn run<B: TextGenerationBackend>(
     let count = request.questions.len() as u64;
     // Row-sized native reductions include the full vocabulary; host output is bounded by selected IDs.
     let vocabulary = model
-        .capture_discovery()?
+        .capture_declarations()?
         .catalog
         .get(eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
         .and_then(|p| p.axes.as_ref())
@@ -308,6 +308,7 @@ pub(crate) fn run<B: TextGenerationBackend>(
     };
     let plan = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::Session,
         selections: compiled
             .slots
             .iter()

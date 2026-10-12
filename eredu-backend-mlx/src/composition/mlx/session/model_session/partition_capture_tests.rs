@@ -174,7 +174,8 @@ fn verify_native_partition_components(
             "fixture includes actual and effective FFN/attention components"
         );
         let plan = CapturePlan {
-            schema_version: 1,
+            schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections,
             limits: CaptureLimits {
                 per_step: budget,
@@ -211,7 +212,7 @@ fn verify_native_partition_components(
         let count = plan.points().len();
         let mut capture = Some(CaptureSession::new(plan));
         let identity = PartitionCaptureIdentity::for_session(
-            discovery.artifact_identity,
+            Some(discovery.artifact_identity),
             session
                 .capture_discovery
                 .as_ref()

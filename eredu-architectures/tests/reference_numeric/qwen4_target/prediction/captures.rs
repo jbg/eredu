@@ -380,6 +380,7 @@ fn plan(discovery: &SpeculativeActivationDiscovery) -> SpeculativeActivationPlan
         schema_version: SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
         captures: CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: discovery
                 .captures
                 .catalog

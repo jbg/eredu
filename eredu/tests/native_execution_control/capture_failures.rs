@@ -41,6 +41,7 @@ fn budgets() -> CaptureUsage {
 fn capture(scores: bool, cumulative: CaptureUsage) -> CapturePlan {
     CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "selected".into(),
             path: if scores {

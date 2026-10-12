@@ -104,6 +104,7 @@ fn prove_bounded(device: DeviceType) {
             };
             let plan = CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: paths
                     .iter()
                     .enumerate()

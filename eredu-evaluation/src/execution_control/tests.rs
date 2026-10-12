@@ -245,6 +245,11 @@ impl TextGenerationBackend for Host {
         })
     }
 
+    fn capture_declarations(
+        _: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
+        Ok(discovery().declarations())
+    }
     fn capture_discovery(_: &ModelRuntime<Self>) -> Result<CaptureDiscovery, CaptureError> {
         Ok(discovery())
     }
@@ -261,7 +266,7 @@ impl TextGenerationBackend for Host {
     ) -> Result<(), CaptureError> {
         eredu_runtime::capture::validate_session(
             &capture,
-            &Self::capture_discovery(runtime)?,
+            &Self::capture_declarations(runtime)?,
             estimate,
         )?;
         eredu_runtime::intervention::validate_session(

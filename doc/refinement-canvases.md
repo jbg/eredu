@@ -69,12 +69,19 @@ cargo test -p eredu-cli --no-default-features --features mlx --test decisions
 
 ## Preparation profiling
 
-Decision-read timing separates canvas tokenization, chat preparation, capture
-discovery and admission. The first capture discovery hashes the complete physical
-checkpoint graph for content-exact provenance. Subsequent discovery calls share
-the resolved identity. Large multi-member artifacts use up to four hashing
-workers while preserving full-content identity and per-file metadata change
-checks.
+Decision-read timing separates canvas tokenization, chat preparation, declaration
+lookup and admission. Live decisions use `CaptureProvenance::Session` and
+`LoadedModel::capture_declarations()`, which read retained architecture/collector
+facts without resolving checkpoint contents. Delivered observations remain bound
+to the loaded session, execution, parameter overlay and admitted plan. Their
+`artifact_identity` is absent unless an independent stronger consumer requests it.
+
+`CaptureProvenance::ContentExact` explicitly resolves complete source provenance
+for records, including trace-only requests. `LoadedModel::capture_discovery()`
+also requests that guarantee. Interventions and capture snapshot/fork validation
+retain their content-exact checks independently of the ordinary observation
+policy. Large multi-member artifacts use up to four hashing workers while
+preserving full-content identity and per-file metadata change checks.
 
 The pinned official tokenizer sidecars at revision
 `f7f5b7f5fa82ffc52addd066915886d497f5517b` reproduce the 97-token duplicate-charge

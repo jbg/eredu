@@ -5,19 +5,31 @@ use eredu_runtime::capture::{partition::*, CaptureSession};
 use std::sync::Arc;
 
 pub(super) struct LoadedPartitionCapture {
-    pub(super) discovery: CaptureDiscovery,
+    pub(super) declarations: CaptureDeclarations,
+    prepared: Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
     execution: String,
     setup: eredu_runtime::CommunicationSessionIdentity,
     layouts: eredu_architectures::component_partition::ComponentPartitionLayouts,
 }
 
 impl LoadedPartitionCapture {
+    pub(super) fn content_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
+        let mut discovery = self.prepared.capture()?;
+        discovery.catalog = self.declarations.catalog.clone();
+        discovery.support = self.declarations.support.clone();
+        Ok(discovery)
+    }
     pub(super) fn identity(
         &self,
+        content_exact: bool,
         overlay: Option<&str>,
     ) -> Result<PartitionCaptureIdentity, CaptureError> {
         PartitionCaptureIdentity::for_session(
-            self.discovery.artifact_identity.clone(),
+            if content_exact {
+                Some(self.content_discovery()?.artifact_identity)
+            } else {
+                None
+            },
             self.execution.clone(),
             self.setup,
             overlay.map(str::to_owned),
@@ -45,7 +57,7 @@ impl MlxModelSession {
             }
             transport.capture_wait()?;
             transport.estimate_capture_gather(16)?;
-            let mut discovery = prepared.capture_with_partition_support(&layouts, |point| {
+            let mut declarations = prepared.capture_declarations_with_partition_support(&layouts, |point| {
                 let Some(members) = layouts.capture_hook_members(&point.path) else {
                     return ObservationSupportStatus::Unverified(
                         "global observation ownership is not yet implemented for this point".into(),
@@ -56,12 +68,12 @@ impl MlxModelSession {
                     Err(error) => ObservationSupportStatus::Unverified(error.to_string()),
                 }
             })?;
-            discovery.support.capture.transformations.retain(|kind| matches!(kind,
+            declarations.support.capture.transformations.retain(|kind| matches!(kind,
                 CaptureTransformKind::Preview | CaptureTransformKind::Slice | CaptureTransformKind::FullTensor |
                 CaptureTransformKind::Summary | CaptureTransformKind::Histogram |
                 CaptureTransformKind::TokenScores | CaptureTransformKind::TopCandidates | CaptureTransformKind::RoutedUnits
             ));
-            discovery.support.capture.conditions = vec![
+            declarations.support.capture.conditions = vec![
                 "Component, normalized-input and readout observations with retained global ownership and independent invocation-group failure agreement; one token-ID sequence".into(),
                 "Every model rank participates in the same capture plan and forward; records publish after shared completion and commit".into(),
                 "Vocabulary reductions require the complete ordered final logits on the retained publication owner; probabilities normalize the full model vocabulary".into(),
@@ -70,7 +82,7 @@ impl MlxModelSession {
                 "Logical storage bounds exclude native private allocator workspace; deferred projection-input factories use a conservative native bound".into(),
             ];
             Ok(Arc::new(LoadedPartitionCapture {
-                discovery, execution: prepared.execution_identity().into(), setup, layouts,
+                declarations, prepared: Arc::clone(prepared), execution: prepared.execution_identity().into(), setup, layouts,
             }))
         }).clone().map(Some)
     }
@@ -173,7 +185,10 @@ pub(super) fn with_observer<R>(
                 capture, stream, domain, prediction,
             )),
             (Some(transport), Ok(Some(loaded))) => {
-                match loaded.identity(session.payload.parameter_state.active.as_deref()) {
+                match loaded.identity(
+                    capture.requires_content_identity(),
+                    session.payload.parameter_state.active.as_deref(),
+                ) {
                     Ok(identity) => Box::new(observer(
                         capture, stream, domain, prediction, transport, loaded, identity,
                     )),

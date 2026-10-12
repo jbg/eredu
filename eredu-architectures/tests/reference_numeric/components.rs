@@ -2921,7 +2921,8 @@ fn component_partition_capture_plan(
         encoded_bytes: 10_000_000,
     };
     CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections,
         limits: CaptureLimits {
             per_step: usage,
@@ -3414,7 +3415,7 @@ fn component_producer_receipts(
                 plan.clone(),
                 PartitionCaptureContext {
                     invocation: None,
-                    artifact_identity: "pinned-numeric-source".into(),
+                    artifact_identity: Some("pinned-numeric-source".into()),
                     execution_identity: "retained-partition-selection".into(),
                     run_identity: "numerical-forward".into(),
                     overlay_identity: None,

@@ -518,10 +518,15 @@ impl TextGenerationBackend for MockBackend {
         )
     }
 
+    fn capture_declarations(
+        _: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
+        Ok(observed_mock::discovery().declarations())
+    }
     fn capture_discovery(
         _: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
-        Ok(observed_mock::discovery())
+        Ok(observed_mock::content_discovery())
     }
     fn validate_text_capture(
         _: &ModelRuntime<Self>,
@@ -3016,4 +3021,152 @@ fn non_mlx_backend_conforms_to_automatic_planning() {
 #[test]
 fn non_mlx_backend_conforms_to_residency_realization() {
     assert_residency_realization_conformance();
+}
+
+#[test]
+fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
+    use eredu::api::{PreparedChatGenerationSettings, TraceLimits};
+    use eredu_core::capture::{CapturePlan, CaptureProvenance};
+    use std::ops::ControlFlow;
+    let mut expected = None;
+    for controlled in [false, true] {
+        for captures in [false, true] {
+            for provenance in [CaptureProvenance::Session, CaptureProvenance::ContentExact] {
+                observed_mock::reset_content_discovery_calls();
+                let mut model = unicode_model(None);
+                let chat = model
+                    .prepare_chat(ChatTemplateRequest {
+                        messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+                        add_generation_prompt: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let mut plan = if captures {
+                    observed_mock::plan()
+                } else {
+                    CapturePlan::none()
+                };
+                plan.provenance = provenance;
+                let prepared = model
+                    .prepare_observed_chat(
+                        &chat,
+                        PreparedChatGenerationSettings {
+                            overrides: GenerationConfigOverrides {
+                                max_new_tokens: Some(2),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        plan,
+                        TraceLimits {
+                            per_record_bytes: 64 * 1024,
+                            total_bytes: 1024 * 1024,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    observed_mock::content_discovery_calls(),
+                    usize::from(provenance == CaptureProvenance::ContentExact)
+                );
+                let mut records = Vec::new();
+                let tokens = if controlled {
+                    let mut session = model
+                        .start_controlled_text(prepared, &[], Default::default(), |record| {
+                            records.push(record.generation);
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    if captures && provenance == CaptureProvenance::Session {
+                        assert_eq!(observed_mock::content_discovery_calls(), 0);
+                        session
+                            .enable_snapshots(eredu_core::execution_control::SnapshotLimits {
+                                max_snapshots: 1,
+                                max_branches: 0,
+                                retained_bytes: 4_000_000,
+                                cumulative_copy_bytes: 32_000_000,
+                            })
+                            .unwrap();
+                        let snapshot = session
+                            .snapshot(|record| {
+                                records.push(record.generation);
+                                ControlFlow::Continue(())
+                            })
+                            .unwrap();
+                        assert!(
+                            observed_mock::content_discovery_calls() > 0,
+                            "snapshot capture must resolve its source identity"
+                        );
+                        drop(snapshot);
+                    }
+                    session
+                        .run(|record| {
+                            records.push(record.generation);
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    session.token_ids().to_vec()
+                } else {
+                    model
+                        .generate_observed_text(prepared, &[], Default::default(), |record| {
+                            records.push(record);
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap()
+                        .token_ids
+                };
+                assert!(records
+                    .iter()
+                    .all(|record| record.artifact_identity.as_deref()
+                        == (provenance == CaptureProvenance::ContentExact)
+                            .then_some("conformance-mock-artifact")));
+                if !controlled || !captures {
+                    assert_eq!(
+                        observed_mock::content_discovery_calls(),
+                        usize::from(provenance == CaptureProvenance::ContentExact)
+                    );
+                }
+                if let Some(expected) = &expected {
+                    assert_eq!(&tokens, expected);
+                } else {
+                    expected = Some(tokens);
+                }
+            }
+        }
+    }
+    // Admission remains session-bound even when two loaded sources have identical metadata.
+    let mut first = unicode_model(None);
+    let chat = first
+        .prepare_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({"role":"user","content":"hello"})],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut plan = observed_mock::plan();
+    plan.provenance = CaptureProvenance::Session;
+    let prepared = first
+        .prepare_observed_chat(
+            &chat,
+            PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            plan,
+            TraceLimits {
+                per_record_bytes: 64 * 1024,
+                total_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+    let mut foreign = unicode_model(None);
+    assert!(matches!(
+        foreign.generate_observed_text(prepared, &[], Default::default(), |_| {
+            ControlFlow::Continue(())
+        }),
+        Err(eredu::api::PreparedChatError::Capture(
+            eredu_core::capture::CaptureError::Invalid(_)
+        ))
+    ));
 }

@@ -64,6 +64,7 @@ fn main() -> anyhow::Result<()> {
     };
     let plan = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: [
             CaptureTransform::Summary,
             CaptureTransform::Preview { max_elements: 16 },

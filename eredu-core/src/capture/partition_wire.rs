@@ -5,7 +5,7 @@ use super::{CaptureError, CapturePhase, CaptureRecord};
 use serde::{Deserialize, Serialize};
 
 /// Version of partition capture receipt records.
-pub const PARTITION_CAPTURE_SCHEMA_VERSION: u32 = 3;
+pub const PARTITION_CAPTURE_SCHEMA_VERSION: u32 = 4;
 
 /// How measured native regions form the globally selected activation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +81,8 @@ pub struct PartitionCaptureEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionCaptureContext {
-    /// Exact prepared artifact identity.
-    pub artifact_identity: String,
+    /// Content-exact provenance when requested; execution/run identities always bind live records.
+    pub artifact_identity: Option<String>,
     /// Common selected execution/communication identity, including parameter version.
     pub execution_identity: String,
     /// Coordinated run or branch identity.
@@ -112,12 +112,12 @@ impl PartitionCaptureContext {
             shape.validate()?;
         }
         for identity in [
-            &self.artifact_identity,
             &self.execution_identity,
             &self.run_identity,
             &self.capture_plan_identity,
         ]
         .into_iter()
+        .chain(self.artifact_identity.iter())
         .chain(self.overlay_identity.iter())
         {
             if identity.is_empty() || identity.len() > 256 {

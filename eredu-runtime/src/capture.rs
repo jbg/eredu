@@ -119,6 +119,12 @@ impl CaptureSession {
         Ok(())
     }
 
+    /// Whether explicit provenance or interventions require content identity.
+    pub fn requires_content_identity(&self) -> bool {
+        self.plan.plan().provenance == CaptureProvenance::ContentExact
+            || self.interventions.is_some()
+    }
+
     /// Borrows this run's immutable admission.
     pub fn plan(&self) -> &AdmittedCapturePlan {
         &self.plan
@@ -664,7 +670,7 @@ pub fn preflight(
 /// caller; this helper never accesses a device or starts a submission.
 pub fn validate_session(
     plan: &AdmittedCapturePlan,
-    discovery: &CaptureDiscovery,
+    discovery: &CaptureDeclarations,
     estimate: impl FnMut(
         &[u64],
         &CaptureSelection,
@@ -676,7 +682,7 @@ pub fn validate_session(
 
 pub(crate) fn validate_continuation(
     plan: &AdmittedCapturePlan,
-    discovery: &CaptureDiscovery,
+    discovery: &CaptureDeclarations,
     next_prediction: u64,
     inherited: CaptureUsage,
     estimate: impl FnMut(

@@ -230,6 +230,7 @@ fn capture_with_precision_and_selection<
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: paths
             .iter()
             .enumerate()

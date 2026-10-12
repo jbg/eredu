@@ -95,7 +95,7 @@ impl CaptureSession {
             .interventions
             .as_ref()
             .ok_or_else(|| invalid("no intervention admission"))?;
-        if run.plan.artifact_identity() != partition.identity.artifact {
+        if Some(run.plan.artifact_identity()) != partition.identity.artifact.as_deref() {
             return Err(
                 invalid("partition intervention belongs to another prepared artifact").into(),
             );

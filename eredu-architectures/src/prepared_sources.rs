@@ -385,6 +385,14 @@ impl PreparedModelDiscovery {
             .map(Some)
     }
 
+    /// Projects retained architecture and collector facts without hashing sources.
+    pub fn capture_declarations(&self) -> eredu_core::capture::CaptureDeclarations {
+        eredu_core::capture::CaptureDeclarations {
+            catalog: self.descriptor.observations.clone(),
+            support: self.support.clone(),
+        }
+    }
+
     /// Resolves the exact content identity for a caller using capture features.
     pub fn capture(
         &self,
@@ -406,9 +414,22 @@ impl PreparedModelDiscovery {
     pub fn capture_with_partition_support(
         &self,
         layouts: &crate::component_partition::ComponentPartitionLayouts,
-        mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
+        partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        let declarations = self.capture_declarations_with_partition_support(layouts, partition)?;
         let mut discovery = self.capture()?;
+        discovery.catalog = declarations.catalog;
+        discovery.support = declarations.support;
+        Ok(discovery)
+    }
+
+    /// Projects partition support using retained layouts and collector facts only.
+    pub fn capture_declarations_with_partition_support(
+        &self,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, eredu_core::capture::CaptureError> {
+        let mut declarations = self.capture_declarations();
         let mut support = eredu_runtime::inspection::observation_support_with_partition(
             &self.descriptor.observations,
             self.observation_context,
@@ -420,8 +441,8 @@ impl PreparedModelDiscovery {
             },
         );
         support.capture = self.support.capture.clone();
-        discovery.support = support;
-        Ok(discovery)
+        declarations.support = support;
+        Ok(declarations)
     }
 
     /// Combines retained semantic points with current native intervention facts.

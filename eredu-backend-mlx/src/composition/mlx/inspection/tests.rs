@@ -281,7 +281,12 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
     )
     .unwrap();
     let mut results = Vec::new();
-    for captured in [false, true] {
+    for provenance in [
+        None,
+        Some(CaptureProvenance::Session),
+        Some(CaptureProvenance::ContentExact),
+    ] {
+        let captured = provenance.is_some();
         let backend = crate::native::backend(stream, stream);
         let prepared =
             eredu_core::load_model(&backend, root.path(), MlxLoadRequest::default()).unwrap();
@@ -298,10 +303,12 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
             capabilities,
         );
         let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
-        let plan = if captured {
+        let plan = if let Some(provenance) = provenance {
             let discovery =
-                <crate::backend::MlxBackend as TextGenerationBackend>::capture_discovery(&runtime)
-                    .unwrap();
+                <crate::backend::MlxBackend as TextGenerationBackend>::capture_declarations(
+                    &runtime,
+                )
+                .unwrap();
             let report = inspect_model(root.path(), MlxInspectionOptions::default()).unwrap();
             assert_eq!(
                 discovery.support.capture,
@@ -314,7 +321,8 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                 encoded_bytes: 10_000_000,
             };
             let plan = CapturePlan {
-                schema_version: 1,
+                schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+                provenance,
                 selections: discovery
                     .catalog
                     .points
@@ -372,7 +380,10 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
                 }
             }
         }
-        assert_eq!(discovery_probe.identity_is_resolved(), captured);
+        assert_eq!(
+            discovery_probe.identity_is_resolved(),
+            provenance == Some(CaptureProvenance::ContentExact)
+        );
         drop(generator);
         runtime.parts_mut().1.reset().unwrap();
         let mut following = ControlledTextGeneration::new(
@@ -403,6 +414,7 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
         results.push(tokens);
     }
     assert_eq!(results[0], results[1]);
+    assert_eq!(results[0], results[2]);
 }
 
 #[test]
@@ -423,7 +435,8 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
         encoded_bytes: 1_000_000,
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "candidates".into(),
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),
@@ -586,7 +599,8 @@ fn native_intervention_loaded_dense_preserves_rng_and_returns_effective_logits()
         encoded_bytes: 10_000_000,
     };
     let capture = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![],
         limits: CaptureLimits {
             per_step: budget,

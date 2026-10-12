@@ -455,7 +455,8 @@ fn routing_intervention_loaded_discovery_admission_and_evidence_agree_for_qwen_f
             encoded_bytes: 10_000_000,
         };
         let capture = CapturePlan {
-            schema_version: 1,
+            schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: vec![],
             limits: CaptureLimits {
                 per_step: budget,

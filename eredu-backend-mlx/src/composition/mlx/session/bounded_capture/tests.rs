@@ -88,7 +88,8 @@ fn verify_native_partition_capture_fragments(
         }],
     };
     let plan = CapturePlan {
-        schema_version: 1,
+        schema_version: eredu_core::capture::CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![selected],
         limits: CaptureLimits {
             per_step: usage,
@@ -143,7 +144,7 @@ fn verify_native_partition_capture_fragments(
             let mut ledger = CaptureLedger::new(&plan);
             let context = PartitionCaptureContext {
                 invocation: None,
-                artifact_identity: "native-fixture".into(),
+                artifact_identity: Some("native-fixture".into()),
                 execution_identity: "selected-native-shards".into(),
                 run_identity: "native-observed-branch".into(),
                 overlay_identity: Some("native-overlay-context".into()),
@@ -926,6 +927,7 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
         selected.path = path.clone();
         let plan = CapturePlan {
             schema_version: CAPTURE_SCHEMA_VERSION,
+            provenance: eredu_core::capture::CaptureProvenance::ContentExact,
             selections: vec![selected],
             limits: CaptureLimits {
                 per_step: usage,

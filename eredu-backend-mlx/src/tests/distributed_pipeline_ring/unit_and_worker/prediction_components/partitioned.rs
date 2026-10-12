@@ -235,6 +235,7 @@ pub(super) fn verify_partitioned(
                 },
                 captures: CapturePlan {
                     schema_version: CAPTURE_SCHEMA_VERSION,
+                    provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                     selections: paths
                         .iter()
                         .map(|path| CaptureSelection {

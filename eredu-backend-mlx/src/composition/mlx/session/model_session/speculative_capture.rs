@@ -168,7 +168,7 @@ impl SpeculativePartitionBinding {
             Arc::clone(&self.transport),
             self.layouts()?,
             PartitionCaptureIdentity::for_session(
-                plan.artifact_identity().into(),
+                Some(plan.artifact_identity().into()),
                 self.prepared()?.execution_identity().into(),
                 self.transport.session_identity(),
                 self.overlay.clone(),

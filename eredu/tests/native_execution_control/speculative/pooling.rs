@@ -159,6 +159,7 @@ fn verify(device: LocalDevice) {
                     settings,
                     CapturePlan {
                         schema_version: CAPTURE_SCHEMA_VERSION,
+                        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                         selections: vec![CaptureSelection {
                             id: "logits".into(),
                             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

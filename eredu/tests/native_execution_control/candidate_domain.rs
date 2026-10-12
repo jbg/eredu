@@ -88,6 +88,7 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     };
     let capture = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![CaptureSelection {
             id: "candidates".into(),
             path: eredu_core::MODEL_LOGITS_OBSERVATION_PATH.into(),

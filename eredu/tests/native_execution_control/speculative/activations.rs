@@ -95,6 +95,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                     },
                     captures: CapturePlan {
                         schema_version: CAPTURE_SCHEMA_VERSION,
+                        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                         selections: paths
                             .iter()
                             .enumerate()

@@ -188,9 +188,10 @@ completion. Refinement timing includes score capture and sampler processing;
 context timing includes controlled-session setup. Prompt and canvas token counts
 help identify the amount of work performed. Preparation is further divided into
 canvas tokenization, chat preparation, capture discovery and capture admission.
-First capture discovery establishes content-exact checkpoint provenance by hashing
-all source files; large multi-shard checkpoints use bounded parallel hashing.
-The result is retained for subsequent reads on the same loaded model.
+Decision reads use declaration-only discovery and session-bound provenance, so
+preparation does not hash the checkpoint. Library callers explicitly select
+`CaptureProvenance::ContentExact` when their records need portable content identity;
+interventions and capture snapshot/fork validation retain their stronger checks.
 
 ## Native tool calls
 

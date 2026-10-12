@@ -78,6 +78,7 @@ impl CaptureSession {
             };
             let evidence = CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: vec![selection],
                 limits: self.plan.plan().limits.clone(),
             };

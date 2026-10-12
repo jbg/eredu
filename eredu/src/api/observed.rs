@@ -98,7 +98,8 @@ pub struct ObservedGenerationRecord {
     pub schema_version: u32,
     /// Unique identity assigned by the facade for this run.
     pub run_id: String,
-    /// Content identity resolved for capture or intervention; absent for trace-only runs.
+    /// Content identity when explicitly requested or required by intervention admission.
+    /// Session-bound observations and trace-only runs leave this absent.
     pub artifact_identity: Option<String>,
     /// Identity of the loaded facade session that admitted this request.
     pub session_id: String,
@@ -359,7 +360,14 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         Ok(prepared)
     }
 
-    /// Returns the exact loaded session's retained catalog and capture support.
+    /// Returns loaded observation and collector facts without resolving source contents.
+    pub fn capture_declarations(
+        &self,
+    ) -> Result<eredu_core::capture::CaptureDeclarations, CaptureError> {
+        B::capture_declarations(&self.runtime)
+    }
+
+    /// Resolves content-exact provenance together with loaded observation facts.
     pub fn capture_discovery(&self) -> Result<CaptureDiscovery, CaptureError> {
         B::capture_discovery(&self.runtime)
     }
@@ -370,45 +378,44 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         request: CaptureRequestShape,
     ) -> Result<(AdmittedCapturePlan, Option<String>), PreparedChatError> {
         let bounds = B::text_capture_invocation_bounds(&self.runtime, request)?;
-        let (admitted, artifact_identity) = if plan.selections.is_empty() {
-            let catalog = eredu_core::ObservationCatalog {
-                schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
-                points: Vec::new(),
-                completeness: eredu_core::DescriptionCompleteness::Complete,
-            };
-            let support = eredu_core::ObservationSupportReport {
-                schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
-                points: Vec::new(),
-                capture: Default::default(),
-            };
-            let admitted = match bounds {
-                Some(bounds) => {
-                    plan.admit_invocations(&catalog, &support, &support.capture, bounds)?
-                }
-                None => plan.admit(&catalog, &support, &support.capture, request)?,
-            };
-            (admitted, None)
-        } else {
-            let discovery = self.capture_discovery()?;
-            (
-                match bounds {
-                    Some(bounds) => plan.admit_invocations(
-                        &discovery.catalog,
-                        &discovery.support,
-                        &discovery.support.capture,
-                        bounds,
-                    )?,
-                    None => plan.admit(
-                        &discovery.catalog,
-                        &discovery.support,
-                        &discovery.support.capture,
-                        request,
-                    )?,
+        let provenance = plan.provenance;
+        let declarations = if plan.selections.is_empty() {
+            eredu_core::capture::CaptureDeclarations {
+                catalog: eredu_core::ObservationCatalog {
+                    schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
+                    points: Vec::new(),
+                    completeness: eredu_core::DescriptionCompleteness::Complete,
                 },
-                Some(discovery.artifact_identity),
-            )
+                support: eredu_core::ObservationSupportReport {
+                    schema_version: eredu_core::DISCOVERY_SCHEMA_VERSION,
+                    points: Vec::new(),
+                    capture: Default::default(),
+                },
+            }
+        } else {
+            self.capture_declarations()?
+        };
+        let admitted = match bounds {
+            Some(bounds) => plan.admit_invocations(
+                &declarations.catalog,
+                &declarations.support,
+                &declarations.support.capture,
+                bounds,
+            )?,
+            None => plan.admit(
+                &declarations.catalog,
+                &declarations.support,
+                &declarations.support.capture,
+                request,
+            )?,
         };
         B::validate_text_capture(&self.runtime, &admitted)?;
+        let artifact_identity = match provenance {
+            eredu_core::capture::CaptureProvenance::Session => None,
+            eredu_core::capture::CaptureProvenance::ContentExact => {
+                Some(self.capture_discovery()?.artifact_identity)
+            }
+        };
         Ok((admitted, artifact_identity))
     }
 

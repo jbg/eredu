@@ -100,6 +100,7 @@ pub(super) fn parameter_logits_mode<
     };
     let plan = CapturePlan {
         schema_version: CAPTURE_SCHEMA_VERSION,
+        provenance: eredu_core::capture::CaptureProvenance::ContentExact,
         selections: vec![
             CaptureSelection {
                 id: "score".into(),
@@ -680,6 +681,7 @@ pub(super) fn parameter_decode_logits<
             },
             CapturePlan {
                 schema_version: CAPTURE_SCHEMA_VERSION,
+                provenance: eredu_core::capture::CaptureProvenance::ContentExact,
                 selections: vec![CaptureSelection {
                     id: "cached-logits".into(),
                     path: "model.logits".into(),

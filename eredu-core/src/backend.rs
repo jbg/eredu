@@ -1875,7 +1875,16 @@ pub trait TextGenerationBackend: BackendProvider {
         Self::configure_text_capture(runtime, state, capture)
     }
 
-    /// Returns observation facts retained from this session's admitted preparation.
+    /// Returns retained admission facts without resolving checkpoint content identity.
+    fn capture_declarations(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::capture::CaptureDeclarations, crate::capture::CaptureError> {
+        Err(crate::capture::CaptureError::Unsupported(
+            "backend has no bounded capture declarations".into(),
+        ))
+    }
+
+    /// Resolves content-exact provenance together with retained observation facts.
     fn capture_discovery(
         _runtime: &ModelRuntime<Self>,
     ) -> Result<crate::capture::CaptureDiscovery, crate::capture::CaptureError> {
