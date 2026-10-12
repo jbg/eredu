@@ -278,12 +278,14 @@ pub(crate) fn run<B: TextGenerationBackend>(
         .context("the selected model does not support pinned block refinement")?
         .get() as usize;
     let compiled = compile(&request, length, |text| Ok(model.encode(text, false)?))?;
+    let canvas_prepared = Instant::now();
     let chat = model.prepare_chat(ChatTemplateRequest {
         messages: vec![json!({"role": "user", "content": compiled.prompt})],
         enable_thinking: Some(false),
         add_generation_prompt: true,
         ..Default::default()
     })?;
+    let chat_prepared = Instant::now();
     let count = request.questions.len() as u64;
     // Row-sized native reductions include the full vocabulary; host output is bounded by selected IDs.
     let vocabulary = model
@@ -297,6 +299,7 @@ pub(crate) fn run<B: TextGenerationBackend>(
             _ => None,
         })
         .context("model score vocabulary is not declared")?;
+    let discovery_finished = Instant::now();
     let per_step = CaptureUsage {
         captures: count,
         retained_bytes: count * (vocabulary * 32 + (2 << 20)),
@@ -422,6 +425,7 @@ pub(crate) fn run<B: TextGenerationBackend>(
         answers.insert(question.id(), value);
     }
     if report_timing {
+        eprintln!("canvas_prepare_seconds={:.3} chat_prepare_seconds={:.3} discovery_seconds={:.3} admission_seconds={:.3}", canvas_prepared.duration_since(started).as_secs_f64(), chat_prepared.duration_since(canvas_prepared).as_secs_f64(), discovery_finished.duration_since(chat_prepared).as_secs_f64(), context_started.duration_since(discovery_finished).as_secs_f64());
         eprintln!("prepare_seconds={prepare_seconds:.3} context_seconds={context_seconds:.3} refinement_seconds={refinement_seconds:.3} finish_seconds={:.3} prompt_tokens={prompt_tokens} canvas_tokens={length}", finish_started.elapsed().as_secs_f64());
     }
     Ok(

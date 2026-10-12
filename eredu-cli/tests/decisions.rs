@@ -118,6 +118,10 @@ fn cli_reads_choice_noul_and_score_with_resident_and_bounded_weights() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         for field in [
+            "canvas_prepare_seconds=",
+            "chat_prepare_seconds=",
+            "discovery_seconds=",
+            "admission_seconds=",
             "prepare_seconds=",
             "context_seconds=",
             "refinement_seconds=",

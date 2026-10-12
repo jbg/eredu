@@ -186,7 +186,11 @@ and conflict with this mode. `--auto quick`, `--auto plan`, `--no-auto`, and
 Timing output separates request preparation, context encoding, refinement and
 completion. Refinement timing includes score capture and sampler processing;
 context timing includes controlled-session setup. Prompt and canvas token counts
-help identify the amount of work performed.
+help identify the amount of work performed. Preparation is further divided into
+canvas tokenization, chat preparation, capture discovery and capture admission.
+First capture discovery establishes content-exact checkpoint provenance by hashing
+all source files; large multi-shard checkpoints use bounded parallel hashing.
+The result is retained for subsequent reads on the same loaded model.
 
 ## Native tool calls
 

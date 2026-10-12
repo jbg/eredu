@@ -66,3 +66,35 @@ cargo test -p eredu-backend-mlx --no-default-features --lib selected_position_sc
 cargo test -p eredu-backend-mlx --no-default-features --lib constrained_finalization_uses_each_final_position_domain
 cargo test -p eredu-cli --no-default-features --features mlx --test decisions
 ```
+
+## Preparation profiling
+
+Decision-read timing separates canvas tokenization, chat preparation, capture
+discovery and admission. The first capture discovery hashes the complete physical
+checkpoint graph for content-exact provenance. Subsequent discovery calls share
+the resolved identity. Large multi-member artifacts use up to four hashing
+workers while preserving full-content identity and per-file metadata change
+checks.
+
+The pinned official tokenizer sidecars at revision
+`f7f5b7f5fa82ffc52addd066915886d497f5517b` reproduce the 97-token duplicate-charge
+request without model weights. Their SHA-256 values are asserted by the opt-in
+portable profile:
+
+```sh
+EREDU_DIFFUSION_TOKENIZER_DIR=/path/to/sidecars cargo test -p eredu --release --no-default-features --lib released_diffusion_gemma_chat_preparation -- --ignored --nocapture
+cargo run --release -p eredu-core --example artifact_fingerprint -- /path/to/checkpoint 3
+```
+
+A release profile measures tokenizer loading at 0.293 seconds, grammar compiler
+construction at 0.560 seconds, chat preparation at 0.00236 seconds and prompt
+encoding at 0.000142 seconds. An eleven-member fixture of 128 MiB per member
+(1.375 GiB total) measures median fresh fingerprint resolution at 0.187 seconds
+with parallel hashing, versus 0.616 seconds with one worker. The fixture uses
+warm filesystem cache; full-checkpoint and GPU end-to-end latency are not measured
+by these numbers. All runs produce identity
+`sha256:c9b49771af6b3d2163cb64c9f33b2765c11d2d576a9a6473cd7fa34652072e12`.
+
+The hashing fixture is reproducible with ordinary binary files. For each member
+index 0..10, write `bytes((byte + index) % 256 for byte in range(256))` repeated
+524288 times to `member-00` through `member-10` in the benchmark directory.

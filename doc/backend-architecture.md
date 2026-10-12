@@ -2623,8 +2623,12 @@ plans own that partition through materialization without reconstructing it.
 Exact checkpoint content identity is demand-driven. `eredu-checkpoint` records
 file identity, size and change metadata without retaining per-shard file handles;
 when requested it hashes each admitted file in one sequential pass, checking
-metadata before and after reading. `eredu-core::DeferredArtifactIdentity` shares
-and caches that result or failure. Model, external-assistant and Moshi source
+metadata before and after reading. Multi-member graphs of at least 8 MiB use up
+to four host workers, bounded by available CPU parallelism, with one 1 MiB read
+buffer and open file per worker. Logical member order and SHA-256 identity encoding
+are independent of scheduling; failures cancel unscheduled work and all active
+workers settle before the operation returns.
+`eredu-core::DeferredArtifactIdentity` shares and caches that result or failure. Model, external-assistant and Moshi source
 preparation retain the pending identity without reading payloads for hashing.
 Architecture-owned discovery declarations carry it through native construction;
 explicit capture/intervention discovery resolves it on demand. Ordinary generation
@@ -2639,7 +2643,7 @@ when CPU hash instructions are available. Eredu code retains ordinary debug
 settings; the SHA-256 identity format, full-content reads and change detection
 are unchanged. Downstream workspaces control their own Cargo profiles and can
 apply the same `[profile.dev.package.sha2] opt-level = 3` override.
-`cargo run -p eredu-core --example artifact_fingerprint -- FILE [ITERATIONS]`
+`cargo run -p eredu-core --example artifact_fingerprint -- FILE_OR_DIRECTORY [ITERATIONS]`
 measures fresh deferred resolutions and memoized lookups. Compare profiles on the
 same file and require identical artifact identities; throughput depends on build
 configuration, hardware and filesystem caching.

@@ -32,6 +32,7 @@ mod ifm;
 mod qwen4_exp;
 mod qwen4_metadata;
 mod qwen4_tokenizer;
+mod refinement_preparation;
 mod sampler;
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);

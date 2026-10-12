@@ -118,22 +118,92 @@ impl ArtifactFingerprintSource {
     }
 
     /// Reads each complete file once, rejecting changes since admission.
+    /// Large multi-member artifacts use at most four hashing workers and read buffers.
     pub fn fingerprint(&self) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintError> {
-        self.files
+        let bytes = self
+            .files
             .iter()
-            .map(|pinned| {
-                let path = pinned.member.path();
-                let file = File::open(path).map_err(|source| io_error("open", path, source))?;
-                let fingerprint =
-                    fingerprint_open_file_with_hook(path, &file, pinned.admitted, || {})?;
-                Ok(ArtifactMemberFingerprint {
-                    logical_role: pinned.member.logical_role.clone(),
-                    length: fingerprint.length,
-                    digest: fingerprint.digest,
-                })
-            })
-            .collect()
+            .fold(0u64, |sum, file| sum.saturating_add(file.admitted.length));
+        let workers = if bytes >= 8 * 1024 * 1024 {
+            std::thread::available_parallelism()
+                .map_or(1, |count| count.get())
+                .min(4)
+        } else {
+            1
+        };
+        self.fingerprint_with_workers(workers)
     }
+
+    fn fingerprint_with_workers(
+        &self,
+        workers: usize,
+    ) -> Result<Vec<ArtifactMemberFingerprint>, ArtifactFingerprintError> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let workers = workers.max(1).min(self.files.len()).min(4);
+        if workers <= 1 {
+            return self.files.iter().map(fingerprint_member).collect();
+        }
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                handles.push(
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, || {
+                            let mut results = Vec::new();
+                            while !failed.load(Ordering::Relaxed) {
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(member) = self.files.get(index) else {
+                                    break;
+                                };
+                                let result = fingerprint_member(member);
+                                if result.is_err() {
+                                    failed.store(true, Ordering::Relaxed);
+                                }
+                                results.push((index, result));
+                            }
+                            results
+                        })
+                        .map_err(|error| {
+                            failed.store(true, Ordering::Relaxed);
+                            io_error(
+                                "spawn fingerprint worker",
+                                self.files[0].member.path(),
+                                error,
+                            )
+                        })?,
+                );
+            }
+            let mut results = Vec::with_capacity(self.files.len());
+            for handle in handles {
+                results.extend(handle.join().map_err(|_| {
+                    failed.store(true, Ordering::Relaxed);
+                    io_error(
+                        "join fingerprint worker",
+                        self.files[0].member.path(),
+                        std::io::Error::other("fingerprint worker panicked"),
+                    )
+                })?);
+            }
+            // Logical member order and the identity encoding are independent of scheduling.
+            results.sort_unstable_by_key(|(index, _)| *index);
+            results.into_iter().map(|(_, result)| result).collect()
+        })
+    }
+}
+
+fn fingerprint_member(
+    pinned: &AdmittedArtifactFile,
+) -> Result<ArtifactMemberFingerprint, ArtifactFingerprintError> {
+    let path = pinned.member.path();
+    let file = File::open(path).map_err(|source| io_error("open", path, source))?;
+    let fingerprint = fingerprint_open_file_with_hook(path, &file, pinned.admitted, || {})?;
+    Ok(ArtifactMemberFingerprint {
+        logical_role: pinned.member.logical_role.clone(),
+        length: fingerprint.length,
+        digest: fingerprint.digest,
+    })
 }
 
 /// Reads content fingerprints with one sequential pass per file.
@@ -347,5 +417,29 @@ mod tests {
             result,
             Err(ArtifactFingerprintError::Changed { .. })
         ));
+    }
+    #[test]
+    fn parallel_members_preserve_content_and_order_and_reject_changed_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut members = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..7 {
+            let payload = vec![index as u8 + 3; 1024 * 1024 + index * 17];
+            let path = directory.path().join(format!("member-{index}"));
+            std::fs::write(&path, &payload).unwrap();
+            let role = format!("role-{}", 7 - index);
+            expected.push(ArtifactMemberFingerprint {
+                logical_role: role.clone(),
+                length: payload.len() as u64,
+                digest: Sha256::digest(&payload).into(),
+            });
+            members.push(ArtifactFile::new(role, path));
+        }
+        let source = ArtifactFingerprintSource::new(members.clone()).unwrap();
+        assert_eq!(source.fingerprint_with_workers(4).unwrap(), expected);
+        std::fs::write(members[2].path(), b"replaced payload").unwrap();
+        assert!(
+            matches!(source.fingerprint_with_workers(4), Err(ArtifactFingerprintError::Changed { path }) if path == members[2].path())
+        );
     }
 }
