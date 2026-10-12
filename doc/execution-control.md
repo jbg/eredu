@@ -26,6 +26,14 @@ Drafts clear before canonical delivery and on cancellation, failure, restoration
 or branch exchange. Snapshot replay preserves numerical state while advancing
 the output epoch, so consumers cannot mistake replayed drafts for older revisions.
 
+A prepared observed request can retain a seeded `RefinementCanvas` with pinned
+positions. Ordinary and controlled execution preserve those positions during
+refinement and carry them through snapshot, restore and fork. Fixed positions use
+one-hot feedback and do not dilute confidence at unresolved positions. Explicit
+position score captures support reads without commitment: advance through context
+and refinement, collect the scores, then cancel before finalization. See
+[seeded and pinned canvases](refinement-canvases.md).
+
 The `refinement` setting controls the trained iterative schedule. Causal sampling
 knob overrides and causal likelihood-ratio speculative verification reject
 noncausal target scores with `RequiresCausalConditionalScores`. Constrained

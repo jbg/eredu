@@ -20,6 +20,19 @@ Restoration advances the output epoch, and forks receive independent draft ident
 Physical capture bounds cover the complete context and canvas separately from the
 committed prediction schedule; repeated refinement cannot refund capture budgets.
 
+Seeded and fixed-position canvas contracts live in `eredu-core::refinement`.
+The runtime validates them and preserves fixed tokens and one-hot feedback through
+refinement; confidence averaging excludes fixed positions. Native backends supply
+seed installation, masking and finite-candidate validation as general numerical
+mechanisms. They do not compile question schemas or interpret alternatives.
+Ordinary observed requests and controlled sessions share this state, including
+snapshots and finalization. Explicit-position token-score capture retains the
+requested coordinate in its admitted selection and reduces one complete vocabulary
+row with bounded host output. Workspace envelopes cover masking and one-hot
+feedback; snapshot reservations cover both immutable native pins and host layout.
+The CLI owns question schemas, letter-template compilation, normalized option
+probabilities and numeric level expectations. See [canvas controls](refinement-canvases.md).
+
 Iterative token-block policy lives in `eredu-core::refinement` and
 `eredu-runtime::generation::refinement`. The portable engine owns temperature,
 entropy acceptance, confidence/stability stopping, feedback precision and RNG

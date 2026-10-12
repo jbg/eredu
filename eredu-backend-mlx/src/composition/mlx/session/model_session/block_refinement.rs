@@ -256,6 +256,7 @@ impl MlxBackend<'_> {
                     domain,
                     submission.output.dtype(),
                     RandomState::with_seed(state.sampling.refinement_seed)?,
+                    state.sampling.canvas.clone(),
                 ));
             }
             let block = state.sampling.refinement.as_mut().expect("active block");

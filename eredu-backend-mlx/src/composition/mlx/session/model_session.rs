@@ -1857,6 +1857,20 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .and_then(eredu_runtime::capture::CaptureSession::take_step)
     }
 
+    fn refinement_vocabulary_size(runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
+        runtime
+            .session()
+            .block_refinement_geometry()
+            .map(|geometry| geometry.vocabulary_size)
+    }
+
+    fn refinement_canvas_length(runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
+        runtime
+            .session()
+            .block_refinement_geometry()
+            .map(|geometry| geometry.canvas_length)
+    }
+
     fn start_text_generation(
         _: &Self,
         config: TextGenerationConfig,
@@ -1872,7 +1886,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             } else {
                 Some(RandomState::from_key(safemlx::random::key(config.seed())?))
             };
-            let sampler = MlxTextSampler::from_config(config).map_err(|error| {
+            let sampler = MlxTextSampler::from_config(&config).map_err(|error| {
                 eredu_core::BackendError::Execution {
                     session: "text-generation".into(),
                     operation: "configure Mirostat V2".into(),
@@ -1889,6 +1903,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     refinement_seed: config.seed(),
                     refinement_policy: config.refinement_policy().unwrap_or_default(),
                     draft_events: config.draft_events(),
+                    canvas: config.refinement_canvas().cloned(),
                     refinement: None,
                 },
                 capture: None,

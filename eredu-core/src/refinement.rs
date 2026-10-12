@@ -3,6 +3,45 @@
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 
+/// Initial token positions and immutable positions of an iterative canvas.
+/// Missing seed tokens receive ordinary full-domain noise. Pins require a seed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefinementCanvas {
+    /// Complete canvas, in model token IDs.
+    pub seed_tokens: Vec<Option<u32>>,
+    /// Unique zero-based positions held fixed throughout refinement.
+    pub pinned_positions: Vec<u32>,
+}
+
+impl RefinementCanvas {
+    /// Validates geometry and identity before backend allocation or random draws.
+    pub fn validate(&self, length: u32, vocabulary: usize) -> Result<(), RefinementPolicyError> {
+        let pins: std::collections::BTreeSet<_> = self.pinned_positions.iter().copied().collect();
+        if self.seed_tokens.len() != length as usize
+            || self
+                .seed_tokens
+                .iter()
+                .flatten()
+                .any(|id| *id as usize >= vocabulary)
+            || pins.len() != self.pinned_positions.len()
+            || pins.iter().any(|p| {
+                self.seed_tokens
+                    .get(*p as usize)
+                    .is_none_or(Option::is_none)
+            })
+        {
+            return Err(RefinementPolicyError::Canvas);
+        }
+        Ok(())
+    }
+
+    /// Immutable host storage retained by request and snapshot owners.
+    pub fn host_bytes(&self) -> u64 {
+        (self.seed_tokens.len() * std::mem::size_of::<Option<u32>>()
+            + self.pinned_positions.len() * std::mem::size_of::<u32>()) as u64
+    }
+}
+
 /// Validated entropy-bounded refinement controls, independent of model geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RefinementOptions", into = "RefinementOptions")]
@@ -44,6 +83,11 @@ impl Default for RefinementOptions {
 /// A refinement request rejected before execution or random draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RefinementPolicyError {
+    /// Seed geometry, token identities or pinned positions are invalid.
+    #[error(
+        "refinement canvas requires exact geometry, admitted token IDs and unique seeded pins"
+    )]
+    Canvas,
     /// No decoder invocation is allowed.
     #[error("refinement requires at least one denoising step")]
     ZeroSteps,

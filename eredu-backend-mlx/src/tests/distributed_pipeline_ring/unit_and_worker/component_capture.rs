@@ -360,7 +360,12 @@ fn verify_loaded_component_capture(
             };
             let (before, after) = (values(input), values(output));
             assert!(before.iter().zip(after).any(|(a, b)| (a - b).abs() > 1e-4));
-            for (before, after) in before.as_chunks::<32>().0.iter().zip(after.as_chunks::<32>().0.iter()) {
+            for (before, after) in before
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .zip(after.as_chunks::<32>().0.iter())
+            {
                 let rms = (before.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / 32.0 + 1e-6)
                     .sqrt();
                 for (index, (&input, &output)) in before.iter().zip(after).enumerate() {
@@ -480,6 +485,7 @@ fn verify_loaded_component_capture(
     // exported complete final rows, never a softmax over truncated candidates.
     for transform in [
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![0, 3],
         },
         CaptureTransform::TopCandidates { count: 3 },

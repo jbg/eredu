@@ -172,6 +172,7 @@ fn main() -> anyhow::Result<()> {
         },
         slices: vec![],
         transform: CaptureTransform::TokenScores {
+            position: None,
             token_ids: selected_scores,
         },
     });

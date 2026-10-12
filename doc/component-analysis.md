@@ -205,9 +205,11 @@ softcaps apply to the reconstructed score as a whole. The evaluation helper
 `MeasuredReadout` implements this host reference arithmetic with compensated
 signed summation; it is not inference or attribution policy in the backend.
 
-`CaptureTransform::TokenScores { token_ids }` at unsliced `model.logits` returns
+`CaptureTransform::TokenScores { position, token_ids }` at unsliced `model.logits` returns
 up to 64 selected raw scores, their strongest different-token competitors,
-competition ranks and full-model-vocabulary log probabilities for the final row.
+competition ranks and full-model-vocabulary log probabilities for the selected row.
+An explicit zero-based `position` selects a sequence row; `None` selects the final
+row. The position must exist in each captured invocation.
 It performs no sampling or forcing. The distribution includes every model output
 ID; tokenizer and grammar membership are reported separately. Nonlinear output
 transforms already applied by the architecture are included in these scores.

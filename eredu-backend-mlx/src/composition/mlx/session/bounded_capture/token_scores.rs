@@ -7,6 +7,7 @@ impl NativeCapture<'_> {
         &self,
         tensor: &MlxTensor,
         ids: &[u32],
+        position: Option<u64>,
     ) -> Result<CapturePayload, Exception> {
         let stream = self.stream;
         let vocabulary = *tensor
@@ -16,10 +17,22 @@ impl NativeCapture<'_> {
         if vocabulary <= 0 || ids.iter().any(|id| *id >= vocabulary as u32) {
             return Err(Exception::custom("invalid selected score vocabulary"));
         }
+        let positions = tensor
+            .shape()
+            .iter()
+            .take(tensor.shape().len() - 1)
+            .try_fold(1u64, |n, v| n.checked_mul(*v as u64))
+            .ok_or_else(|| Exception::custom("score position geometry overflow"))?;
+        if position.is_some_and(|p| p >= positions) {
+            return Err(Exception::custom(
+                "selected score position lies outside the invocation",
+            ));
+        }
+        let row_index = position.map_or(-1, |p| p as i32);
         let row = tensor
             .as_array()
             .reshape(&[-1, vocabulary], stream)?
-            .try_index_device((-1, ..), stream)?
+            .try_index_device((row_index, ..), stream)?
             .as_dtype(Dtype::Float32, stream)?;
         if count_mask(row.is_finite(stream)?, stream)? != vocabulary as u64 {
             return Err(Exception::custom(

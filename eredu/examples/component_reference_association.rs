@@ -119,6 +119,7 @@ pub fn run<B: ParameterBackend>(
                 },
                 slices: vec![],
                 transform: CaptureTransform::TokenScores {
+                    position: None,
                     token_ids: vec![target],
                 },
             });

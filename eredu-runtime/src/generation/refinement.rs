@@ -34,7 +34,22 @@ pub trait RefinementBackend {
     /// Architecture-selected embedding arithmetic used for retained feedback.
     type ConditioningFormat: Clone;
 
-    /// Divides scores by a validated positive temperature.
+    /// Installs explicit seed values and returns the fixed-position mask.
+    fn seed_canvas(
+        noise: &Self::Token,
+        layout: &eredu_core::refinement::RefinementCanvas,
+        context: &Self::Context,
+    ) -> Result<(Self::Token, Self::Mask), Self::Error>;
+    /// Fixed positions have one-hot conditioning: zero at their seed and negative infinity elsewhere.
+    fn pin_scores(
+        scores: &Self::Logits,
+        tokens: &Self::Token,
+        pins: &Self::Mask,
+        context: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error>;
+
+    /// Rejects NaN, positive infinity and rows without a finite candidate, then
+    /// divides scores by a validated positive temperature.
     fn scale_temperature(
         logits: &Self::Logits,
         temperature: f32,
@@ -99,6 +114,7 @@ pub trait RefinementBackend {
         argmax: &Self::Token,
         preceding: &[Self::Token],
         confidence_threshold: f32,
+        pins: Option<&Self::Mask>,
         context: &Self::Context,
     ) -> Result<bool, Self::Error>;
 
@@ -159,6 +175,7 @@ pub struct RefinementState<B: RefinementBackend> {
     random: B::RandomState,
     completed: u32,
     finished: bool,
+    pinning: Option<(B::Token, B::Mask)>,
 }
 
 /// Immutable numerical storage retained by an iterative continuation.
@@ -192,6 +209,7 @@ where
             random: self.random.clone(),
             completed: self.completed,
             finished: self.finished,
+            pinning: self.pinning.clone(),
         }
     }
 }
@@ -203,6 +221,10 @@ where
     /// Enumerates retained immutable values for native snapshot accounting.
     pub fn visit_retained_values(&self, mut visit: impl FnMut(RefinementValue<'_, B>)) {
         visit(RefinementValue::Tokens(&self.canvas));
+        if let Some((tokens, pins)) = &self.pinning {
+            visit(RefinementValue::Tokens(tokens));
+            visit(RefinementValue::Mask(pins));
+        }
         if let Some(value) = &self.argmax {
             visit(RefinementValue::Tokens(value));
         }
@@ -240,6 +262,7 @@ where
         domain: TokenDomain,
         conditioning_format: B::ConditioningFormat,
         mut random: B::RandomState,
+        layout: Option<&eredu_core::refinement::RefinementCanvas>,
         context: &B::Context,
     ) -> Result<Self, RefinementError<B::Error>> {
         if domain.cardinality() == 0
@@ -248,8 +271,19 @@ where
         {
             return Err(RefinementError::Geometry);
         }
+        if let Some(layout) = layout {
+            layout.validate(canvas_length.get(), domain.cardinality())?;
+        }
         let canvas = B::uniform_tokens(canvas_length, domain, &mut random, context)
             .map_err(RefinementError::Backend)?;
+        let (canvas, pinning) = match layout {
+            Some(layout) => {
+                let (seeded, pins) =
+                    B::seed_canvas(&canvas, layout, context).map_err(RefinementError::Backend)?;
+                (seeded.clone(), Some((seeded, pins)))
+            }
+            None => (canvas, None),
+        };
         B::settle_initial_canvas(&canvas, &random, context).map_err(RefinementError::Backend)?;
         Ok(Self {
             config,
@@ -265,6 +299,7 @@ where
             random,
             completed: 0,
             finished: false,
+            pinning,
         })
     }
 
@@ -331,6 +366,12 @@ where
         let mut random = self.random.clone();
         let scores = B::scale_temperature(raw_logits, temperature, context)
             .map_err(RefinementError::Backend)?;
+        let scores = match &self.pinning {
+            Some((tokens, mask)) => {
+                B::pin_scores(&scores, tokens, mask, context).map_err(RefinementError::Backend)?
+            }
+            None => scores,
+        };
         let sampled = B::categorical_tokens(&scores, &mut random, context)
             .map_err(RefinementError::Backend)?;
         let argmax = B::argmax_tokens(&scores, context).map_err(RefinementError::Backend)?;
@@ -349,6 +390,7 @@ where
                 &argmax,
                 &self.history,
                 options.confidence_threshold,
+                self.pinning.as_ref().map(|(_, pins)| pins),
                 context,
             )
             .map_err(RefinementError::Backend)?;

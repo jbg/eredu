@@ -228,6 +228,7 @@ fn aborted_prefill_span_restores_authority_without_refunding_or_committing_progr
 fn generated_prediction_scores_wait_for_the_final_prefill_chunk() {
     for transform in [
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![1, 2],
         },
         CaptureTransform::TopCandidates { count: 2 },

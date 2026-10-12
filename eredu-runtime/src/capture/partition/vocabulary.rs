@@ -125,7 +125,7 @@ pub(super) fn validate_payload(
                             && (index == 0 || value.candidates[index - 1].score >= candidate.score)
                     })
         }
-        (CaptureTransform::TokenScores { token_ids }, CapturePayload::TokenScores(value)) => {
+        (CaptureTransform::TokenScores { token_ids, .. }, CapturePayload::TokenScores(value)) => {
             value.source == expected_source
                 && value.vocabulary == vocabulary
                 && value.log_partition.is_finite()

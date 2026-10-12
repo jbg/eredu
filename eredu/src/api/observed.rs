@@ -53,6 +53,7 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
     pub(super) chat: PreparedChat,
     pub(super) prompt_token_ids: Vec<u32>,
     pub(super) settings: PreparedChatGenerationSettings,
+    pub(super) canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     pub(super) resolved: ResolvedGenerationConfig,
     pub(super) plan: AdmittedCapturePlan,
     pub(super) intervention: Option<AdmittedInterventionPlan>,
@@ -63,6 +64,15 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
 }
 
 impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
+    /// Installs generic seed/pin controls. The loaded session validates them before execution.
+    pub fn with_refinement_canvas(
+        mut self,
+        canvas: eredu_core::refinement::RefinementCanvas,
+    ) -> Self {
+        self.canvas = Some(std::sync::Arc::new(canvas));
+        self
+    }
+
     /// Prompt alignment in the checkpoint's canonical tokenizer vocabulary.
     pub fn prompt_token_ids(&self) -> &[u32] {
         &self.prompt_token_ids
@@ -457,6 +467,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             chat: chat.clone(),
             prompt_token_ids,
             settings,
+            canvas: None,
             resolved: config.sampling(),
             plan: admitted,
             intervention: None,
@@ -695,6 +706,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )),
             started,
             mode,
+            prepared.canvas,
         );
         let mut delivery = delivery.into_inner();
         if let Some(event) = delivery.drafts.clear() {

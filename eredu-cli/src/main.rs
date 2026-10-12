@@ -1,4 +1,5 @@
 mod common;
+mod decisions;
 mod memory;
 #[cfg(feature = "realtime")]
 mod realtime;
@@ -414,6 +415,10 @@ struct Cli {
     /// Measure cold prefill, repeated prefill, and one cached decode separately.
     #[arg(long)]
     expert_cache_benchmark: bool,
+
+    /// Read choice/noul/score questions and evidence from JSON; '-' reads stdin.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["prompt", "raw", "tools", "draft_model", "mirostat_v2", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "repeat_last_n", "frequency_penalty", "presence_penalty", "max_tokens", "stop_sequences", "thinking", "reasoning_effort", "expert_cache_benchmark", "memory_report", "estimate_memory_tokens", "telemetry_json", "memory_budget_bytes", "memory_policy", "memory_reserve_bytes", "speculative_draft_tokens"])]
+    decisions: Option<PathBuf>,
 
     /// Pass the prompt directly instead of applying the model's chat template.
     #[arg(long)]
@@ -2010,8 +2015,12 @@ fn main() -> Result<()> {
     if args.no_auto {
         args.auto = None;
     }
+    if args.decisions.is_some() {
+        args.speculative_draft_tokens = 0;
+    }
     let original_args = args.clone();
     validate_args(&args)?;
+    let decision_request = args.decisions.as_deref().map(decisions::read).transpose()?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
         args.common
             .model
@@ -2166,7 +2175,7 @@ fn main() -> Result<()> {
     if args.estimate_memory_tokens.is_none() {
         args.common.configure_runtime()?;
     }
-    let prompt = if args.estimate_memory_tokens.is_some() {
+    let prompt = if args.estimate_memory_tokens.is_some() || decision_request.is_some() {
         String::new()
     } else {
         read_prompt(args.prompt.as_deref())?
@@ -2256,6 +2265,20 @@ fn main() -> Result<()> {
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
+    if let Some(request) = decision_request {
+        let load_seconds = load_started.elapsed().as_secs_f64();
+        let read_started = Instant::now();
+        let result = decisions::run(&mut model, request, args.common.seed)?;
+        if args.timing || args.verbose {
+            eprintln!(
+                "load_seconds={load_seconds:.3} read_seconds={:.3}",
+                read_started.elapsed().as_secs_f64()
+            );
+        }
+        serde_json::to_writer_pretty(io::stdout().lock(), &result)?;
+        println!();
+        return Ok(());
+    }
     if args.prefill_chunk_size > 0 && (args.verbose || memory::requested(&args)) {
         if let Err(reason) = model.prefill_chunking_support() {
             eprintln!("prefill uses one complete pass: {reason}");
@@ -2907,6 +2930,9 @@ fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkS
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
+    if args.decisions.is_some() && matches!(args.auto, Some(AutoMode::Benchmark)) {
+        bail!("--decisions supports --auto quick, --auto plan or --no-auto; generation benchmarks do not measure decision reads");
+    }
     if args.estimate_memory_tokens.is_some()
         && matches!(args.auto, Some(AutoMode::Plan | AutoMode::Benchmark))
     {

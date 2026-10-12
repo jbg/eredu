@@ -154,6 +154,7 @@ fn encoded(plan: &AdmittedCapturePlan, receipt: &PartitionCaptureReceiptPlan) ->
 fn complete_vocabulary_receipts_preserve_reductions_and_provenance() {
     for transform in [
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         CaptureTransform::TopCandidates { count: 3 },
@@ -181,6 +182,7 @@ fn complete_vocabulary_receipts_preserve_reductions_and_provenance() {
 fn vocabulary_admission_rejects_shards_permutations_and_replicate_export_before_work() {
     for transform in [
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         CaptureTransform::TopCandidates { count: 3 },
@@ -244,6 +246,7 @@ fn vocabulary_admission_rejects_shards_permutations_and_replicate_export_before_
 fn vocabulary_receipts_reject_malformed_score_and_candidate_evidence() {
     for transform in [
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         CaptureTransform::TopCandidates { count: 3 },
@@ -344,6 +347,7 @@ fn vocabulary_receipts_reject_malformed_score_and_candidate_evidence() {
 #[test]
 fn vocabulary_delivery_reserves_bounded_payload_and_rejects_exhaustion() {
     let transform = CaptureTransform::TokenScores {
+        position: None,
         token_ids: vec![3, 0],
     };
     let small = score_plan(transform.clone(), 4);
@@ -408,6 +412,7 @@ fn vocabulary_delivery_reserves_bounded_payload_and_rejects_exhaustion() {
 fn vocabulary_receipts_preserve_stable_probabilities_at_extreme_equal_scores() {
     let plan = score_plan(
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         4,
@@ -445,6 +450,7 @@ fn vocabulary_receipts_preserve_stable_probabilities_at_extreme_equal_scores() {
 fn vocabulary_receipts_reject_impossible_probabilities_when_log_partition_rounds() {
     let plan = score_plan(
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         4,
@@ -486,6 +492,7 @@ fn vocabulary_receipts_reject_impossible_probabilities_when_log_partition_rounds
 fn vocabulary_receipts_preserve_probabilities_across_score_gaps() {
     let plan = score_plan(
         CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![3, 0],
         },
         4,

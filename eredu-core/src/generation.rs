@@ -971,6 +971,12 @@ pub enum SemanticEvent {
 /// Invalid backend-neutral generation configuration or state transition.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GenerationError {
+    /// Canvas controls require a selected block-refinement realization.
+    #[error("selected executable has no block-refinement canvas")]
+    RefinementUnavailable,
+    /// Invalid explicit canvas, before request allocation or execution.
+    #[error(transparent)]
+    RefinementCanvas(#[from] crate::refinement::RefinementPolicyError),
     /// Conditional samplers cannot consume iterative position scores.
     #[error("sampling settings require causal conditional scores; use the refinement policy for iterative execution")]
     RequiresCausalConditionalScores,

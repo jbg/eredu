@@ -469,7 +469,13 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
                 eredu_core::TextGenerationConfig::new(sampling.clone())
                     .with_seed(13)
                     .with_refinement_policy(Some(policy))
-                    .with_draft_events(true),
+                    .with_draft_events(true)
+                    .with_refinement_canvas(Some(std::sync::Arc::new(
+                        eredu_core::refinement::RefinementCanvas {
+                            seed_tokens: vec![Some(5), None, Some(7)],
+                            pinned_positions: vec![0, 2],
+                        },
+                    ))),
                 SnapshotController::default(),
             )
             .unwrap();
@@ -541,6 +547,11 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
                                 .as_ref()
                                 .expect("opt-in tentative IDs");
                             assert_eq!(ids.len(), 3);
+                            assert_eq!(
+                                (ids[0], ids[2]),
+                                (5, 7),
+                                "snapshot/fork lost pinned positions"
+                            );
                             assert!(ids.iter().all(|id| *id < 11));
                         }
                         (Some(progress.phase), None)

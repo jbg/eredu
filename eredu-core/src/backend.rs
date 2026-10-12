@@ -1391,7 +1391,7 @@ impl<B: ModelLoadingBackend> ModelRuntime<B> {
 }
 
 /// Portable sampling inputs for one text-generation session.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextGenerationConfig {
     sampling: ResolvedGenerationConfig,
     seed: u64,
@@ -1399,6 +1399,7 @@ pub struct TextGenerationConfig {
     prefill: PrefillChunkPolicy,
     refinement: Option<crate::refinement::RefinementConfig>,
     draft_events: bool,
+    canvas: Option<std::sync::Arc<crate::refinement::RefinementCanvas>>,
 }
 
 /// Bounds the number of prompt tokens processed together when the selected
@@ -1446,7 +1447,24 @@ impl TextGenerationConfig {
             prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(512).unwrap()),
             refinement: None,
             draft_events: false,
+            canvas: None,
         }
+    }
+
+    /// Selects a seeded and optionally pinned canvas for every iterative block.
+    pub fn with_refinement_canvas(
+        mut self,
+        canvas: Option<std::sync::Arc<crate::refinement::RefinementCanvas>>,
+    ) -> Self {
+        self.canvas = canvas;
+        self
+    }
+
+    /// Immutable canvas controls retained independently from numerical state.
+    pub fn refinement_canvas(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::refinement::RefinementCanvas>> {
+        self.canvas.as_ref()
     }
 
     /// Selects the deterministic root seed used by a stochastic backend.
@@ -1980,7 +1998,17 @@ pub trait TextGenerationBackend: BackendProvider {
         Ok(false)
     }
 
-    /// Declares the next physical operation without execution or controller queries.
+    /// Trained canvas extent of the selected iterative realization, without execution.
+    fn refinement_canvas_length(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
+        None
+    }
+
+    /// Complete score vocabulary of the selected iterative realization.
+    fn refinement_vocabulary_size(_runtime: &ModelRuntime<Self>) -> Option<std::num::NonZeroU32> {
+        None
+    }
+
+    /// Whether the selected executable supports iterative token blocks.
     fn supports_block_refinement(_runtime: &ModelRuntime<Self>) -> bool {
         false
     }
@@ -2372,7 +2400,10 @@ where
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
         let block_refinement = B::supports_block_refinement(runtime);
-        let admission = if config.refinement_policy().is_some() && !block_refinement {
+        let admission = if (config.refinement_policy().is_some()
+            || config.refinement_canvas().is_some())
+            && !block_refinement
+        {
             Err(ControlledTextGenerationError::Operation(
                 TextOperationPolicyError::RequiresBlockRefinementArchitecture,
             ))
@@ -2385,13 +2416,35 @@ where
         } else {
             Ok(())
         };
+        let admission = admission.and_then(|()| {
+            if let Some(canvas) = config.refinement_canvas() {
+                let length = B::refinement_canvas_length(runtime).ok_or(
+                    ControlledTextGenerationError::Operation(
+                        TextOperationPolicyError::RequiresBlockRefinementArchitecture,
+                    ),
+                )?;
+                let vocabulary = B::refinement_vocabulary_size(runtime).ok_or(
+                    ControlledTextGenerationError::Operation(
+                        TextOperationPolicyError::RequiresBlockRefinementArchitecture,
+                    ),
+                )?;
+                canvas
+                    .validate(length.get(), vocabulary.get() as usize)
+                    .map_err(|e| {
+                        ControlledTextGenerationError::Operation(
+                            TextOperationPolicyError::InvalidRefinementCanvas(e),
+                        )
+                    })?;
+            }
+            Ok(())
+        });
         // Agree portable admission before configuring native state or drawing noise.
         runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Sampling,
             admission,
             ControlledTextGenerationError::Preparation,
         )?;
-        let backend_state = B::start_text_generation(runtime.backend(), config)
+        let backend_state = B::start_text_generation(runtime.backend(), config.clone())
             .map_err(ControlledTextGenerationError::Backend);
         let backend_state = runtime.finish_text_preparation(
             crate::run_preparation::TextPreparationStage::Sampling,
@@ -3687,7 +3740,7 @@ mod tests {
         let mut ordinary = ControlledTextGeneration::new(
             &mut ordinary_runtime,
             vec![1, 2],
-            config,
+            config.clone(),
             controller.clone(),
         )
         .unwrap();
@@ -3769,7 +3822,9 @@ mod tests {
             let ordinary = TextGeneration::new(
                 &mut ordinary_runtime,
                 prompt.clone(),
-                config.with_prefill_chunk_policy(PrefillChunkPolicy::Unchunked),
+                config
+                    .clone()
+                    .with_prefill_chunk_policy(PrefillChunkPolicy::Unchunked),
             )
             .unwrap()
             .map(|token| token.unwrap())

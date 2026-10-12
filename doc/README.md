@@ -13,6 +13,8 @@ changes, archived APIs and exact revisions for applications pinned to old `main`
   modalities, artifact formats, and inspection.
 - [DiffusionGemma validation](diffusion-gemma-validation.md): shared-stack block
   refinement, released SafeTensors/GGUF evidence, and reproduction commands.
+- [Seeded and pinned refinement canvases](refinement-canvases.md): generic
+  canvas controls, position score captures and controlled reads.
 - [Model loading, quantization, and memory](model-loading.md): weight residency,
   cache residency, prompt caches, and memory accounting.
 - [Parallel execution](parallel-execution.md): tensor, pipeline, and expert

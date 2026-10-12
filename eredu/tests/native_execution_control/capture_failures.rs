@@ -52,7 +52,10 @@ fn capture(scores: bool, cumulative: CaptureUsage) -> CapturePlan {
             schedule: CaptureSchedule::default(),
             slices: vec![],
             transform: if scores {
-                CaptureTransform::TokenScores { token_ids: vec![1] }
+                CaptureTransform::TokenScores {
+                    position: None,
+                    token_ids: vec![1],
+                }
             } else {
                 CaptureTransform::FullTensor
             },

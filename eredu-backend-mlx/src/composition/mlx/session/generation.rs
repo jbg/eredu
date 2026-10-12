@@ -19,6 +19,7 @@ pub struct MlxTextSamplingState {
     pub(super) refinement_seed: u64,
     pub(super) refinement_policy: eredu_core::refinement::RefinementConfig,
     pub(super) draft_events: bool,
+    pub(super) canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     pub(super) refinement: Option<
         eredu_runtime::generation::refinement::block::BlockRefinementState<MlxSamplingBackend>,
     >,
@@ -32,7 +33,7 @@ pub(crate) enum MlxTextSampler {
 
 impl MlxTextSampler {
     pub(crate) fn from_config(
-        config: TextGenerationConfig,
+        config: &TextGenerationConfig,
     ) -> Result<Self, SamplingConfigurationError> {
         let sampling = config.sampling();
         Ok(match config.strategy() {

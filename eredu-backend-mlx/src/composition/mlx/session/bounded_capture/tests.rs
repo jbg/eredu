@@ -530,6 +530,7 @@ fn full_vocabulary_token_scores_use_every_logit_and_bound_host_reads() {
         domain: None,
     };
     let request = selection(CaptureTransform::TokenScores {
+        position: None,
         token_ids: vec![0, 73, 2000],
     });
     let cost = native
@@ -575,6 +576,7 @@ fn full_vocabulary_token_scores_use_every_logit_and_bound_host_reads() {
     for values in [vec![f32::MAX, f32::MAX], vec![10000.0, 10000.0]] {
         let tensor = MlxTensor::from_array(Array::from_slice(&values, &[2]));
         let request = selection(CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![0, 1],
         });
         let CapturePayload::TokenScores(result) =
@@ -980,4 +982,45 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
         assert!(result.candidates[1].allowed);
         assert_eq!(result.candidates[0].score, 8.0);
     }
+}
+
+#[test]
+fn selected_position_scores_read_requested_row_and_reject_out_of_range() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let tensor = MlxTensor::from_array(Array::from_slice(
+        &[1.0f32, 2.0, 0.0, 10.0, -3.0, 4.0],
+        &[1, 2, 3],
+    ));
+    let mut native = NativeCapture {
+        stream: &stream,
+        domain: None,
+        partition: None,
+    };
+    let request = selection(CaptureTransform::TokenScores {
+        position: Some(0),
+        token_ids: vec![0, 2],
+    });
+    let CapturePayload::TokenScores(scores) = native
+        .transform(&tensor, &request, &whole(&[1, 2, 3]))
+        .unwrap()
+    else {
+        panic!("selected scores")
+    };
+    assert_eq!(
+        scores
+            .scores
+            .iter()
+            .map(|s| s.target.score)
+            .collect::<Vec<_>>(),
+        [1.0, 0.0]
+    );
+    assert!((scores.log_partition - (1f64.exp() + 2f64.exp() + 1.0).ln()).abs() < 1e-7);
+    assert_eq!(scores.scores[0].rank, 2);
+    let invalid = selection(CaptureTransform::TokenScores {
+        position: Some(2),
+        token_ids: vec![0],
+    });
+    assert!(native
+        .transform(&tensor, &invalid, &whole(&[1, 2, 3]))
+        .is_err());
 }

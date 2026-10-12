@@ -480,6 +480,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         resolve_generation_config(self.checkpoint_generation_config.as_ref(), overrides)
     }
 
+    /// Trained canvas extent reported by the selected block-refinement realization.
+    pub fn refinement_canvas_length(&self) -> Option<std::num::NonZeroU32> {
+        B::refinement_canvas_length(&self.runtime)
+    }
+
     /// Starts asynchronous text generation from tokenizer ids.
     /// Only IDs with a consistent mapping in this model's tokenizer may be
     /// sampled, even when the model's output vocabulary is padded or sparse.

@@ -950,6 +950,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             let (config, max_tokens) = self
                 .resolve_text_generation_settings(prepared.settings)
                 .map_err(PreparedChatError::Generation)?;
+            self.validate_refinement_canvas(prepared.canvas.as_deref())
+                .map_err(PreparedChatError::Generation)?;
+            let config = config.with_refinement_canvas(prepared.canvas.clone());
             let prepare_runtime = match mode {
                 OutputMode::Semantic => prepared_chat_control_runtime,
                 OutputMode::Text => prepared_text_control_runtime,
@@ -991,6 +994,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     self.tokenizer_fingerprint,
                     prepared.resolved,
                     prepared.settings.seed,
+                    prepared.settings.refinement,
+                    prepared.canvas.as_deref(),
                     semantic_identity,
                     prepared.chat.eos_token_ids(),
                     caller_stop_sequences,

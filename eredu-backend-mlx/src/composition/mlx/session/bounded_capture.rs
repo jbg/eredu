@@ -137,7 +137,7 @@ pub(crate) fn capabilities() -> CaptureCapabilities {
             "Logical capture storage is bounded; inference allocations and native private allocator/workspace are excluded".into(),
             "Transforms execute synchronously; no native views or lazy capture graphs are queued".into(),
             "Statistics use F32 inputs and native chunk reductions with F64 aggregation; raw integer IDs remain exact".into(),
-            "Candidate scores are finite raw logits for the last row, before token filtering and sampler processing".into(),
+            "Candidate scores are finite raw logits for the selected row, before token filtering and sampler processing".into(),
             "Candidate domain membership reuses the exact tokenizer/constraint filter before forcing; unavailable provenance is explicit as domain: None".into(),
         ],
     }
@@ -162,7 +162,12 @@ pub(super) fn estimate_shape(
         return routed::estimate(source, slice);
     }
     let source_elements = elements(source)?;
-    let selected = elements(&slice.shape)?;
+    let selected = match selection.transform {
+        CaptureTransform::TopCandidates { .. } | CaptureTransform::TokenScores { .. } => {
+            source.last().copied().unwrap_or(0)
+        }
+        _ => elements(&slice.shape)?,
+    };
     if source_elements > i32::MAX as u64
         || source
             .iter()
@@ -176,7 +181,7 @@ pub(super) fn estimate_shape(
     let chunks = selected.div_ceil(CHUNK);
     let (host_bytes, encoded_bytes, temporary_elements) = match &selection.transform {
         CaptureTransform::RoutedUnits => unreachable!("handled before dense estimation"),
-        CaptureTransform::TokenScores { token_ids } => {
+        CaptureTransform::TokenScores { token_ids, .. } => {
             if token_ids.is_empty()
                 || token_ids.len() > 64
                 || source
@@ -226,13 +231,13 @@ pub(super) fn estimate_shape(
             )
         }
     };
-    // Candidate capture touches only the last logits row: its temporaries
+    // Candidate capture touches only the selected logits row: its temporaries
     // (dtype copy, finite mask, argsort indices) are all row-sized, and the
     // source backing is an inference allocation that exists regardless of
     // capture. Charging the whole source would veto prefill candidate capture
     // — where the source is [batch, prompt, vocabulary] — for any real prompt.
     let (retained_source, retained_selected) = match &selection.transform {
-        CaptureTransform::TopCandidates { .. } => {
+        CaptureTransform::TopCandidates { .. } | CaptureTransform::TokenScores { .. } => {
             let vocabulary = source.last().copied().unwrap_or(0);
             (vocabulary, vocabulary)
         }
@@ -409,9 +414,12 @@ impl CaptureBackend for NativeCapture<'_> {
             CaptureTransform::RoutedUnits => Err(Error::observation(CaptureError::Invalid(
                 "routed units require actual route metadata".into(),
             ))),
-            CaptureTransform::TokenScores { token_ids } => {
-                self.token_scores(tensor, token_ids).map_err(Into::into)
-            }
+            CaptureTransform::TokenScores {
+                position,
+                token_ids,
+            } => self
+                .token_scores(tensor, token_ids, *position)
+                .map_err(Into::into),
             CaptureTransform::TopCandidates { count } => {
                 let vocabulary = *tensor
                     .shape()

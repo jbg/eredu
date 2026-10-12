@@ -125,6 +125,7 @@ pub(super) fn parameter_logits_mode<
                 },
                 slices: vec![],
                 transform: CaptureTransform::TokenScores {
+                    position: None,
                     token_ids: vec![1, 2, 3],
                 },
             },

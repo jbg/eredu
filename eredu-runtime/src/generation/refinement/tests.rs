@@ -32,6 +32,48 @@ impl RefinementBackend for Numeric {
     type Mask = Vec<bool>;
     type ConditioningFormat = ();
 
+    fn seed_canvas(
+        noise: &Self::Token,
+        layout: &eredu_core::refinement::RefinementCanvas,
+        _: &Context,
+    ) -> Result<(Self::Token, Self::Mask), Self::Error> {
+        let tokens = noise
+            .iter()
+            .zip(&layout.seed_tokens)
+            .map(|(n, s)| s.unwrap_or(*n))
+            .collect();
+        let pins = (0..noise.len())
+            .map(|p| layout.pinned_positions.contains(&(p as u32)))
+            .collect();
+        Ok((tokens, pins))
+    }
+    fn pin_scores(
+        scores: &Self::Logits,
+        tokens: &Self::Token,
+        pins: &Self::Mask,
+        _: &Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(scores
+            .iter()
+            .enumerate()
+            .map(|(p, row)| {
+                if pins[p] {
+                    (0..row.len())
+                        .map(|i| {
+                            if i == tokens[p] as usize {
+                                0.0
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                        .collect()
+                } else {
+                    row.clone()
+                }
+            })
+            .collect())
+    }
+
     fn validate_refinement_logits(
         logits: &Self::Logits,
         canvas: NonZeroU32,
@@ -51,6 +93,12 @@ impl RefinementBackend for Numeric {
         temperature: f32,
         _: &Context,
     ) -> Result<Self::Logits, Self::Error> {
+        if logits.iter().any(|row| {
+            row.iter().any(|v| v.is_nan() || *v == f32::INFINITY)
+                || !row.iter().any(|v| v.is_finite())
+        }) {
+            return Err("invalid scores");
+        }
         Ok(logits
             .iter()
             .map(|r| r.iter().map(|x| x / temperature).collect())
@@ -155,10 +203,17 @@ impl RefinementBackend for Numeric {
         argmax: &Self::Token,
         preceding: &[Self::Token],
         threshold: f32,
+        pins: Option<&Self::Mask>,
         _: &Context,
     ) -> Result<bool, Self::Error> {
+        let rows: Vec<_> = logits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| pins.is_none_or(|pins| !pins[*i]))
+            .map(|(_, row)| row)
+            .collect();
         Ok(preceding.iter().all(|old| old == argmax)
-            && logits.iter().map(|row| entropy(row)).sum::<f32>() / (logits.len() as f32)
+            && rows.iter().map(|row| entropy(row)).sum::<f32>() / (rows.len().max(1) as f32)
                 < threshold)
     }
 
@@ -214,6 +269,7 @@ fn entropy_acceptance_is_not_commitment_and_final_output_is_argmax() {
         TokenDomain::new(2),
         (),
         0,
+        None,
         &context,
     )
     .unwrap();
@@ -241,6 +297,7 @@ fn adaptive_stop_requires_confidence_and_prior_stability_and_forks_replay() {
         TokenDomain::new(2),
         (),
         1,
+        None,
         &context,
     )
     .unwrap();
@@ -265,6 +322,7 @@ fn failed_settlement_and_invalid_geometry_do_not_advance_state_or_randomness() {
         TokenDomain::new(2),
         (),
         3,
+        None,
         &context,
     )
     .unwrap();
@@ -309,6 +367,7 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
         TokenDomain::new(2),
         (),
         3,
+        None,
     );
     assert!(state.finalization_input().is_err());
     context.fail_settlement.set(true);
@@ -359,5 +418,111 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
     assert_eq!(
         state.finalization_input().unwrap(),
         restored.finalization_input().unwrap()
+    );
+}
+
+#[test]
+fn pinned_positions_preserve_seed_and_one_hot_feedback_across_iterations_and_forks() {
+    let context = context();
+    let policy = RefinementOptions {
+        max_denoising_steps: 3,
+        stability_threshold: 3,
+        t_max: 1.0,
+        t_min: 1.0,
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    let layout = eredu_core::refinement::RefinementCanvas {
+        seed_tokens: vec![Some(1), Some(0), Some(2)],
+        pinned_positions: vec![0, 2],
+    };
+    let mut state = RefinementState::<Numeric>::new(
+        policy,
+        NonZeroU32::new(3).unwrap(),
+        TokenDomain::new(3),
+        (),
+        0,
+        Some(&layout),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(state.canvas(), &[1, 0, 2]);
+    let logits = vec![
+        vec![100.0, -100.0, 0.0],
+        vec![0.0, 3.0, 1.0],
+        vec![90.0, 0.0, -20.0],
+    ];
+    let mut invalid_logits = logits.clone();
+    invalid_logits[0][0] = f32::NAN;
+    assert!(state.advance(&invalid_logits, &context).is_err());
+    assert_eq!(state.completed_steps(), 0);
+    state.advance(&logits, &context).unwrap();
+    assert_eq!(state.draft().unwrap(), &[1, 1, 2]);
+    assert_eq!(
+        probabilities(&state.self_conditioning().unwrap()[0]),
+        &[0.0, 1.0, 0.0]
+    );
+    assert_eq!(
+        probabilities(&state.self_conditioning().unwrap()[2]),
+        &[0.0, 0.0, 1.0]
+    );
+    let mut fork = state.clone();
+    for _ in 0..2 {
+        state.advance(&logits, &context).unwrap();
+        fork.advance(&logits, &context).unwrap();
+    }
+    assert_eq!(state.candidates().unwrap(), &[1, 1, 2]);
+    assert_eq!(state.canvas(), fork.canvas());
+    assert_eq!(state.into_random(), fork.into_random());
+    let invalid = eredu_core::refinement::RefinementCanvas {
+        seed_tokens: vec![Some(1), None, Some(2)],
+        pinned_positions: vec![1],
+    };
+    assert!(RefinementState::<Numeric>::new(
+        policy,
+        NonZeroU32::new(3).unwrap(),
+        TokenDomain::new(3),
+        (),
+        0,
+        Some(&invalid),
+        &context
+    )
+    .is_err());
+}
+
+#[test]
+fn pinned_template_rows_do_not_dilute_confidence_of_unresolved_positions() {
+    let context = context();
+    let layout = eredu_core::refinement::RefinementCanvas {
+        seed_tokens: vec![Some(0), Some(0), None],
+        pinned_positions: vec![0, 1],
+    };
+    let policy = RefinementOptions {
+        max_denoising_steps: 4,
+        confidence_threshold: 0.4,
+        stability_threshold: 1,
+        t_max: 1.0,
+        t_min: 1.0,
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    let mut state = RefinementState::<Numeric>::new(
+        policy,
+        NonZeroU32::new(3).unwrap(),
+        TokenDomain::new(2),
+        (),
+        0,
+        Some(&layout),
+        &context,
+    )
+    .unwrap();
+    let scores = vec![vec![1.0, 0.0]; 3];
+    state.advance(&scores, &context).unwrap();
+    state.advance(&scores, &context).unwrap();
+    assert!(
+        !state.is_finished(),
+        "the free row entropy exceeds 0.4 even though whole-canvas mean is below it"
     );
 }

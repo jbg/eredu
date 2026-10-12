@@ -283,8 +283,8 @@ pub fn describe_text_workspace(
             return Err(invalid("iterative invocation dimensions must be positive"));
         }
         schedule.allocation("iterative-scores", MemoryBytes::estimated(0,
-            product(&[request.batch_size, iteration.query_rows, topology.vocabulary_size, 4, iteration.score_buffer_copies])?,
-            "whole-canvas feedback, processed scores and categorical-noise buffers; eight FP32 copies is a calibrated retention envelope"), global.clone())?;
+            product(&[request.batch_size, iteration.query_rows, topology.vocabulary_size, 4, add(iteration.score_buffer_copies, 3)?])?,
+            "whole-canvas feedback, processed scores and categorical-noise buffers; declared FP32 copies plus three conservative copies for fixed-position masks and one-hot feedback"), global.clone())?;
         for projection_topology in &iteration.conditioning {
             schedule.allocation(
                 "feedback-projection",

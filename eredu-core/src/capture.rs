@@ -203,8 +203,10 @@ pub enum CaptureTransform {
         /// Maximum candidate count, bounded by the vocabulary extent.
         count: u64,
     },
-    /// Selected raw scores and full-model-vocabulary reductions for the last row.
+    /// Selected raw scores and full-vocabulary reductions for one sequence row.
     TokenScores {
+        /// Zero-based sequence position; None selects the last row.
+        position: Option<u64>,
         /// Unique model output IDs; at most 64. No vocabulary slicing or filtering.
         token_ids: Vec<u32>,
     },
@@ -543,7 +545,22 @@ impl CapturePlan {
                     }
                 }
             }
-            if let CaptureTransform::TokenScores { token_ids } = &selection.transform {
+            if let CaptureTransform::TokenScores {
+                position,
+                token_ids,
+            } = &selection.transform
+            {
+                if let Some(position) = position {
+                    let maximum = invocation_bounds
+                        .map_or(request.prompt_tokens.max(request.max_predictions), |b| {
+                            b.max_sequence
+                        });
+                    if *position >= maximum {
+                        return Err(CaptureError::Invalid(
+                            "selected score position exceeds admitted invocation extent".into(),
+                        ));
+                    }
+                }
                 let unique: std::collections::BTreeSet<_> = token_ids.iter().collect();
                 if token_ids.is_empty()
                     || token_ids.len() > 64
@@ -946,7 +963,7 @@ pub struct CaptureTokenScore {
     pub strongest_alternative: Option<CaptureCandidate>,
 }
 
-/// Bounded selected scores for the final sequence row, before sampler processing.
+/// Bounded selected scores for the requested sequence row, before sampler processing.
 /// Normalization includes every model output ID, including tokenizer holes/padding.
 /// Domain membership is evidence only; it does not alter this distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

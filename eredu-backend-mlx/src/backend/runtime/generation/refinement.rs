@@ -30,6 +30,61 @@ impl RefinementBackend for MlxSamplingBackend {
     type Mask = MlxTensor;
     type ConditioningFormat = Dtype;
 
+    fn seed_canvas(
+        noise: &MlxTensor,
+        layout: &eredu_core::refinement::RefinementCanvas,
+        stream: &Stream,
+    ) -> Result<(MlxTensor, MlxTensor), Exception> {
+        let values: Vec<i32> = layout
+            .seed_tokens
+            .iter()
+            .map(|id| id.unwrap_or(0) as i32)
+            .collect();
+        let seeded: Vec<bool> = layout.seed_tokens.iter().map(Option::is_some).collect();
+        let mut pins = vec![false; values.len()];
+        for position in &layout.pinned_positions {
+            pins[*position as usize] = true;
+        }
+        let shape = [values.len() as i32];
+        let canvas = safemlx::ops::r#where(
+            Array::from_slice(&seeded, &shape),
+            Array::from_slice(&values, &shape),
+            noise.as_array(),
+            stream,
+        )?;
+        Ok((
+            MlxTensor::from_array(canvas),
+            MlxTensor::from_array(Array::from_slice(&pins, &shape)),
+        ))
+    }
+
+    fn pin_scores(
+        scores: &MlxTensor,
+        tokens: &MlxTensor,
+        pins: &MlxTensor,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        let width = scores.as_array().dim(-1);
+        let ids = Array::arange::<i32, i32>(None, width, None, stream)?;
+        let selected = tokens
+            .as_array()
+            .reshape(&[-1, 1], stream)?
+            .eq(ids, stream)?;
+        let fixed = safemlx::ops::r#where(
+            selected,
+            Array::from_f32(0.0),
+            Array::from_f32(f32::NEG_INFINITY),
+            stream,
+        )?;
+        safemlx::ops::r#where(
+            pins.as_array().reshape(&[-1, 1], stream)?,
+            fixed,
+            scores.as_array(),
+            stream,
+        )
+        .map(MlxTensor::from_array)
+    }
+
     fn validate_refinement_logits(
         logits: &MlxTensor,
         canvas: NonZeroU32,
@@ -183,11 +238,24 @@ impl RefinementBackend for MlxSamplingBackend {
         argmax: &MlxTensor,
         preceding: &[MlxTensor],
         confidence_threshold: f32,
+        pins: Option<&MlxTensor>,
         stream: &Stream,
     ) -> Result<bool, Exception> {
-        let mut stop = entropy(logits, stream)?
-            .mean(false, stream)?
-            .lt(Array::from_f32(confidence_threshold), stream)?;
+        let entropies = entropy(logits, stream)?;
+        let mean = match pins {
+            Some(pins) => {
+                let active = pins.as_array().logical_not(stream)?;
+                let count = active
+                    .as_dtype(Dtype::Float32, stream)?
+                    .sum(false, stream)?;
+                let count = safemlx::ops::maximum(count, Array::from_f32(1.0), stream)?;
+                safemlx::ops::r#where(active, entropies, Array::from_f32(0.0), stream)?
+                    .sum(false, stream)?
+                    .divide(count, stream)?
+            }
+            None => entropies.mean(false, stream)?,
+        };
+        let mut stop = mean.lt(Array::from_f32(confidence_threshold), stream)?;
         for old in preceding {
             stop = stop.logical_and(
                 argmax
@@ -225,6 +293,26 @@ impl RefinementBackend for MlxSamplingBackend {
         _: &Stream,
     ) -> Result<(), Exception> {
         safemlx::transforms::eval([canvas.as_array(), random.as_array()])
+    }
+}
+
+impl eredu_runtime::generation::refinement::finalization::RefinementFinalizationBackend
+    for MlxSamplingBackend
+{
+    fn position_has_candidate(scores: &MlxTensor, stream: &Stream) -> Result<bool, Exception> {
+        let values = scores.as_array();
+        if values
+            .is_nan(stream)?
+            .logical_or(values.eq(Array::from_f32(f32::INFINITY), stream)?, stream)?
+            .any(false, stream)?
+            .try_item::<bool>(stream)?
+        {
+            return Err(Exception::custom("invalid finalization position scores"));
+        }
+        values
+            .is_finite(stream)?
+            .any(false, stream)?
+            .try_item::<bool>(stream)
     }
 }
 
@@ -275,6 +363,21 @@ mod tests {
                 PredictionScoreKind::ConstrainedFinalization
             );
         }
+        let fixed = MlxTensor::from_array(Array::from_slice(
+            &[f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY, f32::NEG_INFINITY],
+            &[1, 4],
+        ));
+        let incompatible = TokenFilter::allowed(vec![true, false, true, false]).unwrap();
+        assert!(matches!(
+            finalize_refinement_position::<MlxSamplingBackend>(
+                &fixed,
+                0,
+                TokenDomain::new(4),
+                &incompatible,
+                &stream
+            ),
+            Err(FinalizationError::NoAdmissibleToken)
+        ));
         let absent = TokenFilter::allowed(vec![false, false, false, false, true]).unwrap();
         assert!(matches!(
             finalize_refinement_position::<MlxSamplingBackend>(
@@ -337,6 +440,7 @@ mod tests {
             &argmax,
             &[argmax.clone()],
             0.005,
+            None,
             &stream
         )
         .unwrap());
@@ -346,6 +450,7 @@ mod tests {
             &argmax,
             &[changed],
             0.005,
+            None,
             &stream
         )
         .unwrap());

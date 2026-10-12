@@ -28,6 +28,7 @@ pub enum BlockRefinementError<E> {
 /// architecture's retained context and completion resources.
 pub struct BlockRefinementState<B: RefinementBackend> {
     config: RefinementConfig,
+    canvas_layout: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     canvas_length: NonZeroU32,
     domain: TokenDomain,
     conditioning_format: B::ConditioningFormat,
@@ -46,6 +47,7 @@ where
     fn clone(&self) -> Self {
         Self {
             config: self.config,
+            canvas_layout: self.canvas_layout.clone(),
             canvas_length: self.canvas_length,
             domain: self.domain,
             conditioning_format: self.conditioning_format.clone(),
@@ -77,6 +79,7 @@ where
     /// Host state copied by snapshots, including the complete finalization cursor.
     pub fn snapshot_host_bytes(&self) -> Option<u64> {
         (std::mem::size_of::<Self>() as u64)
+            .checked_add(self.canvas_layout.as_ref().map_or(0, |c| c.host_bytes()))?
             .checked_add(
                 (self.authoritative.len() as u64)
                     .checked_mul(std::mem::size_of::<B::Token>() as u64)?,
@@ -127,9 +130,11 @@ where
         domain: TokenDomain,
         conditioning_format: B::ConditioningFormat,
         random: B::RandomState,
+        canvas_layout: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     ) -> Self {
         Self {
             config,
+            canvas_layout,
             canvas_length,
             domain,
             conditioning_format,
@@ -182,6 +187,7 @@ where
             self.domain,
             self.conditioning_format.clone(),
             self.random.clone(),
+            self.canvas_layout.as_deref(),
             context,
         )?;
         self.refinement = Some(refinement);

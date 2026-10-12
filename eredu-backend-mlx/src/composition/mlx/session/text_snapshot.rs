@@ -164,7 +164,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                 .checked_mul(16)?
                 .checked_add(2 * (4096 + 128))?;
             let history = u64::from(sampling.refinement_policy.options().stability_threshold)
-                .checked_add(3)?;
+                .checked_add(if sampling.canvas.is_some() { 5 } else { 3 })?;
             let tokens = canvas.checked_mul(8)?.checked_mul(history)?;
             let scalar_handles = canvas.checked_mul(4096 + 128)?;
             causal?
@@ -232,6 +232,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             if let Some(random) = &sampling.prng {
                 bytes = bytes.checked_add(array_storage(random.as_array())?)?;
             }
+            bytes = bytes.checked_add(sampling.canvas.as_ref().map_or(0, |c| c.host_bytes()))?;
             let mut copy_bytes = bytes;
             if let Some(refinement) = &sampling.refinement {
                 let host = refinement.snapshot_host_bytes()?;
@@ -282,6 +283,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                     refinement_seed: sampling.refinement_seed,
                     refinement_policy: sampling.refinement_policy,
                     draft_events: sampling.draft_events,
+                    canvas: sampling.canvas.clone(),
                     refinement: sampling.refinement.clone(),
                 })
             })())

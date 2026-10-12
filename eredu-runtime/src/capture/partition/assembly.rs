@@ -54,7 +54,7 @@ pub(super) fn assembly_payload_usage(
                 add(256, mul(edges.len() as u64, 16)?)?,
                 add(1024, mul(edges.len() as u64, 64)?)?,
             ),
-            CaptureTransform::TokenScores { token_ids } => (
+            CaptureTransform::TokenScores { token_ids, .. } => (
                 add(256, mul(token_ids.len() as u64, 128)?)?,
                 add(1024, mul(token_ids.len() as u64, 512)?)?,
             ),

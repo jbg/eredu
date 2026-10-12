@@ -125,6 +125,65 @@ not available with `--raw`. See [Speculative decoding and
 MTP](https://github.com/jbg/eredu/blob/main/doc/speculative-decoding.md) for
 compatibility and placement rules.
 
+## Typed decision reads
+
+`--decisions PATH` reads evidence and typed questions from JSON. Use `-` for
+standard input. This mode requires a model exposing block refinement, including
+DiffusionGemma. The existing device, quantization and weight-residency options
+apply. No generated answer text is parsed: the CLI reads model scores directly
+at the compiled answer positions.
+
+```json
+{
+  "state": {"ticket": "I was charged twice; please refund the duplicate payment."},
+  "steps": 2,
+  "seed": 42,
+  "questions": [
+    {"id": "department", "type": "choice", "question": "Which department should handle this?", "options": ["billing", "technical", "sales"]},
+    {"id": "refund", "type": "noul", "question": "Does the customer request a refund?"},
+    {"id": "priority", "type": "score", "question": "Rate the urgency.", "levels": [
+      {"label": "routine", "value": 0, "description": "Can wait for ordinary processing"},
+      {"label": "urgent", "value": 10, "description": "Requires immediate attention"}
+    ]}
+  ]
+}
+```
+
+Save this as `request.json`, then run:
+
+```sh
+eredu --model /path/to/diffusiongemma --decisions request.json --timing
+eredu --model /path/to/diffusiongemma --decisions - < request.json
+```
+
+Standard output contains one JSON object with `answers` keyed by question ID:
+
+- `choice` returns the selected option, its confidence and every option's probability.
+- `noul` returns a boolean `value` and a `probability` of yes, plus both alternatives.
+- `score` returns the expected numeric `score` over the declared levels and the
+  highest-probability `level`, plus the level distribution. Values must be finite
+  and strictly increasing; level descriptions define their meaning.
+
+`normalization: "allowed_labels"` identifies probabilities normalized over the
+specified alternatives. `label_mass` reports how much of the original full-model
+probability those labels cover. These preferences are not calibrated correctness
+estimates. Ties choose the first declared alternative. Questions sharing a canvas
+can affect one another; their distributions are not independent joint probabilities.
+
+The CLI encodes each alternative as a verified single-token letter within its
+answer template, pins the scaffold and padding, and leaves answer slots as noise.
+It executes exactly `steps` refinement passes, then reads raw position scores and
+stops without committing generated tokens. `steps` defaults to 1 and accepts
+1..=64; `seed` defaults to 0, with `--seed` overriding the request value.
+Requests are limited to 1 MiB, 1..=32 unique questions and 2..=26 alternatives
+per question. The complete template must fit the model's trained canvas. Invalid
+schemas or unsuitable label tokenization produce errors rather than repaired output.
+
+Generation sampling flags, speculative drafting, ordinary prompt/tool options,
+and generation-specific memory/telemetry reports do not apply to decision reads
+and conflict with this mode. `--auto quick`, `--auto plan`, `--no-auto`, and
+`--timing` remain available; generation benchmarks do not measure decision reads.
+
 ## Native tool calls
 
 Pass OpenAI-shaped function definitions with `--tools`. Tool generation is

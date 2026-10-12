@@ -60,6 +60,9 @@ pub enum TextOperationOutput<P, T> {
 /// A backend violated the declared advancement protocol.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum TextOperationPolicyError {
+    /// Invalid seeded/pinned canvas, rejected before native preparation.
+    #[error(transparent)]
+    InvalidRefinementCanvas(crate::refinement::RefinementPolicyError),
     /// Causal execution has no tentative block or refinement schedule.
     #[error("refinement policy requires a block-refinement architecture")]
     RequiresBlockRefinementArchitecture,

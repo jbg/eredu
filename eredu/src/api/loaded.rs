@@ -133,6 +133,28 @@ where
 }
 
 impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
+    pub(super) fn validate_refinement_canvas(
+        &self,
+        canvas: Option<&eredu_core::refinement::RefinementCanvas>,
+    ) -> Result<(), eredu_core::generation::GenerationError> {
+        if let Some(canvas) = canvas {
+            let length = B::refinement_canvas_length(&self.runtime)
+                .ok_or(eredu_core::generation::GenerationError::RefinementUnavailable)?;
+            let vocabulary = B::refinement_vocabulary_size(&self.runtime)
+                .ok_or(eredu_core::generation::GenerationError::RefinementUnavailable)?;
+            canvas.validate(length.get(), vocabulary.get() as usize)?;
+            if canvas
+                .seed_tokens
+                .iter()
+                .flatten()
+                .any(|id| !self.token_validity.allows(*id))
+            {
+                return Err(eredu_core::refinement::RefinementPolicyError::Canvas.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn resolve_text_generation_settings(
         &self,
         settings: PreparedChatGenerationSettings,
@@ -208,6 +230,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             None,
             std::time::Instant::now(),
             PreparedGenerationMode::Text,
+            None,
         )
     }
 
@@ -234,6 +257,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             capture,
             generation_started,
             PreparedGenerationMode::Semantic,
+            None,
         )
     }
 
@@ -252,6 +276,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         )>,
         generation_started: std::time::Instant,
         mode: PreparedGenerationMode,
+        canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
     where
         F: FnMut(SemanticEvent),
@@ -270,6 +295,8 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 return Ok(None);
             }
             let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
+            self.validate_refinement_canvas(canvas.as_deref())?;
+            let config = config.with_refinement_canvas(canvas);
             let control = mode
                 .prepare_control(
                     prepared_chat,

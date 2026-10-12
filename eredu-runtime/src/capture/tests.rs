@@ -103,6 +103,7 @@ fn fixture(
 fn selected_full_vocabulary_scores_reject_slices_duplicates_and_out_of_range_ids() {
     let (mut plan, mut catalog, mut support, mut capabilities) =
         fixture(CaptureTransform::TokenScores {
+            position: None,
             token_ids: vec![0, 3],
         });
     capabilities
@@ -113,9 +114,23 @@ fn selected_full_vocabulary_scores_reject_slices_duplicates_and_out_of_range_ids
     catalog.points[0].axes.as_mut().unwrap()[1].name = "vocabulary".into();
     support.points[0].path = MODEL_LOGITS_OBSERVATION_PATH.into();
     admit(plan.clone(), &catalog, &support, &capabilities).unwrap();
+    let mut positioned = plan.clone();
+    positioned.selections[0].transform = CaptureTransform::TokenScores {
+        position: Some(0),
+        token_ids: vec![0, 3],
+    };
+    admit(positioned.clone(), &catalog, &support, &capabilities).unwrap();
+    positioned.selections[0].transform = CaptureTransform::TokenScores {
+        position: Some(u64::MAX),
+        token_ids: vec![0, 3],
+    };
+    assert!(admit(positioned, &catalog, &support, &capabilities).is_err());
     for ids in [vec![], vec![0, 0], vec![4], (0..65).collect()] {
         let mut invalid = plan.clone();
-        invalid.selections[0].transform = CaptureTransform::TokenScores { token_ids: ids };
+        invalid.selections[0].transform = CaptureTransform::TokenScores {
+            position: None,
+            token_ids: ids,
+        };
         assert!(admit(invalid, &catalog, &support, &capabilities).is_err());
     }
     plan.selections[0].slices = vec![CaptureSlice {

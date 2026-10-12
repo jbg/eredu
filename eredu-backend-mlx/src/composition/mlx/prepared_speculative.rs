@@ -729,7 +729,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         C: SpeculativeTokenFilterController,
     {
         let resolved = generation.sampling();
-        let sampler = MlxTextSampler::from_config(generation)
+        let sampler = MlxTextSampler::from_config(&generation)
             .map_err(|error| Error::Exception(Exception::from_source(error)))?;
         let prng_key = (resolved.temperature != 0.0)
             .then(|| safemlx::random::key(generation.seed()))

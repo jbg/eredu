@@ -219,7 +219,7 @@ fn prepared_mirostat_is_reproducible_with_lookahead_and_mixed_lane_interleavings
                     config.with_mirostat_v2(tau, eta).unwrap()
                 }
             };
-            crate::composition::mlx::session::MlxTextSampler::from_config(config).unwrap()
+            crate::composition::mlx::session::MlxTextSampler::from_config(&config).unwrap()
         };
         scheduler
             .submit_with_semantics(
