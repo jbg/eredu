@@ -114,3 +114,18 @@ pub const CODEC_ENCODER_REFERENCE_JSON: &str =
 /// this fixture validates prompt policy rather than waveform encoding.
 pub const ARIA_PROMPT_REFERENCE_JSON: &str =
     include_str!("../fixtures/voicechat/aria-prompt-nvidia.json");
+
+/// Pinned inference configuration for NVIDIA VoiceChat component fixtures.
+pub const OFFICIAL_CONFIG_JSON: &str =
+    include_str!("../fixtures/voicechat/official-inference-config.json");
+
+/// Original NVIDIA RNNT transcript presentation across token-piece boundaries.
+pub const TRANSCRIPTION_REFERENCE_JSON: &str =
+    include_str!("../fixtures/voicechat/transcription-nvidia.json");
+
+/// Original NVIDIA TTS character transition with retained codec conditioning.
+pub const TTS_CHARACTER_TRANSITION_REFERENCE_JSON: &str =
+    include_str!("../fixtures/voicechat/tts-character-transition-nvidia.json");
+
+/// Original NVIDIA speech composition with nonzero miniature parameters.
+pub const SPEECH_REFERENCE_JSON: &str = include_str!("../fixtures/voicechat/speech-nvidia.json");

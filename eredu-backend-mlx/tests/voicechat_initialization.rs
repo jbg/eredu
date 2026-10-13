@@ -36,10 +36,8 @@ fn geometry() -> NeuralStateGeometry {
         "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3, "conv_kernel":3
     }))
     .unwrap();
-    let mut config = VoiceChatConfig::from_json(include_str!(
-        "../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let mut config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     let tts = &mut config.tts.backbone;
     tts.hidden_size = 4;
     tts.intermediate_size = 8;

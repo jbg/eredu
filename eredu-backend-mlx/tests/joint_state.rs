@@ -281,10 +281,8 @@ fn realtime_snapshot_restores_native_draws_with_voicechat_clocks_and_history() {
         RandomState,
         Ready,
     >;
-    let config = VoiceChatConfig::from_json(include_str!(
-        "../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     let policy = SchedulePolicy::from_config(
         &config,
         ScheduleLimits {

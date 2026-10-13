@@ -126,10 +126,9 @@ fn waveform_pipeline_agrees_codes_provider_and_spectral_failures_without_adoptin
 
 fn run_worker(rank: usize, mut coordinator: Coordinator) {
     let context = NumericContext::default();
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../eredu-evaluation/fixtures/voicechat/tts-character-transition-nvidia.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::voicechat::TTS_CHARACTER_TRANSITION_REFERENCE_JSON)
+            .unwrap();
     let mut ordinary = codec(&fixture, &context);
     let selected = codec(&fixture, &context);
     let kernel = AudioDecoderKernel::new(selected.config().clone(), &context).unwrap();

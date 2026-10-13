@@ -150,10 +150,8 @@ fn voicechat_speech_sampling_native_controlled_and_uninterrupted_share_exact_rng
         agent: MlxTensor::from_f32_slice(&floats(&agent["logits"]), &[1, 1, 16], &stream).unwrap(),
         function: MlxTensor::from_f32_slice(&function, &[1, 1, 16], &stream).unwrap(),
     };
-    let original = VoiceChatConfig::from_json(include_str!(
-        "../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let original =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     // Zero noise must still consume the released Gaussian draw. Compare both
     // policy settings using real native random keys, not forced mixture IDs.
     for noise_scale in [original.tts.noise_scale, 0.0] {

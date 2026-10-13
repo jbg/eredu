@@ -15,8 +15,7 @@ use support::numeric_backend::{
     activate, Context, FailAt, NumericTensor, ReferenceBackend as Backend,
 };
 // Evaluation owns this artifact; importing its crate would create a dev cycle.
-const REFERENCE: &str =
-    include_str!("../../eredu-evaluation/fixtures/voicechat/codec-encoder-nvidia.json");
+const REFERENCE: &str = eredu_evaluation::voicechat::CODEC_ENCODER_REFERENCE_JSON;
 fn tensor(v: &Value) -> NumericTensor {
     let shape = v["shape"]
         .as_array()

@@ -9,6 +9,7 @@ pub mod component_attribution;
 mod distribution;
 mod evidence;
 pub mod execution_control;
+pub mod gguf;
 pub mod intervention;
 mod parity;
 pub mod qwen4_exp;

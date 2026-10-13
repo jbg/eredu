@@ -27,10 +27,8 @@ fn cpu_startup_silence_matches_nvidia_full_perception_and_backbone_precision() {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TOOL_SILENCE_REFERENCE_JSON).unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let config = VoiceChatConfig::from_json(include_str!(
-        "../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     let prepared = PreparedSilenceConditioning::with_coefficients(
         &config.perception.preprocessor,
         values(&fixture["preprocessing"]["window"]),

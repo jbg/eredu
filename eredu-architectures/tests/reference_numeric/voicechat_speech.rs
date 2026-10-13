@@ -21,10 +21,8 @@ use eredu_codec::{
 use serde_json::Value;
 
 pub(super) fn codec(tts: &Value, context: &NumericContext) -> AudioDecoder<NumericBackend> {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../eredu-evaluation/fixtures/voicechat/codec-nvidia.json"
-    ))
-    .unwrap();
+    let fixture: Value =
+        serde_json::from_str(eredu_evaluation::voicechat::CODEC_REFERENCE_JSON).unwrap();
     let config = AudioDecoderConfig {
         quantizer: Geometry {
             depth: 31,
@@ -83,10 +81,9 @@ pub(super) fn codec(tts: &Value, context: &NumericContext) -> AudioDecoder<Numer
 
 #[test]
 fn voicechat_spoken_text_runs_character_encoder_and_cached_speech_against_nvidia() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../eredu-evaluation/fixtures/voicechat/tts-character-transition-nvidia.json"
-    ))
-    .unwrap();
+    let fixture: Value =
+        serde_json::from_str(eredu_evaluation::voicechat::TTS_CHARACTER_TRANSITION_REFERENCE_JSON)
+            .unwrap();
     let context = NumericContext::default();
     let integers = |value: &Value| {
         value["values"]
@@ -234,10 +231,8 @@ fn voicechat_spoken_text_runs_character_encoder_and_cached_speech_against_nvidia
 fn voicechat_speech_retains_feedback_guidance_and_actual_codec_candidates() {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TTS_TRANSITION_REFERENCE_JSON).unwrap();
-    let oracle: Value = serde_json::from_str(include_str!(
-        "../../../eredu-evaluation/fixtures/voicechat/speech-nvidia.json"
-    ))
-    .unwrap();
+    let oracle: Value =
+        serde_json::from_str(eredu_evaluation::voicechat::SPEECH_REFERENCE_JSON).unwrap();
     let context = NumericContext::default();
     let mut generator = model(&fixture, &context);
     let mut decoder = codec(&fixture, &context);

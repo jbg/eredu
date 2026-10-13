@@ -209,10 +209,9 @@ mod tests {
 
     #[test]
     fn committed_deltas_match_pinned_nvidia_transcripts_across_piece_boundaries() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../eredu-evaluation/fixtures/voicechat/transcription-nvidia.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(eredu_evaluation::voicechat::TRANSCRIPTION_REFERENCE_JSON)
+                .unwrap();
         let vocabulary: Vec<String> =
             serde_json::from_value(fixture["vocabulary"].clone()).unwrap();
         for case in fixture["cases"].as_array().unwrap() {

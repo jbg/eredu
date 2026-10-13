@@ -36,10 +36,8 @@ fn roots(state: &State, stream: &Stream) -> Retained {
     values
 }
 fn frontend(fixture: &Value) -> VoiceChatFrontend {
-    let config = VoiceChatConfig::from_json(include_str!(
-        "../../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     VoiceChatFrontend::with_coefficients(
         &config.perception.preprocessor,
         FrontendOptions {
