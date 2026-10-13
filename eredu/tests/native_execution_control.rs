@@ -351,6 +351,43 @@ fn nanbeige_controlled_text_matches_uninterrupted_generation() {
     text_matches_ordinary_sampling("nanbeige");
 }
 
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
+)]
+fn phi4_controlled_text_matches_uninterrupted_generation() {
+    for residency in [
+        eredu_core::ResidencyPlan::FullyResident,
+        eredu_core::ResidencyPlan::LayerwiseHost {
+            device_layer_window: 1,
+            device_budget_bytes: Some(8 << 20),
+            host_budget_bytes: Some(8 << 20),
+        },
+        eredu_core::ResidencyPlan::DenseDiskStream {
+            device_budget_bytes: 8 << 20,
+            host_budget_bytes: 8 << 20,
+            host_lookahead: 1,
+            background_queue: 1,
+        },
+    ] {
+        text_matches_ordinary_sampling_with_policy(
+            "phi3",
+            residency,
+            eredu_core::WeightTransformationPlan::PreserveCheckpoint,
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "run with --no-default-features --features mlx for CPU-only native initialization"
+)]
+fn phi4_controlled_snapshots_restore_and_fork_sampled_partial_text() {
+    native_facade_with_family(LocalDevice::Cpu, true, "phi3");
+}
+
 fn text_matches_ordinary_sampling(family: &str) {
     text_matches_ordinary_sampling_with_policy(
         family,
@@ -496,6 +533,20 @@ mod speculative;
 fn use_family_weights(root: &Path, family: &str) {
     match family {
         "qwen2" => {}
+        "phi3" => {
+            let mut config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap();
+            config["model_type"] = "phi3".into();
+            config["rope_theta"] = 250000.0.into();
+            std::fs::write(
+                root.join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let resolved =
+                eredu_architectures::configuration::resolve_model_config(&config).unwrap();
+            write_tensor_plan(root, resolved.architecture.checkpoint());
+        }
         "k2_horizon_dense" | "k2_horizon_mova" => {
             let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

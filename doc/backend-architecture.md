@@ -2852,7 +2852,7 @@ then uses the ordinary requirements, selection, exact materialization tasks,
 neutral session constructor, and lifecycle. Adding it does not require a
 backend family registry case or a complete-model wrapper.
 
-Architecture-owned typed dispatch admits replicated Llama/Mistral, Nanbeige, dense
+Architecture-owned typed dispatch admits replicated Llama/Mistral/Phi-4, Nanbeige, dense
 Qwen2/Qwen3, dense LFM2, dense Kimi Linear, target-only dense Nemotron-H, and
 target-only text Qwen3-Next/Qwen3.5 configurations. Its additive routed class
 admits replicated Qwen3 MoE, GPT-OSS, routed LFM2, Kimi Linear, Nemotron-H,
@@ -2872,6 +2872,8 @@ constructor adapter. Optional profiles are additive, so an ordinary backend
 does not acquire heterogeneous-state bounds.
 
 Shared decoder parameter declarations retain the Q/K/V and gate/up component boundaries inside fused matrices. Tensor-parallel layouts partition each component independently, including its bias, and derive local head and intermediate dimensions from the retained semantic ranges. Native backends bind the ordinary linear, normalization, rotary and attention mechanisms.
+
+The original Phi-4 uses the Llama-compatible execution class with retained `phi3` source identity and component-major fused QKV and gate/up projections. GGUF admission preserves the fused weights and their HF half-head rotary convention. Checkpoint schemas, tokenizer policy and discovery remain portable.
 
 Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
 lowers physical checkpoint blocks to logical invocations with exact source
@@ -5291,13 +5293,13 @@ retains that exact group ID, the publication owner, and any independent tensor
 group ID and passes them to the partitioned execution plan; a backend realizes
 the descriptors without interpreting tensor or pipeline coordinates.
 
-For prediction-free dense Llama/Mistral artifacts backed by indexed or
+For prediction-free dense Llama/Mistral/Phi-4 artifacts backed by indexed or
 unindexed SafeTensors, or by an admitted GGUF checkpoint, pure TP, pure PP, and
 TP+PP use an architecture-owned partition dispatch and executor under selected
 fully resident, host-layerwise, or dense disk-stream residency. The backend
 binds one selected layerwise policy shared by execution and reporting; it does
 not construct a second cache or residency-specific family executor.
-Selected Llama/Mistral load-time transforms use this same route. Architecture
+Selected Llama/Mistral/Phi-4 load-time transforms use this same route. Architecture
 construction carries both the exact target partition and its source-format
 partition with rank-local physical layouts and identical local unit/owner
 addresses. The generic materializer applies each selected task recipe to the

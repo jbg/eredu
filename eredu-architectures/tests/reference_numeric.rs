@@ -11949,6 +11949,11 @@ fn llama_and_mistral_tp2_reconstruct_uneven_tied_vocabulary_and_exact_collective
     );
 }
 
+#[test]
+fn phi4_fused_tp2_reconstructs_uneven_tied_vocabulary_and_exact_collectives() {
+    assert_llama_compatible_tp2_reconstructs_uneven_tied_vocabulary_and_exact_collectives("phi3");
+}
+
 fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
     let mut value = config(model_type, tied);
     value["num_hidden_layers"] = 2.into();
@@ -20482,6 +20487,7 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
     for (architecture_name, model_type) in [
         ("LlamaForCausalLM", "llama"),
         ("MistralForCausalLM", "mistral"),
+        ("Phi3ForCausalLM", "phi3"),
     ] {
         let config = serde_json::json!({
             "architectures":[architecture_name], "model_type":model_type,

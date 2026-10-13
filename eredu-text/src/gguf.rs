@@ -149,7 +149,7 @@ fn build_gpt(
             )?),
             PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
         ])));
-    } else if pre_tokenizer == "lfm2" || matches!(architecture, "lfm2" | "lfm2moe") {
+    } else if pre_tokenizer == "lfm2" || matches!(architecture, "lfm2" | "lfm2moe" | "phi3") {
         const LFM2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
             PreTokenizerWrapper::Split(Split::new(
@@ -456,13 +456,27 @@ fn register_special_tokens(
             ids.insert(id);
         }
     }
+    // The original Phi-4 GPT tokenizer strips whitespace around every special token.
+    let strip = metadata
+        .get("general.architecture")
+        .and_then(GgufMetadataValue::as_str)
+        == Some("phi3")
+        && metadata
+            .get("tokenizer.ggml.model")
+            .and_then(GgufMetadataValue::as_str)
+            == Some("gpt2");
     let added = ids
         .into_iter()
         .map(|id| {
             tokens
                 .get(id)
                 .cloned()
-                .map(|token| AddedToken::from(token, true).normalized(false))
+                .map(|token| {
+                    AddedToken::from(token, true)
+                        .normalized(false)
+                        .lstrip(strip)
+                        .rstrip(strip)
+                })
                 .ok_or_else(|| {
                     tokenizer_error(format!("special token id {id} is outside the vocabulary"))
                 })
@@ -636,6 +650,75 @@ mod tests {
     use eredu_gguf::{MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue};
 
     use super::*;
+
+    #[test]
+    fn phi4_preserves_three_digit_and_whitespace_boundaries() {
+        use tokenizers::PreTokenizer;
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("phi3".into()),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![])),
+            ),
+        ]);
+        let tokenizer = build_gpt(&["x".into()], &metadata).unwrap();
+        let input = "it's 1234567\n  A";
+        let mut pretokenized = tokenizers::PreTokenizedString::from(input);
+        tokenizer
+            .get_pre_tokenizer()
+            .unwrap()
+            .pre_tokenize(&mut pretokenized)
+            .unwrap();
+        let pieces = pretokenized
+            .get_splits(
+                tokenizers::OffsetReferential::Original,
+                tokenizers::OffsetType::Byte,
+            )
+            .into_iter()
+            .map(|(_, (start, end), _)| &input[start..end])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pieces,
+            ["it", "'s", " ", "123", "456", "7", "\n", " ", " A"]
+        );
+    }
+
+    #[test]
+    fn phi4_chat_markers_consume_adjacent_whitespace() {
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("phi3".into()),
+            ),
+            (
+                "tokenizer.ggml.model".into(),
+                GgufMetadataValue::String("gpt2".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![
+                    "x".into(),
+                    "<|im_end|>".into(),
+                    "Ġ".into(),
+                ])),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::String(vec![])),
+            ),
+        ]);
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        assert_eq!(
+            tokenizer
+                .encode("x  <|im_end|>  x", false)
+                .unwrap()
+                .get_ids(),
+            [0, 1, 0]
+        );
+    }
 
     #[test]
     fn k2_horizon_preserves_joined_words_marks_and_three_digit_boundaries() {

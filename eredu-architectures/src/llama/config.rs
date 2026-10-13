@@ -14,7 +14,7 @@ use crate::GgufTensorCatalog;
 use super::Config;
 use crate::rotary::RopeValue;
 
-/// Invalid Llama/Mistral model configuration.
+/// Invalid Llama/Mistral/Phi-4 model configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// Configuration JSON could not be read or decoded.
@@ -25,7 +25,7 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-/// Normalized Llama/Mistral decoder configuration used by every backend.
+/// Normalized Llama/Mistral/Phi-4 decoder configuration used by every backend.
 #[derive(Debug, Clone)]
 pub struct ModelArgs {
     /// Model family identifier.
@@ -73,6 +73,10 @@ pub struct ModelArgs {
 #[derive(Debug, Clone, Deserialize)]
 struct ModelArgsSource {
     model_type: String,
+    #[serde(default)]
+    hidden_act: Option<String>,
+    #[serde(default)]
+    partial_rotary_factor: Option<f32>,
     hidden_size: i32,
     num_hidden_layers: i32,
     intermediate_size: i32,
@@ -172,6 +176,22 @@ impl Config for ModelArgs {
     fn attention_bias(&self, _projection: super::AttentionProjection) -> bool {
         self.attention_bias
     }
+    fn attention_projection_layout(&self) -> crate::decoder::AttentionProjectionLayout<'_> {
+        if self.model_type == "phi3" {
+            crate::decoder::AttentionProjectionLayout::Fused { field: "qkv_proj" }
+        } else {
+            crate::decoder::AttentionProjectionLayout::Split
+        }
+    }
+    fn gated_projection_layout(&self) -> crate::decoder::GatedProjectionLayout<'_> {
+        if self.model_type == "phi3" {
+            crate::decoder::GatedProjectionLayout::Fused {
+                field: "gate_up_proj",
+            }
+        } else {
+            crate::decoder::GatedProjectionLayout::Split
+        }
+    }
     fn mlp_bias(&self) -> bool {
         self.mlp_bias
     }
@@ -206,15 +226,15 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, ConfigE
     normalize_model_args(serde_json::from_value(config.clone())?)
 }
 
-/// Parses normalized Llama/Mistral arguments from a backend-neutral GGUF catalog.
+/// Parses normalized Llama/Mistral/Phi-4 arguments from a neutral GGUF catalog.
 pub fn model_args_from_gguf_catalog(
     arrays: &impl GgufTensorCatalog,
     metadata: &HashMap<String, MetadataValue>,
 ) -> Result<ModelArgs, ConfigError> {
     let architecture = gguf_string(metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "llama" | "mistral") {
+    if !matches!(architecture.as_str(), "llama" | "mistral" | "phi3") {
         return Err(invalid(format!(
-            "GGUF architecture {architecture:?}; expected llama or mistral"
+            "GGUF architecture {architecture:?}; expected llama, mistral or phi3"
         )));
     }
     let key = |suffix: &str| format!("{architecture}.{suffix}");
@@ -235,6 +255,12 @@ pub fn model_args_from_gguf_catalog(
         .transpose()
         .map_err(|_| invalid("GGUF attention key length exceeds i32"))?
         .unwrap_or(hidden_size / num_attention_heads);
+    if architecture == "phi3"
+        && gguf_optional_i64(metadata, &key("rope.dimension_count"))?
+            .is_some_and(|dimensions| dimensions != i64::from(head_dim))
+    {
+        return Err(invalid("Phi-4 requires full-head rotary encoding"));
+    }
     let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000.0);
     let rope_scaling = gguf_rope_scaling(metadata, &architecture)?;
     let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"))?;
@@ -287,7 +313,8 @@ pub fn model_args_from_gguf_catalog(
         num_key_value_heads,
         max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         rope_theta,
-        rope_traditional: true,
+        // Phi GGUF retains the HF half-head rotary layout in its fused QKV.
+        rope_traditional: architecture != "phi3",
         head_dim,
         tie_word_embeddings: !arrays.contains("output.weight"),
         attention_bias: arrays.any(&mut attention_bias),
@@ -391,6 +418,21 @@ fn gguf_optional_f32(
 }
 
 fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
+    if source.model_type == "phi3" {
+        if source
+            .hidden_act
+            .as_deref()
+            .is_some_and(|activation| activation != "silu")
+        {
+            return Err(invalid("Phi-4 requires the SiLU gated activation"));
+        }
+        if source
+            .partial_rotary_factor
+            .is_some_and(|factor| factor != 1.0)
+        {
+            return Err(invalid("Phi-4 requires full-head rotary encoding"));
+        }
+    }
     if source.num_key_value_heads == 0 {
         source.num_key_value_heads = source.num_attention_heads;
     }
@@ -473,11 +515,14 @@ fn normalize_hf_sliding_window(value: Option<Value>) -> Result<Option<u32>, Conf
 }
 
 fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
-    if !matches!(args.model_type.as_str(), "llama" | "mistral") {
+    if !matches!(args.model_type.as_str(), "llama" | "mistral" | "phi3") {
         return Err(invalid(format!(
             "unsupported model type {:?}",
             args.model_type
         )));
+    }
+    if args.model_type == "phi3" && (args.attention_bias || args.mlp_bias) {
+        return Err(invalid("Phi-4 projections do not have biases"));
     }
     for (name, value) in [
         ("hidden_size", args.hidden_size),

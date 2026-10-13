@@ -222,7 +222,7 @@ pub enum ModelKind {
     K2Horizon,
     /// Moonshot Kimi Linear architecture.
     KimiLinear,
-    /// Llama-compatible dense decoders, including Mistral.
+    /// Llama-compatible dense decoders, including Mistral and Phi-4.
     Llama,
     /// Gemma 2 dense decoder.
     Gemma2,
@@ -364,7 +364,7 @@ impl ModelKind {
             "inkling_mm_model" => Ok(Self::Inkling),
             "k2_horizon" => Ok(Self::K2Horizon),
             "kimi_linear" => Ok(Self::KimiLinear),
-            "llama" | "mistral" => Ok(Self::Llama),
+            "llama" | "mistral" | "phi3" => Ok(Self::Llama),
             "nanbeige" => Ok(Self::Nanbeige),
             "gemma2" => Ok(Self::Gemma2),
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
@@ -412,6 +412,8 @@ pub enum GgufArchitecture {
     Nanbeige,
     /// `mistral`.
     Mistral,
+    /// `phi3`, including the original Phi-4 dense decoder.
+    Phi3,
     /// `muse-glimmer`.
     MuseGlimmer,
     /// `lfm2`.
@@ -458,6 +460,7 @@ impl GgufArchitecture {
             "gemma4" => Ok(Self::Gemma4),
             "llama" => Ok(Self::Llama),
             "mistral" => Ok(Self::Mistral),
+            "phi3" => Ok(Self::Phi3),
             "nanbeige" => Ok(Self::Nanbeige),
             "gemma2" => Ok(Self::Gemma2),
             "muse-glimmer" => Ok(Self::MuseGlimmer),
@@ -490,7 +493,7 @@ impl GgufArchitecture {
             Self::Inkling => ModelKind::Inkling,
             Self::DiffusionGemma => ModelKind::DiffusionGemma,
             Self::Gemma4 => ModelKind::Gemma4,
-            Self::Llama | Self::Mistral => ModelKind::Llama,
+            Self::Llama | Self::Mistral | Self::Phi3 => ModelKind::Llama,
             Self::Nanbeige => ModelKind::Nanbeige,
             Self::Gemma2 => ModelKind::Gemma2,
             Self::MuseGlimmer => ModelKind::MuseGlimmer,
@@ -521,6 +524,7 @@ impl GgufArchitecture {
             Self::Llama => "llama",
             Self::Gemma2 => "gemma2",
             Self::Mistral => "mistral",
+            Self::Phi3 => "phi3",
             Self::Nanbeige => "nanbeige",
             Self::MuseGlimmer => "muse-glimmer",
             Self::Lfm2 => "lfm2",

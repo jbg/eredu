@@ -1,4 +1,4 @@
-//! Architecture-owned checkpoint contracts for Llama and Mistral decoders.
+//! Architecture-owned checkpoint contracts for Llama, Mistral and Phi-4 decoders.
 //!
 //! This module owns physical tensor names, geometry, bias policy, affine
 //! SafeTensors companions, GGUF encodings, and the small RoPE catalog
@@ -61,9 +61,17 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         .replace("output", "lm_head")
 }
 
-/// Translates a GGUF tensor using its normalized model configuration.
-pub(crate) fn translate_gguf_weight_name_for_model(name: &str, _args: &ModelArgs) -> String {
-    translate_gguf_weight_name(name)
+/// Translates the physical fused Phi layout or the ordinary split layout.
+pub(crate) fn translate_gguf_weight_name_for_model(name: &str, args: &ModelArgs) -> String {
+    if args.model_type == "phi3" {
+        translate_gguf_weight_name(
+            &name
+                .replace("attn_qkv", "self_attn.qkv_proj")
+                .replace("ffn_up", "mlp.gate_up_proj"),
+        )
+    } else {
+        translate_gguf_weight_name(name)
+    }
 }
 
 /// Builds the complete SafeTensors catalog expected by this configuration.
@@ -110,15 +118,29 @@ pub fn safetensors_plan(
                 vec![hidden],
             ),
         ]);
-        let attention = vec![
-            ("self_attn.q_proj.weight", vec![query, hidden]),
-            ("self_attn.k_proj.weight", vec![key_value, hidden]),
-            ("self_attn.v_proj.weight", vec![key_value, hidden]),
-        ];
-        let feed_forward = vec![
-            ("mlp.gate_proj.weight", vec![intermediate, hidden]),
-            ("mlp.up_proj.weight", vec![intermediate, hidden]),
-        ];
+        let attention = if args.model_type == "phi3" {
+            vec![(
+                "self_attn.qkv_proj.weight",
+                vec![fused_query_width(query, key_value)?, hidden],
+            )]
+        } else {
+            vec![
+                ("self_attn.q_proj.weight", vec![query, hidden]),
+                ("self_attn.k_proj.weight", vec![key_value, hidden]),
+                ("self_attn.v_proj.weight", vec![key_value, hidden]),
+            ]
+        };
+        let feed_forward = if args.model_type == "phi3" {
+            vec![(
+                "mlp.gate_up_proj.weight",
+                vec![checked_mul(intermediate, 2, "gate/up width")?, hidden],
+            )]
+        } else {
+            vec![
+                ("mlp.gate_proj.weight", vec![intermediate, hidden]),
+                ("mlp.up_proj.weight", vec![intermediate, hidden]),
+            ]
+        };
         let matrices = attention
             .into_iter()
             .chain([("self_attn.o_proj.weight", vec![hidden, query])])
@@ -311,15 +333,29 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
                 TensorOperation::Vector,
             ));
         }
-        let attention = vec![
-            ("attn_q.weight", vec![query, hidden]),
-            ("attn_k.weight", vec![key_value, hidden]),
-            ("attn_v.weight", vec![key_value, hidden]),
-        ];
-        let feed_forward = vec![
-            ("ffn_gate.weight", vec![intermediate, hidden]),
-            ("ffn_up.weight", vec![intermediate, hidden]),
-        ];
+        let attention = if args.model_type == "phi3" {
+            vec![(
+                "attn_qkv.weight",
+                vec![fused_query_width(query, key_value)?, hidden],
+            )]
+        } else {
+            vec![
+                ("attn_q.weight", vec![query, hidden]),
+                ("attn_k.weight", vec![key_value, hidden]),
+                ("attn_v.weight", vec![key_value, hidden]),
+            ]
+        };
+        let feed_forward = if args.model_type == "phi3" {
+            vec![(
+                "ffn_up.weight",
+                vec![checked_mul(intermediate, 2, "gate/up width")?, hidden],
+            )]
+        } else {
+            vec![
+                ("ffn_gate.weight", vec![intermediate, hidden]),
+                ("ffn_up.weight", vec![intermediate, hidden]),
+            ]
+        };
         let matrices = attention
             .into_iter()
             .chain([("attn_output.weight", vec![hidden, query])])
@@ -386,6 +422,12 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Llama {name} geometry overflows"))
 }
 
+fn fused_query_width(query: usize, key_value: usize) -> Result<usize, String> {
+    query
+        .checked_add(checked_mul(key_value, 2, "key/value width")?)
+        .ok_or_else(|| "Phi-4 fused QKV width overflows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -401,6 +443,40 @@ mod tests {
             "attention_bias": true, "mlp_bias": true, "tie_word_embeddings": false
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn phi4_released_config_requires_fused_checkpoint_geometry() {
+        let args = crate::llama::model_args_from_config_value(
+            &serde_json::from_str(include_str!(
+                "../../tests/fixtures/configs/phi-4-2db69c1c.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let safe = safetensors_plan(&args).unwrap();
+        let query = safe
+            .common_tensors
+            .iter()
+            .find(|tensor| tensor.key == "model.layers.0.self_attn.qkv_proj.weight")
+            .unwrap();
+        let gate = safe
+            .common_tensors
+            .iter()
+            .find(|tensor| tensor.key == "model.layers.39.mlp.gate_up_proj.weight")
+            .unwrap();
+        assert_eq!(query.shape, [7680, 5120]);
+        assert_eq!(gate.shape, [35840, 5120]);
+
+        let mut partial: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/configs/phi-4-2db69c1c.json"
+        ))
+        .unwrap();
+        partial["partial_rotary_factor"] = 0.5.into();
+        assert!(crate::llama::model_args_from_config_value(&partial)
+            .unwrap_err()
+            .to_string()
+            .contains("full-head"));
     }
 
     #[test]
