@@ -107,7 +107,7 @@ fn qwen_vl_components_follow_media_residency_and_all_parallel_bank_placements_wi
                         let workers = (0..topology.world_size()).map(|rank| {
                             let (inspection, parameters, inputs, plan, descriptor) = (&inspection, &parameters, &inputs, &plan, &descriptor);
                             let world = world.clone();
-                            scope.spawn(move || {
+                            spawn_reference_worker(scope, move || {
                                 let sources = partitioned_adapter::prepare_plan_with_banks(inspection, plan, rank, std::time::Duration::from_secs(30),
                                     independent.then(|| ParameterBankLoadOptions::new(
                                         eredu_core::residency::OffloadConfig::new(Some(4608), Some(1<<20), 1).unwrap(), 4608, 4608).unwrap())).unwrap();
@@ -525,7 +525,7 @@ fn qwen_vl_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 let (inspection, plan, args, parameters) =
                                     (&inspection, &plan, &args, &parameters);
                                 let world = world.clone();
-                                scope.spawn(move || {
+                                spawn_reference_worker(scope, move || {
                                     let sources = partitioned_adapter::prepare_plan(
                                         inspection,
                                         plan,

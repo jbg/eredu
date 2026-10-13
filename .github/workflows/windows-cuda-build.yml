@@ -36,6 +36,10 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
+      # Match the CPU job and keep generic backend archives small for MSVC
+      # when linking downstream consumers.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       CMAKE_BUILD_PARALLEL_LEVEL: "1"
       SAFEMLX_CUDA_ARCHITECTURES: ${{ inputs.cuda_architectures }}
     steps:

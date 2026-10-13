@@ -27552,7 +27552,7 @@ fn run_numeric_composite_partitions(
                 let description = description.clone();
                 let inputs = inputs.to_vec();
                 let world = Arc::clone(&world);
-                scope.spawn(move || {
+                spawn_reference_worker(scope, move || {
                     // Eight-rank fixture construction can outlast the short
                     // deadlines used by deliberate failure cases on CI hosts.
                     let sources = partitioned_adapter::prepare_with_timeout(
@@ -27619,7 +27619,7 @@ fn run_numeric_composite_partitions_observed(
                 let world = Arc::clone(&world);
                 let zero_path = zero_path.map(str::to_owned);
                 let fail_path = fail_path.map(str::to_owned);
-                scope.spawn(move || {
+                spawn_reference_worker(scope, move || {
                     let sources =
                         partitioned_adapter::prepare(&inspection, topology, rank, false).unwrap();
                     let rank_topology = ParallelRankTopology::new(topology, rank).unwrap();
@@ -29132,3 +29132,21 @@ mod voicechat_codec_encoder_distributed;
 
 #[path = "reference_numeric/voicechat_codec_decoder_distributed.rs"]
 mod voicechat_codec_decoder_distributed;
+
+// Composite and prediction execution retain large generic frames in debug
+// builds. Give reference workers the same stack budget as the other large
+// numerical fixtures, independently of the host's thread default.
+fn spawn_reference_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    worker: F,
+) -> std::thread::ScopedJoinHandle<'scope, T>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    std::thread::Builder::new()
+        .name("reference-worker".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn_scoped(scope, worker)
+        .unwrap()
+}

@@ -364,6 +364,18 @@ pub(super) fn run(
     prediction_source: Option<&std::path::Path>,
     residency: LayerWeightResidency,
 ) -> super::super::registry::Trajectory {
+    std::thread::scope(|scope| {
+        spawn_reference_worker(scope, move || run_inner(path, prediction_source, residency))
+            .join()
+            .unwrap()
+    })
+}
+
+fn run_inner(
+    path: &std::path::Path,
+    prediction_source: Option<&std::path::Path>,
+    residency: LayerWeightResidency,
+) -> super::super::registry::Trajectory {
     let request = NormalizedLoadRequest::default()
         .with_weight_residency(WeightResidency::with_layers(residency))
         .with_drafting(DraftingLoadRequest::embedded(1).unwrap());
