@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use eredu_checkpoint::WeightQuantization;
 use eredu_core::InputModalities;
 use serde::Deserialize;
 
@@ -48,7 +47,7 @@ struct FamilySource {
     #[serde(default = "default_true")]
     tie_word_embeddings: bool,
     #[serde(default)]
-    quantization: Option<WeightQuantization>,
+    quantization: Option<serde_json::Value>,
 }
 
 fn default_model_type() -> String {
@@ -76,6 +75,74 @@ pub struct FamilyConfig {
     pub audio: Option<AudioConfig>,
     /// Audio placeholder token.
     pub audio_token_id: Option<i32>,
+}
+
+/// Identifies projector-only media metadata in unified text conversions.
+/// Full tower configurations and malformed non-object values remain subject
+/// to ordinary geometry validation.
+pub(crate) fn is_media_config_stub(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        !object.contains_key("num_hidden_layers")
+            && matches!(
+                object.get("model_type").and_then(serde_json::Value::as_str),
+                Some("gemma4_unified_vision" | "gemma4_unified_audio")
+            )
+    })
+}
+
+/// Splits a Hugging Face `quantization` object into the default weight
+/// format and the per-tensor overrides that mixed-precision conversions carry
+/// as nested objects keyed by physical tensor name without the `.weight`
+/// suffix (for example `language_model.model.layers.3.mlp.down_proj`). Each
+/// override inherits the fields it omits (typically `mode`) from the default
+/// and is re-keyed by the canonical `model.*.weight` name the checkpoint plan
+/// resolves formats with.
+fn split_quantization(
+    value: serde_json::Value,
+) -> Result<
+    (
+        serde_json::Value,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    FamilyConfigError,
+> {
+    let serde_json::Value::Object(entries) = value else {
+        return Ok((value, serde_json::Map::new()));
+    };
+    let mut default = serde_json::Map::new();
+    let mut nested = Vec::new();
+    for (key, entry) in entries {
+        match entry {
+            serde_json::Value::Object(_) => nested.push((key, entry)),
+            serde_json::Value::Bool(false) => {
+                return Err(FamilyConfigError::Invalid(format!(
+                    "Gemma 4 quantization marks {key:?} as unquantized; per-tensor dense overrides are not supported"
+                )))
+            }
+            serde_json::Value::Bool(true) => {}
+            other => {
+                default.insert(key, other);
+            }
+        }
+    }
+    let mut overrides = serde_json::Map::new();
+    for (key, entry) in nested {
+        let serde_json::Value::Object(fields) = entry else {
+            unreachable!("only objects are collected");
+        };
+        let mut merged = default.clone();
+        merged.extend(fields);
+        let canonical = crate::gemma4::config::canonical_weight_name(&key);
+        if overrides
+            .insert(canonical.clone(), serde_json::Value::Object(merged))
+            .is_some()
+        {
+            return Err(FamilyConfigError::Invalid(format!(
+                "duplicate Gemma 4 quantization override for {canonical:?}"
+            )));
+        }
+    }
+    Ok((serde_json::Value::Object(default), overrides))
 }
 
 impl FamilyConfig {
@@ -117,36 +184,103 @@ impl FamilyConfig {
             serde_json::Value::Bool(source.tie_word_embeddings),
         );
         if let Some(quantization) = source.quantization {
-            text_object.insert(
-                "weight_quantization".into(),
-                serde_json::to_value(quantization)?,
-            );
+            let (default, overrides) = split_quantization(quantization)?;
+            text_object.insert("weight_quantization".into(), default);
+            if !overrides.is_empty() {
+                text_object.insert(
+                    "quantized_weight_configs".into(),
+                    serde_json::Value::Object(overrides),
+                );
+            }
         }
         let text = ModelArgs::from_hf_json(&serde_json::to_vec(&text_value)?)?;
+        let vision_stub = source
+            .vision_config
+            .as_ref()
+            .is_some_and(is_media_config_stub);
+        let audio_stub = source
+            .audio_config
+            .as_ref()
+            .is_some_and(is_media_config_stub);
         let vision = source
             .vision_config
+            .filter(|_| !vision_stub)
             .map(|value| -> Result<VisionConfig, FamilyConfigError> {
-                let config: VisionConfig = serde_json::from_value(value)?;
+                let mut config: VisionConfig = serde_json::from_value(value)?;
+                // Media-to-text projections use the conversion's decoder encoding.
+                // Store it in the media configuration so admission and construction
+                // consume the same normalized format.
+                let projection = "model.embed_vision.embedding_projection.weight";
+                if let Some(format) = text.linear_format_for(projection).weight_quantization() {
+                    config
+                        .quantized_weight_configs
+                        .get_or_insert_default()
+                        .entry(projection.into())
+                        .or_insert(format);
+                }
+                for (name, format) in text.quantized_weight_configs.iter().flatten() {
+                    if name.starts_with("model.vision_tower.") || name == projection {
+                        config
+                            .quantized_weight_configs
+                            .get_or_insert_default()
+                            .insert(name.clone(), *format);
+                    }
+                }
                 config.validate()?;
                 Ok(config)
             })
             .transpose()?;
         let audio = source
             .audio_config
+            .filter(|_| !audio_stub)
             .map(|value| -> Result<AudioConfig, FamilyConfigError> {
-                let config: AudioConfig = serde_json::from_value(value)?;
+                let mut config: AudioConfig = serde_json::from_value(value)?;
+                // Media-to-text projections use the conversion's decoder encoding.
+                // Store it in the media configuration so admission and construction
+                // consume the same normalized format.
+                let projection = "model.embed_audio.embedding_projection.weight";
+                if let Some(format) = text.linear_format_for(projection).weight_quantization() {
+                    config
+                        .quantized_weight_configs
+                        .get_or_insert_default()
+                        .entry(projection.into())
+                        .or_insert(format);
+                }
+                for (name, format) in text.quantized_weight_configs.iter().flatten() {
+                    if name.starts_with("model.audio_tower.") || name == projection {
+                        config
+                            .quantized_weight_configs
+                            .get_or_insert_default()
+                            .insert(name.clone(), *format);
+                    }
+                }
                 config.validate()?;
                 Ok(config)
             })
             .transpose()?;
+        // A text-only conversion keeps the placeholder ids of the towers it
+        // reduced to stubs; without an encoder they admit nothing, so they are
+        // cleared rather than reported as a modality the artifact cannot serve.
+        // A placeholder with no media configuration at all is still an orphan
+        // and is rejected by `validate`.
+        let (image_token_id, video_token_id) = if vision_stub {
+            (None, None)
+        } else {
+            (source.image_token_id, source.video_token_id)
+        };
+        let audio_token_id = if audio_stub {
+            None
+        } else {
+            source.audio_token_id
+        };
         let config = Self {
             model_type: source.model_type,
             text,
             vision,
-            image_token_id: source.image_token_id,
-            video_token_id: source.video_token_id,
+            image_token_id,
+            video_token_id,
             audio,
-            audio_token_id: source.audio_token_id,
+            audio_token_id,
         };
         config.validate()?;
         Ok(config)
@@ -281,6 +415,133 @@ impl FamilyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_tensor_quantization_overrides_reach_the_text_formats() {
+        let mut value = config();
+        value["quantization"] = serde_json::json!({
+            "group_size": 64, "bits": 4, "mode": "affine",
+            "language_model.model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64},
+            "model.language_model.layers.1.mlp.up_proj": {"bits": 8, "group_size": 32},
+            "language_model.model.embed_tokens": {"bits": 6, "group_size": 64}
+        });
+        let family = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let bits = |name: &str| {
+            family
+                .text
+                .linear_format_for(name)
+                .weight_quantization()
+                .expect("quantized")
+                .bits()
+        };
+        assert_eq!(bits("model.layers.0.mlp.down_proj.weight"), 8);
+        assert_eq!(bits("model.layers.1.mlp.up_proj.weight"), 8);
+        assert_eq!(bits("model.embed_tokens.weight"), 6);
+        assert_eq!(bits("model.layers.0.mlp.up_proj.weight"), 4);
+        assert_eq!(bits("model.layers.0.self_attn.q_proj.weight"), 4);
+        let mut value = config();
+        value["quantization"] = serde_json::json!({
+            "group_size": 64, "bits": 4,
+            "language_model.model.layers.0.mlp.down_proj": false
+        });
+        assert!(FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn conversion_media_formats_preserve_dense_towers_and_quantized_projections() {
+        let mut value = config();
+        value["vision_config"]["hidden_size"] = 32.into();
+        value["vision_config"]["num_attention_heads"] = 4.into();
+        value["audio_config"]["output_proj_dims"] = 32.into();
+        value["quantization"] = serde_json::json!({
+            "group_size": 32, "bits": 4,
+            "embed_audio.embedding_projection": {"bits": 8},
+            "vision_tower.encoder.layers.0.mlp.fc1.linear": {"bits": 8}
+        });
+        let family = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let vision = family.vision.unwrap();
+        let audio = family.audio.unwrap();
+        assert_eq!(
+            vision
+                .linear_format_for("model.embed_vision.embedding_projection.weight", 32)
+                .weight_quantization()
+                .unwrap()
+                .bits(),
+            4
+        );
+        assert_eq!(
+            audio
+                .linear_format_for("model.embed_audio.embedding_projection.weight", 32)
+                .weight_quantization()
+                .unwrap()
+                .bits(),
+            8
+        );
+        assert_eq!(
+            vision
+                .linear_format_for(
+                    "model.vision_tower.encoder.layers.0.mlp.fc1.linear.weight",
+                    32
+                )
+                .weight_quantization()
+                .unwrap()
+                .bits(),
+            8
+        );
+        assert_eq!(
+            vision.linear_format_for(
+                "model.vision_tower.encoder.layers.0.mlp.fc2.linear.weight",
+                32
+            ),
+            eredu_checkpoint::LinearFormat::Dense
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_quantization_and_malformed_media_geometry() {
+        let mut value = config();
+        value["quantization"] = serde_json::json!({
+            "group_size": 32, "bits": 4,
+            "language_model.model.layers.0.mlp.down_proj": {"bits": 8},
+            "model.layers.0.mlp.down_proj.weight": {"bits": 4}
+        });
+        assert!(FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        for malformed in [
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!({"model_type":"gemma4_vision","hidden_size":16}),
+        ] {
+            let mut value = config();
+            value["vision_config"] = malformed;
+            assert!(FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn text_only_conversion_stub_media_configs_are_treated_as_absent() {
+        // mlx-community's text-only 4-bit conversions keep `vision_config` /
+        // `audio_config` with projector metadata only (no `num_hidden_layers`)
+        // and the placeholder ids of the towers they dropped.
+        let mut value = config();
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "vision_config".into(),
+            serde_json::json!({"model_type":"gemma4_unified_vision","mm_embed_dim":16,"rms_norm_eps":0.000001}),
+        );
+        object.insert(
+            "audio_config".into(),
+            serde_json::json!({"model_type":"gemma4_unified_audio","hidden_size":16,"output_proj_dims":8,"rms_norm_eps":0.000001}),
+        );
+        let family = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(family.vision.is_none());
+        assert!(family.audio.is_none());
+        assert_eq!(family.image_token_id, None);
+        assert_eq!(family.video_token_id, None);
+        assert_eq!(family.audio_token_id, None);
+        assert!(!family.input_modalities().image);
+        assert!(!family.input_modalities().audio);
+        assert!(!is_media_config_stub(&config()["vision_config"]));
+    }
 
     fn config() -> serde_json::Value {
         serde_json::json!({

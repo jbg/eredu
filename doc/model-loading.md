@@ -36,6 +36,49 @@ match a planned load. Backend-author tooling that binds native distributed
 groups uses the selected implementation crate directly. Non-replicated
 distributed topologies still use the same architecture-erased loader.
 
+## Gemma 4 MLX conversions
+
+Gemma 4 SafeTensors admission accepts released `model.language_model.*`,
+neutral `model.*`, and MLX conversion `language_model.model.*` decoder names.
+MLX media towers and projections may use root-level names. Quantized weights
+and their scales/biases must satisfy the same exact geometry under every alias;
+duplicate physical aliases for a logical tensor are rejected.
+
+Nested per-weight entries in the Hugging Face `quantization` object override
+the default format and inherit omitted format fields. Names are normalized
+before format selection, including the 8-bit MLP overrides in the 4-bit QAT
+conversion. Conflicting aliases for an override are rejected. Boolean `false`
+per-weight overrides are rejected explicitly rather than silently quantized.
+Media projection encodings are retained in the media configuration consumed by
+both checkpoint admission and model construction; tower alignment restrictions
+still apply. Audio framing accepts `boa_token_index` and `eoa_token_index` as
+fallbacks when the corresponding `_id` field is absent.
+
+Projector-only `gemma4_unified_vision` / `gemma4_unified_audio` metadata without
+`num_hidden_layers` admits text execution without advertising those media
+modalities. Associated placeholder IDs are cleared and unused projection
+weights are permitted. Missing media configurations with live placeholder IDs,
+malformed configurations, and incomplete full-tower geometries remain errors.
+
+Header-only validation covers these pinned `mlx-community` artifacts. Counts
+include the complete tensor catalogs; this evidence establishes checkpoint
+admission and processor selection, not numerical generation parity.
+
+| Artifact | Revision | Tensor headers | Processor |
+| --- | --- | ---: | --- |
+| `gemma-4-e4b-it-4bit` | `475b9088d29754a3379866cf5aeb6b41acd313c2` | 2,770 | Media enabled |
+| `gemma-4-12B-it-4bit` | `73bcf09092aa277861d5a191b989b666f7f32e8f` | 1,341 | Text only |
+| `gemma-4-12B-it-qat-4bit` | `e70c6b3ba0979b3357dcd2f223ad8bde7787a6b6` | 1,341 | Text only |
+
+The QAT regression fixture retains published layer-0 and static header metadata,
+with the configured layer count and override map restricted to that layer. It
+checks admission, the independent packed shapes, missing companions, and alias
+ambiguity without allocating model tensors:
+
+```sh
+CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/eredu" cargo test --locked -p eredu-architectures --test gemma4_checkpoint_compat
+```
+
 ## Weight residency
 
 ### Fully resident

@@ -463,13 +463,17 @@ impl ModelArgs {
         )
     }
 
-    /// Returns the physical encoding for one canonical linear weight.
+    /// Returns the physical encoding for one linear weight, named in the
+    /// released, canonical or mlx-vlm spelling. Per-tensor overrides are
+    /// keyed by the canonical `model.*.weight` name, but callers that build
+    /// modules under a released layer root look them up by that root, so
+    /// the raw name is tried first and the canonical one second.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
-        if let Some(format) = self
-            .quantized_weight_configs
-            .as_ref()
-            .and_then(|formats| formats.get(name))
-        {
+        if let Some(format) = self.quantized_weight_configs.as_ref().and_then(|formats| {
+            formats
+                .get(name)
+                .or_else(|| formats.get(&canonical_weight_name(name)))
+        }) {
             return (*format).into();
         }
         match self.weight_quantization {
@@ -483,6 +487,36 @@ impl ModelArgs {
             }
             _ => LinearFormat::Dense,
         }
+    }
+}
+
+/// Canonical `model.*.weight` name of a tensor named in a quantization
+/// override, accepting the released, canonical and mlx-vlm spellings.
+pub(crate) fn canonical_weight_name(key: &str) -> String {
+    let name = if let Some(rest) = key
+        .strip_prefix("language_model.model.")
+        .or_else(|| key.strip_prefix("model.language_model."))
+    {
+        format!("model.{rest}")
+    } else if let Some(rest) = key.strip_prefix("language_model.lm_head") {
+        format!("lm_head{rest}")
+    } else if [
+        "vision_tower.",
+        "audio_tower.",
+        "embed_vision.",
+        "embed_audio.",
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
+    {
+        format!("model.{key}")
+    } else {
+        key.to_string()
+    };
+    if name.ends_with(".weight") {
+        name
+    } else {
+        format!("{name}.weight")
     }
 }
 

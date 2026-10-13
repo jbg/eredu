@@ -292,14 +292,94 @@ pub(crate) fn shared_safetensors_plan(
     if let Some(audio) = audio {
         add_safetensors_audio(audio, hidden, &mut common)?;
     }
+    for constraint in &mut common {
+        add_mlx_vlm_aliases(constraint);
+    }
+    for group in &mut groups {
+        for variant in &mut group.variants {
+            for constraint in &mut variant.tensors {
+                add_mlx_vlm_aliases(constraint);
+            }
+        }
+    }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.extend([
         "multi_modal_projector.".into(),
         "model.multi_modal_projector.".into(),
         "model.vision_embedder.".into(),
+        "vision_embedder.".into(),
     ]);
+    // A text-only conversion may keep the media-to-text projections of the
+    // towers it dropped; with no encoder declared they are dead weight, not an
+    // unexpected tensor.
+    if vision.is_none() {
+        policy
+            .allowed_prefixes
+            .extend(["model.embed_vision.".into(), "embed_vision.".into()]);
+    }
+    if audio.is_none() {
+        policy
+            .allowed_prefixes
+            .extend(["model.embed_audio.".into(), "embed_audio.".into()]);
+    }
     SafetensorsCheckpointPlan::new("Gemma 4 SafeTensors", common, groups, policy)
         .map_err(|error| error.to_string())
+}
+
+/// Physical name of a released-layout tensor in the `mlx-vlm` /
+/// `mlx-community` SafeTensors conversions, which nest the decoder under
+/// `language_model.model` and keep the media towers and projections at the
+/// root without the `model.` prefix. Returns `None` for names that already
+/// use a layout those conversions share with the released one.
+fn mlx_vlm_physical_name(name: &str) -> Option<String> {
+    for (canonical, physical) in [
+        ("model.language_model.", "language_model.model."),
+        ("lm_head.", "language_model.lm_head."),
+        ("model.vision_tower.", "vision_tower."),
+        ("model.embed_vision.", "embed_vision."),
+        ("model.audio_tower.", "audio_tower."),
+        ("model.embed_audio.", "embed_audio."),
+    ] {
+        if let Some(rest) = name.strip_prefix(canonical) {
+            return Some(format!("{physical}{rest}"));
+        }
+    }
+    None
+}
+
+/// Whether a name uses the `mlx-vlm` physical spelling rather than the
+/// released or backend-neutral one.
+pub(crate) fn is_mlx_vlm_physical_name(name: &str) -> bool {
+    name.starts_with("language_model.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("embed_vision.")
+        || name.starts_with("audio_tower.")
+        || name.starts_with("embed_audio.")
+}
+
+/// The backend-neutral alias of a constraint, if it has one. Alias order is
+/// normalized alphabetically by the checkpoint plan, so callers that need the
+/// neutral name must select it rather than take the first alias.
+pub(crate) fn neutral_alias(tensor: &SafetensorsTensorConstraint) -> Option<&String> {
+    tensor
+        .aliases
+        .iter()
+        .find(|alias| !is_mlx_vlm_physical_name(alias))
+}
+
+/// Adds the `mlx-vlm` physical alias of a constraint's key and existing
+/// aliases so one plan admits the released, canonical, and MLX conversions.
+fn add_mlx_vlm_aliases(constraint: &mut SafetensorsTensorConstraint) {
+    let extra = std::iter::once(&constraint.key)
+        .chain(constraint.aliases.iter())
+        .filter_map(|name| mlx_vlm_physical_name(name))
+        .filter(|physical| physical != &constraint.key && !constraint.aliases.contains(physical))
+        .collect::<Vec<_>>();
+    for physical in extra {
+        if !constraint.aliases.contains(&physical) {
+            constraint.aliases.push(physical);
+        }
+    }
 }
 
 /// Builds the strict released sibling-projector GGUF catalog.
