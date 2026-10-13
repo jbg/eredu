@@ -52,7 +52,7 @@ pub(crate) fn grouped_rms(
                     uint i=thread_position_in_grid.x;
                     float x=gate[i];
                     // MLX's ordinary sigmoid, distinct from stable_exp_f32 SiLU.
-                    float y=1.0f/(1.0f+metal::exp(metal::abs(x)));
+                    float y=1.0f/(1.0f+metal::precise::exp(metal::abs(x)));
                     float probability=x<0 ? y : 1.0f-y;
                     float activated=x*probability;
                     float value=input[i]*activated;
@@ -147,10 +147,16 @@ pub(crate) fn gelu_product(
         let Ok(size) = i32::try_from(gate.size()) else {
             return Ok(None);
         };
-        // Runtime operands prevent a compiler from replacing pow(x, 3) with a
-        // differently rounded multiplication tree or reassociating coefficients.
+        // Retain the ordinary GELU multiplication order and its host-rounded
+        // coefficient, including the reference tanh saturation boundary.
         let scalars = Array::from_slice(
-            &[3.0_f32, 0.044715, 0.5, 1.0, 2.0 / std::f32::consts::PI],
+            &[
+                0.044715_f32,
+                0.5,
+                1.0,
+                (2.0_f64 / std::f64::consts::PI).sqrt() as f32,
+                8.664_34,
+            ],
             &[5],
         );
         thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
@@ -163,13 +169,15 @@ pub(crate) fn gelu_product(
                     r#"
                     uint i=thread_position_in_grid.x;
                     float x=gate[i];
-                    float cube=metal::pow(x,scalars[0]);
-                    float correction=scalars[1]*cube;
+                    float square=x*x;
+                    float cube=square*x;
+                    float correction=cube*scalars[0];
                     float inner=x+correction;
-                    float coefficient=metal::precise::sqrt(scalars[4]);
-                    float argument=coefficient*inner;
-                    float curved=scalars[3]+metal::precise::tanh(argument);
-                    float half_product=scalars[2]*x;
+                    float argument=inner*scalars[3];
+                    float hyperbolic=argument>scalars[4] ? scalars[2] :
+                        (argument<-scalars[4] ? -scalars[2] : metal::precise::tanh(argument));
+                    float curved=hyperbolic+scalars[2];
+                    float half_product=scalars[1]*x;
                     float activated=half_product*curved;
                     output[i]=activated*up[i];
                     "#,
@@ -276,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn gelu_product_preserves_native_power_tanh_and_exceptional_values() {
+    fn gelu_product_preserves_native_multiplication_tanh_and_exceptional_values() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
         let mut values = (0..18436)
             .map(|i| ((i * 37 % 8191) as f32 - 4095.) / 1024.)

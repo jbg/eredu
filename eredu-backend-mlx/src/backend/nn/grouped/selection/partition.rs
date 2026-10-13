@@ -44,7 +44,7 @@ pub(super) fn repair(
                     }
                     thread uint ids[WIDTH];
                     for (int i=0; i<WIDTH; ++i) ids[i] = i;
-                    device const float* values = scores + row*WIDTH;
+                    auto values = scores + row*WIDTH;
                     route_partition(values, ids, COUNT-1, WIDTH);
                     for (int i=0; i<COUNT; ++i) out[row*COUNT+i]=ids[i];
                     "#,

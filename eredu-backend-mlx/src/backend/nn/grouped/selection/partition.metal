@@ -2,15 +2,18 @@
 // Copyright (c) the LLVM Project contributors.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // https://llvm.org/LICENSE.txt
-// Indices, comparison and address spaces are specialized for routing scores.
-inline bool route_less(device const float* scores, uint a, uint b) {
+// MLX binds small score arrays in constant memory and larger ones in device
+// memory. Deduce the score pointer address space; indices remain thread-local.
+template <typename Scores>
+inline bool route_less(Scores scores, uint a, uint b) {
     float x = scores[a], y = scores[b];
     return isnan(x) ? false : (isnan(y) || x < y);
 }
 inline void route_swap(thread uint* ids, int a, int b) {
     uint tmp = ids[a]; ids[a] = ids[b]; ids[b] = tmp;
 }
-inline bool route_sort3(device const float* scores, thread uint* ids, int x, int y, int z) {
+template <typename Scores>
+inline bool route_sort3(Scores scores, thread uint* ids, int x, int y, int z) {
     if (!route_less(scores, ids[y], ids[x])) {
         if (!route_less(scores, ids[z], ids[y])) return false;
         route_swap(ids, y, z);
@@ -24,7 +27,8 @@ inline bool route_sort3(device const float* scores, thread uint* ids, int x, int
     if (route_less(scores, ids[z], ids[y])) route_swap(ids, y, z);
     return true;
 }
-inline void route_partition(device const float* scores, thread uint* ids, int nth, int last) {
+template <typename Scores>
+inline void route_partition(Scores scores, thread uint* ids, int nth, int last) {
     int first = 0;
     while (true) {
         int len = last - first;

@@ -417,7 +417,8 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
                         MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
                     let identity = prompt.cache_identity().cloned();
                     let mut state =
-                        MlxBackend::start_text_generation(runtime.backend(), config).unwrap();
+                        MlxBackend::start_text_generation(runtime.backend(), config.clone())
+                            .unwrap();
                     while MlxBackend::prefill_text_prefix(
                         &mut runtime,
                         &mut prompt,
@@ -443,7 +444,9 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
                 let ordinary = TextGeneration::new(
                     &mut runtime,
                     ids.clone(),
-                    config.with_prefill_chunk_policy(PrefillChunkPolicy::Unchunked),
+                    config
+                        .clone()
+                        .with_prefill_chunk_policy(PrefillChunkPolicy::Unchunked),
                 )
                 .unwrap()
                 .map(|token| token.unwrap().token_id().unwrap())
@@ -452,9 +455,11 @@ fn run_cases(device: DeviceType, families: Vec<(&str, tempfile::TempDir)>) {
                 let controlled = ControlledTextGeneration::new(
                     &mut runtime,
                     ids,
-                    config.with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
-                        NonZeroUsize::new(2).unwrap(),
-                    )),
+                    config
+                        .clone()
+                        .with_prefill_chunk_policy(PrefillChunkPolicy::Bounded(
+                            NonZeroUsize::new(2).unwrap(),
+                        )),
                     Unconstrained,
                 )
                 .unwrap()
@@ -708,7 +713,8 @@ fn released_checkpoint_chunked_prefill_and_cached_decode_match_reference() {
     for chunk in [1, 2, 4, 128] {
         runtime.reset().unwrap();
         let mut prompt = MlxBackend::prepare_text_prompt(runtime.backend(), ids.clone()).unwrap();
-        let mut state = MlxBackend::start_text_generation(runtime.backend(), config).unwrap();
+        let mut state =
+            MlxBackend::start_text_generation(runtime.backend(), config.clone()).unwrap();
         while MlxBackend::prefill_text_prefix(
             &mut runtime,
             &mut prompt,
@@ -756,7 +762,7 @@ fn released_checkpoint_chunked_prefill_and_cached_decode_match_reference() {
             let generated = TextGeneration::new(
                 &mut runtime,
                 tokens,
-                config.with_prefill_chunk_policy(policy),
+                config.clone().with_prefill_chunk_policy(policy),
             )
             .unwrap()
             .map(|token| token.unwrap().token_id().unwrap())

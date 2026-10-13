@@ -369,6 +369,7 @@ impl TextSnapshotBackend for Host {
         match input? {
             PendingTextInput::Prefill(prompt) => (prompt.len() as u64).checked_add(predictions - 1),
             PendingTextInput::Decode(_) => Some(predictions),
+            PendingTextInput::Continue => None,
         }
     }
     fn estimate_sampling_growth(
@@ -420,6 +421,7 @@ impl TextSnapshotBackend for Host {
         Ok(input.map(|input| match input {
             PendingTextInput::Prefill(prompt) => PendingTextInput::Prefill(prompt.clone()),
             PendingTextInput::Decode(token) => PendingTextInput::Decode(*token),
+            PendingTextInput::Continue => PendingTextInput::Continue,
         }))
     }
     fn capture_run(state: &Generation) -> Option<&CaptureSession> {

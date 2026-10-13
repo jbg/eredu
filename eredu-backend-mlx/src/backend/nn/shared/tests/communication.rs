@@ -193,7 +193,7 @@ fn fine_grained_collectives_retain_exact_singleton_resources() {
 }
 
 #[test]
-fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchange() {
+fn fine_grained_collectives_admit_i32_for_sum_count_gather_and_variable_exchange() {
     let (group, stream) = singleton_communication();
 
     let gathered = <MlxNeuralBackend as EvenGatherBackend>::all_gather_even(
@@ -215,13 +215,13 @@ fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchang
         &[2, 0, 3]
     );
 
-    let reduction_error = <MlxNeuralBackend as SumReductionBackend>::all_reduce_sum(
+    let reduced = <MlxNeuralBackend as SumReductionBackend>::all_reduce_sum(
         MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
         &group,
         &stream,
     )
-    .expect_err("integer reduction is not advertised");
-    assert!(reduction_error.what().contains("does not advertise dtype"));
+    .unwrap().wait().unwrap();
+    assert_eq!(reduced.as_array().evaluated().unwrap().as_slice::<i32>(), &[1]);
 
     let uneven_error = <MlxNeuralBackend as UnevenGatherBackend>::all_gather_uneven(
         MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),

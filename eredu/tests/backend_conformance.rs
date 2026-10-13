@@ -2707,13 +2707,14 @@ fn assert_prepared_generation_and_speculative_conformance() {
 
     let token_config =
         TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
-    let token = model
+    // Canonical token extraction happens before the driver commits output.
+    let failure = model
         .generate_tokens(vec![0; 999], token_config)
         .unwrap()
         .next()
         .unwrap()
-        .unwrap();
-    let failure = token.token_id().unwrap_err();
+        .err()
+        .expect("token extraction must fail before commitment");
     assert!(matches!(
         std::error::Error::source(&failure)
             .unwrap()

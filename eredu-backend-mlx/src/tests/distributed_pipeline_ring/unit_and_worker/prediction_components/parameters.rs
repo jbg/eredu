@@ -638,11 +638,17 @@ fn native_v3_prediction_quantization_reports_auxiliary_work() {
             .clone()
             .with_drafting(eredu_runtime::DraftingLoadRequest::Disabled),
     );
-    let complete = load(options);
+    let complete = load(options.clone());
+    let cached = load(options);
     let target = target.materialization_report().unwrap();
     let complete = complete.materialization_report().unwrap();
     assert!(complete.transformed_weights > target.transformed_weights);
-    assert!(complete.source_bytes_read > target.source_bytes_read);
+    // Source reads count cache misses, while transformed weights and output
+    // bytes describe the complete prepared model even on cache hits.
+    let cached = cached.materialization_report().unwrap();
+    assert_eq!(cached.transformed_weights, complete.transformed_weights);
+    assert_eq!(cached.output_bytes, complete.output_bytes);
+    assert_eq!(cached.source_bytes_read, 0);
     assert!(complete.output_bytes > target.output_bytes);
     assert!(complete.peak_planned_working_set_bytes <= complete.admitted_working_set_bytes);
     assert_eq!(
