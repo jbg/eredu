@@ -43,7 +43,7 @@ impl BlockDecoder {
     /// Exact output length. Truncated blocks and integer overflow reject before
     /// allocation or output mutation.
     pub fn output_len(self, encoded_bytes: usize) -> Result<usize> {
-        if encoded_bytes % self.bytes != 0 {
+        if !encoded_bytes.is_multiple_of(self.bytes) {
             return Err(Error::tensor("<blocks>", "partial encoded block"));
         }
         (encoded_bytes / self.bytes)

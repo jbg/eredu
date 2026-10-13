@@ -345,7 +345,6 @@ fn binding() -> eredu_architectures::qwen4_exp::prepared::PredictionObservationB
                 RoutingScoreStage::RankingScores,
             ],
             dtypes: vec![InterventionDtype::Float32],
-            ..Default::default()
         },
     }
 }

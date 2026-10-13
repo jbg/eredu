@@ -1,8 +1,6 @@
 //! Actual pinned HF transformer outputs using native shared attention caches.
 use super::super::*;
-use eredu_architectures::voicechat::tts_transformer_layered::{
-    CausalTransformerExecution, TransformerExecution,
-};
+use eredu_architectures::voicechat::tts_transformer_layered::CausalTransformerExecution;
 use eredu_architectures::voicechat::{
     config::GemmaConfig,
     tts_transformer::{TransformerConfig, TtsTransformer},

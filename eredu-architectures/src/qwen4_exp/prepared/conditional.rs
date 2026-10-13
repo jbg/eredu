@@ -105,8 +105,11 @@ pub(super) fn joint_requirements<C: eredu_checkpoint::recipe::RecipeCatalog + ?S
     for (name, recipe) in vision_static {
         declared.add(name, recipe, Owner::StaticRole("vision".into()), false)?;
     }
-    for index in 0..vision_config.layer_count() {
-        for (name, recipe) in &vision_blocks[index] {
+    for (index, block) in vision_blocks[..vision_config.layer_count()]
+        .iter()
+        .enumerate()
+    {
+        for (name, recipe) in block {
             declared.add(
                 name,
                 recipe,

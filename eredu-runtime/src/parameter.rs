@@ -1384,6 +1384,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod batch_budget_tests {
     use super::ParameterBatchBudget;
 

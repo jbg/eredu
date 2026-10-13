@@ -489,7 +489,7 @@ impl GgufTextPlan {
                         .ggml_type
                         .block_and_bytes()
                         .map_err(|e| fail(e.to_string()))?;
-                    if config.recurrent.value_dim as u64 % block != 0 {
+                    if !(config.recurrent.value_dim as u64).is_multiple_of(block) {
                         decoded.push(entry.physical.clone());
                     }
                 }

@@ -83,9 +83,9 @@ pub fn validate_component_pipeline<G, A: ArchitectureBoundary>(
             }
         }
     }
-    plan.validate_manifest(&manifest)?;
-    plan.validate_exact_commit_agreement(&manifest)?;
-    if manifest.completion_policy().is_none() || plan.publication_authority(&manifest)?.is_none() {
+    plan.validate_manifest(manifest)?;
+    plan.validate_exact_commit_agreement(manifest)?;
+    if manifest.completion_policy().is_none() || plan.publication_authority(manifest)?.is_none() {
         return Err(Contract(
             "pipeline requires bounded completion and exact output publication",
         ));

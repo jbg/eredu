@@ -2044,6 +2044,7 @@ pub trait TextGenerationBackend: BackendProvider {
 
     /// Submits one declared operation. Progress receives no commitment decision;
     /// selecting operations receive the current controller decision exactly once.
+    #[allow(clippy::type_complexity)]
     fn submit_text_operation(
         runtime: &mut ModelRuntime<Self>,
         input: PendingTextInput<Self::Prompt, Self::Token>,
@@ -2266,6 +2267,7 @@ where
     }
 
     /// Advances one physical operation using the same driver as the token iterator.
+    #[allow(clippy::type_complexity)]
     pub fn advance_operation(
         &mut self,
     ) -> Result<Option<TextAdvancement<B::Token>>, ControlledTextGenerationError<B::Error, C::Error>>
@@ -2531,6 +2533,7 @@ where
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn next_physical_committed(
         &mut self,
         runtime: &mut ModelRuntime<B>,
@@ -2602,6 +2605,7 @@ where
             .map(|result| result.map(ControlledToken::into_output))
     }
 
+    #[allow(clippy::type_complexity)]
     fn next_physical_output(
         &mut self,
         runtime: &mut ModelRuntime<B>,

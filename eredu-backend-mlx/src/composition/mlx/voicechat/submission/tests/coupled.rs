@@ -429,7 +429,7 @@ fn run_with_precision(
             state.model_state().input().neural().rnnt().hypothesis(),
             &[0, 0]
         );
-        for index in 2..6 {
+        for (index, expected) in records.iter().enumerate().take(6).skip(2) {
             let mut branch = state.branch().unwrap();
             let frame = submit(
                 index,
@@ -448,7 +448,7 @@ fn run_with_precision(
             }
             state.commit_branch(branch).unwrap();
             let replay = record(frame.into_host_output().unwrap(), &state, stream);
-            assert_same_record(&records[index], &replay);
+            assert_same_record(expected, &replay);
         }
         let mut child = forked.take().unwrap();
         assert_same_record(
@@ -456,7 +456,7 @@ fn run_with_precision(
             &record(records[1].host.clone(), &child, stream),
         );
         assert_eq!(child.model_state().input().frontend().queued_samples(), 157);
-        for index in 2..6 {
+        for (index, expected) in records.iter().enumerate().take(6).skip(2) {
             let mut branch = child.branch().unwrap();
             let frame = submit(
                 index,
@@ -477,7 +477,7 @@ fn run_with_precision(
             child.commit_branch(branch).unwrap();
             assert!(retained >= child.estimate_isolated_copy().unwrap().retained_bytes);
             let continuation = record(frame.into_host_output().unwrap(), &child, stream);
-            assert_same_record(&records[index], &continuation);
+            assert_same_record(expected, &continuation);
         }
         let consumed_copy_bytes = budget.usage().cumulative_copy_bytes;
         drop(child);

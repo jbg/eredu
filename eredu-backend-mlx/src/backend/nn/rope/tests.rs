@@ -66,8 +66,8 @@ fn fused_input_products_rotary_preserves_strided_pair_layout_tail_and_position_r
                         let row = ((batch * 3 + head) * 4 + token) * 16;
                         let source = ((batch * 4 + token) * 3 + head) * 16;
                         let position = offset as f32 + token as f32;
-                        for pair in 0..6 {
-                            let angle = (position * frequencies[pair]) as f64;
+                        for (pair, frequency) in frequencies.iter().enumerate() {
+                            let angle = (position * frequency) as f64;
                             let cosine = angle.cos() * 1.125;
                             let sine = angle.sin() * 1.125;
                             let left = if traditional { 2 * pair } else { pair };

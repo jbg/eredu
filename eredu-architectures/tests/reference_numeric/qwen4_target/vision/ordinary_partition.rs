@@ -104,7 +104,6 @@ fn run(
             .map(|rank| {
                 let inspection = inspection.clone();
                 let world = Arc::clone(&world);
-                let residency = residency.clone();
                 std::thread::Builder::new()
                     .name(format!("qwen4-media-rank-{rank}"))
                     .stack_size(32 * 1024 * 1024)

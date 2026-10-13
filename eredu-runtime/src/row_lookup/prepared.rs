@@ -772,6 +772,7 @@ mod selection_tests {
         assert!(empty.descriptors().entries().is_empty());
         assert!(empty.decode_memory().is_empty());
         assert!(empty.bind(PreparedRowLookups::default()).is_ok());
+        #[allow(clippy::reversed_empty_ranges)] // Exercise rejection of reversed ranges.
         for range in [3..2, 0..5] {
             assert!(selected.plan().clone().for_units(range, 4).is_err());
         }

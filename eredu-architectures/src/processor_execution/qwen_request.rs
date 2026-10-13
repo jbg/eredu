@@ -38,9 +38,11 @@ impl<'a> Request<'a> {
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
         budget: Option<ProcessorRequestBudget>,
     ) -> Result<Self, ProcessorExecutionError<E, eredu_media::MediaError>> {
-        let mut resources = ProcessorRequestResources::default();
         // Bound planning itself before sampling-index vectors or timestamp callbacks.
-        resources.planning_items = mul(request.segments().len() as u64, 24)?;
+        let mut resources = ProcessorRequestResources {
+            planning_items: mul(request.segments().len() as u64, 24)?,
+            ..Default::default()
+        };
         let mut step_capacity = mul(request.segments().len() as u64, 3)?;
         for segment in request.segments() {
             match segment {
@@ -193,8 +195,8 @@ impl<'a> Request<'a> {
             .filter(|n| *n > 0)
             .ok_or_else(invalid)?;
         if patches.temporal_patch_size == 0
-            || transform.width % factor != 0
-            || transform.height % factor != 0
+            || !transform.width.is_multiple_of(factor)
+            || !transform.height.is_multiple_of(factor)
             || frames == 0
         {
             return Err(invalid());

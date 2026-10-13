@@ -583,7 +583,7 @@ pub fn rnnt_parameter_description(
             },
         )
     };
-    for group in 0..5 {
+    for (group, group_name) in GROUPS.iter().enumerate() {
         let count = if group == 1 { d.predictor_layers } else { 1 };
         for index in 0..count {
             let (name, members) = match group {
@@ -617,7 +617,7 @@ pub fn rnnt_parameter_description(
                         _ => unreachable!(),
                     };
                     (
-                        GROUPS[group].into(),
+                        (*group_name).into(),
                         vec![
                             member(
                                 format!("stt_model.rnnt_joint.{path}.weight"),

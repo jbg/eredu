@@ -125,6 +125,7 @@ fn run(
 ) -> (Vec<NumericTensor>, State) {
     run_with_header(target, residency, chunks, None)
 }
+#[allow(clippy::large_enum_variant)]
 enum ColdHeader {
     Gguf(GgufTargetPlan),
     Safetensors(eredu_architectures::qwen4_exp::prepared::SafetensorsTargetPlan),

@@ -517,7 +517,7 @@ fn transform_target(
         target.source().preflight_bounded(source)?;
         submit_quantization_tile(
             source,
-            &target.source(),
+            target.source(),
             target,
             plan.quantization(),
             tile_contexts,

@@ -37,7 +37,7 @@ impl<'a> ParameterVisitorMut<'a, MlxTensor> for Bind<'_> {
             Dtype::Float32
         };
         *value = MlxTensor::from_array(
-            Array::from_slice(&data, &shape)
+            Array::from_slice(&data, shape)
                 .as_dtype(dtype, self.0)
                 .unwrap(),
         );

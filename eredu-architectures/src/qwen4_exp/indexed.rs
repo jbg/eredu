@@ -131,13 +131,13 @@ impl IndexedSublayerSpec {
             projections,
             query_norm: norm("q_norm", a.head_dim)?,
             key_norm: norm("k_norm", a.head_dim)?,
-            rotary: a.rotary.clone(),
+            rotary: a.rotary,
             indexer: QsaIndexerSpec {
                 selection,
                 query_key: projection("indexer.index_qk_proj", config.hidden_size, index, false)?,
                 query_norm: norm("indexer.q_layernorm", a.index_head_dim)?,
                 key_norm: norm("indexer.k_layernorm", a.index_head_dim)?,
-                rotary: a.rotary.clone(),
+                rotary: a.rotary,
             },
             state: QsaStreamStateSpec::new(
                 selection,

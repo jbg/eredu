@@ -181,8 +181,8 @@ where
             let mut words = vec![slot as u64, top_p.to_bits(), self.latent as u64];
             words.extend(shape.iter().map(|n| *n as u64));
             let agreement = coordination.agree(102, &words, prepared.is_ok(), self.context);
-            if prepared.is_err() {
-                return Err(prepared.unwrap_err());
+            if let Err(error) = prepared {
+                return Err(error);
             }
             agreement?;
         }

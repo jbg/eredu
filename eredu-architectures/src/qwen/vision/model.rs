@@ -1000,7 +1000,7 @@ fn rotary_embeddings<T: Tensor>(
     let spec = config.rotary_spec()?;
     let patches =
         validate_patch_grid(grid, config.spatial_merge_size, None).map_err(Error::backend)?;
-    let rows = i32::try_from(patches).map_err(Error::backend)?;
+    let rows = patches;
     let positions = patch_positions(grid, PatchTraversal::MergeMajor(config.spatial_merge_size))
         .map_err(Error::backend)?
         .into_iter()

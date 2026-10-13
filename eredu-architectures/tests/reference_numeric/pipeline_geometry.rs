@@ -179,9 +179,9 @@ impl LayeredArchitecture<NumericBackend, State> for Geometry {
     fn build_unit(&self, _: usize, _: usize, _: &NumericContext) -> Result<Empty, Error> {
         Ok(Empty)
     }
-    fn begin_forward<'a>(
+    fn begin_forward(
         &mut self,
-        input: &'a NumericTensor,
+        input: &NumericTensor,
         _: &mut State,
         _: &NumericContext,
     ) -> Result<LayeredForwardState<NumericTensor, Self::ForwardContext>, Error> {
@@ -276,9 +276,9 @@ impl LayeredArchitecture<NumericBackend, State> for Geometry {
     }
 }
 impl ParallelLayeredArchitecture<NumericBackend, State> for Geometry {
-    fn begin_forward_parallel<'a>(
+    fn begin_forward_parallel(
         &mut self,
-        input: &'a NumericTensor,
+        input: &NumericTensor,
         state: &mut State,
         _: &NumericParallelContext,
         context: &NumericContext,
@@ -372,9 +372,9 @@ impl PipelinePartitionArchitecture<NumericBackend, State> for Geometry {
         }
         Ok((input.dim(0), input.dim(1)))
     }
-    fn begin_pipeline_partition<'a, O>(
+    fn begin_pipeline_partition<O>(
         &mut self,
-        input: &'a NumericTensor,
+        input: &NumericTensor,
         incoming: Option<(NumericTensor, NumericTensor)>,
         state: &mut State,
         _: Option<&StateLayout>,

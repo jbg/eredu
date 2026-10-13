@@ -323,7 +323,6 @@ fn run(
             .map(|rank| {
                 let inspection = inspection.clone();
                 let world = world.clone();
-                let residency = residency.clone();
                 std::thread::Builder::new()
                     .name(format!("qwen4-mtp-partition-{rank}"))
                     .stack_size(32 * 1024 * 1024)
@@ -334,7 +333,7 @@ fn run(
                             topology.expert(),
                             rank,
                         )
-                        .with_weight_residency(WeightResidency::with_layers(residency.clone()))
+                        .with_weight_residency(WeightResidency::with_layers(residency))
                         .with_drafting(DraftingLoadRequest::embedded(1).unwrap());
                         if let Some(path) = companion {
                             request = request.with_prediction_source(path.to_path_buf());
@@ -379,7 +378,7 @@ fn run(
                             Binding {
                                 context: context.clone(),
                                 world: communication.world,
-                                residency: residency.clone(),
+                                residency,
                                 selected: prediction_selected.clone(),
                             }
                         };

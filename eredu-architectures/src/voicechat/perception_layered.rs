@@ -525,7 +525,7 @@ pub(super) fn perception_local_dimensions(
     let range = query.expanded_logical_range(heads)?;
     let local_heads = range.len();
     if local_heads == 0
-        || heads % local_heads != 0
+        || !heads.is_multiple_of(local_heads)
         || range.start % local_heads != 0
         || range.end > heads
     {

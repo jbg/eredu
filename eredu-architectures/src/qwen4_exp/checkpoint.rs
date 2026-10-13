@@ -145,7 +145,7 @@ pub(in crate::qwen4_exp) fn table_row_range(
 ) -> Result<eredu_core::residency::OffloadUnitRange, NGramArtifactError> {
     use eredu_core::residency::{OffloadUnitId, OffloadUnitRange};
     lookup.validate()?;
-    if metadata.byte_len % lookup.rows != 0 {
+    if !metadata.byte_len.is_multiple_of(lookup.rows) {
         return Err(invalid("table bytes do not describe a uniform row range"));
     }
     let prefix = OffloadUnitId::new(format!(

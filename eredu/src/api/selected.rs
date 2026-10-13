@@ -663,6 +663,7 @@ pub fn benchmark_local_expert_cache(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{validate_expert_cache_benchmark_prompt, ExpertCacheBenchmarkError};
 

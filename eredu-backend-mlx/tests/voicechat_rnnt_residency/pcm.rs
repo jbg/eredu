@@ -224,6 +224,7 @@ fn snapshot(state: &State, stream: &Stream) -> State {
     copy
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exercise(
     predictor: PreparedRnntPredictorPipelineBindings,
     predictor_residency: LayerWeightResidency,

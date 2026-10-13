@@ -83,7 +83,7 @@ impl Text {
                         .char_indices()
                         .filter(|&(i, c)| i > 0 && c.is_whitespace())
                         .map(|(i, _)| i)
-                        .last()
+                        .next_back()
                         .unwrap_or(end),
                 )
             });

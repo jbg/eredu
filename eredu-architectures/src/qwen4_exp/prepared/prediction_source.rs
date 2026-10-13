@@ -186,7 +186,7 @@ impl SafetensorsPredictionPlan {
             |depth| {
                 expert_spec(
                     &self.config,
-                    &formats,
+                    formats,
                     &format!("mtp.layers.{depth}.mlp.experts"),
                 )
             },

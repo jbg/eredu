@@ -323,7 +323,7 @@ fn mlx_explicit_projection_precision_rounds_input_and_restores_f32_output() {
         (
             eredu_nn::TensorElementType::F16,
             Dtype::Float16,
-            vec![1.0, -2.00390625],
+            vec![1.0, -2.003_906_3],
         ),
         (
             eredu_nn::TensorElementType::Bf16,

@@ -397,7 +397,7 @@ pub(crate) fn run<B: TextGenerationBackend>(
     let finish_started = Instant::now();
     session.cancel(&mut collect)?;
     drop(session);
-    drop(collect);
+
     ensure!(
         iteration == request.steps,
         "refinement ended before the requested readout"

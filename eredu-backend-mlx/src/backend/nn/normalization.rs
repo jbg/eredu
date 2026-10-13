@@ -272,10 +272,10 @@ mod tests {
             let values = (0..3 * width)
                 .map(|i| {
                     let signed = ((i * 37 % 103) as f32 - 51.0) / 13.0;
-                    signed * 2.0_f32.powi((i % 19) as i32 - 9)
+                    signed * 2.0_f32.powi((i % 19) - 9)
                 })
                 .collect::<Vec<_>>();
-            let input = Array::from_slice(&values, &[3, width as i32]);
+            let input = Array::from_slice(&values, &[3, width]);
             let expected = input
                 .sum_axes(&[-1], true, &cpu)
                 .unwrap()
@@ -292,7 +292,7 @@ mod tests {
                 false,
             ).unwrap();
             let config = CustomKernelConfig::new()
-                .with_template_arg_int("WIDTH", width as i32)
+                .with_template_arg_int("WIDTH", width)
                 .with_grid([3 * 32, 1, 1])
                 .with_thread_group([32, 1, 1])
                 .with_output_arg([3, 1], Dtype::Float32);

@@ -28,13 +28,9 @@ fn exercise_native(device: DeviceType) {
     let stream = Stream::new_with_device(&Device::new(device, 0));
     // Dyadic values survive every source cast exactly; the independent oracle
     // therefore isolates promotion/segmentation from input quantization error.
-    let q: Vec<f32> = (0..40).map(|i| (i as i32 % 11 - 5) as f32 / 8.).collect();
-    let k: Vec<f32> = (0..40)
-        .map(|i| ((i * 7) as i32 % 13 - 6) as f32 / 8.)
-        .collect();
-    let v: Vec<f32> = (0..30)
-        .map(|i| ((i * 3) as i32 % 17 - 8) as f32 / 4.)
-        .collect();
+    let q: Vec<f32> = (0..40).map(|i| (i % 11 - 5) as f32 / 8.).collect();
+    let k: Vec<f32> = (0..40).map(|i| ((i * 7) % 13 - 6) as f32 / 8.).collect();
+    let v: Vec<f32> = (0..30).map(|i| ((i * 3) % 17 - 8) as f32 / 4.).collect();
     let segments = [2, 1, 2];
     let expected = reference_segmented_attention(5, 2, 4, 3, &q, &k, &v, &segments, 0.5).unwrap();
     for types in [

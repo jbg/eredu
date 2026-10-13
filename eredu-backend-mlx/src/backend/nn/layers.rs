@@ -124,7 +124,7 @@ pub fn gelu_approximate(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> Mlx
     // Match the FP32 vector tanh saturation used by the tensor GELU reference.
     // The tail differs by at most one tanh ULP but cancellation in 1+tanh
     // makes that rounding visible even after a reduced-precision output cast.
-    let saturation = array!(8.664339742f32);
+    let saturation = array!(8.664_34_f32);
     let hyperbolic = r#where(
         inner.gt(&saturation, stream)?,
         array!(1.0f32),

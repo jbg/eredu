@@ -119,7 +119,7 @@ pub(super) fn normalize(
                 (Some(architecture), None, None) => safetensors_parameters(
                     architecture,
                     inspection.tensors(),
-                    &config,
+                    config,
                     recipe_source.as_ref(),
                 )?,
                 (None, Some(architecture), Some(checkpoint)) => {
@@ -152,7 +152,7 @@ pub(super) fn normalize(
                         primary_mapping,
                         &metadata_sources,
                         checkpoint,
-                        &config,
+                        config,
                         recipe_source.as_ref(),
                     )?;
                     if let Some(projector_plan) = plan.gguf_media_projector() {
@@ -173,7 +173,7 @@ pub(super) fn normalize(
                                 projector_plan.tensor_mapping(),
                                 &BTreeSet::new(),
                                 companion.checkpoint(),
-                                &config,
+                                config,
                                 recipe_source.as_ref(),
                             )?
                             .into_iter()

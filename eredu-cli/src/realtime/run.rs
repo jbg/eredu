@@ -684,6 +684,7 @@ mod tests {
     };
     use std::collections::VecDeque;
 
+    #[derive(Default)]
     struct Fixture {
         input: VecDeque<f32>,
         accepted: u64,
@@ -708,36 +709,6 @@ mod tests {
         waits: Vec<(VoiceChatToolTicket, Duration)>,
         responses: Vec<(VoiceChatToolTicket, String)>,
         cancellations: Vec<Duration>,
-    }
-
-    impl Default for Fixture {
-        fn default() -> Self {
-            Self {
-                input: VecDeque::new(),
-                accepted: 0,
-                consumed: Vec::new(),
-                finish: None,
-                frames: 0,
-                continuation: 0,
-                progress: Progress::default(),
-                prefilled: false,
-                tool_steps: 0,
-                tool_active: false,
-                response_ready: false,
-                response_steps: 0,
-                invocations: 0,
-                staged: None,
-                delivered: None,
-                polled: false,
-                times: Vec::new(),
-                batch: None,
-                interrupt: false,
-                stale_ticket: None,
-                waits: Vec::new(),
-                responses: Vec::new(),
-                cancellations: Vec::new(),
-            }
-        }
     }
 
     impl Session for Fixture {

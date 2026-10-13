@@ -76,7 +76,7 @@ impl RowLookupSpec {
             let Ok((block, _)) = encoding.block_and_bytes() else {
                 return Err(RowLookupError::Geometry);
             };
-            if self.dimensions as u64 % block != 0 {
+            if !(self.dimensions as u64).is_multiple_of(block) {
                 return Err(RowLookupError::Geometry);
             }
         }

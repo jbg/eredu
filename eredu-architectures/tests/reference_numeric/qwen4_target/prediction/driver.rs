@@ -249,56 +249,56 @@ impl SpeculativeTensorMechanisms for Mechanisms {
     fn sequence_len(value: &NumericTensor) -> Result<usize, Error> {
         Ok(value.shape[1] as usize)
     }
-    fn logits_row<'a>(
+    fn logits_row(
         value: &NumericTensor,
         row: usize,
-        ctx: &'a NumericContext,
+        ctx: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Self::tensor_row(value, row, ctx)
     }
-    fn tensor_row<'a>(
+    fn tensor_row(
         value: &NumericTensor,
         row: usize,
-        _: &'a NumericContext,
+        _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Ok(value.axis_slice(1, row, row + 1))
     }
-    fn tensor_prefix<'a>(
+    fn tensor_prefix(
         value: &NumericTensor,
         end: usize,
-        _: &'a NumericContext,
+        _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Ok(value.axis_slice(1, 0, end))
     }
-    fn token_range<'a>(
+    fn token_range(
         value: &NumericTensor,
         start: usize,
         end: usize,
-        _: &'a NumericContext,
+        _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Ok(value.axis_slice(1, start, end))
     }
-    fn token_prefix<'a>(
+    fn token_prefix(
         value: &NumericTensor,
         end: usize,
-        ctx: &'a NumericContext,
+        ctx: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Self::tensor_prefix(value, end, ctx)
     }
-    fn target_tokens<'a>(tokens: &[u32], _: &'a NumericContext) -> Result<NumericTensor, Error> {
+    fn target_tokens(tokens: &[u32], _: &NumericContext) -> Result<NumericTensor, Error> {
         Ok(tokens_tensor(tokens))
     }
-    fn fused_logits_row<'a>(
+    fn fused_logits_row(
         value: &NumericTensor,
         row: usize,
-        ctx: &'a NumericContext,
+        ctx: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         Self::logits_row(value, row, ctx)
     }
-    fn submit_verification_completion<'a>(
+    fn submit_verification_completion(
         _: &EmbeddedPredictionOutput<NumericTensor>,
         _: &NumericTensor,
-        _: &'a NumericContext,
+        _: &NumericContext,
     ) -> Result<NumericCompletion, Error> {
         Ok(NumericCompletion::immediate())
     }
@@ -488,7 +488,7 @@ pub(super) fn check(
         }
         let (logits, state, _) = executor
             .prefill(
-                Input::new(&prompt).with_chunk_tokens(accepted as usize + 1),
+                Input::new(&prompt).with_chunk_tokens(accepted + 1),
                 &mut cache,
                 ctx,
             )
@@ -710,7 +710,7 @@ fn scheduler_check(
                 if *reject {
                     assert!(accepts.iter().all(|n| *n == 0));
                 } else {
-                    assert!(accepts.iter().any(|n| *n == 2));
+                    assert!(accepts.contains(&2));
                 }
             }
             if let Some((target, prediction, previous_accepts)) = &previous {

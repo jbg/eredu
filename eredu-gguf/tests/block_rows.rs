@@ -16,7 +16,9 @@ fn half(value: f32, endian: Endian) -> [u8; 2] {
 fn block_decoding_matches_hash_pinned_upstream_c_f32_bits() {
     let hex = |text: &str| {
         text.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect::<Vec<_>>()
     };
@@ -136,8 +138,8 @@ fn scalar_rows_match_independent_codes_without_half_rounded_affine_intermediates
                 }
                 data[108..].copy_from_slice(&half(0.375, endian));
             } else {
-                for g in 0..16 {
-                    data[g] = ((15 - g) << 4 | g) as u8;
+                for (g, value) in data.iter_mut().take(16).enumerate() {
+                    *value = ((15 - g) << 4 | g) as u8;
                 }
                 data[16..80].fill(0b11100100);
                 data[80..82].copy_from_slice(&half(0.375, endian));

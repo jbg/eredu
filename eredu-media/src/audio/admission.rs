@@ -52,7 +52,7 @@ impl SpeechAdmission {
     pub fn new(rate: u32, config: SpeechAdmissionConfig) -> Result<Self, MediaError> {
         if rate == 0
             || rate > 384_000
-            || rate % 100 != 0
+            || !rate.is_multiple_of(100)
             || !config.threshold_dbfs.is_finite()
             || !(-100.0..=0.0).contains(&config.threshold_dbfs)
             || !config.hysteresis_db.is_finite()

@@ -120,7 +120,7 @@ pub fn execution_plan_layer_residency(
             .with_max_cached_shards(max_cached_shards)
             .with_memory_sampling(diagnostics.backend_memory, diagnostics.process_memory),
         )),
-        _ => return Err(ExecutionPlanLoadError::Unsupported("residency")),
+        _ => Err(ExecutionPlanLoadError::Unsupported("residency")),
     }
 }
 

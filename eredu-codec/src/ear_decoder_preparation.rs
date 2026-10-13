@@ -338,6 +338,7 @@ impl PreparedDecoderPartitionBindings {
         &self.units
     }
     /// Consumes the retained stage selection without reopening artifacts.
+    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (

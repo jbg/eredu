@@ -77,7 +77,9 @@ pub fn write_vision_projector(path: &std::path::Path, depth: usize) {
         if name == "v.patch_embd.weight" {
             for t in 0..2 {
                 let bytes = data
-                    .chunks_exact(32)
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
                     .flat_map(|pair| pair[t * 16..t * 16 + 16].iter().copied())
                     .collect();
                 tensors.push((

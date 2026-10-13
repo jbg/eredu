@@ -262,6 +262,7 @@ fn original_ids_and_rotary_survive_projection_wire_roundtrip_and_arbitrary_slice
         assert_tensor_exact(span.token_ids(), expected.token_ids(), "span original IDs");
         assert_eq!(span.rotary_delta(), -2);
     }
+    #[allow(clippy::reversed_empty_ranges)] // Exercise rejection of reversed ranges.
     for range in [-1..2, 0..0, 1..19, 5..3] {
         assert!(matches!(
             prepared.assemble(

@@ -522,7 +522,7 @@ fn run_joint(target: &PreparedTarget, ingress: &MediaIngress) {
         .admit(&prompt_input, &inspector)
         .and_then(|admitted| admitted.prepare(&ctx))
         .unwrap();
-    let expected = reference(&target, &ingress, &prepared, &ctx);
+    let expected = reference(target, ingress, &prepared, &ctx);
     for residency in [
         LayerWeightResidency::FullyResident,
         LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
@@ -543,7 +543,7 @@ fn run_joint(target: &PreparedTarget, ingress: &MediaIngress) {
             .source_diagnostics()
             .unwrap()
             .physical_reads;
-        let bound_plan = gguf::plan(&target)
+        let bound_plan = gguf::plan(target)
             .with_vision(ingress.vision().clone())
             .unwrap();
         let plan = cold_joint(target, ingress, residency);
@@ -880,7 +880,7 @@ fn conditional_history_rejection_precedes_request_tensors_and_media_embeddings()
     let inspector = Inspector(0.into());
     let source = input(
         vec![
-            text(&vec![3; 30]),
+            text(&[3; 30]),
             PreparedInputPart::new(
                 M::Image,
                 P::Tensor(pixels(16)),

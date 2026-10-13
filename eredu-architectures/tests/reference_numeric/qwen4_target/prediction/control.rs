@@ -105,7 +105,7 @@ fn run_result(
     let output = output.map_err(|_| failure.take().expect("driver retains typed failure"))?;
     assert!(failure.is_none());
     drop(executor);
-    drop(strategy);
+
     let row_completions = session
         .execution_strategy()
         .provider()

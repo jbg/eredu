@@ -255,7 +255,7 @@ pub(in crate::qwen4_exp) fn controls(
         .ok_or_else(|| invalid("invalid bounded n-gram head count"))? as usize;
     if config.vocabulary <= 0
         || config.ngram.embedding_dim <= 0
-        || config.ngram.embedding_dim as usize % heads != 0
+        || !(config.ngram.embedding_dim as usize).is_multiple_of(heads)
         || !config.ngram.layers.contains(&layer)
     {
         return Err(invalid("invalid configured GGUF table geometry"));
