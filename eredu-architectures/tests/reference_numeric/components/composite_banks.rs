@@ -177,7 +177,7 @@ fn composite_independent_banks_preserve_media_writes_and_cached_decode() {
                                     &provider_local,
                                 );
                                 let world = world.clone();
-                                scope.spawn(move || {
+                                spawn_reference_worker(scope, move || {
                                     let sources = partitioned_adapter::prepare_plan_with_banks(
                                         inspection,
                                         plan,

@@ -366,7 +366,7 @@ fn run_placements(
                     let workers=(0..topology.world_size()).map(|rank| {
                             let (inspection,parameters,inputs,plan,descriptor)=(&inspection,&parameters,&inputs,&plan,&descriptor);
                             let world=world.clone();
-                            scope.spawn(move || {
+                            spawn_reference_worker(scope, move || {
                                 let sources=partitioned_adapter::prepare_plan_with_banks_and_sequence_maximum(inspection,plan,rank,std::time::Duration::from_secs(30),
                                     independent.then(||ParameterBankLoadOptions::new(eredu_core::residency::OffloadConfig::new(Some(bank_budget),Some(1<<20),1).unwrap(),bank_budget,bank_budget).unwrap()),maximum_sequence).unwrap();
                                 let component_layout=sources.selected().execution().component_partition_layout(descriptor,parameters).unwrap().unwrap();
@@ -772,7 +772,7 @@ fn gemma4_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 let (inspection, plan, args, parameters) =
                                     (&inspection, &plan, &args, &parameters);
                                 let world = world.clone();
-                                scope.spawn(move || {
+                                spawn_reference_worker(scope, move || {
                                     let sources = partitioned_adapter::prepare_plan(
                                         inspection,
                                         plan,

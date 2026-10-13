@@ -364,7 +364,7 @@ fn conditional_qwen_components_reconstruct_media_and_deepstack_writes_serial_and
                         let descriptor = &descriptor;
                         let layout = numeric_local_layout(&groups, 2, rank).unwrap();
                         let world = Arc::clone(&world);
-                        scope.spawn(move || {
+                        spawn_reference_worker(scope, move || {
                             let parallel = NumericParallelContext::new(rank, world);
                             let result = trial(
                                 parsed,
@@ -541,7 +541,7 @@ fn prepared_conditional_components_with_tying(independent: bool, tied: bool) {
                             let expected = &expected;
                             let residency = residency.clone();
                             let world = Arc::clone(&world);
-                            scope.spawn(move || {
+                            spawn_reference_worker(scope, move || {
                                 let plan = prepared_adapter::plan(None)
                                     .with_topology(topology)
                                     .with_residency(residency);
