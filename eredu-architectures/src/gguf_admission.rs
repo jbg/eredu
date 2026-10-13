@@ -265,7 +265,7 @@ fn resolve_family(
             let plan = crate::llama::gguf_plan(args.dense_config())?;
             Ok((GgufModelConfig::Nanbeige(args), plan, None))
         }
-        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+        GgufArchitecture::Llama | GgufArchitecture::Mistral | GgufArchitecture::Phi3 => {
             let args = crate::llama::model_args_from_gguf_catalog(checkpoint, &metadata)
                 .map_err(|error| error.to_string())?;
             if args.num_hidden_layers as usize > checkpoint.physical_tensor_count() {

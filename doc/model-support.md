@@ -58,6 +58,7 @@ projector.
 | Family | Inputs | SafeTensors | GGUF | Notable support |
 | --- | --- | :---: | :---: | --- |
 | Llama / Mistral | text | yes | yes | full or sliding attention, tied or untied head |
+| Phi-4 (original 14B) | text | `phi3` | `phi3` | fused QKV and gate/up projections, full-head RoPE; [validation](phi4-validation.md) |
 | Nanbeige 4.2 | text | yes | `nanbeige` | shared-weight repeated GQA/SwiGLU stack; independent KV caches for each pass |
 | Qwen2 / Qwen2.5 | text | yes | `qwen2` | dense text models; exact full/sliding schedules |
 | Qwen3 | text | yes | `qwen3`, `qwen3moe` | dense and MoE |

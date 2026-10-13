@@ -1,4 +1,4 @@
-//! Backend-neutral Llama/Mistral decoder implementation.
+//! Backend-neutral Llama/Mistral/Phi-4 decoder implementation.
 
 mod checkpoint;
 mod config;
@@ -58,6 +58,10 @@ pub fn local_block_args(
     layer: usize,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<ModelArgs, ParallelPlanError> {
+    if args.model_type == "phi3" {
+        return crate::decoder::PartitionedConfig::local_block_config(args, layer, layout)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()));
+    }
     let prefix = format!("model.layers.{layer}");
     let tensor = |suffix: &str| {
         layout

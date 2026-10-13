@@ -626,6 +626,16 @@ fn tiny_heterogeneous_gguf_with_packed_qwen_next(
     )
 }
 
+fn phi4_config() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "phi3", "hidden_size": 8, "num_hidden_layers": 4,
+        "intermediate_size": 12, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "vocab_size": 16,
+        "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
+        "rope_theta": 250000.0, "tie_word_embeddings": false
+    })
+}
+
 fn lfm2_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "lfm2", "vocab_size": 64, "hidden_size": 16,

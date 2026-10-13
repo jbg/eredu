@@ -8,6 +8,7 @@ fn heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency(
         .unwrap()
         .with_full_attention(true);
     for (name, config) in [
+        ("phi4", phi4_config()),
         ("lfm2", lfm2_config()),
         ("kimi_linear", kimi_linear_config()),
         ("nemotron_h", nemotron_h_config()),
@@ -403,7 +404,7 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
     );
     host = host.with_max_cached_shards(3);
     let disk = eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 30, 2 << 30, 5, 4).unwrap();
-    for (model_type, residency) in ["llama", "qwen2"].into_iter().flat_map(|family| {
+    for (model_type, residency) in ["llama", "qwen2", "phi3"].into_iter().flat_map(|family| {
         [
             eredu_runtime::WeightResidency::fully_resident(),
             eredu_runtime::WeightResidency::layerwise_host(host),
@@ -412,7 +413,11 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
         .into_iter()
         .map(move |residency| (family, residency))
     }) {
-        let root = tiny_artifact(model_type, false);
+        let root = if model_type == "phi3" {
+            tiny_heterogeneous_artifact(phi4_config())
+        } else {
+            tiny_artifact(model_type, false)
+        };
         let paged = PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
             .unwrap()
             .with_full_attention(true);
