@@ -430,14 +430,12 @@ pub fn assistant_safetensors_plan(
     let canonical_names = common
         .iter()
         .filter_map(|tensor| {
-            tensor
-                .aliases
-                .first()
+            super::checkpoint::neutral_alias(tensor)
                 .map(|canonical| (tensor.key.clone(), canonical.clone()))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     for tensor in &mut common {
-        if let Some(canonical) = tensor.aliases.first().cloned() {
+        if let Some(canonical) = super::checkpoint::neutral_alias(tensor).cloned() {
             tensor.key = canonical;
         }
         if let Some(companion) = &mut tensor.linear_companion {
@@ -991,6 +989,30 @@ mod tests {
         let transformed = config.load_time_quantization(checkpoint_format).unwrap();
         assert_eq!(transformed.quantization, Some(checkpoint_format));
         assert!(transformed.text_config.quantized_weight_configs.is_none());
+    }
+
+    #[test]
+    fn safetensors_assistant_keeps_canonical_bindings_after_alias_sorting() {
+        let config = AssistantConfig::from_json(CONFIG.as_bytes())
+            .unwrap()
+            .load_time_quantization(eredu_checkpoint::WeightQuantization::Affine(
+                eredu_checkpoint::AffineQuantization::new(32, 4).unwrap(),
+            ))
+            .unwrap();
+        let plan = assistant_safetensors_plan(&config).unwrap();
+        assert!(plan
+            .common_tensors
+            .iter()
+            .any(|tensor| tensor.key == "model.norm.weight"));
+        let scales = plan
+            .common_tensors
+            .iter()
+            .find(|tensor| tensor.key == "model.layers.0.self_attn.q_proj.scales")
+            .unwrap();
+        assert_eq!(
+            scales.linear_companion.as_ref().unwrap().primary,
+            "model.layers.0.self_attn.q_proj.weight"
+        );
     }
 
     #[test]

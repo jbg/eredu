@@ -1136,9 +1136,16 @@ struct Gemma4ModelSource {
     eoi_token_id: Option<u32>,
     boa_token_id: Option<u32>,
     eoa_token_id: Option<u32>,
+    // Some released and converted configurations spell the closing audio
+    // placeholder `eoa_token_index`, with or without the `_id` spelling
+    // beside it; a `serde` alias cannot be used because both may be present.
+    #[serde(default)]
+    boa_token_index: Option<u32>,
+    #[serde(default)]
+    eoa_token_index: Option<u32>,
     #[serde(default = "default_gemma_soft_tokens")]
     vision_soft_tokens_per_image: usize,
-    vision_config: Option<Gemma4VisionSource>,
+    vision_config: Option<serde_json::Value>,
     audio_config: Option<serde_json::Value>,
 }
 
@@ -1289,6 +1296,12 @@ impl Gemma4ProcessorPlan {
         video: Option<&[u8]>,
     ) -> Result<Option<Self>, ProcessorPlanError> {
         let model: Gemma4ModelSource = serde_json::from_slice(model)?;
+        let vision_source = model
+            .vision_config
+            .as_ref()
+            .filter(|value| !crate::gemma4::family::is_media_config_stub(value))
+            .map(|value| serde_json::from_value::<Gemma4VisionSource>(value.clone()))
+            .transpose()?;
         let image_source: Gemma4ImageProcessorSource = image
             .map(serde_json::from_slice)
             .transpose()?
@@ -1297,19 +1310,16 @@ impl Gemma4ProcessorPlan {
             .map(serde_json::from_slice)
             .transpose()?
             .unwrap_or_default();
-        let image_policy = model
-            .vision_config
-            .as_ref()
-            .map(|vision| Gemma4VisualPolicy {
-                patch_size: image_source.patch_size.unwrap_or(vision.patch_size),
-                pooling_kernel_size: image_source
-                    .pooling_kernel_size
-                    .unwrap_or(vision.pooling_kernel_size),
-                max_soft_tokens: image_source
-                    .max_soft_tokens
-                    .unwrap_or(model.vision_soft_tokens_per_image),
-            });
-        let video_policy = model.vision_config.as_ref().map(|_| {
+        let image_policy = vision_source.as_ref().map(|vision| Gemma4VisualPolicy {
+            patch_size: image_source.patch_size.unwrap_or(vision.patch_size),
+            pooling_kernel_size: image_source
+                .pooling_kernel_size
+                .unwrap_or(vision.pooling_kernel_size),
+            max_soft_tokens: image_source
+                .max_soft_tokens
+                .unwrap_or(model.vision_soft_tokens_per_image),
+        });
+        let video_policy = vision_source.as_ref().map(|_| {
             (
                 Gemma4VisualPolicy {
                     patch_size: video_source.patch_size,
@@ -1328,11 +1338,14 @@ impl Gemma4ProcessorPlan {
                 "Gemma 4 visual",
             )?,
             audio_framing: optional_framing(
-                model.boa_token_id,
-                model.eoa_token_id,
+                model.boa_token_id.or(model.boa_token_index),
+                model.eoa_token_id.or(model.eoa_token_index),
                 "Gemma 4 audio",
             )?,
-            has_audio: model.audio_config.is_some(),
+            has_audio: model
+                .audio_config
+                .as_ref()
+                .is_some_and(|value| !crate::gemma4::family::is_media_config_stub(value)),
         };
         plan.validate()?;
         if plan.image.is_none() && !plan.has_audio {
@@ -2746,6 +2759,29 @@ mod tests {
         assert_eq!(image.transform.mean, [0.1, 0.2, 0.3]);
         assert_eq!(image.patches.patch_size, 2);
         assert_eq!(image.patches.merge_size, 2);
+    }
+
+    #[test]
+    fn gemma_audio_framing_accepts_index_fallback_and_prefers_id() {
+        let model = br#"{
+            "boa_token_index":7,"eoa_token_index":8,
+            "audio_config":{"num_hidden_layers":1}
+        }"#;
+        let plan = Gemma4ProcessorPlan::from_hf_json(model, None, None)
+            .unwrap()
+            .unwrap();
+        let framing = plan.audio().unwrap().framing;
+        assert_eq!((framing.start_token_id, framing.end_token_id), (7, 8));
+        let model = br#"{
+            "boa_token_id":9,"eoa_token_id":10,
+            "boa_token_index":7,"eoa_token_index":8,
+            "audio_config":{"num_hidden_layers":1}
+        }"#;
+        let plan = Gemma4ProcessorPlan::from_hf_json(model, None, None)
+            .unwrap()
+            .unwrap();
+        let framing = plan.audio().unwrap().framing;
+        assert_eq!((framing.start_token_id, framing.end_token_id), (9, 10));
     }
 
     #[test]
