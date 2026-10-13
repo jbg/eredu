@@ -367,7 +367,7 @@ fn prepared_tp2_encoded_gguf_reads_only_owned_projection_rows() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("encoded.gguf");
     let mut fixture = eredu_evaluation::qwen4_exp::Fixture::new();
-    let line = include_str!("../../../../eredu-gguf/tests/fixtures/scalar-block-rows.txt")
+    let line = eredu_evaluation::gguf::SCALAR_BLOCK_ROWS_REFERENCE
         .lines()
         .find(|line| line.starts_with("8|"))
         .unwrap();

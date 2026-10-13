@@ -10062,7 +10062,9 @@ redundant chunk products/encoder continuations. Inspection promises neither summ
 peak nor admission authority.
 
 Reusable miniature artifacts and comparison fixtures belong to `eredu-evaluation` as development
-dependencies. Production architectures, facade and backends do not depend on evaluation. Native
+dependencies. Codec and architecture tests import packaged fixture constants rather than
+reading sibling workspace paths, so archive validation exercises the same references.
+Production architectures, facade and backends do not depend on evaluation. Native
 conformance uses ordinary selected constructors and erased executables. Numerical, distributed
 and released-artifact verification scope is recorded in the family validation report.
 

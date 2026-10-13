@@ -165,7 +165,7 @@ fn quantized_head_crossing_decodes_one_matrix_and_reorders_exact_upstream_values
             .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
             .collect::<Vec<_>>()
     };
-    let line = include_str!("../../../eredu-gguf/tests/fixtures/scalar-block-rows.txt")
+    let line = eredu_evaluation::gguf::SCALAR_BLOCK_ROWS_REFERENCE
         .lines()
         .find(|l| l.starts_with("12|"))
         .unwrap();

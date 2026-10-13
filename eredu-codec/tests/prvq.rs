@@ -10,9 +10,8 @@ use support::numeric_backend::{activate, Context, FailAt, NumericTensor, Referen
 
 // The validation crate owns this independent artifact. Including its bytes
 // avoids making a codec development dependency cycle through evaluation.
-const REFERENCE: &str = include_str!("../../eredu-evaluation/fixtures/voicechat/prvq-nvidia.json");
-const MOG_REFERENCE: &str =
-    include_str!("../../eredu-evaluation/fixtures/voicechat/mog-nvidia.json");
+const REFERENCE: &str = eredu_evaluation::voicechat::PRVQ_REFERENCE_JSON;
+const MOG_REFERENCE: &str = eredu_evaluation::voicechat::MOG_REFERENCE_JSON;
 
 fn tensor(value: &Value) -> NumericTensor {
     let shape = value["shape"]

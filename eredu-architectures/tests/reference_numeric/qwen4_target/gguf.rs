@@ -19,7 +19,7 @@ pub(super) fn fixtures(quantized: bool) -> (tempfile::TempDir, PreparedTarget, P
                 .map(|v| u8::from_str_radix(std::str::from_utf8(v).unwrap(), 16).unwrap())
                 .collect::<Vec<_>>()
         };
-        let fixture = include_str!("../../../../eredu-gguf/tests/fixtures/scalar-block-rows.txt")
+        let fixture = eredu_evaluation::gguf::SCALAR_BLOCK_ROWS_REFERENCE
             .lines()
             .find(|l| l.starts_with("12|"))
             .unwrap();

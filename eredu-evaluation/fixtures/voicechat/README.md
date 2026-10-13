@@ -1,5 +1,10 @@
 # VoiceChat component references
 
+`official-inference-config.json` retains inference fields from NVIDIA revision
+`443794ea956ef0065f001967ffd00e77f519cb39`, with defaults from the pinned NeMo
+reference `097dfe9e2f55baf653b83035868bdc89849f1b47`. This packaged snapshot is
+shared by native component tests through `voicechat::OFFICIAL_CONFIG_JSON`.
+
 ## RNNT transcript presentation
 
 `transcription-nvidia.json` executes the original `_rnnt_decode_text` method from

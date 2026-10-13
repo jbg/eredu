@@ -251,10 +251,8 @@ fn native_backbone_residency_preserves_prefill_cached_dual_logits_and_hybrid_sta
         Err(BackbonePreparationError::Catalog(_))
     ));
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
-    let config = VoiceChatConfig::from_json(include_str!(
-        "../../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    ))
-    .unwrap();
+    let config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     let fusion = ChannelFusion::from_config(&config.channels).unwrap();
     let function = || {
         let mut head = FunctionHead::<Backend>::new(
