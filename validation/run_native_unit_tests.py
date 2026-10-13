@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 
 def test_names(listing: str) -> list[str]:
@@ -37,7 +38,13 @@ def run_batches(executable: str, batch_size: int) -> int:
     for start in range(0, len(names), batch_size):
         batch = names[start:start + batch_size]
         print(f"Backend tests {start + 1}–{start + len(batch)} / {len(names)}", flush=True)
-        result = subprocess.run([executable, "--test-threads=1", "--exact", *batch], env=environment)
+        # Cold-cache fixtures must not depend on a previous invocation or a
+        # user's model cache. Warm-cache tests reuse this directory within a test.
+        with tempfile.TemporaryDirectory(prefix="eredu-native-test-") as cache:
+            environment["EREDU_PREPARED_CHECKPOINT_CACHE"] = cache
+            result = subprocess.run(
+                [executable, "--test-threads=1", "--exact", *batch], env=environment,
+            )
         failed |= result.returncode != 0
     return int(failed)
 

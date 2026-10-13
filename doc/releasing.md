@@ -219,6 +219,8 @@ preparation should use a clean checkout and the command without that option.
 Native numerical validation sets `MLX_ENABLE_TF32=0` before MLX initialization
 so FP32 reference tolerances apply on NAX-capable Macs as well. The backend unit
 runner defaults to one fresh process per test to isolate global allocator
-observations, failed submissions, and process-lifetime stream workers. An explicit
+observations, failed submissions, and process-lifetime stream workers. Each process
+also receives a temporary prepared-checkpoint cache: cold fixtures are repeatable
+and warm-cache checks reuse entries within their own test. An explicit
 `--batch-size` groups tests sequentially; `MLX_ENABLE_TF32=1` selects native TF32
 dispatch for targeted compatibility checks.
