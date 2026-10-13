@@ -12,6 +12,8 @@ jobs:
     name: Native backend and consumers
     runs-on: macos-26
     env:
+      # FP32 reference tolerances require FP32 GEMM, including on NAX-capable Macs.
+      MLX_ENABLE_TF32: "0"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"

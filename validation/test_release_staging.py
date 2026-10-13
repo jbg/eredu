@@ -179,6 +179,54 @@ class ReleaseStagingTests(unittest.TestCase):
                     checksums.append(current)
             self.assertEqual(checksums[0], checksums[1])
 
+    def test_development_cycle_uses_the_extracted_archive_type_identity(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "Cargo.toml").write_text('[workspace]\nmembers=["model","helper"]\nresolver="2"\n')
+            sources = {
+                "model": 'pub struct Token;',
+                "helper": 'pub fn accept(_: fixture_model::Token) {}',
+            }
+            for name, source in sources.items():
+                directory = workspace / name
+                (directory / "src").mkdir(parents=True)
+                (directory / "src/lib.rs").write_text(source)
+                other = "helper" if name == "model" else "model"
+                kind = "dev-dependencies" if name == "model" else "dependencies"
+                (directory / "Cargo.toml").write_text(
+                    f'[package]\nname="fixture-{name}"\nversion="1.0.0"\nedition="2021"\n'
+                    f'[{kind}]\nfixture-{other}={{version="=1.0.0",path="../{other}"}}\n'
+                )
+            (workspace / "model/tests").mkdir()
+            (workspace / "model/tests/identity.rs").write_text(
+                '#[test] fn shares_type() { fixture_helper::accept(fixture_model::Token); }'
+            )
+            environment = dict(os.environ, CARGO_HOME=str(root / "cargo-home"),
+                               CARGO_TARGET_DIR=str(root / "target"), CARGO_INCREMENTAL="0")
+            metadata = json.loads(subprocess.check_output(
+                ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                cwd=workspace, env=environment, text=True,
+            ))
+            packages = {package["name"]: package for package in metadata["packages"]}
+            staged = []
+            config = root / "config.toml"
+            for name in ("fixture-model", "fixture-helper"):
+                subprocess.run(
+                    ["cargo", "package", "-p", name, "--no-verify", "--exclude-lockfile"],
+                    cwd=workspace, env=environment, check=True, capture_output=True,
+                )
+                archive = root / "target/package" / f"{name}-1.0.0.crate"
+                staged.append(stage_package(packages[name], archive, root / "registries", staged))
+            write_cargo_config(config, staged)
+            # Nothing in the source workspace is available to archive validation.
+            shutil.rmtree(workspace)
+            for name in ("fixture-model", "fixture-helper"):
+                archive = root / "target/package" / f"{name}-1.0.0.crate"
+                validate_packaged_tests(packages[name], archive, root / "tests", config, environment, staged)
+                validate_downstream_consumer(packages[name], root / "consumers", config, environment)
+
     def test_packaged_checks_are_isolated_from_enclosing_workspace(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             root = Path(temporary)
