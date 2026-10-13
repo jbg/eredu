@@ -1,0 +1,24 @@
+diff --git a/mlx/backend/cpu/copy.h b/mlx/backend/cpu/copy.h
+--- a/mlx/backend/cpu/copy.h
++++ b/mlx/backend/cpu/copy.h
+@@ -17,7 +17,7 @@ void copy_cpu_inplace(
+     CopyType ctype,
+     Stream stream);
+ 
+-void copy_cpu_inplace(
++MLX_API void copy_cpu_inplace(
+     const array& src,
+     array& dst,
+     const Shape& data_shape,
+diff --git a/mlx/transforms_impl.h b/mlx/transforms_impl.h
+--- a/mlx/transforms_impl.h
++++ b/mlx/transforms_impl.h
+@@ -45,7 +45,7 @@ struct InTracing {
+ 
+  private:
+   static thread_local int grad_counter;
+-  static std::vector<std::pair<char, char>>& trace_stack();
++  static MLX_API std::vector<std::pair<char, char>>& trace_stack();
+ };
+ 
+ struct InExportTracing {

@@ -31,6 +31,10 @@ only untouched defaults under the same allocator lock used by explicit setters.
 Direct MLX setters mark explicit ownership even when the value is unchanged.
 Conditional configuration does not raise smaller native limits or evict cache.
 
+The prefix-append exports patch exposes the strided CPU copy operation and
+tracing-state accessor across the Windows MLX/MLX-C DLL boundary. Linux static
+CUDA consumers link cuSOLVER alongside the other native CUDA dependencies.
+
 ## Backends
 
 | Target | Backend selection |

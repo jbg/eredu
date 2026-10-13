@@ -52,16 +52,17 @@
 //! let a = Array::from_iter(0..8, &[2, 2, 2]);
 //!
 //! // a[:, :, 0]
-//! let mut s1 = a.index_device((.., .., 0), &stream);
+//! let s1 = a.index_device((.., .., 0), &stream);
 //!
-//! let expected = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-//! assert_eq!(s1.evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
+//! // Indexing can return a strided view; compact it before borrowing a host slice.
+//! let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
+//! assert_eq!(s1.contiguous(false, &stream).unwrap().evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
 //!
 //! // a[..., 0]
-//! let mut s2 = a.index_device((Ellipsis, 0), &stream);
+//! let s2 = a.index_device((Ellipsis, 0), &stream);
 //!
-//! let expected = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-//! assert_eq!(s2.evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
+//! let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
+//! assert_eq!(s2.contiguous(false, &stream).unwrap().evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
 //! ```
 //!
 //! # Set values with indexing

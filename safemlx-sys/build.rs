@@ -152,6 +152,7 @@ fn link_cuda_dependencies(target_os: &str, target_arch: &str) {
     for library in [
         "cublasLt",
         "cufft",
+        "cusolver",
         "nvrtc",
         "cuda",
         "cudart",
