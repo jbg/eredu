@@ -1,46 +1,9 @@
-diff --git a/mlx/backend/cpu/softmax.cpp b/mlx/backend/cpu/softmax.cpp
---- a/mlx/backend/cpu/softmax.cpp
-+++ b/mlx/backend/cpu/softmax.cpp
-@@ -6,6 +6,7 @@
- #include "mlx/backend/cpu/copy.h"
- #include "mlx/backend/cpu/encoder.h"
- #include "mlx/backend/cpu/simd/simd.h"
-+#include "mlx/backend/cpu/exp_f32.h"
- #include "mlx/primitives.h"
- #include "mlx/types/limits.h"
- 
-@@ -35,6 +36,26 @@
-     T* current_out_ptr;
- 
-     for (int i = 0; i < L; i++, in_ptr += M, out_ptr += M) {
-+      if constexpr (std::is_same_v<T, float> && std::is_same_v<AccT, float>) {
-+        if (M >= 4) {
-+          // Fix the reduction width independently of the native vector ABI.
-+          // Merge the partial final vector before the balanced four-lane sum.
-+          float maximum = -numeric_limits<float>::infinity();
-+          for (int j = 0; j < M; ++j) {
-+            maximum = std::isnan(in_ptr[j]) ? in_ptr[j] : std::max(maximum, in_ptr[j]);
-+          }
-+          float sums[4] = {};
-+          for (int j = 0; j < M; ++j) {
-+            out_ptr[j] = exp_f32(in_ptr[j] - maximum);
-+            sums[j % 4] += out_ptr[j];
-+          }
-+          float inverse = 1.0f / ((sums[0] + sums[2]) + (sums[1] + sums[3]));
-+          for (int j = 0; j < M; ++j) {
-+            out_ptr[j] *= inverse;
-+          }
-+          continue;
-+        }
-+      }
-       // Find the maximum
-       current_in_ptr = in_ptr;
-       Simd<AccT, N> vmaximum(-numeric_limits<AccT>::infinity());
 diff --git a/mlx/backend/cpu/exp_f32.h b/mlx/backend/cpu/exp_f32.h
 new file mode 100644
+index 0000000..e822518
 --- /dev/null
 +++ b/mlx/backend/cpu/exp_f32.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +// Adapted from SLEEF xexpf, revision 5a1d179df9cf652951b59010a2d2075372d67f68.
 +// Copyright Naoki Shibata and contributors 2010 - 2024.
 +// The original polynomial is retained with explicit fused multiply-adds.
@@ -93,7 +56,47 @@ new file mode 100644
 +  return std::ldexp(std::ldexp(u, q >> 1), q - (q >> 1));
 +}
 +} // namespace mlx::core
+diff --git a/mlx/backend/cpu/softmax.cpp b/mlx/backend/cpu/softmax.cpp
+index d62e86a..d94252b 100644
+--- a/mlx/backend/cpu/softmax.cpp
++++ b/mlx/backend/cpu/softmax.cpp
+@@ -7,6 +7,7 @@
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/simd/simd.h"
+ #include "mlx/dtype_utils.h"
++#include "mlx/backend/cpu/exp_f32.h"
+ #include "mlx/primitives.h"
+ #include "mlx/types/limits.h"
+ 
+@@ -36,6 +37,26 @@ void softmax(const array& in, array& out, Stream stream) {
+     T* current_out_ptr;
+ 
+     for (int i = 0; i < L; i++, in_ptr += M, out_ptr += M) {
++      if constexpr (std::is_same_v<T, float> && std::is_same_v<AccT, float>) {
++        if (M >= 4) {
++          // Fix the reduction width independently of the native vector ABI.
++          // Merge the partial final vector before the balanced four-lane sum.
++          float maximum = -numeric_limits<float>::infinity();
++          for (int j = 0; j < M; ++j) {
++            maximum = std::isnan(in_ptr[j]) ? in_ptr[j] : std::max(maximum, in_ptr[j]);
++          }
++          float sums[4] = {};
++          for (int j = 0; j < M; ++j) {
++            out_ptr[j] = exp_f32(in_ptr[j] - maximum);
++            sums[j % 4] += out_ptr[j];
++          }
++          float inverse = 1.0f / ((sums[0] + sums[2]) + (sums[1] + sums[3]));
++          for (int j = 0; j < M; ++j) {
++            out_ptr[j] *= inverse;
++          }
++          continue;
++        }
++      }
+       // Find the maximum
+       current_in_ptr = in_ptr;
+       Simd<AccT, N> vmaximum(-numeric_limits<AccT>::infinity());
 diff --git a/mlx/backend/cpu/unary_ops.h b/mlx/backend/cpu/unary_ops.h
+index e2dd741..e5180ba 100644
 --- a/mlx/backend/cpu/unary_ops.h
 +++ b/mlx/backend/cpu/unary_ops.h
 @@ -7,6 +7,7 @@
@@ -104,7 +107,7 @@ diff --git a/mlx/backend/cpu/unary_ops.h b/mlx/backend/cpu/unary_ops.h
  
  namespace mlx::core::detail {
  
-@@ -77,6 +78,14 @@
+@@ -77,6 +78,14 @@ struct Real {
  struct Sigmoid {
    template <int N, typename T>
    Simd<T, N> operator()(Simd<T, N> x) {

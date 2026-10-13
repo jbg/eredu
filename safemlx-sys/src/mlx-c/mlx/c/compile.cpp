@@ -42,7 +42,7 @@ extern "C" int mlx_detail_compile(
 }
 extern "C" int mlx_detail_compile_clear_cache(void) {
   try {
-    mlx::core::detail::compile_clear_cache();
+    mlx::core::detail::compile_clear_cache(mlx::core::detail::compile_cache());
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -51,7 +51,7 @@ extern "C" int mlx_detail_compile_clear_cache(void) {
 }
 extern "C" int mlx_detail_compile_erase(uintptr_t fun_id) {
   try {
-    mlx::core::detail::compile_erase(fun_id);
+    mlx::core::detail::compile_erase(mlx::core::detail::compile_cache(), fun_id);
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -84,4 +84,37 @@ extern "C" int mlx_set_compile_mode(mlx_compile_mode mode) {
     return 1;
   }
   return 0;
+}
+
+// Retain weak identities, never cache ownership, across foreign TLS teardown.
+using CompileCaches = std::vector<mlx::core::detail::CompileCacheWeakPtr>;
+extern "C" int mlx_detail_compile_record_cache(void** caches) {
+  try {
+    auto current = mlx::core::detail::compile_cache();
+    if (!*caches) {
+      auto owned = std::make_unique<CompileCaches>();
+      owned->push_back(current);
+      *caches = owned.release();
+    } else {
+      auto& retained = *static_cast<CompileCaches*>(*caches);
+      for (auto it = retained.begin(); it != retained.end();) {
+        if (it->expired()) { it = retained.erase(it); continue; }
+        if (!it->owner_before(current) && !current.owner_before(*it)) { return 0; }
+        ++it;
+      }
+      retained.push_back(current);
+    }
+  } catch (const std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" void mlx_detail_compile_release_caches(void* caches, uintptr_t fun_id) {
+  std::unique_ptr<CompileCaches> retained(static_cast<CompileCaches*>(caches));
+  if (retained) {
+    for (const auto& cache : *retained) {
+      mlx::core::detail::compile_erase(cache, fun_id);
+    }
+  }
 }

@@ -9331,13 +9331,15 @@ eligible parameter roles and enforces boundary precision before neural execution
 
 Native compilation forwards the complete scalar-specialization slice to MLX.
 Scalar constants therefore distinguish cached graphs even when their array inputs
-have identical geometry. The pinned `mlx-compile-cache-lifetime.patch` exposes a
-trivial thread-local live-cache pointer to erasure. C++ cache destruction clears
-it before destroying entries, so later foreign-language TLS destructors cannot
-erase already-destroyed storage. Native destruction remains within the existing
+have identical geometry. The MLX 0.32.3 bridge records weak cache identities on
+invocation, including each thread used by a moved wrapper. Cleanup erases through
+those retained identities without accessing native TLS; expired caches are a
+no-op. Caches retain their upstream thread-local lifetime. Native destruction
+remains within the existing
 `safemlx`/`safemlx-sys` unsafe boundary; portable crates gain no native dependency.
 The native regressions exercise scalar specialization, lazy outputs after cache
-erasure, and wrapper teardown after the populated C++ thread-local cache.
+erasure, cross-thread wrapper destruction, and wrapper teardown after the
+populated C++ thread-local cache.
 
 ### Mixed-storage FP32 GEMM
 

@@ -171,15 +171,12 @@ struct CompiledState<F> {
     f: F,
     shapeless: bool,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> Drop for CompiledState<F> {
     fn drop(&mut self) {
-        let _transform_guard = transform_guard::enter();
-        unsafe {
-            // remove the compiled structure from the back end
-            safemlx_sys::mlx_detail_compile_erase(self.id);
-        }
+        self.caches.erase(self.id);
     }
 }
 
@@ -192,4 +189,40 @@ where
     let mut hasher = DefaultHasher::new();
     type_id.hash(&mut hasher);
     hasher.finish() as usize
+}
+
+/// Weak native cache identities recorded on invocation, including after a move
+/// to another thread. Destruction never reads the current thread's native TLS.
+#[derive(Debug, Default)]
+struct CompileCaches(*mut std::ffi::c_void);
+
+// All access to native caches is serialized by the shared transform guard.
+unsafe impl Send for CompileCaches {}
+unsafe impl Sync for CompileCaches {}
+
+impl Clone for CompileCaches {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl CompileCaches {
+    fn record(&mut self) -> Result<()> {
+        crate::error::ensure_mlx_error_handler();
+        let status = unsafe { safemlx_sys::mlx_detail_compile_record_cache(&mut self.0) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(crate::error::get_and_clear_last_mlx_error()
+                .expect("MLX cache recording failed without an error")
+                .into())
+        }
+    }
+    fn erase(&mut self, id: usize) {
+        let _guard = transform_guard::enter();
+        unsafe {
+            safemlx_sys::mlx_detail_compile_release_caches(self.0, id);
+        }
+        self.0 = std::ptr::null_mut();
+    }
 }

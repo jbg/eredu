@@ -1,112 +1,121 @@
+diff --git a/mlx/backend/cpu/encoder.cpp b/mlx/backend/cpu/encoder.cpp
+index 0b4654b..558bce7 100644
+--- a/mlx/backend/cpu/encoder.cpp
++++ b/mlx/backend/cpu/encoder.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cpu/encoder.h"
++#include "mlx/utils.h"
+ 
+ #include <fmt/format.h>
+ 
 diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
-index cd015623..ec088997 100644
+index eb45d64..ec08899 100644
 --- a/mlx/backend/cpu/encoder.h
 +++ b/mlx/backend/cpu/encoder.h
-@@ -47,7 +47,12 @@ struct MLX_API CommandEncoder {
+@@ -46,10 +46,16 @@ struct MLX_API CommandEncoder {
+     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
      if (num_ops_ == 0) {
        scheduler::notify_new_task(stream_);
-       auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
--        task();
+-      scheduler::enqueue(stream_, std::move(task));
+-      // Notify completion separately as |task| may throw exception.
+-      scheduler::enqueue(
+-          stream_, [s = stream_] { scheduler::notify_task_completion(s); });
++      auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
 +        try {
 +          task();
 +        } catch (...) {
 +          scheduler::notify_task_completion(s);
 +          throw;
 +        }
-         scheduler::notify_task_completion(s);
-       };
-       scheduler::enqueue(stream_, std::move(task_wrap));
++        scheduler::notify_task_completion(s);
++      };
++      scheduler::enqueue(stream_, std::move(task_wrap));
+     } else {
+       scheduler::enqueue(stream_, std::move(task));
+     }
 diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
-index b73937ec..74ae70b5 100644
+index bcea005..a992f82 100644
 --- a/mlx/backend/cuda/event.cu
 +++ b/mlx/backend/cuda/event.cu
-@@ -90,22 +90,27 @@ CudaEvent::~CudaEvent() {
- void CudaEvent::wait() {
-   nvtx3::scoped_range r("cu::CudaEvent::wait");
-   event_.device.make_current();
--  cudaEventSynchronize(event_);
-+  CHECK_CUDA_ERROR(cudaEventSynchronize(event_));
- }
+@@ -327,84 +327,82 @@ void EventImpl::ensure_created(Stream s, uint64_t signal_value) {
+ ///////////////////////////////////////////////////////////////////////////////
  
- void CudaEvent::wait(cudaStream_t stream) {
-   event_.device.make_current();
--  cudaStreamWaitEvent(stream, event_);
-+  CHECK_CUDA_ERROR(cudaStreamWaitEvent(stream, event_));
- }
- 
- void CudaEvent::record(cudaStream_t stream) {
-   event_.device.make_current();
--  cudaEventRecord(event_, stream);
-+  CHECK_CUDA_ERROR(cudaEventRecord(event_, stream));
- }
- 
- bool CudaEvent::completed() const {
-   // Note: cudaEventQuery can be safely called from any device.
--  return cudaEventQuery(event_) == cudaSuccess;
-+  auto status = cudaEventQuery(event_);
-+  if (status == cudaErrorNotReady) {
-+    return false;
-+  }
-+  CHECK_CUDA_ERROR(status);
-+  return true;
- }
- 
- // static
-@@ -339,6 +344,7 @@ struct EventImpl {
-   // 2. signal value other than 1 has been specified.
-   std::unique_ptr<cu::CopyableCudaEvent> cuda;
-   std::unique_ptr<cu::AtomicEvent> atomic;
-+  std::shared_ptr<std::string> error;
- 
-   bool is_created() const {
-     return cuda || atomic;
-@@ -365,9 +371,12 @@ Event::Event(Stream s) : stream_(s) {
-       new EventImpl(), [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+ Event::Event(Stream s) : stream_(s) {
+-  event_ = std::make_shared<cu::EventImpl>();
++  event_ = std::shared_ptr<void>(
++      new cu::EventImpl(), [](void* ptr) { delete static_cast<cu::EventImpl*>(ptr); });
  }
  
 -void Event::wait() {
--  auto* event = static_cast<EventImpl*>(event_.get());
+-  check_error();
+-  auto& event = cast<cu::EventImpl>();
+-  assert(event.is_created());
+-  if (event.cuda) {
 +void Event::wait() const {
-+  auto event = std::static_pointer_cast<EventImpl>(event_);
-   assert(event->is_created());
++  auto event = std::static_pointer_cast<cu::EventImpl>(event_);
++  assert(event->is_created());
 +  if (auto error = std::atomic_load(&event->error)) {
 +    throw std::runtime_error(*error);
 +  }
-   if (event->cuda) {
++  if (event->cuda) {
      assert(value() == 1);
-     event->cuda->wait();
-@@ -375,11 +384,21 @@ void Event::wait() {
-     event->atomic->wait(value());
+-    event.cuda->wait();
++    event->cuda->wait();
+   } else {
+-    event.atomic->wait(value());
++    event->atomic->wait(value());
    }
    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+-  check_error();
 +  if (auto error = std::atomic_load(&event->error)) {
 +    throw std::runtime_error(*error);
 +  }
  }
  
 -void Event::wait(Stream s) {
--  auto* event = static_cast<EventImpl*>(event_.get());
+-  auto& event = cast<cu::EventImpl>();
+-  assert(event.is_created());
+-  if (event.cuda) {
 +void Event::wait(Stream s) const {
 +  if (s.device == mlx::core::Device::cpu) {
 +    scheduler::enqueue(s, [event = *this]() { event.wait(); });
 +    return;
 +  }
-+  auto event = std::static_pointer_cast<EventImpl>(event_);
-   assert(event->is_created());
++  auto event = std::static_pointer_cast<cu::EventImpl>(event_);
++  assert(event->is_created());
 +  if (auto error = std::atomic_load(&event->error)) {
 +    throw std::runtime_error(*error);
 +  }
-   if (event->cuda) {
++  if (event->cuda) {
      assert(value() == 1);
-     event->cuda->wait(s);
-@@ -389,9 +408,16 @@ void Event::wait(Stream s) {
+-    if (s.device == mlx::core::Device::cpu) {
+-      scheduler::wait_event(s, *this, [value = value()](Event& self) {
+-        self.cast<cu::EventImpl>().cuda->wait();
+-      });
+-    } else {
+-      event.cuda->wait(s);
+-    }
++    event->cuda->wait(s);
+   } else {
+-    if (s.device == mlx::core::Device::cpu) {
+-      scheduler::wait_event(s, *this, [value = value()](Event& self) {
+-        self.cast<cu::EventImpl>().atomic->wait(value);
+-      });
+-    } else {
+-      event.atomic->wait(s, value());
+-    }
++    event->atomic->wait(s, value());
+   }
  }
  
  void Event::signal(Stream s) {
--  auto* event = static_cast<EventImpl*>(event_.get());
-+  auto event = std::static_pointer_cast<EventImpl>(event_);
-   event->ensure_created(s, value());
--  if (event->cuda) {
+-  auto& event = cast<cu::EventImpl>();
+-  event.ensure_created(s, value());
+-  if (event.cuda) {
++  auto event = std::static_pointer_cast<cu::EventImpl>(event_);
++  event->ensure_created(s, value());
 +  if (s.device == mlx::core::Device::cpu) {
 +    scheduler::enqueue(s, [event = std::move(event), s, value = value()]() {
 +      if (auto error = scheduler::stream_error(s)) {
@@ -116,75 +125,153 @@ index b73937ec..74ae70b5 100644
 +    });
 +  } else if (event->cuda) {
      assert(value() == 1);
-     event->cuda->record(s);
+-    if (s.device == mlx::core::Device::cpu) {
+-      throw std::runtime_error("CudaEvent can not wait on CPU stream.");
+-    } else {
+-      event.cuda->record(s);
+-    }
++    event->cuda->record(s);
    } else {
-@@ -404,12 +430,19 @@ bool Event::is_signaled() const {
-   if (!event->is_created()) {
+-    if (s.device == mlx::core::Device::cpu) {
+-      // Signal through a GPU stream so the atomic is updated in GPU - updating
+-      // the atomic in CPU sometimes does not get GPU notified.
+-      scheduler::signal_event(s, *this, [value = value()](Event& self) {
+-        self.cast<cu::EventImpl>().atomic->signal(cu::signal_stream(), value);
+-      });
+-    } else {
+-      event.atomic->signal(s, value());
+-    }
++    event->atomic->signal(s, value());
+   }
+ }
+ 
+ bool Event::is_signaled() const {
+-  auto& event = cast<cu::EventImpl>();
+-  if (!event.is_created()) {
++  auto* event = static_cast<cu::EventImpl*>(event_.get());
++  if (!event->is_created()) {
      return false;
    }
+-  if (event.cuda) {
 +  bool signaled;
-   if (event->cuda) {
++  if (event->cuda) {
      assert(value() == 1);
--    return event->cuda->is_signaled();
+-    return event.cuda->is_signaled();
 +    signaled = event->cuda->is_signaled();
    } else {
--    return event->atomic->is_signaled(value());
+-    return event.atomic->is_signaled(value());
 +    signaled = event->atomic->is_signaled(value());
-+  }
+   }
+-}
+-
+-std::atomic<Error*>& Event::error() {
+-  return cast<cu::EventImpl>().error;
 +  if (signaled) {
 +    if (auto error = std::atomic_load(&event->error)) {
 +      throw std::runtime_error(*error);
 +    }
-   }
++  }
 +  return signaled;
  }
  
  } // namespace mlx::core
+diff --git a/mlx/backend/cuda/event.h b/mlx/backend/cuda/event.h
+index fdeb6a0..84c2dfa 100644
+--- a/mlx/backend/cuda/event.h
++++ b/mlx/backend/cuda/event.h
+@@ -76,7 +76,7 @@ class AtomicEvent {
+ };
+ 
+ struct EventImpl {
+-  std::atomic<Error*> error;
++  std::shared_ptr<std::string> error;
+ 
+   // CudaEvent is preferred when possible because it is fast, however we have
+   // to fallback to AtomicEvent in following cases:
 diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
-index 77f48f08..483d1a5d 100644
+index 38a387c..483d1a5 100644
 --- a/mlx/backend/metal/event.cpp
 +++ b/mlx/backend/metal/event.cpp
-@@ -40,7 +40,7 @@ void EventImpl::set_error(std::shared_ptr<std::string> error) {
+@@ -26,13 +26,26 @@ EventImpl::~EventImpl() {
  }
  
- void EventImpl::check_error() {
--  auto error = std::atomic_exchange(&error_, {});
+ void EventImpl::wait(uint64_t value) {
++  check_error();
+   mtl_event_->waitUntilSignaledValue(value, -1); // never times out
++  check_error();
+ }
+ 
+ void EventImpl::signal(uint64_t value) {
+   mtl_event_->setSignaledValue(value);
+ }
+ 
++void EventImpl::set_error(std::shared_ptr<std::string> error) {
++  std::atomic_store(&error_, std::move(error));
++}
++
++void EventImpl::check_error() {
 +  auto error = std::atomic_load(&error_);
-   if (error) {
-     throw std::runtime_error(*error);
-   }
-@@ -56,11 +56,11 @@ Event::Event(Stream stream) : stream_(stream) {
++  if (error) {
++    throw std::runtime_error(*error);
++  }
++}
++
+ } // namespace metal
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -43,41 +56,45 @@ Event::Event(Stream stream) : stream_(stream) {
    event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device));
  }
  
 -void Event::wait() {
+-  check_error();
+-  cast<metal::EventImpl>().wait(value());
+-  check_error();
 +void Event::wait() const {
-   static_cast<metal::EventImpl*>(event_.get())->wait(value());
++  static_cast<metal::EventImpl*>(event_.get())->wait(value());
  }
  
 -void Event::wait(Stream stream) {
 +void Event::wait(Stream stream) const {
-   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
++  auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
    if (stream.device == Device::cpu) {
-     scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
-@@ -75,7 +75,10 @@ void Event::wait(Stream stream) {
+-    scheduler::wait_event(stream, *this, [value = value()](Event& self) {
+-      self.cast<metal::EventImpl>().wait(value);
++    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
++      impl->wait(value);
+     });
+   } else {
+     auto& encoder = metal::get_command_encoder(stream);
+-    encoder.wait_event(*this, value());
++    encoder.wait_event(std::move(impl), value());
+   }
+ }
+ 
  void Event::signal(Stream stream) {
-   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
++  auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
    if (stream.device == Device::cpu) {
--    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+-    scheduler::signal_event(stream, *this, [value = value()](Event& self) {
+-      self.cast<metal::EventImpl>().signal(value);
 +    scheduler::enqueue(stream, [impl = std::move(impl), stream, value = value()]() {
 +      if (auto error = scheduler::stream_error(stream)) {
 +        impl->set_error(std::move(error));
 +      }
-       impl->signal(value);
++      impl->signal(value);
      });
    } else {
-@@ -85,8 +88,13 @@ void Event::signal(Stream stream) {
+     auto& encoder = metal::get_command_encoder(stream);
+-    encoder.signal_event(*this, value());
++    encoder.signal_event(std::move(impl), value());
+   }
  }
  
  bool Event::is_signaled() const {
--  auto* mtl_event = static_cast<metal::EventImpl*>(event_.get())->mtl_event();
+-  auto* mtl_event = cast<metal::EventImpl>().mtl_event();
 -  return mtl_event->signaledValue() >= value();
+-}
+-
+-std::atomic<Error*>& Event::error() {
+-  return cast<metal::EventImpl>().error();
 +  auto* impl = static_cast<metal::EventImpl*>(event_.get());
 +  impl->check_error();
 +  auto signaled = impl->mtl_event()->signaledValue() >= value();
@@ -195,68 +282,123 @@ index 77f48f08..483d1a5d 100644
  }
  
  } // namespace mlx::core
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+index d1e43fa..256db4c 100644
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -13,17 +13,16 @@ class EventImpl {
+   void wait(uint64_t value);
+   void signal(uint64_t value);
+ 
+-  auto& error() {
+-    return error_;
+-  }
++  void set_error(std::shared_ptr<std::string> error);
++  void check_error();
+ 
+   auto* mtl_event() const {
+     return mtl_event_.get();
+   }
+ 
+  private:
+-  // All streams outlive events so pointers would be always valid.
+-  std::atomic<Error*> error_;
++  // Keep the diagnostic available after stream synchronization.
++  std::shared_ptr<std::string> error_;
+ 
+   NS::SharedPtr<MTL::SharedEvent> mtl_event_;
+ };
 diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
-index 6dde047a..c6df8ad6 100644
+index 8966b77..c6df8ad 100644
 --- a/mlx/backend/no_gpu/event.cpp
 +++ b/mlx/backend/no_gpu/event.cpp
-@@ -10,6 +10,7 @@ namespace mlx::core {
+@@ -10,54 +10,52 @@ namespace mlx::core {
  
  struct EventCounter {
    uint64_t value{0};
 +  std::shared_ptr<std::string> error;
    std::mutex mtx;
    std::condition_variable cv;
+-  std::atomic<Error*> error;
+-
+-  void wait(uint64_t val) {
+-    std::unique_lock<std::mutex> lk(mtx);
+-    if (value >= val) {
+-      return;
+-    }
+-    cv.wait(lk, [this, val] { return value >= val; });
+-  }
  };
-@@ -19,24 +20,27 @@ Event::Event(Stream stream) : stream_(stream) {
-   event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
+ 
+ Event::Event(Stream stream) : stream_(stream) {
+-  event_ = std::make_shared<EventCounter>();
++  auto dtor = [](void* ptr) { delete static_cast<EventCounter*>(ptr); };
++  event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
  }
  
 -void Event::wait() {
+-  check_error();
+-  cast<EventCounter>().wait(value());
+-  check_error();
 +void Event::wait() const {
-   auto ec = static_cast<EventCounter*>(event_.get());
-   std::unique_lock<std::mutex> lk(ec->mtx);
--  if (ec->value >= value()) {
--    return;
++  auto ec = static_cast<EventCounter*>(event_.get());
++  std::unique_lock<std::mutex> lk(ec->mtx);
 +  if (ec->value < value()) {
 +    ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
 +  }
 +  if (ec->error) {
 +    throw std::runtime_error(*ec->error);
-   }
--  ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
++  }
  }
  
 -void Event::wait(Stream stream) {
+-  scheduler::wait_event(stream, *this, [value = value()](Event& self) {
+-    self.cast<EventCounter>().wait(value);
+-  });
 +void Event::wait(Stream stream) const {
-   scheduler::enqueue(stream, [*this]() mutable { wait(); });
++  scheduler::enqueue(stream, [*this]() mutable { wait(); });
  }
  
  void Event::signal(Stream stream) {
--  scheduler::enqueue(stream, [*this]() mutable {
+-  scheduler::signal_event(stream, *this, [value = value()](Event& self) {
+-    auto& ec = self.cast<EventCounter>();
 +  scheduler::enqueue(stream, [*this, stream]() mutable {
-     auto ec = static_cast<EventCounter*>(event_.get());
++    auto ec = static_cast<EventCounter*>(event_.get());
      {
-       std::lock_guard<std::mutex> lk(ec->mtx);
+-      std::lock_guard lk(ec.mtx);
+-      ec.value = value;
++      std::lock_guard<std::mutex> lk(ec->mtx);
 +      ec->error = scheduler::stream_error(stream);
-       ec->value = value();
++      ec->value = value();
      }
-     ec->cv.notify_all();
-@@ -47,7 +51,11 @@ bool Event::is_signaled() const {
-   auto ec = static_cast<EventCounter*>(event_.get());
-   {
-     std::lock_guard<std::mutex> lk(ec->mtx);
--    return (ec->value >= value());
+-    ec.cv.notify_all();
++    ec->cv.notify_all();
+   });
+ }
+ 
+ bool Event::is_signaled() const {
+-  auto& ec = cast<EventCounter>();
+-  std::lock_guard lk(ec.mtx);
+-  return ec.value >= value();
+-}
+-
+-std::atomic<Error*>& Event::error() {
+-  return cast<EventCounter>().error;
++  auto ec = static_cast<EventCounter*>(event_.get());
++  {
++    std::lock_guard<std::mutex> lk(ec->mtx);
 +    auto signaled = ec->value >= value();
 +    if (signaled && ec->error) {
 +      throw std::runtime_error(*ec->error);
 +    }
 +    return signaled;
-   }
++  }
  }
+-
  } // namespace mlx::core
 diff --git a/mlx/completion.h b/mlx/completion.h
 new file mode 100644
-index 00000000..1b002a68
+index 0000000..f0fb245
 --- /dev/null
 +++ b/mlx/completion.h
 @@ -0,0 +1,76 @@
@@ -337,10 +479,10 @@ index 00000000..1b002a68
 +
 +} // namespace mlx::core
 diff --git a/mlx/event.h b/mlx/event.h
-index 66a6a75d..7cfa08a7 100644
+index cf2d5cc..2b6a302 100644
 --- a/mlx/event.h
 +++ b/mlx/event.h
-@@ -9,16 +9,16 @@
+@@ -10,16 +10,16 @@
  
  namespace mlx::core {
  
@@ -360,28 +502,200 @@ index 66a6a75d..7cfa08a7 100644
  
    // Signal the event at its current value in the given stream
    void signal(Stream stream);
+@@ -27,25 +27,8 @@ class Event {
+   // Check if the event has been signaled at its current value
+   bool is_signaled() const;
+ 
+-  // Associate an error to the event
+-  void set_error(Error& err) {
+-    error().store(&err);
+-  }
+-
+-  // Get the error associated with the event
+-  Error* load_error() const {
+-    if (!valid()) {
+-      return nullptr;
+-    }
+-    return error().load();
+-  }
+-
+-  // Throw and clear the associated error
+-  void check_error() {
+-    if (auto* p = load_error(); p) {
+-      p->check();
+-    }
+-  }
++  // Poll the persistent diagnostic before detaching a completed event.
++  void check_error() const { if (valid()) { (void)is_signaled(); } }
+ 
+   // Check if the event is valid
+   bool valid() const {
+@@ -74,12 +57,6 @@ class Event {
+   }
+ 
+  private:
+-  std::atomic<Error*>& error();
+-
+-  const std::atomic<Error*>& error() const {
+-    return const_cast<Event*>(this)->error();
+-  }
+-
+   // Default constructed stream should never be used
+   // since the event is not yet valid
+   Stream stream_{0, Device::cpu};
 diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
-index 7507917f..c6de4d38 100644
+index 572e236..c6de4d3 100644
 --- a/mlx/scheduler.cpp
 +++ b/mlx/scheduler.cpp
-@@ -13,6 +13,9 @@ void synchronize(Stream s) {
+@@ -1,12 +1,8 @@
+ // Copyright © 2023-2026 Apple Inc.
+ 
+-#include <future>
+-#include <thread>
+-
++#include "mlx/scheduler.h"
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
+-#include "mlx/compile_impl.h"
+-#include "mlx/scheduler.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core {
+@@ -17,7 +13,9 @@ void synchronize(Stream s) {
      std::future<void> f = p->get_future();
      scheduler::enqueue(s, [p = std::move(p)]() { p->set_value(); });
      f.wait();
+-    scheduler::check_error(s);
 +    if (auto error = scheduler::take_stream_error(s)) {
 +      throw std::runtime_error(*error);
 +    }
    } else {
      gpu::synchronize(s);
    }
-@@ -57,7 +60,35 @@ void Scheduler::enqueue(Stream s, std::function<void()> task) {
-     }
-     st = it->second.get();
-   }
--  st->enqueue(std::move(task));
+@@ -32,65 +30,12 @@ void synchronize() {
+ }
+ 
+ void clear_streams() {
+-  detail::compile_clear_cache(detail::compile_cache());
+   cpu::clear_streams();
+   gpu::clear_streams();
+ }
+ 
+ namespace scheduler {
+ 
+-struct StreamThread {
+-  std::mutex mtx;
+-  std::queue<std::function<void()>> q;
+-  std::condition_variable cond;
+-  bool stop;
+-  std::thread thread;
+-  Error error;
+-
+-  StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
+-
+-  ~StreamThread() {
+-    {
+-      std::lock_guard<std::mutex> lk(mtx);
+-      stop = true;
+-    }
+-    cond.notify_one();
+-    thread.join();
+-  }
+-
+-  void thread_fn() {
+-    while (true) {
+-      std::function<void()> task;
+-      {
+-        std::unique_lock<std::mutex> lk(mtx);
+-        cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+-        if (q.empty() && stop) {
+-          return;
+-        }
+-        task = std::move(q.front());
+-        q.pop();
+-      }
+-
+-      task();
+-    }
+-  }
+-
+-  void enqueue(std::function<void()> f) {
+-    if (is_main_thread()) {
+-      error.check();
+-    }
+-    {
+-      std::lock_guard<std::mutex> lk(mtx);
+-      if (stop) {
+-        throw std::runtime_error(
+-            "Cannot enqueue work after stream is stopped.");
+-      }
+-      q.emplace(std::move(f));
+-    }
+-    cond.notify_one();
+-  }
+-};
+-
+ Scheduler::Scheduler() {
+   is_main_thread();
+   gpu::init();
+@@ -99,66 +44,51 @@ Scheduler::Scheduler() {
+ Scheduler::~Scheduler() = default;
+ 
+ void Scheduler::enqueue(Stream s, std::function<void()> task) {
+-  auto& st = get_thread(s);
+-  st.enqueue([&st, task = std::move(task)]() mutable {
++  StreamThread* st = nullptr;
++  {
++    std::shared_lock lock(threads_mtx_);
++    auto it = threads_.find(s.index);
++    if (it != threads_.end()) {
++      st = it->second.get();
++    }
++  }
++  if (!st) {
++    std::unique_lock lock(threads_mtx_);
++    auto it = threads_.find(s.index);
++    if (it == threads_.end()) {
++      it = threads_.emplace(s.index, std::make_unique<StreamThread>()).first;
++    }
++    st = it->second.get();
++  }
 +  st->enqueue([this, s, task = std::move(task)]() mutable {
-+    try {
-+      task();
+     try {
+       task();
+-    } catch (const std::exception& error) {
+-      // Set error to stream only when no error happended before, to preserve
+-      // the earliest error.
+-      if (!st.error.valid()) {
+-        st.error.set_message(std::make_shared<std::string>(error.what()));
+-      }
+-    }
+-  });
+-}
+-
+-void Scheduler::wait_event(
+-    Stream s,
+-    Event event,
+-    std::function<void(Event&)> task) {
+-  assert(s.device == Device::cpu);
+-  auto& st = get_thread(s);
+-  st.enqueue([&st, event = std::move(event), task = std::move(task)]() mutable {
+-    task(event);
+-    // Poison current stream if the waited event has error.
+-    st.error.store_if_valid(event.load_error());
+-  });
+-}
+-
+-void Scheduler::signal_event(
+-    Stream s,
+-    Event event,
+-    std::function<void(Event&)> task) {
+-  assert(s.device == Device::cpu);
+-  auto& st = get_thread(s);
+-  st.enqueue([&st, event = std::move(event), task = std::move(task)]() mutable {
+-    // Poison the signal event if current stream has error.
+-    if (st.error.valid()) {
+-      event.set_error(st.error);
 +    } catch (const std::exception& e) {
 +      std::lock_guard lk(mtx);
 +      stream_errors_.try_emplace(
@@ -392,17 +706,34 @@ index 7507917f..c6de4d38 100644
 +          s.index,
 +          std::make_shared<std::string>(
 +              "Unknown exception in asynchronous CPU stream work."));
-+    }
-+  });
-+}
-+
+     }
+-    task(event);
+   });
+ }
+ 
+-void Scheduler::check_error(Stream s) {
+-  get_thread(s).error.check();
 +std::shared_ptr<std::string> Scheduler::stream_error(
 +    const Stream& stream) const {
 +  std::lock_guard lk(mtx);
 +  auto it = stream_errors_.find(stream.index);
 +  return it == stream_errors_.end() ? nullptr : it->second;
-+}
-+
+ }
+ 
+-StreamThread& Scheduler::get_thread(Stream s) {
+-  {
+-    std::shared_lock lock(threads_mtx_);
+-    auto it = threads_.find(s.index);
+-    if (it != threads_.end()) {
+-      return *it->second.get();
+-    }
+-  }
+-  std::unique_lock lock(threads_mtx_);
+-  auto it = threads_.find(s.index);
+-  if (it == threads_.end()) {
+-    it = threads_.emplace(s.index, std::make_unique<StreamThread>()).first;
+-  }
+-  return *it->second.get();
 +std::shared_ptr<std::string> Scheduler::take_stream_error(
 +    const Stream& stream) {
 +  std::lock_guard lk(mtx);
@@ -412,29 +743,100 @@ index 7507917f..c6de4d38 100644
  
  // Leak the scheduler singleton on all platforms. During static destruction,
 diff --git a/mlx/scheduler.h b/mlx/scheduler.h
-index c84ab628..fe82b252 100644
+index 7bce5a9..fe82b25 100644
 --- a/mlx/scheduler.h
 +++ b/mlx/scheduler.h
-@@ -6,6 +6,7 @@
- #include <future>
+@@ -3,19 +3,67 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <future>
  #include <queue>
  #include <shared_mutex>
 +#include <string>
- #include <thread>
++#include <thread>
  #include <unordered_map>
  
-@@ -77,6 +78,10 @@ class MLX_API Scheduler {
+ #include "mlx/api.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/device.h"
+ #include "mlx/stream.h"
+-#include "mlx/utils.h"
+ 
+ namespace mlx::core::scheduler {
+ 
+-class StreamThread;
++struct StreamThread {
++  std::mutex mtx;
++  std::queue<std::function<void()>> q;
++  std::condition_variable cond;
++  bool stop;
++  std::thread thread;
++
++  StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
++
++  ~StreamThread() {
++    {
++      std::lock_guard<std::mutex> lk(mtx);
++      stop = true;
++    }
++    cond.notify_one();
++    thread.join();
++  }
++
++  void thread_fn() {
++    while (true) {
++      std::function<void()> task;
++      {
++        std::unique_lock<std::mutex> lk(mtx);
++        cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
++        if (q.empty() && stop) {
++          return;
++        }
++        task = std::move(q.front());
++        q.pop();
++      }
++
++      task();
++    }
++  }
++
++  void enqueue(std::function<void()> f) {
++    {
++      std::lock_guard<std::mutex> lk(mtx);
++      if (stop) {
++        throw std::runtime_error(
++            "Cannot enqueue work after stream is stopped.");
++      }
++      q.emplace(std::move(f));
++    }
++    cond.notify_one();
++  }
++};
+ 
+ class MLX_API Scheduler {
+  public:
+@@ -29,9 +77,10 @@ class MLX_API Scheduler {
+   Scheduler& operator=(Scheduler&&) = delete;
  
    void enqueue(Stream s, std::function<void()> task);
- 
+-  void wait_event(Stream s, Event event, std::function<void(Event&)> task);
+-  void signal_event(Stream s, Event event, std::function<void(Event&)> task);
+-  void check_error(Stream s);
++
 +  std::shared_ptr<std::string> stream_error(const Stream& stream) const;
 +
 +  std::shared_ptr<std::string> take_stream_error(const Stream& stream);
-+
+ 
    void notify_new_task(const Stream& stream) {
      {
-       std::lock_guard<std::mutex> lk(mtx);
-@@ -114,7 +119,8 @@ class MLX_API Scheduler {
+@@ -66,36 +115,19 @@ class MLX_API Scheduler {
+  private:
+   friend Stream mlx::core::new_stream(Device d);
+ 
+-  StreamThread& get_thread(Stream s);
+-
+   int n_active_tasks_{0};
    std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
    std::shared_mutex threads_mtx_;
    std::condition_variable completion_cv;
@@ -444,7 +846,32 @@ index c84ab628..fe82b252 100644
  };
  
  MLX_API Scheduler& scheduler();
-@@ -140,4 +146,12 @@ inline void wait_for_one() {
+ 
+ template <typename F>
+-inline void enqueue(Stream s, F&& f) {
+-  scheduler().enqueue(s, std::forward<F>(f));
+-}
+-
+-// Like enqueue but the task is used for processing the passed event.
+-template <typename F>
+-inline void wait_event(Stream s, Event event, F&& f) {
+-  scheduler().wait_event(s, std::move(event), std::forward<F>(f));
+-}
+-
+-template <typename F>
+-inline void signal_event(Stream s, Event event, F&& f) {
+-  scheduler().signal_event(s, std::move(event), std::forward<F>(f));
+-}
+-
+-// Throw and clear the error stored in the stream, if any.
+-inline void check_error(Stream s) {
+-  scheduler().check_error(s);
++void enqueue(const Stream& stream, F&& f) {
++  scheduler().enqueue(stream, std::forward<F>(f));
+ }
+ 
+ inline int n_active_tasks() {
+@@ -114,4 +146,12 @@ inline void wait_for_one() {
    scheduler().wait_for_one();
  }
  
@@ -458,7 +885,7 @@ index c84ab628..fe82b252 100644
 +
  } // namespace mlx::core::scheduler
 diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
-index 9a820733..e75ac5f8 100644
+index 77d81e1..053f8b4 100644
 --- a/mlx/transforms.cpp
 +++ b/mlx/transforms.cpp
 @@ -11,6 +11,7 @@
@@ -469,17 +896,16 @@ index 9a820733..e75ac5f8 100644
  #include "mlx/fence.h"
  #include "mlx/memory.h"
  #include "mlx/ops.h"
-@@ -86,6 +87,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
-     if (o.status() == array::Status::unscheduled && o.has_primitive()) {
-       stream = o.primitive().stream();
-       break;
-+    } else if (o.event().valid()) {
-+      stream = o.event().stream();
-+      break;
+@@ -86,6 +87,8 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     for (auto& o : outputs) {
+       if (o.status() == array::Status::unscheduled && o.has_primitive()) {
+         return o.primitive().stream();
++      } else if (o.event().valid()) {
++        return o.event().stream();
+       }
      }
-   }
- 
-@@ -333,6 +337,65 @@ void async_eval(std::vector<array> outputs) {
+     return default_stream(default_device());
+@@ -369,6 +372,65 @@ void async_eval(std::vector<array> outputs) {
    eval_impl(std::move(outputs), true);
  }
  
@@ -546,7 +972,7 @@ index 9a820733..e75ac5f8 100644
    if (outputs.empty()) {
      return;
 diff --git a/mlx/transforms.h b/mlx/transforms.h
-index 1848be79..896ff595 100644
+index 1848be7..896ff59 100644
 --- a/mlx/transforms.h
 +++ b/mlx/transforms.h
 @@ -6,11 +6,22 @@
@@ -573,10 +999,10 @@ index 1848be79..896ff595 100644
  void async_eval(Arrays&&... outputs) {
    async_eval(std::vector<array>{std::forward<Arrays>(outputs)...});
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 2a4a41c6..27c73cbb 100644
+index aa0d901..c2c138d 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -20,6 +20,7 @@ target_sources(
+@@ -29,6 +29,7 @@ target_sources(
            autograd_tests.cpp
            blas_tests.cpp
            compile_tests.cpp
@@ -586,7 +1012,7 @@ index 2a4a41c6..27c73cbb 100644
            device_tests.cpp
 diff --git a/tests/completion_tests.cpp b/tests/completion_tests.cpp
 new file mode 100644
-index 00000000..ef7f688e
+index 0000000..ef7f688
 --- /dev/null
 +++ b/tests/completion_tests.cpp
 @@ -0,0 +1,84 @@

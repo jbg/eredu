@@ -69,7 +69,6 @@ else()
   # Rust packaging/metallib integration, but never patch an unknown old tree.
   set(mlx_patch_files
       mlx-apple-mobile-platforms.patch
-      mlx-cuda-global-encoder-lifetime.patch
       mlx-affine-group16.patch
       mlx-completion-events.patch
       mlx-variable-all-to-all.patch
@@ -89,7 +88,6 @@ else()
       mlx-cache-limit-query.patch
       mlx-metal-kernel-selection-trace.patch
       mlx-metal-mixed-storage-gemm.patch
-      mlx-compile-cache-lifetime.patch
       mlx-timing-summary.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
@@ -108,8 +106,8 @@ else()
   endforeach()
   string(SHA256 mlx_patch_set_hash "${mlx_patch_identity}")
   safemlx_declare_vendored(
-    mlx mlx-v0.32.0.tar.gz
-    8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec
+    mlx mlx-v0.32.3.tar.gz
+    4129039ddcb36cb860982b616c975a5b9b8e6d8fa97efa86335b4427c29c4b4b
     SOURCE_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-src"
     SUBBUILD_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-subbuild"
     BINARY_DIR "${FETCHCONTENT_BASE_DIR}/mlx-build"
@@ -196,6 +194,8 @@ if(MLX_BUILD_METAL AND MLX_METAL_JIT AND NOT MLX_C_USE_SYSTEM_MLX)
 endif()
 
 if(MLX_BUILD_METAL)
+  find_library(MLX_C_COMPRESSION_LIBRARY Compression REQUIRED)
+  target_link_libraries(mlxc PRIVATE ${MLX_C_COMPRESSION_LIBRARY})
   target_compile_definitions(mlxc PRIVATE MLX_C_PREFIX_APPEND_GPU)
 endif()
 

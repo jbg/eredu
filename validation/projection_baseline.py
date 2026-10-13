@@ -152,7 +152,7 @@ def main():
         "checkpoint_sha256": CHECKPOINT_SHA256, "checkpoint_bytes": args.model.stat().st_size,
         "binary_sha256": sha256(args.binary), "runner_sha256": sha256(__file__),
         "native_trace_patch_sha256": sha256(patch),
-        "mlx_archive_sha256": sha256("safemlx-sys/vendor/mlx-v0.32.0.tar.gz"),
+        "mlx_archive_sha256": sha256("safemlx-sys/vendor/mlx-v0.32.3.tar.gz"),
         "git_revision": command_output(["git", "rev-parse", "HEAD"]),
         "tracked_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--"])).hexdigest(),
         "untracked_file_sha256": {name: sha256(name) for name in subprocess.check_output(

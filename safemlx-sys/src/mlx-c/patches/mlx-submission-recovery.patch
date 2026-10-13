@@ -1,5 +1,5 @@
 diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
-index 6112222c..3874977e 100644
+index 4c21b02..c6b7457 100644
 --- a/mlx/CMakeLists.txt
 +++ b/mlx/CMakeLists.txt
 @@ -16,6 +16,7 @@ target_sources(
@@ -11,7 +11,7 @@ index 6112222c..3874977e 100644
            ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
 diff --git a/mlx/array.cpp b/mlx/array.cpp
-index 07d3acd6..37c005cb 100644
+index e6dbbe7..ebb95b4 100644
 --- a/mlx/array.cpp
 +++ b/mlx/array.cpp
 @@ -5,6 +5,7 @@
@@ -39,7 +39,7 @@ index 07d3acd6..37c005cb 100644
    array_desc_->data_size = data_size;
    array_desc_->strides = std::move(strides);
 diff --git a/mlx/array.h b/mlx/array.h
-index 8e14ca47..8b137a4a 100644
+index cc29290..938831b 100644
 --- a/mlx/array.h
 +++ b/mlx/array.h
 @@ -2,6 +2,7 @@
@@ -50,7 +50,7 @@ index 8e14ca47..8b137a4a 100644
  #include <cstdint>
  #include <functional>
  #include <memory>
-@@ -231,6 +232,12 @@ class MLX_API array {
+@@ -241,6 +242,10 @@ class MLX_API array {
    struct Data {
      allocator::Buffer buffer;
      Deleter d;
@@ -61,7 +61,7 @@ index 8e14ca47..8b137a4a 100644
      Data(allocator::Buffer buffer, Deleter d = allocator::free)
          : buffer(buffer), d(d) {}
      // Not copyable
-@@ -292,7 +299,23 @@ class MLX_API array {
+@@ -302,7 +307,25 @@ class MLX_API array {
  
    /** True indicates the arrays buffer is safe to reuse */
    bool is_donatable() const {
@@ -89,7 +89,7 @@ index 8e14ca47..8b137a4a 100644
  
    /** The array's siblings. */
 diff --git a/mlx/backend/common/buffer_cache.h b/mlx/backend/common/buffer_cache.h
-index 27648b2f..215e7f5c 100644
+index 27648b2..215e7f5 100644
 --- a/mlx/backend/common/buffer_cache.h
 +++ b/mlx/backend/common/buffer_cache.h
 @@ -47,12 +47,21 @@ class BufferCache {
@@ -119,7 +119,7 @@ index 27648b2f..215e7f5c 100644
  
    int release_cached_buffers(size_t min_bytes_to_free) {
 diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
-index c6df8ad6..e01932fd 100644
+index c6df8ad..e01932f 100644
 --- a/mlx/backend/no_gpu/event.cpp
 +++ b/mlx/backend/no_gpu/event.cpp
 @@ -2,7 +2,10 @@
@@ -220,11 +220,11 @@ index c6df8ad6..e01932fd 100644
 +void Event::progress_side_effects() noexcept {}
  } // namespace mlx::core
 diff --git a/mlx/backend/no_gpu/fence.cpp b/mlx/backend/no_gpu/fence.cpp
-index cd66d23c..118d4085 100644
+index 2e02703..a28ddc1 100644
 --- a/mlx/backend/no_gpu/fence.cpp
 +++ b/mlx/backend/no_gpu/fence.cpp
-@@ -51,4 +51,14 @@ void Fence::update(Stream stream, const array&, bool) {
-   }
+@@ -30,4 +30,14 @@ uint32_t Fence::update(Stream s, const array&, bool) {
+   return f.count;
  }
  
 +bool Fence::side_effects_terminal() const noexcept {
@@ -239,10 +239,10 @@ index cd66d23c..118d4085 100644
 +
  } // namespace mlx::core
 diff --git a/mlx/event.h b/mlx/event.h
-index 7cfa08a7..4f4a1dab 100644
+index 2b6a302..62d71c7 100644
 --- a/mlx/event.h
 +++ b/mlx/event.h
-@@ -17,6 +17,10 @@ class MLX_API Event {
+@@ -18,6 +18,10 @@ class MLX_API Event {
    // Wait for the event to be signaled at its current value
    void wait() const;
  
@@ -253,7 +253,7 @@ index 7cfa08a7..4f4a1dab 100644
    // Wait in the given stream for the event to be signaled at its current value
    void wait(Stream stream) const;
  
-@@ -26,6 +30,14 @@ class MLX_API Event {
+@@ -27,6 +31,14 @@ class MLX_API Event {
    // Check if the event has been signaled at its current value
    bool is_signaled() const;
  
@@ -265,25 +265,25 @@ index 7cfa08a7..4f4a1dab 100644
 +  bool side_effects_failed() const noexcept;
 +  void progress_side_effects() noexcept;
 +
-   // Check if the event is valid
-   bool valid() const {
-     return event_ != nullptr;
+   // Poll the persistent diagnostic before detaching a completed event.
+   void check_error() const { if (valid()) { (void)is_signaled(); } }
+ 
 diff --git a/mlx/fence.h b/mlx/fence.h
-index 0ececdb6..c06aa804 100644
+index fd6bc11..bae0abf 100644
 --- a/mlx/fence.h
 +++ b/mlx/fence.h
-@@ -31,6 +31,9 @@ class Fence {
- 
-   void update(Stream stream, const array& x, bool cross_device);
-   void wait(Stream stream, const array& x);
+@@ -33,6 +33,9 @@ class Fence {
+   auto& cast() const {
+     return *static_cast<T*>(fence_.get());
+   }
 +  bool side_effects_terminal() const noexcept;
 +  bool side_effects_failed() const noexcept;
 +  void progress_side_effects() noexcept;
  
   private:
-   std::shared_ptr<void> fence_{nullptr};
+   std::shared_ptr<void> fence_;
 diff --git a/mlx/scheduler.h b/mlx/scheduler.h
-index 853b89d5..351246ac 100644
+index 5bf3a79..c4fb721 100644
 --- a/mlx/scheduler.h
 +++ b/mlx/scheduler.h
 @@ -3,6 +3,7 @@
@@ -294,7 +294,7 @@ index 853b89d5..351246ac 100644
  #include <cstdint>
  #include <deque>
  #include <exception>
-@@ -210,6 +211,14 @@ class MLX_API Scheduler {
+@@ -211,6 +212,14 @@ class MLX_API Scheduler {
      }
    }
  
@@ -309,12 +309,12 @@ index 853b89d5..351246ac 100644
   private:
    friend Stream mlx::core::new_stream(Device d);
  
-diff --git a/target/mlx-recovery-edit/new/mlx/submission.cpp b/mlx/submission.cpp
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
 new file mode 100644
-index 00000000..13a2fb67
+index 0000000..e6aea2c
 --- /dev/null
 +++ b/mlx/submission.cpp
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,535 @@
 +#include "mlx/submission.h"
 +
 +#include <algorithm>
@@ -850,9 +850,9 @@ index 00000000..13a2fb67
 +}
 +
 +} // namespace mlx::core::submission
-diff --git a/target/mlx-recovery-edit/new/mlx/submission.h b/mlx/submission.h
+diff --git a/mlx/submission.h b/mlx/submission.h
 new file mode 100644
-index 00000000..c32fdb89
+index 0000000..c32fdb8
 --- /dev/null
 +++ b/mlx/submission.h
 @@ -0,0 +1,138 @@
@@ -995,7 +995,7 @@ index 00000000..c32fdb89
 +
 +} // namespace mlx::core::submission
 diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
-index 9583dda2..6227f9ac 100644
+index 1a0f06a..218438a 100644
 --- a/mlx/transforms.cpp
 +++ b/mlx/transforms.cpp
 @@ -17,6 +17,7 @@
@@ -1102,11 +1102,20 @@ index 9583dda2..6227f9ac 100644
 +  try {
 +  auto& tape = recovery->tape;
  
-   // Make an effort to choose a good output stream
-   Stream stream = default_stream(default_device());
-@@ -99,14 +185,15 @@ array eval_impl(
-   // Map of array id that needs fence and stream it's computed on
-   std::unordered_map<uintptr_t, std::pair<uint32_t, bool>> needs_fence;
+   // Make an effort to choose a good output stream, and only create the default
+   // stream when there is no other choice.
+@@ -97,21 +183,19 @@ array eval_impl(
+     return default_stream(default_device());
+   }();
+ 
+-  struct FenceInfo {
+-    int stream_index;
+-    bool cross_device;
+-    uint32_t value{0};
+-  };
++  // Map of array id that needs fence and stream it's computed on
++  struct FenceInfo { int stream_index; bool cross_device; uint32_t value{0}; };
+   std::unordered_map<uintptr_t, FenceInfo> needs_fence;
  
 -  auto synchronizer = array(
 -      {}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
@@ -1124,12 +1133,10 @@ index 9583dda2..6227f9ac 100644
    {
      auto e = Event{stream};
      e.set_value(1);
-@@ -231,14 +318,27 @@ array eval_impl(
+@@ -236,120 +320,109 @@ array eval_impl(
      }
    }
  
--  if (timer) {
--    timer->start();
 +  // Reserve all receipts and primitive owners before the first native task.
 +  // Array copies alone would not retain primitive resources after detach().
 +  recovery->primitive_owners.reserve(tape.size());
@@ -1138,55 +1145,203 @@ index 9583dda2..6227f9ac 100644
 +    recovery->prepare_stream(arr.primitive().stream());
 +    recovery->primitive_owners.push_back(arr.primitive_ptr());
 +    output_count += 1 + arr.siblings().size();
-   }
++  }
 +  recovery->reserve_outputs(output_count);
- 
-   std::set<Stream> open_streams;
-+  if (timer) {
++
++  std::set<Stream> open_streams;
+   if (timer) {
 +    recovery->prepare_stream(timer->stream());
 +    open_streams.insert(timer->stream());
-+    timer->start();
-+  }
-   while (!tape.empty()) {
--    auto arr = std::move(tape.back());
+     timer->start();
+   }
++  while (!tape.empty()) {
 +    recovery->current.emplace(std::move(tape.back()));
-     tape.pop_back();
++    tape.pop_back();
 +    auto& arr = *recovery->current;
++
++    auto stream = arr.primitive().stream();
++    open_streams.insert(stream);
++
++    if (async) {
++      // Lookup corresponding event
++      auto e = events.find(stream.index);
++      if (e == events.end()) {
++        e = events.emplace(stream.index, Event{stream}).first;
++      }
++      e->second.set_value(1);
++      arr.attach_event(e->second);
++      for (auto& s : arr.siblings()) {
++        s.attach_event(e->second);
++      }
++    }
  
-     auto stream = arr.primitive().stream();
-     open_streams.insert(stream);
-@@ -272,11 +372,17 @@ array eval_impl(
+-  std::set<Stream> open_streams;
+-  try {
+-    while (!tape.empty()) {
+-      auto arr = std::move(tape.back());
+-      tape.pop_back();
+-
+-      auto stream = arr.primitive().stream();
+-      open_streams.insert(stream);
+-
+-      if (async) {
+-        // Lookup corresponding event
+-        auto e = events.find(stream.index);
+-        if (e == events.end()) {
+-          e = events.emplace(stream.index, Event{stream}).first;
+-        }
+-        e->second.set_value(1);
+-        arr.attach_event(e->second);
+-        for (auto& s : arr.siblings()) {
+-          s.attach_event(e->second);
++    for (auto& in : arr.inputs()) {
++      if (auto it = needs_fence.find(in.id()); it != needs_fence.end()) {
++        // Use fence to wait within a single eval
++        // Get the input array's stream fence and wait on the
++        // output arrays stream
++        fences.at(it->second.stream_index).wait(stream, in, it->second.value);
++      } else if (in.event().valid()) {
++        if (in.event().is_signaled()) {
++          in.detach_event();
++        } else if (in.event().stream() != stream) {
++          // Use event to wait across async eval
++          in.event().wait(stream);
+         }
        }
-     }
++    }
  
+-      for (auto& in : arr.inputs()) {
+-        if (auto it = needs_fence.find(in.id()); it != needs_fence.end()) {
+-          // Use fence to wait within a single eval
+-          // Get the input array's stream fence and wait on the
+-          // output arrays stream
+-          auto& info = it->second;
+-          fences.at(info.stream_index).wait(stream, in, info.value);
+-        } else if (in.event().valid()) {
+-          if (in.event().is_signaled()) {
+-            in.detach_event();
+-          } else if (in.event().stream() != stream) {
+-            // Use event to wait across async eval
+-            in.event().wait(stream);
+-          }
 +    recovery->begin_primitive();
-     if (arr.primitive().device() == Device::gpu) {
-       gpu::eval(arr);
-     } else {
-       cpu::eval(arr);
-     }
++    if (arr.primitive().device() == Device::gpu) {
++      gpu::eval(arr);
++    } else {
++      cpu::eval(arr);
++    }
 +    recovery->retain_output(arr.data_shared_ptr());
 +    for (const auto& sibling : arr.siblings()) {
 +      recovery->retain_output(sibling.data_shared_ptr());
 +    }
 +    recovery->end_primitive();
- 
-     if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
-         (get_active_memory() > get_memory_limit() &&
-@@ -287,10 +393,10 @@ array eval_impl(
-           gpu::finalize(s);
++
++    if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
++        (get_active_memory() > get_memory_limit() &&
++         scheduler::n_active_tasks() > 0)) {
++      // Commit any open streams
++      for (auto& s : open_streams) {
++        if (s.device == Device::gpu) {
++          gpu::finalize(s);
          }
        }
--      scheduler::wait_for_one();
+-
+-      if (arr.primitive().device() == Device::gpu) {
+-        gpu::eval(arr);
+-      } else {
+-        cpu::eval(arr);
 +      recovery->wait_for_progress();
-       while (get_active_memory() > get_memory_limit() &&
-              scheduler::n_active_tasks() > 0) {
--        scheduler::wait_for_one();
++      while (get_active_memory() > get_memory_limit() &&
++             scheduler::n_active_tasks() > 0) {
 +        recovery->wait_for_progress();
        }
-     }
++    }
  
-@@ -333,7 +439,15 @@ array eval_impl(
+-      if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+-          (get_active_memory() > get_memory_limit() &&
+-           scheduler::n_active_tasks() > 0)) {
+-        // Commit any open streams
+-        for (auto& s : open_streams) {
+-          if (s.device == Device::gpu) {
+-            gpu::finalize(s);
+-          }
+-        }
+-        scheduler::wait_for_one();
+-        while (get_active_memory() > get_memory_limit() &&
+-               scheduler::n_active_tasks() > 0) {
+-          scheduler::wait_for_one();
++    auto maybe_update_fence = [&fences, &needs_fence, stream](const array& a) {
++      if (auto nf = needs_fence.find(a.id()); nf != needs_fence.end()) {
++        auto it = fences.find(stream.index);
++        if (it == fences.end()) {
++          it = fences.emplace(stream.index, Fence{stream}).first;
+         }
++        nf->second.value = it->second.update(stream, a, nf->second.cross_device);
+       }
++    };
+ 
+-      auto maybe_update_fence =
+-          [&fences, &needs_fence, stream](const array& a) {
+-            if (auto nf = needs_fence.find(a.id()); nf != needs_fence.end()) {
+-              auto it = fences.find(stream.index);
+-              if (it == fences.end()) {
+-                it = fences.emplace(stream.index, Fence{stream}).first;
+-              }
+-              nf->second.value =
+-                  it->second.update(stream, a, nf->second.cross_device);
+-            }
+-          };
+-
+-      arr.set_status(array::Status::evaluated);
+-      // TODO Maybe always want the fence coherent kernel in the same cbuf
+-      // as the other kernels?
+-      maybe_update_fence(arr);
+-      for (auto& sib : arr.siblings()) {
+-        sib.set_status(array::Status::evaluated);
+-        maybe_update_fence(sib);
+-      }
+-      if (!arr.is_tracer()) {
+-        arr.detach();
+-      }
+-    }
+-  } catch (...) {
+-    // A primitive threw from inside its eval (e.g. argument validation in
+-    // eval_gpu, or a JIT compile failure). Arrays evaluated earlier in this
+-    // tape are already marked evaluated, but their kernels sit in pending
+-    // command buffers that only the epilogue below would commit, and events
+-    // attached during this eval would never be signaled. Left that way, a
+-    // later read of an affected array returns an unwritten buffer or blocks
+-    // forever. Signal the events and flush the touched streams, then let the
+-    // exception propagate.
+-    for (auto& [idx, e] : events) {
+-      try {
+-        auto es = e.stream();
+-        e.signal(es);
+-        open_streams.insert(es);
+-      } catch (...) {
+-      }
++    arr.set_status(array::Status::evaluated);
++    // TODO Maybe always want the fence coherent kernel in the same cbuf
++    // as the other kernels?
++    maybe_update_fence(arr);
++    for (auto& sib : arr.siblings()) {
++      sib.set_status(array::Status::evaluated);
++      maybe_update_fence(sib);
+     }
+-    for (auto& s : open_streams) {
+-      try {
+-        synchronize(s);
+-      } catch (...) {
+-        // Preserve the original exception.
+-      }
++    if (!arr.is_tracer()) {
++      arr.detach();
+     }
+-    throw;
+   }
+ 
+   // Record the stop timestamp before the completion event. Consequently a
+@@ -368,7 +441,16 @@ array eval_impl(
      }
    }
  
@@ -1203,7 +1358,7 @@ index 9583dda2..6227f9ac 100644
  }
  
  void async_eval(std::vector<array> outputs) {
-@@ -413,6 +527,8 @@ void Completion::wait() const {
+@@ -448,6 +530,8 @@ void Completion::wait() const {
    if (event_) {
      event_->wait();
    }
@@ -1212,7 +1367,7 @@ index 9583dda2..6227f9ac 100644
  }
  
  void Completion::wait(Stream stream) const {
-@@ -427,11 +543,38 @@ void Completion::wait(Stream stream) const {
+@@ -462,11 +546,38 @@ void Completion::wait(Stream stream) const {
              << ".";
      throw std::invalid_argument(message.str());
    }
@@ -1253,7 +1408,7 @@ index 9583dda2..6227f9ac 100644
  }
  
  double Completion::elapsed_seconds() const {
-@@ -491,10 +634,14 @@ void eval(std::vector<array> outputs) {
+@@ -526,10 +637,14 @@ void eval(std::vector<array> outputs) {
      for (auto& x : outputs) {
        x.wait();
      }

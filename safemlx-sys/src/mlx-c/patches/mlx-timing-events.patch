@@ -1,5 +1,5 @@
 diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
-index d2d4597..6112222 100644
+index d1a12c9..4c21b02 100644
 --- a/mlx/CMakeLists.txt
 +++ b/mlx/CMakeLists.txt
 @@ -16,6 +16,7 @@ target_sources(
@@ -11,10 +11,10 @@ index d2d4597..6112222 100644
            ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/linalg.cpp
 diff --git a/mlx/backend/cuda/CMakeLists.txt b/mlx/backend/cuda/CMakeLists.txt
-index 064e1ef..ee6585d 100644
+index f3594e2..4c41762 100644
 --- a/mlx/backend/cuda/CMakeLists.txt
 +++ b/mlx/backend/cuda/CMakeLists.txt
-@@ -26,6 +26,7 @@ target_sources(
+@@ -29,6 +29,7 @@ target_sources(
            ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cu
            ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/event.cu
@@ -23,11 +23,11 @@ index 064e1ef..ee6585d 100644
            ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/gemms/block_mask.cu
 diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
-index 74ae70b..6409a29 100644
+index a992f82..02e2557 100644
 --- a/mlx/backend/cuda/event.cu
 +++ b/mlx/backend/cuda/event.cu
 @@ -103,6 +103,14 @@ void CudaEvent::record(cudaStream_t stream) {
-   CHECK_CUDA_ERROR(cudaEventRecord(event_, stream));
+   cudaEventRecord(event_, stream);
  }
  
 +double CudaEvent::elapsed_seconds(const CudaEvent& end) const {
@@ -40,12 +40,12 @@ index 74ae70b..6409a29 100644
 +
  bool CudaEvent::completed() const {
    // Note: cudaEventQuery can be safely called from any device.
-   auto status = cudaEventQuery(event_);
+   return cudaEventQuery(event_) == cudaSuccess;
 diff --git a/mlx/backend/cuda/event.h b/mlx/backend/cuda/event.h
-index 53afeb0..494b133 100644
+index 84c2dfa..dab20be 100644
 --- a/mlx/backend/cuda/event.h
 +++ b/mlx/backend/cuda/event.h
-@@ -38,6 +38,7 @@ class CudaEvent {
+@@ -39,6 +39,7 @@ class CudaEvent {
    void wait();
    void wait(cudaStream_t stream);
    void record(cudaStream_t stream);
@@ -116,7 +116,7 @@ index 0000000..4230c7a
 +} // namespace mlx::core::gpu
 diff --git a/mlx/backend/gpu/timing.h b/mlx/backend/gpu/timing.h
 new file mode 100644
-index 0000000..4da55c7
+index 0000000..7c80901
 --- /dev/null
 +++ b/mlx/backend/gpu/timing.h
 @@ -0,0 +1,18 @@
@@ -139,10 +139,10 @@ index 0000000..4da55c7
 +
 +} // namespace mlx::core::gpu
 diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
-index 31cb535..4da2a97 100644
+index 336e399..ddaf662 100644
 --- a/mlx/backend/metal/CMakeLists.txt
 +++ b/mlx/backend/metal/CMakeLists.txt
-@@ -165,6 +165,7 @@ target_sources(
+@@ -183,6 +183,7 @@ target_sources(
            ${CMAKE_CURRENT_SOURCE_DIR}/slicing.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
@@ -151,7 +151,7 @@ index 31cb535..4da2a97 100644
            ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
            ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
 diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
-index 29eecf5..383eb4d 100644
+index d3f435a..2cef80e 100644
 --- a/mlx/backend/metal/device.cpp
 +++ b/mlx/backend/metal/device.cpp
 @@ -11,6 +11,7 @@
@@ -162,7 +162,7 @@ index 29eecf5..383eb4d 100644
  #include "mlx/backend/metal/event.h"
  #include "mlx/backend/metal/metal.h"
  #include "mlx/backend/metal/utils.h"
-@@ -329,6 +330,23 @@ CommandEncoder::~CommandEncoder() {
+@@ -331,6 +332,23 @@ CommandEncoder::~CommandEncoder() {
    queue_.reset();
  }
  
@@ -186,10 +186,10 @@ index 29eecf5..383eb4d 100644
  void CommandEncoder::set_buffer(
      const MTL::Buffer* buf,
      int idx,
-@@ -515,11 +533,18 @@ bool CommandEncoder::needs_commit() const {
- }
- 
- void CommandEncoder::commit(std::function<void()> completion) {
+@@ -517,11 +535,18 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   // Metal locks a command buffer's residency at commit time, so attach any
+   // sets created since the last commit first.
+   residency_sets_.attach_new_sets(queue_.get(), sets_attached_);
 +  if (timer_) {
 +    timer_->submitted();
 +  }
@@ -198,7 +198,7 @@ index 29eecf5..383eb4d 100644
 +       timer = timer_,
         wait_events = std::move(wait_events_),
         signal_events = std::move(signal_events_),
-        completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
+        completion = std::move(completion)](MTL::CommandBuffer* cbuf) mutable {
 +        if (timer) {
 +          timer->record(cbuf);
 +        }
@@ -206,18 +206,19 @@ index 29eecf5..383eb4d 100644
            completion();
          }
 diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
-index 871e95c..ea5bd37 100644
+index 2d22283..3e8bd73 100644
 --- a/mlx/backend/metal/device.h
 +++ b/mlx/backend/metal/device.h
-@@ -22,6 +22,7 @@ using MTLFCList =
+@@ -20,6 +20,8 @@ using MTLFCList =
+     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
  
  class Device;
- class EventImpl;
++class EventImpl;
 +struct TimerState;
  
  class MLX_API CommandEncoder {
   public:
-@@ -102,6 +103,9 @@ class MLX_API CommandEncoder {
+@@ -100,6 +102,9 @@ class MLX_API CommandEncoder {
      return buffer_.get();
    }
  
@@ -227,10 +228,10 @@ index 871e95c..ea5bd37 100644
   private:
    MTL::ComputeCommandEncoder* get_command_encoder();
  
-@@ -120,6 +124,7 @@ class MLX_API CommandEncoder {
+@@ -122,6 +127,7 @@ class MLX_API CommandEncoder {
  
    // Error from previous commited command buffer.
-   std::shared_ptr<std::string> error_;
+   Error error_;
 +  std::shared_ptr<TimerState> timer_;
  
    // Encoder for issuing GPU commands.
@@ -573,7 +574,7 @@ index 0000000..a9bf728
 +
 +} // namespace mlx::core
 diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
-index e75ac5f..9583dda 100644
+index 053f8b4..1a0f06a 100644
 --- a/mlx/transforms.cpp
 +++ b/mlx/transforms.cpp
 @@ -78,7 +78,10 @@ int& detail::InExportTracing::counter() {
@@ -587,8 +588,8 @@ index e75ac5f..9583dda 100644
 +    DeviceTimer* timer = nullptr) {
    std::deque<array> tape;
  
-   // Make an effort to choose a good output stream
-@@ -228,6 +231,10 @@ array eval_impl(std::vector<array> outputs, bool async) {
+   // Make an effort to choose a good output stream, and only create the default
+@@ -233,6 +236,10 @@ array eval_impl(std::vector<array> outputs, bool async) {
      }
    }
  
@@ -597,10 +598,10 @@ index e75ac5f..9583dda 100644
 +  }
 +
    std::set<Stream> open_streams;
-   while (!tape.empty()) {
-     auto arr = std::move(tape.back());
-@@ -310,6 +317,12 @@ array eval_impl(std::vector<array> outputs, bool async) {
-     }
+   try {
+     while (!tape.empty()) {
+@@ -345,6 +352,12 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     throw;
    }
  
 +  // Record the stop timestamp before the completion event. Consequently a
@@ -612,7 +613,7 @@ index e75ac5f..9583dda 100644
    // Signal the event in its stream
    for (auto& s : open_streams) {
      if (auto e = events.find(s.index); e != events.end()) {
-@@ -357,6 +370,45 @@ Completion async_eval_with_completion(std::vector<array> outputs) {
+@@ -392,6 +405,45 @@ Completion async_eval_with_completion(std::vector<array> outputs) {
    return Completion{synchronizer.event()};
  }
  
@@ -658,7 +659,7 @@ index e75ac5f..9583dda 100644
  void Completion::wait() const {
    if (event_) {
      event_->wait();
-@@ -382,6 +434,38 @@ bool Completion::is_complete() const {
+@@ -417,6 +469,38 @@ bool Completion::is_complete() const {
    return !event_ || event_->is_signaled();
  }
  

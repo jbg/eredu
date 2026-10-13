@@ -1,5 +1,5 @@
 diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
-index 7667cd0..ae9fe4a 100644
+index 0d107a8..f977248 100644
 --- a/mlx/backend/cuda/jit_module.cpp
 +++ b/mlx/backend/cuda/jit_module.cpp
 @@ -6,6 +6,7 @@
@@ -10,8 +10,8 @@ index 7667cd0..ae9fe4a 100644
  #include <cstdlib>
  #include <filesystem>
  #include <fstream>
-@@ -50,10 +51,51 @@ const std::filesystem::path& default_cuda_toolkit_path() {
-   return cached_path;
+@@ -63,10 +64,51 @@ inline const char* cudart_dirname() {
+ #endif
  }
  
 +void add_include_path(
@@ -62,7 +62,7 @@ index 7667cd0..ae9fe4a 100644
      // Add path to bundled headers.
      auto root_dir = current_binary_dir();
  #if !defined(_WIN32)
-@@ -61,7 +103,7 @@ const std::vector<std::string>& include_path_args() {
+@@ -74,7 +116,7 @@ const std::vector<std::string>& include_path_args() {
  #endif
      auto path = root_dir / "include";
      if (std::filesystem::exists(path)) {
@@ -71,7 +71,7 @@ index 7667cd0..ae9fe4a 100644
      }
      // Add path to CCCL headers.
      path = path / "cccl";
-@@ -69,7 +111,7 @@ const std::vector<std::string>& include_path_args() {
+@@ -82,7 +124,7 @@ const std::vector<std::string>& include_path_args() {
        path = cccl_dir();
      }
      if (std::filesystem::exists(path)) {
@@ -80,7 +80,7 @@ index 7667cd0..ae9fe4a 100644
      }
      // Add path to CUDA runtime headers, try local-installed python package
      // first and then system-installed headers.
-@@ -91,7 +133,7 @@ const std::vector<std::string>& include_path_args() {
+@@ -102,7 +144,7 @@ const std::vector<std::string>& include_path_args() {
              "variable CUDA_HOME or CUDA_PATH.");
        }
      }

@@ -44,6 +44,10 @@ int mlx_detail_compile(
     const uint64_t* constants,
     size_t constants_num);
 int mlx_detail_compile_clear_cache(void);
+/* Record each calling thread before compilation; release without accessing TLS.
+ * The caller serializes compilation and release across recorded threads. */
+int mlx_detail_compile_record_cache(void** caches);
+void mlx_detail_compile_release_caches(void* caches, uintptr_t fun_id);
 int mlx_detail_compile_erase(uintptr_t fun_id);
 int mlx_disable_compile(void);
 int mlx_enable_compile(void);

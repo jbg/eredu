@@ -1,5 +1,6 @@
 diff --git a/mlx/backend/common/timing_intervals.h b/mlx/backend/common/timing_intervals.h
 new file mode 100644
+index 0000000..de48029
 --- /dev/null
 +++ b/mlx/backend/common/timing_intervals.h
 @@ -0,0 +1,32 @@
@@ -35,7 +36,87 @@ new file mode 100644
 +  return result;
 +}
 +} // namespace mlx::core
+diff --git a/mlx/backend/cuda/timing.cu b/mlx/backend/cuda/timing.cu
+index 4230c7a..c9a6ec0 100644
+--- a/mlx/backend/cuda/timing.cu
++++ b/mlx/backend/cuda/timing.cu
+@@ -47,6 +47,11 @@ double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
+   return timer->start.elapsed_seconds(timer->stop);
+ }
+ 
++TimingSummary timer_summary(const std::shared_ptr<void>& state) {
++  const double elapsed = timer_elapsed_seconds(state);
++  return {elapsed, elapsed, elapsed, 1, 0};
++}
++
+ std::optional<double> timer_try_elapsed_seconds(
+     const std::shared_ptr<void>& state) {
+   return timer_elapsed_seconds(state);
+diff --git a/mlx/backend/gpu/timing.h b/mlx/backend/gpu/timing.h
+index 7c80901..83ef731 100644
+--- a/mlx/backend/gpu/timing.h
++++ b/mlx/backend/gpu/timing.h
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ #pragma once
+ 
++#include "mlx/backend/common/timing_intervals.h"
+ #include <memory>
+ #include <optional>
+ 
+@@ -11,6 +12,8 @@ namespace mlx::core::gpu {
+ std::shared_ptr<void> new_timer(Stream stream);
+ void record_timer_start(const std::shared_ptr<void>& state, Stream stream);
+ void record_timer_stop(const std::shared_ptr<void>& state, Stream stream);
++TimingSummary timer_summary(const std::shared_ptr<void>& state);
++
+ double timer_elapsed_seconds(const std::shared_ptr<void>& state);
+ std::optional<double> timer_try_elapsed_seconds(
+     const std::shared_ptr<void>& state);
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 547f89d..6fc6424 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -624,6 +624,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   auto waits = wait_events_;
+   auto signals = signal_events_;
+   auto timer = timer_;
++  const auto timing_slot = timer ? timer->reserve_slot() : 0;
+   if (!receipt_->active) {
+     submission_state_->check_admission();
+     submission_state_->open();
+@@ -636,12 +637,12 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   // accepted work even if the caller sees an exception.
+   commit_attempted_ = true;
+   buffer_->addCompletedHandler(
+-      [this, receipt, state, timer, waits = std::move(waits),
++      [this, receipt, state, timer, timing_slot, waits = std::move(waits),
+        signals = std::move(signals), completion = std::move(completion)]
+       (MTL::CommandBuffer* cbuf) mutable noexcept {
+         bool failed = cbuf->status() == MTL::CommandBufferStatusError;
+         try {
+-          if (timer) { timer->record(cbuf); }
++          if (timer) { timer->record(cbuf, timing_slot); }
+           for (auto& event : waits) {
+             if (event.cast<EventImpl>().failed()) { failed = true; }
+             if (auto error = event.cast<EventImpl>().error()) {
+diff --git a/mlx/backend/metal/timing.cpp b/mlx/backend/metal/timing.cpp
+index b928e06..58d4f4b 100644
+--- a/mlx/backend/metal/timing.cpp
++++ b/mlx/backend/metal/timing.cpp
+@@ -20,6 +20,10 @@ void record_timer_stop(const std::shared_ptr<void>& state, Stream stream) {
+   metal::get_command_encoder(stream).end_timing(timer);
+ }
+ 
++TimingSummary timer_summary(const std::shared_ptr<void>& state) {
++  return std::static_pointer_cast<metal::TimerState>(state)->summary();
++}
++
+ double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
+   return std::static_pointer_cast<metal::TimerState>(state)->elapsed();
+ }
 diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
+index 8b60013..9d43b8c 100644
 --- a/mlx/backend/metal/timing.h
 +++ b/mlx/backend/metal/timing.h
 @@ -1,6 +1,8 @@
@@ -61,7 +142,7 @@ diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
    void submitted() {
      std::lock_guard lock(mutex);
      pending++;
-@@ -23,13 +32,18 @@
+@@ -23,7 +32,7 @@ struct TimerState {
      }
    }
  
@@ -70,18 +151,19 @@ diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
      auto start = command_buffer->GPUStartTime();
      auto stop = command_buffer->GPUEndTime();
      {
-       std::lock_guard lock(mutex);
+@@ -31,6 +40,11 @@ struct TimerState {
        if (stop >= start) {
          elapsed_seconds += stop - start;
-+      }
+       }
 +      if (start > 0 && stop >= start && std::isfinite(start) && std::isfinite(stop)) {
 +        intervals[slot] = {start, stop};
 +      } else {
 +        missing++;
-       }
++      }
        pending--;
        if (stopped && pending == 0) {
-@@ -52,11 +66,21 @@
+         ready.notify_all();
+@@ -52,11 +66,21 @@ struct TimerState {
      return elapsed_seconds;
    }
  
@@ -103,85 +185,11 @@ diff --git a/mlx/backend/metal/timing.h b/mlx/backend/metal/timing.h
  };
  
  } // namespace mlx::core::metal
-diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
---- a/mlx/backend/metal/device.cpp
-+++ b/mlx/backend/metal/device.cpp
-@@ -624,6 +624,7 @@
-   auto waits = wait_events_;
-   auto signals = signal_events_;
-   auto timer = timer_;
-+  const auto timing_slot = timer ? timer->reserve_slot() : 0;
-   if (!receipt_->active) {
-     submission_state_->check_admission();
-     submission_state_->open();
-@@ -636,12 +637,12 @@
-   // accepted work even if the caller sees an exception.
-   commit_attempted_ = true;
-   buffer_->addCompletedHandler(
--      [this, receipt, state, timer, waits = std::move(waits),
-+      [this, receipt, state, timer, timing_slot, waits = std::move(waits),
-        signals = std::move(signals), completion = std::move(completion)]
-       (MTL::CommandBuffer* cbuf) mutable noexcept {
-         bool failed = cbuf->status() == MTL::CommandBufferStatusError;
-         try {
--          if (timer) { timer->record(cbuf); }
-+          if (timer) { timer->record(cbuf, timing_slot); }
-           for (auto& event : waits) {
-             if (event->failed()) { failed = true; }
-             if (auto error = event->error()) {
-diff --git a/mlx/backend/gpu/timing.h b/mlx/backend/gpu/timing.h
---- a/mlx/backend/gpu/timing.h
-+++ b/mlx/backend/gpu/timing.h
-@@ -1,6 +1,7 @@
- // Copyright © 2026 Apple Inc.
- #pragma once
- 
-+#include "mlx/backend/common/timing_intervals.h"
- #include <memory>
- #include <optional>
- 
-@@ -11,6 +12,8 @@
- std::shared_ptr<void> new_timer(Stream stream);
- void record_timer_start(const std::shared_ptr<void>& state, Stream stream);
- void record_timer_stop(const std::shared_ptr<void>& state, Stream stream);
-+TimingSummary timer_summary(const std::shared_ptr<void>& state);
-+
- double timer_elapsed_seconds(const std::shared_ptr<void>& state);
- std::optional<double> timer_try_elapsed_seconds(
-     const std::shared_ptr<void>& state);
-diff --git a/mlx/backend/metal/timing.cpp b/mlx/backend/metal/timing.cpp
---- a/mlx/backend/metal/timing.cpp
-+++ b/mlx/backend/metal/timing.cpp
-@@ -20,6 +20,10 @@
-   metal::get_command_encoder(stream).end_timing(timer);
- }
- 
-+TimingSummary timer_summary(const std::shared_ptr<void>& state) {
-+  return std::static_pointer_cast<metal::TimerState>(state)->summary();
-+}
-+
- double timer_elapsed_seconds(const std::shared_ptr<void>& state) {
-   return std::static_pointer_cast<metal::TimerState>(state)->elapsed();
- }
-diff --git a/mlx/backend/cuda/timing.cu b/mlx/backend/cuda/timing.cu
---- a/mlx/backend/cuda/timing.cu
-+++ b/mlx/backend/cuda/timing.cu
-@@ -47,6 +47,11 @@
-   return timer->start.elapsed_seconds(timer->stop);
- }
- 
-+TimingSummary timer_summary(const std::shared_ptr<void>& state) {
-+  const double elapsed = timer_elapsed_seconds(state);
-+  return {elapsed, elapsed, elapsed, 1, 0};
-+}
-+
- std::optional<double> timer_try_elapsed_seconds(
-     const std::shared_ptr<void>& state) {
-   return timer_elapsed_seconds(state);
 diff --git a/mlx/backend/no_gpu/timing.cpp b/mlx/backend/no_gpu/timing.cpp
+index 149e4a5..f689693 100644
 --- a/mlx/backend/no_gpu/timing.cpp
 +++ b/mlx/backend/no_gpu/timing.cpp
-@@ -17,6 +17,8 @@
+@@ -17,6 +17,8 @@ double timer_elapsed_seconds(const std::shared_ptr<void>&) {
    throw std::runtime_error("GPU timing is unavailable in this MLX build.");
  }
  
@@ -190,29 +198,23 @@ diff --git a/mlx/backend/no_gpu/timing.cpp b/mlx/backend/no_gpu/timing.cpp
  std::optional<double> timer_try_elapsed_seconds(
      const std::shared_ptr<void>&) {
    throw std::runtime_error("GPU timing is unavailable in this MLX build.");
-diff --git a/mlx/timing.h b/mlx/timing.h
---- a/mlx/timing.h
-+++ b/mlx/timing.h
-@@ -1,6 +1,7 @@
- // Copyright © 2026 Apple Inc.
- #pragma once
+diff --git a/mlx/completion.h b/mlx/completion.h
+index 5ad7fdc..7491332 100644
+--- a/mlx/completion.h
++++ b/mlx/completion.h
+@@ -63,6 +63,7 @@ class MLX_API Completion {
  
-+#include "mlx/backend/common/timing_intervals.h"
- #include <memory>
- #include <optional>
- 
-@@ -28,6 +29,7 @@
-   void start();
-   void stop();
+   /** Block until complete and return the stable measured elapsed seconds. */
    double elapsed_seconds() const;
-+  TimingSummary summary() const;
-   std::optional<double> try_elapsed_seconds() const;
++  TimingSummary timing_summary() const;
  
-   const Stream& stream() const {
+   /** Return elapsed seconds when ready without blocking, otherwise nullopt. */
+   std::optional<double> try_elapsed_seconds() const;
 diff --git a/mlx/timing.cpp b/mlx/timing.cpp
+index 04745c3..6ff4498 100644
 --- a/mlx/timing.cpp
 +++ b/mlx/timing.cpp
-@@ -67,6 +67,12 @@
+@@ -67,6 +67,12 @@ double DeviceTimer::elapsed_seconds() const {
    return std::chrono::duration<double>(*state->stop - *state->start).count();
  }
  
@@ -225,21 +227,31 @@ diff --git a/mlx/timing.cpp b/mlx/timing.cpp
  std::optional<double> DeviceTimer::try_elapsed_seconds() const {
    if (stream_.device != Device::cpu) {
      return gpu::timer_try_elapsed_seconds(state_);
-diff --git a/mlx/completion.h b/mlx/completion.h
---- a/mlx/completion.h
-+++ b/mlx/completion.h
-@@ -63,6 +63,7 @@
+diff --git a/mlx/timing.h b/mlx/timing.h
+index a9bf728..2873c35 100644
+--- a/mlx/timing.h
++++ b/mlx/timing.h
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
+ #pragma once
  
-   /** Block until complete and return the stable measured elapsed seconds. */
++#include "mlx/backend/common/timing_intervals.h"
+ #include <memory>
+ #include <optional>
+ 
+@@ -28,6 +29,7 @@ class MLX_API DeviceTimer {
+   void start();
+   void stop();
    double elapsed_seconds() const;
-+  TimingSummary timing_summary() const;
- 
-   /** Return elapsed seconds when ready without blocking, otherwise nullopt. */
++  TimingSummary summary() const;
    std::optional<double> try_elapsed_seconds() const;
+ 
+   const Stream& stream() const {
 diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index 218438a..9e29b7f 100644
 --- a/mlx/transforms.cpp
 +++ b/mlx/transforms.cpp
-@@ -597,6 +597,12 @@
+@@ -593,6 +593,12 @@ double Completion::elapsed_seconds() const {
    return *elapsed_seconds_;
  }
  

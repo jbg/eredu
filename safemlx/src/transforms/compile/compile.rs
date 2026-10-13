@@ -7,7 +7,8 @@ use std::marker::PhantomData;
 use crate::{error::Exception, Array, Stream};
 
 use super::{
-    transform_guard, type_id_to_usize, Closure, Compiled, CompiledState, Guarded, VectorArray,
+    transform_guard, type_id_to_usize, Closure, CompileCaches, Compiled, CompiledState, Guarded,
+    VectorArray,
 };
 
 /// Options used when compiling reusable functions.
@@ -154,6 +155,7 @@ pub struct CompiledWithCaptures<F> {
     captures: Vec<Array>,
     options: CompileOptions,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> CompiledWithCaptures<F>
@@ -171,6 +173,7 @@ where
             captures: captures.into_iter().collect(),
             options: options.into(),
             id,
+            caches: CompileCaches::default(),
         }
     }
 
@@ -204,6 +207,7 @@ where
         call_mut_inner(
             inner_closure,
             self.id,
+            &mut self.caches,
             self.options.shapeless,
             &self.options.constants,
             &inputs,
@@ -221,6 +225,7 @@ where
             captures: self.captures.clone(),
             options: self.options.clone(),
             id: self.id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -237,7 +242,7 @@ impl<F> std::fmt::Debug for CompiledWithCaptures<F> {
 
 impl<F> Drop for CompiledWithCaptures<F> {
     fn drop(&mut self) {
-        erase_compiled(self.id);
+        self.caches.erase(self.id);
     }
 }
 
@@ -248,6 +253,7 @@ pub struct CompiledWithStreamAndCaptures<F> {
     captures: Vec<Array>,
     options: CompileOptions,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> CompiledWithStreamAndCaptures<F>
@@ -265,6 +271,7 @@ where
             captures: captures.into_iter().collect(),
             options: options.into(),
             id,
+            caches: CompileCaches::default(),
         }
     }
 
@@ -299,6 +306,7 @@ where
         call_mut_inner(
             inner_closure,
             self.id,
+            &mut self.caches,
             self.options.shapeless,
             &self.options.constants,
             &inputs,
@@ -316,6 +324,7 @@ where
             captures: self.captures.clone(),
             options: self.options.clone(),
             id: self.id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -332,7 +341,7 @@ impl<F> std::fmt::Debug for CompiledWithStreamAndCaptures<F> {
 
 impl<F> Drop for CompiledWithStreamAndCaptures<F> {
     fn drop(&mut self) {
-        erase_compiled(self.id);
+        self.caches.erase(self.id);
     }
 }
 
@@ -343,6 +352,7 @@ pub struct CompiledUnaryWithStreamAndCaptures<F> {
     captures: Vec<Array>,
     options: CompileOptions,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> CompiledUnaryWithStreamAndCaptures<F>
@@ -360,6 +370,7 @@ where
             captures: captures.into_iter().collect(),
             options: options.into(),
             id,
+            caches: CompileCaches::default(),
         }
     }
 
@@ -393,6 +404,7 @@ where
         let result = call_mut_inner(
             inner_closure,
             self.id,
+            &mut self.caches,
             self.options.shapeless,
             &self.options.constants,
             &inputs,
@@ -411,6 +423,7 @@ where
             captures: self.captures.clone(),
             options: self.options.clone(),
             id: self.id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -427,7 +440,7 @@ impl<F> std::fmt::Debug for CompiledUnaryWithStreamAndCaptures<F> {
 
 impl<F> Drop for CompiledUnaryWithStreamAndCaptures<F> {
     fn drop(&mut self) {
-        erase_compiled(self.id);
+        self.caches.erase(self.id);
     }
 }
 
@@ -438,6 +451,7 @@ pub struct CompiledBinaryWithStreamAndCaptures<F> {
     captures: Vec<Array>,
     options: CompileOptions,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> CompiledBinaryWithStreamAndCaptures<F>
@@ -455,6 +469,7 @@ where
             captures: captures.into_iter().collect(),
             options: options.into(),
             id,
+            caches: CompileCaches::default(),
         }
     }
 
@@ -488,6 +503,7 @@ where
         let result = call_mut_inner(
             inner_closure,
             self.id,
+            &mut self.caches,
             self.options.shapeless,
             &self.options.constants,
             &inputs,
@@ -506,6 +522,7 @@ where
             captures: self.captures.clone(),
             options: self.options.clone(),
             id: self.id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -522,7 +539,7 @@ impl<F> std::fmt::Debug for CompiledBinaryWithStreamAndCaptures<F> {
 
 impl<F> Drop for CompiledBinaryWithStreamAndCaptures<F> {
     fn drop(&mut self) {
-        erase_compiled(self.id);
+        self.caches.erase(self.id);
     }
 }
 
@@ -531,6 +548,7 @@ pub struct CompiledUnaryWithStream<F> {
     f: F,
     shapeless: bool,
     id: usize,
+    caches: CompileCaches,
 }
 
 impl<F> CompiledUnaryWithStream<F>
@@ -543,6 +561,7 @@ where
             f,
             shapeless: shapeless.into().unwrap_or(false),
             id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -558,7 +577,14 @@ where
             Ok(vec![f(&args[0], stream)?])
         };
         let inner_closure = Closure::new_fallible(&mut inner);
-        let result = call_mut_inner(inner_closure, self.id, self.shapeless, &[], &[x])?;
+        let result = call_mut_inner(
+            inner_closure,
+            self.id,
+            &mut self.caches,
+            self.shapeless,
+            &[],
+            &[x],
+        )?;
         Ok(result.into_iter().next().unwrap())
     }
 }
@@ -572,6 +598,7 @@ where
             f: self.f.clone(),
             shapeless: self.shapeless,
             id: self.id,
+            caches: CompileCaches::default(),
         }
     }
 }
@@ -587,7 +614,7 @@ impl<F> std::fmt::Debug for CompiledUnaryWithStream<F> {
 
 impl<F> Drop for CompiledUnaryWithStream<F> {
     fn drop(&mut self) {
-        erase_compiled(self.id);
+        self.caches.erase(self.id);
     }
 }
 
@@ -634,6 +661,7 @@ where
 
             shapeless,
             id,
+            caches: CompileCaches::default(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -660,7 +688,12 @@ where
             let result = (self)(&args[0]);
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -686,7 +719,12 @@ where
             let result = (self)((&args[0], &args[1]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -712,7 +750,12 @@ where
             let result = (self)((&args[0], &args[1], &args[2]));
             vec![result]
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -738,6 +781,7 @@ where
             f: self,
             shapeless,
             id,
+            caches: CompileCaches::default(),
         };
         Compiled {
             f_marker: PhantomData::<F>,
@@ -764,7 +808,12 @@ where
             let result = (self)(&args[0])?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -790,7 +839,12 @@ where
             let result = (self)((&args[0], &args[1]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -816,7 +870,12 @@ where
             let result = (self)((&args[0], &args[1], &args[2]))?;
             Ok(vec![result])
         };
-        let state = CompiledState { f, shapeless, id };
+        let state = CompiledState {
+            f,
+            shapeless,
+            id,
+            caches: CompileCaches::default(),
+        };
         Compiled {
             f_marker: PhantomData::<F>,
             state,
@@ -927,11 +986,13 @@ where
 fn call_mut_inner(
     inner_closure: Closure,
     fun_id: usize,
+    caches: &mut CompileCaches,
     shapeless: bool,
     constants: &[u64],
     args: &[impl AsRef<Array>],
 ) -> crate::error::Result<Vec<Array>> {
     let _transform_guard = transform_guard::enter();
+    caches.record()?;
 
     // note: this will use the cached compile (via the id)
     // but will be able to re-evaluate with fresh state if needed
@@ -969,13 +1030,6 @@ fn combined_inputs(args: &[impl AsRef<Array>], captures: &[Array]) -> Vec<Array>
         .collect()
 }
 
-fn erase_compiled(id: usize) {
-    let _transform_guard = transform_guard::enter();
-    unsafe {
-        safemlx_sys::mlx_detail_compile_erase(id);
-    }
-}
-
 impl<F> CompiledState<F> {
     fn call_mut(&mut self, args: &[impl AsRef<Array>]) -> Result<Vec<Array>, Exception>
     where
@@ -983,7 +1037,14 @@ impl<F> CompiledState<F> {
     {
         let inner_closure = Closure::new(&mut self.f);
 
-        call_mut_inner(inner_closure, self.id, self.shapeless, &[], args)
+        call_mut_inner(
+            inner_closure,
+            self.id,
+            &mut self.caches,
+            self.shapeless,
+            &[],
+            args,
+        )
     }
 
     fn fallible_call_mut(&mut self, args: &[impl AsRef<Array>]) -> Result<Vec<Array>, Exception>
@@ -992,7 +1053,14 @@ impl<F> CompiledState<F> {
     {
         let inner_closure = Closure::new_fallible(&mut self.f);
 
-        call_mut_inner(inner_closure, self.id, self.shapeless, &[], args)
+        call_mut_inner(
+            inner_closure,
+            self.id,
+            &mut self.caches,
+            self.shapeless,
+            &[],
+            args,
+        )
     }
 }
 

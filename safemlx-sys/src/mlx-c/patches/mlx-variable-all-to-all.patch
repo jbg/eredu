@@ -1,12 +1,11 @@
 diff --git a/mlx/backend/cpu/distributed.cpp b/mlx/backend/cpu/distributed.cpp
-index 22dc4b4cc86b29f76df6749b38c161a6fa61dfad..5d2e0dafb857c68bdacee145240517a7495de0bc 100644
+index 88ec269..836e297 100644
 --- a/mlx/backend/cpu/distributed.cpp
 +++ b/mlx/backend/cpu/distributed.cpp
-@@ -100,4 +100,20 @@ void ReduceScatter::eval_cpu(
-     std::vector<array>& outputs) {
-   throw std::runtime_error("[ReduceScatter] Not implemented yet.");
+@@ -117,4 +117,19 @@ void ReduceScatter::eval_cpu(
+   }
  }
-+
+ 
 +void AllToAllV::eval_cpu(
 +    const std::vector<array>& inputs,
 +    std::vector<array>& outputs) {
@@ -24,7 +23,7 @@ index 22dc4b4cc86b29f76df6749b38c161a6fa61dfad..5d2e0dafb857c68bdacee145240517a7
 +}
  } // namespace mlx::core::distributed
 diff --git a/mlx/backend/cuda/distributed.cu b/mlx/backend/cuda/distributed.cu
-index ac798757899234cf719a6fe7063a1350d50b8989..bd301b8749a9dcb3ddd0c8878e1f8c4731c05c81 100644
+index ac79875..bd301b8 100644
 --- a/mlx/backend/cuda/distributed.cu
 +++ b/mlx/backend/cuda/distributed.cu
 @@ -118,4 +118,27 @@ void ReduceScatter::eval_gpu(
@@ -56,7 +55,7 @@ index ac798757899234cf719a6fe7063a1350d50b8989..bd301b8749a9dcb3ddd0c8878e1f8c47
 +}
  } // namespace mlx::core::distributed
 diff --git a/mlx/backend/metal/distributed.cpp b/mlx/backend/metal/distributed.cpp
-index 217ee3c94688fb6433b52060bd6c54719f885f08..ee7c55f595b79929210b4974d7af084f1fc58c1d 100644
+index 217ee3c..ee7c55f 100644
 --- a/mlx/backend/metal/distributed.cpp
 +++ b/mlx/backend/metal/distributed.cpp
 @@ -35,4 +35,9 @@ void ReduceScatter::eval_gpu(const std::vector<array>&, std::vector<array>&) {
@@ -70,10 +69,10 @@ index 217ee3c94688fb6433b52060bd6c54719f885f08..ee7c55f595b79929210b4974d7af084f
 +
  } // namespace mlx::core::distributed
 diff --git a/mlx/backend/no_cpu/primitives.cpp b/mlx/backend/no_cpu/primitives.cpp
-index ae51dd9b2f0190ca776fa8421e89ea8c36c28cba..751572c995f741944c4d194dd8443217888b461b 100644
+index e522307..17846ea 100644
 --- a/mlx/backend/no_cpu/primitives.cpp
 +++ b/mlx/backend/no_cpu/primitives.cpp
-@@ -141,6 +141,7 @@ NO_CPU_MULTI(AllGather)
+@@ -143,6 +143,7 @@ NO_CPU_MULTI(AllGather)
  NO_CPU_MULTI(Send)
  NO_CPU_MULTI(Recv)
  NO_CPU_MULTI(ReduceScatter)
@@ -82,10 +81,10 @@ index ae51dd9b2f0190ca776fa8421e89ea8c36c28cba..751572c995f741944c4d194dd8443217
  
  } // namespace mlx::core
 diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
-index 4819ed2724f4653132acedc527cc362b729bf6c1..2c685b72aa409ea2b7178bea76d19b36c7f15dc2 100644
+index c37515f..7d536cb 100644
 --- a/mlx/backend/no_gpu/primitives.cpp
 +++ b/mlx/backend/no_gpu/primitives.cpp
-@@ -180,6 +180,7 @@ NO_GPU_MULTI(AllGather)
+@@ -201,6 +201,7 @@ NO_GPU_MULTI(AllGather)
  NO_GPU_MULTI(Send)
  NO_GPU_MULTI(Recv)
  NO_GPU_MULTI(ReduceScatter)
@@ -94,7 +93,7 @@ index 4819ed2724f4653132acedc527cc362b729bf6c1..2c685b72aa409ea2b7178bea76d19b36
  
  } // namespace mlx::core
 diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
-index 3cde6a263bbf07d42ecec85b08bd8a36de08fb3f..7809fce53252c6391f21e24d73179ce165775e80 100644
+index 34be2ec..4744cf4 100644
 --- a/mlx/distributed/distributed.cpp
 +++ b/mlx/distributed/distributed.cpp
 @@ -1,5 +1,7 @@
@@ -180,7 +179,7 @@ index 3cde6a263bbf07d42ecec85b08bd8a36de08fb3f..7809fce53252c6391f21e24d73179ce1
  
  } // namespace detail
 diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
-index d889587abcdb81b4538e97ea8df67f8c1d33c83d..be2eb7502fd745b7edde78ff5a41f42db7541fdf 100644
+index d889587..be2eb75 100644
 --- a/mlx/distributed/distributed_impl.h
 +++ b/mlx/distributed/distributed_impl.h
 @@ -30,8 +30,24 @@ class GroupImpl {
@@ -223,11 +222,11 @@ index d889587abcdb81b4538e97ea8df67f8c1d33c83d..be2eb7502fd745b7edde78ff5a41f42d
 +
  } // namespace mlx::core::distributed::detail
 diff --git a/mlx/distributed/jaccl/jaccl.cpp b/mlx/distributed/jaccl/jaccl.cpp
-index 01cc415a00cda8e776d81d1f16b0012953de8f9e..0bb84dd5f559df73ac4bae53671f82d025ef0bcc 100644
+index 99a4ac3..44ada21 100644
 --- a/mlx/distributed/jaccl/jaccl.cpp
 +++ b/mlx/distributed/jaccl/jaccl.cpp
-@@ -148,6 +148,34 @@ class JACCLGroup : public GroupImpl {
-     throw std::runtime_error("[jaccl] sum_scatter not supported.");
+@@ -160,6 +160,34 @@ class JACCLGroup : public GroupImpl {
+     });
    }
  
 +  void all_to_all_v(
@@ -262,7 +261,7 @@ index 01cc415a00cda8e776d81d1f16b0012953de8f9e..0bb84dd5f559df73ac4bae53671f82d0
      throw std::runtime_error("[jaccl] Group split not supported.");
    }
 diff --git a/mlx/distributed/jaccl/lib/jaccl/group.h b/mlx/distributed/jaccl/lib/jaccl/group.h
-index 758109c256ed076334d108688a7251b92aaaadbb..ce75f33382f04cd6cd52a212be70904a51786fec 100644
+index 603765a..6b33a78 100644
 --- a/mlx/distributed/jaccl/lib/jaccl/group.h
 +++ b/mlx/distributed/jaccl/lib/jaccl/group.h
 @@ -4,6 +4,7 @@
@@ -273,7 +272,7 @@ index 758109c256ed076334d108688a7251b92aaaadbb..ce75f33382f04cd6cd52a212be70904a
  
  namespace jaccl {
  
-@@ -30,6 +31,13 @@ class Group {
+@@ -40,6 +41,13 @@ class Group {
  
    virtual void send(const void* input, size_t n_bytes, int dst) = 0;
    virtual void recv(void* output, size_t n_bytes, int src) = 0;
@@ -288,7 +287,7 @@ index 758109c256ed076334d108688a7251b92aaaadbb..ce75f33382f04cd6cd52a212be70904a
  };
  
 diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
-index d120114323efff37ac9ceb12b295770e418d83ee..97e9e8e4423740c2ec184509467830f142f2a042 100644
+index 5b749f2..05cb534 100644
 --- a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
 +++ b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
 @@ -4,6 +4,10 @@
@@ -302,7 +301,7 @@ index d120114323efff37ac9ceb12b295770e418d83ee..97e9e8e4423740c2ec184509467830f1
  namespace jaccl {
  
  MeshGroup::MeshGroup(
-@@ -184,6 +188,52 @@ void MeshGroup::recv(void* output, size_t n_bytes, int src) {
+@@ -186,6 +190,52 @@ void MeshGroup::recv(void* output, size_t n_bytes, int src) {
    mesh_.recv(static_cast<char*>(output), n_bytes, src);
  }
  
@@ -356,10 +355,10 @@ index d120114323efff37ac9ceb12b295770e418d83ee..97e9e8e4423740c2ec184509467830f1
    uint8_t b = 0;
    all_sum(&b, &b, sizeof(b), Dtype::UInt8);
 diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.h b/mlx/distributed/jaccl/lib/jaccl/mesh.h
-index 2ced24416f50b516d198d2f86a4adcede6d0f5d6..596d8e42932f3aa125c87898666c25564b628a90 100644
+index 8e5164a..438c88c 100644
 --- a/mlx/distributed/jaccl/lib/jaccl/mesh.h
 +++ b/mlx/distributed/jaccl/lib/jaccl/mesh.h
-@@ -46,6 +46,13 @@ class MeshGroup : public Group {
+@@ -48,6 +48,13 @@ class MeshGroup : public Group {
  
    void send(const void* input, size_t n_bytes, int dst) override;
    void recv(void* output, size_t n_bytes, int src) override;
@@ -374,7 +373,7 @@ index 2ced24416f50b516d198d2f86a4adcede6d0f5d6..596d8e42932f3aa125c87898666c2556
    void barrier() override;
  
 diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.cpp b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
-index 541e825b4b3645f4a96e803d46450193328aa90d..38a340c44349ed0b429cb868d940d9db97e3ccde 100644
+index a08035f..1aa32bf 100644
 --- a/mlx/distributed/jaccl/lib/jaccl/ring.cpp
 +++ b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
 @@ -4,6 +4,12 @@
@@ -390,7 +389,7 @@ index 541e825b4b3645f4a96e803d46450193328aa90d..38a340c44349ed0b429cb868d940d9db
  namespace jaccl {
  
  RingGroup::RingGroup(
-@@ -190,6 +196,102 @@ void RingGroup::recv(void* output, size_t n_bytes, int src) {
+@@ -203,6 +209,102 @@ void RingGroup::recv(void* output, size_t n_bytes, int src) {
    ring_.recv(static_cast<char*>(output), n_bytes, src, n_conns_);
  }
  
@@ -494,10 +493,10 @@ index 541e825b4b3645f4a96e803d46450193328aa90d..38a340c44349ed0b429cb868d940d9db
    uint8_t b = 0;
    all_sum(&b, &b, sizeof(b), Dtype::UInt8);
 diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.h b/mlx/distributed/jaccl/lib/jaccl/ring.h
-index 016c6af6456c6f05d4d15d01a4aed3b35c0899d9..6e6d022c7d7f0b0e295adcb7d81055b7aeb29f9a 100644
+index c901c15..9a72d20 100644
 --- a/mlx/distributed/jaccl/lib/jaccl/ring.h
 +++ b/mlx/distributed/jaccl/lib/jaccl/ring.h
-@@ -47,6 +47,13 @@ class RingGroup : public Group {
+@@ -50,6 +50,13 @@ class RingGroup : public Group {
  
    void send(const void* input, size_t n_bytes, int dst) override;
    void recv(void* output, size_t n_bytes, int src) override;
@@ -512,7 +511,7 @@ index 016c6af6456c6f05d4d15d01a4aed3b35c0899d9..6e6d022c7d7f0b0e295adcb7d81055b7
    void barrier() override;
  
 diff --git a/mlx/distributed/mpi/mpi.cpp b/mlx/distributed/mpi/mpi.cpp
-index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389c51c0088 100644
+index ea3960e..a7bf019 100644
 --- a/mlx/distributed/mpi/mpi.cpp
 +++ b/mlx/distributed/mpi/mpi.cpp
 @@ -3,6 +3,8 @@
@@ -532,7 +531,7 @@ index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389
      LOAD_SYMBOL(MPI_Send, send);
      LOAD_SYMBOL(MPI_Recv, recv);
      LOAD_SYMBOL(MPI_Type_contiguous, mpi_type_contiguous);
-@@ -237,6 +240,10 @@ struct MPIWrapper {
+@@ -242,6 +245,10 @@ struct MPIWrapper {
      }
    }
  
@@ -543,7 +542,7 @@ index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389
    MPI_Op op_sum(const array& arr) {
      switch (arr.dtype()) {
        case float16:
-@@ -290,6 +297,16 @@ struct MPIWrapper {
+@@ -295,6 +302,16 @@ struct MPIWrapper {
        int,
        MPI_Datatype,
        MPI_Comm);
@@ -560,7 +559,7 @@ index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389
    int (*comm_split)(MPI_Comm, int, int, MPI_Comm*);
    int (*comm_free)(MPI_Comm*);
    int (*send)(const void*, int, MPI_Datatype, int, int, MPI_Comm);
-@@ -476,6 +493,67 @@ class MPIGroup : public GroupImpl {
+@@ -481,6 +498,67 @@ class MPIGroup : public GroupImpl {
      throw std::runtime_error("[mpi] sum_scatter not yet implemented.");
    }
  
@@ -629,7 +628,7 @@ index 3b176e6e6718cbbce451a29ae28188563dca4c2f..f356ac382e22a8618f333f0d3378e389
    MPI_Comm comm_;
    bool global_;
 diff --git a/mlx/distributed/nccl/nccl.cpp b/mlx/distributed/nccl/nccl.cpp
-index faaee3183a6a99efad02616a6e19924b3e801527..4b31514a7e3f4b32455528d9e31fa9b71d4dd21a 100644
+index faaee31..f29be8b 100644
 --- a/mlx/distributed/nccl/nccl.cpp
 +++ b/mlx/distributed/nccl/nccl.cpp
 @@ -87,6 +87,22 @@ MLX_NCCL_TYPE_LIST(MLX_DEF_NCCL_MAP)
@@ -737,7 +736,7 @@ index faaee3183a6a99efad02616a6e19924b3e801527..4b31514a7e3f4b32455528d9e31fa9b7
    void all_reduce_impl(
        const array& input,
 diff --git a/mlx/distributed/ops.cpp b/mlx/distributed/ops.cpp
-index 1762f0e6bc99cf5de6705cb940c970b747148220..10c3d38d67b3aa1f65977a7b47bcf82776dea588 100644
+index 3b338dd..d6a5076 100644
 --- a/mlx/distributed/ops.cpp
 +++ b/mlx/distributed/ops.cpp
 @@ -1,5 +1,6 @@
@@ -747,7 +746,7 @@ index 1762f0e6bc99cf5de6705cb940c970b747148220..10c3d38d67b3aa1f65977a7b47bcf827
  #include <sstream>
  
  #include "mlx/backend/cuda/cuda.h"
-@@ -183,4 +184,121 @@ array sum_scatter(
+@@ -167,4 +168,121 @@ array sum_scatter(
        std::make_shared<ReduceScatter>(stream, group, ReduceScatter::Sum),
        {x});
  }
@@ -870,7 +869,7 @@ index 1762f0e6bc99cf5de6705cb940c970b747148220..10c3d38d67b3aa1f65977a7b47bcf827
 +}
  } // namespace mlx::core::distributed
 diff --git a/mlx/distributed/ops.h b/mlx/distributed/ops.h
-index e223c5bea2e3a39b476d1201350dafa7b55e9703..84a85ff8e7df0fe408759eec77d4c45347f8a55a 100644
+index e223c5b..84a85ff 100644
 --- a/mlx/distributed/ops.h
 +++ b/mlx/distributed/ops.h
 @@ -3,6 +3,7 @@
@@ -894,7 +893,7 @@ index e223c5bea2e3a39b476d1201350dafa7b55e9703..84a85ff8e7df0fe408759eec77d4c453
 +
  } // namespace mlx::core::distributed
 diff --git a/mlx/distributed/primitives.cpp b/mlx/distributed/primitives.cpp
-index 5e8d5327a109dca0d9a46fe6ddc432949736344a..58812f7aa8caf61924d5e1de469b2d95901fa576 100644
+index 5e8d532..58812f7 100644
 --- a/mlx/distributed/primitives.cpp
 +++ b/mlx/distributed/primitives.cpp
 @@ -92,4 +92,67 @@ std::pair<std::vector<array>, std::vector<int>> Send::vmap(
@@ -966,7 +965,7 @@ index 5e8d5327a109dca0d9a46fe6ddc432949736344a..58812f7aa8caf61924d5e1de469b2d95
 +
  } // namespace mlx::core::distributed
 diff --git a/mlx/distributed/primitives.h b/mlx/distributed/primitives.h
-index 18a0d65f5f30881eb06f1de6ddeae03b09b0c6ba..d17779ef51a2bddbacac42ffb6cf92247eccc353 100644
+index 18a0d65..d17779e 100644
 --- a/mlx/distributed/primitives.h
 +++ b/mlx/distributed/primitives.h
 @@ -153,4 +153,48 @@ class ReduceScatter : public DistPrimitive {
@@ -1019,12 +1018,12 @@ index 18a0d65f5f30881eb06f1de6ddeae03b09b0c6ba..d17779ef51a2bddbacac42ffb6cf9224
 +};
  } // namespace mlx::core::distributed
 diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
-index ea40042844bf6da909b3a37d5457fcc0aa88c041..ee0b17deb5efb83d80fd9d6a68f9046bf8aa3396 100644
+index 9a81010..2cb385d 100644
 --- a/mlx/distributed/ring/ring.cpp
 +++ b/mlx/distributed/ring/ring.cpp
-@@ -6,9 +6,12 @@
- #include <unistd.h>
+@@ -7,9 +7,12 @@
  
+ #include <algorithm>
  #include <chrono>
 +#include <cstdint>
 +#include <cstring>
@@ -1034,8 +1033,8 @@ index ea40042844bf6da909b3a37d5457fcc0aa88c041..ee0b17deb5efb83d80fd9d6a68f9046b
 +#include <limits>
  #include <list>
  #include <sstream>
- #include <thread>
-@@ -579,6 +582,105 @@ class RingGroup : public GroupImpl {
+ #include <stdexcept>
+@@ -551,6 +554,105 @@ class RingGroup : public GroupImpl {
      throw std::runtime_error("[ring] sum_scatter not supported.");
    }
  
@@ -1142,10 +1141,10 @@ index ea40042844bf6da909b3a37d5457fcc0aa88c041..ee0b17deb5efb83d80fd9d6a68f9046b
    template <typename T, typename ReduceOp>
    void all_reduce(
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 27c73cbbaf11d3c300a53b26105edbb1dcd16bf0..b8f000e7bdca269aa4a17681179aa4676c4f2132 100644
+index c2c138d..08fc0c9 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -21,6 +21,7 @@ target_sources(
+@@ -30,6 +30,7 @@ target_sources(
            blas_tests.cpp
            compile_tests.cpp
            completion_tests.cpp
@@ -1155,7 +1154,7 @@ index 27c73cbbaf11d3c300a53b26105edbb1dcd16bf0..b8f000e7bdca269aa4a17681179aa467
            device_tests.cpp
 diff --git a/tests/distributed_all_to_all_v_tests.cpp b/tests/distributed_all_to_all_v_tests.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..eb14346fc30024bae51d47caf7bdb8fedc2806fd
+index 0000000..eb14346
 --- /dev/null
 +++ b/tests/distributed_all_to_all_v_tests.cpp
 @@ -0,0 +1,241 @@

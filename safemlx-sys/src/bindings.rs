@@ -4971,3 +4971,10 @@ unsafe extern "C" {
     pub fn _mlx_prefix_append(result: *mut mlx_array, backing: mlx_array, update: mlx_array,
         axis: ::std::os::raw::c_int, start: ::std::os::raw::c_int, stream: mlx_stream) -> ::std::os::raw::c_int;
 }
+
+unsafe extern "C" {
+    pub fn mlx_detail_compile_record_cache(
+        caches: *mut *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+    pub fn mlx_detail_compile_release_caches(caches: *mut ::std::os::raw::c_void, fun_id: usize);
+}

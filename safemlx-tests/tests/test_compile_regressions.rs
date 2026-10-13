@@ -85,3 +85,45 @@ fn scalar_constants_distinguish_same_shape_compiled_graphs() {
     .join()
     .unwrap();
 }
+
+#[test]
+fn moved_wrapper_erases_the_cache_on_its_original_thread() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    static TRACES: AtomicUsize = AtomicUsize::new(0);
+    fn traced(
+        inputs: &[Array],
+        captures: &[Array],
+        stream: &Stream,
+    ) -> Result<Vec<Array>, Exception> {
+        TRACES.fetch_add(1, Ordering::SeqCst);
+        square_plus_input(inputs, captures, stream)
+    }
+    let (send_wrapper, receive_wrapper) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let mut graph = compile_with_stream_and_captures(traced as Trace, [], false);
+        let result = graph
+            .call(&[Array::from_f32(3.)], &stream)
+            .unwrap()
+            .remove(0);
+        assert_eq!(result.try_item::<f32>(&stream).unwrap(), 12.);
+        send_wrapper.send(graph).unwrap();
+        resumed.recv().unwrap();
+        let mut graph = compile_with_stream_and_captures(traced as Trace, [], false);
+        let result = graph
+            .call(&[Array::from_f32(4.)], &stream)
+            .unwrap()
+            .remove(0);
+        assert_eq!(result.try_item::<f32>(&stream).unwrap(), 20.);
+    });
+    let graph = receive_wrapper.recv().unwrap();
+    assert_eq!(TRACES.load(Ordering::SeqCst), 1);
+    drop(graph);
+    resume.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(TRACES.load(Ordering::SeqCst), 2);
+}

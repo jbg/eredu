@@ -624,6 +624,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
                           : std::nullopt),
             (sinks.ctx ? std::make_optional(mlx_array_get_(sinks))
                        : std::nullopt),
+            false,
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
