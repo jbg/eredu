@@ -20,6 +20,7 @@ fn verify_partitioned_prediction_parameters(
     rank: usize,
     graph: &eredu_core::ArchitectureDescriptor,
     integer_buffers: &std::collections::BTreeSet<String>,
+    attention: &[PredictionAttentionEvidence],
     run: impl Fn(&mut ModelRuntime<MlxBackend<'_>>, u8, [u32; 3], bool) -> PredictionResult,
 ) {
     use eredu_core::{capture::CaptureUsage, intervention::InterventionDtype, parameters::*};
@@ -407,6 +408,9 @@ fn verify_partitioned_prediction_parameters(
             ffn_writes,
         }
     });
+    let edited_attention = v4_source.as_ref().filter(|_| !attention.is_empty()).map_or_else(Vec::new, |source| {
+        prediction_attention_evidence(reference, &graph.component_scopes[0], source, &ordinary, &edits, limits)
+    });
     let plan = |base_identity: &str| ParameterOverlayPlan {
         schema_version: PARAMETER_SCHEMA_VERSION,
         base_identity: base_identity.into(),
@@ -430,7 +434,7 @@ fn verify_partitioned_prediction_parameters(
         facts.identity
     );
     eprintln!("prediction parameter comparison rank={rank}: rejected reservation");
-    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], false), &baseline);
+    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], false), &baseline, attention);
     // A late peer rejection must roll back both target and prediction weights.
     if rank == 1 {
         runtime
@@ -443,7 +447,7 @@ fn verify_partitioned_prediction_parameters(
         facts.identity
     );
     eprintln!("prediction parameter comparison rank={rank}: rejected publication");
-    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], false), &baseline);
+    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], false), &baseline, attention);
     let active = MlxBackend::activate_parameter_overlay(runtime, &overlay, limits).unwrap();
     let local_active =
         MlxBackend::activate_parameter_overlay(reference, &local_overlay, limits).unwrap();
@@ -537,6 +541,7 @@ fn verify_partitioned_prediction_parameters(
             &expected,
             edited_readout.as_ref(),
             stream_readout,
+            &edited_attention,
         );
         for phase in &actual.1 {
             for partition in &phase.captures.partitions {
@@ -584,6 +589,7 @@ fn verify_partitioned_prediction_parameters(
         &run(reference, 0, [1, 2, 3], false),
         edited_readout.as_ref(),
         stream_readout,
+        &edited_attention,
     );
     let restored = MlxBackend::remove_parameter_overlay(runtime, &active.identity).unwrap();
     MlxBackend::remove_parameter_overlay(reference, &local_active.identity).unwrap();
@@ -600,7 +606,7 @@ fn verify_partitioned_prediction_parameters(
         assert_eq!(&actual.values, original, "restored {}", edit.parameter);
     }
     eprintln!("prediction parameter comparison rank={rank}: restored");
-    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], true), &baseline);
+    assert_partitioned_prediction_result(&run(runtime, 0, [1, 2, 3], true), &baseline, attention);
     let final_usage = MlxBackend::parameter_discovery(runtime).unwrap().usage;
     assert!(final_usage.host_bytes > measured.usage.host_bytes);
     assert!(final_usage.captures <= limits.captures);

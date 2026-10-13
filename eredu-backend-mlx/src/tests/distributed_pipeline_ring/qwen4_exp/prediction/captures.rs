@@ -134,7 +134,9 @@ pub(super) fn compare(
                     for (actual, expected) in actual.iter().zip(expected) {
                         assert!(actual.is_finite() && expected.is_finite());
                         assert!(
-                            (actual - expected).abs() <= 2e-4,
+                            // Tensor-parallel reductions use a different FP32 summation order.
+                            (actual - expected).abs()
+                                <= ABS_TOLERANCE + REL_TOLERANCE * expected.abs(),
                             "distributed capture {actual} differs from resident {expected}"
                         );
                     }

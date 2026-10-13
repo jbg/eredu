@@ -141,7 +141,10 @@ fn snapshot(state: &mut MlxHybridState) -> (Vec<i32>, Vec<(Vec<i32>, Vec<f32>)>)
         .into_iter()
         .map(|array| {
             let evaluated = array.evaluated().unwrap();
-            (array.shape().to_vec(), evaluated.as_slice::<f32>().to_vec())
+            (
+                array.shape().to_vec(),
+                evaluated.try_to_vec::<f32>().unwrap(),
+            )
         })
         .collect();
     (positions, tensors)

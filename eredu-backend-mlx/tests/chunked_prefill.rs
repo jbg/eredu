@@ -568,7 +568,14 @@ fn apple_metal_loaded_request_forecast_uses_one_physical_pool() {
     );
     // Exercise missing, exhausted and sufficient app headroom on desktop runners too.
     profile.available.physical_memory_bytes = Observed::unavailable("mobile capacity unavailable");
-    let options = GenerationForecastOptions::default();
+    // This tests physical-pool budget comparisons, independently of the
+    // process-global allocator cache, which can exceed the synthetic 1 GiB budget.
+    let options = GenerationForecastOptions {
+        backend_overhead: Some(eredu_runtime::memory_estimation::MemoryBytes::exact(
+            64 * 1024 * 1024,
+        )),
+        ..Default::default()
+    };
     for budget in [None, Some(0), Some(1 << 30)] {
         profile.available.available_memory_bytes = budget.map_or_else(
             || Observed::unavailable("app headroom unavailable"),

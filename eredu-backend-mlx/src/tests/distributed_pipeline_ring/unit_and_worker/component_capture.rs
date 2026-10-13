@@ -915,7 +915,9 @@ fn verify_cold_component_preparation(
         );
     }
     let usage = runtime.text_preparation_usage().unwrap();
-    assert_eq!(usage.attempts - initial_usage.attempts, 6);
+    // Prompt rejects after one agreement; sampling has admission and publication
+    // agreements, so its rejection uses three and instrumentation uses four.
+    assert_eq!(usage.attempts - initial_usage.attempts, 8);
     assert!(usage.retained_bytes > initial_usage.retained_bytes);
     assert!(usage.host_bytes > initial_usage.host_bytes);
 }
