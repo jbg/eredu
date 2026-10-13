@@ -4,6 +4,7 @@ mod prediction_components {
     include!("prediction_components/partitioned.rs");
     include!("prediction_components/parameters.rs");
     include!("prediction_components/readout_bounds.rs");
+    include!("prediction_components/attention_bounds.rs");
     use super::*;
     use eredu_core::{
         speculative::SpeculativeActivationPhase as Phase, ModelConfigurationResolver,

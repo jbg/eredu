@@ -343,9 +343,26 @@ where
             ))
         })?;
         match &mut *policy {
-            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy
-                .acquire(ordinal, address, build, context)
-                .map(MlxSelectedUnitLease::Resident),
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                let &(expected, local) =
+                    self.parameter_locations.get(ordinal).ok_or_else(|| {
+                        eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                            "resident unit ordinal is outside the selected policy".into(),
+                        ))
+                    })?;
+                if expected != address {
+                    return Err(eredu_runtime::LayerwiseAcquireError::Policy(
+                        Error::ArchitectureModel(
+                            "resident unit address differs from the prepared owner".into(),
+                        ),
+                    ));
+                }
+                // Pipeline stages retain global architecture addresses while
+                // resident storage uses compact local slots, just as inspection does.
+                policy
+                    .acquire(ordinal, local, build, context)
+                    .map(MlxSelectedUnitLease::Resident)
+            }
             MlxSelectedLayerwisePolicyInner::Bounded {
                 policy,
                 local_addresses,

@@ -406,7 +406,7 @@ mod tests {
     use eredu_nn::*;
 
     #[test]
-    fn grouped_provider_keeps_custom_selector_modules_explicitly_unknown() {
+    fn grouped_provider_preserves_routed_geometry_with_selector_modules() {
         let parameter = |name| ParameterSpec::trainable(name).unwrap();
         let format = || LinearFormatSpec::unscaled(LinearFormat::Dense).unwrap();
         let selector = TopKGroupSelectorSpec::new(
@@ -437,9 +437,15 @@ mod tests {
         );
         let scaled = selector.with_coefficient_scale(parameter("coefficient"));
         for selector in [transformed, scaled] {
-            assert!(
-                matches!(FeedForwardTopology::from_grouped_specs(&selector, &bank).unwrap(), FeedForwardTopology::Unknown { reason } if !reason.is_empty())
-            );
+            assert!(matches!(
+                FeedForwardTopology::from_grouped_specs(&selector, &bank).unwrap(),
+                FeedForwardTopology::Routed {
+                    experts: 4,
+                    selected: 2,
+                    intermediate_size: 16,
+                    ..
+                }
+            ));
         }
     }
 }

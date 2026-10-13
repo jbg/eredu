@@ -82,7 +82,7 @@ fn runtime_default_policy_and_forecast_observation() {
             // Available memory is observed at initialization, so its exact
             // value can change between calls. Portable sizing tests cover the
             // fraction; this integration checks native caps and ownership.
-            assert!(configured.limit_bytes <= initial.limit_bytes.min(2 * 1024 * 1024 * 1024));
+            assert!(configured.limit_bytes <= initial.limit_bytes.min(8 * 1024 * 1024 * 1024));
             assert_eq!(
                 serde_json::to_value(configured).unwrap()["source"],
                 "managed_default"

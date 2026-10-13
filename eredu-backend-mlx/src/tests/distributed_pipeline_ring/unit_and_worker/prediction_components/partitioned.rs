@@ -6,7 +6,7 @@ pub(super) fn verify_partitioned(
     options: &eredu_runtime::NormalizedLoadRequest,
     rank: usize,
 ) {
-    use eredu_core::{capture::*, intervention::*, speculative::*};
+    use eredu_core::{capture::*, intervention::*, parameters::ParameterBackend, speculative::*};
     use eredu_runtime::speculative::{
         ControlledSpeculativeOptions, ControlledSpeculativeSession, DriveControlledSpeculation,
     };
@@ -84,7 +84,13 @@ pub(super) fn verify_partitioned(
             }
         }
     }
+    let fp8_attention = fused && std::env::var_os("EREDU_RING_DEEPSEEK_FP8").is_some();
     for component in &scope.components {
+        if fp8_attention {
+            if let Some(factor) = &component.write_input_projection {
+                paths.extend([factor.input.clone(), factor.output.clone(), factor.final_input.clone()]);
+            }
+        }
         paths.extend([
             component.activation.clone(),
             component.effective_activation.clone(),
@@ -188,6 +194,14 @@ pub(super) fn verify_partitioned(
     )
     .unwrap();
     let mut reference = ModelRuntime::from_prepared(backend, model).unwrap();
+    let attention = if fp8_attention {
+        let facts = MlxBackend::parameter_discovery(&mut reference).unwrap();
+        let bytes = std::fs::read(checkpoint.join("model.safetensors")).unwrap();
+        let source = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        prediction_attention_evidence(&mut reference, scope, &source, &facts, &[], CaptureUsage {
+            captures: 100_000, retained_bytes: 8 << 30, host_bytes: 16 << 30, encoded_bytes: 8 << 30,
+        })
+    } else { Vec::new() };
     let run =
         |runtime: &mut ModelRuntime<MlxBackend<'_>>, mode: u8, tokens: [u32; 3], replay: bool| {
             let input = prediction_component_prompt(&tokens, media);
@@ -465,7 +479,7 @@ pub(super) fn verify_partitioned(
         eprintln!("prediction component comparison rank={rank} mode={mode}");
         let expected = run(&mut reference, mode, [1, 2, 3], false);
         let actual = run(runtime, mode, [1, 2, 3], false);
-        assert_partitioned_prediction_result(&actual, &expected);
+        assert_partitioned_prediction_result(&actual, &expected, &attention);
         if fused {
             verify_fused_readout(runtime, scope, &actual.1);
         }
@@ -496,7 +510,7 @@ pub(super) fn verify_partitioned(
             eprintln!("prediction selected-component trial rank={rank} mode={mode}");
             let expected = run(&mut reference, mode, [1, 2, 3], false);
             let actual = run(runtime, mode, [1, 2, 3], false);
-            assert_partitioned_prediction_result(&actual, &expected);
+            assert_partitioned_prediction_result(&actual, &expected, &attention);
             verify_prediction_mask_values(&actual.1, scope, mode, if media { 4 } else { 2 });
             if fused {
                 verify_fused_readout(runtime, scope, &actual.1);
@@ -527,7 +541,7 @@ pub(super) fn verify_partitioned(
         for mode in [9, 10] {
             let expected = run(&mut reference, mode, [1, 2, 3], false);
             let actual = run(runtime, mode, [1, 2, 3], false);
-            assert_partitioned_prediction_result(&actual, &expected);
+            assert_partitioned_prediction_result(&actual, &expected, &attention);
             verify_fused_readout(runtime, scope, &actual.1);
             assert_ne!(
                 logits(&references[0]),
@@ -564,6 +578,7 @@ pub(super) fn verify_partitioned(
         rank,
         &graph,
         &integer_buffers,
+        &attention,
         run,
     );
 }
@@ -781,8 +796,8 @@ fn verify_prediction_mask_values(
     }
 }
 
-fn assert_partitioned_prediction_result(actual: &PredictionResult, expected: &PredictionResult) {
-    assert_partitioned_prediction_result_with_readout(actual, expected, None, None);
+fn assert_partitioned_prediction_result(actual: &PredictionResult, expected: &PredictionResult, attention: &[PredictionAttentionEvidence]) {
+    assert_partitioned_prediction_result_with_readout(actual, expected, None, None, attention);
 }
 
 fn assert_partitioned_prediction_result_with_readout(
@@ -790,6 +805,7 @@ fn assert_partitioned_prediction_result_with_readout(
     expected: &PredictionResult,
     readout: Option<&EditedReadoutEvidence>,
     stream_readout: Option<&eredu_core::component::ComponentReadoutEquation>,
+    attention: &[PredictionAttentionEvidence],
 ) {
     use eredu_core::capture::*;
     // The block-FP8 fixture uses 256-wide projections (complete 128-wide TP
@@ -847,6 +863,9 @@ fn assert_partitioned_prediction_result_with_readout(
             .map_or_else(std::collections::BTreeMap::new, |equation| {
                 edited_stream_pair_bounds(equation, actual, expected)
             });
+        for evidence in attention {
+            conditioned_bounds.extend(evidence.bounds(actual, expected));
+        }
         let mut routed_bounds = std::collections::BTreeMap::new();
         if let Some(readout) = readout {
             if let Some(bounds) = readout.bounds(actual, expected) {

@@ -223,7 +223,14 @@ fn expert_exchange_ring_worker() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let arrays = Array::load_safetensors(std::env::var_os(PAYLOAD_FILE).unwrap(), &stream).unwrap();
     let blocks = (0..2)
-        .map(|destination| arrays[&format!("r{expected_rank}d{destination}")].clone())
+        .map(|destination| {
+            if expected_rank == 1 && destination == 0 {
+                // Empty transport messages are valid; checkpoint parameters are nonempty.
+                safemlx::ops::zeros_dtype(&[0, 1], safemlx::Dtype::Int32, &stream).unwrap()
+            } else {
+                arrays[&format!("r{expected_rank}d{destination}")].clone()
+            }
+        })
         .collect::<Vec<_>>();
     let _profiling = profile_expert_parallel_timings();
     let send_counts = blocks
@@ -508,7 +515,6 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
     };
     let r0d0 = i32_bytes(&[10]);
     let r0d1 = i32_bytes(&[11, 12]);
-    let r1d0 = Vec::<u8>::new();
     let r1d1 = i32_bytes(&[21]);
     let f32_bytes = |values: &[f32]| {
         values
@@ -527,10 +533,6 @@ fn ring_two_process_all_to_all_v_and_dispatch_sharded() {
             (
                 "r0d1",
                 TensorView::new(TensorDtype::I32, vec![2, 1], &r0d1).unwrap(),
-            ),
-            (
-                "r1d0",
-                TensorView::new(TensorDtype::I32, vec![0, 1], &r1d0).unwrap(),
             ),
             (
                 "r1d1",

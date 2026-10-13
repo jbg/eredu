@@ -4332,6 +4332,17 @@ fn authoritative_composite_pp_summaries(
 
 #[test]
 fn authoritative_composite_dispatch_preserves_selected_gemma_partition_and_local_payload() {
+    // Unoptimized composite construction needs more than the default test stack.
+    std::thread::Builder::new()
+        .name("reference-structural-composite".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(authoritative_composite_dispatch_preserves_selected_gemma_partition_and_local_payload_inner)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn authoritative_composite_dispatch_preserves_selected_gemma_partition_and_local_payload_inner() {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     let config = serde_json::json!({
@@ -4502,6 +4513,17 @@ fn assert_two_stage_composite_dispatch(
 
 #[test]
 fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling() {
+    // Unoptimized composite construction needs more than the default test stack.
+    std::thread::Builder::new()
+        .name("reference-structural-composite".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling_inner)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn authoritative_composite_dispatch_reaches_muse_qwen_vl_conditional_and_inkling_inner() {
     let muse_config = serde_json::json!({
         "architectures": ["MuseGlimmerForConditionalGeneration"],
         "model_type": "muse_glimmer",
