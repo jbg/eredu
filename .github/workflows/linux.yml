@@ -29,6 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libclang-dev libasound2-dev
+          rustup component add llvm-tools-preview
           python3 -m pip install --user "cmake>=3.25" "meson>=0.63" ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check the portable workspace with the locked MSRV
@@ -60,6 +61,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libasound2-dev libclang-dev
+          rustup component add llvm-tools-preview
           python3 -m pip install --user "cmake>=3.25" "meson>=0.63" ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Test scoped architecture and portable consumers
