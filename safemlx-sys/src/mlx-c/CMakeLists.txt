@@ -88,7 +88,8 @@ else()
       mlx-cache-limit-query.patch
       mlx-metal-kernel-selection-trace.patch
       mlx-metal-mixed-storage-gemm.patch
-      mlx-timing-summary.patch)
+      mlx-timing-summary.patch
+      mlx-prefix-append-exports.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")

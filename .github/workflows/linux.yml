@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libclang-dev libasound2-dev
-          python3 -m pip install --user "cmake>=3.25"
+          python3 -m pip install --user "cmake>=3.25" "meson>=0.63" ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check the portable workspace with the locked MSRV
         run: cargo check --locked --workspace --all-targets --no-default-features
@@ -59,8 +59,8 @@ jobs:
       - name: Install MLX CPU build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libasound2-dev
-          python3 -m pip install --user "cmake>=3.25"
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev libasound2-dev libclang-dev
+          python3 -m pip install --user "cmake>=3.25" "meson>=0.63" ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Test scoped architecture and portable consumers
         if: ${{ !inputs.full }}

@@ -556,6 +556,9 @@ impl HostDemotionWorker {
         let handle = thread::Builder::new()
             .name("eredu-mlx-cache-host-demotion".into())
             .spawn(move || {
+                // MLX retains stream workers for the process lifetime. Reuse one
+                // stream per device rather than allocating one per cache block.
+                let mut streams: Vec<(CacheTransferDevice, Stream)> = Vec::new();
                 while let Ok(request) = receiver.recv() {
                     match request {
                         HostDemotionRequest::Demote {
@@ -564,9 +567,15 @@ impl HostDemotionWorker {
                             completion,
                         } => {
                             let result = catch_unwind(AssertUnwindSafe(|| {
-                                let device = Device::new(device.device_type, device.index);
-                                let stream = Stream::new_with_device(&device);
-                                HostCacheBlock::from_device_arrays(&arrays, &stream)
+                                let index = streams
+                                    .iter()
+                                    .position(|(key, _)| *key == device)
+                                    .unwrap_or_else(|| {
+                                        let native = Device::new(device.device_type, device.index);
+                                        streams.push((device, Stream::new_with_device(&native)));
+                                        streams.len() - 1
+                                    });
+                                HostCacheBlock::from_device_arrays(&arrays, &streams[index].1)
                             }))
                             .unwrap_or_else(|_| {
                                 Err(CacheResidencyError::Runtime(

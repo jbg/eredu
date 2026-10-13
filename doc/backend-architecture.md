@@ -2805,7 +2805,10 @@ MLX prefetch, cache-I/O, and host-demotion worker handles request shutdown
 without joining from recovery or teardown. Each worker owns its active inputs
 until that operation returns. Prefetch and cache-I/O workers cancel queued work
 and release its admission slots; the host-demotion worker drains queued inputs
-after its sender disconnects. Portable worker APIs retain deterministic joining by default and
+after its sender disconnects. Host demotion reuses one native stream per device
+for that worker's lifetime; MLX retains stream workers through process shutdown,
+so allocating a stream per cache block would accumulate unbounded threads.
+Portable worker APIs retain deterministic joining by default and
 expose nonjoining shutdown as an explicit option. Final cache-state reclamation
 removes its ephemeral files. Disk commits hold a weak state reference to avoid
 ownership cycles and remove late ephemeral outputs when that state is gone.
