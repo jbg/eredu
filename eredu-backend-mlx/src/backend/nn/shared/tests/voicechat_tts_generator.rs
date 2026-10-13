@@ -87,12 +87,9 @@ fn cpu_voicechat_tts_generator_matches_original_cached_refinement() {
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TTS_TRANSITION_REFERENCE_JSON).unwrap();
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let mut config = VoiceChatConfig::from_json(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    )))
-    .unwrap()
-    .tts;
+    let mut config = VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON)
+        .unwrap()
+        .tts;
     config.backbone = geometry(&fixture["transformer_config"], true);
     // This fixture supplies already encoded subwords. Keep construction compact
     // without binding/executing a synthetic character encoder.

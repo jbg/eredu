@@ -26,11 +26,8 @@ mod coupled;
 mod preparation;
 
 fn generation(stream: &Stream) -> MlxVoiceChatGeneration {
-    let config = VoiceChatConfig::from_json(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    )))
-    .unwrap();
+    let config =
+        VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON).unwrap();
     let input =
         InputState::new(&config.perception.preprocessor, FrontendOptions::default()).unwrap();
     let hybrid = MlxHybridState::device(

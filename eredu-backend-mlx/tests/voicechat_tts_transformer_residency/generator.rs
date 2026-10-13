@@ -91,12 +91,9 @@ pub(super) fn run(
     mode: u64,
     stream: &Stream,
 ) {
-    let mut config = VoiceChatConfig::from_json(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    )))
-    .unwrap()
-    .tts;
+    let mut config = VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON)
+        .unwrap()
+        .tts;
     config.backbone = geometry(&fixture["transformer_config"], true);
     let transformer: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TRANSFORMER_REFERENCE_JSON).unwrap();

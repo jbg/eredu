@@ -4,6 +4,9 @@
 //! nonzero weights, not a released-checkpoint parity substitute. Export ordering,
 //! normalization offsets, and recurrent negative-exponential values are authored
 //! independently of architecture checkpoint recipes.
+/// Published Qwen4-Exp configuration used by checkpoint and metadata conformance fixtures.
+pub const RELEASED_CONFIG_JSON: &str = include_str!("qwen4_exp/released-config.json");
+
 use eredu_architectures::qwen4_exp::{
     checkpoint::schema::SafetensorsEncoding,
     config::NGramSourceLayout,

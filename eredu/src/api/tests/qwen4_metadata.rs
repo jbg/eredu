@@ -1,8 +1,7 @@
 //! Released Flash-Next sidecars keep lexical reset and facade termination distinct.
 use super::*;
 
-const CONFIG: &str =
-    include_str!("../../../../eredu-architectures/src/qwen4_exp/config/released.json");
+const CONFIG: &str = eredu_evaluation::qwen4_exp::RELEASED_CONFIG_JSON;
 const GENERATION: &str = include_str!(
     "../../../tests/fixtures/chat_templates/qwen3.8-flash-next-de4b8e4d-generation-config.json"
 );
