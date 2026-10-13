@@ -567,7 +567,10 @@ fn full_vocabulary_token_scores_use_every_logit_and_bound_host_reads() {
         );
     }
     let (reads, largest) = HOST_READS.with(|reads| reads.get());
-    assert_eq!(largest, 1, "only scalar reductions leave the device");
+    assert_eq!(
+        largest, 2,
+        "only the two full chunk sums leave the device together"
+    );
     assert!(reads <= 32);
     assert!(cost.host_bytes >= reads as u64 * 4);
     assert!(

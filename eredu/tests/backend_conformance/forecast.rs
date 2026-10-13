@@ -868,6 +868,7 @@ fn continuation_payload_floors_cover_installed_state_without_capacity_or_optiona
         zero.additional_input_tokens = 0;
         let mut zero_request = request.clone();
         zero_request.max_output_tokens = Some(0);
+        zero_request.forecast_output_tokens = 0;
         let forecast = estimate_continuation_memory(&zero_request, &zero).unwrap();
         assert_eq!(forecast.domains[0].phases.len(), 1);
         assert_eq!(

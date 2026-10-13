@@ -1394,6 +1394,17 @@ impl AttentionCache<ReferenceTensor> for ReferenceCache {
     }
 }
 
+impl eredu_nn::ReadOnlyAttentionCache<ReferenceTensor> for ReferenceCache {
+    fn attention_with_transient(
+        &mut self,
+        request: AttentionRequest<'_, ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        // Structural attention preserves query geometry without advancing state.
+        Ok(request.queries)
+    }
+}
+
 impl eredu_nn::AuxiliaryConvolutionState<ReferenceTensor> for ReferenceCache {
     fn convolution_state(&mut self, _slot: u32) -> Result<&mut Option<ReferenceTensor>, Error> {
         Ok(&mut self.fixed)

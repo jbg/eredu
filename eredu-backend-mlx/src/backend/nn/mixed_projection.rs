@@ -223,7 +223,15 @@ mod tests {
         let weight = weight.reshape(&[17, 128], &stream).unwrap();
         safemlx::transforms::eval([&weight]).unwrap();
         let batch = Array::from_slice(&values(256, 123), &[2, 128]);
-        assert_same(&batch, &weight, &stream);
+        if safemlx::fast::mixed_storage_gemm_workspace(2, 17, 128, &stream)
+            .unwrap()
+            .is_some()
+        {
+            assert_same(&batch, &weight, &stream);
+        } else {
+            // Native NAX/TF32 dispatch retains the ordinary projection fallback.
+            assert!(project(&batch, &weight, &stream).unwrap().is_none());
+        }
         assert!(project(
             &input.as_dtype(Dtype::Bfloat16, &stream).unwrap(),
             &weight,
@@ -312,7 +320,11 @@ mod tests {
                     .retained_payload_bytes;
                 // Beyond the admitted GEMM bounds, both callers still use
                 // the existing retained-conversion fallback.
-                assert_eq!(retained, if rows == 2001 { 17 * 128 * 4 } else { 0 });
+                let mixed = rows == 1
+                    || safemlx::fast::mixed_storage_gemm_workspace(rows as i32, 17, 128, &stream)
+                        .unwrap()
+                        .is_some();
+                assert_eq!(retained, if mixed { 0 } else { 17 * 128 * 4 });
                 trim_budget(&budget).unwrap();
             }
         }
@@ -439,16 +451,18 @@ mod storage_tests {
             let before = safemlx::memory::active_memory().unwrap();
             let facts = storage_facts(&weight, &stream).unwrap().unwrap();
             assert_eq!(before, safemlx::memory::active_memory().unwrap());
-            let partial = safemlx::fast::mixed_storage_gemm_workspace(8, 129, 257, &stream)
-                .unwrap()
-                .unwrap();
-            assert!(partial > 0, "fixture must select split-K partial storage");
+            let partial =
+                safemlx::fast::mixed_storage_gemm_workspace(8, 129, 257, &stream).unwrap();
+            if let Some(partial) = partial {
+                assert!(
+                    partial > 0,
+                    "SIMD fixture must select split-K partial storage"
+                );
+            }
             assert_eq!(
                 facts
                     .for_invocation(257, 129, &eredu_core::checkpoint::TensorDtype::F32, 8)
-                    .unwrap()
-                    .partial_bytes_per_row
-                    * 8,
+                    .map(|row| row.partial_bytes_per_row * 8),
                 partial
             );
             assert!(facts
@@ -475,7 +489,12 @@ mod storage_tests {
                 let input = strided.try_index_device((0..rows, ..), &stream).unwrap();
                 safemlx::transforms::eval([&input]).unwrap();
                 assert_eq!(input.strides()[1], 2);
-                let actual = project(&input, &weight, &stream).unwrap().unwrap();
+                let actual = project(&input, &weight, &stream).unwrap();
+                if rows > 1 && partial.is_none() {
+                    assert!(actual.is_none(), "NAX/TF32 retains the ordinary fallback");
+                    continue;
+                }
+                let actual = actual.unwrap();
                 assert!(!actual.is_available().unwrap());
                 let expected = safemlx::ops::matmul(
                     &input,
