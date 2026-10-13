@@ -48,16 +48,24 @@ rustup toolchain install 1.89.0 --profile minimal
 RUSTUP_TOOLCHAIN=1.89.0 python3 validation/validate_release_packages.py
 ```
 
-The validator copies the Git package candidates to a content-identified workspace, then
-runs `cargo package` for each crate. It unpacks each archive, compiles its
-library unit tests, and runs its doctests with default features disabled before
-adding that archive to its own content-identified local registry. After staging a library, it
-also checks a new lock-free downstream crate that depends on the staged package
-with default features disabled. This lets consumers and the next workspace crate
-resolve the exact unpublished version while retaining Cargo's normal package
-verification. Package builds use a temporary target directory by default, or retain compiler
-outputs in an explicit `--target-dir` for subsequent runs. Nothing contacts a registry publishing API and no credentials
-are required.
+The validator copies the Git package candidates to a content-identified workspace,
+then runs `cargo package --no-verify --exclude-lockfile` for each selected crate.
+It stages every exact archive in a content-identified local registry before
+building or testing any archive. This supports development-dependency cycles
+without substituting workspace source for packaged files. Normal and build
+dependencies still follow publication order.
+
+Verification is explicit after staging: each extracted archive builds with
+default features, library test targets compile with default features disabled,
+and doctests run with default features disabled. A test helper's dependency back
+to the package under test resolves to that same extracted archive so public Rust
+types retain one identity. A fresh lock-free downstream consumer also checks
+each staged library with default features disabled. No workspace lockfile or
+source path is used for these checks.
+
+Package builds use a temporary target directory by default, or retain compiler
+outputs in an explicit `--target-dir` for subsequent runs. Nothing contacts a
+registry publishing API and no credentials are required.
 
 This catches:
 
@@ -190,18 +198,27 @@ available in the registry index before continuing:
 10. `eredu-nn`
 11. `eredu-runtime`
 12. `eredu-media`
-13. `eredu-architectures`
-14. `eredu-codec`
+13. `eredu-codec`
+14. `eredu-architectures`
 15. `eredu-evaluation`
 16. `eredu-backend-mlx`
 17. `eredu`
 18. `eredu-cli`
 
-This is a valid topological order for normal, build, and development
-dependencies. In particular, `eredu-evaluation` precedes
-`eredu-backend-mlx` because the backend uses it as a development dependency.
-`eredu-media` precedes its architecture consumers. The validator's declared
-order is checked against Cargo metadata so CI fails when it becomes stale.
+This is a topological order for normal and build dependencies. Development
+dependencies may point forward: architecture integration tests use evaluation
+helpers that depend on the architecture library. The complete archive set is
+staged before test verification. The validator checks the declared production
+order against Cargo metadata so CI fails when it becomes stale.
 
 For a local check of uncommitted source, pass `--allow-dirty`. CI and release
 preparation should use a clean checkout and the command without that option.
+
+## Native numerical validation
+
+Native numerical validation sets `MLX_ENABLE_TF32=0` before MLX initialization
+so FP32 reference tolerances apply on NAX-capable Macs as well. The backend unit
+runner defaults to one fresh process per test to isolate global allocator
+observations, failed submissions, and process-lifetime stream workers. An explicit
+`--batch-size` groups tests sequentially; `MLX_ENABLE_TF32=1` selects native TF32
+dispatch for targeted compatibility checks.

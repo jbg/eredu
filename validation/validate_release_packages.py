@@ -20,8 +20,8 @@ import urllib.request
 from typing import Any
 
 
-# This is also the documented publication order. Dependency order includes
-# development dependencies because crates.io validates their version metadata.
+# Normal/build dependencies determine publication order. Development edges may
+# point forward: all archives are staged before their tests are compiled.
 RELEASE_ORDER = (
     "eredu-gguf",
     "safemlx-internal-macros",
@@ -35,8 +35,8 @@ RELEASE_ORDER = (
     "eredu-nn",
     "eredu-runtime",
     "eredu-media",
-    "eredu-architectures",
     "eredu-codec",
+    "eredu-architectures",
     "eredu-evaluation",
     "eredu-backend-mlx",
     "eredu",
@@ -117,7 +117,7 @@ def validate_release_order(packages: dict[str, dict[str, Any]]) -> None:
         for dependency in package["dependencies"]:
             dependency_name = dependency["name"]
             if dependency_name in packages:
-                if positions[dependency_name] >= positions[package_name]:
+                if dependency.get("kind") != "dev" and positions[dependency_name] >= positions[package_name]:
                     raise RuntimeError(
                         f"{dependency_name} must precede {package_name} in the release order"
                     )
@@ -287,7 +287,10 @@ def registry_record(
     return record
 
 
-def write_cargo_config(config: Path, staged: list[dict[str, Any]]) -> None:
+def write_cargo_config(
+    config: Path, staged: list[dict[str, Any]],
+    root_package: tuple[str, Path] | None = None,
+) -> None:
     lines = []
     for package in staged:
         lines.extend([f'[registries.{package["name"]}]',
@@ -295,10 +298,21 @@ def write_cargo_config(config: Path, staged: list[dict[str, Any]]) -> None:
     if staged:
         lines.extend(["", "[patch.crates-io]"])
         for package in staged:
-            lines.append(
-                f'{json.dumps(package["name"])} = '
-                f'{{ version = "={package["version"]}", registry = "{package["name"]}" }}'
-            )
+            if root_package is not None and package["name"] == root_package[0]:
+                lines.append(f'{json.dumps(package["name"])} = {{ path = {json.dumps(str(root_package[1]))} }}')
+            else:
+                lines.append(
+                    f'{json.dumps(package["name"])} = '
+                    f'{{ version = "={package["version"]}", registry = "{package["name"]}" }}'
+                )
+        if root_package is not None:
+            root = next(package for package in staged if package["name"] == root_package[0])
+            # A test helper may depend back on the package under test. Resolve
+            # that edge to this extracted archive, preserving Rust type identity.
+            lines.extend([
+                "", f'[patch.{json.dumps(root["index"].as_uri())}]',
+                f'{json.dumps(root_package[0])} = {{ path = {json.dumps(str(root_package[1]))} }}',
+            ])
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -369,15 +383,20 @@ def validate_packaged_tests(
     destination: Path,
     config: Path,
     environment: dict[str, str],
+    staged: list[dict[str, Any]] | None = None,
 ) -> None:
+    destination = destination / hashlib.sha256(archive.read_bytes()).hexdigest()
+    shutil.unpack_archive(archive, destination, "gztar")
+    package_root = (destination / f'{package["name"]}-{package["version"]}').resolve()
+    normalize_source_times(package_root)
+    if staged is not None:
+        config = destination / "cargo-config.toml"
+        write_cargo_config(config, staged, (package["name"], package_root))
+    # Preserve Cargo package's default-feature build verification after staging.
+    run(["cargo", "build", "--config", str(config)], cwd=package_root, env=environment)
     library_kinds = {"lib", "proc-macro"}
     if not any(library_kinds.intersection(target["kind"]) for target in package["targets"]):
         return
-
-    destination = destination / hashlib.sha256(archive.read_bytes()).hexdigest()
-    shutil.unpack_archive(archive, destination, "gztar")
-    package_root = destination / f'{package["name"]}-{package["version"]}'
-    normalize_source_times(package_root)
     run(
         [
             "cargo",
@@ -548,6 +567,8 @@ def main() -> int:
                     "cargo",
                     "package",
                     "--quiet",
+                    "--no-verify",
+                    "--exclude-lockfile",
                     "-p",
                     crate_name,
                     "--config",
@@ -565,16 +586,19 @@ def main() -> int:
                     f"{MAX_ARCHIVE_BYTES:,} bytes"
                 )
             print(f"    archive size: {size / 1024:.1f} KiB", flush=True)
-            validate_packaged_tests(
-                package,
-                archive,
-                root / "unit-tests",
-                config,
-                environment,
-            )
             entry = stage_package(package, archive, root / "registries", staged)
             staged.append(entry)
             write_cargo_config(config, staged)
+
+        # Dev dependencies can form cycles with production dependencies. Package
+        # without resolving a registry lockfile, then verify the exact archives
+        # against the complete staged set rather than workspace source paths.
+        for entry in staged:
+            package = packages[entry["name"]]
+            archive = target_dir / "package" / f"{package['name']}-{package['version']}.crate"
+            validate_packaged_tests(
+                package, archive, root / "unit-tests", config, environment, staged,
+            )
             validate_downstream_consumer(
                 package,
                 root / "downstream-consumers" / entry["index"].parent.name,

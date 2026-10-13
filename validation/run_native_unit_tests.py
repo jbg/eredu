@@ -3,12 +3,15 @@
 
 MLX retains stream workers for the process lifetime. The full backend suite
 creates enough independent streams to exceed macOS's thread limit even when
-tests run sequentially. Batching bounds that accumulation without skipping tests
+tests run sequentially. A fresh process per test also isolates global allocator
+counters and failed submissions. Explicit batching bounds accumulation without
+skipping tests
 or changing production stream ownership. Explicitly ignored tests remain ignored.
 """
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -26,11 +29,15 @@ def run_batches(executable: str, batch_size: int) -> int:
     names = test_names(listing)
     if not names:
         raise RuntimeError("backend unit test executable listed no tests")
+    # Reference fixtures compare full FP32 arithmetic across execution paths.
+    # Callers can explicitly opt into native TF32 dispatch for targeted checks.
+    environment = dict(os.environ)
+    environment.setdefault("MLX_ENABLE_TF32", "0")
     failed = False
     for start in range(0, len(names), batch_size):
         batch = names[start:start + batch_size]
         print(f"Backend tests {start + 1}–{start + len(batch)} / {len(names)}", flush=True)
-        result = subprocess.run([executable, "--exact", *batch])
+        result = subprocess.run([executable, "--test-threads=1", "--exact", *batch], env=environment)
         failed |= result.returncode != 0
     return int(failed)
 
@@ -38,7 +45,7 @@ def run_batches(executable: str, batch_size: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", default="metal,accelerate")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--executable", help="reuse an already built test executable")
     args = parser.parse_args()
     if args.batch_size < 1:
