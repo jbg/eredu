@@ -22,10 +22,17 @@ class NativeUnitBatchTests(unittest.TestCase):
                         .open(std::env::var("EREDU_BATCH_TEST_LOG").unwrap()).unwrap();
                     writeln!(file, "{name}").unwrap();
                 }
-                #[test] fn a() { record("a"); }
+                fn cache_marker() -> std::path::PathBuf {
+                    std::path::PathBuf::from(std::env::var("EREDU_PREPARED_CHECKPOINT_CACHE").unwrap())
+                        .join("marker")
+                }
+                #[test] fn a() { record("a"); std::fs::write(cache_marker(), "warm").unwrap(); }
                 #[test] fn a_longer() { record("a_longer"); panic!("must propagate"); }
                 #[test] #[ignore] fn ignored() { panic!("must stay ignored"); }
-                #[test] fn z_after_failure() { record("after_failure"); }
+                #[test] fn z_after_failure() {
+                    assert!(!cache_marker().exists(), "each batch starts with a fresh cache");
+                    record("after_failure");
+                }
             ''')
             executable = str(root / "tests")
             subprocess.run(["rustc", "--test", str(source), "-o", executable], check=True)
