@@ -166,8 +166,8 @@ fn arbitrary_prefill_chunks_decode_and_restored_histories_match_reference() {
             let result = spec.select(Some(&input), 2, n, &history, 96).unwrap();
             let replay = spec.select(Some(&input), 2, n, &saved, 96).unwrap();
             assert_eq!(result, replay);
-            for b in 0..2 {
-                rows[b].extend_from_slice(&result.rows[b * n * 6..(b + 1) * n * 6]);
+            for (b, row) in rows.iter_mut().enumerate() {
+                row.extend_from_slice(&result.rows[b * n * 6..(b + 1) * n * 6]);
             }
             // A rejected speculative proposal is a separate history value.
             let rejected = spec.select(Some(&[99, 100]), 2, 1, &saved, 12).unwrap();

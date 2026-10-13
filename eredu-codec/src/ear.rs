@@ -321,6 +321,7 @@ pub trait AudioDecoderExecution<B: NeuralBackend> {
         batch: i32,
     ) -> Result<AudioDecoderState<B::Tensor, Self::NeuralState>, Error>;
     /// Proposes one code chunk without adopting its neural or spectral carry.
+    #[allow(clippy::type_complexity)]
     fn step(
         &mut self,
         codes: &B::Tensor,
@@ -329,6 +330,7 @@ pub trait AudioDecoderExecution<B: NeuralBackend> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, AudioDecoderState<B::Tensor, Self::NeuralState>), Error>;
     /// Drains retained overlap without consuming a code frame.
+    #[allow(clippy::type_complexity)]
     fn finish(
         &mut self,
         state: &AudioDecoderState<B::Tensor, Self::NeuralState>,
@@ -428,6 +430,7 @@ impl<B: NeuralBackend> AudioDecoderKernel<B> {
             .checked_add(codes.dim(1) as u64)
             .ok_or_else(|| invalid("EAR code frame clock exhausted"))
     }
+    #[allow(clippy::type_complexity)]
     pub(crate) fn render<N>(
         &self,
         raw: &B::Tensor,
@@ -451,6 +454,7 @@ impl<B: NeuralBackend> AudioDecoderKernel<B> {
             },
         ))
     }
+    #[allow(clippy::type_complexity)]
     pub(crate) fn drain<N>(
         &self,
         neural: N,

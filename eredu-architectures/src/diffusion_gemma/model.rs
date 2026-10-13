@@ -131,8 +131,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TextModel<B> 
             let origin = forward.position + query - keys;
             let values = (0..query)
                 .flat_map(|q| {
-                    (0..keys)
-                        .map(move |k| i32::from(origin + k >= forward.position + q - window + 1))
+                    (0..keys).map(move |k| i32::from(origin + k > forward.position + q - window))
                 })
                 .collect::<Vec<_>>();
             let visible = B::Tensor::from_i32_slice(&values, &[1, 1, query, keys], context)?

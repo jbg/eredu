@@ -4,6 +4,7 @@ use eredu_core::{
     refinement::GenerationPhase, PendingTextInput, TextOperationOutput, TextProgress,
 };
 
+#[allow(clippy::type_complexity)]
 pub(super) fn submit(
     runtime: &mut ModelRuntime<MockBackend>,
     input: PendingTextInput<Vec<u32>, MockToken>,
@@ -107,7 +108,7 @@ fn iterative_drafts_preserve_controlled_and_ordinary_unicode_and_eos_commitment(
     };
     let prepare = |model: &LoadedModel<MockBackend>| {
         model
-            .prepare_observed_chat(&chat, settings.clone(), CapturePlan::none(), limits)
+            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits)
             .unwrap()
     };
     let mut ordinary = Vec::new();

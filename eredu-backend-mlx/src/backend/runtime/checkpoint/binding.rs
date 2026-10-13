@@ -194,9 +194,8 @@ pub fn materialize_module_bindings(
             BindingReadBatch::Direct { bindings, reads } => {
                 let inputs = DirectRecipeRead::materialize_many(reads, source_stream)?;
                 let mut prepared = WeightMaterialization::prepare_retained(inputs, Vec::new())?;
-                for index in 0..prepared.inputs().len() {
+                for (index, binding) in bindings[..prepared.inputs().len()].iter().enumerate() {
                     let input = &prepared.inputs()[index];
-                    let binding = bindings[index];
                     let output = if source_stream == execution_stream {
                         input.clone()
                     } else {

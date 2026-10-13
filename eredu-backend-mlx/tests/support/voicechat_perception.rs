@@ -330,7 +330,7 @@ pub fn pipeline(
         residency,
     } = prepare_pipeline(dimensions, source, cut, mode, world);
     let (model, state, metadata) =
-        materialize_voicechat_perception_pipeline(prepared, &world, residency, &weights, &stream)
+        materialize_voicechat_perception_pipeline(prepared, world, residency, weights, stream)
             .unwrap();
 
     assert_eq!(metadata.static_device_bytes(), 0);

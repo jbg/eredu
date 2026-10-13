@@ -423,6 +423,7 @@ pub fn duplex(
     Ok((input, output))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn input_stream<T: SizedSample + Send + 'static>(
     device: &Device,
     config: cpal::StreamConfig,
@@ -464,6 +465,7 @@ where
         )
         .map_err(device_error)
 }
+#[allow(clippy::too_many_arguments)]
 fn capture<T: Sample>(
     data: &[T],
     channels: usize,
@@ -476,7 +478,7 @@ fn capture<T: Sample>(
 ) where
     f32: FromSample<T>,
 {
-    if channels == 0 || data.len() % channels != 0 {
+    if channels == 0 || !data.len().is_multiple_of(channels) {
         failed.store(true, Ordering::Release);
         return;
     }
@@ -758,7 +760,7 @@ impl PlaybackConsumer {
             self.len -= 1;
         }
         data.fill(T::EQUILIBRIUM);
-        if channels == 0 || data.len() % channels != 0 {
+        if channels == 0 || !data.len().is_multiple_of(channels) {
             state.failed.store(true, Ordering::Release);
             return;
         }

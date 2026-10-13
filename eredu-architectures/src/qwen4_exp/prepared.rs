@@ -436,7 +436,7 @@ fn safetensors_format_recipes<C: eredu_checkpoint::recipe::RecipeCatalog + ?Size
     // The released policy is homogeneous; do not silently reinterpret a
     // custom per-expert exclusion as a block-scaled packed parameter.
     for key in keys {
-        let canonical = checkpoint::schema::canonical_name(&key);
+        let canonical = checkpoint::schema::canonical_name(key);
         let Some((root, member)) = canonical.split_once(".mlp.experts.") else {
             continue;
         };

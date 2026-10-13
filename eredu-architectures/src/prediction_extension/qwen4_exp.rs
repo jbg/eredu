@@ -863,7 +863,7 @@ where
         let module = mtp::PredictionUnit::<B>::new(unit.clone(), context)
             .map_err(|error| invalid(error.to_string()))?;
         let group = module_parameter_group(
-            &format!("mtp.layers.{depth}"),
+            format!("mtp.layers.{depth}"),
             ParameterRole::Replicated,
             &module,
             |_, _| Ok(MemberSharding::Replicated),

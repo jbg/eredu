@@ -345,7 +345,7 @@ fn voicechat_channel_decision_rejects_before_draws_and_rolls_back_partial_select
         "invalid effective feedback is rejected before sampling"
     );
     assert_eq!(branch.random_state(), Some(&random));
-    assert_eq!(branch.samplers(), &[sampler.clone()]);
+    assert_eq!(branch.samplers(), std::slice::from_ref(&sampler));
     let mut malformed = logits.clone();
     malformed.function = NumericTensor::new(vec![2, 8], vec![0.; 16]);
     assert!(select_channels::<TensorSampling, _, _, _, _>(
@@ -663,7 +663,7 @@ fn voicechat_dynamic_channel_policy_sees_current_rnnt_and_raw_tokens_before_rng_
             "raw sampling precedes dynamic policy"
         );
         assert_eq!(branch.random_state(), Some(&random));
-        assert_eq!(branch.samplers(), &[sampler.clone()]);
+        assert_eq!(branch.samplers(), std::slice::from_ref(&sampler));
     }
     let decision = select_channels::<TensorSampling, _, _, _, _>(
         &mut branch,

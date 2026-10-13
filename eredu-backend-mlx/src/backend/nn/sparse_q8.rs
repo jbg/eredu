@@ -1,7 +1,7 @@
 //! Exact-zero-aware affine Q8 matrix-vector projection over shared transposed storage.
-use safemlx::{error::Exception, Array, Stream};
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 use safemlx::Dtype;
+use safemlx::{error::Exception, Array, Stream};
 
 pub(crate) fn project(
     input: &Array,

@@ -357,7 +357,7 @@ impl ModelProcessor {
     }
 
     /// Lowers the authoritative architecture-owned processor plan to MLX execution.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "image"))]
     pub fn from_plan(
         plan: &eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     ) -> Option<Self> {

@@ -64,6 +64,7 @@ fn snapshot(state: &State, stream: &Stream) -> State {
     copied
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exercise(
     predictor: &mut MlxRnntPredictorPipeline,
     directory: &std::path::Path,

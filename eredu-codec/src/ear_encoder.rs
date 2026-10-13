@@ -192,6 +192,7 @@ impl EncoderUnitSpec {
 
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "T")]
+#[allow(clippy::large_enum_variant)]
 enum EncoderOperation<T: Tensor> {
     Input(Pointwise<T>),
     Block(ConvNextBlock<T>),

@@ -66,7 +66,7 @@ fn expected_convolution(input: &[f32], length: usize, mode: PadMode) -> Vec<f32>
     for channel in 0..2 {
         for frame in 0..length.div_ceil(2) {
             let mut sum = biases[channel];
-            for tap in 0..3 {
+            for (tap, weight) in weights[channel].iter().enumerate() {
                 let index = 2 * frame as isize + 2 * tap as isize - 3;
                 let sample = if (0..length as isize).contains(&index) {
                     input[channel * length + index as usize]
@@ -75,7 +75,7 @@ fn expected_convolution(input: &[f32], length: usize, mode: PadMode) -> Vec<f32>
                 } else {
                     0.
                 };
-                sum += sample * weights[channel][tap];
+                sum += sample * weight;
             }
             output.push(sum);
         }
@@ -181,11 +181,11 @@ fn expected_transpose(input: &[f32], length: usize, tail: TransposeTail) -> Vec<
             output[channel * out_length + position] = biases[channel];
         }
         for frame in 0..length {
-            for tap in 0..5 {
+            for (tap, weight) in weights[channel].iter().enumerate() {
                 let position = frame * 2 + tap;
                 if position < out_length {
                     output[channel * out_length + position] +=
-                        input[channel * length + frame] * weights[channel][tap];
+                        input[channel * length + frame] * weight;
                 }
             }
         }

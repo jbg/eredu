@@ -567,6 +567,7 @@ impl<T: Tensor> ConvNextBlock<T> {
 /// One execution and residency unit in canonical decoder layer order.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "T")]
+#[allow(clippy::large_enum_variant)]
 enum DecoderOperation<T: Tensor> {
     /// Nonoverlapping learned upsampling.
     Upsample(Upsample<T>),

@@ -215,6 +215,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
     /// Advances one physical operation, including context and tentative refinement.
     /// Progress leaves the commitment controller unchanged. Drain its completed
     /// records before advancing or composing a snapshot boundary.
+    #[allow(clippy::type_complexity)]
     pub fn advance_operation<C: TokenFilterController>(
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,

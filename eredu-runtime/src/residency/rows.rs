@@ -22,7 +22,9 @@ impl RowResidencyRange {
         let binding = validate_name(binding.into())?;
         let rows = source.metadata().shape[0] as u64;
         let bytes = source.metadata().byte_len;
-        if range.end() - range.start() != rows || bytes % rows != 0 || range.bytes() != bytes / rows
+        if range.end() - range.start() != rows
+            || !bytes.is_multiple_of(rows)
+            || range.bytes() != bytes / rows
         {
             return Err(ResidencyControllerError::RowRangeGeometry {
                 prefix: range.prefix().clone(),

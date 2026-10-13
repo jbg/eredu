@@ -7,6 +7,7 @@ use eredu_runtime::{
     CommunicationTensorLimits,
 };
 
+#[allow(dead_code)] // Shared fixture; individual integration targets use different constructors.
 pub fn coordinator(
     world: &safemlx::distributed::Group,
     stream: &safemlx::Stream,
@@ -15,6 +16,7 @@ pub fn coordinator(
 }
 
 /// Includes bounded F32 vocabulary gathering for independently leased heads.
+#[allow(dead_code)] // Shared fixture; individual integration targets use different constructors.
 pub fn coordinator_with_gather(
     world: &safemlx::distributed::Group,
     stream: &safemlx::Stream,

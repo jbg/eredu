@@ -641,7 +641,9 @@ impl Fixture {
                 n != &format!("{root}.gate_proj") && n != &format!("{root}.up_proj")
             });
             let packed = gate
-                .chunks_exact(1024)
+                .as_chunks::<1024>()
+                .0
+                .iter()
                 .zip(up.chunks_exact(1024))
                 .flat_map(|(g, u)| g.iter().chain(u))
                 .flat_map(|v| v.to_le_bytes())

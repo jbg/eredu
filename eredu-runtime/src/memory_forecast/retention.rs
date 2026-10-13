@@ -361,7 +361,9 @@ mod tests {
         ] {
             let r = report(policy, retained, reserved);
             let before = r.clone();
-            let plan = ConversionRetentionMemoryPlan::observe(&[r.clone()], None, &[&t]).unwrap();
+            let plan =
+                ConversionRetentionMemoryPlan::observe(std::slice::from_ref(&r), None, &[&t])
+                    .unwrap();
             assert_eq!(
                 plan.groups[0].additional_admission_payload.upper_bytes,
                 Some(expected)
@@ -390,11 +392,21 @@ mod tests {
         let mut t = topology();
         let c = conversion(r.group.clone(), 100);
         assert_eq!(
-            credit_topology(&mut t, &[c.clone()], Some(&[r.clone()])).unwrap(),
+            credit_topology(
+                &mut t,
+                std::slice::from_ref(&c),
+                Some(std::slice::from_ref(&r))
+            )
+            .unwrap(),
             100
         );
         assert_eq!(
-            credit_topology(&mut t, &[c.clone()], Some(&[r.clone()])).unwrap(),
+            credit_topology(
+                &mut t,
+                std::slice::from_ref(&c),
+                Some(std::slice::from_ref(&r))
+            )
+            .unwrap(),
             0
         );
         assert_eq!(t.selected_parameter_promotion_bytes, Some(200));
@@ -409,7 +421,8 @@ mod tests {
         ] {
             let mut refreshed = topology();
             assert_eq!(
-                credit_topology(&mut refreshed, &conversions, Some(&[r.clone()])).unwrap(),
+                credit_topology(&mut refreshed, &conversions, Some(std::slice::from_ref(&r)))
+                    .unwrap(),
                 0
             );
             assert_eq!(refreshed.selected_parameter_promotion_bytes, Some(300));
@@ -417,12 +430,12 @@ mod tests {
         let mut shared = c.clone();
         shared.bindings.push(shared.bindings[0].clone());
         assert_eq!(
-            credit_topology(&mut topology(), &[shared], Some(&[r.clone()])).unwrap(),
+            credit_topology(&mut topology(), &[shared], Some(std::slice::from_ref(&r))).unwrap(),
             100
         );
         let trimmed = report(Policy::Bounded { max_bytes: 300 }, 0, 0);
         assert_eq!(
-            credit_topology(&mut topology(), &[c], Some(&[trimmed.clone()])).unwrap(),
+            credit_topology(&mut topology(), &[c], Some(std::slice::from_ref(&trimmed))).unwrap(),
             0,
             "another owner holding backing cannot keep a released claim's credit"
         );
@@ -438,7 +451,8 @@ mod tests {
     #[test]
     fn missing_policy_and_mechanisms_stay_unknown_and_round_trip() {
         let mut r = report(Policy::Bounded { max_bytes: 100 }, 0, 0);
-        let plan = ConversionRetentionMemoryPlan::observe(&[r.clone()], None, &[]).unwrap();
+        let plan =
+            ConversionRetentionMemoryPlan::observe(std::slice::from_ref(&r), None, &[]).unwrap();
         assert_eq!(
             plan.groups[0].additional_admission_payload.upper_bytes,
             Some(100)
@@ -452,14 +466,16 @@ mod tests {
             plan
         );
         r.policy = Observed::unavailable("historical observation");
-        assert!(
-            ConversionRetentionMemoryPlan::observe(&[r.clone()], None, &[&topology()])
-                .unwrap()
-                .groups[0]
-                .additional_admission_payload
-                .upper_bytes
-                .is_none()
-        );
+        assert!(ConversionRetentionMemoryPlan::observe(
+            std::slice::from_ref(&r),
+            None,
+            &[&topology()]
+        )
+        .unwrap()
+        .groups[0]
+            .additional_admission_payload
+            .upper_bytes
+            .is_none());
         r.policy = Observed::exact(
             ParameterConversionRetentionPolicyReport::resolve(
                 Some(Policy::Unlimited),

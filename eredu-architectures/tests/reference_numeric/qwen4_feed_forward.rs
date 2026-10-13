@@ -114,7 +114,7 @@ fn oracle(input: &NumericTensor, c: &Config, p: &Parameters) -> NumericTensor {
             1.
         };
         selected.sort();
-        let mut output = vec![0.; 3];
+        let mut output = [0.; 3];
         for expert in selected {
             let both = projection(
                 &mixed,

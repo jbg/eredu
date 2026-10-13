@@ -128,6 +128,7 @@ fn quantizer_bindings(
     PreparedQuantizerBindings::from_recipes(config, "tts_model.audio_codec.prvq", source, &recipes)
         .unwrap()
 }
+#[allow(clippy::too_many_arguments)]
 fn step(
     kernel: &AudioDecoderKernel<Backend>,
     neural: &mut MlxEarDecoderPipeline,
@@ -149,6 +150,7 @@ fn step(
     )
     .step(codes, parent, true, stream)
 }
+#[allow(clippy::too_many_arguments)]
 fn finish(
     kernel: &AudioDecoderKernel<Backend>,
     neural: &mut MlxEarDecoderPipeline,
@@ -190,6 +192,7 @@ fn compare_tensor(actual: &MlxTensor, expected: &MlxTensor, fixture: &Value, str
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exercise(
     neural: &mut MlxEarDecoderPipeline,
     source: SharedCheckpointSource,

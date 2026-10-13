@@ -78,23 +78,23 @@ fn selected_cpu_sdpa_reports_full_score_payloads_and_preserves_unknowns() {
     let storage = |name: &str| cpu.storage.iter().find(|s| s.name == name).unwrap();
     assert_eq!(
         storage("sdpa_scaled_queries").payload,
-        MechanismBytes::exact(1 * 2 * 128 * 2 * 2)
+        MechanismBytes::exact(2 * 128 * 2 * 2)
     );
     assert_eq!(
         storage("sdpa_full_scores").payload,
-        MechanismBytes::exact(1 * 2 * 128 * 129 * 2)
+        MechanismBytes::exact(2 * 128 * 129 * 2)
     );
     assert_eq!(
         storage("sdpa_masked_scores").payload,
         MechanismBytes {
             lower: 0,
-            upper: Some(1 * 2 * 128 * 129 * 2)
+            upper: Some(2 * 128 * 129 * 2)
         }
     );
     for name in ["sdpa_sink_scores", "sdpa_probabilities"] {
         assert_eq!(
             storage(name).payload,
-            MechanismBytes::exact(1 * 2 * 128 * 130 * 2)
+            MechanismBytes::exact(2 * 128 * 130 * 2)
         );
         assert_eq!(storage(name).capacity.upper, None);
         assert_eq!(storage(name).retention, StorageRetention::Evaluation);

@@ -487,7 +487,7 @@ where
             .map_err(ChannelDecisionPreflightError::Sampling)?;
         Ok(effective)
     })();
-    let agreement = match coordination.as_deref_mut() {
+    let agreement = match coordination {
         Some(authority) => authority.agree(
             ChannelDecisionPhase::Candidate,
             &[

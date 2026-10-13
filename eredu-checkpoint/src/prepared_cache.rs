@@ -602,6 +602,7 @@ impl Drop for PreparedCheckpointWriter {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::store::{EncodedTensorLease, MemoryWeightStore, TensorSelection};
@@ -770,7 +771,13 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(
-            prepared_checkpoint_recipe_key(&source, &[selected.clone()], b"selected", 16).unwrap(),
+            prepared_checkpoint_recipe_key(
+                &source,
+                std::slice::from_ref(&selected),
+                b"selected",
+                16
+            )
+            .unwrap(),
             prepared_checkpoint_recipe_key(&unrelated, &[selected], b"selected", 16).unwrap()
         );
         drop(write(&policy, &key));

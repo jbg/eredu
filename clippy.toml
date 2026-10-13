@@ -1,0 +1,3 @@
+# Portable errors retain typed geometry and provenance inline. Keep the public
+# error representation stable while still flagging payloads above this bound.
+large-error-threshold = 256

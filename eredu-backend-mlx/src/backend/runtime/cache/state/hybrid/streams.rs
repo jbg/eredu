@@ -506,19 +506,19 @@ mod tests {
                 MlxHybridState::device(layout, &bindings).unwrap()
             };
             for value in [17, 23, 16_777_217] {
-                step(&mut state, value, &stream);
+                step(&mut state, value, stream);
             }
             let checkpoint = state.deep_clone_state().unwrap();
-            let mut fork = state.fork_prediction_target_state(&stream).unwrap();
-            let mut isolated = state.isolated_snapshot(&stream).unwrap();
-            step(&mut state, 99, &stream);
-            step(&mut fork, 71, &stream);
-            assert_eq!(last(&mut state, &stream), [99, -99]);
-            assert_eq!(last(&mut fork, &stream), [71, -71]);
-            assert_eq!(last(&mut isolated, &stream), [16_777_217, -16_777_217]);
-            state.restore_checkpoint(&checkpoint, &stream).unwrap();
+            let mut fork = state.fork_prediction_target_state(stream).unwrap();
+            let mut isolated = state.isolated_snapshot(stream).unwrap();
+            step(&mut state, 99, stream);
+            step(&mut fork, 71, stream);
+            assert_eq!(last(&mut state, stream), [99, -99]);
+            assert_eq!(last(&mut fork, stream), [71, -71]);
+            assert_eq!(last(&mut isolated, stream), [16_777_217, -16_777_217]);
+            state.restore_checkpoint(&checkpoint, stream).unwrap();
             assert_eq!(state.offset(), 3);
-            assert_eq!(last(&mut state, &stream), [16_777_217, -16_777_217]);
+            assert_eq!(last(&mut state, stream), [16_777_217, -16_777_217]);
             assert_eq!(state.layers_mut()[0].append_stream(9, 1).unwrap().len(), 0);
             assert!(state.layers_mut()[0].append_stream_pair(5, 5, 0).is_err());
             assert!(state.layers_mut()[0].append_stream(5, 2).is_err());
@@ -534,8 +534,8 @@ mod tests {
                 );
                 assert_eq!(before.transfer_bytes, after.transfer_bytes);
             }
-            assert_eq!(last(&mut fork, &stream), [71, -71]);
-            assert_eq!(last(&mut isolated, &stream), [16_777_217, -16_777_217]);
+            assert_eq!(last(&mut fork, stream), [71, -71]);
+            assert_eq!(last(&mut isolated, stream), [16_777_217, -16_777_217]);
         }
     }
 
@@ -611,7 +611,7 @@ mod tests {
         )
         .unwrap();
         for value in [19, 71, 16_777_217] {
-            step_for_batch(&mut state, value, batch, &stream);
+            step_for_batch(&mut state, value, batch, stream);
         }
         let descriptor = PromptCacheDescriptor::new(
             "fixture",
@@ -668,28 +668,28 @@ mod tests {
         );
         let (manager, manifest) =
             open_prompt_cache(&destination, &descriptor, &identity, &[1, 2, 3], options).unwrap();
-        let arrays = load_prompt_cache_state_tensors(&destination, &manifest, &stream).unwrap();
+        let arrays = load_prompt_cache_state_tensors(&destination, &manifest, stream).unwrap();
         let mut restored = MlxHybridState::paged(layout, manager, None, &bindings).unwrap();
         restored
             .restore_prompt_cache_state(arrays, 3, &[0])
             .unwrap();
         assert_eq!(restored.offset(), 3);
-        assert_eq!(last(&mut restored, &stream), [16_777_217, -16_777_217]);
+        assert_eq!(last(&mut restored, stream), [16_777_217, -16_777_217]);
         let fixed = restored.layers_mut()[0]
             .fixed_component(StateTensorRole::IntegerHistory { slot: 0 })
             .unwrap()
             .as_ref()
             .unwrap();
         assert_eq!(
-            fixed.to_i32_vec(&stream).unwrap(),
+            fixed.to_i32_vec(stream).unwrap(),
             [16_777_217, 17, 23, -16_777_217][..batch * 2]
         );
         assert_eq!(
             restored.layers_mut()[0].append_stream(5, 1).unwrap().len(),
             0
         );
-        step_for_batch(&mut restored, 101, batch, &stream);
-        assert_eq!(last(&mut restored, &stream), [101, -101]);
-        assert_eq!(last(&mut state, &stream), [16_777_217, -16_777_217]);
+        step_for_batch(&mut restored, 101, batch, stream);
+        assert_eq!(last(&mut restored, stream), [101, -101]);
+        assert_eq!(last(&mut state, stream), [16_777_217, -16_777_217]);
     }
 }

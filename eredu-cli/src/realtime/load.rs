@@ -347,7 +347,9 @@ pub fn load(
             crate::format_memory_size(report.host_materialization_bytes),
             crate::format_memory_size(report.speech.execution_cache_device_bytes)
         );
-        eprintln!("Conversation history and temporary computation buffers require additional memory.");
+        eprintln!(
+            "Conversation history and temporary computation buffers require additional memory."
+        );
     }
     let weights = ExecutionContext::cpu()?;
     let execution = match device {

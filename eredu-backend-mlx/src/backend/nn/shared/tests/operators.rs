@@ -1515,7 +1515,7 @@ fn mlx_selective_scan_chunk_boundaries_preserve_outputs_and_cached_state() {
         // y = c*s + x/4. The partial final chunk must retain its last state.
         close(
             &result.output,
-            &[1.09657359, 0.65342641, 1.05958116, -0.49143398, -0.75034104],
+            &[1.096_573_6, 0.653_426_4, 1.059_581_2, -0.49143398, -0.75034104],
             1e-6,
         );
         close(&result.state, &[-0.50068208], 1e-6);
@@ -1536,7 +1536,7 @@ fn mlx_selective_scan_chunk_boundaries_preserve_outputs_and_cached_state() {
         )
         .unwrap();
         close(&cached.output, &[-0.82875946], 1e-6);
-        close(&cached.state, &[0.78937973], 1e-6);
+        close(&cached.state, &[0.789_379_7], 1e-6);
     }
 }
 

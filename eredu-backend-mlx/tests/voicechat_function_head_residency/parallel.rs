@@ -34,7 +34,9 @@ fn native_function_head_parallel_worker() {
             .unwrap()
             .truncate(vocabulary as usize * 4);
         let expected = floats(&original["f32"]["function_logits"])
-            .chunks_exact(24)
+            .as_chunks::<24>()
+            .0
+            .iter()
             .flat_map(|row| row[..vocabulary as usize].iter().copied())
             .collect::<Vec<_>>();
         let mut expected = serde_json::json!({"values": expected});

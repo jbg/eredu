@@ -492,8 +492,8 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
             ));
         }
         let offset;
-        let hidden;
-        if self.config.geometry().causal {
+
+        let hidden = if self.config.geometry().causal {
             if input.key_mask.is_some()
                 || state.caches.len() != self.config.geometry().num_hidden_layers
             {
@@ -524,7 +524,7 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
                     ));
                 }
             }
-            hidden = input.embedded.clone();
+            input.embedded.clone()
         } else {
             let keys = input.key_mask.ok_or(TransformerError::Configuration(
                 "character encoder requires key mask",
@@ -544,8 +544,8 @@ impl<B: NeuralBackend> TransformerArchitecture<B> {
                         input.embedded.element_type().expect("validated precision"),
                         context,
                     )?;
-            hidden = input.embedded.multiply(&scale, context)?;
-        }
+            input.embedded.multiply(&scale, context)?
+        };
         Ok(LayeredForwardState {
             hidden,
             context: TransformerForward {

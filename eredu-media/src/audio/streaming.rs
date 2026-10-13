@@ -381,7 +381,7 @@ impl CenteredSlaneyLogMelConfig {
         if self.sample_rate == 0
             || self.window_length < 2
             || self.fft_length < self.window_length
-            || self.fft_length % 2 != 0
+            || !self.fft_length.is_multiple_of(2)
             || self.hop_length == 0
             || self.mel_bins == 0
             || self.capacity_samples <= self.fft_length / 2

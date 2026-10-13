@@ -78,7 +78,7 @@ impl SafetensorsTableSourcePlan {
         if shards == 0
             || vocabulary_alignment == 0
             || config.ngram.embedding_dim <= 0
-            || config.ngram.embedding_dim as usize % heads != 0
+            || !(config.ngram.embedding_dim as usize).is_multiple_of(heads)
             || config.eos.is_empty()
             || config.ngram.order > 4096
         {
@@ -131,7 +131,7 @@ impl SafetensorsTableSourcePlan {
             catalog.insert(name.clone(), meta);
             shard_names.push(name);
         }
-        if total > i64::MAX as u64 || total % vocabulary_alignment != 0 {
+        if total > i64::MAX as u64 || !total.is_multiple_of(vocabulary_alignment) {
             return Err(invalid("table row count differs from vocabulary alignment"));
         }
         let names = [

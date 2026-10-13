@@ -58,6 +58,7 @@ fn compiled_wrapper_survives_foreign_tls_teardown_and_lazy_output_outlives_cache
 fn scalar_constants_distinguish_same_shape_compiled_graphs() {
     // This factory produces the same callback type/cache identity for both
     // offsets. The supplied scalar constants must distinguish their graphs.
+    #[allow(clippy::type_complexity)]
     fn offset_graph(
         offset: f32,
     ) -> CompiledWithStreamAndCaptures<

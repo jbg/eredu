@@ -675,7 +675,7 @@ impl<
                     context,
                 )
                 .map_err(|e| ExecutionError::Decision(BackendFailure::from_error(e)));
-                drop(channel_authority);
+
                 let decision = finish_child(&mut coordination, decision)?;
                 branch.model_state_mut().feedback = decision.feedback;
                 decisions_output = Some(decision);
@@ -729,7 +729,7 @@ impl<
                         context,
                     )
                     .map_err(ExecutionError::from);
-                drop(speech_authority);
+
                 let rendered = finish_child(&mut coordination, rendered)?;
                 branch.model_state_mut().speech = Some(rendered.state.clone());
                 speech_output = Some(rendered);

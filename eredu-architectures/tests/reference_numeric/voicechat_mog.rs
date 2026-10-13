@@ -204,7 +204,7 @@ fn voicechat_rvq_parameter_rebinding_invalidates_retained_codebook_norms() {
     let mut parameters = BTreeMap::from([
         (
             "tts_model.tts_model.rvq_embs".into(),
-            NumericTensor::new(vec![31, 2, 1], vec![0., 10.].repeat(31)),
+            NumericTensor::new(vec![31, 2, 1], [0., 10.].repeat(31)),
         ),
         (
             "tts_model.tts_model.embed_code.weight".into(),
@@ -219,7 +219,7 @@ fn voicechat_rvq_parameter_rebinding_invalidates_retained_codebook_norms() {
     // New means reverse the nearest mean. Retaining old [0,100] norms chooses 0.
     parameters.insert(
         "tts_model.tts_model.rvq_embs".into(),
-        NumericTensor::new(vec![31, 2, 1], vec![10., 1.].repeat(31)),
+        NumericTensor::new(vec![31, 2, 1], [10., 1.].repeat(31)),
     );
     replace_numeric_parameters(&mut refinement, &parameters);
     let rebound = refinement.advance(&state, &latent, &context).unwrap();

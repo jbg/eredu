@@ -291,8 +291,8 @@ pub fn canonical_recipes(
         .collect::<BTreeMap<_, _>>();
     match layout {
         None | Some(GgufLayout::Complete) => Ok(canonical
-            .into_iter()
-            .map(|(name, _)| {
+            .into_keys()
+            .map(|name| {
                 let mut recipe = DerivedWeightRecipe::source(&name, TensorSelection::Full);
                 if layout.is_some() && name.ends_with(".pad_tensor") {
                     recipe = DerivedWeightRecipe::Reshape {

@@ -394,6 +394,7 @@ impl<B: NeuralBackend> QuantizerArchitecture<B> {
 }
 
 impl<B: NeuralBackend> QuantizerArchitecture<B> {
+    #[allow(clippy::too_many_arguments)]
     fn forward_selected(
         &self,
         group: usize,
@@ -763,6 +764,7 @@ impl<B: DistributedNeuralBackend> QuantizerArchitecture<B> {
         }
         Ok(B::Tensor::concatenate(&parts, -1, context)?)
     }
+    #[allow(clippy::too_many_arguments)]
     fn forward_unit_guarded(
         &self,
         group: usize,

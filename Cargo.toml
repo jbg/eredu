@@ -26,6 +26,10 @@ resolver = "2"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+# Byte-decoding interfaces intentionally consume slices, not fixed-size arrays.
+chunks_exact_to_as_chunks = "allow"
+
 [workspace.package]
 edition = "2021"
 authors = ["Jasper Hugo <jasper@jasperhugo.com>"]

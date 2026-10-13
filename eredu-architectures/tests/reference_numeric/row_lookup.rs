@@ -221,7 +221,7 @@ fn composed_rows_survive_erasure_bank_dispatch_and_failure_agreement() {
         &context
     )
     .is_err());
-    drop(agreement);
+
     assert_eq!(votes, [true, false]);
     let mut rejected = AgreeingParameterProvider::new(&mut banks, |_| Ok(false));
     assert!(ParameterProvider::<NumericBackend>::lookup_rows(

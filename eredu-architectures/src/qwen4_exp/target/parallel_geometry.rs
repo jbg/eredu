@@ -179,6 +179,7 @@ impl Selections {
     }
 }
 impl Selections {
+    #[allow(clippy::single_range_in_vec_init)]
     pub(crate) fn partition_sublayers(
         &mut self,
         mixer: &mut MixerSpec,

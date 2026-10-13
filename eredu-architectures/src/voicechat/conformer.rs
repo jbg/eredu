@@ -805,4 +805,3 @@ fn float_like<T: Tensor>(value: f32, prototype: &T, context: &T::Context) -> Res
         _ => Ok(tensor),
     }
 }
-

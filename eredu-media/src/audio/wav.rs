@@ -110,10 +110,8 @@ impl<R: Read + Seek> WavReader<R> {
                     }
                     format = Some((encoding, rate));
                 }
-                b"data" => {
-                    if data.replace((start, bytes)).is_some() {
-                        return Err(WavError::Invalid("duplicate data chunk"));
-                    }
+                b"data" if data.replace((start, bytes)).is_some() => {
+                    return Err(WavError::Invalid("duplicate data chunk"));
                 }
                 _ => {}
             }

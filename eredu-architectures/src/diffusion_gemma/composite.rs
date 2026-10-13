@@ -740,11 +740,8 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group == 0 && forward.vision.is_some() {
-            let output =
-                self.statics
-                    .image
-                    .finish(hidden, forward.vision.as_ref().unwrap(), context)?;
+        if let (0, Some(vision)) = (group, forward.vision.as_ref()) {
+            let output = self.statics.image.finish(hidden, vision, context)?;
             forward.vision_output = Some(output.clone());
             Ok(output)
         } else {

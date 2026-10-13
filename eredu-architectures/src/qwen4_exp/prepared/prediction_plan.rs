@@ -120,7 +120,7 @@ pub(super) fn prediction_requirements<C: eredu_checkpoint::recipe::RecipeCatalog
         for (local, recipe) in &complete.recipes {
             declared.add(
                 &format!("{root}.{local}"),
-                &recipe,
+                recipe,
                 parameter_owner.clone(),
                 true,
             )?;

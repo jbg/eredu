@@ -1059,7 +1059,7 @@ fn normalize(source: &Value) -> Result<VoiceChatConfig, ConfigError> {
         &format!("{S}/perception/preprocessor"),
         json!({
             "preemph":0.97, "lowfreq":0.0, "highfreq":8000.0, "log_zero_guard_type":"add",
-            "log_zero_guard_value": 0.000000059604644775390625, "exact_pad":false,
+            "log_zero_guard_value": 0.000_000_059_604_644_775_390_63, "exact_pad":false,
             "mag_power":2.0, "mel_norm":"slaney", "use_torchaudio":false
         }),
         &[],

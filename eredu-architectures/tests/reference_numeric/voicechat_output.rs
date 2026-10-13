@@ -31,9 +31,7 @@ fn host(
                     }
                     RealtimeChannelPayload::Dense { shape } => {
                         assert_eq!(v.payload().shape(), [1, shape[0] as i32]);
-                        RealtimeHostChannelValues::Dense(
-                            v.payload().data.iter().map(|x| *x as f32).collect(),
-                        )
+                        RealtimeHostChannelValues::Dense(v.payload().data.to_vec())
                     }
                 };
                 RealtimeFrameChannel::new(v.channel(), v.coordinate(), payload)

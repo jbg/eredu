@@ -669,9 +669,6 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
     .map_err(|error| error.to_string())
 }
 
-/// Carries encoded companions through the same expert stacking and gate/up
-/// concatenation as their weights. Source spellings remain family-owned here.
-
 fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), String> {
     let target_layers = count(args.num_hidden_layers, "V4 target layer count")?;
     let prediction_layers = count(args.num_nextn_predict_layers, "V4 prediction layer count")?;

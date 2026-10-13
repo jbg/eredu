@@ -438,7 +438,7 @@ mod tests {
         assert!(MlxSamplingBackend::stable_and_confident(
             &high,
             &argmax,
-            &[argmax.clone()],
+            std::slice::from_ref(&argmax),
             0.005,
             None,
             &stream

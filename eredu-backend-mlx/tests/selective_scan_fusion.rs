@@ -1,16 +1,14 @@
 //! Numerical recurrence parity and coupled scalar-token readback contracts.
-use eredu_backend_mlx::{
-    backend::{nn::shared::MlxNeuralBackend as Backend, runtime::generation::MlxSamplingBackend},
-    MlxTensor,
-};
-use eredu_nn::{NeuralBackend, SelectiveStateSpaceScanInput, Tensor};
+use eredu_backend_mlx::{backend::runtime::generation::MlxSamplingBackend, MlxTensor};
 use eredu_runtime::{SamplingBackend, TokenDomain};
-use safemlx::ops::indexing::TryIndexOp;
 use safemlx::{Array, Device, DeviceType, Stream};
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[test]
 fn metal_single_step_matches_scalar_recurrence_and_unfused_prefill_without_mutating_carry() {
+    use eredu_backend_mlx::backend::nn::shared::MlxNeuralBackend as Backend;
+    use eredu_nn::{NeuralBackend, SelectiveStateSpaceScanInput, Tensor};
+    use safemlx::ops::indexing::TryIndexOp;
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     for n in [1, 7, 128] {
         let (b, h, d) = (2, 3, 5);

@@ -44,9 +44,11 @@ impl TransformerConfig {
         ]
         .into_iter()
         .all(positive)
-            || geometry.head_dim % 2 != 0
+            || !geometry.head_dim.is_multiple_of(2)
             || geometry.num_hidden_layers > 256
-            || geometry.num_attention_heads % geometry.num_key_value_heads != 0
+            || !geometry
+                .num_attention_heads
+                .is_multiple_of(geometry.num_key_value_heads)
             || geometry
                 .num_attention_heads
                 .checked_mul(geometry.head_dim)

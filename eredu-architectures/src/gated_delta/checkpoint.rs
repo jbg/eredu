@@ -15,7 +15,7 @@ pub(crate) fn grouped_value_heads(
 ) -> Result<Recipe, String> {
     if key_heads == 0
         || value_heads == 0
-        || value_heads % key_heads != 0
+        || !value_heads.is_multiple_of(key_heads)
         || axis >= shape.len()
         || prefix >= shape[axis]
     {
@@ -26,7 +26,7 @@ pub(crate) fn grouped_value_heads(
     if key_heads == 1 || key_heads == value_heads {
         return Ok(input);
     }
-    if (shape[axis] - prefix) % value_heads != 0 {
+    if !(shape[axis] - prefix).is_multiple_of(value_heads) {
         return Err("invalid grouped value-head storage geometry".into());
     }
     let mut tail_shape = shape.to_vec();

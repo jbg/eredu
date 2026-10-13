@@ -11,6 +11,7 @@ impl Retention for SelectedPage {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::backend::submission_recovery::{reap, Probe};

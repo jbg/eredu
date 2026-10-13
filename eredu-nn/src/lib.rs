@@ -4281,6 +4281,7 @@ pub trait NeuralBackend: Sized + 'static {
     /// Weight has one entry per final-axis feature.
     /// Input and gate shapes must match; positive groups must divide the final
     /// feature axis, and epsilon must be finite and strictly positive.
+    #[allow(clippy::too_many_arguments)]
     fn output_gated_group_rms_norm(
         input: &Self::Tensor,
         gate: &Self::Tensor,

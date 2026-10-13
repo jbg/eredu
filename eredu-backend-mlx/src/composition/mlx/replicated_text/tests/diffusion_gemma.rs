@@ -467,7 +467,7 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
         let mut continuation = driver
             .start(
                 prompt,
-                eredu_core::TextGenerationConfig::new(sampling.clone())
+                eredu_core::TextGenerationConfig::new(sampling)
                     .with_seed(13)
                     .with_refinement_policy(Some(policy))
                     .with_draft_events(true)

@@ -98,7 +98,9 @@ fn tensor(result: Result<Array, safemlx::error::Exception>) -> Result<MlxTensor,
 impl Tensor for MlxTensor {
     type Context = Stream;
 
-    fn immutable_context_key(context: &Stream) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
+    fn immutable_context_key(
+        context: &Stream,
+    ) -> Result<Option<eredu_nn::TensorContextKey>, Error> {
         let device = backend(context.get_device())?;
         let kind = u32::from(backend(device.get_type())?);
         let index = backend(device.get_index())?;

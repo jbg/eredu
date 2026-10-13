@@ -131,6 +131,7 @@ fn state() -> MlxHybridState {
     MlxHybridState::device(nemotron_h::state_layout(&args()).unwrap(), &[]).unwrap()
 }
 
+#[allow(clippy::type_complexity)]
 fn snapshot(state: &mut MlxHybridState) -> (Vec<i32>, Vec<(Vec<i32>, Vec<f32>)>) {
     let positions = (0..3)
         .map(|index| state.layer(index).unwrap().position())

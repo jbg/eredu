@@ -636,7 +636,7 @@ impl State {
         self.history.push_back(token);
         Ok((
             token,
-            event.or_else(|| {
+            event.or({
                 if token == controls.bos {
                     Some(VoiceChatTurnEvent::AgentStarted)
                 } else if token == controls.eos {

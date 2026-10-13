@@ -139,6 +139,7 @@ pub(super) fn load(
     model
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exercise(
     predictor: &mut MlxRnntPredictorPipeline,
     directory: &std::path::Path,
@@ -296,7 +297,7 @@ pub(super) fn exercise(
         let valid = MlxTensor::from_array(Array::from_slice(&[1f32, 2., 3.], &[1, 3]));
         assert!(projections
             .project_output(
-                if world.rank() % 2 == 0 {
+                if world.rank().is_multiple_of(2) {
                     &malformed
                 } else {
                     &valid
