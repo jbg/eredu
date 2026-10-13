@@ -20,7 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
       - name: Test Apple target mapping
         if: inputs.full
         run: |
