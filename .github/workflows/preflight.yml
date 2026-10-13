@@ -26,6 +26,8 @@ jobs:
         run: |
           rustc --edition 2021 --test safemlx-sys/build_support.rs -o /tmp/safemlx-build-support-tests
           /tmp/safemlx-build-support-tests
+      - name: Install system audio build tools
+        run: brew install meson ninja pkg-config
       - name: Install Metal toolchain when required
         run: |
           if xcrun --toolchain Metal metal --version; then exit 0; fi

@@ -57,12 +57,9 @@ fn native_speech_sampling_worker() {
     let mut agreement = coordinator(&world, &stream);
     let fixture: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TTS_TRANSITION_REFERENCE_JSON).unwrap();
-    let mut config = VoiceChatConfig::from_json(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/src/voicechat/fixtures/official-inference-config.json"
-    )))
-    .unwrap()
-    .tts;
+    let mut config = VoiceChatConfig::from_json(eredu_evaluation::voicechat::OFFICIAL_CONFIG_JSON)
+        .unwrap()
+        .tts;
     config.backbone = geometry(&config.backbone, &fixture["transformer_config"]);
     let transformer: Value =
         serde_json::from_str(eredu_evaluation::voicechat::TRANSFORMER_REFERENCE_JSON).unwrap();

@@ -34,11 +34,7 @@ impl<'a> ParameterVisitorMut<'a, MlxTensor> for Load {
 }
 fn specification() -> IndexedSublayerSpec {
     let mut c = Config::from_json(
-        &serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../eredu-architectures/src/qwen4_exp/config/released.json"
-        )))
-        .unwrap(),
+        &serde_json::from_str(eredu_evaluation::qwen4_exp::RELEASED_CONFIG_JSON).unwrap(),
     )
     .unwrap();
     c.hidden_size = 2;
