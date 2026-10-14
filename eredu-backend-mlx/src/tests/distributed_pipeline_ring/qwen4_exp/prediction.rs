@@ -25,7 +25,7 @@ fn run(axes: &'static str, residency: WorkerResidency, media: bool) {
     run_ring_pipeline_processes(
         residency,
         FixtureFamily::Qwen4Exp,
-        WorkerMode::OpaqueSession,
+        WorkerMode::OpaquePredictionSession,
         directory,
         fixture.safetensors_path,
         Some(axes),
@@ -310,9 +310,10 @@ pub(super) fn worker(
             expected.stats().rounds()
         );
     }
+    let started = std::time::Instant::now();
     let phase = |name: &str| {
         if topology.global_rank() == 0 {
-            eprintln!("Flash-Next MTP: {name}");
+            eprintln!("Flash-Next MTP [{:.2?}]: {name}", started.elapsed());
         }
     };
     phase("baseline captures");

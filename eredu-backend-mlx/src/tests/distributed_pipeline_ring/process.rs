@@ -762,6 +762,7 @@ enum WorkerMode {
     AddressableParameterBankRequantize,
     Requantize,
     OpaqueSession,
+    OpaquePredictionSession,
     OpaqueSessionPredictionFree,
     OpaquePreparedSpeculativeCapability,
     OpaqueUnsupportedDirectPartition,
@@ -811,7 +812,8 @@ impl WorkerMode {
     fn runs_prediction_components(self) -> bool {
         matches!(
             self,
-            Self::OpaqueInklingComponents
+            Self::OpaquePredictionSession
+                | Self::OpaqueInklingComponents
                 | Self::OpaqueInklingComponentsRequantize
                 | Self::OpaqueInklingComponentsMxFp4
                 | Self::OpaqueInklingMtpAddressableParameterBank
@@ -1387,7 +1389,7 @@ fn run_ring_pipeline_processes(
             WorkerMode::Requantize => {
                 command.env(REQUANTIZE, "1");
             }
-            WorkerMode::OpaqueSession => {
+            WorkerMode::OpaqueSession | WorkerMode::OpaquePredictionSession => {
                 command.env(OPAQUE_SESSION, "1");
             }
             WorkerMode::OpaqueSessionPredictionFree => {
