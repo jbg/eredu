@@ -85,6 +85,7 @@ fn setup(captures: u64, sliced: bool) -> (CaptureSession, CaptureDiscovery, Inte
 }
 fn shape(sequence: u64) -> CaptureInvocationShape {
     CaptureInvocationShape {
+            media: None,
         batch: 1,
         sequence,
         context: None,
@@ -218,6 +219,7 @@ fn exact_position_masks_and_scope_applicability_precede_observed_work() {
     assert_eq!((backend.copies, backend.applications), (3, 1));
     for bad in [
         CaptureInvocationShape {
+            media: None,
             batch: 2,
             ..shape(1)
         },

@@ -1,6 +1,6 @@
 use super::*;
 use crate::api::forecast::{
-    add_retention, continuation_forecast, estimate_continuation_memory, ContinuationForecast,
+    add_retention, continuation_forecast, ContinuationForecast,
     ContinuationForecastBackend, GenerationForecastError, GenerationForecastOptions,
 };
 use eredu_runtime::execution_control::{SnapshotTokenController, TextSnapshotBackend};
@@ -60,6 +60,8 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationS
             runtime,
             state,
             pending,
+            boundary.decoding_state(),
+            boundary.sequence(),
             additional_tokens,
             options,
             Some(self.delivery.budget.limits()),
@@ -72,8 +74,8 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationS
         )?;
         add_retention(&mut result.request, Some(retained_snapshots),
             "live snapshot/branch reserved retention; conservative per-pool upper allowance, never resident credit", false)?;
-        let assumptions = result.estimate.assumptions;
-        result.estimate = estimate_continuation_memory(&result.request, &result.continuation)?;
+        let assumptions = std::mem::take(&mut result.estimate.assumptions);
+        result.reestimate()?;
         for assumption in assumptions {
             if !result.estimate.assumptions.contains(&assumption) {
                 result.estimate.assumptions.push(assumption);

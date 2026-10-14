@@ -19,6 +19,15 @@ pub enum CompositeTensorCollective {
         /// Exact logical shape of the active or zero-work tensor.
         shape: Vec<i32>,
     },
+    /// Gather rank-local slices into an exact complete tensor shape.
+    Gather {
+        /// Complete output shape; the submitted axis uses this rank's count.
+        shape: Vec<i32>,
+        /// Exact per-rank counts on the selected axis.
+        counts: Vec<usize>,
+        /// Concatenation axis.
+        axis: usize,
+    },
 }
 
 /// Exact external-assistant capture requested from one ordinary target pass.
@@ -68,10 +77,10 @@ pub enum ExternalPredictionTargetOperation<'a, T> {
 }
 
 impl CompositeTensorCollective {
-    /// Exact logical tensor shape submitted by active and zero-work ranks.
+    /// Exact sum shape or complete gathered output shape.
     pub fn shape(&self) -> &[i32] {
         match self {
-            Self::Sum { shape } => shape,
+            Self::Sum { shape } | Self::Gather { shape, .. } => shape,
         }
     }
 }
@@ -104,6 +113,7 @@ pub struct PreparedCompositeInput<'a, T, P> {
     prepared: &'a eredu_runtime::PreparedModelInput<T>,
     admitted: &'a AdmittedCompositeInput<P>,
     refinement: Option<Option<&'a T>>,
+    invocation: Option<eredu_core::decoding::AttentionInvocation>,
 }
 
 impl<T, P> Clone for PreparedCompositeInput<'_, T, P> {
@@ -130,6 +140,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
             prepared,
             admitted,
             refinement: None,
+            invocation: None,
         })
     }
 
@@ -143,6 +154,21 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     /// Feedback authority for an explicit tentative-block invocation.
     pub fn refinement(&self) -> Option<Option<&'a T>> {
         self.refinement
+    }
+
+    /// Supplies explicit request-local attention and adapter semantics to a
+    /// shared-backbone family. Admission and prepared handles remain unchanged.
+    pub fn with_attention_invocation(
+        mut self,
+        invocation: eredu_core::decoding::AttentionInvocation,
+    ) -> Self {
+        self.invocation = Some(invocation);
+        self
+    }
+
+    /// Explicit invocation authority, when supplied by the generation driver.
+    pub fn attention_invocation(&self) -> Option<eredu_core::decoding::AttentionInvocation> {
+        self.invocation
     }
 
     /// Exact backend-native prepared tensor handles.
@@ -284,6 +310,15 @@ where
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
         None
     }
+    /// Exact request-local attention equations over prepared token rows.
+    fn supports_attention_invocation(
+        config: &Self::AdmissionConfig,
+        invocation: eredu_core::decoding::AttentionInvocation,
+    ) -> bool {
+        invocation == eredu_core::decoding::AttentionInvocation::CAUSAL
+            || (invocation == eredu_core::decoding::AttentionInvocation::DIFFUSION
+                && Self::block_refinement_geometry(config).is_some())
+    }
     /// Prepared requests implement partial invocations with retained continuations.
     fn supports_retained_prefill() -> bool {
         false
@@ -400,11 +435,11 @@ where
         Ok(None)
     }
 
-    /// Whether a group-local continuation transports its internal activation
-    /// with an explicit leading batch dimension.
+    /// Whether transport adds a leading batch axis to an internal group activation.
     ///
-    /// Shared Qwen vision blocks normally use batched activations. Conditional
-    /// Qwen keeps its flattened patch matrix unbatched between vision owners.
+    /// `true` expands before encoding and squeezes before decoding. Architectures
+    /// whose activation already has its wire-ready batch axis, or whose encoding
+    /// owns that reshape, return `false`.
     fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
         true
     }
@@ -434,14 +469,16 @@ where
     /// Exact TP collective sequence for every PP stage of one prepared group.
     ///
     /// `None` means the architecture declares no shared-world schedule for the
-    /// group. A tensor-sharded optional group that is active under TP+PP must
-    /// return one stage entry (possibly empty) for every pipeline stage.
+    /// group. `stage_units` carries exact retained group-local ownership for every
+    /// pipeline stage, including empty ranges. A tensor-sharded optional group
+    /// active under TP+PP returns one entry per stage and uses these ranges to
+    /// describe its native operation order.
     fn prepared_group_collective_waves(
         &self,
         _group: usize,
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         _tensor_partitions: usize,
-        _pipeline_stages: usize,
+        _stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, String> {
         Ok(None)
     }
@@ -523,6 +560,7 @@ where
         _schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         _hidden: &B::Tensor,
         _forward: &Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>, Self::Error> {
         Ok(None)
     }
@@ -535,6 +573,7 @@ where
         _schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         _values: Vec<B::Tensor>,
         _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
         Ok(None)
     }
@@ -587,6 +626,20 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Observes architecture-owned ingress while entering the same graph.
+    fn begin_composite_forward_observed<'a, O>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_composite_forward(input, state, context)
+    }
 }
 
 /// Composite ingress whose static operations honor the declared tensor partition.
@@ -605,6 +658,21 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Observes ingress under the retained tensor partition.
+    fn begin_composite_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: PreparedCompositeInput<'a, B::Tensor, Self::InputPartPlan>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_composite_forward_parallel(input, state, parallel, context)
+    }
 }
 
 /// Additive input adapter over the same architecture modules and graph lifecycle.
@@ -799,6 +867,19 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         self.inner.begin_composite_forward(input, state, context)
+    }
+
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.begin_composite_forward_observed(input, state, context, observer)
     }
 
     fn begin_execution_group(
@@ -1014,6 +1095,20 @@ where
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         self.inner
             .begin_composite_forward_parallel(input, state, parallel, context)
+    }
+
+    fn begin_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.begin_composite_forward_parallel_observed(input, state, parallel, context, observer)
     }
 
     fn forward_unit_parallel(

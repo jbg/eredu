@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use eredu_core::speculative::{
     AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationOrigin,
-    SpeculativeActivationPhase, SpeculativeControlError,
+    SpeculativeActivationPhase, SpeculativeControlError, GenerationExecutorTypes, GenerationExecutorCacheFactory,
 };
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill,
@@ -360,6 +360,12 @@ pub enum EmbeddedPredictionCacheAccessError<E> {
 /// Implementations contain no architecture identity, prediction depth, capture path, or replay
 /// policy. The selected execution context determines where each operation runs.
 pub trait SpeculativeTensorMechanisms: 'static {
+    /// Complete immutable score-row backing allowance for settled handoffs.
+    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
+    /// Source-free mode agreement through the retained request transport.
+    fn coordinate_decoding_control<'a>(
+        local: eredu_core::decoding::DecodingCoordination, _context: Self::Context<'a>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> { Ok(local) }
     /// Native retained tensor value.
     type Tensor: Clone;
     /// Native logits value consumed by the selected sampling mechanism.
@@ -794,7 +800,7 @@ where
     /// Optional backend component telemetry.
     type Telemetry: SpeculativeTelemetry;
     /// Fixed scheduler-facing type bundle used after architecture pairing.
-    type ExecutorTypes: EmbeddedExecutorTypes<
+    type ExecutorTypes: GenerationExecutorTypes<
         Input = Self::Input,
         Logits = M::Logits,
         Completion = M::Completion,
@@ -803,7 +809,7 @@ where
     >;
     /// Binds the fixed erased context to the typed tensor mechanisms.
     fn executor_context<'a>(
-        context: <Self::ExecutorTypes as EmbeddedExecutorTypes>::Context<'a>,
+        context: <Self::ExecutorTypes as GenerationExecutorTypes>::Context<'a>,
     ) -> M::Context<'a>;
     /// Returns the ordinary target tensor context selected by composition.
     fn target_context<'a>(context: M::Context<'a>) -> &'a <B::Tensor as eredu_nn::Tensor>::Context;
@@ -1670,7 +1676,7 @@ where
     }
 }
 
-impl<A, B, S, SM, D, P, I, N, M> EmbeddedExecutorCacheFactory<N::ExecutorTypes>
+impl<A, B, S, SM, D, P, I, N, M> GenerationExecutorCacheFactory<N::ExecutorTypes>
     for EmbeddedPredictionExecutor<
         '_,
         ReplicatedMaterializedPredictionStrategy<'_, A, B, S, SM, D, P, I, N, M>,
@@ -1701,13 +1707,13 @@ where
     I: ReplicatedPredictionInput<A, B, S, M::Error, Input = N::Input>,
     M: SpeculativeTensorMechanisms<Tensor = B::Tensor>,
 {
-    fn new_cache(&mut self) -> Result<Self::Cache, Self::Error> {
+    fn new_cache<'a>(&mut self, _context: Self::Context<'a>) -> Result<Self::Cache, Self::Error>  where Self: 'a {
         self.strategy_mut().new_cache()
     }
 
     fn bind_context<'a>(
-        context: <N::ExecutorTypes as EmbeddedExecutorTypes>::Context<'a>,
-    ) -> Self::Context<'a> {
+        context: <N::ExecutorTypes as GenerationExecutorTypes>::Context<'a>,
+    ) -> Self::Context<'a>  where Self: 'a {
         N::executor_context(context)
     }
 }
@@ -1732,835 +1738,7 @@ pub struct EmbeddedPredictionDraftState<T, C: Clone> {
     proposal_capacity: usize,
 }
 
-/// Retained verification output and its exact input tokens.
-pub struct EmbeddedPredictionVerification<T> {
-    output: EmbeddedPredictionOutput<T>,
-    inputs: T,
-}
 
-/// Fixed backend-facing types shared by every erased embedded-prediction executor.
-///
-/// Architecture construction remains statically typed through the target and its paired
-/// extension.  This bundle fixes only the values which the backend scheduler must handle after
-/// that pairing has completed; target state, prediction state, checkpoints, and verification
-/// payloads are erased by [`DynEmbeddedExecutor`] itself.
-pub trait EmbeddedExecutorTypes: 'static {
-    /// Backend-owned model input.
-    type Input;
-    /// Opaque logits consumed by backend sampling.
-    type Logits;
-    /// Selected execution assignment.
-    type Context<'a>: Copy
-    where
-        Self: 'a;
-    /// Exact native completion.
-    type Completion: BoundedCompletion<Error = Self::Error>;
-    /// Optional component telemetry.
-    type Telemetry: SpeculativeTelemetry;
-    /// Structured backend failure.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Constructs the stable failure for an internally inconsistent erased value.
-    fn erased_type_mismatch(value: &'static str) -> Self::Error;
-}
-
-trait CloneAny: std::any::Any {
-    fn clone_any(&self) -> Box<dyn CloneAny>;
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
-}
-
-impl<T: Clone + 'static> CloneAny for T {
-    fn clone_any(&self) -> Box<dyn CloneAny> {
-        Box::new(self.clone())
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-        self
-    }
-}
-
-/// Architecture-owned erased target cache for a completed embedded executor.
-pub struct DynEmbeddedCache(Box<dyn std::any::Any>);
-/// Architecture-owned erased proposal seed state.
-pub struct DynEmbeddedTargetState(Box<dyn std::any::Any>);
-/// Architecture-owned erased, discardable prediction branch.
-pub struct DynEmbeddedDraftState(Box<dyn CloneAny>);
-/// Architecture-owned erased target-cache checkpoint.
-pub struct DynEmbeddedCheckpoint(Box<dyn std::any::Any>);
-/// Architecture-owned erased verification payload.
-pub struct DynEmbeddedVerification(Box<dyn std::any::Any>);
-
-impl Clone for DynEmbeddedDraftState {
-    fn clone(&self) -> Self {
-        Self(self.0.as_ref().clone_any())
-    }
-}
-
-/// An executor which can realize a fresh lane cache before scheduling.
-pub trait EmbeddedExecutorCacheFactory<T: EmbeddedExecutorTypes>: SpeculativeExecutor {
-    /// Realizes one independent authoritative target/prediction lane.
-    fn new_cache(&mut self) -> Result<Self::Cache, Self::Error>;
-
-    /// Binds the backend's fixed scheduler context to this exact typed executor.
-    fn bind_context<'a>(context: T::Context<'a>) -> Self::Context<'a>;
-}
-
-/// Object-safe ABI for one already paired architecture-owned embedded executor.
-///
-/// The trait is deliberately not a backend integration surface.  Its blanket implementation
-/// below erases a completed [`SpeculativeExecutor`] only after architecture composition has
-/// paired the exact target, extension, state, and capture contract.
-pub trait ErasedEmbeddedExecutor<T: EmbeddedExecutorTypes> {
-    /// Preserves preparation agreement through executable erasure.
-    fn coordinate_speculative_step<'a>(
-        &mut self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-        context: T::Context<'a>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>;
-    /// Preserves preparation agreement through executable erasure.
-    fn agree_text_preparation<'a>(
-        &mut self,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-        context: T::Context<'a>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>;
-    /// Installs validated prospective internal edits through the typed collector.
-    fn readmit_activation_interventions(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-    ) -> Result<(), SpeculativeControlError>;
-    /// Releases optional conversions; caller must establish a settled boundary.
-    fn trim_parameter_conversions(
-        &mut self,
-    ) -> Result<
-        eredu_core::residency::ExecutionConversionRetentionTrimReport,
-        eredu_core::residency::ParameterConversionTrimError,
-    >;
-
-    /// Reads shared retention budgets without touching a lane or native work.
-    fn parameter_conversion_retention(
-        &self,
-    ) -> Result<
-        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
-        eredu_core::BackendFailure,
-    >;
-
-    /// Reads one settled lane without polling, copying, or evaluating native work.
-    fn continuation_memory_observation(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-        additional: u64,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
-        eredu_core::BackendFailure,
-    >;
-    /// Complete durable snapshot bound for the erased canonical lane.
-    fn control_snapshot_estimate(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate>;
-    /// Copies complete typed state without erasing a native failure's source.
-    fn control_snapshot<'a>(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-        context: T::Context<'a>,
-    ) -> Result<Option<(DynEmbeddedCheckpoint, DynEmbeddedTargetState)>, SpeculativeControlError>;
-    /// Restores all typed state atomically after copying succeeds.
-    fn restore_control_snapshot<'a>(
-        &mut self,
-        cache: &mut DynEmbeddedCache,
-        saved: &DynEmbeddedCheckpoint,
-        state: &DynEmbeddedTargetState,
-        context: T::Context<'a>,
-    ) -> Result<Option<DynEmbeddedTargetState>, SpeculativeControlError>;
-    /// Installs one request's admitted collector for the borrowed executor scope.
-    fn configure_activation_capture<'a>(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-        request: eredu_core::SpeculativeRequestId,
-        context: T::Context<'a>,
-    ) -> Result<(), SpeculativeControlError>;
-    /// Whether the installed internal observer requires scheduler provenance.
-    fn requires_activation_origin(&self) -> bool;
-    /// Forwards the shared scheduler's bounded operation scope.
-    fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>);
-    /// Moves one already charged internal record through erasure.
-    fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture>;
-    /// Drains the original portable capture failure.
-    fn take_activation_error(&mut self)
-        -> Option<eredu_core::speculative::SpeculativeControlError>;
-    /// Maximum proposals supported by the paired realization.
-    fn max_proposals(&self) -> usize;
-    /// Enables optional component telemetry.
-    fn set_telemetry_enabled(&mut self, enabled: bool);
-    /// Whether component telemetry is available.
-    fn supports_telemetry(&self) -> bool;
-    /// Drains component telemetry.
-    fn take_telemetry(&mut self) -> Result<T::Telemetry, T::Error>;
-    /// Drains telemetry retained in one verification payload.
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut DynEmbeddedVerification,
-    ) -> Result<T::Telemetry, T::Error>;
-    /// Whether an exact cloned branch may be promoted.
-    fn supports_exact_optimistic_promotion(&self) -> bool;
-    /// Realizes one lane cache.
-    fn new_cache(&mut self) -> Result<DynEmbeddedCache, T::Error>;
-    /// Prefills one lane.
-    fn prefill<'a>(
-        &mut self,
-        input: T::Input,
-        cache: &mut DynEmbeddedCache,
-        context: T::Context<'a>,
-    ) -> Result<SpeculativePrefill<DynEmbeddedTargetState, T::Logits>, T::Error>;
-    /// Forks a proposal branch.
-    fn begin_proposal<'a>(
-        &mut self,
-        state: &DynEmbeddedTargetState,
-        last_token: u32,
-        proposal_capacity: usize,
-        context: T::Context<'a>,
-    ) -> Result<DynEmbeddedDraftState, T::Error>;
-    /// Advances a proposal branch and produces logits.
-    fn proposal_logits<'a>(
-        &mut self,
-        state: &mut DynEmbeddedDraftState,
-        last_token: u32,
-        context: T::Context<'a>,
-    ) -> Result<T::Logits, T::Error>;
-    /// Captures an exact target-cache checkpoint.
-    fn checkpoint(&self, cache: &DynEmbeddedCache) -> Result<DynEmbeddedCheckpoint, T::Error>;
-    /// Restores an exact checkpoint.
-    fn restore_checkpoint<'a>(
-        &mut self,
-        cache: &mut DynEmbeddedCache,
-        checkpoint: &DynEmbeddedCheckpoint,
-        context: T::Context<'a>,
-    ) -> Result<(), T::Error>;
-    /// Submits target verification.
-    fn submit_verification<'a>(
-        &mut self,
-        input_tokens: &[u32],
-        cache: &mut DynEmbeddedCache,
-        context: T::Context<'a>,
-    ) -> Result<Submission<DynEmbeddedVerification, T::Completion>, T::Error>;
-    /// Selects one retained verification-logits row.
-    fn verification_logits<'a>(
-        &self,
-        output: &DynEmbeddedVerification,
-        index: usize,
-        context: T::Context<'a>,
-    ) -> Result<T::Logits, T::Error>;
-    /// Commits an exact verified prefix.
-    #[allow(clippy::too_many_arguments)]
-    fn commit_verification<'a>(
-        &mut self,
-        output: DynEmbeddedVerification,
-        draft_state: DynEmbeddedDraftState,
-        cache: &mut DynEmbeddedCache,
-        checkpoint: &DynEmbeddedCheckpoint,
-        verified_inputs: usize,
-        context: T::Context<'a>,
-    ) -> Result<SpeculativeCommit<DynEmbeddedTargetState>, T::Error>;
-}
-
-fn erased_ref<'a, T: 'static, E: EmbeddedExecutorTypes>(
-    value: &'a Box<dyn std::any::Any>,
-    name: &'static str,
-) -> Result<&'a T, E::Error> {
-    value
-        .downcast_ref::<T>()
-        .ok_or_else(|| E::erased_type_mismatch(name))
-}
-
-fn erased_mut<'a, T: 'static, E: EmbeddedExecutorTypes>(
-    value: &'a mut Box<dyn std::any::Any>,
-    name: &'static str,
-) -> Result<&'a mut T, E::Error> {
-    value
-        .downcast_mut::<T>()
-        .ok_or_else(|| E::erased_type_mismatch(name))
-}
-
-impl<T, E> ErasedEmbeddedExecutor<T> for E
-where
-    T: EmbeddedExecutorTypes,
-    E: EmbeddedExecutorCacheFactory<
-        T,
-        Input = T::Input,
-        Logits = T::Logits,
-        Completion = T::Completion,
-        Telemetry = T::Telemetry,
-        Error = T::Error,
-    >,
-    E::Cache: 'static,
-    E::TargetState: 'static,
-    E::DraftState: 'static,
-    E::CacheCheckpoint: 'static,
-    E::Verification: 'static,
-{
-    fn readmit_activation_interventions(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-    ) -> Result<(), SpeculativeControlError> {
-        SpeculativeExecutor::readmit_activation_interventions(self, plan)
-    }
-    /// Releases optional conversions; caller must establish a settled boundary.
-    fn trim_parameter_conversions(
-        &mut self,
-    ) -> Result<
-        eredu_core::residency::ExecutionConversionRetentionTrimReport,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        SpeculativeExecutor::trim_parameter_conversions(self)
-    }
-
-    fn parameter_conversion_retention(
-        &self,
-    ) -> Result<
-        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
-        eredu_core::BackendFailure,
-    > {
-        SpeculativeExecutor::parameter_conversion_retention(self)
-    }
-
-    fn continuation_memory_observation(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-        additional: u64,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
-        eredu_core::BackendFailure,
-    > {
-        SpeculativeExecutor::continuation_memory_observation(
-            self,
-            cache.0.downcast_ref().expect("paired embedded cache"),
-            state
-                .0
-                .downcast_ref()
-                .expect("paired embedded target state"),
-            additional,
-        )
-    }
-
-    fn control_snapshot_estimate(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        SpeculativeExecutor::control_snapshot_estimate(
-            self,
-            erased_ref::<E::Cache, T>(&cache.0, "snapshot cache").ok()?,
-            erased_ref::<E::TargetState, T>(&state.0, "snapshot seed").ok()?,
-        )
-    }
-    fn control_snapshot<'a>(
-        &self,
-        cache: &DynEmbeddedCache,
-        state: &DynEmbeddedTargetState,
-        context: T::Context<'a>,
-    ) -> Result<Option<(DynEmbeddedCheckpoint, DynEmbeddedTargetState)>, SpeculativeControlError>
-    {
-        let cache = erased_ref::<E::Cache, T>(&cache.0, "snapshot cache")
-            .map_err(SpeculativeControlError::backend)?;
-        let state = erased_ref::<E::TargetState, T>(&state.0, "snapshot seed")
-            .map_err(SpeculativeControlError::backend)?;
-        SpeculativeExecutor::control_snapshot(
-            self,
-            cache,
-            state,
-            <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context),
-        )
-        .map(|pair| {
-            pair.map(|(cache, state)| {
-                (
-                    DynEmbeddedCheckpoint(Box::new(cache)),
-                    DynEmbeddedTargetState(Box::new(state)),
-                )
-            })
-        })
-    }
-    fn restore_control_snapshot<'a>(
-        &mut self,
-        cache: &mut DynEmbeddedCache,
-        saved: &DynEmbeddedCheckpoint,
-        state: &DynEmbeddedTargetState,
-        context: T::Context<'a>,
-    ) -> Result<Option<DynEmbeddedTargetState>, SpeculativeControlError> {
-        let cache = erased_mut::<E::Cache, T>(&mut cache.0, "snapshot cache")
-            .map_err(SpeculativeControlError::backend)?;
-        let saved = erased_ref::<E::CacheCheckpoint, T>(&saved.0, "snapshot checkpoint")
-            .map_err(SpeculativeControlError::backend)?;
-        let state = erased_ref::<E::TargetState, T>(&state.0, "snapshot seed")
-            .map_err(SpeculativeControlError::backend)?;
-        SpeculativeExecutor::restore_control_snapshot(
-            self,
-            cache,
-            saved,
-            state,
-            <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context),
-        )
-        .map(|state| state.map(|state| DynEmbeddedTargetState(Box::new(state))))
-    }
-    fn coordinate_speculative_step<'a>(
-        &mut self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-        context: T::Context<'a>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
-        SpeculativeExecutor::coordinate_speculative_step(
-            self,
-            local,
-            <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context),
-        )
-    }
-
-    fn agree_text_preparation<'a>(
-        &mut self,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-        context: T::Context<'a>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        SpeculativeExecutor::agree_text_preparation(
-            self,
-            stage,
-            status,
-            <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context),
-        )
-    }
-
-    fn configure_activation_capture<'a>(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-        request: eredu_core::SpeculativeRequestId,
-        context: T::Context<'a>,
-    ) -> Result<(), SpeculativeControlError> {
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::configure_activation_capture(self, plan, request, context)
-    }
-
-    fn requires_activation_origin(&self) -> bool {
-        SpeculativeExecutor::requires_activation_origin(self)
-    }
-
-    fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>) {
-        SpeculativeExecutor::set_activation_origin(self, origin);
-    }
-
-    fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
-        SpeculativeExecutor::take_activation_capture(self)
-    }
-
-    fn take_activation_error(
-        &mut self,
-    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
-        SpeculativeExecutor::take_activation_error(self)
-    }
-
-    fn max_proposals(&self) -> usize {
-        SpeculativeExecutor::max_proposals(self)
-    }
-
-    fn set_telemetry_enabled(&mut self, enabled: bool) {
-        SpeculativeExecutor::set_telemetry_enabled(self, enabled);
-    }
-
-    fn supports_telemetry(&self) -> bool {
-        SpeculativeExecutor::supports_telemetry(self)
-    }
-
-    fn take_telemetry(&mut self) -> Result<T::Telemetry, T::Error> {
-        SpeculativeExecutor::take_telemetry(self)
-    }
-
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut DynEmbeddedVerification,
-    ) -> Result<T::Telemetry, T::Error> {
-        let output = erased_mut::<E::Verification, T>(&mut output.0, "verification telemetry")?;
-        SpeculativeExecutor::take_verification_telemetry(self, output)
-    }
-
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        SpeculativeExecutor::supports_exact_optimistic_promotion(self)
-    }
-
-    fn new_cache(&mut self) -> Result<DynEmbeddedCache, T::Error> {
-        EmbeddedExecutorCacheFactory::<T>::new_cache(self)
-            .map(|cache| DynEmbeddedCache(Box::new(cache)))
-    }
-
-    fn prefill<'a>(
-        &mut self,
-        input: T::Input,
-        cache: &mut DynEmbeddedCache,
-        context: T::Context<'a>,
-    ) -> Result<SpeculativePrefill<DynEmbeddedTargetState, T::Logits>, T::Error> {
-        let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::prefill(self, input, cache, context).map(|prefill| {
-            let (logits, state, target_tokens) = prefill.into_parts();
-            SpeculativePrefill::new(
-                logits,
-                DynEmbeddedTargetState(Box::new(state)),
-                target_tokens,
-            )
-        })
-    }
-
-    fn begin_proposal<'a>(
-        &mut self,
-        state: &DynEmbeddedTargetState,
-        last_token: u32,
-        proposal_capacity: usize,
-        context: T::Context<'a>,
-    ) -> Result<DynEmbeddedDraftState, T::Error> {
-        let state = erased_ref::<E::TargetState, T>(&state.0, "target state")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::begin_proposal(self, state, last_token, proposal_capacity, context)
-            .map(|state| DynEmbeddedDraftState(Box::new(state)))
-    }
-
-    fn proposal_logits<'a>(
-        &mut self,
-        state: &mut DynEmbeddedDraftState,
-        last_token: u32,
-        context: T::Context<'a>,
-    ) -> Result<T::Logits, T::Error> {
-        let state = state
-            .0
-            .as_any_mut()
-            .downcast_mut::<E::DraftState>()
-            .ok_or_else(|| T::erased_type_mismatch("draft state"))?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::proposal_logits(self, state, last_token, context)
-    }
-
-    fn checkpoint(&self, cache: &DynEmbeddedCache) -> Result<DynEmbeddedCheckpoint, T::Error> {
-        let cache = erased_ref::<E::Cache, T>(&cache.0, "target cache")?;
-        SpeculativeExecutor::checkpoint(self, cache)
-            .map(|checkpoint| DynEmbeddedCheckpoint(Box::new(checkpoint)))
-    }
-
-    fn restore_checkpoint<'a>(
-        &mut self,
-        cache: &mut DynEmbeddedCache,
-        checkpoint: &DynEmbeddedCheckpoint,
-        context: T::Context<'a>,
-    ) -> Result<(), T::Error> {
-        let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let checkpoint = erased_ref::<E::CacheCheckpoint, T>(&checkpoint.0, "target checkpoint")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::restore_checkpoint(self, cache, checkpoint, context)
-    }
-
-    fn submit_verification<'a>(
-        &mut self,
-        input_tokens: &[u32],
-        cache: &mut DynEmbeddedCache,
-        context: T::Context<'a>,
-    ) -> Result<Submission<DynEmbeddedVerification, T::Completion>, T::Error> {
-        let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::submit_verification(self, input_tokens, cache, context).map(
-            |submission| Submission {
-                output: DynEmbeddedVerification(Box::new(submission.output)),
-                completion: submission.completion,
-            },
-        )
-    }
-
-    fn verification_logits<'a>(
-        &self,
-        output: &DynEmbeddedVerification,
-        index: usize,
-        context: T::Context<'a>,
-    ) -> Result<T::Logits, T::Error> {
-        let output = erased_ref::<E::Verification, T>(&output.0, "verification")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::verification_logits(self, output, index, context)
-    }
-
-    fn commit_verification<'a>(
-        &mut self,
-        output: DynEmbeddedVerification,
-        draft_state: DynEmbeddedDraftState,
-        cache: &mut DynEmbeddedCache,
-        checkpoint: &DynEmbeddedCheckpoint,
-        verified_inputs: usize,
-        context: T::Context<'a>,
-    ) -> Result<SpeculativeCommit<DynEmbeddedTargetState>, T::Error> {
-        let output = output
-            .0
-            .downcast::<E::Verification>()
-            .map_err(|_| T::erased_type_mismatch("verification"))?;
-        let draft_state = draft_state
-            .0
-            .into_any()
-            .downcast::<E::DraftState>()
-            .map_err(|_| T::erased_type_mismatch("draft state"))?;
-        let cache = erased_mut::<E::Cache, T>(&mut cache.0, "target cache")?;
-        let checkpoint = erased_ref::<E::CacheCheckpoint, T>(&checkpoint.0, "target checkpoint")?;
-        let context = <E as EmbeddedExecutorCacheFactory<T>>::bind_context(context);
-        SpeculativeExecutor::commit_verification(
-            self,
-            *output,
-            *draft_state,
-            cache,
-            checkpoint,
-            verified_inputs,
-            context,
-        )
-        .map(|commit| {
-            let (state, replayed) = commit.into_parts();
-            SpeculativeCommit::new(DynEmbeddedTargetState(Box::new(state)), replayed)
-        })
-    }
-}
-
-/// Concrete `SpeculativeExecutor` view over an architecture-erased paired executor.
-pub struct DynEmbeddedExecutor<'a, T: EmbeddedExecutorTypes> {
-    inner: &'a mut dyn ErasedEmbeddedExecutor<T>,
-}
-
-impl<'a, T: EmbeddedExecutorTypes> DynEmbeddedExecutor<'a, T> {
-    /// Lends one already paired executor to backend scheduling.
-    pub fn new(inner: &'a mut dyn ErasedEmbeddedExecutor<T>) -> Self {
-        Self { inner }
-    }
-
-    /// Realizes one independent lane cache from the paired executor.
-    pub fn new_cache(&mut self) -> Result<DynEmbeddedCache, T::Error> {
-        self.inner.new_cache()
-    }
-}
-
-impl<T: EmbeddedExecutorTypes> SpeculativeExecutor for DynEmbeddedExecutor<'_, T> {
-    type Input = T::Input;
-    type Cache = DynEmbeddedCache;
-    type TargetState = DynEmbeddedTargetState;
-    type DraftState = DynEmbeddedDraftState;
-    type CacheCheckpoint = DynEmbeddedCheckpoint;
-    type Verification = DynEmbeddedVerification;
-    type Logits = T::Logits;
-    type Context<'a> = T::Context<'a>;
-    type Completion = T::Completion;
-    type Telemetry = T::Telemetry;
-    type Error = T::Error;
-
-    fn readmit_activation_interventions(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-    ) -> Result<(), SpeculativeControlError> {
-        self.inner.readmit_activation_interventions(plan)
-    }
-
-    /// Releases optional conversions; caller must establish a settled boundary.
-    fn trim_parameter_conversions(
-        &mut self,
-    ) -> Result<
-        eredu_core::residency::ExecutionConversionRetentionTrimReport,
-        eredu_core::residency::ParameterConversionTrimError,
-    > {
-        self.inner.trim_parameter_conversions()
-    }
-
-    fn parameter_conversion_retention(
-        &self,
-    ) -> Result<
-        Option<eredu_core::residency::ExecutionConversionRetentionReport>,
-        eredu_core::BackendFailure,
-    > {
-        self.inner.parameter_conversion_retention()
-    }
-
-    fn continuation_memory_observation(
-        &self,
-        cache: &Self::Cache,
-        state: &Self::TargetState,
-        additional: u64,
-    ) -> Result<
-        Option<eredu_core::speculative::SpeculativeContinuationObservation>,
-        eredu_core::BackendFailure,
-    > {
-        self.inner
-            .continuation_memory_observation(cache, state, additional)
-    }
-
-    fn control_snapshot_estimate(
-        &self,
-        cache: &Self::Cache,
-        state: &Self::TargetState,
-    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
-        self.inner.control_snapshot_estimate(cache, state)
-    }
-    fn control_snapshot<'a>(
-        &self,
-        cache: &Self::Cache,
-        state: &Self::TargetState,
-        context: Self::Context<'a>,
-    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError> {
-        self.inner.control_snapshot(cache, state, context)
-    }
-    fn restore_control_snapshot<'a>(
-        &mut self,
-        cache: &mut Self::Cache,
-        saved: &Self::CacheCheckpoint,
-        state: &Self::TargetState,
-        context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, SpeculativeControlError> {
-        self.inner
-            .restore_control_snapshot(cache, saved, state, context)
-    }
-
-    fn coordinate_speculative_step<'a>(
-        &mut self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-        context: T::Context<'a>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
-        self.inner.coordinate_speculative_step(local, context)
-    }
-
-    fn agree_text_preparation<'a>(
-        &mut self,
-        stage: eredu_core::run_preparation::TextPreparationStage,
-        status: eredu_core::run_preparation::TextPreparationStatus,
-        context: T::Context<'a>,
-    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
-        self.inner.agree_text_preparation(stage, status, context)
-    }
-
-    fn configure_activation_capture<'a>(
-        &mut self,
-        plan: AdmittedSpeculativeActivations,
-        request: eredu_core::SpeculativeRequestId,
-        context: T::Context<'a>,
-    ) -> Result<(), SpeculativeControlError> {
-        self.inner
-            .configure_activation_capture(plan, request, context)
-    }
-
-    fn requires_activation_origin(&self) -> bool {
-        self.inner.requires_activation_origin()
-    }
-
-    fn set_activation_origin(&mut self, origin: Option<SpeculativeActivationOrigin>) {
-        self.inner.set_activation_origin(origin);
-    }
-
-    fn take_activation_capture(&mut self) -> Option<SpeculativeActivationCapture> {
-        self.inner.take_activation_capture()
-    }
-
-    fn take_activation_error(
-        &mut self,
-    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
-        self.inner.take_activation_error()
-    }
-
-    fn max_proposals(&self) -> usize {
-        self.inner.max_proposals()
-    }
-    fn set_telemetry_enabled(&mut self, enabled: bool) {
-        self.inner.set_telemetry_enabled(enabled);
-    }
-    fn supports_telemetry(&self) -> bool {
-        self.inner.supports_telemetry()
-    }
-    fn take_telemetry(&mut self) -> Result<Self::Telemetry, Self::Error> {
-        self.inner.take_telemetry()
-    }
-    fn take_verification_telemetry(
-        &mut self,
-        output: &mut Self::Verification,
-    ) -> Result<Self::Telemetry, Self::Error> {
-        self.inner.take_verification_telemetry(output)
-    }
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        self.inner.supports_exact_optimistic_promotion()
-    }
-    fn prefill<'a>(
-        &mut self,
-        input: Self::Input,
-        cache: &mut Self::Cache,
-        context: Self::Context<'a>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
-        self.inner.prefill(input, cache, context)
-    }
-    fn begin_proposal<'a>(
-        &mut self,
-        state: &Self::TargetState,
-        last_token: u32,
-        proposal_capacity: usize,
-        context: Self::Context<'a>,
-    ) -> Result<Self::DraftState, Self::Error> {
-        self.inner
-            .begin_proposal(state, last_token, proposal_capacity, context)
-    }
-    fn proposal_logits<'a>(
-        &mut self,
-        state: &mut Self::DraftState,
-        last_token: u32,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> {
-        self.inner.proposal_logits(state, last_token, context)
-    }
-    fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
-        self.inner.checkpoint(cache)
-    }
-    fn restore_checkpoint<'a>(
-        &mut self,
-        cache: &mut Self::Cache,
-        checkpoint: &Self::CacheCheckpoint,
-        context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
-        self.inner.restore_checkpoint(cache, checkpoint, context)
-    }
-    fn submit_verification<'a>(
-        &mut self,
-        input_tokens: &[u32],
-        cache: &mut Self::Cache,
-        context: Self::Context<'a>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
-        self.inner.submit_verification(input_tokens, cache, context)
-    }
-    fn verification_logits<'a>(
-        &self,
-        output: &Self::Verification,
-        index: usize,
-        context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> {
-        self.inner.verification_logits(output, index, context)
-    }
-    fn commit_verification<'a>(
-        &mut self,
-        output: Self::Verification,
-        draft_state: Self::DraftState,
-        cache: &mut Self::Cache,
-        checkpoint: &Self::CacheCheckpoint,
-        verified_inputs: usize,
-        context: Self::Context<'a>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
-        self.inner.commit_verification(
-            output,
-            draft_state,
-            cache,
-            checkpoint,
-            verified_inputs,
-            context,
-        )
-    }
-}
 
 /// Neutral embedded prediction executor consumed by the shared runtime scheduler.
 pub struct EmbeddedPredictionExecutor<'a, S, M>
@@ -2669,14 +1847,23 @@ where
     M: SpeculativeTensorMechanisms + 'static,
     S: EmbeddedPredictionStrategy<M>,
 {
+    fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
+        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals()).with_completion_support(
+            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::NativeCancel),
+            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::QuarantineUntilComplete),
+        )
+    }
+    fn logits_snapshot_estimate(&self, logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        M::control_logits_estimate(logits)
+    }
     type Input = S::Input;
     type Cache = S::TargetCache;
     type TargetState = EmbeddedPredictionTargetState<M::Tensor, S::PredictionCache>;
     type DraftState = EmbeddedPredictionDraftState<M::Tensor, S::PredictionCache>;
     type CacheCheckpoint = EmbeddedPredictionCheckpoint<S::TargetCache>;
-    type Verification = EmbeddedPredictionVerification<M::Tensor>;
+    type Verification = eredu_runtime::speculative::CausalVerification<EmbeddedPredictionOutput<M::Tensor>, M::Tensor>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a>;
+    type Context<'a> = M::Context<'a> where Self: 'a;
     type Completion = M::Completion;
     type Telemetry = S::Telemetry;
     type Error = M::Error;
@@ -2758,7 +1945,7 @@ where
         cache: &Self::Cache,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError> {
+    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError>  where Self: 'a {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
@@ -2784,7 +1971,7 @@ where
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, SpeculativeControlError> {
+    ) -> Result<Option<Self::TargetState>, SpeculativeControlError>  where Self: 'a {
         let prepared = match (self.observers.internal.as_mut(), saved.activations.as_ref()) {
             (Some(observer), Some(saved)) => Some(observer.prepare_activation_restore(saved)?),
             (None, None) => None,
@@ -2818,11 +2005,17 @@ where
             .readmit_activation_interventions(plan)
     }
 
+    fn coordinate_decoding_control<'a>(&mut self,
+        local: eredu_core::decoding::DecodingCoordination, context: M::Context<'a>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'a {
+        M::coordinate_decoding_control(local, context)
+    }
+
     fn coordinate_speculative_step<'a>(
         &mut self,
         local: Vec<eredu_core::SpeculativeScheduleState>,
         context: M::Context<'a>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'a {
         M::coordinate_speculative_step(local, context)
     }
 
@@ -2832,7 +2025,7 @@ where
         status: eredu_core::run_preparation::TextPreparationStatus,
         context: M::Context<'a>,
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-    {
+     where Self: 'a {
         M::agree_text_preparation(stage, status, context)
     }
 
@@ -2841,7 +2034,7 @@ where
         plan: AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,
         context: M::Context<'a>,
-    ) -> Result<(), SpeculativeControlError> {
+    ) -> Result<(), SpeculativeControlError>  where Self: 'a {
         if self.execution_started || self.prior_internal.is_some() {
             return Err(SpeculativeControlError::Unsupported(
                 "activation authority must be installed once, before speculative execution",
@@ -2898,7 +2091,7 @@ where
         output: &mut Self::Verification,
     ) -> Result<Self::Telemetry, Self::Error> {
         self.strategy
-            .take_verification_telemetry(&mut output.output)
+            .take_verification_telemetry(output.output_mut())
     }
 
     fn prefill<'context>(
@@ -2906,7 +2099,7 @@ where
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
         self.execution_started = true;
         if self.observers.internal.is_some() && !self.strategy.supports_internal_observations() {
             return Err(M::observation_error(
@@ -2940,22 +2133,26 @@ where
         }
     }
 
-    fn begin_proposal(
+    fn begin_proposal<'context>(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        context: M::Context<'_>,
-    ) -> Result<Self::DraftState, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
         let mut prediction_cache = DraftStateTransaction::fork(&state.prediction_cache);
-        let fused_logits = self.strategy.fused_logits(
-            &state.capture,
-            last_token,
-            proposal_capacity,
-            prediction_cache.draft_mut(),
-            context,
-            self.observers.internal(),
-        )?;
+        let fused_logits = if proposal_capacity == 0 {
+            None
+        } else {
+            self.strategy.fused_logits(
+                &state.capture,
+                last_token,
+                proposal_capacity,
+                prediction_cache.draft_mut(),
+                context,
+                self.observers.internal(),
+            )?
+        };
         if let Some(logits) = &fused_logits {
             let available = M::sequence_len(logits)?;
             if available < proposal_capacity {
@@ -2973,12 +2170,12 @@ where
         })
     }
 
-    fn proposal_logits(
+    fn proposal_step<'context>(
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        context: M::Context<'_>,
-    ) -> Result<Self::Logits, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
         if state.depth.max(state.fused_cursor) >= state.proposal_capacity {
             return Err(M::fused_prediction_exhausted());
         }
@@ -2993,7 +2190,10 @@ where
             let logits = self
                 .strategy
                 .adjust_fused_logits(logits, last_token, context)?;
-            return self.observers.logits(&logits);
+            return self
+                .observers
+                .logits(&logits)
+                .map(eredu_core::speculative::SpeculativeProposalStep::CausalLogits);
         }
         let (logits, capture) = self.strategy.sequential_logits(
             &state.capture,
@@ -3007,7 +2207,9 @@ where
             .observers
             .tensor(EMBEDDED_PREDICTION_OUTPUT_PATH, &capture)?;
         state.depth += 1;
-        self.observers.logits(&logits)
+        self.observers
+            .logits(&logits)
+            .map(eredu_core::speculative::SpeculativeProposalStep::CausalLogits)
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -3022,16 +2224,16 @@ where
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>  where Self: 'a {
         S::restore_target_checkpoint(cache, &checkpoint.cache, context)
     }
 
-    fn submit_verification(
+    fn submit_verification<'context>(
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        context: M::Context<'_>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
         let inputs = M::target_tokens(input_tokens, context)?;
         let mut output = self.strategy.verify_target(
             &inputs,
@@ -3049,7 +2251,7 @@ where
         Self::validate_output(&output, Some(input_tokens.len()))?;
         let completion = M::submit_verification_completion(&output, &inputs, context)?;
         Ok(Submission {
-            output: EmbeddedPredictionVerification { output, inputs },
+            output: eredu_runtime::speculative::CausalVerification::new(output, inputs),
             completion,
         })
     }
@@ -3059,22 +2261,23 @@ where
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> {
-        M::logits_row(output.output.logits(), index, context)
+    ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+        M::logits_row(output.output().logits(), index, context)
     }
 
-    fn commit_verification(
+    fn commit_verification<'context>(
         &mut self,
         output: Self::Verification,
         mut draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
-        context: M::Context<'_>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+        let (verified, inputs) = output.into_parts();
         let result = (|| {
-            let input_len = M::sequence_len(&output.inputs)?;
-            Self::validate_output(&output.output, Some(input_len))?;
+            let input_len = M::sequence_len(&inputs)?;
+            Self::validate_output(&verified, Some(input_len))?;
             if verified_inputs == 0 || verified_inputs > input_len {
                 return Err(M::invalid_prediction_commit(verified_inputs, input_len));
             }
@@ -3086,7 +2289,7 @@ where
                 // from the target's actual capture through every prediction unit.
                 let accepted = draft_state.prediction_cache.checkpoint().clone();
                 *draft_state.prediction_cache.draft_mut() = accepted;
-                let anchor = M::token_prefix(&output.inputs, 1, context)?;
+                let anchor = M::token_prefix(&inputs, 1, context)?;
                 self.strategy.advance_prediction_cache(
                     &draft_state.anchor_capture,
                     &anchor,
@@ -3097,8 +2300,8 @@ where
             }
             if verified_inputs > 1 {
                 let captures =
-                    M::tensor_prefix(output.output.capture(), verified_inputs - 1, context)?;
-                let tokens = M::token_range(&output.inputs, 1, verified_inputs, context)?;
+                    M::tensor_prefix(verified.capture(), verified_inputs - 1, context)?;
+                let tokens = M::token_range(&inputs, 1, verified_inputs, context)?;
                 self.strategy.advance_prediction_cache(
                     &captures,
                     &tokens,
@@ -3108,10 +2311,10 @@ where
                 )?;
             }
             let (committed, replayed_tokens) = if verified_inputs == input_len {
-                (output.output, 0)
+                (verified, 0)
             } else {
                 S::restore_target_checkpoint(cache, &checkpoint.cache, context)?;
-                let retained = M::token_prefix(&output.inputs, verified_inputs, context)?;
+                let retained = M::token_prefix(&inputs, verified_inputs, context)?;
                 (
                     self.strategy.verify_target(
                         &retained,

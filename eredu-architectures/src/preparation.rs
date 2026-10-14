@@ -143,6 +143,11 @@ pub const fn gguf_composite_artifact_plan(
     use GgufMediaProjectorRequirement::{NotApplicable, Optional, Required};
 
     let (model_modalities, projector_modalities, projector_requirement) = match architecture {
+        GgufArchitecture::NemotronLabsDiffusion => (
+            InputModalities::TEXT,
+            Some(InputModalities { text: true, image: true, audio: false, video: false }),
+            Optional,
+        ),
         GgufArchitecture::VoiceChat => (
             InputModalities {
                 text: true,
@@ -369,6 +374,14 @@ pub fn prepared_safetensors_floating_state_dtype_source(
     use crate::configuration::SafetensorsModelConfig;
 
     let parameter = match architecture.model() {
+        SafetensorsModelConfig::NemotronLabsDiffusion(config) => {
+            if config.tensor_fp8() {
+                // Scalar-scaled FP8 projection recipes decode to F32. The
+                // admitted F32 scale establishes cache arithmetic even when
+                // embeddings and normalization gains retain BF16 storage.
+                "model.layers.0.self_attn.q_proj.weight_scale".into()
+            } else { "model.embed_tokens.weight".into() }
+        },
         SafetensorsModelConfig::DiffusionGemma(_) => "model.decoder.embed_tokens.weight".into(),
         SafetensorsModelConfig::Gemma4(_) | SafetensorsModelConfig::MuseGlimmer(_) => {
             "model.language_model.embed_tokens.weight".into()
@@ -411,6 +424,7 @@ pub fn prepared_gguf_floating_state_dtype_source(
     use crate::configuration::GgufModelConfig;
 
     let parameter = match architecture.model() {
+        GgufModelConfig::NemotronLabsDiffusion(_) => "token_embd.weight",
         GgufModelConfig::VoiceChat(_) => {
             return Err(invalid(
                 "Realtime floating-state dtype belongs to the realtime loader contract",
@@ -473,6 +487,12 @@ pub fn prepared_safetensors_capabilities(
 
     let (parallel, independently_addressable_experts, input_modalities, embedded_draft_layers) =
         match architecture.model() {
+            SafetensorsModelConfig::NemotronLabsDiffusion(args) => (
+                ParallelCapabilityPlan::TENSOR_PIPELINE,
+                false,
+                InputModalities { text: true, image: args.vision.is_some(), audio: false, video: false },
+                0,
+            ),
             SafetensorsModelConfig::DeepSeekV3(args) => {
                 let mut capabilities = routed_text(args.has_sparse_moe_layers());
                 capabilities.3 = usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?;
@@ -661,6 +681,7 @@ pub fn prepared_gguf_capabilities(
 
     let architecture = plan.architecture();
     let routed = match plan.model() {
+        GgufModelConfig::NemotronLabsDiffusion(_) => false,
         GgufModelConfig::DiffusionGemma(family) => family.text.num_experts.is_some(),
         GgufModelConfig::Gemma4(family) => family.text.num_experts.is_some(),
         GgufModelConfig::MuseGlimmer(args) => args.is_moe(),

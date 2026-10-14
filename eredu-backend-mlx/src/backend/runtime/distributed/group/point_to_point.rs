@@ -1,6 +1,17 @@
 use super::collectives::{logical_direct_exchange, ordered_world_sum, pack_logical_value};
 use super::*;
 
+/// Broadcasts one already framed boundary under exact world participation.
+/// Completing each frame preserves role order across independently lazy branches.
+pub(crate) fn broadcast_boundary_frame(input: &Array, source: usize, group: &Group, stream: &Stream) -> Result<Array> {
+    if source >= group.size() || group.logical.is_some() || input.dtype() != Dtype::Uint8 {
+        return Err(Exception::custom("world boundary frame requires a native world, valid source and byte storage"));
+    }
+    let contribution = if group.rank() == source { input.clone() }
+        else { input.multiply(Array::from_slice(&[0u8], &[]), stream)? };
+    ordered_world_sum(&contribution, group, stream)
+}
+
 fn checked_peer(peer: usize, group: &Group, role: &str) -> Result<()> {
     if group.size() == 1 {
         return Err(Exception::custom(format!(

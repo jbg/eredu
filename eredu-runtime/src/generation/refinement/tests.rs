@@ -1,5 +1,5 @@
 use super::*;
-use eredu_core::refinement::RefinementOptions;
+use eredu_core::refinement::{EntropyRefinementConfig, EntropyRefinementOptions};
 use std::cell::Cell;
 
 struct Numeric;
@@ -31,6 +31,93 @@ impl RefinementBackend for Numeric {
     type Error = &'static str;
     type Mask = Vec<bool>;
     type ConditioningFormat = ();
+
+    fn initialize_masked_canvas(
+        canvas: NonZeroU32,
+        mask_token: u32,
+        layout: Option<&eredu_core::refinement::RefinementCanvas>,
+        context: &Context,
+    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
+        let mut tokens = vec![mask_token; canvas.get() as usize];
+        if let Some(layout) = layout {
+            tokens = Self::seed_canvas(&tokens, layout, context)?.0;
+        }
+        let count = tokens.iter().filter(|x| **x == mask_token).count() as u32;
+        Ok(Some((tokens, count)))
+    }
+
+    fn masked_refinement_step(
+        canvas: &Self::Token,
+        previous: Option<&Self::Logits>,
+        logits: &Self::Logits,
+        mask_token: u32,
+        config: eredu_core::refinement::MaskedRefinementConfig,
+        scheduled: u32,
+        random: &mut u64,
+        _: &Context,
+    ) -> Result<Option<MaskedRefinementStep<Self>>, Self::Error> {
+        let options = config.options();
+        let eligible: Vec<_> = canvas.iter().map(|x| *x == mask_token).collect();
+        let sampled: Vec<_> = logits
+            .iter()
+            .map(|row| {
+                masked::sample_position(row, options.sampling, options.temperature, || {
+                    *random += 1;
+                    0.5
+                })
+                .map_err(|_| "invalid masked scores")
+            })
+            .collect::<Result<_, _>>()?;
+        let transfer = masked::transfer_positions(
+            logits,
+            &sampled,
+            &eligible,
+            scheduled,
+            options.confidence_threshold,
+        )
+        .map_err(|_| "invalid masked transfer")?;
+        let result = Self::select_tokens(&transfer, &sampled, canvas, &context())?;
+        let scores = logits
+            .iter()
+            .enumerate()
+            .map(|(p, row)| {
+                if !eligible[p] {
+                    previous.map_or(row, |old| &old[p]).clone()
+                } else {
+                    row.clone()
+                }
+            })
+            .collect();
+        let remaining = result.iter().filter(|x| **x == mask_token).count() as u32;
+        Ok(Some(MaskedRefinementStep {
+            canvas: result,
+            scores,
+            transfer,
+            remaining,
+        }))
+    }
+
+    fn invalidate_masked_suffix(
+        canvas: &Self::Token,
+        position: usize,
+        token: &Self::Token,
+        mask_token: u32,
+        pins: Option<(&Self::Token, &Self::Mask)>,
+        _: &Context,
+    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
+        let mut ids = canvas.clone();
+        ids[position] = token[0];
+        ids[position + 1..].fill(mask_token);
+        if let Some((seeds, fixed)) = pins {
+            for p in position + 1..ids.len() {
+                if fixed[p] {
+                    ids[p] = seeds[p];
+                }
+            }
+        }
+        let count = ids.iter().filter(|x| **x == mask_token).count() as u32;
+        Ok(Some((ids, count)))
+    }
 
     fn seed_canvas(
         noise: &Self::Token,
@@ -255,7 +342,7 @@ fn context() -> Context {
 #[test]
 fn entropy_acceptance_is_not_commitment_and_final_output_is_argmax() {
     let context = context();
-    let policy = RefinementOptions {
+    let policy = EntropyRefinementOptions {
         max_denoising_steps: 1,
         t_min: 1.0,
         t_max: 1.0,
@@ -329,9 +416,11 @@ fn failed_settlement_and_invalid_geometry_do_not_advance_state_or_randomness() {
     let initial = state.clone();
     assert!(state.advance(&vec![vec![0.0, 1.0]], &context).is_err());
     context.fail_settlement.set(true);
-    assert!(state
-        .advance(&vec![vec![0.0, 1.0], vec![2.0, 0.0]], &context)
-        .is_err());
+    assert!(
+        state
+            .advance(&vec![vec![0.0, 1.0], vec![2.0, 0.0]], &context)
+            .is_err()
+    );
     assert_eq!(state.completed_steps(), 0);
     assert!(state.draft().is_none());
     assert_eq!(state.canvas(), initial.canvas());
@@ -340,12 +429,168 @@ fn failed_settlement_and_invalid_geometry_do_not_advance_state_or_randomness() {
 
 #[test]
 fn schedule_and_json_admission_preserve_reference_indexing() {
-    let policy = RefinementConfig::default();
+    let policy = EntropyRefinementConfig::default();
     assert_eq!(policy.temperature(0).unwrap(), 0.8);
     assert!((policy.temperature(47).unwrap() - (0.4 + 0.4 / 48.0)).abs() < 1e-7);
     assert!(policy.temperature(48).is_err());
-    assert!(serde_json::from_str::<RefinementConfig>(r#"{"max_denoising_steps":0}"#).is_err());
-    assert!(serde_json::from_str::<RefinementConfig>(r#"{"t_min":-1}"#).is_err());
+    assert!(
+        serde_json::from_str::<EntropyRefinementConfig>(r#"{"max_denoising_steps":0}"#).is_err()
+    );
+    assert!(serde_json::from_str::<EntropyRefinementConfig>(r#"{"t_min":-1}"#).is_err());
+}
+
+#[test]
+fn masked_policy_preserves_selected_tokens_scores_and_isolates_failed_steps() {
+    use eredu_core::refinement::{MaskedRefinementConfig, MaskedRefinementOptions};
+    let context = context();
+    let config: MaskedRefinementConfig = MaskedRefinementOptions {
+        max_denoising_steps: 2,
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    let policy = RefinementPolicy::MaskedUnmasking {
+        config,
+        mask_token_id: 2,
+    };
+    let mut state = RefinementState::<Numeric>::new(
+        policy,
+        NonZeroU32::new(3).unwrap(),
+        TokenDomain::new(3),
+        (),
+        7,
+        None,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(state.canvas(), &[2, 2, 2]);
+    let first = vec![
+        vec![4.0, 0.0, -20.0],
+        vec![0.0, 3.0, -20.0],
+        vec![0.0, 0.1, -20.0],
+    ];
+    state.advance(&first, &context).unwrap();
+    assert_eq!(state.canvas(), &[0, 1, 2]);
+    assert!(state.self_conditioning().is_none());
+    assert!(!state.is_finished());
+    let mut fork = state.clone();
+    let second = vec![
+        vec![0.0, 9.0, -20.0],
+        vec![9.0, 0.0, -20.0],
+        vec![5.0, 0.0, -20.0],
+    ];
+    context.fail_settlement.set(true);
+    assert!(matches!(
+        state.advance(&second, &context),
+        Err(RefinementError::Backend("unresolved native failure"))
+    ));
+    assert_eq!(state.canvas(), &[0, 1, 2]);
+    assert_eq!(state.completed_steps(), 1);
+    context.fail_settlement.set(false);
+    state.advance(&second, &context).unwrap();
+    fork.advance(&second, &context).unwrap();
+    assert_eq!(state.candidates(), Some(&vec![0, 1, 0]));
+    assert_eq!(state.candidates(), fork.candidates());
+    assert_eq!(state.final_scores().unwrap()[0], first[0]);
+    assert_eq!(state.final_scores().unwrap()[1], first[1]);
+    assert_eq!(state.final_scores().unwrap()[2], second[2]);
+    assert_eq!(state.into_random(), 7);
+}
+
+#[test]
+fn masked_policy_keeps_full_canvas_and_front_loads_short_schedule() {
+    use eredu_core::refinement::{
+        MaskedRefinementConfig, MaskedRefinementOptions, RefinementCanvas,
+    };
+    let config: MaskedRefinementConfig = MaskedRefinementOptions {
+        max_denoising_steps: 2,
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    assert_eq!(
+        [
+            config.transfer_tokens(3, 0).unwrap(),
+            config.transfer_tokens(3, 1).unwrap()
+        ],
+        [2, 1]
+    );
+    let layout = RefinementCanvas {
+        seed_tokens: vec![Some(1), None, None, None],
+        pinned_positions: vec![0],
+    };
+    let mut state = RefinementState::<Numeric>::new(
+        RefinementPolicy::MaskedUnmasking {
+            config,
+            mask_token_id: 2,
+        },
+        NonZeroU32::new(4).unwrap(),
+        TokenDomain::new(3),
+        (),
+        0,
+        Some(&layout),
+        &context(),
+    )
+    .unwrap();
+    let scores = vec![vec![2.0, 0.0, -20.0]; 4];
+    state.advance(&scores, &context()).unwrap();
+    assert_eq!(state.canvas(), &[1, 0, 0, 2]);
+    state.advance(&scores, &context()).unwrap();
+    assert_eq!(state.candidates(), Some(&vec![1, 0, 0, 0]));
+}
+
+#[test]
+fn constrained_masked_replacement_refines_only_the_dependent_suffix() {
+    use super::block::BlockRefinementState;
+    use eredu_core::refinement::{GenerationPhase, MaskedRefinementOptions, RefinementCanvas};
+    let config = MaskedRefinementOptions {
+        max_denoising_steps: 1,
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    let layout = std::sync::Arc::new(RefinementCanvas {
+        seed_tokens: vec![None, None, None, Some(1)],
+        pinned_positions: vec![3],
+    });
+    let mut block = BlockRefinementState::<Numeric>::new(
+        RefinementPolicy::MaskedUnmasking {
+            config,
+            mask_token_id: 2,
+        },
+        NonZeroU32::new(4).unwrap(),
+        TokenDomain::new(3),
+        (),
+        9,
+        Some(layout),
+    );
+    let context = context();
+    block.context_encoded(&context, None).unwrap();
+    block
+        .refine(&vec![vec![4.0, 0.0, -20.0]; 4], &context)
+        .unwrap();
+    assert_eq!(block.phase(), GenerationPhase::Finalization);
+    assert_eq!(
+        block.refinement().unwrap().candidates(),
+        Some(&vec![0, 0, 0, 1])
+    );
+    block.finalize(vec![1], true, &context).unwrap();
+    assert_eq!(block.phase(), GenerationPhase::Refinement);
+    assert_eq!(block.refinement().unwrap().canvas(), &[1, 2, 2, 1]);
+    let mut fork = block.clone();
+    let updated = vec![vec![0.0, 5.0, -20.0]; 4];
+    block.refine(&updated, &context).unwrap();
+    fork.refine(&updated, &context).unwrap();
+    assert_eq!(
+        block.refinement().unwrap().candidates(),
+        Some(&vec![1, 1, 1, 1])
+    );
+    assert_eq!(block.refinement().unwrap().completed_steps(), 2);
+    assert_eq!(block.finalization_input().unwrap().1, 1);
+    assert_eq!(
+        block.finalization_input().unwrap(),
+        fork.finalization_input().unwrap()
+    );
 }
 
 #[test]
@@ -353,7 +598,7 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
     use super::block::BlockRefinementState;
     use eredu_core::refinement::GenerationPhase;
     let context = context();
-    let policy = RefinementOptions {
+    let policy = EntropyRefinementOptions {
         max_denoising_steps: 1,
         t_min: 1.0,
         t_max: 1.0,
@@ -371,10 +616,10 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
     );
     assert!(state.finalization_input().is_err());
     context.fail_settlement.set(true);
-    assert!(state.context_encoded(&context).is_err());
+    assert!(state.context_encoded(&context, None).is_err());
     assert_eq!(state.phase(), GenerationPhase::Context);
     context.fail_settlement.set(false);
-    state.context_encoded(&context).unwrap();
+    state.context_encoded(&context, None).unwrap();
     assert_eq!(state.refinement().unwrap().canvas(), &vec![1, 0]);
     state
         .refine(&vec![vec![3.0, 0.0], vec![0.0, 4.0]], &context)
@@ -383,26 +628,26 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
     assert_eq!(state.finalization_input().unwrap().1, 0);
     // A constrained first commitment replaces argmax 0. This token, rather than
     // the draft or noisy canvas, is retained for the next context invocation.
-    state.finalize(vec![1]).unwrap();
+    state.finalize(vec![1], false, &context).unwrap();
     assert_eq!(state.continuation_context_tokens(1), Some(0));
     assert_eq!(state.continuation_context_tokens(2), Some(2));
     assert_eq!(state.continuation_context_tokens(4), Some(4));
     let mut restored = state.clone();
     let mut alternate = state.clone();
-    alternate.finalize(vec![0]).unwrap();
+    alternate.finalize(vec![0], false, &context).unwrap();
     assert_eq!(alternate.authoritative_tokens(), &[vec![1], vec![0]]);
     assert_eq!(state.finalization_input().unwrap().1, 1);
-    state.finalize(vec![1]).unwrap();
-    restored.finalize(vec![1]).unwrap();
+    state.finalize(vec![1], false, &context).unwrap();
+    restored.finalize(vec![1], false, &context).unwrap();
     assert_eq!(state.authoritative_tokens(), &[vec![1], vec![1]]);
     assert_eq!(state.phase(), GenerationPhase::Context);
     assert_eq!(state.block(), 1);
     assert_eq!(state.continuation_context_tokens(0), Some(0));
     assert_eq!(state.continuation_context_tokens(1), Some(2));
     assert_eq!(state.continuation_context_tokens(3), Some(4));
-    assert!(state.finalize(vec![0]).is_err());
-    state.context_encoded(&context).unwrap();
-    restored.context_encoded(&context).unwrap();
+    assert!(state.finalize(vec![0], false, &context).is_err());
+    state.context_encoded(&context, None).unwrap();
+    restored.context_encoded(&context, None).unwrap();
     assert!(state.authoritative_tokens().is_empty());
     assert_eq!(state.refinement().unwrap().canvas(), &vec![1, 0]);
     assert_eq!(
@@ -424,7 +669,7 @@ fn block_snapshots_preserve_finalization_and_encode_only_authoritative_tokens() 
 #[test]
 fn pinned_positions_preserve_seed_and_one_hot_feedback_across_iterations_and_forks() {
     let context = context();
-    let policy = RefinementOptions {
+    let policy = EntropyRefinementOptions {
         max_denoising_steps: 3,
         stability_threshold: 3,
         t_max: 1.0,
@@ -479,16 +724,18 @@ fn pinned_positions_preserve_seed_and_one_hot_feedback_across_iterations_and_for
         seed_tokens: vec![Some(1), None, Some(2)],
         pinned_positions: vec![1],
     };
-    assert!(RefinementState::<Numeric>::new(
-        policy,
-        NonZeroU32::new(3).unwrap(),
-        TokenDomain::new(3),
-        (),
-        0,
-        Some(&invalid),
-        &context
-    )
-    .is_err());
+    assert!(
+        RefinementState::<Numeric>::new(
+            policy,
+            NonZeroU32::new(3).unwrap(),
+            TokenDomain::new(3),
+            (),
+            0,
+            Some(&invalid),
+            &context
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -498,7 +745,7 @@ fn pinned_template_rows_do_not_dilute_confidence_of_unresolved_positions() {
         seed_tokens: vec![Some(0), Some(0), None],
         pinned_positions: vec![0, 1],
     };
-    let policy = RefinementOptions {
+    let policy = EntropyRefinementOptions {
         max_denoising_steps: 4,
         confidence_threshold: 0.4,
         stability_threshold: 1,

@@ -152,9 +152,13 @@ fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
 
 #[test]
 fn lane_proposal_width_cannot_exceed_selected_realization() {
-    let config = SpeculativeConfig {
-        max_draft_tokens: 5,
-        ..SpeculativeConfig::default()
+    let config = GenerationRequestConfig {
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(5).expect("positive proposal capacity"),
+            ),
+        ),
+        ..GenerationRequestConfig::default()
     };
     let error = validate_lane_proposal_capacity(&config, 4).unwrap_err();
     assert!(error.to_string().contains("admits at most 4"));

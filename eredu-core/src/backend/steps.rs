@@ -28,18 +28,12 @@ pub struct TextProgress {
 
 /// One shared-driver advancement, including work between token commitments.
 pub enum TextAdvancement<T> {
+    /// Canonical cache and tentative output settled before another prediction.
+    ModeChanged(crate::decoding::ModeChangeAcknowledgement),
     /// Completed context or refinement work; the controller is unchanged.
     Progress(TextProgress),
     /// One canonical token committed through the ordinary controller.
     Token(ControlledToken<T>),
-}
-
-pub(super) enum PhysicalTextOutput<T> {
-    Progress(TextProgress),
-    Token {
-        token: T,
-        score_kind: PredictionScoreKind,
-    },
 }
 
 /// Submission output, with the pending input retained after physical progress.
@@ -60,12 +54,18 @@ pub enum TextOperationOutput<P, T> {
 /// A backend violated the declared advancement protocol.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum TextOperationPolicyError {
+    /// A prospective mode is incompatible with the retained execution or lifecycle.
+    #[error(transparent)]
+    DecodingMode(#[from] crate::decoding::DecodingModeError),
     /// Invalid seeded/pinned canvas, rejected before native preparation.
     #[error(transparent)]
     InvalidRefinementCanvas(crate::refinement::RefinementPolicyError),
     /// Causal execution has no tentative block or refinement schedule.
     #[error("refinement policy requires a block-refinement architecture")]
     RequiresBlockRefinementArchitecture,
+    /// A valid numerical policy does not match the retained architecture equations.
+    #[error("refinement numerical policy does not match the selected architecture")]
+    RefinementPolicyMismatch,
     /// Adaptive surprise requires scores from a causal conditional distribution.
     #[error("the selected sampling strategy requires causal conditional scores")]
     RequiresCausalConditionalScores,

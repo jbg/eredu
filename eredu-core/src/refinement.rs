@@ -44,15 +44,20 @@ impl RefinementCanvas {
 
 /// Validated entropy-bounded refinement controls, independent of model geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "RefinementOptions", into = "RefinementOptions")]
-pub struct RefinementConfig {
-    options: RefinementOptions,
+#[serde(
+    try_from = "EntropyRefinementOptions",
+    into = "EntropyRefinementOptions"
+)]
+pub struct EntropyRefinementConfig {
+    options: EntropyRefinementOptions,
 }
+// All floating fields are finite after construction and deserialization.
+impl Eq for EntropyRefinementConfig {}
 
 /// Request or artifact values accepted by entropy-bounded refinement.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RefinementOptions {
+pub struct EntropyRefinementOptions {
     /// Maximum decoder invocations for each block.
     pub max_denoising_steps: u32,
     /// Initial logit temperature.
@@ -67,7 +72,7 @@ pub struct RefinementOptions {
     pub stability_threshold: u32,
 }
 
-impl Default for RefinementOptions {
+impl Default for EntropyRefinementOptions {
     fn default() -> Self {
         Self {
             max_denoising_steps: 48,
@@ -100,12 +105,18 @@ pub enum RefinementPolicyError {
     /// The requested iteration is outside the selected schedule.
     #[error("refinement iteration lies outside the selected schedule")]
     Iteration,
+    /// Confidence thresholds lie in the probability interval.
+    #[error("masked refinement confidence must be finite and lie in [0, 1]")]
+    Confidence,
+    /// Masked sampling allows greedy selection or finite positive noise.
+    #[error("masked refinement temperature must be finite and nonnegative")]
+    MaskedTemperature,
 }
 
-impl TryFrom<RefinementOptions> for RefinementConfig {
+impl TryFrom<EntropyRefinementOptions> for EntropyRefinementConfig {
     type Error = RefinementPolicyError;
 
-    fn try_from(options: RefinementOptions) -> Result<Self, Self::Error> {
+    fn try_from(options: EntropyRefinementOptions) -> Result<Self, Self::Error> {
         if options.max_denoising_steps == 0 {
             return Err(RefinementPolicyError::ZeroSteps);
         }
@@ -126,23 +137,23 @@ impl TryFrom<RefinementOptions> for RefinementConfig {
     }
 }
 
-impl From<RefinementConfig> for RefinementOptions {
-    fn from(config: RefinementConfig) -> Self {
+impl From<EntropyRefinementConfig> for EntropyRefinementOptions {
+    fn from(config: EntropyRefinementConfig) -> Self {
         config.options
     }
 }
 
-impl Default for RefinementConfig {
+impl Default for EntropyRefinementConfig {
     fn default() -> Self {
-        RefinementOptions::default()
+        EntropyRefinementOptions::default()
             .try_into()
             .expect("the default refinement policy is valid")
     }
 }
 
-impl RefinementConfig {
+impl EntropyRefinementConfig {
     /// Returns the immutable validated controls.
-    pub const fn options(self) -> RefinementOptions {
+    pub const fn options(self) -> EntropyRefinementOptions {
         self.options
     }
 
@@ -169,11 +180,153 @@ impl RefinementConfig {
     }
 }
 
+/// Numerical selection used while unmasking a tentative block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskedSampling {
+    /// Select `argmax(exp(logits) / (-ln(U))^temperature)` in float64.
+    GumbelPower,
+    /// Categorical selection from temperature-scaled position scores.
+    Categorical,
+}
+
+/// Request values for confidence-based masked-token unmasking.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MaskedRefinementOptions {
+    /// Maximum numerical invocations for one block.
+    pub max_denoising_steps: u32,
+    /// Zero selects greedy tokens; positive values control proposal noise.
+    pub temperature: f32,
+    /// Absent uses the even transfer schedule; present forces at least one transfer.
+    pub confidence_threshold: Option<f32>,
+    /// Explicit position-selection equations.
+    pub sampling: MaskedSampling,
+}
+
+impl Default for MaskedRefinementOptions {
+    fn default() -> Self {
+        Self {
+            max_denoising_steps: 32,
+            temperature: 0.0,
+            confidence_threshold: None,
+            sampling: MaskedSampling::GumbelPower,
+        }
+    }
+}
+
+/// Validated unmasking policy, independent of the architecture's mask identity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "MaskedRefinementOptions", into = "MaskedRefinementOptions")]
+pub struct MaskedRefinementConfig {
+    options: MaskedRefinementOptions,
+}
+// Validation excludes NaN, preserving reflexive equality for retained policies.
+impl Eq for MaskedRefinementConfig {}
+
+impl TryFrom<MaskedRefinementOptions> for MaskedRefinementConfig {
+    type Error = RefinementPolicyError;
+    fn try_from(options: MaskedRefinementOptions) -> Result<Self, Self::Error> {
+        if options.max_denoising_steps == 0 {
+            return Err(RefinementPolicyError::ZeroSteps);
+        }
+        if !options.temperature.is_finite() || options.temperature < 0.0 {
+            return Err(RefinementPolicyError::MaskedTemperature);
+        }
+        if options
+            .confidence_threshold
+            .is_some_and(|x| !x.is_finite() || !(0.0..=1.0).contains(&x))
+        {
+            return Err(RefinementPolicyError::Confidence);
+        }
+        Ok(Self { options })
+    }
+}
+
+impl From<MaskedRefinementConfig> for MaskedRefinementOptions {
+    fn from(config: MaskedRefinementConfig) -> Self {
+        config.options
+    }
+}
+
+impl Default for MaskedRefinementConfig {
+    fn default() -> Self {
+        MaskedRefinementOptions::default()
+            .try_into()
+            .expect("valid masked defaults")
+    }
+}
+
+impl MaskedRefinementConfig {
+    /// Complete validated numerical controls.
+    pub const fn options(self) -> MaskedRefinementOptions {
+        self.options
+    }
+
+    /// Even transfer count with remainder assigned to the earliest invocations.
+    pub fn transfer_tokens(
+        self,
+        initial_masked: u32,
+        completed: u32,
+    ) -> Result<u32, RefinementPolicyError> {
+        let steps = self.options.max_denoising_steps;
+        if completed >= steps {
+            return Err(RefinementPolicyError::Iteration);
+        }
+        Ok(initial_masked / steps + u32::from(completed < initial_masked % steps))
+    }
+}
+
+/// Independent numerical policies sharing one refinement lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "policy", content = "options", rename_all = "snake_case")]
+pub enum RefinementPolicy {
+    /// Entropy-bounded feedback and final argmax selection.
+    EntropyFeedback(EntropyRefinementConfig),
+    /// Confidence-based unmasking; selected tokens remain fixed.
+    MaskedUnmasking {
+        /// Validated schedule and numerical selection.
+        config: MaskedRefinementConfig,
+        /// Architecture-admitted mask-token identity.
+        mask_token_id: u32,
+    },
+}
+
+impl RefinementPolicy {
+    /// Maximum number of preceding token canvases retained by the numerical policy.
+    pub const fn stability_history_length(self) -> u32 {
+        match self {
+            Self::EntropyFeedback(config) => config.options().stability_threshold,
+            Self::MaskedUnmasking { .. } => 0,
+        }
+    }
+}
+
+impl From<EntropyRefinementConfig> for RefinementPolicy {
+    fn from(config: EntropyRefinementConfig) -> Self {
+        Self::EntropyFeedback(config)
+    }
+}
+
+impl Default for RefinementPolicy {
+    fn default() -> Self {
+        Self::EntropyFeedback(EntropyRefinementConfig::default())
+    }
+}
+
+impl TryFrom<EntropyRefinementOptions> for RefinementPolicy {
+    type Error = RefinementPolicyError;
+    fn try_from(options: EntropyRefinementOptions) -> Result<Self, Self::Error> {
+        Ok(EntropyRefinementConfig::try_from(options)?.into())
+    }
+}
+
 /// Meaning of a reported prediction score.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PredictionScoreKind {
     /// Probability conditioned on the committed causal prefix.
+    #[default]
     CausalConditional,
     /// Position score conditioned on a complete tentative block.
     RefinementPosition,

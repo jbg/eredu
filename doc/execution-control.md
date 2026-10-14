@@ -1,5 +1,12 @@
 # Execution control
 
+Prepared source-backed requests and ordinary requests use
+`PreparedChatGenerationSettings.decoding_mode` for initial selection. Omission
+selects AR for a causal target; self-speculation carries its options in the mode.
+The target-only source enters the shared request table without an assistant and
+supports the target's declared ordinary refinement policy. Controlled and
+uninterrupted visitors borrow the same prepared target executor.
+
 Live capture admission reads `CaptureDeclarations` without hashing checkpoint
 contents. Session-provenance records carry the loaded session and admitted plan,
 with absent artifact attribution. Explicit content-exact capture, intervention
@@ -21,7 +28,7 @@ current controller decision and commit one authoritative token. `Progress` recor
 carry phase, block, iteration and independent execution coordinates; token records
 also declare the meaning of their scores. Causal conditional scores, refinement
 position scores and constrained finalization scores remain distinct. Generation
-records and execution-control metadata use schema version 2.
+records and execution-control metadata use schema version 3.
 
 Snapshots preserve the logical physical-step and committed-token coordinates,
 alongside backend phase state, sampler, pending input and constraint state.
@@ -44,8 +51,64 @@ position score captures support reads without commitment: advance through contex
 and refinement, collect the scores, then cancel before finalization. See
 [seeded and pinned canvases](refinement-canvases.md).
 
-The `refinement` setting controls the trained iterative schedule. Causal sampling
-knob overrides and causal likelihood-ratio speculative verification reject
+The `decoding_mode` setting selects `Autoregressive`, `Diffusion` or
+`SelfSpeculation` with validated invocation options. Absence selects AR when the
+retained realization supplies causal target sampling. An intrinsically iterative
+architecture such as DiffusionGemma retains its trained position-score policy.
+Diffusion and masked drafting carry their numerical `RefinementPolicy` in the mode.
+Incompatible modes fail before context execution. The common runtime
+refinement state retains masked selections, selected score rows, independent RNG,
+the suffix transfer cursor and cumulative invocation count. Constraint-driven
+suffix refinement preserves the committed prefix and fixed pins; snapshot clones
+isolate the numerical cursor and random stream.
+
+`request_decoding_mode` on a controlled session or its thread-safe
+`GenerationControlHandle` validates the request against immutable realized-mode
+facts. One pending transition is allowed; another returns `ModeChangePending`.
+Request-local sampling requirements are checked at admission as well. Mirostat
+rejects diffusion position scores with `RequiresCausalConditionalScores`, while
+leaving active execution and the pending command unchanged.
+Executions without a settled handoff reject changes before altering the run.
+The shared physical driver finishes the current block or verification transaction,
+appends any committed suffix once, preserves next-target logits and removes
+tentative output. `ModeChanged` follows tentative-output clearing and carries the
+effective generated-token position. Cancellation wins over an unacknowledged
+handoff. Terminal runs reject commands.
+
+`PreparedChatGenerationRequest.control_handle` supplies the same mode command
+mailbox to uninterrupted advancement. Mode state, including pending commands and
+the last acknowledgement, is copied with complete snapshots. Restore installs it
+with the corresponding cache and sampler; a fork has an independent mailbox.
+Capture, transport and copy usage remain cumulative. Native loaded-family support
+is reported separately from the neutral command mechanism. Nemotron's native
+physical driver supports AR/masked-diffusion handoff at completed block boundaries.
+Committed block append retains only the final causal score row for resumed AR.
+Refinement and target random streams remain independent, and snapshot accounting
+includes retained next-token logits and spent refinement randomness.
+
+Prepared executor lanes carry `GenerationRequestConfig.decoding_mode`, including
+the same validated speculative options used by request preparation. The common
+`GenerationRequestTable` runs causal lanes with zero proposals and no optimistic
+drafting. Controlled executor sessions expose `request_decoding_mode`,
+`decoding_state` and `bind_control_handle` after prefill. Supplying
+`PreparedChatSpeculativeGenerationRequest.control_handle` or a batch lane's
+handle binds uninterrupted commands before prefill. Failed submission closes a
+bound mailbox; terminal output closes commands before its delivery callback.
+
+AR and speculative executor handoffs settle through a zero-proposal transaction.
+The final committed token enters causal cache once and its next-target row stays
+retained for subsequent sampling. The acknowledgement precedes that sampling,
+does not consume either random stream and clears promoted tentative proposals.
+Durable snapshots retain the row, explicit pending committed token and complete
+mode state. Each serial branch has an independent command owner; inactive
+commands survive exchange, and branch release closes only its mailbox. Branch
+creation charges host command metadata while sharing immutable saved tensors.
+Per-request lookahead and completion deadlines stay within shared scheduler
+ceilings. Continuation forecasts cover active and pending proposal allowances,
+lookahead, adapter workspace and retained next-target rows. Numerical unmasking
+support and complete diffusion commitment are distinct capability facts.
+
+Causal sampling overrides and causal likelihood-ratio speculative verification reject
 noncausal target scores with `RequiresCausalConditionalScores`. Constrained
 finalization applies the evolving canonical constraints independently to each
 position. Explicit reseeding remains a prospective change to the retained stream.
@@ -355,7 +418,7 @@ attribution or accounting reason recorded here and in the Inspector guide.
 | --- | --- | --- |
 | Model KV, ring/sliding offsets, fixed recurrent and convolution state | Architecture-declared runtime state, realized by backend mechanisms | Independent native state copy plus all typed metadata |
 | Prepared source, execution selection, native authority | Loaded backend session | Retain exact compatibility and completion ownership; never reload or replay |
-| Pending prompt or last committed decode input | Core `TextGenerationMachine` | Preserve phase and pending input explicitly |
+| Pending prompt or last committed decode input | Core `GenerationRequestTable` completed-decision source | Preserve phase and pending input explicitly |
 | Native RNG, standard/Mirostat policy and penalty history | Backend text-generation state and neutral sampler | Preserve RNG key and adaptive counters; overrides must be explicit |
 | Canonical generated IDs, output limit, terminal precedence | Facade `CommittedGenerationCursor` / core `GenerationSequence` | Copy complete sequence and terminal outcome |
 | Grammar/token constraints | Facade `ConstraintController` | Independent grammar fork |
@@ -524,10 +587,16 @@ semantic pipeline. The pipeline and built-in protocol parsers support exact stat
 forks, including buffered bytes, JSON/Python/tool-call state, stop matching, pending
 delivery and terminal state. An unimplemented custom parser fork fails explicitly.
 
-The core ordinary text machine also exposes `TextGenerationDriver` and detached
-`TextGenerationContinuation` state. Existing asynchronous and controlled iterators
-use the same machine. The detached state retains the pending prompt/token,
-controller, sampler, remaining allowance and exact completions. A driver rejects
+The common `GenerationRequestTable` also drives `TextGenerationDriver`, detached
+`TextGenerationContinuation` state, and native-token and controlled iterators.
+A native completed-decision source retains the pending prompt/token, opaque
+sampler, non-cloneable controller and exact completions. The common request owns
+canonical generated IDs, commitment allowance, cancellation and mode control.
+Native token iterators yield the original handle after exact completion and
+canonical identity validation. An invalid identity fails that iterator advancement
+before commitment or delivery.
+Snapshots copy the real canonical sequence with native state and pending input;
+restore and fork preserve spent observation, transport and copy budgets. A driver rejects
 another driver's continuation before any work, requires completion and one-step
 record draining between advances, and fences failures even after cleanup. This
 low-level mechanism still requires facade composition with native state exchange,
@@ -1069,7 +1138,7 @@ and capture accounting remain cumulative. Additional encoding and family accepta
 `doc/component-analysis.md`.
 
 
-Internal speculative activation plans use schema 2. The admitted scope binds
+Internal speculative activation plans use schema 3. The admitted scope binds
 phase applicability: `PredictionContext` runs only during prediction prefill and
 replay, `FusedProposal` only during fused proposal execution, and sequential
 `Prediction { depth }` only during its own proposal depth or prediction
@@ -2463,3 +2532,155 @@ implementation. A caller must use the chosen mode's declared timing and cannot
 discard the streaming prefix or tail without accounting for it. Codec candidate
 state does not own native completion, previously published audio or the complete
 VoiceChat session commit boundary.
+
+Shared-backbone self-speculation resolves exact verification within the selected
+completion deadline. MLX admits quarantine-until-complete disposition before model
+work, retains live native roots on timeout and fences further generation after
+failure. Cancellation observed while waiting for exact sampling completion prevents
+controller commitment and mode acknowledgement. Ordinary target decisions update
+the same capture commitment coordinate in AR and self-speculation. Instrumented
+causal context may retain every physical score row; sampling consumes only its final
+conditional row. Verification capture covers the complete causal transaction, while
+accepted decisions and snapshot boundaries retain independent committed positions.
+
+Distributed switchable generation agrees controls before the next physical action.
+A pending mode from one rank propagates to every participant; differing pending
+commands reject before cache work. Active mode, committed position and remaining
+allowance must match exactly. Cancellation from any rank discards prospective
+changes. Command exchange uses the retained bounded session transport and consumes
+monotone session credits, independent of model snapshots. A complete refinement
+canvas must fit the partition's admitted sequence bound at load time.
+
+Composite ordered pipeline placement can retain media-only stages with no decoder
+cache. They participate in command agreement and output publication without
+asserting a local text frontier. Vision/projector processing occurs for admitted
+native image input; cached continuation uses its retained causal context and skips
+inactive media producers. Complete invocation visibility and adapter scope travel
+with the decoder boundary.
+
+Composite pipeline stages with no decoder state participate in the same bounded
+verification-lane and snapshot preparation agreements. Their lanes and control
+slots contain explicit stateless realizations, and ownership exchange requires
+both sides to have no mutable layout. Snapshot copies preserve prompt-input and
+invocation metadata, while cache-shard identity remains absent. Restore and fork
+retain the shared cumulative copy and transport charges on every rank.
+
+World-participating boundary routes include idle stages in framing and exact
+completion. Only the named consumer installs the received invocation boundary;
+idle ranks discard its output. Preparation or source-completion failure is agreed
+before the world transfer, so a rejected local tensor cannot strand peers in the
+broadcast. These routes remain serialized across restored or forked continuations.
+
+`ExecutionPlan::with_draft_adapter` retains a `DraftAdapterSource` at load time.
+`SpeculationOptionsRequest::draft_adapter` selects its use for that invocation.
+Adapter parameters execute only during shared-backbone proposal refinement;
+causal context, causal verification and ordinary diffusion use the shared base.
+A request enabling an adapter absent from the retained selection fails before
+altering active execution. Snapshot mode options preserve the adapter selection.
+
+Settled generation forecasts preserve active and pending decoding policies.
+They include the complete diffusion canvas even for a one-token horizon,
+committed block tokens awaiting causal append, and shared-target verification
+overshoot. Current sampler, semantic, capture and snapshot retention remains
+charged when projecting a mode handoff. Recomputing facade retention uses the
+same mode-aware estimate and excludes completed loading and prompt execution.
+Ordinary and common request-table forecasts with zero additional output still
+include an admitted handoff's uncached committed suffix. Ordinary shared-backbone
+handoffs include isolated append and rollback cache copies; a pending
+diffusion block retains complete refinement geometry while reaching that boundary. A previously settled next-token
+row adds no second cache position. Forecasting leaves the queued command and
+all cumulative budgets unchanged.
+
+Prepared requests retaining an external, embedded or shared-backbone draft
+source accept an explicit initial AR mode. They use the same request table and
+can enter speculation through a later admitted command. Their startup forecast
+keeps the retained parameter owners and causal verification work, with zero
+proposal width and no draft or optimistic workspace until speculation applies.
+
+Shared-backbone requests in `GenerationRequestTable` admit initial diffusion as
+well as AR and self-speculation. Initial diffusion keeps the context's causal
+next-token row without committing it. Numerical advancements retain the full
+canvas without publishing tokens; a finalization advancement publishes one constrained
+selected position. Controlled step records expose the remaining tentative
+canvas separately from committed IDs and speculative proposals. Position captures
+carry `RefinementPosition`; causal prefill and verification captures carry
+`CausalConditional`. Finalization uses current controller restrictions without
+applying causal penalties, temperature or truncation to selected diffusion tokens.
+A forced replacement discards its dependent tentative rows before the next
+advancement refines that suffix.
+
+Snapshots preserve the partially finalized canvas, its position rows and cursor,
+the finalized suffix awaiting causal append, the active and pending modes, and
+independent proposal and ordinary-refinement streams. A queued mode change drains
+the active canvas and appends its finalized suffix once before acknowledgement.
+A second command receives `ModeChangePending`. Cancellation is agreed before
+publication and takes priority over a tentative terminal candidate. Snapshot,
+copy, observation and transport reservations remain cumulative through restore
+and fork. Refinement counters report full numerical canvas work even when EOS or
+a shortened output budget ends commitment inside the block.
+
+Switchable executions retaining causal target sampling accept its standard
+sampling settings even when the initial mode is diffusion. Those settings remain
+available for later AR or verification; diffusion finalization applies only its
+position restrictions. A strategy requiring causal conditional scores still
+rejects initial or pending diffusion before changing execution. Diffusion-only
+families retain their position-score sampling admission rules.
+
+A controlled request starting in diffusion establishes TTFT on its first
+position commitment. Active prefill and refinement work contributes to that
+metric; time spent paused between advancements and output callbacks does not.
+Before a first commitment, snapshots retain the completed active work allowance.
+Once established, TTFT remains available through restoration and branch exchange.
+
+Controlled shared-backbone requests admit internal activation capture and tensor
+interventions through the same scoped plan as causal and embedded drafting.
+Schema version 3 reports each ordinary refinement forward as `Refinement` and
+each masked draft forward as `MaskedDraft`, with its iteration index, complete
+physical canvas and assumed-prefix provenance. These records describe tentative
+computation; committed token IDs remain separate. A constraint correction causes
+new refinement invocations for the dependent suffix. Reusing saved position rows
+performs no new forward and emits no duplicate activation record. Snapshot and
+fork restore observer authority without refunding capture allowances or rewinding
+invocation identities.
+
+Batched verification and incremental shared-backbone verification use the same
+neutral `VerificationCursor`. It freezes one target choice, reports the exact
+accepted input count, and advances after successful commitment. Pending and
+finished cursors reject further target decisions with typed generation errors.
+Sampling and controller state stay with their existing owners; an explicitly
+advanced native cache failure leaves the chosen target frozen. Cursor snapshots
+copy writable progress while native verification evidence remains immutable.
+
+Image capture uses physical invocation media geometry, independently of text
+sequence and context extents. Shared-backbone prefill and ordinary controlled
+prefill obtain packed raw and projected counts from prepared media admission.
+Pixtral internal hooks execute during image context preparation; later mode
+changes reuse that causal context and do not rerun its tower. Original and
+effective values occupy separate capture paths, and edits affect the value
+consumed by the next operation. Capture schema version 3 includes these extents
+in invocation records and paid snapshots retain the existing authority ledger.
+
+The common request table advances shared refinement one numerical invocation at
+a time. A settled iteration produces no committed token; its complete canvas,
+selected rows, pinning, schedule counters and independent RNG remain in the
+request seed. Snapshots can pause at this boundary. Finalization takes a separate
+advancement and preserves selected identities. Mode commands remain pending
+through the numerical schedule and left-to-right commitment of the whole block.
+Paused numerical storage contributes to snapshot retention and copy allowances.
+
+Independent causal assistants retain ordinary target refinement separately from
+their proposal source. `TargetRefinement` supplies the target's declared policy,
+request-owned numerical continuation and snapshot estimates. Causal proposals
+retain likelihood-ratio verification in every mode. Diffusion refines only the
+target, then its causal append advances both target and assistant frontiers before
+a mode acknowledgement. Its numerical randomness uses the request's independent
+refinement substream; snapshots preserve it with both causal prefix seeds.
+
+Entropy and masked refinement share the common request-table lifecycle while
+retaining distinct finalization semantics. Entropy feedback selects the highest
+allowed position score and reports `ConstrainedFinalization`; masked refinement
+preserves admissible selected identities and reports position scores. Only a
+changed masked selection invalidates its dependent suffix. Single-model requests
+retain the complete numerical continuation with their immutable causal-context
+prefix and independent random stream. Declared refinement-only executions reject
+AR and speculative modes before changing request state.

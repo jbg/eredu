@@ -296,6 +296,7 @@ fn controlled_facade_pauses_unicode_and_resumes_the_ordinary_pipeline_in_all_mod
         let mut ordinary = vec![];
         let baseline = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings,
                 caller_stop_sequences: &[],
@@ -716,6 +717,7 @@ fn conversion_retention_observation_preserves_controlled_state_and_output() {
     model.reset().unwrap();
     let ordinary = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
             caller_stop_sequences: &[],

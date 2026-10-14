@@ -627,6 +627,7 @@ fn voicechat_codec_decoder_partition_rejects_malformed_boundary_and_foreign_carr
             &mut pass,
             &selected_route,
             vec![incoming, metadata],
+            &context,
         );
         if accepted.is_ok() {
             assert!(executor
@@ -681,6 +682,7 @@ fn voicechat_codec_decoder_partition_rejects_malformed_boundary_and_foreign_carr
         &mut pass,
         &route,
         vec![hidden.clone(), header(&[3, 1, 1])],
+        &context,
     )
     .unwrap();
     assert!(executor
@@ -726,6 +728,7 @@ fn voicechat_codec_decoder_partition_rejects_malformed_boundary_and_foreign_carr
         &mut pass,
         &route,
         vec![hidden, header(&[3, 1, 1])],
+        &context,
     )
     .unwrap();
     executor

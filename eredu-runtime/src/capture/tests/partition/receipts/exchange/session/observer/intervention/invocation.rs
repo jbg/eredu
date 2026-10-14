@@ -64,6 +64,7 @@ fn verify_invocation_scopes(scoped: bool) {
                             session.restore(&saved).unwrap();
                         }
                         let invocation = CaptureInvocationShape {
+            media: None,
                             batch: 1,
                             sequence: rows,
                             context: None,
@@ -121,7 +122,7 @@ fn verify_invocation_scopes(scoped: bool) {
                             use crate::inspection::SpeculativeActivationObserver;
                             owner.begin_activation_invocation(
                                 eredu_core::speculative::SpeculativeActivationPhase::Verification,
-                                rows as usize,
+                                (rows as usize).into(),
                             ).unwrap();
                             owner.with_activation_observer(&mut execute).unwrap();
                         }
@@ -201,8 +202,9 @@ impl crate::inspection::SpeculativeActivationObserver<Value, Error> for ScopedPa
     fn begin_activation_invocation(
         &mut self,
         phase: eredu_core::speculative::SpeculativeActivationPhase,
-        sequence: usize,
+        geometry: crate::inspection::SpeculativeActivationGeometry,
     ) -> Result<(), Error> {
+        let sequence = geometry.sequence;
         assert_eq!(
             phase,
             eredu_core::speculative::SpeculativeActivationPhase::Verification

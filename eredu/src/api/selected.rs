@@ -237,6 +237,16 @@ impl LocalLoadOptions {
         self
     }
 
+    /// Admits separate low-rank parameters used only by shared-backbone drafting.
+    pub fn with_draft_adapter(mut self, source: eredu_core::DraftAdapterSource) -> Self {
+        self.normalized = self.normalized.with_draft_adapter(source);
+        self
+    }
+    /// Optional shared-backbone draft adapter selected at load time.
+    pub fn draft_adapter(&self) -> Option<&eredu_core::DraftAdapterSource> {
+        self.normalized.draft_adapter()
+    }
+
     /// Explicit embedded prediction artifact, if supplied.
     pub fn prediction_source(&self) -> Option<&std::path::Path> {
         self.normalized.prediction_source()

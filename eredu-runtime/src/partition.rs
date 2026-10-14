@@ -2129,7 +2129,7 @@ where
         ))
     })?;
     let primary_transport = architecture.group_transport(primary_index);
-    if primary_transport.placement != crate::ArchitectureGroupPlacement::Pipeline {
+    if !matches!(primary_transport.placement, crate::ArchitectureGroupPlacement::Pipeline | crate::ArchitectureGroupPlacement::PipelineSequence) {
         return Err(ArchitecturePartitionError::ArchitectureTopology(format!(
             "primary execution group {primary:?} must have pipeline placement"
         )));

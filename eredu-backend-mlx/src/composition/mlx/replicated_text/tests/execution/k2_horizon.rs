@@ -71,7 +71,7 @@ fn k2_mova_native_prepared_banks_residency_paged_cache_and_rollback_match() {
         assert_eq!(probe.3, probe.5);
         assert_eq!(generic.state_snapshot(), saved);
         let descriptor = PromptCacheDescriptor::from_model_identity(
-            generic.prompt_cache_model_identity().clone(),
+            generic.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone(),
             "k2-fixture",
             "tokens:1,3,2",
             1,

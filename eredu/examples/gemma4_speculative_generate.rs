@@ -7,8 +7,7 @@ use std::{
 use eredu::{
     api::{
         default_local_device, local_device_plan, LoadedModel, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatSpeculativeGenerationOptions,
-        PreparedChatSpeculativeGenerationRequest,
+        PreparedChatInput, PreparedChatSpeculativeGenerationRequest,
     },
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
@@ -157,21 +156,28 @@ fn run_speculative(
     }
     let output =
         target.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(prepared),
             drafting: drafting
                 .as_speculative_draft()
                 .expect("drafting is enabled"),
-            settings: PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    temperature: Some(0.0),
-                    max_new_tokens: Some(max_tokens),
-                    ..Default::default()
-                },
-                ..PreparedChatGenerationSettings::default()
-            },
-            options: PreparedChatSpeculativeGenerationOptions {
-                max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                ..PreparedChatSpeculativeGenerationOptions::default()
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptionsRequest {
+                        max_draft_tokens: NonZeroUsize::new(3).unwrap(),
+                        ..eredu_core::decoding::SpeculationOptionsRequest::default()
+                    }
+                    .try_into()
+                    .expect("validated speculation options"),
+                )),
+                ..PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        temperature: Some(0.0),
+                        max_new_tokens: Some(max_tokens),
+                        ..Default::default()
+                    },
+                    ..PreparedChatGenerationSettings::default()
+                }
             },
             caller_stop_sequences: &[],
             cancellation: GenerationCancellationToken::new(),

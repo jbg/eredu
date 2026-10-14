@@ -5,9 +5,13 @@ fn greedy_engine_commits_only_the_accepted_prefix() {
     let prompt = Array::from_slice(&[7u32], &[1, 1]);
     let parts = [InputPart::text_token_ids(&prompt)];
     let input = ModelInput::new(&parts);
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 3,
-        max_draft_tokens: 2,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 0.0,
         eos_token_ids: Vec::new(),
     };
@@ -53,9 +57,13 @@ fn cpu_draft_gpu_target_split_stream_routes_and_commits() {
     let prompt = Array::from_slice(&[7u32], &[1, 1]);
     let parts = [InputPart::text_token_ids(&prompt)];
     let input = ModelInput::new(&parts);
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 3,
-        max_draft_tokens: 2,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 0.0,
         eos_token_ids: Vec::new(),
     };
@@ -102,9 +110,13 @@ fn split_stream_engine_preserves_stochastic_acceptance() {
     let prompt = Array::from_slice(&[7u32], &[1, 1]);
     let parts = [InputPart::text_token_ids(&prompt)];
     let input = ModelInput::new(&parts);
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 4,
-        max_draft_tokens: 4,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(4).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 1.0,
         eos_token_ids: Vec::new(),
     };
@@ -145,9 +157,13 @@ fn mirostat_v2_speculative_commits_accepted_target_distributions() {
     let prompt = Array::from_slice(&[7u32], &[1, 1]);
     let parts = [InputPart::text_token_ids(&prompt)];
     let input = ModelInput::new(&parts);
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 4,
-        max_draft_tokens: 4,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(4).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 1.0,
         eos_token_ids: Vec::new(),
     };
@@ -189,9 +205,13 @@ fn mirostat_v2_speculative_commits_replacement_not_rejected_draft() {
     let prompt = Array::from_slice(&[7u32], &[1, 1]);
     let parts = [InputPart::text_token_ids(&prompt)];
     let input = ModelInput::new(&parts);
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 2,
-        max_draft_tokens: 4,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(4).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 1.0,
         eos_token_ids: Vec::new(),
     };
@@ -352,9 +372,13 @@ fn same_gpu_split_stream_runs_exact_optimistic_lookahead() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -461,9 +485,13 @@ fn same_device_split_preserves_stochastic_lookahead() {
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 8,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 1.0,
                     eos_token_ids: Vec::new(),
                 },

@@ -491,6 +491,7 @@ fn bounded_capture_native_failure_respects_recovery_and_retirement() {
             eredu_core::TokenFilter::All,
         )),
         &mut state,
+        Some(1),
     );
     let error = match result {
         Err(eredu_core::TextOperationError::Backend(error)) => error,

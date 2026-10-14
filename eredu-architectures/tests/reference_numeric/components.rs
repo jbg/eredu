@@ -37,6 +37,10 @@ mod qwen_vl;
 
 #[path = "components/nemotron_prediction.rs"]
 mod nemotron_prediction;
+#[path = "components/nemotron_diffusion.rs"]
+mod nemotron_diffusion;
+#[path = "components/nemotron_pixtral.rs"]
+mod nemotron_pixtral;
 
 #[path = "components/inkling.rs"]
 mod inkling;

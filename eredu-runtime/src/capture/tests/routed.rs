@@ -383,6 +383,7 @@ fn independent_cached_invocation_geometry_controls_sparse_receipt_completeness()
                 CapturePhase::Decode,
                 1,
                 CaptureInvocationShape {
+            media: None,
                     batch: 1,
                     sequence,
                     context: None,

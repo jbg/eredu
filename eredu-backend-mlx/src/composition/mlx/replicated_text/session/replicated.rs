@@ -20,7 +20,7 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedReplicatedText<
 {
     pub(super) session:
         ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
-    prompt_cache_identity: PromptCacheModelIdentity,
+    prompt_cache_identity: Option<PromptCacheModelIdentity>,
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     pub(super) prediction: P,
@@ -100,7 +100,7 @@ where
 {
     pub(super) fn from_session(
         session: ReplicatedTextSession<A, MlxNeuralBackend, MlxReplicatedTextMechanisms<A, S>, D>,
-        prompt_cache_identity: PromptCacheModelIdentity,
+        prompt_cache_identity: Option<PromptCacheModelIdentity>,
         capability_estimate: eredu_architectures::capability::CapabilityEstimate,
         effective_model_type: String,
         selected_residency: eredu_runtime::LayerWeightResidency,
@@ -266,38 +266,6 @@ where
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
         self.session.block_refinement_geometry()
-    }
-
-    fn refine_block_with_observer(
-        &mut self,
-        canvas: &Array,
-        feedback: Option<&Array>,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
-    ) -> Result<Array, Error> {
-        let canvas = MlxTensor::from_array(canvas.clone());
-        let feedback = feedback.cloned().map(MlxTensor::from_array);
-        let input =
-            A::block_refinement_input(&canvas, feedback.as_ref(), None).ok_or_else(|| {
-                Error::ArchitectureModel("causal execution has no tentative-block equation".into())
-            })?;
-        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-        let before = self.session.successful_state_restoration_generation();
-        self.session
-            .sequence_output_with_observer(
-                input,
-                eredu_runtime::ExpertPass::Decode,
-                stream,
-                &mut observer,
-            )
-            .map(MlxTensor::into_array)
-            .map_err(|error| {
-                Error::after_replicated_model_call(
-                    error,
-                    before,
-                    self.session.successful_state_restoration_generation(),
-                )
-            })
     }
 
     fn projects_final_prefill_position(&self) -> bool {
@@ -485,54 +453,69 @@ where
             .map(MlxPredictionTargetState::new)
             .map_err(|e| Error::Other(Box::new(e)))
     }
-    fn autoregressive_forward(
+    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error> {
+        if !cache.is::<S>() { return Err(Error::ArchitectureModel("canonical causal state type differs".into())); }
+        let mut state = cache.take_state::<S>()?;
+        let result = self.session.exchange_prediction_target_state(&mut state, stream)
+            .map_err(|error| Error::Other(Box::new(error)));
+        cache.restore_state(state);
+        result
+    }
+    fn prepared_context_forward(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxPredictionTargetState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<(Array, usize), Error> {
+        let tokens = input::text_token_ids(input, stream)?;
+        let count = tokens.shape()[1] as usize;
+        let output = self.attention_forward_with_observer(&tokens, None,
+            eredu_core::decoding::AttentionInvocation::CAUSAL, Some(cache), true,
+            stream, observer)?;
+        Ok((output, count))
+    }
+    fn attention_forward_with_observer(
         &mut self,
         tokens: &Array,
-        cache: &mut MlxPredictionTargetState,
+        feedback: Option<&Array>,
+        invocation: eredu_core::decoding::AttentionInvocation,
+        cache: Option<&mut MlxPredictionTargetState>,
         prefill: bool,
         stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
-        if !cache.is::<S>() {
-            return Err(Error::Speculative(
-                "ordinary lane state type differs".into(),
-            ));
-        }
-        let mut lane = cache.take_state::<S>()?;
-        if let Err(error) = self
-            .session
-            .exchange_prediction_target_state(&mut lane, stream)
-        {
-            cache.restore_state(lane);
-            return Err(Error::Other(Box::new(error)));
-        }
         let tokens = MlxTensor::from_array(tokens.clone());
-        let result = self.session.sequence_output(
-            A::text_input(&tokens, None),
-            if prefill {
-                eredu_runtime::ExpertPass::Prefill
-            } else {
-                eredu_runtime::ExpertPass::Decode
-            },
-            stream,
-        );
-        let restored = match self
-            .session
-            .exchange_prediction_target_state(&mut lane, stream)
-        {
-            Ok(()) => Ok(()),
-            Err(error) => super::finish_prediction_state_operation(
-                Err(Error::Other(Box::new(error))),
-                self.session
-                    .recover_prediction_target_state_after_failure(&mut lane)
-                    .map_err(|recovery| Error::Other(Box::new(recovery))),
-            ),
-        };
-        cache.restore_state(lane);
-        let output = super::finish_prediction_state_operation(
-            result.map_err(|e| Error::Other(Box::new(e))),
-            restored,
-        )?;
-        Ok(self.published(output.into_array()))
+        let feedback = feedback.cloned().map(MlxTensor::from_array);
+        let input = A::invocation_input(&tokens, feedback.as_ref(), None, invocation)
+            .ok_or_else(|| Error::ArchitectureModel("selected architecture rejects attention invocation".into()))?;
+        let pass = if prefill { eredu_runtime::ExpertPass::Prefill } else { eredu_runtime::ExpertPass::Decode };
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        if let Some(cache) = cache {
+            if !cache.is::<S>() { return Err(Error::Speculative("lane state type differs".into())); }
+            let mut lane = cache.take_state::<S>()?;
+            if let Err(error) = self.session.exchange_prediction_target_state(&mut lane, stream) {
+                cache.restore_state(lane);
+                return Err(Error::Other(Box::new(error)));
+            }
+            let result = self.session.sequence_output_with_observer(input, pass, stream, &mut observer);
+            let restored = match self.session.exchange_prediction_target_state(&mut lane, stream) {
+                Ok(()) => Ok(()),
+                Err(error) => super::finish_prediction_state_operation(
+                    Err(Error::Other(Box::new(error))),
+                    self.session.recover_prediction_target_state_after_failure(&mut lane)
+                        .map_err(|recovery| Error::Other(Box::new(recovery))),
+                ),
+            };
+            cache.restore_state(lane);
+            let output = super::finish_prediction_state_operation(result.map_err(|e| Error::Other(Box::new(e))), restored)?;
+            Ok(self.published(output.into_array()))
+        } else {
+            let before = self.session.successful_state_restoration_generation();
+            self.session.sequence_output_with_observer(input, pass, stream, &mut observer)
+                .map(MlxTensor::into_array)
+                .map_err(|error| Error::after_replicated_model_call(error, before, self.session.successful_state_restoration_generation()))
+        }
     }
 
     fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
@@ -700,7 +683,7 @@ where
     fn speculative_activation_execution(
         &self,
     ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
-        self.prediction.activation_execution()
+        self.prediction.activation_execution().or_else(|| self.capability_estimate.shared_backbone_activation_execution())
     }
 
     fn install_embedded_prediction_observers(
@@ -869,8 +852,8 @@ where
         }
     }
 
-    fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity {
-        &self.prompt_cache_identity
+    fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity> {
+        self.prompt_cache_identity.as_ref()
     }
 
     fn reset_cache(&mut self) -> Result<(), Exception> {

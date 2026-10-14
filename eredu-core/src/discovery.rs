@@ -41,6 +41,8 @@ pub enum SymbolicDimension {
     Context,
     /// Input-dependent media feature positions.
     MediaPositions,
+    /// Media features after architecture-defined spatial merging.
+    ProjectedMediaPositions,
     /// Extent is not described.
     Unknown,
 }

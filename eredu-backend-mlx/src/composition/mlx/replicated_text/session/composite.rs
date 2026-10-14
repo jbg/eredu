@@ -145,7 +145,7 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedComposite<
     >,
     pub(super) admission: A::AdmissionConfig,
     pub(super) processor: eredu_runtime::SelectedProcessorExecution,
-    prompt_cache_identity: PromptCacheModelIdentity,
+    prompt_cache_identity: Option<PromptCacheModelIdentity>,
     capability_estimate: eredu_architectures::capability::CapabilityEstimate,
     effective_model_type: String,
     pub(super) prediction: P,
@@ -612,7 +612,7 @@ where
         >,
         admission: A::AdmissionConfig,
         processor: eredu_runtime::SelectedProcessorExecution,
-        prompt_cache_identity: PromptCacheModelIdentity,
+        prompt_cache_identity: Option<PromptCacheModelIdentity>,
         capability_estimate: eredu_architectures::capability::CapabilityEstimate,
         effective_model_type: String,
         selected_residency: eredu_runtime::LayerWeightResidency,
@@ -714,45 +714,6 @@ where
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
         A::block_refinement_geometry(&self.admission)
-    }
-
-    fn refine_block_with_observer(
-        &mut self,
-        canvas: &Array,
-        feedback: Option<&Array>,
-        stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
-    ) -> Result<Array, Error> {
-        if A::block_refinement_geometry(&self.admission).is_none() {
-            return Err(Error::ArchitectureModel(
-                "causal execution has no tentative-block equation".into(),
-            ));
-        }
-        let part = input::token_ids_part(canvas)?;
-        let input = input::ModelInput::new(std::slice::from_ref(&part));
-        let (prepared, admitted, _) =
-            prepare_composite_input::<A>(&self.admission, &self.processor, input, false)?;
-        let feedback = feedback.cloned().map(MlxTensor::from_array);
-        let paired = PreparedCompositeInput::new(&prepared, &admitted)
-            .map_err(Error::ArchitectureModel)?
-            .with_refinement(feedback.as_ref());
-        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
-        let before = self.session.successful_state_restoration_generation();
-        self.session
-            .sequence_output_with_observer(
-                paired,
-                eredu_runtime::ExpertPass::Decode,
-                stream,
-                &mut observer,
-            )
-            .map(MlxTensor::into_array)
-            .map_err(|error| {
-                Error::after_replicated_model_call(
-                    error,
-                    before,
-                    self.session.successful_state_restoration_generation(),
-                )
-            })
     }
 
     fn projects_final_prefill_position(&self) -> bool {
@@ -1033,6 +994,35 @@ where
             .map(MlxPredictionTargetState::new)
             .map_err(|e| Error::Other(Box::new(e)))
     }
+    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error> {
+        if !cache.is::<MlxHybridState>() { return Err(Error::ArchitectureModel("canonical causal state type differs".into())); }
+        let mut state = cache.take_state::<MlxHybridState>()?;
+        let result = self.session.exchange_prediction_target_state(&mut state, stream)
+            .map_err(|error| Error::Other(Box::new(error)));
+        cache.restore_state(state);
+        result
+    }
+    fn prepared_context_forward(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut MlxPredictionTargetState,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<(Array, usize), Error> {
+        let plans = self.prepared_input_plans(input).map_err(|error| Error::Other(Box::new(error)))?;
+        let count = plans.iter().try_fold(0usize, |total, plan| {
+            total.checked_add(usize::try_from(plan.decoder_positions()).ok()?)
+        }).ok_or_else(|| Error::ArchitectureModel("prepared context position count overflows".into()))?;
+        let (prepared, admitted, _) = prepare_composite_input::<A>(&self.admission, &self.processor, input, false)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::ArchitectureModel)?
+            .with_attention_invocation(eredu_core::decoding::AttentionInvocation::CAUSAL);
+        let output = self.with_native_prediction_target_state(cache, |session| {
+            session.sequence_output_with_observer(paired, eredu_runtime::ExpertPass::Prefill, stream, &mut crate::composition::NeutralActivationObserver::new(observer))
+                .map_err(|error| Error::Other(Box::new(error)))
+        })?;
+        Ok((self.published(output.into_array()), count))
+    }
     fn partition_parameter_description(
         &self,
     ) -> Option<&std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>> {
@@ -1044,29 +1034,38 @@ where
     ) -> Option<eredu_runtime::inspection::ObservationHookSupport> {
         self.session.partition_observation_hooks()
     }
-    fn autoregressive_forward(
+    fn attention_forward_with_observer(
         &mut self,
         tokens: &Array,
-        cache: &mut MlxPredictionTargetState,
+        feedback: Option<&Array>,
+        invocation: eredu_core::decoding::AttentionInvocation,
+        cache: Option<&mut MlxPredictionTargetState>,
         prefill: bool,
         stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
+        if !A::supports_attention_invocation(&self.admission, invocation)
+            || (invocation == eredu_core::decoding::AttentionInvocation::CAUSAL && feedback.is_some()) {
+            return Err(Error::ArchitectureModel("selected composite rejects attention invocation".into()));
+        }
         let (prepared, admitted, _) = self.text_input(tokens)?;
-        let paired =
-            PreparedCompositeInput::new(&prepared, &admitted).map_err(Error::ArchitectureModel)?;
-        let output = self.with_native_prediction_target_state(cache, |session| {
-            session
-                .sequence_output(
-                    paired,
-                    if prefill {
-                        eredu_runtime::ExpertPass::Prefill
-                    } else {
-                        eredu_runtime::ExpertPass::Decode
-                    },
-                    stream,
-                )
-                .map_err(|e| Error::Other(Box::new(e)))
-        })?;
+        let feedback = feedback.cloned().map(MlxTensor::from_array);
+        let mut paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(Error::ArchitectureModel)?.with_attention_invocation(invocation);
+        if invocation.visibility == eredu_core::decoding::AttentionVisibility::PrefixAndBlock {
+            paired = paired.with_refinement(feedback.as_ref());
+        }
+        let pass = if prefill { eredu_runtime::ExpertPass::Prefill } else { eredu_runtime::ExpertPass::Decode };
+        let mut observer = crate::composition::NeutralActivationObserver::new(observer);
+        let mut execute = |session: &mut ReplicatedTextSession<_, _, _, _>| {
+            let before = session.successful_state_restoration_generation();
+            session.sequence_output_with_observer(paired, pass, stream, &mut observer)
+                .map_err(|error| Error::after_replicated_model_call(error, before, session.successful_state_restoration_generation()))
+        };
+        let output = match cache {
+            Some(cache) => self.with_native_prediction_target_state(cache, execute)?,
+            None => execute(&mut self.session)?,
+        };
         Ok(self.published(output.into_array()))
     }
 
@@ -1125,6 +1124,10 @@ where
             .capture_control_state(&self.stream)
             .map(|state| Box::new(state) as Box<dyn std::any::Any>)
             .map_err(|error| Error::Other(Box::new(error)))
+    }
+
+    fn estimate_installed_control_growth(&self, additional: u64) -> Result<Option<u64>, Error> {
+        Ok(self.session.estimate_installed_control_state_growth(additional))
     }
 
     fn estimate_native_control_growth(
@@ -1200,7 +1203,7 @@ where
     fn speculative_activation_execution(
         &self,
     ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
-        self.prediction.activation_execution()
+        self.prediction.activation_execution().or_else(|| self.capability_estimate.shared_backbone_activation_execution())
     }
 
     fn install_embedded_prediction_observers(
@@ -1407,8 +1410,8 @@ where
         }
     }
 
-    fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity {
-        &self.prompt_cache_identity
+    fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity> {
+        self.prompt_cache_identity.as_ref()
     }
 
     fn reset_cache(&mut self) -> Result<(), Exception> {
@@ -1952,8 +1955,8 @@ where
             super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
         >::with_observers(&mut strategy, observers);
         let result = {
-            let mut erased = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
-                super::prepared_speculative::MlxEmbeddedExecutorTypes,
+            let mut erased = eredu_core::speculative::DynGenerationExecutor::<
+                super::prepared_speculative::MlxGenerationExecutorTypes,
             >::new(&mut executor);
             continuation.execute(selected, &mut erased)
         };

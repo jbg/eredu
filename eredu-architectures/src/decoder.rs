@@ -24,13 +24,12 @@ use eredu_nn::{
     RotarySubspace, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    module_parameter_group, partitioned_module_parameter_group, partitioned_projection_group,
-    segmented_projection_group, ArchitectureParameterDescription, ExecutionGraph,
-    ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    LayeredPartitionInput, LocalModelLayout, MemberSharding, OwnedParameterGroupSpec,
-    ParallelLayeredArchitecture, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
-    ParameterRole, PartitionedLayeredArchitecture, ProjectionSharding, StateLayout,
-    TensorPlacement,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LocalModelLayout,
+    MemberSharding, OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelPlanError,
+    ParameterGroupOwner, ParameterGroupSpec, ParameterRole, PartitionedLayeredArchitecture,
+    ProjectionSharding, StateLayout, TensorPlacement, module_parameter_group,
+    partitioned_module_parameter_group, partitioned_projection_group, segmented_projection_group,
 };
 
 /// Narrows a causal decoder's position-independent readout before projection.
@@ -540,6 +539,10 @@ pub trait Config: 'static {
     fn attention_scale(&self) -> f32 {
         (self.head_dim() as f32).sqrt().recip()
     }
+    /// Position-dependent query gain, applied after rotary encoding.
+    fn query_position_scaling(&self) -> Option<PositionQueryScaling> {
+        None
+    }
     /// Optional positive tanh cap on attention scores before masking.
     fn attention_softcap(&self) -> Option<f32> {
         None
@@ -632,6 +635,9 @@ pub trait Config: 'static {
 pub(crate) fn operator_requirements(config: &impl Config) -> eredu_nn::NeuralOperatorCapabilities {
     use eredu_nn::{GatedProductActivation, NeuralOperatorCapabilities as Caps};
     let mut required = Caps::NONE;
+    if config.query_position_scaling().is_some() {
+        required = required.union(Caps::CAST_FLOAT);
+    }
     if let Some((_, activation)) = config.attention_output_gate() {
         required = required.union(match activation {
             OutputGateActivation::Sigmoid => Caps::SIGMOID,
@@ -1338,6 +1344,9 @@ pub enum AttentionInputProjection<B: NeuralBackend> {
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend> {
+    /// Immutable query gain equations; positions belong to each invocation.
+    #[parameter(skip)]
+    pub query_position_scaling: Option<PositionQueryScaling>,
     /// Independent projection of the attention output gate.
     pub output_gate: Option<B::Linear>,
     /// Activation applied to either separately projected or fused-query gates.
@@ -1382,6 +1391,58 @@ pub struct Attention<B: NeuralBackend> {
     /// Whether the query projection's second half gates attended values.
     #[parameter(skip)]
     pub query_output_gate: bool,
+}
+
+/// Query gain `1 + beta * ln(1 + floor(position / original_max_positions))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionQueryScaling {
+    /// Finite nonnegative logarithmic gain.
+    pub beta: f32,
+    /// Positive original positional extent.
+    pub original_max_positions: i32,
+}
+
+impl PositionQueryScaling {
+    /// Validates the gain before module construction.
+    pub fn validate(self) -> Result<(), Error> {
+        if !self.beta.is_finite() || self.beta < 0.0 || self.original_max_positions <= 0 {
+            return Err(Error::backend("invalid position-dependent query scaling"));
+        }
+        Ok(())
+    }
+
+    /// Gain at a canonical causal position, including transient block positions.
+    pub fn gain(self, position: i32) -> Result<f32, Error> {
+        self.validate()?;
+        if position < 0 {
+            return Err(Error::backend("negative query position"));
+        }
+        Ok(1.0 + self.beta * (1.0 + (position / self.original_max_positions) as f32).ln())
+    }
+
+    fn apply<T: Tensor>(
+        self,
+        queries: T,
+        offset: i32,
+        sequence: i32,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        let positions = (0..sequence)
+            .map(|position| {
+                self.gain(
+                    offset
+                        .checked_add(position)
+                        .ok_or_else(|| Error::backend("query position overflow"))?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let element = queries
+            .element_type()
+            .ok_or_else(|| Error::backend("query scaling requires known floating arithmetic"))?;
+        let gains = T::from_f32_slice(&positions, &[1, 1, sequence, 1], context)?
+            .cast_float(element, context)?;
+        queries.multiply(&gains, context)
+    }
 }
 
 struct ProjectedAttention<T> {
@@ -1513,6 +1574,7 @@ impl<B: NeuralBackend> Attention<B> {
             )));
         }
         Ok(Self {
+            query_position_scaling: None,
             output_gate: None,
             output_gate_activation: OutputGateActivation::Sigmoid,
             query_key_norm_per_head_weights: false,
@@ -1539,6 +1601,10 @@ impl<B: NeuralBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        config
+            .query_position_scaling()
+            .map(PositionQueryScaling::validate)
+            .transpose()?;
         if config.learned_attention_sinks() {
             crate::operator_requirements::require::<B>(
                 "shared decoder attention sinks",
@@ -1611,6 +1677,7 @@ impl<B: NeuralBackend> Attention<B> {
             }
         };
         Ok(Self {
+            query_position_scaling: config.query_position_scaling(),
             output_gate: config
                 .attention_output_gate()
                 .map(|(field, _)| linear(field))
@@ -1896,6 +1963,18 @@ impl<B: NeuralBackend> Attention<B> {
                 )
             }
             None => (queries, keys),
+        };
+        let queries = match self.query_position_scaling {
+            Some(scaling) => scaling.apply(
+                queries,
+                match rotary_position {
+                    Some(RotaryPosition::Offset(position)) => position,
+                    _ => offset,
+                },
+                sequence,
+                context,
+            )?,
+            None => queries,
         };
         let (keys, values) = match cache.as_mut() {
             Some(cache) => cache.update_for_attention(keys, values, context)?,
@@ -2499,6 +2578,7 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
         instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        output_adapter: Option<&mut eredu_nn::low_rank::LowRankProjection<B>>,
         state: &mut D,
         values: V,
         feed_forward: H,
@@ -2549,6 +2629,23 @@ where
             parallel,
             context,
         )?;
+        let attention = match output_adapter {
+            Some(adapter) => {
+                let element = attention.element_type().ok_or_else(|| {
+                    Error::backend("unknown base projection precision for low-rank delta")
+                })?;
+                let combined =
+                    attention.add(&adapter.forward(&attended, parallel, context)?, context)?;
+                // PEFT adds in the adapter's promoted precision and restores the
+                // base output type once, after the complete additive update.
+                if combined.element_type() == Some(element) {
+                    combined
+                } else {
+                    combined.cast_float(element, context)?
+                }
+            }
+            None => attention,
+        };
         let attention = instrumentation.apply("attention.write", attention)?;
         let attention = match &mut self.attention_output_norm {
             Some(norm) => norm.forward(&attention, context)?,
@@ -2581,6 +2678,7 @@ where
             None,
             context,
             &mut ComponentInstrumentation::disabled(),
+            None,
             &mut (),
             |policy, input, _, context, _| policy.project_values(input, context),
             |policy, input, _, context, instrumentation| {
@@ -2601,12 +2699,49 @@ where
             None,
             context,
             instrumentation,
+            None,
             &mut (),
             |policy, input, _, context, instrumentation| {
                 policy.project_values_observed(input, context, instrumentation)
             },
             |policy, input, _, context, instrumentation| {
                 policy.forward_feed_forward_observed(input, context, instrumentation)
+            },
+        )
+    }
+
+    /// Borrows a separate low-rank attention-output delta for this invocation.
+    /// Base projection storage and all cache equations remain shared. Parallel
+    /// rank activations are reduced before the replicated adapter up projection.
+    pub fn forward_with_output_adapter_observed<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        input: AttentionInput<'_, B::Tensor, C>,
+        adapter: Option<&mut eredu_nn::low_rank::LowRankProjection<B>>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: TensorParallelProjectionOperator<B>,
+    {
+        self.forward_projections(
+            input,
+            parallel,
+            context,
+            instrumentation,
+            adapter,
+            &mut (),
+            |policy, input, _, context, instrumentation| {
+                policy.project_values_observed(input, context, instrumentation)
+            },
+            |policy, input, _, context, instrumentation| match parallel {
+                Some(parallel) => policy.forward_feed_forward_parallel_observed(
+                    input,
+                    parallel,
+                    context,
+                    instrumentation,
+                ),
+                None => policy.forward_feed_forward_observed(input, context, instrumentation),
             },
         )
     }
@@ -2627,6 +2762,7 @@ where
             None,
             context,
             &mut ComponentInstrumentation::disabled(),
+            None,
             &mut (),
             |policy, input, _, context, _| policy.project_values(input, context),
             |policy, input, _, context, _| feed_forward(policy, input, context),
@@ -2669,6 +2805,7 @@ where
             Some(parallel),
             context,
             instrumentation,
+            None,
             &mut (),
             |policy, input, _, context, instrumentation| {
                 policy.project_values_observed(input, context, instrumentation)
@@ -2701,6 +2838,7 @@ where
             Some(parallel),
             context,
             &mut ComponentInstrumentation::disabled(),
+            None,
             &mut (),
             |policy, input, _, context, _| policy.project_values(input, context),
             |policy, input, _, context, _| feed_forward(policy, input, context),
@@ -2728,6 +2866,7 @@ where
             None,
             context,
             &mut ComponentInstrumentation::disabled(),
+            None,
             provider,
             |policy, input, provider, context, _| {
                 policy.project_values_with_provider(layer, input, pass, provider, context)
@@ -2762,6 +2901,7 @@ where
             None,
             context,
             instrumentation,
+            None,
             provider,
             |policy, input, provider, context, instrumentation| {
                 policy.project_values_observed_with_provider(
@@ -2811,6 +2951,7 @@ where
             Some(parallel),
             context,
             &mut ComponentInstrumentation::disabled(),
+            None,
             provider,
             |policy, input, provider, context, _| {
                 policy.project_values_with_provider(layer, input, pass, provider, context)
@@ -2847,6 +2988,7 @@ where
             Some(parallel),
             context,
             instrumentation,
+            None,
             provider,
             |policy, input, provider, context, instrumentation| {
                 policy.project_values_observed_with_provider(
@@ -4214,6 +4356,13 @@ pub struct ForwardContext<T> {
     rotary_embeddings: Option<(T, T)>,
 }
 
+impl<T> ForwardContext<T> {
+    /// Complete position visibility resolved for the current invocation.
+    pub fn visibility_mask(&self) -> Option<&T> {
+        self.mask.as_ref()
+    }
+}
+
 /// Statically dispatched construction policy for one decoder block family.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
     /// Architecture-selected feed-forward policy inside the shared block.
@@ -4424,6 +4573,13 @@ pub struct LayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry<C>>>,
     block_factory: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<B: NeuralBackend, C: Config + Clone, P> Clone for LayeredModel<B, C, P> {
+    fn clone(&self) -> Self {
+        Self { args: self.args.clone(), static_modules: self.static_modules.clone(),
+            parallel_geometry: self.parallel_geometry.clone(), block_factory: std::marker::PhantomData }
+    }
 }
 
 /// Pinned decoder modules physically present on one pipeline partition.
@@ -4698,6 +4854,11 @@ where
         &self.static_modules
     }
 
+    /// Borrows only statics retained by the selected pipeline owner for binding.
+    pub(crate) fn partition_static_modules_mut(&mut self) -> &mut PartitionStaticModules<B> {
+        &mut self.static_modules
+    }
+
     /// Constructs an admitted unit and rejects every unowned global index.
     pub fn construct_unit(
         &self,
@@ -4909,7 +5070,7 @@ where
         })
     }
 
-    fn finish_local(
+    pub(crate) fn finish_local(
         &mut self,
         hidden: &B::Tensor,
         parallel: Option<&B::ParallelContext>,
@@ -4923,7 +5084,7 @@ where
         )
     }
 
-    fn finish_local_instrumented(
+    pub(crate) fn finish_local_instrumented(
         &mut self,
         hidden: &B::Tensor,
         parallel: Option<&B::ParallelContext>,

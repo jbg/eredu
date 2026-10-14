@@ -280,6 +280,9 @@ pub enum LayeredPipelineScheduleError {
 pub enum ArchitectureGroupPlacement {
     /// Balance the group across every pipeline owner.
     Pipeline,
+    /// Balance an ordered chain of groups as one sequence of execution units.
+    /// Stages may own only stateless media or projector units.
+    PipelineSequence,
     /// Place the complete group on the architecture output owner.
     OutputOwner,
 }

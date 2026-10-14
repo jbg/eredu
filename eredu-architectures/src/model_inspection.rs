@@ -160,8 +160,10 @@ where
 }
 
 /// Inspects supplied immutable headers through the shared cold selection driver.
-/// No filesystem, payload, device or stream access occurs. A successful result
-/// supports forecasting; source preparation returns `ArtifactError::MetadataOnly`.
+/// Primary artifact headers require no filesystem or payload access. Explicitly
+/// requested companion sources receive separate header admission. No device or
+/// stream is realized. Source preparation for a metadata-only primary returns
+/// `ArtifactError::MetadataOnly`.
 pub fn inspect_model_metadata<P: PreparationMechanismProvider>(
     metadata: &eredu_core::artifact::ArtifactMetadata,
     request: &NormalizedLoadRequest,
@@ -235,6 +237,11 @@ where
 
     match select_preparation(&inspection, request, mechanisms) {
         Ok(preparation) => {
+            let inspection = preparation.retained_architecture().map_or_else(
+                || inspection.clone(),
+                |architecture| inspection.clone().map_architecture_plan(|_| architecture.clone()),
+            );
+            let descriptor = inspection.architecture_plan().architecture_descriptor();
             let mut report = eredu_core::assemble_portable_model_inspection(
                 &inspection,
                 preparation.admission(),
@@ -370,19 +377,35 @@ fn record_rank_resources(
 ) {
     use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
     let plan = inspection.architecture_plan();
-    let args = match (
-        plan.safetensors_architecture().map(|p| p.model()),
-        plan.gguf_plan().map(|p| p.model()),
-    ) {
-        (Some(SafetensorsModelConfig::K2Horizon(args)), None)
-        | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
-        _ => return,
-    };
+    if !matches!(plan.model_kind(), crate::ModelKind::K2Horizon | crate::ModelKind::NemotronLabsDiffusion) { return; }
     let project = || -> Result<eredu_core::SelectedRankResourceProfile, String> {
-        let args =
-            crate::replicated_text::selected_k2_horizon_args(args, selected.text_realization())?;
-        let parameters =
-            crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?;
+        let nemotron = plan.gguf_media_projector().and_then(|projector| match projector.model() {
+            crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => Some(config),
+            _ => None,
+        }).or_else(|| match (
+            plan.safetensors_architecture().map(|p| p.model()), plan.gguf_plan().map(|p| p.model()),
+        ) {
+            (Some(SafetensorsModelConfig::NemotronLabsDiffusion(config)), None) => Some(config),
+            (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => Some(plan.text_config()),
+            _ => None,
+        });
+        let (parameters, layers, kv_width) = if let Some(config) = nemotron {
+            use crate::decoder::Config;
+            let config = config.with_checkpoint_formats(crate::replicated_text::selected_formats(selected.text_realization())).map_err(|e| e.to_string())?;
+            let parameters = if config.vision.is_some() {
+                crate::nemotron_labs_diffusion::parallel::composite_parameter_description(&config)
+            } else { crate::nemotron_labs_diffusion::parallel::parameter_description(&config) }.map_err(|e| e.to_string())?;
+            (parameters, config.num_hidden_layers() as usize, (config.num_key_value_heads()*config.head_dim()) as usize)
+        } else {
+            let args = match (
+                plan.safetensors_architecture().map(|p| p.model()), plan.gguf_plan().map(|p| p.model()),
+            ) {
+                (Some(SafetensorsModelConfig::K2Horizon(args)), None) | (None, Some(GgufModelConfig::K2Horizon(args))) => args,
+                _ => return Err("rank resource projection is unavailable for this family".into()),
+            };
+            let args = crate::replicated_text::selected_k2_horizon_args(args, selected.text_realization())?;
+            (crate::k2_horizon::parameter_description(&args).map_err(|e| e.to_string())?, args.num_hidden_layers as usize, (args.num_key_value_heads*args.head_dim) as usize)
+        };
         let (resources, layout) = match selected.partition_parameter_resources(&parameters)? {
             Some((resources, layout)) => (resources, Some(layout)),
             None => (
@@ -397,7 +420,7 @@ fn record_rank_resources(
             .ok_or_else(|| "selected KV dtype is missing".to_owned())?
             .bytes();
         let mut cache_bytes_per_position = 0u64;
-        for layer in 0..args.num_hidden_layers as usize {
+        for layer in 0..layers {
             if selected.partition_groups().is_some_and(|groups| {
                 !groups.iter().any(|group| {
                     group.group().as_str() == crate::decoder::TEXT_DECODER_EXECUTION_GROUP
@@ -412,7 +435,7 @@ fn record_rank_resources(
                     .ok_or_else(|| "local key projection is missing".to_owned())?
                     .local_shape()[0]
             } else {
-                (args.num_key_value_heads * args.head_dim) as usize
+                kv_width
             };
             cache_bytes_per_position += 2 * width as u64 * u64::from(scalar_bytes.get());
         }

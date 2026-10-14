@@ -35,7 +35,7 @@ use eredu_core::{
     load_model, residency::OffloadConfig, BackendSession as _, DevicePlan, DraftPlacementPlan,
     DraftingPlan, ExecutionPlan, ExternalDraftArtifact, FinishReason, GenerationCancellationToken,
     InputExtent, InputMetadataKey, InputModality, ModelRuntime, ObservationRequest, SemanticEvent,
-    SpeculativeCapability, SpeculativeConfig, SpeculativeDraft, SpeculativeExecutionTopology,
+    SpeculativeCapability, GenerationRequestConfig, SpeculativeDraft, SpeculativeExecutionTopology,
     SpeculativeGenerationBackend, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeOutputError, SpeculativeSemanticState, SpeculativeTokenFilterController,
     TextGenerationConfig, TokenFilter, TokenFilterController, TokenOutput as _,
@@ -197,7 +197,7 @@ impl SpeculativeSemanticState for TokenOnlySemanticState {
 fn run_neutral_embedded_mtp<'world>(
     runtime: &mut ModelRuntime<MlxBackend<'world>>,
     prompt: crate::composition::mlx::MlxModelInput,
-    config: SpeculativeConfig,
+    config: GenerationRequestConfig,
 ) -> Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error> {
     execute_neutral_embedded_mtp(runtime, prompt, config).0
 }
@@ -205,7 +205,7 @@ fn run_neutral_embedded_mtp<'world>(
 fn execute_neutral_embedded_mtp<'world>(
     runtime: &mut ModelRuntime<MlxBackend<'world>>,
     prompt: crate::composition::mlx::MlxModelInput,
-    config: SpeculativeConfig,
+    config: GenerationRequestConfig,
 ) -> (
     Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error>,
     usize,
@@ -221,7 +221,7 @@ fn execute_neutral_embedded_mtp<'world>(
 fn execute_neutral_embedded_mtp_with<'world, V: eredu_core::SpeculativeGenerationVisitor>(
     runtime: &mut ModelRuntime<MlxBackend<'world>>,
     prompt: crate::composition::mlx::MlxModelInput,
-    config: SpeculativeConfig,
+    config: GenerationRequestConfig,
     visitor: V,
 ) -> (
     Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error>,

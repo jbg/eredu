@@ -41,7 +41,7 @@ use eredu::{
         local_device_plan, reset_local_allocator_peak, LoadedModel, LocalDevice,
         LocalExpertCacheBenchmarkSample, LocalInspectionOptions, PreparedChatGenerationRequest,
         PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
+        PreparedChatSpeculativeGenerationRequest,
         TextDecoder, TextModelError,
     },
     runtime::chat::{
@@ -2397,7 +2397,20 @@ fn main() -> Result<()> {
     if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
+    let scheduler_options = SpeculativeSchedulerOptions {
+        adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
+        ..SpeculativeSchedulerOptions::default()
+    }.with_lookahead(!args.disable_speculative_lookahead);
+    let decoding_mode = drafting.is_enabled().then(|| eredu_core::decoding::DecodingMode::SelfSpeculation(
+        eredu_core::decoding::SpeculationOptionsRequest {
+            max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
+                .expect("planned speculative execution validates non-zero draft tokens"),
+            scheduler: scheduler_options,
+            ..Default::default()
+        }.try_into().expect("validated speculation options"),
+    ));
     let settings = PreparedChatGenerationSettings {
+        decoding_mode,
         prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
             eredu::api::PrefillChunkPolicy::Unchunked,
             eredu::api::PrefillChunkPolicy::Bounded,
@@ -2424,15 +2437,6 @@ fn main() -> Result<()> {
             &prompt_token_ids,
             settings,
             drafting.as_speculative_draft().as_ref(),
-            PreparedChatSpeculativeGenerationOptions {
-                max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
-                    .unwrap_or(NonZeroUsize::MIN),
-                scheduler: SpeculativeSchedulerOptions {
-                    adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
-                    ..SpeculativeSchedulerOptions::default()
-                }
-                .with_lookahead(!args.disable_speculative_lookahead),
-            },
         ) {
             Ok(report) => memory::advise(&args, &report)?,
             Err(error) => {
@@ -2475,11 +2479,6 @@ fn main() -> Result<()> {
     let _component_timing_guard = args
         .verbose
         .then(eredu_backend_mlx::SpeculativeComponentTimingGuard::enable);
-    let scheduler_options = SpeculativeSchedulerOptions {
-        adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
-        ..SpeculativeSchedulerOptions::default()
-    }
-    .with_lookahead(!args.disable_speculative_lookahead);
     let mut prepared_finish_reason = None;
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
@@ -2488,16 +2487,12 @@ fn main() -> Result<()> {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
             let request = PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(prepared),
                 drafting: drafting
                     .as_speculative_draft()
                     .expect("drafting is enabled"),
                 settings,
-                options: PreparedChatSpeculativeGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
-                        .expect("planned speculative execution validates non-zero draft tokens"),
-                    scheduler: scheduler_options,
-                },
                 caller_stop_sequences: &args.stop_sequences,
                 cancellation,
                 on_event: |event| {
@@ -2530,6 +2525,7 @@ fn main() -> Result<()> {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();
             let request = PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(prepared),
                 settings,
                 caller_stop_sequences: &args.stop_sequences,

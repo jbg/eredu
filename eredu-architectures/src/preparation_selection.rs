@@ -190,6 +190,9 @@ pub(crate) mod qwen4;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PreparationSelectionError {
+    /// Separately supplied draft parameters failed ancestry, geometry or file admission.
+    #[error("draft adapter admission failed: {0}")]
+    DraftAdapter(String),
     /// Request-specific target bounds cannot be lowered from admitted headers.
     #[error(transparent)]
     Qwen4TargetLoad(#[from] std::sync::Arc<crate::qwen4_exp::prepared::TargetLoadError>),
@@ -469,6 +472,12 @@ fn select_preparation_once<P>(
 where
     P: PreparationMechanismProvider,
 {
+    let adapted_inspection = request.draft_adapter().map(|source| {
+        inspection.architecture_plan().clone().with_draft_adapter(source)
+            .map(|plan| inspection.clone().map_architecture_plan(|_| plan))
+            .map_err(PreparationSelectionError::DraftAdapter)
+    }).transpose()?;
+    let inspection = adapted_inspection.as_ref().unwrap_or(inspection);
     let validated = request.validate_model_preparation()?;
     if matches!(
         request.media_execution(),
@@ -616,7 +625,7 @@ where
         admission,
         prediction_extension,
         prediction_realization,
-    ))
+    ).with_retained_architecture(execution_inspection.architecture_plan().clone()))
 }
 
 fn admit_inspected_preparation(

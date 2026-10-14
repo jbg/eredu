@@ -15,15 +15,22 @@ fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
             settings.overrides.max_new_tokens = Some(6);
             let _guard = probe(Fault::DraftSampling { peer });
             let request = PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(
                     &chat,
                     vec![CONTROL_REJECTION_PROMPT_TOKEN],
                 ),
                 drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: PreparedChatSpeculativeGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                    ..Default::default()
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptionsRequest {
+                            max_draft_tokens: NonZeroUsize::new(3).unwrap(),
+                            ..Default::default()
+                        }
+                        .try_into()
+                        .expect("validated speculation options"),
+                    )),
+                    ..settings
                 },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
@@ -61,7 +68,7 @@ fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
             }
             assert_eq!(
                 snapshot().actions,
-                ["prefill", "begin_proposal", "proposal_logits"]
+                ["prefill", "begin_proposal", "proposal_step"]
             );
             assert_eq!(
                 snapshot().votes.last(),
@@ -163,15 +170,25 @@ fn peer_cancellation_is_per_lane_and_other_batch_lanes_finish() {
             drafting: SpeculativeDraft::Embedded,
             lanes: (0..2)
                 .map(|_| PreparedChatSpeculativeBatchLane {
+                    control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
-                    settings,
-                    max_draft_tokens: NonZeroUsize::new(1).unwrap(),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                max_draft_tokens: NonZeroUsize::new(1).unwrap(),
+                                scheduler: Default::default(),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings
+                    },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: Box::new(|_| {}),
                 })
                 .collect(),
-            scheduler: Default::default(),
         })
         .unwrap();
     assert_eq!(batch.requests()[0].token_ids(), [7]);
@@ -186,18 +203,22 @@ fn peer_publication_cancellation_matches_local_callback_cancellation() {
         let _guard = probe(Fault::None);
         let mut armed = false;
         let request = PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
             drafting: SpeculativeDraft::Embedded,
-            settings,
-            options: Default::default(),
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    Default::default(),
+                )),
+                ..settings
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {
                 if !armed {
                     armed = true;
                     PROBE.with(|slot| {
-                        slot.borrow_mut().as_mut().unwrap().fault =
-                            Fault::CancelOnce(Stage::Delivery)
+                        slot.borrow_mut().as_mut().unwrap().fault = Fault::CancelOnce(Stage::Delivery)
                     });
                 }
             },
@@ -234,10 +255,15 @@ fn controlled_record_budget_and_caller_error_agree_before_more_model_work() {
         let error = model
             .with_controlled_text_speculative(
                 PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
                     drafting: SpeculativeDraft::Embedded,
-                    settings,
-                    options: Default::default(),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            Default::default(),
+                        )),
+                        ..settings
+                    },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},

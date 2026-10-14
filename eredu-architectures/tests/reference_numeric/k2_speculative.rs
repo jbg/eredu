@@ -163,14 +163,15 @@ fn k2_independent_speculation_verifies_rejects_and_restores_every_prefix() {
         for accepted in 1..=4 {
             let mut target = Model::new(&fixture[target_family]["config"], &context);
             let mut draft = Model::new(&fixture["dense"]["config"], &context);
-            let mut executor = AutoregressiveExecutor::<Mechanisms>::new(
+            let mut executor = AutoregressiveExecutor::<Mechanisms, eredu_runtime::speculative::autoregressive::NoTargetRefinement>::new(
                 &mut target,
                 &mut draft,
                 std::num::NonZeroUsize::new(3).unwrap(),
+                eredu_runtime::speculative::autoregressive::NoTargetRefinement,
             );
             let mut cache = executor.new_cache(&context).unwrap();
             let (_, seed, count) = executor
-                .prefill(vec![1, 3, 2], &mut cache, &context)
+                .prefill(eredu_runtime::speculative::autoregressive::AutoregressiveInput::new(vec![1, 3, 2], ()), &mut cache, &context)
                 .unwrap()
                 .into_parts();
             assert_eq!(count, 3);
@@ -190,18 +191,15 @@ fn k2_independent_speculation_verifies_rejects_and_restores_every_prefix() {
             let checkpoint = executor.checkpoint(&cache).unwrap();
             let mut proposal = executor.begin_proposal(&seed, 4, 3, &context).unwrap();
             let mut sibling = proposal.clone();
-            let first = executor
-                .proposal_logits(&mut proposal, 4, &context)
-                .unwrap();
-            let _ = executor.proposal_logits(&mut sibling, 8, &context).unwrap();
+            let eredu_core::SpeculativeProposalStep::CausalLogits(first) = executor
+                .proposal_step(&mut proposal, 4, &context)
+                .unwrap() else { panic!("causal assistant must return logits") };
+            let _ = executor.proposal_step(&mut sibling, 8, &context).unwrap();
             let mut repeated = executor.begin_proposal(&seed, 4, 3, &context).unwrap();
-            assert_eq!(
-                first.data,
-                executor
-                    .proposal_logits(&mut repeated, 4, &context)
-                    .unwrap()
-                    .data
-            );
+            let eredu_core::SpeculativeProposalStep::CausalLogits(repeated) = executor
+                .proposal_step(&mut repeated, 4, &context)
+                .unwrap() else { panic!("causal assistant must return logits") };
+            assert_eq!(first.data, repeated.data);
             assert_cache(&cache.draft, &original_draft);
             let verification = executor
                 .submit_verification(&[4, 5, 6, 7], &mut cache, &context)

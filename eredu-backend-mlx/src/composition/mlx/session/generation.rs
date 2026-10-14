@@ -1,5 +1,7 @@
 use super::*;
 use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
+use eredu_runtime::speculative::shared_backbone::SharedBackboneTransaction;
+use crate::composition::mlx::speculative::autoregressive::MlxAutoregressiveMechanisms;
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
@@ -10,6 +12,7 @@ pub struct MlxTextGenerationState {
 /// Native sampling component copied by the shared ordinary snapshot driver.
 /// Capture ownership remains separate; this alone is not a generation snapshot.
 pub struct MlxTextSamplingState {
+    pub(super) mode: eredu_core::decoding::DecodingMode,
     pub(super) temperature: f32,
     pub(super) prng: Option<RandomState>,
     pub(super) sampler: MlxTextSampler,
@@ -17,7 +20,15 @@ pub struct MlxTextSamplingState {
     /// Parameter version bound on first submission and preserved by snapshots.
     pub(super) parameter_epoch: Option<u64>,
     pub(super) refinement_seed: u64,
-    pub(super) refinement_policy: eredu_core::refinement::RefinementConfig,
+    pub(super) proposal_random: Option<RandomState>,
+    pub(super) speculative: Option<Box<SharedBackboneTransaction<MlxAutoregressiveMechanisms>>>,
+    /// Distinguishes a verified committed token from a suffix still awaiting append.
+    pub(super) committed_token_cached: bool,
+    /// Settled causal next-token logits when a committed suffix is already cached.
+    pub(super) next_logits: Option<Array>,
+    /// Spent refinement randomness survives mode changes independently of target draws.
+    pub(super) refinement_random: Option<RandomState>,
+    pub(super) refinement_policy: eredu_core::refinement::RefinementPolicy,
     pub(super) draft_events: bool,
     pub(super) canvas: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     pub(super) refinement: Option<
@@ -70,6 +81,9 @@ impl MlxTextSampler {
 }
 
 impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
+    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, Exception> {
+        Ok(TokenFilter::All)
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(matches!(self, Self::MirostatV2(_)))
     }
@@ -180,6 +194,16 @@ pub(super) fn sample_text_submission(
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
     let operation = super::model_session::ResourceOperation::begin(submission.completion.owner())?;
     let sampled = (|| {
+        // Instrumented context execution may retain every physical score row.
+        // One causal decision always consumes the final conditional row.
+        let logits = submission.output.logits().map(|logits| {
+            let array = logits.as_array();
+            match array.shape() {
+                [_, sequence, _] if *sequence > 0 =>
+                    array.try_index_device((.., -1, ..), &stream).map(MlxTensor::from_array),
+                _ => Ok(logits.clone()),
+            }
+        }).transpose()?;
         let MlxTextSamplingState {
             temperature,
             prng,
@@ -190,7 +214,7 @@ pub(super) fn sample_text_submission(
         let token = if session.synchronizes_sampling() {
             session
                 .sample_under_submission(
-                    submission.output.logits(),
+                    logits.as_ref(),
                     1,
                     &mut sampler,
                     *temperature,
@@ -200,7 +224,7 @@ pub(super) fn sample_text_submission(
                 .token
                 .try_index_device((.., 0), &stream)?
         } else {
-            let logits = submission.output.logits().ok_or_else(|| {
+            let logits = logits.as_ref().ok_or_else(|| {
                 Error::Parallel("local text generation requires model logits".into())
             })?;
             Sampler::<MlxSamplingBackend>::sample(
@@ -220,6 +244,9 @@ pub(super) fn sample_text_submission(
         .next_prediction
         .checked_add(1)
         .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
+    if let Some(capture) = &mut state.capture {
+        capture.set_commitment_boundary(state.sampling.next_prediction).map_err(Error::observation)?;
+    }
     Ok(Submission {
         output: MlxTextToken {
             value: sampled.output,

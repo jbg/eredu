@@ -344,14 +344,14 @@ pub(crate) fn run<B: TextGenerationBackend>(
                     ..Default::default()
                 },
                 seed,
-                refinement: Some(
-                    RefinementOptions {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion { policy: Some(
+                    EntropyRefinementOptions {
                         max_denoising_steps: request.steps,
                         stability_threshold: request.steps,
                         ..Default::default()
                     }
                     .try_into()?,
-                ),
+                ) }),
                 ..Default::default()
             },
             plan,

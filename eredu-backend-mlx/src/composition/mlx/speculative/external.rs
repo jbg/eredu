@@ -41,6 +41,9 @@ impl<A> ExternalAssistantExecutionMechanisms<A> for MlxExternalAssistantMechanis
 where
     A: ExternalAssistantArchitecture,
 {
+    fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        super::state_snapshot::estimate_array(logits)
+    }
     type NeuralBackend = MlxNeuralBackend;
     type AttentionCache = ConcatKeyValueCache;
     type Target = dyn ErasedExternalPredictionExecutable;

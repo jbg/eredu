@@ -207,9 +207,13 @@ fn prove_bounded(device: DeviceType) {
         let (output, publications) = execute_neutral_embedded_mtp(
             &mut runtime,
             synthetic_prediction_input(&parts, &tokens),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: vec![],
             },

@@ -188,18 +188,32 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
             let forecast = model
                 .forecast_speculative_token_ids(
                     &ids,
-                    settings,
+                    {
+                        let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                        eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: settings.decoding_mode.or(Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                            )),
+                            ..settings
+                        }
+                    },
                     &drafting.as_speculative_draft().unwrap(),
-                    generation,
                     &options,
                 )
                 .unwrap();
             let repeated = model
                 .forecast_speculative_token_ids(
                     &ids,
-                    settings,
+                    {
+                        let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                        eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: settings.decoding_mode.or(Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                            )),
+                            ..settings
+                        }
+                    },
                     &drafting.as_speculative_draft().unwrap(),
-                    generation,
                     &options,
                 )
                 .unwrap();
@@ -271,9 +285,16 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                 model
                     .forecast_speculative_token_ids(
                         &ids,
-                        settings,
+                        {
+                            let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                            eredu::api::PreparedChatGenerationSettings {
+                                decoding_mode: settings.decoding_mode.or(Some(
+                                    eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                                )),
+                                ..settings
+                            }
+                        },
                         &drafting.as_speculative_draft().unwrap(),
-                        generation,
                         &tight,
                     )
                     .unwrap()
@@ -285,10 +306,15 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
             macro_rules! request {
                 () => {
                     PreparedChatSpeculativeGenerationRequest {
+                        control_handle: None,
                         input: PreparedChatInput::token_ids(&chat, ids.clone()),
                         drafting: drafting.as_speculative_draft().unwrap(),
-                        settings,
-                        options: generation,
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                generation,
+                            )),
+                            ..settings
+                        },
                         caller_stop_sequences: &[],
                         cancellation: Default::default(),
                         on_event: |_| {},
@@ -323,9 +349,16 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
             let after = model
                 .forecast_speculative_token_ids(
                     &ids,
-                    settings,
+                    {
+                        let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                        eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: settings.decoding_mode.or(Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                            )),
+                            ..settings
+                        }
+                    },
                     &drafting.as_speculative_draft().unwrap(),
-                    generation,
                     &options,
                 )
                 .unwrap();
@@ -451,9 +484,16 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
             let isolated = model
                 .forecast_speculative_token_ids(
                     &ids,
-                    settings,
+                    {
+                        let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                        eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: settings.decoding_mode.or(Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                            )),
+                            ..settings
+                        }
+                    },
                     &drafting.as_speculative_draft().unwrap(),
-                    generation,
                     &options,
                 )
                 .unwrap();
@@ -509,9 +549,16 @@ fn native_embedded_startup_forecasts_keep_uncovered_mechanisms_unknown() {
         let forecast = model
             .forecast_speculative_token_ids(
                 &[1, 2, 3, 4],
-                settings,
+                {
+                    let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                    eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: settings.decoding_mode.or(Some(
+                            eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                        )),
+                        ..settings
+                    }
+                },
                 &drafting.as_speculative_draft().unwrap(),
-                generation,
                 &options,
             )
             .unwrap();

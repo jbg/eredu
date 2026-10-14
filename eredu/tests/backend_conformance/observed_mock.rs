@@ -22,6 +22,10 @@ pub(super) struct State {
 
 #[derive(Clone, Default)]
 pub(super) struct Sampling {
+    pub mode: eredu_core::decoding::DecodingMode,
+    pub mode_context_ready: bool,
+    pub mode_candidates: std::collections::VecDeque<u32>,
+    pub mode_suffix: Vec<u32>,
     pub physical: u64,
     pub iterative_first: u32,
     pub draft_events: bool,
@@ -504,6 +508,7 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
     };
     let baseline = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
             caller_stop_sequences: &[],

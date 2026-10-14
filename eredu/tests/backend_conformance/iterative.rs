@@ -299,10 +299,15 @@ fn iterative_active_draft_snapshot_restore_fork_and_cancel_preserve_commitment()
 fn iterative_target_rejects_causal_speculative_verification_before_backend_execution() {
     let (mut model, chat, settings) = setup();
     let request = PreparedChatSpeculativeGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
         drafting: SpeculativeDraft::Embedded,
-        settings,
-        options: Default::default(),
+        settings: eredu::api::PreparedChatGenerationSettings {
+            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                Default::default(),
+            )),
+            ..settings
+        },
         caller_stop_sequences: &[],
         cancellation: Default::default(),
         on_event: |_| {},
@@ -313,4 +318,20 @@ fn iterative_target_rejects_causal_speculative_verification_before_backend_execu
             eredu_core::generation::GenerationError::RequiresCausalConditionalScores
         ))
     ));
+    let request = PreparedChatSpeculativeGenerationRequest {
+        control_handle: None,
+        input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+        drafting: SpeculativeDraft::Target,
+        settings: PreparedChatGenerationSettings {
+            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                Default::default(),
+            )),
+            ..settings
+        },
+        caller_stop_sequences: &[],
+        cancellation: Default::default(),
+        on_event: |_| {},
+    };
+    assert!(matches!(model.generate_prepared_chat_speculative(request),
+        Err(PreparedChatSpeculativeError::Generation(eredu_core::GenerationError::NoBackendDraftCapacity))));
 }

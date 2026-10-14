@@ -6,6 +6,9 @@ use super::*;
 /// needs it; absence never means zero or the generated prediction position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureInvocationShape {
+    /// Exact packed raw and projected media rows, when this invocation runs a tower.
+    #[serde(default)]
+    pub media: Option<CaptureMediaShape>,
     /// Number of independent sequences.
     pub batch: u64,
     /// Physical input rows per sequence in this invocation.
@@ -14,11 +17,29 @@ pub struct CaptureInvocationShape {
     pub context: Option<u64>,
 }
 
+/// Independent media extents; delimiter tokens are excluded from projected rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMediaShape {
+    /// Packed unmerged tower positions.
+    pub patches: u64,
+    /// Packed positions after the spatial merger.
+    pub projected: u64,
+}
+
 impl CaptureInvocationShape {
     /// Validates positive extents and checked products without touching tensors.
     pub fn validate(self) -> Result<(), CaptureError> {
         if self.batch == 0 || self.sequence == 0 || self.context == Some(0) {
             return Err(CaptureError::Invalid("empty invocation geometry".into()));
+        }
+        if let Some(media) = self.media {
+            if media.patches == 0 || media.projected == 0 || media.projected > media.patches {
+                return Err(CaptureError::Invalid(
+                    "invalid invocation media geometry".into(),
+                ));
+            }
+            mul(self.batch, media.patches)?;
+            mul(self.batch, media.projected)?;
         }
         mul(self.batch, self.sequence)?;
         if let Some(context) = self.context {
@@ -39,7 +60,9 @@ impl CaptureInvocationShape {
                     "selected context axis requires exact invocation context".into(),
                 )
             })?),
-            SymbolicDimension::MediaPositions | SymbolicDimension::Unknown => None,
+            SymbolicDimension::MediaPositions => self.media.map(|media| media.patches),
+            SymbolicDimension::ProjectedMediaPositions => self.media.map(|media| media.projected),
+            SymbolicDimension::Unknown => None,
         })
     }
     /// Checks every declared axis even when other axes remain runtime-dependent.
@@ -145,6 +168,7 @@ impl CaptureInvocationBounds {
             ));
         }
         let shape = CaptureInvocationShape {
+            media: None,
             batch: self.batch,
             sequence: self.max_sequence,
             context: self.max_context,
@@ -222,6 +246,7 @@ mod tests {
             max_predictions: 6,
         };
         let shape = CaptureInvocationShape {
+            media: None,
             batch: 2,
             sequence: 3,
             context: Some(11),
@@ -255,9 +280,57 @@ mod tests {
         );
     }
     #[test]
+    fn packed_media_extents_are_independent_of_decoder_rows_and_context() {
+        let shape = CaptureInvocationShape {
+            batch: 1,
+            sequence: 13,
+            context: Some(21),
+            media: Some(CaptureMediaShape {
+                patches: 16,
+                projected: 4,
+            }),
+        };
+        let raw = point(&[
+            SymbolicDimension::Batch,
+            SymbolicDimension::MediaPositions,
+            SymbolicDimension::Known(8),
+        ]);
+        let projected = point(&[
+            SymbolicDimension::Batch,
+            SymbolicDimension::ProjectedMediaPositions,
+            SymbolicDimension::Known(6),
+        ]);
+        assert_eq!(shape.resolve(&raw).unwrap(), Some(vec![1, 16, 8]));
+        assert_eq!(shape.resolve(&projected).unwrap(), Some(vec![1, 4, 6]));
+        assert!(shape.validate_actual(&raw, &[1, 13, 8]).is_err());
+        assert!(shape.validate_actual(&projected, &[1, 16, 6]).is_err());
+        assert!(
+            CaptureInvocationShape {
+                media: Some(CaptureMediaShape {
+                    patches: 4,
+                    projected: 5
+                }),
+                ..shape
+            }
+            .validate()
+            .is_err()
+        );
+        let without_media = CaptureInvocationShape {
+            media: None,
+            ..shape
+        };
+        assert_eq!(without_media.resolve(&raw).unwrap(), None);
+        assert_eq!(
+            serde_json::from_value::<CaptureInvocationShape>(serde_json::to_value(shape).unwrap())
+                .unwrap(),
+            shape
+        );
+    }
+    #[test]
     fn unknown_axes_do_not_hide_context_requirements_or_invalid_known_axes() {
         let unknown_context = point(&[SymbolicDimension::Unknown, SymbolicDimension::Context]);
         let shape = CaptureInvocationShape {
+            media: None,
             batch: 1,
             sequence: 3,
             context: None,
@@ -273,24 +346,29 @@ mod tests {
         let partly_known = point(&[SymbolicDimension::Unknown, SymbolicDimension::Sequence]);
         assert_eq!(shape.resolve(&partly_known).unwrap(), None);
         assert!(shape.validate_actual(&partly_known, &[8, 1]).is_err());
-        assert!(shape
-            .validate_slices(
-                &partly_known,
-                &[CaptureSlice {
-                    axis: "axis1".into(),
-                    start: 0,
-                    end: 4,
-                    stride: 1
-                }]
-            )
-            .is_err());
-        assert!(CaptureInvocationShape {
-            batch: u64::MAX,
-            sequence: 2,
-            context: None
-        }
-        .validate()
-        .is_err());
+        assert!(
+            shape
+                .validate_slices(
+                    &partly_known,
+                    &[CaptureSlice {
+                        axis: "axis1".into(),
+                        start: 0,
+                        end: 4,
+                        stride: 1
+                    }]
+                )
+                .is_err()
+        );
+        assert!(
+            CaptureInvocationShape {
+                media: None,
+                batch: u64::MAX,
+                sequence: 2,
+                context: None
+            }
+            .validate()
+            .is_err()
+        );
         let schedule = CaptureSchedule {
             first_prediction: 3,
             every: 2,

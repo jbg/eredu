@@ -363,6 +363,7 @@ impl PreparedModelDiscovery {
         let Some(target) = self.component_partition_layouts(max_ranks)? else {
             return Ok(None);
         };
+        if execution.is_shared_backbone() { return Ok(Some(target)); }
         let prediction = self.prediction.as_ref().ok_or_else(|| {
             eredu_core::capture::CaptureError::Unsupported(
                 "prepared sources have no selected prediction catalog".into(),
@@ -543,13 +544,14 @@ impl PreparedModelDiscovery {
                 ));
             }
         }
-        let prediction = self.prediction.as_ref().ok_or_else(|| {
-            CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
-        })?;
-        let descriptor = prediction
-            .descriptor
-            .as_ref()
-            .map_err(|reason| CaptureError::Invalid(reason.clone()))?;
+        let (descriptor, intervention_points) = if execution.is_shared_backbone() {
+            (&self.descriptor, &self.intervention_points)
+        } else {
+            let prediction = self.prediction.as_ref().ok_or_else(|| {
+                CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
+            })?;
+            (prediction.descriptor.as_ref().map_err(|reason| CaptureError::Invalid(reason.clone()))?, &prediction.intervention_points)
+        };
         let mut captures = self.capture()?;
         captures.catalog = descriptor.observations.clone();
         let mut bindings = std::collections::BTreeMap::new();
@@ -601,7 +603,7 @@ impl PreparedModelDiscovery {
         // prediction requirement for the scoped execution.
         captures.catalog = descriptor.observations.clone();
         let mut interventions = eredu_runtime::inspection::intervention_support(
-            prediction.intervention_points.clone(),
+            intervention_points.clone(),
             &captures,
             mechanisms,
         );
@@ -957,7 +959,7 @@ pub fn prepare_model_sources(
         .architecture_identity()
         .to_owned();
     let inspection = plan.inspection().clone();
-    let complete_architecture = inspection.architecture_plan().clone();
+    let complete_architecture = selected.retained_architecture().unwrap_or(inspection.architecture_plan()).clone();
     let projection = complete_architecture.prediction_target_projection()?;
     let (architecture, admitted_extension) = projection.map_or_else(
         || (complete_architecture.clone(), None),
@@ -1016,7 +1018,7 @@ pub fn prepare_model_sources(
         )));
     }
     let source_identity = source_graph_identity(
-        plan.inspection(),
+        &execution_inspection,
         &execution_identity,
         selected
             .qwen4_construction()
@@ -1050,7 +1052,7 @@ pub fn prepare_model_sources(
     }?;
     Ok(PreparedModelSources {
         selected,
-        inspection,
+        inspection: execution_inspection,
         graph,
     })
 }
@@ -1298,52 +1300,34 @@ fn source_graph_identity(
     execution_identity: &str,
     prediction: Option<&prediction::InspectedPredictionSource>,
 ) -> Result<DeferredArtifactIdentity, ArtifactError> {
+    let mut files = Vec::new();
     match inspection.format() {
-        ArtifactFormat::SafeTensors => DeferredArtifactIdentity::safetensors(
-            execution_identity,
-            inspection.safetensors_shards().ok_or_else(|| {
-                ArtifactError::InvalidArtifact(
-                    "SafeTensors inspection omitted admitted shards".into(),
-                )
-            })?,
-        ),
+        ArtifactFormat::SafeTensors => {
+            let shards = inspection.safetensors_shards().ok_or_else(|| ArtifactError::InvalidArtifact("SafeTensors inspection omitted admitted shards".into()))?;
+            files.extend(shards.logical_payload_paths().iter().map(|(role, path)| ArtifactFile::new(role, path)));
+        }
         ArtifactFormat::Gguf => {
-            let validated = inspection.validated_gguf().ok_or_else(|| {
-                ArtifactError::InvalidArtifact("GGUF inspection omitted its admission proof".into())
-            })?;
-            let mut files = Vec::new();
-            files.extend(validated.checkpoint().shards().iter().map(|shard| {
-                ArtifactFile::new(
-                    format!("primary/split/{:05}", shard.split_no()),
-                    shard.path(),
-                )
-            }));
+            let validated = inspection.validated_gguf().ok_or_else(|| ArtifactError::InvalidArtifact("GGUF inspection omitted its admission proof".into()))?;
+            files.extend(validated.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("primary/split/{:05}", shard.split_no()), shard.path())));
             for (role, companion) in validated.companions() {
                 let role = match role {
                     GgufCompanionRole::MediaProjector => "media-projector".to_owned(),
                     GgufCompanionRole::Named(name) => format!("named/{name}"),
-                    _ => {
-                        return Err(ArtifactError::InvalidArtifact(
-                            "unsupported GGUF companion role in source identity".into(),
-                        ))
-                    }
+                    _ => return Err(ArtifactError::InvalidArtifact("unsupported GGUF companion role in source identity".into())),
                 };
-                files.extend(companion.checkpoint().shards().iter().map(|shard| {
-                    ArtifactFile::new(
-                        format!("companion/{role}/split/{:05}", shard.split_no()),
-                        shard.path(),
-                    )
-                }));
+                files.extend(companion.checkpoint().shards().iter().map(|shard| ArtifactFile::new(format!("companion/{role}/split/{:05}", shard.split_no()), shard.path())));
             }
-            if let Some(prediction) = prediction {
-                files.extend(prediction.files());
-            }
-            DeferredArtifactIdentity::filesystem(execution_identity, files)
         }
-        _ => Err(ArtifactError::InvalidArtifact(
-            "unsupported artifact format in prepared source identity".into(),
-        )),
+        _ => return Err(ArtifactError::InvalidArtifact("unsupported artifact format in prepared source identity".into())),
     }
+    if let Some(prediction) = prediction { files.extend(prediction.files()); }
+    if let Some(adapter) = inspection.architecture_plan().draft_adapter() {
+        adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?;
+        files.extend(adapter.files());
+    }
+    let identity = DeferredArtifactIdentity::filesystem(execution_identity, files)?;
+    if let Some(adapter) = inspection.architecture_plan().draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
+    Ok(identity)
 }
 
 fn prepare_ordinary_sources(
@@ -1370,6 +1354,7 @@ fn prepare_ordinary_sources(
         ));
     }
     let mut bound = declarations.bind(cache)?;
+    if let Some(adapter) = architecture.draft_adapter() { adapter.verify_configuration().map_err(ArtifactError::InvalidArtifact)?; }
     let primary = bound
         .physical
         .remove(&PhysicalArtifactId::Primary)

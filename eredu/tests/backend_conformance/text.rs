@@ -41,6 +41,7 @@ fn generate<F: FnMut(SemanticEvent)>(
     };
     Ok(match method {
         0 => terminal(model.generate_prepared_text(PreparedChatGenerationRequest {
+            control_handle: None,
             input,
             settings,
             caller_stop_sequences: stops,
@@ -49,10 +50,15 @@ fn generate<F: FnMut(SemanticEvent)>(
         })?),
         1 => terminal(model.generate_prepared_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input,
                 drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: Default::default(),
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        Default::default(),
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: stops,
                 cancellation,
                 on_event,
@@ -63,14 +69,24 @@ fn generate<F: FnMut(SemanticEvent)>(
                 PreparedChatSpeculativeBatchRequest {
                     drafting: SpeculativeDraft::Embedded,
                     lanes: vec![PreparedChatSpeculativeBatchLane {
+                        control_handle: None,
                         input,
-                        settings,
-                        max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                eredu_core::decoding::SpeculationOptionsRequest {
+                                    max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                                    scheduler: Default::default(),
+                                    ..Default::default()
+                                }
+                                .try_into()
+                                .expect("validated speculation options"),
+                            )),
+                            ..settings
+                        },
                         caller_stop_sequences: stops,
                         cancellation,
                         on_event: Box::new(on_event),
                     }],
-                    scheduler: Default::default(),
                 },
             )?;
             let mut lanes = output.into_requests();
@@ -79,10 +95,15 @@ fn generate<F: FnMut(SemanticEvent)>(
         }
         3 => terminal(model.with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input,
                 drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: Default::default(),
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        Default::default(),
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: stops,
                 cancellation,
                 on_event,
@@ -346,6 +367,7 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
     let chat = model.prepare_chat(request()).unwrap();
     let error = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings: Default::default(),
             caller_stop_sequences: &[],
@@ -356,10 +378,15 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
     assert!(matches!(error, PreparedChatError::Semantic(_)));
     let error = model
         .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             drafting: SpeculativeDraft::Embedded,
-            settings: Default::default(),
-            options: Default::default(),
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    Default::default(),
+                )),
+                ..Default::default()
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| panic!("unsupported chat emitted"),

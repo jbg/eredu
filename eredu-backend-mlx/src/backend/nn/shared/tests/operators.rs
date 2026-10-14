@@ -1737,3 +1737,22 @@ fn reduced_precision_gelu_preserves_vector_reference_tail_saturation() {
         ]
     );
 }
+
+#[test]
+fn exact_gelu_preserves_low_precision_with_one_output_rounding_boundary() {
+    let values = [-3.0f32, -1.0, 0.0, 0.5, 1.0, 3.0];
+    // Independent x * standard-normal CDF(x), evaluated in FP64.
+    let expected = [-0.00404969409489028f32, -0.15865525393145705, 0.0, 0.34573123063700655, 0.8413447460685429, 2.9959503059051097];
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        let execution = ExecutionContext::new(Device::new(device, 0));
+        let stream = execution.stream();
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let input = Array::from_slice(&values, &[6]).as_dtype(dtype, stream).unwrap();
+            let actual = super::super::layers::gelu(&input, stream).unwrap();
+            assert_eq!(actual.dtype(), dtype);
+            let actual = actual.as_dtype(Dtype::Float32, stream).unwrap().into_evaluated().unwrap();
+            let expected = expected.map(|x| match dtype { Dtype::Float16 => half::f16::from_f32(x).to_f32(), _ => half::bf16::from_f32(x).to_f32() });
+            assert_eq!(actual.as_slice::<f32>(), expected.as_slice());
+        }
+    }
+}

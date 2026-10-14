@@ -265,7 +265,7 @@ impl SamplingBackend for MlxSamplingBackend {
     }
 
     fn token_id(token: &MlxTensor, stream: &Stream) -> Result<u32, Exception> {
-        Ok(token.as_array().clone().item::<u32>(stream))
+        token.as_array().clone().try_item::<u32>(stream)
     }
 
     fn token_ids<const N: usize>(

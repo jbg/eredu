@@ -81,12 +81,16 @@ fn prompt(media: bool) -> MlxModelInput {
     }
 }
 
-fn generation_config() -> SpeculativeConfig {
-    SpeculativeConfig {
+fn generation_config() -> GenerationRequestConfig {
+    GenerationRequestConfig {
         // Several prediction rounds exercise cached decoding; replay, fork,
         // cancellation and recovery each repeat this sequence independently.
         max_tokens: 8,
-        max_draft_tokens: 1,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 0.,
         eos_token_ids: vec![],
     }

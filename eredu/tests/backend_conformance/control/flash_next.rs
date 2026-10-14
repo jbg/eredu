@@ -128,6 +128,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         let mut ordinary_events = vec![];
         let ordinary = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: settings(),
                 caller_stop_sequences: &[],
@@ -262,6 +263,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         let mut events = vec![];
         let ordinary = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: settings(),
                 caller_stop_sequences: &[],

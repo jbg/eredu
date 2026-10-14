@@ -152,7 +152,7 @@ fn lifecycle(model: &mut dyn ErasedReplicatedTextExecutable, paged: bool, stream
     let prefix = PROMPT.into_iter().chain(0..16u32).collect::<Vec<_>>();
     let persisted = paged.then(|| {
         let descriptor = PromptCacheDescriptor::from_model_identity(
-            model.prompt_cache_model_identity().clone(),
+            model.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone(),
             "miniature-qwen4-native",
             "original-ids-with-eos",
             1,

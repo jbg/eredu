@@ -105,8 +105,9 @@ mod prediction_components {
         fn begin_activation_invocation(
             &mut self,
             phase: Phase,
-            sequence: usize,
+            geometry: eredu_runtime::inspection::SpeculativeActivationGeometry,
         ) -> Result<(), Exception> {
+        let sequence = geometry.sequence;
             let mut trace = self.trace.lock().unwrap();
             assert!(trace.active.replace((phase, sequence)).is_none());
             trace.phases.push((phase, sequence));
@@ -204,9 +205,13 @@ mod prediction_components {
             let (output, publications) = execute_neutral_embedded_mtp(
                 &mut runtime,
                 synthetic_prediction_input(&parts, &tokens),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 5,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },

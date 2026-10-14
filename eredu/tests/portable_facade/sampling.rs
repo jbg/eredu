@@ -126,6 +126,7 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
             } else {
                 model
                     .generate_prepared_chat(PreparedChatGenerationRequest {
+                        control_handle: None,
                         input: PreparedChatInput::rendered_prompt(&chat),
                         settings,
                         caller_stop_sequences: &[],
@@ -189,6 +190,7 @@ fn invalid_mirostat_is_rejected_before_backend_work() {
             });
             let error = model
                 .generate_prepared_chat(PreparedChatGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
                     settings,
                     caller_stop_sequences: &[],
@@ -267,6 +269,7 @@ fn mirostat_requires_positive_effective_temperature_after_resolution() {
         let chat = chat(&mut model);
         let error = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: PreparedChatGenerationSettings {
                     overrides,
@@ -310,17 +313,24 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
             let mut drafter = ();
             let error = model
                 .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
                     drafting: if embedded {
                         SpeculativeDraft::Embedded
                     } else {
                         SpeculativeDraft::External(&mut drafter)
                     },
-                    settings: mirostat(),
-                    options: eredu::api::PreparedChatSpeculativeGenerationOptions {
-                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                            .with_lookahead(lookahead),
-                        ..Default::default()
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                                    .with_lookahead(lookahead),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..mirostat()
                     },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -338,19 +348,29 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                     lanes: [TextSamplingStrategy::Standard, mirostat().strategy]
                         .into_iter()
                         .map(|strategy| PreparedChatSpeculativeBatchLane {
+                            control_handle: None,
                             input: PreparedChatInput::rendered_prompt(&chat),
-                            settings: PreparedChatGenerationSettings {
-                                strategy,
-                                ..mirostat()
+                            settings: eredu::api::PreparedChatGenerationSettings {
+                                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                    eredu_core::decoding::SpeculationOptionsRequest {
+                                        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                                            .with_lookahead(lookahead),
+                                        ..Default::default()
+                                    }
+                                    .try_into()
+                                    .expect("validated speculation options"),
+                                )),
+                                ..PreparedChatGenerationSettings {
+                                    strategy,
+                                    ..mirostat()
+                                }
                             },
-                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
                             caller_stop_sequences: &[],
                             cancellation: Default::default(),
                             on_event: Box::new(|_| panic!("mock backend must not emit events")),
                         })
                         .collect(),
-                    scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                        .with_lookahead(lookahead),
                 })
                 .err()
                 .expect("mock backend returns its sentinel error");
@@ -393,17 +413,24 @@ fn assert_invalid_speculative_settings(
             let mut drafter = ();
             let error = model
                 .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
                     drafting: if embedded {
                         SpeculativeDraft::Embedded
                     } else {
                         SpeculativeDraft::External(&mut drafter)
                     },
-                    settings,
-                    options: eredu::api::PreparedChatSpeculativeGenerationOptions {
-                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                            .with_lookahead(lookahead),
-                        ..Default::default()
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                                    .with_lookahead(lookahead),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings
                     },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
@@ -424,16 +451,26 @@ fn assert_invalid_speculative_settings(
                     lanes: [PreparedChatGenerationSettings::default(), settings]
                         .into_iter()
                         .map(|settings| PreparedChatSpeculativeBatchLane {
+                            control_handle: None,
                             input: PreparedChatInput::rendered_prompt(&chat),
-                            settings,
-                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                            settings: eredu::api::PreparedChatGenerationSettings {
+                                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                    eredu_core::decoding::SpeculationOptionsRequest {
+                                        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
+                                            .with_lookahead(lookahead),
+                                        ..Default::default()
+                                    }
+                                    .try_into()
+                                    .expect("validated speculation options"),
+                                )),
+                                ..settings
+                            },
                             caller_stop_sequences: &[],
                             cancellation: Default::default(),
                             on_event: Box::new(|_| panic!("invalid settings must not emit events")),
                         })
                         .collect(),
-                    scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                        .with_lookahead(lookahead),
                 })
                 .err()
                 .expect("invalid batch settings must fail");

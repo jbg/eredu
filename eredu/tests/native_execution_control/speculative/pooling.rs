@@ -140,10 +140,15 @@ fn verify(device: LocalDevice) {
             // subsequent decode completes both ratio-4 and ratio-128 windows.
             let prefix: Vec<u32> = (0..255).map(|i| 1 + i % 15).collect();
             let request = || PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, prefix.clone()),
                 drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings,
-                options: generation,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        generation,
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},

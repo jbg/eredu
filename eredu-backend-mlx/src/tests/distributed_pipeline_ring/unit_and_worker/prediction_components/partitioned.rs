@@ -428,9 +428,13 @@ pub(super) fn verify_partitioned(
             let (output, _) = execute_neutral_embedded_mtp_with(
                 runtime,
                 input,
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 4,
-                    max_draft_tokens: if fused { 2 } else { 1 },
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(if fused { 2 } else { 1 }).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: vec![],
                 },

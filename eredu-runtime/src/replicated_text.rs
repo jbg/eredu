@@ -40,13 +40,17 @@ where
         None
     }
 
-    /// Forms a tentative invocation. Causal architectures have no such equation.
-    fn block_refinement_input<'a>(
-        _canvas: &'a B::Tensor,
-        _feedback: Option<&'a B::Tensor>,
-        _mask: Option<&'a B::Tensor>,
+    /// Forms one immutable attention/cache/adapter invocation over the shared base.
+    /// Unsupported equations are rejected before layer execution. Ordinary causal
+    /// families accept causal invocations without position-score feedback.
+    fn invocation_input<'a>(
+        tokens: &'a B::Tensor,
+        feedback: Option<&'a B::Tensor>,
+        mask: Option<&'a B::Tensor>,
+        invocation: eredu_core::decoding::AttentionInvocation,
     ) -> Option<Self::Input<'a>> {
-        None
+        (invocation == eredu_core::decoding::AttentionInvocation::CAUSAL && feedback.is_none())
+            .then(|| Self::text_input(tokens, mask))
     }
 
     /// Whether consecutive causal text passes preserve the same state and

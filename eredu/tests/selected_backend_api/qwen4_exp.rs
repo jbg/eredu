@@ -94,6 +94,7 @@ fn qwen4_default_inspection_and_public_loading_generate_and_restore_both_formats
             .unwrap();
         let ordinary = model
             .generate_prepared_text(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
                 settings: settings(PrefillChunkPolicy::Unchunked),
                 caller_stop_sequences: &[],
@@ -108,6 +109,7 @@ fn qwen4_default_inspection_and_public_loading_generate_and_restore_both_formats
         model.reset().unwrap();
         let chunked = model
             .generate_prepared_text(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
                 settings: settings(PrefillChunkPolicy::Bounded(NonZeroUsize::new(3).unwrap())),
                 caller_stop_sequences: &[],
@@ -209,6 +211,7 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
     let chat = target.prepare_chat(chat_request()).unwrap();
     let ordinary = target
         .generate_prepared_text(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, prompt.clone()),
             settings: settings(PrefillChunkPolicy::Bounded(NonZeroUsize::new(17).unwrap())),
             caller_stop_sequences: &[],
@@ -237,10 +240,15 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
         let (mut model, _) = loaded.into_parts();
         let chat = model.prepare_chat(chat_request()).unwrap();
         let request = || PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, prompt.clone()),
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: settings(PrefillChunkPolicy::Unchunked),
-            options: generation,
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    generation,
+                )),
+                ..settings(PrefillChunkPolicy::Unchunked)
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},
@@ -408,6 +416,7 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         let prompt = target.prepare_multimodal_input(&media).unwrap();
         let ordinary = target
             .generate_prepared_text(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(&chat, prompt),
                 settings: settings(PrefillChunkPolicy::Unchunked),
                 caller_stop_sequences: &[],
@@ -625,10 +634,15 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         let chat = model.prepare_chat(chat_request()).unwrap();
         let prompt = model.prepare_multimodal_input(&media).unwrap();
         let request = || PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::prepared_backend_input(&chat, prompt.clone()),
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: settings(PrefillChunkPolicy::Unchunked),
-            options: generation,
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    generation,
+                )),
+                ..settings(PrefillChunkPolicy::Unchunked)
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},

@@ -191,9 +191,16 @@ fn main() -> anyhow::Result<()> {
     let draft = draft.as_speculative_draft().context("missing draft")?;
     let speculative = target.forecast_speculative_token_ids(
         &vec![1; positions],
-        settings,
+        {
+            let settings: eredu::api::PreparedChatGenerationSettings = settings;
+            eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: settings.decoding_mode.or(Some(
+                    eredu_core::decoding::DecodingMode::SelfSpeculation(spec_options),
+                )),
+                ..settings
+            }
+        },
         &draft,
-        spec_options,
         &Default::default(),
     )?;
     ensure!(
@@ -212,10 +219,15 @@ fn main() -> anyhow::Result<()> {
     let mut speculative_continuation = None;
     let spec_output = target.with_controlled_text_speculative(
         PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
             drafting: draft,
-            settings,
-            options: spec_options,
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    spec_options,
+                )),
+                ..settings
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},

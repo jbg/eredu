@@ -39,9 +39,13 @@ fn scheduler_sizes_new_draft_rounds_to_the_available_proposals() {
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -81,9 +85,13 @@ fn ordinary_canonical_and_speculative_lookahead_have_identical_semantics() {
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 5,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -142,9 +150,13 @@ fn optimistic_semantic_stop_truncates_an_accepted_block_transactionally() {
         .submit_with_semantics(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -204,9 +216,13 @@ fn grammar_completion_mid_block_matches_the_committed_prefix() {
         .submit_with_semantics(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -279,9 +295,13 @@ fn terminal_grammar_bonus_discards_matching_optimistic_work() {
         .submit_with_semantics(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 8,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -329,9 +349,13 @@ fn cancellation_discards_only_the_affected_request_runtime() {
         SpeculativeSchedulerOptions::default(),
     )
     .unwrap();
-    let config = SpeculativeConfig {
+    let config = GenerationRequestConfig {
         max_tokens: 5,
-        max_draft_tokens: 2,
+        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+            ),
+        ),
         temperature: 0.0,
         eos_token_ids: Vec::new(),
     };
@@ -434,9 +458,13 @@ fn semantic_callback_token_cancels_at_the_committed_prefill_boundary() {
         .submit_with_semantics_cancellable(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -499,9 +527,13 @@ fn no_lookahead_full_acceptance_bonus_eos_and_max_tokens_use_safe_boundaries() {
             .submit_with_semantics(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids,
                 },
@@ -560,9 +592,13 @@ fn no_lookahead_residual_replacement_commits_only_the_replacement() {
         .submit_with_semantics(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 2,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 1.0,
                 eos_token_ids: Vec::new(),
             },
@@ -604,9 +640,13 @@ fn commit_failure_does_not_publish_or_advance_canonical_output_state() {
         .submit_with_semantics(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },

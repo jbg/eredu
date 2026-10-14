@@ -229,6 +229,10 @@ fn hash_recipe_leaves(
                 hash_part(hash, bytes);
             }
         }
+        DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => {
+            hash_recipe_leaves(source, weight, bound, hash)?;
+            hash_recipe_leaves(source, scale, bound, hash)?;
+        }
         DerivedWeightRecipe::Concatenate { inputs, .. }
         | DerivedWeightRecipe::Stack { inputs, .. } => {
             for input in inputs {

@@ -146,9 +146,13 @@ fn public_qwen_hybrid_moe_embedded_scheduler_executes() {
         let output = run_neutral_embedded_mtp(
             &mut runtime,
             synthetic_prediction_input(&parts, &[1, 2]),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 3,
-                max_draft_tokens: 1,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -222,9 +226,13 @@ fn public_deepseek_v3_embedded_scheduler_executes_on_metal() {
     let output = run_neutral_embedded_mtp(
         &mut runtime,
         synthetic_prediction_input(&parts, &[1, 2]),
-        SpeculativeConfig {
+        GenerationRequestConfig {
             max_tokens: 3,
-            max_draft_tokens: 1,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         },
@@ -465,9 +473,13 @@ fn public_embedded_observers_are_installed_causally_and_transactionally() {
         let (result, publications) = execute_neutral_embedded_mtp(
             &mut runtime,
             synthetic_prediction_input(&parts, &tokens),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 3,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -618,9 +630,13 @@ fn execute_public_gemma_external_scheduler(
             SpeculativeGenerationLane::new(
                 prompt,
                 TextGenerationConfig::new(sampling),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 3,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },

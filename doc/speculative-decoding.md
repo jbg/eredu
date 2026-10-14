@@ -1,9 +1,35 @@
 # Speculative decoding and multi-token prediction
 
-`eredu` supports lossless speculative decoding with either an external
-assistant model or multi-token-prediction (MTP) heads embedded in the target
-checkpoint. The target model always verifies proposals; accepted output has
+`eredu` supports lossless speculative decoding with an external assistant,
+embedded multi-token-prediction (MTP) heads, or a masked draft over a shared backbone. The target model always verifies proposals; accepted output has
 the same target distribution as the corresponding non-speculative path.
+
+The shared speculative transaction carries explicit proposal evidence.
+`SpeculativeProposal::causal` retains a processed causal assistant distribution
+for likelihood-ratio verification. `SpeculativeProposal::target_matching` retains
+only a proposed token, with no invented causal draft probability. Target matching
+samples each processed target row against the evolving accepted prefix, accepts
+matching tokens and commits the first mismatch or full-acceptance bonus token.
+It uses the target RNG independently of proposal randomness, updates adaptive
+sampling and semantic constraints for each commitment, and uses the ordinary
+transactional accepted-prefix cache retention and rejected-suffix rollback.
+Loaded shared-backbone executions expose this policy through
+`DecodingMode::SelfSpeculation`. External assistants and embedded MTP retain
+likelihood-ratio verification with processed causal draft distributions.
+
+Prepared executor requests carry `GenerationRequestConfig.decoding_mode`.
+`SpeculativeDraft::Target` selects the loaded target without an external assistant. Its
+prepared session handoff uses the same request table for causal sampling or
+architecture-declared ordinary refinement. A target with a retained shared-backbone
+draft also realizes self-speculation and all advertised mode handoffs. Refinement-only
+targets do not need causal proposal-score admission; targets without that retained
+draft reject self-speculation with `NoBackendDraftCapacity`.
+Their shared request table also runs AR with zero proposals. Controlled sessions
+and the request's optional `GenerationControlHandle` queue AR/speculation changes
+at settled boundaries. A handoff appends its pending committed token once,
+retains the causal next-token row and acknowledges the effective output position
+before sampling resumes. Snapshots preserve this row and both mode states;
+serial branches use independent mailboxes, including while inactive.
 
 Likelihood-ratio verification requires causal conditional target probabilities.
 Iterative block architectures such as DiffusionGemma report
@@ -226,3 +252,62 @@ See [controlled speculation](execution-control.md#controlled-speculative-generat
 for scope-wide accounting, supported hooks and snapshot requirements, and the
 [Inspector workflow](lm-inspector-execution-control.md#speculative-forks-and-prospective-interventions)
 for branch journal reconciliation.
+
+Proposal advancement uses `SpeculativeProposalStep::CausalLogits` or
+`TargetMatchingToken`. Separate autoregressive assistants and embedded heads
+return causal logits. A masked source returns its selected candidate; the shared
+driver attaches target-matching evidence without resampling it. EOS and grammar
+prefix completion still end proposal collection through the shared lifecycle.
+Target processing and constraints advance only against the accepted canonical
+prefix during verification. The same transaction retains or rolls back cache
+state before publishing either source's accepted output.
+
+The portable shared-backbone executor uses one ordinary model and one canonical
+cache. Its masked source seeds the last committed token that still awaits cache
+append, over the retained causal prefix. That seed is excluded from proposals and
+included once in verification inputs. Full-attention caches transactionally
+truncate rejected K/V; other state mechanisms replay accepted inputs in isolation. Proposal randomness belongs to the request
+seed and survives controlled snapshots and restores independently of target draws.
+Draft blocks retain their complete admitted geometry when the remaining output
+budget shortens proposal collection. The shared physical generation driver uses
+this executor and the same controller, sampler, target RNG and commitment hook
+as AR. Mode changes wait until verification settles. Native verification observes
+the configured completion deadline and quarantines still-live work on timeout;
+unsupported cancellation dispositions are rejected before execution.
+
+The MLX shared source uses a single queue and has no eligible optimistic branch.
+Lookahead is an optional scheduler optimization; its configured capacities remain
+upper bounds. Verification capture records the complete causal transaction at its
+physical sequence extent. Individual accepted decisions consume retained causal
+rows without repeating that forward or charging another capture invocation.
+Snapshots retain the verification evidence, independent proposal RNG, accepted
+cursor and canonical cache; restore and fork preserve consumed capture/copy credits.
+
+Prepared requests, forecasts and batch lanes select their initial mode through
+`PreparedChatGenerationSettings.decoding_mode`. Absence selects AR. Explicit
+`DecodingMode::SelfSpeculation` carries the neutral, validated `SpeculationOptions`;
+there is no separate request-level speculation configuration. A retained source
+also accepts an initial diffusion mode when its target declares refinement.
+Batch lanes agree on one scheduler contract while retaining individual proposal
+limits and sampling state. External and embedded sources reject masked refinement
+and draft-only adapter options. Their causal proposal probabilities retain
+likelihood-ratio verification; shared masked proposals use target matching.
+
+Shared-backbone forecasts retain complete trained canvas geometry independently
+of the proposal or output allowance. Proposal workspace evaluates all canvas rows
+and prefix-plus-block attention; canonical cache residency excludes transient
+block K/V. Verification accounts for proposal overshoot, rollback checkpoints and
+configured lookahead copies. Full canvas distribution storage and optional
+low-rank activation work remain charged when the output allowance is shortened.
+Base and adapter parameters belong to one target catalog and are charged there
+once per actual topology replica. Sampling and graph overlap bounds retain their
+labeled calibration rather than claiming measured allocator peaks.
+
+Independent causal assistants compose ordinary target refinement through
+`TargetRefinement`. Their proposal and verification policy remains causal even
+when the target supports masked diffusion. The prepared input supplies a separate
+refinement stream; the request seed preserves the target's immutable causal
+prefix, aligned assistant prefix and paused numerical state. Refinement advances
+one numerical invocation at a time, and causal settlement after finalization
+advances both caches before a mode acknowledgement. Model parameters remain with
+the existing target and assistant owners.

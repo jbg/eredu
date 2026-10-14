@@ -28,9 +28,13 @@ fn independent_requests_progress_fairly_and_preserve_output_order() {
         .submit(
             &mut cache_a,
             ModelInput::new(&parts_a),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: vec![0],
             },
@@ -43,9 +47,13 @@ fn independent_requests_progress_fairly_and_preserve_output_order() {
         .submit(
             &mut cache_b,
             ModelInput::new(&parts_b),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: vec![2],
             },
@@ -114,9 +122,13 @@ fn scheduler_limits_bound_retained_transactions_and_branches() {
             .submit(
                 cache,
                 ModelInput::new(parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 5,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -161,9 +173,13 @@ fn adaptive_disabling_stops_unproductive_branches_without_changing_output() {
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 10,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },

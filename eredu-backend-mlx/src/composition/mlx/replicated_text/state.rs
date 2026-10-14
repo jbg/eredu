@@ -1,6 +1,9 @@
 use super::*;
 
 pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized {
+    fn stateless() -> Option<Self> { None }
+    fn retain_causal_prefix(&mut self, _length: i32, _stream: &Stream) -> Result<bool, Exception> { Ok(false) }
+
     fn supports_isolated_snapshot(&self) -> bool {
         false
     }
@@ -20,6 +23,10 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         if !self.supports_isolated_snapshot() {
             return None;
+        }
+        if self.optional_layout().is_none() {
+            let bytes = u64::try_from(std::mem::size_of::<Self>()).ok()?;
+            return Some(eredu_core::execution_control::SnapshotEstimate { retained_bytes: bytes, copy_bytes: bytes });
         }
         let mut retained = self
             .layout()
@@ -55,6 +62,7 @@ pub(crate) trait MlxStateMechanisms: LayerRuntimeState<MlxNeuralBackend> + Sized
         if !self.supports_isolated_snapshot() {
             return None;
         }
+        if self.optional_layout().is_none() { return Some(0); }
         // Ordinary text is a single sequence. Interpret only the declared
         // component geometry, including absent fixed tensors. MLX floating
         // storage is at most eight bytes; explicit integer components use four.
@@ -171,6 +179,10 @@ pub(super) fn selected_state_manager(
 }
 
 impl MlxStateMechanisms for MlxKeyValueState {
+    fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
+        MlxKeyValueState::retain_causal_prefix(self, length, stream)
+    }
+
     fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.continuation_capacity_bound(additional)
     }
@@ -305,6 +317,11 @@ impl MlxStateMechanisms for MlxKeyValueState {
 }
 
 impl MlxStateMechanisms for MlxHybridState {
+    fn stateless() -> Option<Self> { Some(MlxHybridState::stateless()) }
+    fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
+        MlxHybridState::retain_causal_prefix(self, length, stream)
+    }
+
     fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.continuation_capacity_bound(additional)
     }

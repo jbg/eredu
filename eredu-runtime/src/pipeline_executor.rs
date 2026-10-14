@@ -1327,6 +1327,7 @@ where
         pass: &mut Self::Pass<'_>,
         route: &crate::PartitionBoundaryRoute,
         mut values: Vec<B::Tensor>,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), A::Error> {
         if route.destination_group != self.addresses[0].group() || pass.next_unit != 0 {
             return Err(pipeline_backend_error::<A::Error>(

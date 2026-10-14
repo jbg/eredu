@@ -19,14 +19,13 @@ use eredu_core::{
 };
 use eredu_core::{SpeculativeExecutor, SpeculativeStats, SpeculativeTelemetry};
 #[cfg(test)]
-use eredu_core::{SpeculativeRequestTable, SpeculativeSchedulerStats};
+use eredu_core::{GenerationRequestTable, SpeculativeSchedulerStats};
 use safemlx::{error::Exception, Array};
 #[cfg(test)]
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 
 use crate::composition::mlx::{
     speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams},
-    MlxModelInput,
 };
 #[cfg(test)]
 use crate::{
@@ -38,8 +37,10 @@ use crate::{
 #[cfg(test)]
 use eredu_core::generation::{
     FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
-    SpeculativeConfig, SpeculativeSchedulerOptions,
+    GenerationRequestConfig, SpeculativeSchedulerOptions,
 };
+#[cfg(test)]
+use crate::composition::mlx::MlxModelInput;
 #[cfg(test)]
 use eredu_core::{generation::SpeculativeRequestId, InputModality};
 #[cfg(test)]
@@ -117,7 +118,6 @@ impl SpeculativeTelemetry for SpeculativeComponentTimings {
 /// sampling and stream placement remain MLX-specific in this module.
 pub trait MlxSpeculativeRuntime<'a>:
     SpeculativeExecutor<
-        Input = MlxModelInput,
         Logits = Array,
         Context<'a> = SpeculativeExecutionStreams<'a>,
         Completion = MlxSpeculativeCompletion,
@@ -129,7 +129,6 @@ pub trait MlxSpeculativeRuntime<'a>:
 
 impl<'a, T> MlxSpeculativeRuntime<'a> for T where
     T: SpeculativeExecutor<
-            Input = MlxModelInput,
             Logits = Array,
             Context<'a> = SpeculativeExecutionStreams<'a>,
             Completion = MlxSpeculativeCompletion,
@@ -149,7 +148,7 @@ type CommittedOutputRuntime<'a, S> = SpeculativeOutputRuntime<
 #[cfg(test)]
 fn plain_runtime<'a, S, F>(
     sampler: S,
-    config: &SpeculativeConfig,
+    config: &GenerationRequestConfig,
     mut on_token: F,
 ) -> CommittedOutputRuntime<'a, S>
 where
@@ -170,7 +169,7 @@ where
 #[cfg(test)]
 fn semantic_runtime<'a, S, F>(
     sampler: S,
-    config: &SpeculativeConfig,
+    config: &GenerationRequestConfig,
     semantic: Box<dyn SpeculativeSemanticState>,
     cancellation: GenerationCancellationToken,
     on_event: F,
@@ -189,7 +188,7 @@ where
 }
 
 #[cfg(test)]
-type MlxRequestTable<'a, B, S> = SpeculativeRequestTable<
+type MlxRequestTable<'a, B, S> = GenerationRequestTable<
     'a,
     B,
     MlxSpeculativeSampling<S>,
@@ -223,7 +222,7 @@ pub struct SpeculativeScheduleOutput<S> {
 #[cfg(test)]
 struct MlxSpeculativeScheduler<'a, B, S>
 where
-    B: MlxSpeculativeRuntime<'a>,
+    B: MlxSpeculativeRuntime<'a> + SpeculativeExecutor<Input = MlxModelInput>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     backend: &'a mut B,
@@ -235,7 +234,7 @@ where
 #[cfg(test)]
 impl<'a, B, S> MlxSpeculativeScheduler<'a, B, S>
 where
-    B: MlxSpeculativeRuntime<'a>,
+    B: MlxSpeculativeRuntime<'a> + SpeculativeExecutor<Input = MlxModelInput>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     /// Creates a scheduler over shared model parameters and explicit streams.
@@ -253,7 +252,7 @@ where
                 wait.cancellation()
             )));
         }
-        let requests = SpeculativeRequestTable::new(options, streams.topology())
+        let requests = GenerationRequestTable::new(options, streams.topology())
             .map_err(|error| Exception::custom(error.to_string()))?;
         let component_timing = component_timing_enabled() && backend.supports_telemetry();
         backend.set_telemetry_enabled(component_timing);
@@ -271,7 +270,7 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: SpeculativeConfig,
+        config: GenerationRequestConfig,
         prng_key: Option<Array>,
         sampler: S,
         on_token: F,
@@ -290,7 +289,7 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: SpeculativeConfig,
+        config: GenerationRequestConfig,
         prng_key: Option<Array>,
         sampler: S,
         semantic: Box<dyn SpeculativeSemanticState>,
@@ -317,7 +316,7 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: SpeculativeConfig,
+        config: GenerationRequestConfig,
         prng_key: Option<Array>,
         sampler: S,
         semantic: Box<dyn SpeculativeSemanticState>,
@@ -335,7 +334,7 @@ where
         &mut self,
         cache: &'a mut B::Cache,
         input: ModelInput<'_>,
-        config: SpeculativeConfig,
+        config: GenerationRequestConfig,
         prng_key: Option<Array>,
         runtime: CommittedOutputRuntime<'a, S>,
     ) -> Result<SpeculativeRequestId, Exception> {
@@ -439,13 +438,13 @@ fn generate<'runtime, B, S>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &SpeculativeConfig,
+    config: &GenerationRequestConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
     stream: &'runtime Stream,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime> + SpeculativeExecutor<Input = MlxModelInput>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_with_streams(
@@ -464,13 +463,13 @@ fn generate_with_streams<'runtime, B, S>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &SpeculativeConfig,
+    config: &GenerationRequestConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
     streams: SpeculativeExecutionStreams<'runtime>,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime> + SpeculativeExecutor<Input = MlxModelInput>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_tokens(
@@ -494,7 +493,7 @@ fn generate_tokens<'runtime, B, S, F>(
     backend: &'runtime mut B,
     cache: &'runtime mut B::Cache,
     input: ModelInput<'_>,
-    config: &SpeculativeConfig,
+    config: &GenerationRequestConfig,
     prng_key: Option<Array>,
     sampler: &mut S,
     streams: SpeculativeExecutionStreams<'runtime>,
@@ -502,7 +501,7 @@ fn generate_tokens<'runtime, B, S, F>(
     on_token: F,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime> + SpeculativeExecutor<Input = MlxModelInput>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
     F: FnMut(&[u32]) -> Result<(), Exception> + 'runtime,
 {

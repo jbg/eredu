@@ -1,6 +1,9 @@
 use super::*;
 use eredu_core::{DraftPlacementPlan, DraftingPlan};
 
+#[path = "speculative/shared_target.rs"]
+mod shared_target;
+
 #[path = "speculative/activations.rs"]
 mod activations;
 #[path = "speculative/continuation_forecast.rs"]
@@ -196,10 +199,15 @@ fn speculative_control_artifacts(
         Some(
             model
                 .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings,
-                    options: generation_options,
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            generation_options,
+                        )),
+                        ..settings
+                    },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},
@@ -287,10 +295,15 @@ fn speculative_control_artifacts(
     let output = model
         .with_controlled_chat_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options: generation_options,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        generation_options,
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},

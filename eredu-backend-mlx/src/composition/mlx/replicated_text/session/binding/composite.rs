@@ -140,8 +140,8 @@ where
             super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
         >::with_observers(&mut strategy, observers);
         let result = {
-            let mut erased = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
-                super::prepared_speculative::MlxEmbeddedExecutorTypes,
+            let mut erased = eredu_core::speculative::DynGenerationExecutor::<
+                super::prepared_speculative::MlxGenerationExecutorTypes,
             >::new(&mut executor);
             continuation.execute(selected, &mut erased)
         };

@@ -169,6 +169,9 @@ impl<P: MlxParameterBankTelemetry> MlxParameterBankTelemetry
 }
 
 pub(super) trait ErasedPredictionTargetState: std::any::Any {
+    #[cfg(test)]
+    fn backing_arrays(&self) -> Vec<&Array>;
+    fn checkpoint_view(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
     fn control_growth(&self, additional: u64) -> Option<u64>;
     fn control_estimate(&self) -> Option<eredu_core::execution_control::SnapshotEstimate>;
     fn control_copy(
@@ -176,6 +179,7 @@ pub(super) trait ErasedPredictionTargetState: std::any::Any {
         stream: &Stream,
     ) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
 
+    fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception>;
     fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception>;
     fn restore_box(
         &mut self,
@@ -191,6 +195,14 @@ impl<S> ErasedPredictionTargetState for S
 where
     S: MlxStateMechanisms + 'static,
 {
+    #[cfg(test)]
+    fn backing_arrays(&self) -> Vec<&Array> { MlxStateMechanisms::retained_arrays(self) }
+    fn checkpoint_view(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
+        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(self))?;
+        let view = self.deep_checkpoint()?;
+        super::super::speculative::state_snapshot::settle(MlxStateMechanisms::retained_arrays(&view))?;
+        Ok(Box::new(view))
+    }
     fn control_growth(&self, additional: u64) -> Option<u64> {
         self.isolated_snapshot_growth(additional)
     }
@@ -203,6 +215,9 @@ where
     ) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
         self.isolated_snapshot(stream)
             .map(|state| Box::new(state) as Box<dyn ErasedPredictionTargetState>)
+    }
+    fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
+        <S as MlxStateMechanisms>::retain_causal_prefix(self, length, stream)
     }
     fn deep_clone_box(&self) -> Result<Box<dyn ErasedPredictionTargetState>, Exception> {
         self.deep_checkpoint()
@@ -242,6 +257,17 @@ where
 pub(crate) struct MlxPredictionTargetState(Option<Box<dyn ErasedPredictionTargetState>>);
 
 impl MlxPredictionTargetState {
+    #[cfg(test)]
+    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
+        self.0.as_ref().map_or_else(Vec::new, |state| state.backing_arrays())
+    }
+    /// Shares published immutable roots and isolates overwrite-capable state.
+    /// Both paths settle native work before exposing the checkpoint.
+    pub(crate) fn checkpoint_view(&self) -> Result<Self, Exception> {
+        self.0.as_ref().ok_or_else(|| Exception::custom("prediction target state is active"))?
+            .checkpoint_view().map(|state| Self(Some(state)))
+    }
+
     pub(crate) fn control_growth(&self, additional: u64) -> Option<u64> {
         self.0.as_ref()?.control_growth(additional)
     }
@@ -304,6 +330,10 @@ impl MlxPredictionTargetState {
         current.restore_box(checkpoint.as_ref(), stream)
     }
 
+    pub(crate) fn retain_causal_prefix(&mut self, length: i32, stream: &Stream) -> Result<bool, Exception> {
+        self.0.as_mut().ok_or_else(|| Exception::custom("target state is active"))?
+            .retain_causal_prefix(length, stream)
+    }
     pub(crate) fn generation(&self) -> Result<u64, Error> {
         let state = self.0.as_ref().ok_or_else(|| {
             Error::ArchitectureModel("prediction target state is already active".into())
@@ -894,15 +924,20 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         None
     }
 
-    fn refine_block_with_observer(
+    /// Executes immutable invocation semantics over installed or transaction-local
+    /// cache state. Base parameter bindings and residency ownership stay shared.
+    fn attention_forward_with_observer(
         &mut self,
-        _canvas: &Array,
+        _tokens: &Array,
         _feedback: Option<&Array>,
+        _invocation: eredu_core::decoding::AttentionInvocation,
+        _cache: Option<&mut MlxPredictionTargetState>,
+        _prefill: bool,
         _stream: &Stream,
         _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
         Err(Error::ArchitectureModel(
-            "causal execution has no tentative-block equation".into(),
+            "selected execution has no requested attention invocation".into(),
         ))
     }
     fn projects_final_prefill_position(&self) -> bool {
@@ -1032,18 +1067,20 @@ pub(crate) trait ErasedReplicatedTextExecutable {
             "ordinary prediction state is unavailable".into(),
         ))
     }
-    fn autoregressive_forward(
+    /// Atomically exchanges an already settled causal prefix with canonical state.
+    /// The slot receives the previous state; parameters and source leases are unchanged.
+    fn exchange_autoregressive_cache(&mut self, cache: &mut MlxPredictionTargetState, stream: &Stream) -> Result<(), Error>;
+    /// Encodes complete prepared media/text context into a transaction-owned
+    /// causal cache. Returns its full decoder position count with sequence logits.
+    fn prepared_context_forward(
         &mut self,
-        _tokens: &Array,
+        _input: input::ModelInput<'_>,
         _cache: &mut MlxPredictionTargetState,
-        _prefill: bool,
         _stream: &Stream,
-    ) -> Result<Array, Error> {
-        Err(Error::Speculative(
-            "ordinary prediction state is unavailable".into(),
-        ))
+        _observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<(Array, usize), Error> {
+        Err(Error::Speculative("prepared causal context is unavailable".into()))
     }
-
     fn native_control_support(&self) -> eredu_core::execution_control::ControlSupport {
         eredu_core::execution_control::ControlSupport::Unsupported {
             reason: "complete native state copying is unavailable for this executable".into(),
@@ -1179,7 +1216,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     ) -> Option<&mut (dyn ErasedExternalPredictionExecutable + 'static)> {
         None
     }
-    fn prompt_cache_model_identity(&self) -> &PromptCacheModelIdentity;
+    fn prompt_cache_model_identity(&self) -> Option<&PromptCacheModelIdentity>;
     fn reset_cache(&mut self) -> Result<(), Exception>;
     fn reset_cache_distributed(&mut self) -> Result<(), Error>;
     fn load_prompt_cache(

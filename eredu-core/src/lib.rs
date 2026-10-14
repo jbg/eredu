@@ -29,6 +29,8 @@ pub mod checkpoint;
 pub mod component;
 /// Backend-neutral distributed scheduler consensus.
 pub mod consensus;
+/// Immutable attention, cache, adapter and score semantics for each invocation.
+pub mod decoding;
 /// Logical architecture and capture discovery contracts.
 pub mod discovery;
 pub mod parameters;
@@ -126,7 +128,7 @@ pub use capability::{
     StateMemoryLayout, StaticMemoryReport,
 };
 pub use execution::{
-    BackendId, DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
+    BackendId, DevicePlan, DraftAdapterSource, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanError,
     ExpertCachePlan, ResidencyPlan, WeightTransformationPlan, DEFAULT_MAX_CACHED_SHARDS,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
@@ -134,8 +136,8 @@ pub use generation::{
     resolve_generation_config, resolve_optimistic_reuse, CheckpointGenerationConfig, FinishReason,
     GenerationCancellationToken, GenerationConfigOverrides, GenerationError, GenerationOutput,
     GenerationSequence, GenerationTiming, OptimisticReuseDecision, ResolvedGenerationConfig,
-    SemanticEvent, SpeculativeCancellationDisposition, SpeculativeCommitPlan, SpeculativeConfig,
-    SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
+    SemanticEvent, SpeculativeCancellationDisposition, SpeculativeCommitPlan, GenerationRequestConfig,
+    SpeculativeRequestId, SpeculativeRequestLifecycle, SpeculativeRequestStatus, VerificationRound,
     SpeculativeSchedulerOptions, SpeculativeTail, TokenCommit, TokenTerminalSignals,
 };
 pub use input::{
@@ -197,8 +199,9 @@ pub use speculative::{
     SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
     SpeculativeGenerationVisitor, SpeculativeLifecycleObserver, SpeculativeLifecycleStage,
     SpeculativeOptimisticBranch, SpeculativeOutputError, SpeculativeOutputRuntime,
-    SpeculativePrefill, SpeculativeProposal, SpeculativePublicationStatus, SpeculativePublisher,
-    SpeculativeRandomness, SpeculativeRequest, SpeculativeRequestTable, SpeculativeSampling,
+    SpeculativePrefill, SpeculativeProposal, SpeculativeProposalEvidence, SpeculativeProposalStep,
+    SpeculativePublicationStatus, SpeculativePublisher,
+    SpeculativeRandomness, SpeculativeRequest, GenerationRequestTable, SpeculativeSampling,
     SpeculativeSchedule, SpeculativeScheduleState, SpeculativeSchedulerStats,
     SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeStats,
     SpeculativeTelemetry,

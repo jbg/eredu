@@ -21,7 +21,7 @@ pub struct GenerationOutputCheckpoint {
 
 /// Versioned metadata for an opaque in-process continuation. Serialized metadata
 /// cannot recreate a snapshot, admission, native handle or compatibility proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationSnapshotMetadata {
     /// Metadata version.
     pub schema_version: u32,
@@ -47,6 +47,8 @@ pub struct GenerationSnapshotMetadata {
     pub status: GenerationStatus,
     /// Logical execution coordinates restored with the complete continuation.
     pub position: eredu_core::refinement::GenerationPosition,
+    /// Active policy, queued transition and last settled acknowledgement.
+    pub decoding: eredu_core::decoding::DecodingState,
     /// Delivered prefix paired with incremental semantic buffers.
     pub output: GenerationOutputCheckpoint,
     /// Complete charged logical native/controller/host state, excluding shared
@@ -115,6 +117,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             // Preserve known, safely completed copy failures. An unresolved or
             // poisoned native owner must not leave a resumable facade lifecycle.
             self.lifecycle.fail();
+            self.state.finish_decoding();
         }
         result
     }
@@ -178,6 +181,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }
@@ -206,6 +210,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             pending_forced_token: self.pending_forced_token(),
             status: self.status(),
             position: self.position(),
+            decoding: self.decoding_state(),
             output: self.output_checkpoint(),
             retained_bytes: 0,
         };
@@ -244,6 +249,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         )?;
         let cursor = self.cursor.clone();
         metadata.retained_bytes = continuation.retained_bytes();
+        metadata.decoding = continuation.decoding_state();
         let snapshot = ControlledGenerationSnapshot {
             continuation,
             pipeline,
@@ -297,6 +303,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }

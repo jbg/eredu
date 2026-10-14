@@ -6,7 +6,7 @@ pub use eredu_runtime::memory_forecast::{
     CaptureMemoryPlan, ConversionRetentionGroupMemoryPlan, ConversionRetentionMemoryPlan,
     EmbeddedPredictionMemoryPlan, ForecastCalibration, ForecastExecutionContract,
     GenerationForecastBackend, GenerationForecastError, SpeculativeForecastBackend,
-    SpeculativeMemoryPlan,
+    SpeculativeMemoryPlan, RefinementMemoryPlan, DecodingContinuationMemoryPlan,
 };
 use serde::{Deserialize, Serialize};
 mod continuation;
@@ -17,6 +17,9 @@ pub use eredu_runtime::memory_forecast::GenerationForecastOptions;
 /// Estimate plus the exact descriptive request and execution contract used for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationForecast {
+    /// Full-canvas refinement and causal-append resource facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<eredu_runtime::memory_forecast::RefinementMemoryPlan>,
     /// Selection geometry and admitted ceilings for capture horizon recomputation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureMemoryPlan>,
@@ -80,9 +83,12 @@ impl GenerationForecast {
         }
         let mut estimate = match &self.speculative {
             Some(plan) => {
-                eredu_runtime::memory_forecast::estimate_speculative_memory(&self.request, plan)?
+                eredu_runtime::memory_forecast::estimate_source_generation_memory(&self.request, plan, self.refinement.as_ref())?
             }
-            None => eredu_runtime::memory_estimation::estimate_generation_memory(&self.request)?,
+            None => match &self.refinement {
+                Some(plan) => eredu_runtime::memory_forecast::estimate_refinement_memory(&self.request, plan)?,
+                None => eredu_runtime::memory_estimation::estimate_generation_memory(&self.request)?,
+            },
         };
         for assumption in &self.estimate.assumptions {
             if !estimate.assumptions.contains(assumption) {
@@ -92,6 +98,12 @@ impl GenerationForecast {
         self.estimate = estimate;
         Ok(())
     }
+}
+
+fn speculative_forecast_settings(mut settings: PreparedChatGenerationSettings) -> (PreparedChatGenerationSettings, DecodingMode) {
+    let mode = settings.decoding_mode.unwrap_or_default();
+    settings.decoding_mode = None;
+    (settings, mode)
 }
 
 fn failure(error: impl std::fmt::Display) -> GenerationForecastError {
@@ -127,8 +139,9 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
     where
         B: SpeculativeForecastBackend<D>,
     {
-        let mut forecast = self.forecast_input(&request.input, request.settings, options, false)?;
-        self.project_speculation(&mut forecast, &request.drafting, request.options, options)?;
+        let (settings, mode) = speculative_forecast_settings(request.settings);
+        let mut forecast = self.forecast_input(&request.input, settings, options, false)?;
+        self.project_speculation(&mut forecast, &request.drafting, mode, options)?;
         Ok(forecast)
     }
 
@@ -139,14 +152,14 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         token_ids: &[u32],
         settings: PreparedChatGenerationSettings,
         drafting: &eredu_core::SpeculativeDraft<'_, D>,
-        speculative: PreparedChatSpeculativeGenerationOptions,
         options: &GenerationForecastOptions,
     ) -> Result<GenerationForecast, GenerationForecastError>
     where
         B: SpeculativeForecastBackend<D>,
     {
+        let (settings, mode) = speculative_forecast_settings(settings);
         let mut forecast = self.forecast_token_ids(token_ids, settings, options)?;
-        self.project_speculation(&mut forecast, drafting, speculative, options)?;
+        self.project_speculation(&mut forecast, drafting, mode, options)?;
         Ok(forecast)
     }
 
@@ -154,17 +167,39 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         &self,
         forecast: &mut GenerationForecast,
         drafting: &eredu_core::SpeculativeDraft<'_, D>,
-        speculative: PreparedChatSpeculativeGenerationOptions,
+        mode: DecodingMode,
         options: &GenerationForecastOptions,
     ) -> Result<(), GenerationForecastError>
     where
         B: SpeculativeForecastBackend<D>,
     {
-        speculative.scheduler.validate()?;
+        let speculative = match mode {
+            DecodingMode::SelfSpeculation(options) => options,
+            _ => SpeculationOptions::default(),
+        };
+        if let DecodingMode::SelfSpeculation(options) = mode {
+            let shared = matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone)
+                || matches!(drafting, eredu_core::SpeculativeDraft::Target) && B::decoding_capabilities(&self.runtime).speculation;
+            if !shared && (options.request().draft_adapter || options.request().refinement.is_some()) {
+                return Err(failure("masked refinement and draft adapters require a shared-backbone source"));
+            }
+        }
         let Some(profile) = B::speculative_memory_profile(&self.runtime, drafting)? else {
             return mark_speculative_forecast(forecast);
         };
-        if speculative.max_draft_tokens.get() as u64 > profile.proposal_capacity {
+        self.project_speculation_profile(forecast, profile, B::speculative_target_memory_profile(&self.runtime)?, speculative, mode, options)
+    }
+
+    fn project_speculation_profile(
+        &self,
+        forecast: &mut GenerationForecast,
+        profile: eredu_runtime::memory_forecast::SpeculativeMemoryProfile,
+        target_profile: LoadedMemoryProfile,
+        speculative: SpeculationOptions,
+        mode: DecodingMode,
+        options: &GenerationForecastOptions,
+    ) -> Result<(), GenerationForecastError> {
+        if matches!(mode, DecodingMode::SelfSpeculation(_)) && speculative.request().max_draft_tokens.get() as u64 > profile.proposal_capacity {
             return Err(failure(
                 "forecast proposal width exceeds the selected drafter capacity",
             ));
@@ -178,7 +213,7 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         // Speculative lanes have isolated target state, even if an unrelated
         // ordinary session has advanced. Observe that exact lane selection.
         let target = loaded_forecast(
-            B::speculative_target_memory_profile(&self.runtime)?,
+            target_profile,
             forecast.request.input,
             forecast
                 .request
@@ -242,14 +277,21 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
             );
         }
         forecast.speculative = Some(SpeculativeMemoryPlan {
+            shared_backbone: profile.shared_backbone.map(|mut shared| { if !matches!(mode, DecodingMode::SelfSpeculation(options) if options.request().draft_adapter) { shared.adapter = None; } shared }),
             embedded,
             draft: draft.map(|f| f.request),
             auxiliary_bytes_per_position: profile.auxiliary_bytes_per_position,
             sampling_bytes_per_vocabulary_entry: profile.sampling_bytes_per_vocabulary_entry,
-            max_draft_tokens: speculative.max_draft_tokens.get() as u64,
-            scheduler: speculative.scheduler,
+            max_draft_tokens: if matches!(mode, DecodingMode::SelfSpeculation(_)) { speculative.request().max_draft_tokens.get() as u64 } else { 0 },
+            scheduler: eredu_core::GenerationRequestConfig { decoding_mode: mode, ..Default::default() }.scheduler_options(speculative.request().scheduler),
             shared_allocator: profile.shared_allocator,
         });
+        if let DecodingMode::Diffusion { policy } = mode {
+            match B::refinement_memory_plan(&self.runtime, policy)? {
+                Some(plan) => forecast.refinement = Some(plan),
+                None => mark_specialized(forecast, "complete refinement invocation and finalization storage is not projected")?,
+            }
+        }
         forecast.reestimate()
     }
 
@@ -360,14 +402,21 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         let (_, output) = self.resolve_text_generation_settings(settings)?;
         let profile = B::loaded_memory_profile(&self.runtime)?;
         let contract = B::forecast_execution_contract(&self.runtime, prompt, instrumented);
-        loaded_forecast(
-            profile,
-            input,
-            output.get() as u64,
-            settings.prefill,
-            contract,
-            options,
-        )
+        let target_profile = profile.clone();
+        let mut forecast = loaded_forecast(profile, input, output.get() as u64, settings.prefill, contract, options)?;
+        if let Some(DecodingMode::SelfSpeculation(speculative)) = settings.decoding_mode {
+            match B::shared_backbone_memory_profile(&self.runtime)? {
+                Some(profile) => self.project_speculation_profile(&mut forecast, profile, target_profile, speculative, DecodingMode::SelfSpeculation(speculative), options)?,
+                None => mark_speculative_forecast(&mut forecast)?,
+            }
+        } else if matches!(settings.decoding_mode.unwrap_or_else(|| B::default_decoding_mode(&self.runtime)), DecodingMode::Diffusion { .. }) {
+            let policy = match settings.decoding_mode { Some(DecodingMode::Diffusion { policy }) => policy, _ => None };
+            match B::refinement_memory_plan(&self.runtime, policy)? {
+                Some(plan) => { forecast.refinement = Some(plan); forecast.reestimate()?; }
+                None => mark_specialized(&mut forecast, "complete refinement invocation and finalization storage is not projected")?,
+            }
+        }
+        Ok(forecast)
     }
 }
 
@@ -388,6 +437,7 @@ fn mark_specialized(
 ) -> Result<(), GenerationForecastError> {
     forecast.execution.full_pass_reason = Some(reason.into());
     forecast.speculative = None;
+    forecast.refinement = None;
     forecast.execution.logits = LogitsWorkspace::EveryPosition;
     forecast.request.prefill_chunk_tokens = forecast.request.input.model_positions.max(1);
     for domain in &mut forecast.request.domains {
@@ -421,6 +471,7 @@ pub(super) fn loaded_forecast(
     estimate.assumptions.extend(assumptions);
     estimate.assumptions.push("Loaded request: loading is excluded; only declared resident parameter bytes are deducted, never process-global active allocation counters.".into());
     Ok(GenerationForecast {
+        refinement: None,
         capture: None,
         speculative: None,
         request,
@@ -482,6 +533,7 @@ pub fn forecast_inspected_generation(
     Ok(GenerationForecast {
         capture: None,
         speculative: None,
+        refinement: None,
         request,
         estimate,
         execution,

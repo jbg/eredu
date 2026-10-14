@@ -61,8 +61,15 @@ impl ModelConfigurationResolver for ModelConfigurations {
     fn gguf_companion_requirements(
         &self,
         architecture: &str,
-        _checkpoint: &GgufCheckpoint,
+        checkpoint: &GgufCheckpoint,
     ) -> Result<Vec<GgufCompanionRequirement>, ArtifactError> {
+        if matches!(architecture, "dream" | "mistral3" | "nemotron_labs_diffusion") {
+            let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+                .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
+            if admitted.config().vision.is_none() { return Ok(Vec::new()); }
+            return GgufCompanionRequirement::new(GgufCompanionRole::MediaProjector, false,
+                "mmproj", 1, GgufCompanionEncoding::DenseRequired).map(|requirement| vec![requirement]);
+        }
         gguf_companion_requirements(GgufArchitecture::resolve(architecture)?)
     }
 
@@ -234,6 +241,8 @@ pub enum ModelKind {
     Lfm2,
     /// Nemotron-H hybrid architecture.
     NemotronH,
+    /// Nemotron-Labs-Diffusion shared text backbone and optional Pixtral context.
+    NemotronLabsDiffusion,
     /// Moshi-family realtime speech architecture, including PersonaPlex.
     Moshi,
     /// NemotronLabs VoiceChat coupled realtime speech architecture.
@@ -275,7 +284,7 @@ impl<'de> Deserialize<'de> for ModelKind {
 
 impl ModelKind {
     /// Every architecture family implemented by this crate.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::DeepSeekV3,
         Self::DeepSeekV4,
         Self::DiffusionGemma,
@@ -290,6 +299,7 @@ impl ModelKind {
         Self::MuseGlimmer,
         Self::Lfm2,
         Self::NemotronH,
+        Self::NemotronLabsDiffusion,
         Self::Moshi,
         Self::VoiceChat,
         Self::Qwen2,
@@ -318,6 +328,7 @@ impl ModelKind {
             Self::MuseGlimmer => "muse_glimmer",
             Self::Lfm2 => "lfm2",
             Self::NemotronH => "nemotron_h",
+            Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
             Self::Moshi => "moshi",
             Self::VoiceChat => "nemotron_voicechat",
             Self::Qwen2 => "qwen2",
@@ -370,6 +381,7 @@ impl ModelKind {
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
+            "nemotron_labs_diffusion" | "nemotron_labs_diffusion_vlm" => Ok(Self::NemotronLabsDiffusion),
             "moshi" | "personaplex" => Ok(Self::Moshi),
             "nemotron_voicechat" => Ok(Self::VoiceChat),
             "qwen2" => Ok(Self::Qwen2),
@@ -388,6 +400,8 @@ impl ModelKind {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GgufArchitecture {
+    /// Content-backed Nemotron-Labs-Diffusion conversions.
+    NemotronLabsDiffusion,
     /// `k2-horizon`.
     K2Horizon,
     /// `kimi-linear`.
@@ -448,6 +462,7 @@ impl GgufArchitecture {
     /// Resolves `general.architecture` through the architecture registry.
     pub fn resolve(name: &str) -> Result<Self, ArtifactError> {
         match name {
+            "nemotron_labs_diffusion" => Ok(Self::NemotronLabsDiffusion),
             "k2-horizon" => Ok(Self::K2Horizon),
             "kimi-linear" => Ok(Self::KimiLinear),
             "deepseek2" => Ok(Self::DeepSeek2),
@@ -482,6 +497,7 @@ impl GgufArchitecture {
     /// General model family implemented by this GGUF architecture.
     pub const fn model_kind(self) -> ModelKind {
         match self {
+            Self::NemotronLabsDiffusion => ModelKind::NemotronLabsDiffusion,
             Self::K2Horizon => ModelKind::K2Horizon,
             Self::KimiLinear => ModelKind::KimiLinear,
             Self::DeepSeek2 => ModelKind::DeepSeekV3,
@@ -510,6 +526,7 @@ impl GgufArchitecture {
     /// Exact metadata spelling.
     pub const fn metadata_name(self) -> &'static str {
         match self {
+            Self::NemotronLabsDiffusion => "nemotron_labs_diffusion",
             Self::K2Horizon => "k2-horizon",
             Self::KimiLinear => "kimi-linear",
             Self::DeepSeek2 => "deepseek2",
@@ -545,8 +562,18 @@ fn resolve_gguf_configuration(
     name: &str,
     checkpoint: &GgufCheckpoint,
 ) -> Result<(ModelConfiguration, GgufArchitecturePlan), ArtifactError> {
-    let architecture = GgufArchitecture::resolve(name)?;
-    let plan = resolve_gguf_architecture(architecture, checkpoint)?;
+    let (architecture, plan) = if matches!(name, "dream" | "mistral3" | "nemotron_labs_diffusion") {
+        let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+            .map_err(|error| ArtifactError::InvalidArtifact(error.to_string()))?;
+        let architecture = GgufArchitecture::NemotronLabsDiffusion;
+        let plan = GgufArchitecturePlan::new(architecture,
+            GgufModelConfig::NemotronLabsDiffusion(admitted.clone()),
+            admitted.checkpoint().clone(), admitted.mapping().to_vec());
+        (architecture, plan)
+    } else {
+        let architecture = GgufArchitecture::resolve(name)?;
+        (architecture, resolve_gguf_architecture(architecture, checkpoint)?)
+    };
     Ok((
         ModelConfiguration::new(
             name,
@@ -699,6 +726,8 @@ fn invalid_configuration(kind: ModelKind, error: impl std::fmt::Display) -> Arti
 /// Typed, normalized family configuration retained from SafeTensors admission.
 #[derive(Debug, Clone)]
 pub enum SafetensorsModelConfig {
+    /// Exact shared-backbone and optional Pixtral geometry.
+    NemotronLabsDiffusion(crate::nemotron_labs_diffusion::FamilyConfig),
     /// DeepSeek-V3/R1 family geometry.
     DeepSeekV3(crate::deepseek::V3Args),
     /// DeepSeek-V4 family geometry.
@@ -758,6 +787,8 @@ pub struct SafetensorsArchitecturePlan {
 /// Typed, normalized family configuration retained from GGUF admission.
 #[derive(Debug, Clone)]
 pub enum GgufModelConfig {
+    /// Pinned normalized text conversion and its already-open source projection.
+    NemotronLabsDiffusion(crate::nemotron_labs_diffusion::gguf::TextGgufPlan),
     /// DeepSeek-V3/R1 family geometry.
     DeepSeekV3(crate::deepseek::V3Args),
     /// DeepSeek-V4 family geometry.
@@ -809,6 +840,7 @@ impl SafetensorsModelConfig {
             Self::K2Horizon(args) => args.is_moe(),
             Self::KimiLinear(args) => args.num_experts > 0,
             Self::Gemma2(_)
+            | Self::NemotronLabsDiffusion(_)
             | Self::Llama(_)
             | Self::Nanbeige(_)
             | Self::Moshi(_)
@@ -828,6 +860,7 @@ impl GgufModelConfig {
     /// Whether this exact normalized configuration constructs grouped routed experts.
     pub fn uses_grouped_routed_experts(&self) -> bool {
         match self {
+            Self::NemotronLabsDiffusion(_) => false,
             Self::DeepSeekV3(args) => args.n_routed_experts > 0,
             Self::DeepSeekV4(args) => args.n_routed_experts > 0,
             Self::DiffusionGemma(args) => matches!(args.text.num_experts, Some(count) if count > 0),
@@ -857,6 +890,14 @@ pub struct GgufArchitecturePlan {
 }
 
 impl GgufArchitecturePlan {
+    pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
+        match &mut self.model {
+            GgufModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
+            _ => return Err("draft-only low-rank parameters require a shared-backbone family".into()),
+        }
+        Ok(self)
+    }
+
     /// Retained complete Flash-Next header admission.
     pub fn qwen4_exp_target_plan(&self) -> Option<&crate::qwen4_exp::prepared::GgufTargetPlan> {
         match &self.model {
@@ -885,6 +926,7 @@ impl GgufArchitecturePlan {
         admitted: &'a eredu_gguf::Checkpoint,
     ) -> &'a eredu_gguf::Checkpoint {
         match &self.model {
+            GgufModelConfig::NemotronLabsDiffusion(plan) => plan.prepared_checkpoint(),
             GgufModelConfig::Qwen4Exp(plan) => plan.text_plan().checkpoint(),
             _ => admitted,
         }
@@ -917,6 +959,14 @@ impl GgufArchitecturePlan {
 }
 
 impl SafetensorsArchitecturePlan {
+    pub(crate) fn with_draft_adapter(mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<Self, String> {
+        match &mut self.model {
+            SafetensorsModelConfig::NemotronLabsDiffusion(plan) => *plan = plan.clone().with_draft_adapter(adapter),
+            _ => return Err("draft-only low-rank parameters require a shared-backbone family".into()),
+        }
+        Ok(self)
+    }
+
     /// Complete Flash-Next header, available only after catalog admission.
     pub fn qwen4_exp_target_plan(
         &self,
@@ -1429,6 +1479,9 @@ fn resolve_safetensors_architecture(
     kind: ModelKind,
 ) -> Result<SafetensorsArchitecturePlan, ArtifactError> {
     let model = match kind {
+        ModelKind::NemotronLabsDiffusion => crate::nemotron_labs_diffusion::FamilyConfig::from_hf_value(json)
+            .map(SafetensorsModelConfig::NemotronLabsDiffusion)
+            .map_err(|error| invalid_configuration(kind, error)),
         ModelKind::DeepSeekV3 => crate::deepseek::parse_v3_config(json)
             .map(SafetensorsModelConfig::DeepSeekV3)
             .map_err(|error| invalid_configuration(kind, error)),
@@ -1515,6 +1568,8 @@ fn resolve_safetensors_architecture(
         }
     }?;
     let checkpoint = match &model {
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) => crate::nemotron_labs_diffusion::safetensors_plan(args)
+            .map_err(|error| invalid_configuration(kind, error))?,
         SafetensorsModelConfig::Qwen4Exp(config, encoding) => {
             crate::qwen4_exp::checkpoint::schema::safetensors_config_plan(config, encoding)
                 .map_err(|error| invalid_configuration(kind, error))?

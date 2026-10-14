@@ -72,6 +72,7 @@ fn generate(
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(prepared),
             settings: PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -124,6 +125,7 @@ fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
     calls.borrow_mut().scripted_tokens = [166105].into();
     let mut events = Vec::new();
     let result = model.generate_prepared_chat(PreparedChatGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::rendered_prompt(&prepared),
         settings: PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {

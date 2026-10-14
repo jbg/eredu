@@ -1,0 +1,135 @@
+[
+  {
+    "repo": "yury-kapoyko/nemotron-diff-vlm-8b-fp8",
+    "revision": "f56d4af962fa95ee22ea43b22d91fb7c9d2652f8",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-VLM-8B",
+    "base_revision": "adca93d16471c1e07d594ae444d23e1876f6b365",
+    "assets": [
+      {
+        "path": "config.json",
+        "size": 4013,
+        "algorithm": "sha256",
+        "digest": "eb36684ad9fea1e3bac502c0d3374205363e472eecc2e559d17f6c3eb4456d9a"
+      },
+      {
+        "path": "README.md",
+        "size": 1214,
+        "algorithm": "sha256",
+        "digest": "748d1804097cd4978bdd3170e897afba895c7f86340b4215c6d8dd6b792011ce"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "size": 71653,
+        "algorithm": "sha256",
+        "digest": "2083528797b88d207371b11bf53ef3330d9cc54dde1d59f37bf615a09cec7d81"
+      }
+    ],
+    "weight_files": [
+      {
+        "rfilename": "model-00001-of-00002.safetensors",
+        "blobId": "5d720ce7d4ee579bf615a4b267f0e09a8103c52c",
+        "size": 9346883184,
+        "lfs": {
+          "sha256": "c157823fb451f0f66d1d90268226eea61270ca5376aef84266dd3226b7a7f012",
+          "size": 9346883184,
+          "pointerSize": 135
+        }
+      },
+      {
+        "rfilename": "model-00002-of-00002.safetensors",
+        "blobId": "53bccd47442eecc3d1fb70fe119533c7c96bdb95",
+        "size": 1073750152,
+        "lfs": {
+          "sha256": "0b724124f6497ba612ff524a8c86804681773d85001c60687b6128c566d5d80a",
+          "size": 1073750152,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "reference_tool": {
+      "repo": "NVIDIA/Model-Optimizer",
+      "tag": "0.45.0",
+      "revision": "ec87a82927d003986d44fb7f4fa8b3d10c31b095"
+    },
+    "reference_export_sha256": "804093fc8118f251c153d4b3962ff17abded2cbff00f4cb8e9466fa416735e15",
+    "reference_quant_utils_sha256": "e42e1143a78b37fbb16b2103ed85cb60426b5fb36949268f07c986d91975548a"
+  },
+  {
+    "repo": "yury-kapoyko/nemotron-diff-vlm-8b-int4_w4a16",
+    "revision": "47b042afc4825327d79612e0cd899762582701a6",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-VLM-8B",
+    "base_revision": "adca93d16471c1e07d594ae444d23e1876f6b365",
+    "assets": [
+      {
+        "path": "config.json",
+        "size": 4267,
+        "algorithm": "sha256",
+        "digest": "d54e29b262335e31f1dc639b4b334d5cd58d28773ae1e76898dd0db0042de3e7"
+      },
+      {
+        "path": "README.md",
+        "size": 2182,
+        "algorithm": "sha256",
+        "digest": "5da392b5cf33380c35894d04a2b5688286358c59f532ef642f04c2ea8f2ade09"
+      }
+    ],
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "3915f60a05c133755b3168389641d65ed9f89d50",
+        "size": 6945922832,
+        "lfs": {
+          "sha256": "413a3a36af9a408d2d84bc65d50a8dde1d59355b2ffc39ba2e6d3f6100784470",
+          "size": 6945922832,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "reference_tool": {
+      "repo": "NVIDIA/Model-Optimizer",
+      "tag": "0.45.0",
+      "revision": "ec87a82927d003986d44fb7f4fa8b3d10c31b095"
+    },
+    "reference_export_sha256": "804093fc8118f251c153d4b3962ff17abded2cbff00f4cb8e9466fa416735e15",
+    "reference_quant_utils_sha256": "e42e1143a78b37fbb16b2103ed85cb60426b5fb36949268f07c986d91975548a"
+  },
+  {
+    "repo": "yury-kapoyko/nemotron-diff-vlm-8b-w4a8_awq",
+    "revision": "9da4800d374c149b13497074977c724b5d05b20f",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-VLM-8B",
+    "base_revision": "adca93d16471c1e07d594ae444d23e1876f6b365",
+    "assets": [
+      {
+        "path": "config.json",
+        "size": 4334,
+        "algorithm": "sha256",
+        "digest": "32724c68e7c06b0a48d1ff9b902704a1483b4553814d6638add3a124ed65da85"
+      },
+      {
+        "path": "README.md",
+        "size": 1267,
+        "algorithm": "sha256",
+        "digest": "402c67cac22687daff1dfb154c6571f82cea72f3918110462e26a0cec62514be"
+      }
+    ],
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "671b87f2b0ce3cce9d7c3731df54b667df961f9d",
+        "size": 6945922832,
+        "lfs": {
+          "sha256": "6675f511705681dc8a19da2b9761b2022a5e321d1fcc94943c3b38d36c545e5c",
+          "size": 6945922832,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "reference_tool": {
+      "repo": "NVIDIA/Model-Optimizer",
+      "tag": "0.45.0",
+      "revision": "ec87a82927d003986d44fb7f4fa8b3d10c31b095"
+    },
+    "reference_export_sha256": "804093fc8118f251c153d4b3962ff17abded2cbff00f4cb8e9466fa416735e15",
+    "reference_quant_utils_sha256": "e42e1143a78b37fbb16b2103ed85cb60426b5fb36949268f07c986d91975548a"
+  }
+]

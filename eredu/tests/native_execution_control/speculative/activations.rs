@@ -67,10 +67,15 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             ..Default::default()
         };
         let request = || PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, vec![1, 2, 5]),
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings,
-            options: generation,
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    generation,
+                )),
+                ..settings
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},

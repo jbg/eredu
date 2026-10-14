@@ -178,6 +178,7 @@ pub struct NormalizedLoadRequest {
     prompt_cache_persistence: bool,
     drafting: DraftingLoadRequest,
     prediction_source: Option<std::path::PathBuf>,
+    draft_adapter: Option<eredu_core::DraftAdapterSource>,
     media_execution: crate::MediaLoadRequest,
     bounded_execution: Option<crate::BoundedExecutionPolicy>,
 }
@@ -382,6 +383,16 @@ impl NormalizedLoadRequest {
     }
 
     /// Supplies the separate artifact for an embedded prediction extension.
+    /// Retains separately stored shared-backbone draft parameters for cold admission.
+    pub fn with_draft_adapter(mut self, source: eredu_core::DraftAdapterSource) -> Self {
+        self.draft_adapter = Some(source);
+        self
+    }
+    /// Optional draft-only adapter source, distinct from prediction heads.
+    pub fn draft_adapter(&self) -> Option<&eredu_core::DraftAdapterSource> {
+        self.draft_adapter.as_ref()
+    }
+
     /// Architecture preparation validates its format and compatibility with the target.
     pub fn with_prediction_source(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.prediction_source = Some(path.into());

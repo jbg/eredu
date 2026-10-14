@@ -1,11 +1,14 @@
 //! Ordinary explicit prediction admission through native typed construction.
 use super::*;
 use crate::composition::mlx::{
-    prepared_speculative::{MlxEmbeddedExecutorContinuation, MlxEmbeddedExecutorTypes},
+    prepared_speculative::{MlxEmbeddedExecutorContinuation, MlxGenerationExecutorTypes},
     speculative::SpeculativeExecutionStreams,
     MlxModelInput,
 };
 use eredu_core::SpeculativeExecutor;
+
+#[path = "qwen4_exp_prediction_modes.rs"]
+mod modes;
 
 struct Probe<'a> {
     stream: &'a Stream,
@@ -18,9 +21,9 @@ impl MlxEmbeddedExecutorContinuation for Probe<'_> {
     fn execute(
         &mut self,
         selected: &eredu_runtime::SelectedSpeculativeRealization,
-        executor: &mut eredu_architectures::speculative_execution::DynEmbeddedExecutor<
+        executor: &mut eredu_core::speculative::DynGenerationExecutor<
             '_,
-            MlxEmbeddedExecutorTypes,
+            MlxGenerationExecutorTypes,
         >,
     ) -> Result<eredu_core::SpeculativeGenerationBatchOutput, Error> {
         assert_eq!(
@@ -39,7 +42,7 @@ impl MlxEmbeddedExecutorContinuation for Probe<'_> {
             .cache_identity(format!("miniature-qwen4-prediction-{:?}", self.prompt))
             .unwrap();
         let input = MlxModelInput::from(input::ModelInput::with_cache_identity(parts, &identity));
-        let mut cache = executor.new_cache()?;
+        let mut cache = executor.new_cache(streams)?;
         let (logits, state, evaluated) = executor.prefill(input, &mut cache, streams)?.into_parts();
         assert_eq!(evaluated, positions);
         self.logits = last_logits(logits);
@@ -49,15 +52,25 @@ impl MlxEmbeddedExecutorContinuation for Probe<'_> {
             .map_err(|e| Error::ArchitectureModel(e.to_string()))?
             .expect("selected snapshot mechanism");
         let mut draft = executor.begin_proposal(&state, 7, 1, streams)?;
-        self.draft = last_logits(executor.proposal_logits(&mut draft, 7, streams)?);
+        let eredu_core::SpeculativeProposalStep::CausalLogits(logits) =
+            executor.proposal_step(&mut draft, 7, streams)?
+        else {
+            panic!("embedded head must return causal logits")
+        };
+        self.draft = last_logits(logits);
         assert!(self.draft.iter().any(|v| v.abs() > 1e-5));
         let restored = executor
             .restore_control_snapshot(&mut cache, &saved, &saved_state, streams)
             .map_err(|e| Error::ArchitectureModel(e.to_string()))?
             .expect("selected restore mechanism");
         let mut replay = executor.begin_proposal(&restored, 7, 1, streams)?;
+        let eredu_core::SpeculativeProposalStep::CausalLogits(logits) =
+            executor.proposal_step(&mut replay, 7, streams)?
+        else {
+            panic!("embedded head must return causal logits")
+        };
         close(
-            &last_logits(executor.proposal_logits(&mut replay, 7, streams)?),
+            &last_logits(logits),
             &self.draft,
             "native prediction snapshot replay",
         );

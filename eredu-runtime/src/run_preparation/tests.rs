@@ -516,3 +516,64 @@ fn speculative_scheduler_exchange_failures_are_confirmed_before_return() {
         });
     }
 }
+
+#[test]
+fn decoding_commands_reach_every_rank_and_cancellation_wins_without_refunding_transport() {
+    use eredu_core::decoding::{DecodingCoordination, DecodingMode, SpeculationOptions};
+    let modes = [DecodingMode::Autoregressive, DecodingMode::Diffusion { policy: None },
+        DecodingMode::SelfSpeculation(SpeculationOptions::default())];
+    ranks(Fault::None, |rank, transport, owner| {
+        let mut position = 0;
+        for active in modes {
+            for pending in modes.into_iter().filter(|mode| *mode != active) {
+                let local = DecodingCoordination { active, pending: (rank == 1).then_some(pending),
+                    cancelled: false, committed_position: position, remaining_tokens: Some(37) };
+                let agreed = owner.coordinate_decoding_control(transport, local).unwrap();
+                assert_eq!(agreed.pending, Some(pending));
+                assert_eq!(agreed.committed_position, position);
+                position += 1;
+            }
+        }
+        let before = owner.usage().unwrap();
+        let local = DecodingCoordination { active: modes[0], pending: Some(modes[rank+1]),
+            cancelled: rank == 0, committed_position: position, remaining_tokens: Some(1) };
+        let agreed = owner.coordinate_decoding_control(transport, local).unwrap();
+        assert!(agreed.cancelled);
+        assert_eq!(agreed.pending, None, "cancellation discards conflicting prospective commands");
+        assert!(owner.usage().unwrap().host_bytes > before.host_bytes);
+        assert!(!transport.fenced.load(Ordering::SeqCst));
+    });
+}
+
+#[test]
+fn conflicting_decoding_commands_reject_without_model_work_and_allow_corrected_retry() {
+    use eredu_core::decoding::{DecodingCoordination, DecodingMode, SpeculationOptions};
+    ranks(Fault::None, |rank, transport, owner| {
+        let local = DecodingCoordination { active: DecodingMode::Autoregressive,
+            pending: Some(if rank == 0 { DecodingMode::Diffusion { policy: None } }
+                else { DecodingMode::SelfSpeculation(SpeculationOptions::default()) }),
+            cancelled: false, committed_position: 3, remaining_tokens: Some(8) };
+        assert!(matches!(owner.coordinate_decoding_control(transport, local),
+            Err(TextPreparationAgreementError::Decoding(_))));
+        let spent = owner.usage().unwrap();
+        assert!(!transport.fenced.load(Ordering::SeqCst));
+        let corrected = DecodingCoordination { pending: Some(DecodingMode::Diffusion { policy: None }), ..local };
+        assert_eq!(owner.coordinate_decoding_control(transport, corrected).unwrap(), corrected);
+        assert!(owner.usage().unwrap().attempts > spent.attempts);
+    });
+}
+
+#[test]
+fn decoding_control_exchange_failures_are_confirmed_and_fence_before_model_work() {
+    use eredu_core::decoding::{DecodingCoordination, DecodingMode};
+    for fault in [Fault::Decode, Fault::Short, Fault::Wait, Fault::Deadline, Fault::Submit] {
+        ranks(fault, |_, transport, owner| {
+            let local = DecodingCoordination { active: DecodingMode::Autoregressive,
+                pending: None, cancelled: false, committed_position: 0, remaining_tokens: Some(7) };
+            assert!(owner.coordinate_decoding_control(transport, local).is_err());
+            assert!(transport.fenced.load(Ordering::SeqCst));
+            assert!(owner.usage().unwrap().attempts > 0);
+            assert!(owner.coordinate_decoding_control(transport, local).is_err());
+        });
+    }
+}

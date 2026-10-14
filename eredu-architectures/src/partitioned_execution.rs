@@ -2,6 +2,7 @@
 
 mod deepseek_dense;
 mod diffusion;
+mod nemotron_labs_diffusion;
 #[path = "partitioned_parameters.rs"]
 mod parameter_access;
 pub(crate) mod qwen4_exp;
@@ -626,7 +627,6 @@ where
     architecture: crate::composite_execution::PreparedCompositeArchitecture<A>,
     policy: P,
     units: Vec<Vec<(usize, eredu_runtime::ExecutionUnitAddress)>>,
-    group_kinds: Vec<ArchitectureGroupKind>,
     primary_group: usize,
     global_state_offset: usize,
     parallel: Option<B::ParallelContext>,
@@ -647,7 +647,6 @@ where
 /// binding cannot reinterpret them.
 pub(crate) struct PreparedCompositeExecutorStructure {
     units: Vec<Vec<(usize, eredu_runtime::ExecutionUnitAddress)>>,
-    group_kinds: Vec<ArchitectureGroupKind>,
     primary_group: usize,
     global_state_offset: usize,
     tensor_group: Option<eredu_core::CollectiveGroupId>,
@@ -703,7 +702,6 @@ impl PreparedCompositeExecutorStructure {
         }
         Ok(Self {
             units,
-            group_kinds,
             primary_group,
             global_state_offset: partition
                 .state()
@@ -799,7 +797,6 @@ where
             ),
             policy,
             units: prepared.units,
-            group_kinds: prepared.group_kinds,
             primary_group: prepared.primary_group,
             global_state_offset: prepared.global_state_offset,
             parallel: parallel.filter(|parallel| B::parallel_size(parallel) > 1),
@@ -861,7 +858,6 @@ where
             ),
             policy,
             units,
-            group_kinds,
             primary_group,
             global_state_offset,
             parallel: parallel.filter(|parallel| B::parallel_size(parallel) > 1),
@@ -914,6 +910,7 @@ where
     group_activity: Vec<bool>,
     group_boundary_sequences: Vec<i32>,
     group_continuation_geometry: Vec<Option<(i32, i32)>>,
+    group_wave_stages: Vec<Vec<usize>>,
     group_collective_waves:
         Vec<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>>,
     primary_ingress_collectives: Option<Vec<crate::composite_execution::CompositeTensorCollective>>,
@@ -1052,6 +1049,17 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let tensor_partitions = self.parallel.as_ref().map_or(1, B::parallel_size);
+        let graph = eredu_runtime::LayeredArchitecture::execution_graph(&self.architecture)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let counts = (0..self.units.len()).map(|group|
+            eredu_runtime::LayeredArchitecture::group_unit_count(&self.architecture, group))
+            .collect::<Result<Vec<_>, _>>().map_err(eredu_nn::Error::backend_source)?;
+        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
+            .map_err(eredu_nn::Error::backend_source)?;
+        let transports = (0..self.units.len()).map(|group|
+            eredu_runtime::LayeredArchitecture::group_transport(&self.architecture, group)).collect::<Vec<_>>();
+        let owners = pipeline_group_owners(&graph, &layout, &transports, self.pipeline_stages)
+            .map_err(eredu_nn::Error::backend)?;
         let group_collective_waves = (0..self.units.len())
             .map(|group| {
                 let waves = self
@@ -1061,7 +1069,9 @@ where
                         group,
                         input,
                         tensor_partitions,
-                        self.pipeline_stages,
+                        &(0..self.pipeline_stages).map(|stage| owners[group].iter()
+                            .find(|(owner, _)| *owner == stage).map_or(0..0, |(_, range)| range.clone()))
+                            .collect::<Vec<_>>(),
                     )
                     .map_err(eredu_nn::Error::backend)?;
                 let requires_schedule = group != self.primary_group
@@ -1139,6 +1149,7 @@ where
             group_activity,
             group_boundary_sequences,
             group_continuation_geometry,
+            group_wave_stages: owners.iter().map(|owners| owners.iter().map(|(stage, _)| *stage).collect()).collect(),
             group_collective_waves,
             primary_ingress_collectives,
             batch_size,
@@ -1161,26 +1172,14 @@ where
         pass: &Self::Pass<'_>,
         group: usize,
     ) -> Result<bool, eredu_nn::Error> {
-        let active = match self.group_kinds.get(group).copied() {
-            Some(ArchitectureGroupKind::VisionEncoder | ArchitectureGroupKind::AudioEncoder) => {
-                pass.group_activity.get(group).copied().ok_or_else(|| {
-                    eredu_nn::Error::backend(
-                        "composite request has no activity decision for an optional group",
-                    )
-                })?
-            }
-            Some(_) => false,
-            None => {
-                return Err(eredu_nn::Error::backend(
-                    "composite request referenced an unknown execution group",
-                ));
-            }
-        };
-        Ok(active)
+        pass.group_activity.get(group).copied().ok_or_else(|| {
+            eredu_nn::Error::backend("composite request has no activity decision for the execution group")
+        })
     }
 
     fn has_cross_stage_collective_waves(&self) -> bool {
         self.unit_strategy.has_cross_stage_collective_waves()
+            || (self.parallel.is_some() && self.pipeline_stages > 1)
     }
 
     fn execute_pipeline_wave<
@@ -1209,7 +1208,8 @@ where
                 ));
             }
         }
-        if group != self.primary_group {
+        if group != self.primary_group || (!active && !self.unit_strategy.has_cross_stage_collective_waves()
+            && pass.group_collective_waves.get(group).is_some_and(Option::is_some)) {
             if active {
                 let driver =
                     driver.expect("active composite pipeline stage owns a partition driver");
@@ -1253,7 +1253,9 @@ where
             else {
                 return Ok(());
             };
-            let operations = waves.get(wave).ok_or_else(|| {
+            let stage = pass.group_wave_stages.get(group).and_then(|stages| stages.get(wave))
+                .ok_or_else(|| eredu_nn::Error::backend("composite wave has no retained pipeline owner"))?;
+            let operations = waves.get(*stage).ok_or_else(|| {
                 eredu_nn::Error::backend(
                     "composite inactive pipeline wave is outside its selected group schedule",
                 )
@@ -1266,22 +1268,35 @@ where
                     "composite group collective wave has no selected tensor group",
                 )
             })?;
-            let values = operations
-                .iter()
-                .map(|operation| match operation {
-                    crate::composite_execution::CompositeTensorCollective::Sum { shape } => {
-                        self.allocator.tensor_placeholder(
-                            shape,
-                            eredu_runtime::BoundaryTensorDtype::Activation,
-                            self.activation_dtype,
-                            context,
-                        )
+            let mut sums = Vec::new();
+            for operation in operations {
+                match operation {
+                    crate::composite_execution::CompositeTensorCollective::Sum { shape } => sums.push(
+                        self.allocator.tensor_placeholder(shape, eredu_runtime::BoundaryTensorDtype::Activation,
+                            self.activation_dtype, context)?),
+                    crate::composite_execution::CompositeTensorCollective::Gather { shape, counts, axis } => {
+                        if !sums.is_empty() {
+                            communication.all_reduce_sum_wave(std::mem::take(&mut sums), tensor_group, communication_executor)
+                                .map_err(eredu_nn::Error::backend_source)?;
+                        }
+                        let rank = communication.manifest().groups().iter().find(|group| group.id() == tensor_group)
+                            .and_then(|group| group.members().iter().position(|rank| *rank == communication.manifest().rank()))
+                            .ok_or_else(|| eredu_nn::Error::backend("gather wave has no retained tensor rank"))?;
+                        let mut local = shape.clone();
+                        *local.get_mut(*axis).ok_or_else(|| eredu_nn::Error::backend("collective gather axis is outside its shape"))? =
+                            i32::try_from(*counts.get(rank).ok_or_else(|| eredu_nn::Error::backend("collective gather has no rank count"))?)
+                                .map_err(eredu_nn::Error::backend)?;
+                        let value = self.allocator.tensor_placeholder(&local, eredu_runtime::BoundaryTensorDtype::Activation,
+                            self.activation_dtype, context)?;
+                        communication.all_gather_uneven(value, counts, *axis, tensor_group, communication_executor)
+                            .map_err(eredu_nn::Error::backend_source)?;
                     }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            communication
-                .all_reduce_sum_wave(values, tensor_group, communication_executor)
-                .map_err(eredu_nn::Error::backend_source)?;
+                }
+            }
+            if !sums.is_empty() {
+                communication.all_reduce_sum_wave(sums, tensor_group, communication_executor)
+                    .map_err(eredu_nn::Error::backend_source)?;
+            }
             return Ok(());
         }
         if active {
@@ -1425,7 +1440,7 @@ where
                 Some(parallel) => self
                     .architecture
                     .begin_forward_parallel(input, state, parallel, context),
-                None => self.architecture.begin_forward(input, state, context),
+                None => eredu_runtime::LayeredArchitecture::begin_forward(&mut self.architecture, input, state, context),
             }
             .map_err(eredu_nn::Error::backend_source)?;
             pass.forward = Some(forward);
@@ -1463,6 +1478,7 @@ where
                         &schema,
                         values,
                         &mut forward.context,
+                        context,
                     )
                     .map_err(eredu_nn::Error::backend_source)?;
                 pass.group_outputs[source_group] = Some(installed.unwrap_or(fallback));
@@ -1594,17 +1610,11 @@ where
                 .into_iter()
                 .filter_map(|dependency| {
                     let output = pass.group_outputs[dependency].as_ref();
-                    let required = match self.group_kinds.get(dependency).copied() {
-                        Some(
-                            ArchitectureGroupKind::VisionEncoder
-                            | ArchitectureGroupKind::AudioEncoder,
-                        ) => pass
-                            .group_activity
-                            .get(dependency)
-                            .copied()
-                            .unwrap_or(false),
-                        Some(_) | None => true,
-                    };
+                    // Invocation activity is architecture-owned for every
+                    // group, including a separate media projector. An inactive
+                    // producer contributes no new value during cached text
+                    // continuation or when features are already prepared.
+                    let required = pass.group_activity.get(dependency).copied().unwrap_or(true);
                     if required && output.is_none() {
                         return Some(Err(eredu_nn::Error::backend(
                             "composite group executed before its active dependency arrived",
@@ -1892,6 +1902,7 @@ where
                     schema,
                     &hidden,
                     &forward.context,
+                        context,
                 )
                 .map_err(eredu_nn::Error::backend_source)?
             {
@@ -2012,6 +2023,7 @@ where
         pass: &mut Self::Pass<'_>,
         route: &eredu_runtime::PartitionBoundaryRoute,
         values: Vec<B::Tensor>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), eredu_nn::Error> {
         let schema = self.route_schemas.get(&route.route).ok_or_else(|| {
             eredu_nn::Error::backend("composite route has no selected architecture schema")
@@ -2033,6 +2045,7 @@ where
                         schema,
                         std::iter::once(hidden).chain(values).collect(),
                         &mut forward.context,
+                        context,
                     )
                     .map_err(eredu_nn::Error::backend_source)?
                     .ok_or_else(|| {
@@ -2077,13 +2090,27 @@ where
 
     fn finish(
         &mut self,
-        pass: Self::Pass<'_>,
-        _state: &mut S,
+        mut pass: Self::Pass<'_>,
+        state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(B::Tensor, A::ForwardContext), eredu_nn::Error> {
-        let forward = pass.forward.ok_or_else(|| {
-            eredu_nn::Error::backend("composite partition executed no local group")
-        })?;
+        let forward = match pass.forward.take() {
+            Some(forward) => forward,
+            None => {
+                if self.units.iter().enumerate().any(|(group, units)|
+                    !units.is_empty() && pass.group_activity.get(group).copied().unwrap_or(true)) {
+                    return Err(eredu_nn::Error::backend("active composite partition executed no local group"));
+                }
+                // An inactive media-only owner still contributes publication and
+                // invocation metadata; it executes no layer or decoder cache work.
+                let input = pass.input.take().ok_or_else(||
+                    eredu_nn::Error::backend("inactive composite partition has no invocation input"))?;
+                match self.parallel.as_ref() {
+                    Some(parallel) => eredu_runtime::ParallelLayeredArchitecture::begin_forward_parallel(&mut self.architecture, input, state, parallel, context),
+                    None => eredu_runtime::LayeredArchitecture::begin_forward(&mut self.architecture, input, state, context),
+                }.map_err(eredu_nn::Error::backend_source)?
+            }
+        };
         let expected = pass.publication_shape;
         let output = match pass.final_output {
             Some(output) if output.shape() == expected => output,
@@ -2372,6 +2399,7 @@ where
         _pass: &mut Self::Pass<'_>,
         _route: &eredu_runtime::PartitionBoundaryRoute,
         _values: Vec<B::Tensor>,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), eredu_nn::Error> {
         Err(eredu_nn::Error::backend(
             "direct resident executor has no pipeline boundary",
@@ -3977,6 +4005,7 @@ where
         _pass: &mut Self::Pass<'_>,
         _route: &eredu_runtime::PartitionBoundaryRoute,
         _values: Vec<B::Tensor>,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), eredu_nn::Error> {
         Err(eredu_nn::Error::backend(
             "routed direct partition has no pipeline boundary",
@@ -4698,6 +4727,8 @@ where
                                 activation_dtype,
                                 context,
                             ),
+                            crate::composite_execution::CompositeTensorCollective::Gather { .. } =>
+                                Err(eredu_nn::Error::backend("vocabulary embedding ingress requires sums, not output gathers")),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     communication
@@ -5981,6 +6012,15 @@ fn composite_partitioned_state_layout(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "composite artifact has no normalized family configuration".to_owned())?;
     match config {
+        crate::replicated_text::CompositeConfig::NemotronLabsDiffusion(args) => {
+            let parameters = crate::nemotron_labs_diffusion::parallel::composite_parameter_description(args)
+                .map_err(|error| error.to_string())?;
+            let layout = derive_partitioned_local_layout(&parameters, rank)?;
+            let geometry = crate::decoder::partition_local_geometry(args, &layout, 0..crate::decoder::Config::num_hidden_layers(args) as usize)
+                .map_err(|error| error.to_string())?;
+            Ok(geometry.complete_state_layout().clone())
+        }
+
         crate::replicated_text::CompositeConfig::Diffusion(args) => {
             crate::diffusion_gemma::parallel::tensor_state_layout(args, rank)
                 .map_err(|error| error.to_string())
@@ -6109,6 +6149,12 @@ fn direct_partitioned_state_layout(
         (Some(crate::configuration::SafetensorsModelConfig::Gemma2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Gemma2(args))) => {
             dense_decoder_partitioned_state_layout(args, rank).map(Some)
+        }
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) => {
+            dense_decoder_partitioned_state_layout(args, rank).map(Some)
+        }
+        (None, Some(crate::configuration::GgufModelConfig::NemotronLabsDiffusion(plan))) => {
+            dense_decoder_partitioned_state_layout(plan.text_config(), rank).map(Some)
         }
         (Some(crate::configuration::SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Llama(args))) => {
@@ -6307,8 +6353,51 @@ fn communication_manifest(
 > {
     let topology = rank.topology();
     validate_pipeline_decoder_coverage(execution, topology)?;
+    if let Some(geometry) = execution.block_refinement() {
+        let maximum_sequence = boundary.primary().shape().get(1).copied()
+            .ok_or_else(|| "partitioned refinement has no sequence bound".to_owned())?;
+        if maximum_sequence < i32::try_from(geometry.canvas_length.get()).map_err(|_| "canvas length exceeds partition wire geometry")? {
+            return Err("partitioned invocation limits must cover the complete admitted refinement canvas".into());
+        }
+    }
     let activation_dtype = activation_tensor_dtype(activation_dtype)?;
+    // Wire encoding does not establish projection, embedding or readout
+    // arithmetic. Retain the actual selected floating parameter/recipe widths,
+    // together with F32 promotion, for native collectives over those values.
+    let mut collective_dtypes = vec![activation_dtype.clone(), TensorDtype::F32];
+    if let Some(dtype) = execution.floating_state_source() {
+        if matches!(dtype, TensorDtype::F16 | TensorDtype::Bf16 | TensorDtype::F32) { collective_dtypes.push(dtype.clone()); }
+    }
+    for parameter in execution.parameters().iter().chain(execution.auxiliary_parameters()) {
+        let dtype = execution.derived_recipe_outputs().get(parameter.name()).map(|m| m.dtype.clone())
+            .or_else(|| parameter.source_encoding().and_then(|encoding| encoding.scalar_dtype()).map(Into::into));
+        match dtype {
+            Some(eredu_checkpoint::recipe::RecipeDtype::F16) => collective_dtypes.push(TensorDtype::F16),
+            Some(eredu_checkpoint::recipe::RecipeDtype::BF16) => collective_dtypes.push(TensorDtype::Bf16),
+            _ => {},
+        }
+    }
+    collective_dtypes = collective_dtypes.into_iter().fold(Vec::new(), |mut dtypes, dtype| { if !dtypes.contains(&dtype) { dtypes.push(dtype); } dtypes });
     let primary_elements = tensor_elements(boundary.primary().shape())?;
+    // Media TP reductions retain native encoder positions and width, which
+    // may exceed both the projected decoder sequence and the decoder width.
+    let mut reduction_elements = primary_elements;
+    if let Some(composite) = composite {
+        for (group, transport) in execution.group_transports().iter().enumerate() {
+            if transport.parallel_subgroup != Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded) { continue; }
+            let units = execution.execution_units().group_range(group)
+                .ok_or("tensor-sharded group has no unit geometry")?.len();
+            for unit in 0..units {
+                if let Some((schema, sequence)) = composite.partition_boundaries()
+                    .resolve(group, group, unit, units, boundary.primary().shape()[1])? {
+                    let resolved = schema.resolve(boundary.primary().shape()[0], sequence)
+                        .map_err(|error| error.to_string())?;
+                    reduction_elements = reduction_elements.max(tensor_elements(resolved.primary().shape())?);
+                }
+            }
+        }
+    }
+
     let mut plan = TopologyCommunicationPlan::new().with_completion_policy(completion_policy);
 
     if topology.pipeline() > 1 || topology.expert() > 1 {
@@ -6318,11 +6407,7 @@ fn communication_manifest(
             .map_or(complete_logit_elements, |(_, elements)| {
                 elements.max(complete_logit_elements)
             });
-        let publication_dtypes = if activation_dtype == TensorDtype::F32 {
-            vec![TensorDtype::F32]
-        } else {
-            vec![activation_dtype.clone(), TensorDtype::F32]
-        };
+        let publication_dtypes = collective_dtypes.clone();
         let publication = CommunicationOperationRequirement::tensors(
             CommunicationOperation::Broadcast,
             publication_dtypes,
@@ -6365,7 +6450,7 @@ fn communication_manifest(
                     .ok_or_else(|| "tensor reduction has no limits".to_owned())
             })
             .transpose()?;
-        let mut reduction_dtypes = vec![activation_dtype.clone()];
+        let mut reduction_dtypes = collective_dtypes.clone();
         if let Some(requirement) = additional_tensor_reduction {
             for dtype in requirement.dtypes() {
                 if !reduction_dtypes.contains(dtype) {
@@ -6383,15 +6468,15 @@ fn communication_manifest(
                         .max_tensor_rank()
                         .max(boundary.primary().shape().len())
                 }),
-                additional_limits.map_or(primary_elements, |limits| {
-                    limits.max_tensor_elements().max(primary_elements)
+                additional_limits.map_or(reduction_elements, |limits| {
+                    limits.max_tensor_elements().max(reduction_elements)
                 }),
                 None,
             )
             .and_then(|limits| {
                 limits.with_output_tensor_elements(
-                    additional_limits.map_or(primary_elements, |extra| {
-                        extra.max_output_tensor_elements().max(primary_elements)
+                    additional_limits.map_or(reduction_elements, |extra| {
+                        extra.max_output_tensor_elements().max(reduction_elements)
                     }),
                 )
             })
@@ -6401,7 +6486,7 @@ fn communication_manifest(
         .map_err(|error| error.to_string())?;
         let gather = CommunicationOperationRequirement::tensors(
             CommunicationOperation::AllGatherUneven,
-            [activation_dtype.clone()],
+            collective_dtypes.clone(),
             CommunicationTensorLimits::new(1, 3, local_logit_elements, None)
                 .and_then(|limits| limits.with_output_tensor_elements(complete_logit_elements))
                 .map_err(|error| error.to_string())?,
@@ -6422,11 +6507,7 @@ fn communication_manifest(
                 .map_or(complete_logit_elements, |(_, elements)| {
                     elements.max(complete_logit_elements)
                 });
-            let publication_dtypes = if activation_dtype == TensorDtype::F32 {
-                vec![TensorDtype::F32]
-            } else {
-                vec![activation_dtype.clone(), TensorDtype::F32]
-            };
+            let publication_dtypes = collective_dtypes.clone();
             let publication = CommunicationOperationRequirement::tensors(
                 CommunicationOperation::Broadcast,
                 publication_dtypes,
@@ -6837,6 +6918,9 @@ fn pipeline_routes(
                     requirement.clone(),
                 )
                 .and_then(|route| route.with_boundary_contract(boundary_contract.clone()))
+                .map(|route| if topology.pipeline() > 2 && topology.tensor() > 1 {
+                    route.with_world_broadcast()
+                } else { route })
                 .map_err(|error| error.to_string())?,
             );
             selected.push(SelectedPartitionBoundaryRoute {
@@ -6868,18 +6952,7 @@ fn semantic_pipeline_routes(
     transports: &[eredu_runtime::ArchitectureGroupTransport],
     pp_size: usize,
 ) -> Result<Vec<SemanticPipelineRoute>, String> {
-    let mut owners = Vec::with_capacity(transports.len());
-    for (group, transport) in transports.iter().enumerate() {
-        let count = unit_layout
-            .group_range(group)
-            .ok_or_else(|| format!("execution group {group} has no unit geometry"))?
-            .len();
-        let path = match transport.placement {
-            ArchitectureGroupPlacement::Pipeline => 0..pp_size,
-            ArchitectureGroupPlacement::OutputOwner => pp_size - 1..pp_size,
-        };
-        owners.push(balanced_ranges(count, path));
-    }
+    let owners = pipeline_group_owners(graph, unit_layout, transports, pp_size)?;
     let mut semantic_routes = Vec::new();
     for (group, group_owners) in owners.iter().enumerate() {
         for pair in group_owners.windows(2) {
@@ -7000,6 +7073,8 @@ fn rank_requirements_inner(
     let mut output_pipeline = None;
     let mut decoder_state_offset = 0usize;
     let mut local_state_ranges = Vec::new();
+    let placements = pipeline_group_owners(execution.execution_graph(), execution.execution_units(),
+        execution.group_transports(), pp_size)?;
 
     for (group_index, transport) in execution.group_transports().iter().enumerate() {
         if transport.kind == ArchitectureGroupKind::Prediction {
@@ -7010,12 +7085,10 @@ fn rank_requirements_inner(
             .group_range(group_index)
             .ok_or_else(|| format!("execution group {group_index} has no unit geometry"))?
             .len();
-        let path = match transport.placement {
-            ArchitectureGroupPlacement::Pipeline => 0..pp_size,
-            ArchitectureGroupPlacement::OutputOwner => pp_size - 1..pp_size,
-        };
-        let owners = balanced_ranges(count, path.clone());
-        let first_owner = owners.first().map_or(path.start, |(owner, _)| *owner);
+        let owners = &placements[group_index];
+        let first_owner = owners.first().map_or(
+            if transport.placement == ArchitectureGroupPlacement::OutputOwner { pp_size-1 } else { 0 },
+            |(owner, _)| *owner);
         let last_owner = owners.last().map_or(first_owner, |(owner, _)| *owner);
         let merge_owner = match transport.merge_destination {
             ArchitectureMergeDestination::LastOwner => last_owner,
@@ -7143,6 +7216,55 @@ fn rank_requirements_inner(
         state,
         parameter_targets,
     })
+}
+
+/// One retained placement drives both route endpoints and rank-local parameter/state ownership.
+fn pipeline_group_owners(
+    graph: &eredu_runtime::ExecutionGraph,
+    layout: &eredu_runtime::ExecutionUnitLayout,
+    transports: &[eredu_runtime::ArchitectureGroupTransport],
+    stages: usize,
+) -> Result<Vec<Vec<(usize, Range<usize>)>>, String> {
+    if stages == 0 || transports.len() != graph.groups().len() {
+        return Err("pipeline placement differs from its declared groups".into());
+    }
+    let mut owners = vec![Vec::new(); transports.len()];
+    let sequence = graph.execution_order().iter().copied()
+        .filter(|&group| transports[group].placement == ArchitectureGroupPlacement::PipelineSequence)
+        .collect::<Vec<_>>();
+    let mut total = 0usize;
+    let mut spans = Vec::new();
+    for (index, &group) in sequence.iter().enumerate() {
+        let dependencies = graph.dependencies(group).ok_or("pipeline sequence group is absent")?;
+        if (index == 0 && !dependencies.is_empty()) || (index > 0 && dependencies != [sequence[index-1]]) {
+            return Err("pipeline sequence groups must form an ordered dependency chain".into());
+        }
+        let count = layout.group_range(group).ok_or("pipeline sequence has no unit geometry")?.len();
+        if count == 0 { return Err("pipeline sequence contains an empty group".into()); }
+        let end = total.checked_add(count).ok_or("pipeline sequence unit count overflowed")?;
+        spans.push((group,total..end));
+        total = end;
+    }
+    if !sequence.is_empty() {
+        if total < stages { return Err("pipeline sequence has fewer execution units than stages".into()); }
+        let balanced = balanced_ranges(total,0..stages);
+        for (group,span) in spans {
+            owners[group] = balanced.iter().filter_map(|(owner,range)| {
+                let start=range.start.max(span.start);
+                let end=range.end.min(span.end);
+                (start<end).then(|| (*owner,start-span.start..end-span.start))
+            }).collect();
+        }
+    }
+    for (group,transport) in transports.iter().enumerate() {
+        let count=layout.group_range(group).ok_or("execution group has no unit geometry")?.len();
+        match transport.placement {
+            ArchitectureGroupPlacement::PipelineSequence => {},
+            ArchitectureGroupPlacement::Pipeline => owners[group]=balanced_ranges(count,0..stages),
+            ArchitectureGroupPlacement::OutputOwner => owners[group]=balanced_ranges(count,stages-1..stages),
+        }
+    }
+    Ok(owners)
 }
 
 fn balanced_ranges(unit_count: usize, ranks: Range<usize>) -> Vec<(usize, Range<usize>)> {
@@ -8606,6 +8728,12 @@ where
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) => {
+            nemotron_labs_diffusion::prepare::<B, S, V>(args, selected, store, context, visitor)
+        }
+        (None, Some(crate::configuration::GgufModelConfig::NemotronLabsDiffusion(plan))) => {
+            nemotron_labs_diffusion::prepare::<B, S, V>(plan.text_config(), selected, store, context, visitor)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::DiffusionGemma(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::DiffusionGemma(args))) => {
             diffusion::prepare_dense::<B, S, V>(args, selected, store, context, visitor)
@@ -9893,6 +10021,9 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) => args.vision.is_none(),
+        (None, Some(crate::configuration::GgufModelConfig::NemotronLabsDiffusion(_))) => true,
+
         (Some(crate::configuration::SafetensorsModelConfig::Gemma2(_)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Gemma2(_)))
         | (Some(crate::configuration::SafetensorsModelConfig::Llama(_)), None)
@@ -12077,6 +12208,9 @@ pub fn dense_decoder_partitioned_production_route(
     );
     let llama_compatible = matches!(
         models,
+        (Some(crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(_)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::NemotronLabsDiffusion(_))) |
+
         (
             Some(crate::configuration::SafetensorsModelConfig::Gemma2(_)),
             None

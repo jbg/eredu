@@ -35,14 +35,44 @@ where
         let (target_profile, mechanism) = self.forecast_profiles.as_ref().ok_or_else(|| {
             unsupported("selected speculative mechanism has no continuation memory profile")
         })?;
-        let scheduler = self.scheduler.requests.options();
-        let width = request.forecast_max_draft_tokens();
+        let policies = request.forecast_decoding_policies(self.scheduler.requests.options());
+        let mut scheduler = request.forecast_scheduler_options(self.scheduler.requests.options());
+        let mut width = request.forecast_max_draft_tokens();
+        let mut draft_adapter = false;
+        for (mode, options) in &policies {
+            if let eredu_core::decoding::DecodingMode::SelfSpeculation(speculation) = mode {
+                width = width.max(speculation.request().max_draft_tokens.get() as u64);
+                draft_adapter |= speculation.request().draft_adapter;
+            }
+            scheduler.lookahead_blocks = scheduler.lookahead_blocks.max(options.lookahead_blocks);
+            scheduler.max_optimistic_branches = scheduler.max_optimistic_branches.max(options.max_optimistic_branches);
+            scheduler.max_in_flight_verifications = scheduler.max_in_flight_verifications.max(options.max_in_flight_verifications);
+        }
         if width > mechanism.proposal_capacity {
             return Err(unsupported(
                 "configured proposals exceed the selected mechanism capacity",
             ));
         }
-        let extra = speculative_continuation_positions(additional_tokens, width, scheduler)?;
+        let refinement_active = policies.iter().any(|(mode, _)| matches!(mode, eredu_core::decoding::DecodingMode::Diffusion { .. }));
+        let mut refinement_plan = if refinement_active {
+            Some(mechanism.refinement.as_ref().ok_or_else(|| unsupported("retained refinement geometry is unavailable"))?.clone())
+        } else { None };
+        if let Some(refinement) = &mut refinement_plan {
+            for (mode, _) in &policies {
+                if let eredu_core::decoding::DecodingMode::Diffusion { policy: Some(policy) } = mode {
+                    refinement.stability_history = refinement.stability_history.max(policy.stability_history_length());
+                }
+            }
+        }
+        let refinement = refinement_plan.as_ref();
+        let mut extra = speculative_continuation_positions(additional_tokens, width, scheduler)?
+            .max(request.forecast_mode_settlement_positions());
+        if additional_tokens > 0 {
+            if let Some(refinement) = refinement {
+                extra = extra.max(additional_tokens.checked_add(u64::from(refinement.canvas_positions.get()))
+                    .ok_or(eredu_core::CapabilityError::ArithmeticOverflow { operation: "refinement continuation canvas" })?);
+            }
+        }
         let native = request
             .continuation_memory_observation(self.scheduler.executor, extra)
             .map_err(|error| match error {
@@ -132,6 +162,7 @@ where
                 };
                 (None, None, Some(prediction), Some(state))
             }
+            (None, None, None, None) => (None, None, None, None),
             _ => {
                 return Err(unsupported(
                     "settled observations do not match the selected speculative mechanism",
@@ -176,12 +207,16 @@ where
         let seed = allowance(
             native.seed_bytes,
             "currently retained assistant seed snapshot",
-        );
+        ).add(&allowance(request.retained_next_scores_estimate(self.scheduler.executor).map(|estimate| estimate.retained_bytes),
+            "settled next-target score row retained across the mode boundary"))?
+            .add(&allowance(request.retained_refinement_estimate(self.scheduler.executor).map(|estimate| estimate.retained_bytes),
+                "tentative position rows and complete refinement commitment cursor"))?;
         let seed = embedded_state
             .as_ref()
             .map_or(seed.clone(), |state| seed.maximum(&state.current_state));
         let continuation = SpeculativeContinuationMemoryPlan {
             additional_tokens,
+            settlement_input_tokens: request.forecast_mode_settlement_positions(),
             target: target_state,
             draft: draft_state,
             embedded: embedded_state,
@@ -189,7 +224,12 @@ where
             host_retention: allowance(host, "sampler/RNG, canonical and forked semantic/history state plus one compact JSON trace allowance; charged conservatively in every pool because native sampling placement is unavailable; unknown custom growth or instrumentation retention stays unknown"),
             retained_snapshots: allowance(Some(self.snapshot_usage().retained_bytes), "live snapshot/branch reservations; conservative per-pool allowance, not resident credit"),
         };
+        let mut shared_backbone = mechanism.shared_backbone.clone();
+        if !draft_adapter {
+            if let Some(shared) = &mut shared_backbone { shared.adapter = None; }
+        }
         let speculative = SpeculativeMemoryPlan {
+            shared_backbone,
             embedded,
             draft,
             auxiliary_bytes_per_position: mechanism.auxiliary_bytes_per_position.clone(),
@@ -207,8 +247,28 @@ where
         }
         let mut estimate =
             estimate_speculative_continuation_memory(&target, &speculative, &continuation)?;
+        if let Some(refinement) = refinement {
+            let mut refinement_request = target.clone();
+            refinement_request.forecast_output_tokens = additional_tokens;
+            refinement_request.max_output_tokens = Some(additional_tokens);
+            if request.has_tentative_refinement() && request.forecast_mode_settlement_positions() > 0 {
+                refinement_request.forecast_output_tokens = refinement_request.forecast_output_tokens.max(1);
+                refinement_request.max_output_tokens = Some(additional_tokens.max(1));
+            }
+
+            for pool in &mut refinement_request.domains {
+                pool.retained_input = pool.retained_input.add(&continuation.seed)?
+                    .add(&continuation.host_retention)?.add(&continuation.retained_snapshots)?;
+            }
+            let refined = estimate_refinement_continuation_memory(&refinement_request, refinement, &continuation.target)?;
+            crate::memory_forecast::merge_decoding_phase_estimate(&mut estimate, refined, &refinement_request)?;
+        }
         estimate.assumptions.extend(conversion_assumptions);
+        if policies.len() > 1 {
+            estimate.assumptions.push("The active and admitted pending modes share parameter residency and canonical state. Proposal width, lookahead and draft adapter workspace cover both policies through the settled handoff.".into());
+        }
         Ok(SpeculativeContinuationForecast {
+            decoding: Some(request.decoding_state()),
             estimate,
             request: target,
             speculative,

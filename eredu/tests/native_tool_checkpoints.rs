@@ -116,6 +116,7 @@ fn smoke_with_tool(
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
                 overrides: eredu_core::GenerationConfigOverrides {
@@ -422,6 +423,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                     } else {
                         model
                             .generate_prepared_chat(PreparedChatGenerationRequest {
+                                control_handle: None,
                                 input: PreparedChatInput::rendered_prompt(&prepared),
                                 settings,
                                 caller_stop_sequences: &[],

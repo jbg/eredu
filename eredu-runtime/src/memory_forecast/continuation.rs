@@ -171,7 +171,14 @@ pub fn estimate_continuation_memory(
         };
         start.total = total(&start)?;
         let mut phases = vec![start];
-        if request.forecast_output_tokens > 0 {
+        // An explicit commitment limit overrides the forecasting fallback.
+        // Cache settlement can still submit inputs at a zero-output boundary.
+        if request
+            .max_output_tokens
+            .unwrap_or(request.forecast_output_tokens)
+            > 0
+            || plan.additional_input_tokens > 0
+        {
             let mut decode = phase(
                 &without_copy,
                 request,

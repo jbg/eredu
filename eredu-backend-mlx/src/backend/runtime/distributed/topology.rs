@@ -89,7 +89,7 @@ impl CommunicationRouteRealization {
             }
             _ => None,
         };
-        let group = endpoint
+        let group = if descriptor.world_broadcast() { Some(world.clone()) } else { endpoint
             .map(|_| world.logical_subgroup(&[descriptor.source(), descriptor.destination()]))
             .transpose()
             .map(|group| group.map(|group| group.with_world_collective_wave(world_collective_wave)))
@@ -100,7 +100,7 @@ impl CommunicationRouteRealization {
                     descriptor.source(),
                     descriptor.destination()
                 ))
-            })?;
+            })? };
         let peer_rank = endpoint.map(|endpoint| match endpoint {
             CommunicationRouteEndpoint::Source => 1,
             CommunicationRouteEndpoint::Destination => 0,
@@ -329,6 +329,7 @@ pub(crate) fn mlx_communication_capabilities() -> CommunicationCapabilities {
     .expect("static MLX communication capabilities are valid")
     .with_boundary_framing([eredu_runtime::BoundaryFramingProtocol::RoleExactV1])
     .expect("static MLX boundary framing capability is valid")
+    .with_world_boundary_broadcast()
     .with_completion_capabilities(
         CommunicationCompletionCapabilities::new([
             eredu_core::CompletionCancellationMode::QuarantineUntilComplete,

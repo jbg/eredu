@@ -90,15 +90,21 @@ pub fn log_sigmoid(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResul
 /// Applies exact GELU.
 pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array> {
     let stream = stream.as_ref();
-    x.as_ref()
+    let dtype = x.as_ref().dtype();
+    let work = match dtype {
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => x.as_ref().as_dtype(safemlx::Dtype::Float32, stream)?,
+        _ => x.as_ref().clone(),
+    };
+    work
         .multiply(
             array!(1).add(
-                erf(x.as_ref().divide(array!(2f32.sqrt()), stream)?, stream)?,
+                erf(work.divide(array!(2f32.sqrt()), stream)?, stream)?,
                 stream,
             )?,
             stream,
         )?
-        .divide(array!(2.0), stream)
+        .divide(array!(2.0), stream)?
+        .as_dtype(dtype, stream)
 }
 
 /// Applies the tanh GELU approximation.

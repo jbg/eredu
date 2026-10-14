@@ -2,6 +2,7 @@ use super::*;
 
 mod admission_failures;
 mod diffusion_gemma;
+mod nemotron_labs_diffusion;
 mod execution;
 mod qwen4_exp;
 mod qwen4_exp_media;

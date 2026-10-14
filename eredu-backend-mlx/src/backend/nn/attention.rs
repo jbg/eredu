@@ -337,12 +337,19 @@ pub fn attention_with_softcap(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     if memory_path(0, 0, arithmetic, softcap.is_some()) == AttentionMemoryPath::Fused {
+        // Additive visibility masks do not select projection or cache precision.
+        // Native SDPA promotes its result when a wider floating mask is supplied.
+        let dtype = Dtype::from_promoting_types(Dtype::from_promoting_types(queries.dtype(), keys.dtype()), values.dtype());
+        let mask = mask.map(|mask| {
+            if mask.dtype() == Dtype::Bool { Ok(mask.clone()) }
+            else { mask.as_dtype(dtype, stream) }
+        }).transpose()?;
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
             values,
             scale,
-            mask.map(ScaledDotProductAttentionMask::Array),
+            mask.as_ref().map(ScaledDotProductAttentionMask::Array),
             sinks,
             stream,
         );

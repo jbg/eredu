@@ -655,6 +655,7 @@ fn independent_cached_invocations_edit_sparse_units_using_physical_token_rows() 
         CapturePhase::Decode,
         1,
         CaptureInvocationShape {
+            media: None,
             batch: 1,
             sequence: 2,
             context: None,

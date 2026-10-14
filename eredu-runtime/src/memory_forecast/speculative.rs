@@ -1,11 +1,17 @@
 //! Phase accounting for one speculative lane. This never allocates model state.
 use super::*;
 mod embedded;
+mod shared_backbone;
+pub use shared_backbone::SharedBackboneMemoryPlan;
 pub use embedded::{apply_embedded_parameter_conversion_credit, EmbeddedPredictionMemoryPlan};
 use eredu_core::{generation::SpeculativeSchedulerOptions, ObservationKind, SpeculativeDraft};
 
 /// Native/architecture facts about the selected speculative mechanism.
 pub struct SpeculativeMemoryProfile {
+    /// Complete retained ordinary refinement and native numerical workspace.
+    pub refinement: Option<RefinementMemoryPlan>,
+    /// Complete masked invocation geometry over the target's parameter catalog.
+    pub shared_backbone: Option<SharedBackboneMemoryPlan>,
     /// Exact selected embedded invocation, state and retained-feature contracts.
     pub embedded: Option<crate::prediction_resources::EmbeddedPredictionTopology>,
     /// Exact existing conversion allocations and their authoritative retaining bindings.
@@ -51,6 +57,9 @@ pub trait SpeculativeForecastBackend<D>: GenerationForecastBackend {
 /// never predictions of acceptance rate or adaptive lookahead behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeculativeMemoryPlan {
+    /// Fixed masked canvas and optional additive draft work; no second parameter owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_backbone: Option<SharedBackboneMemoryPlan>,
     /// Embedded invocation costs; target residency already includes its parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedded: Option<EmbeddedPredictionMemoryPlan>,
@@ -66,6 +75,53 @@ pub struct SpeculativeMemoryPlan {
     pub scheduler: SpeculativeSchedulerOptions,
     /// Whether a shared pool has one cache/driver allowance.
     pub shared_allocator: bool,
+}
+
+/// Projects a retained source and ordinary refinement over the same target.
+/// Parameters are shared between mutually exclusive numerical phases. Separate
+/// source state remains resident; its full transaction allowance conservatively
+/// bounds retained state and scratch when exact idle-source storage is unavailable.
+pub fn estimate_source_generation_memory(
+    request: &GenerationMemoryRequest,
+    source: &SpeculativeMemoryPlan,
+    refinement: Option<&RefinementMemoryPlan>,
+) -> Result<GenerationMemoryEstimate, CapabilityError> {
+    let mut estimate = estimate_speculative_memory(request, source)?;
+    let Some(refinement) = refinement else { return Ok(estimate) };
+    let mut refined = estimate_refinement_memory(request, refinement)?;
+    if source.draft.is_some() || source.embedded.is_some() {
+        let allowance = |bytes: &MemoryBytes| match bytes.upper_bytes {
+            Some(upper) => MemoryBytes::estimated(0, upper, "retained source transaction storage allowance; shared target state may alias"),
+            None => MemoryBytes::unknown("retained source transaction storage allowance is unavailable"),
+        };
+        for domain in &mut refined.domains {
+            let Some(owner) = estimate.domains.iter().find(|owner| owner.domain == domain.domain) else { continue };
+            let phases = owner.phases.iter().filter(|phase| phase.phase != MemoryPhase::Loading).collect::<Vec<_>>();
+            let maximum = |value: fn(&PhaseMemoryEstimate) -> &MemoryBytes| phases.iter()
+                .fold(MemoryBytes::exact(0), |bytes, phase| bytes.maximum(value(phase)));
+            let parameters = maximum(|phase| &phase.parameters);
+            let state = allowance(&maximum(|phase| &phase.persistent_state));
+            let workspace = allowance(&maximum(|phase| &phase.workspace));
+            let staging = allowance(&maximum(|phase| &phase.staging));
+            for phase in &mut domain.phases {
+                if matches!(phase.phase, MemoryPhase::Refinement | MemoryPhase::RefinementCommit) {
+                    phase.parameters = phase.parameters.maximum(&parameters);
+                    phase.persistent_state = phase.persistent_state.add(&state)?;
+                    phase.workspace = phase.workspace.add(&workspace)?;
+                    phase.staging = phase.staging.add(&staging)?;
+                    phase.total = phase.parameters.add(&phase.persistent_state)?
+                        .add(&phase.retained_input)?.add(&phase.workspace)?
+                        .add(&phase.staging)?.add(&phase.backend_overhead)?;
+                }
+            }
+            domain.generation_peak = domain.phases.iter().filter(|phase| phase.phase != MemoryPhase::Loading)
+                .fold(MemoryBytes::exact(0), |bytes, phase| bytes.maximum(&phase.total));
+            domain.overall_peak = domain.overall_peak.maximum(&domain.generation_peak);
+        }
+        refined.assumptions.push("Ordinary refinement retains the selected source's parameters once and conservatively includes its full transaction state/scratch upper allowance; this is not measured distinct allocation.".into());
+    }
+    super::merge_decoding_phase_estimate(&mut estimate, refined, request)?;
+    Ok(estimate)
 }
 
 /// Installed embedded state with native capacity and retained capture observations.
@@ -88,6 +144,10 @@ pub struct EmbeddedContinuationMemoryPlan {
 pub struct SpeculativeContinuationMemoryPlan {
     /// Requested additional committed decisions; this does not change the run limit.
     pub additional_tokens: u64,
+    /// Already committed input awaiting append for an admitted mode change.
+    /// This work can occur without any additional output decision.
+    #[serde(default)]
+    pub settlement_input_tokens: u64,
     /// Actual target state, including speculative overshoot in its peak horizon.
     pub target: ContinuationMemoryPlan,
     /// Actual draft state, which need not have the same installed frontier.
@@ -109,6 +169,9 @@ pub struct SpeculativeContinuationMemoryPlan {
 /// or changing the horizon; native capacity cannot be extrapolated from this record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeculativeContinuationForecast {
+    /// Active and admitted pending policy at this read-only observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoding: Option<eredu_core::decoding::DecodingState>,
     /// Total/additional peaks without completed loading or prefill.
     pub estimate: GenerationMemoryEstimate,
     /// Target physical pools and calibrated geometry.
@@ -131,8 +194,8 @@ pub fn estimate_speculative_continuation_memory(
         continuation.additional_tokens,
         plan.max_draft_tokens,
         plan.scheduler,
-    )?;
-    if continuation.target.additional_input_tokens != extra {
+    )?.max(continuation.settlement_input_tokens);
+    if continuation.target.additional_input_tokens < extra {
         return Err(CapabilityError::InvalidConfiguration { field: "speculative continuation horizon", detail: "native state observations must include the requested horizon and configured speculative overshoot".into() });
     }
     match (&plan.draft, &plan.embedded, &mut continuation.draft, &mut continuation.embedded) {
@@ -142,8 +205,9 @@ pub fn estimate_speculative_continuation_memory(
         (None, Some(prediction), None, Some(state)) if state.additional_input_tokens == extra => {
             prediction.validate_continuation(target, state)?;
         }
+        (None, None, None, None) if plan.shared_backbone.is_some() || plan.max_draft_tokens == 0 => {}
         _ => return Err(CapabilityError::InvalidConfiguration {
-            field: "speculative continuation", detail: "requires matching settled observations and horizon for exactly one selected draft mechanism".into(),
+            field: "speculative continuation", detail: "requires matching settled observations and horizon; nonzero proposals require one selected draft mechanism".into(),
         }),
     }
     estimate_speculative_inner(target, plan, Some(&continuation))
@@ -163,7 +227,7 @@ pub fn speculative_continuation_positions(
         mul(
             add(width, 1)?,
             1 + u64::from(
-                scheduler.lookahead_blocks != 0 && scheduler.max_optimistic_branches != 0,
+                width > 0 && scheduler.lookahead_blocks != 0 && scheduler.max_optimistic_branches != 0,
             ),
         )?,
     )
@@ -242,10 +306,11 @@ fn estimate_speculative_inner(
         normalize(draft);
     }
     let plan = &normalized;
-    if plan.embedded.is_some() && plan.draft.is_some() {
+    if let Some(shared) = &plan.shared_backbone { shared.validate(plan.max_draft_tokens)?; }
+    if [plan.embedded.is_some(), plan.draft.is_some(), plan.shared_backbone.is_some()].into_iter().filter(|selected| *selected).count() > 1 {
         return Err(CapabilityError::InvalidConfiguration {
             field: "speculative forecast",
-            detail: "embedded and independently resident drafters are mutually exclusive".into(),
+            detail: "exactly one draft mechanism owns speculative invocation geometry".into(),
         });
     }
     plan.auxiliary_bytes_per_position.validate()?;
@@ -263,10 +328,10 @@ fn estimate_speculative_inner(
         estimate_generation_memory(&validation)
     };
     let mut result = ordinary(target)?;
-    if target.batch_size != 1 || plan.max_draft_tokens == 0 {
+    if target.batch_size != 1 {
         return Err(CapabilityError::InvalidConfiguration {
             field: "speculative forecast",
-            detail: "requires one lane and a positive proposal width".into(),
+            detail: "requires one lane".into(),
         });
     }
     plan.scheduler
@@ -282,11 +347,12 @@ fn estimate_speculative_inner(
         |c| c.additional_tokens,
     );
     let canonical = add(target.input.model_positions, output)?;
-    let width = add(plan.max_draft_tokens, 1)?;
+    let settlement_only = output == 0 && continuation.is_some_and(|c| c.settlement_input_tokens != 0);
+    let width = if settlement_only { continuation.unwrap().settlement_input_tokens } else { add(plan.max_draft_tokens, 1)? };
     // A verified block and one optimistic block may extend beyond the canonical
     // frontier. Use configured maxima even if the run ends or disables lookahead.
     let lookahead = u64::from(
-        plan.scheduler.lookahead_blocks != 0 && plan.scheduler.max_optimistic_branches != 0,
+        !settlement_only && plan.max_draft_tokens > 0 && plan.scheduler.lookahead_blocks != 0 && plan.scheduler.max_optimistic_branches != 0,
     );
     let frontier = add(canonical, mul(width, add(1, lookahead)?)?)?;
     let mut pools = target.domains.clone();
@@ -364,6 +430,8 @@ fn estimate_speculative_inner(
                     MemoryPhase::SpeculativeVerification,
                     MemoryPhase::SpeculativeCommit,
                 ]);
+            } else if settlement_only {
+                stages.extend([MemoryPhase::SpeculativeVerification, MemoryPhase::SpeculativeCommit]);
             }
             stages
         } else if output == 0 {
@@ -376,7 +444,7 @@ fn estimate_speculative_inner(
                 MemoryPhase::SpeculativeCommit,
             ]
         };
-        for stage in stages {
+        for stage in stages.into_iter().filter(|stage| plan.max_draft_tokens > 0 || *stage != MemoryPhase::SpeculativeDraft) {
             let prefill = stage == MemoryPhase::Prefill;
             let start = stage == MemoryPhase::ContinuationStart;
             let positions = if prefill {
@@ -384,7 +452,9 @@ fn estimate_speculative_inner(
             } else {
                 frontier
             };
-            let query = if prefill { positions } else { width };
+            let shared_draft = !prefill && !start && stage == MemoryPhase::SpeculativeDraft && plan.shared_backbone.is_some();
+            let query = if prefill { positions } else if shared_draft { plan.shared_backbone.as_ref().unwrap().canvas_positions } else { width };
+            let positions = if shared_draft { positions.max(add(canonical, query)?) } else { positions };
             let get = |r: &GenerationMemoryRequest,
                        p: &DomainMemoryPlan,
                        native: Option<&ContinuationMemoryPlan>|
@@ -397,11 +467,16 @@ fn estimate_speculative_inner(
                     } else {
                         add(native.current_positions, native.additional_input_tokens)?
                     };
+                    if shared_draft { positions = add(positions, query)?; }
                     for e in &mut pool.executions {
                         e.cache_update = CacheUpdateWorkspace::InPlace;
                     }
                 }
                 let mut result = phase(&pool, r, stage, positions, if start { 0 } else { query })?;
+                if shared_draft && native.is_none() {
+                    // Bidirectional block K/V is workspace; it does not extend the causal frontier.
+                    result.persistent_state = phase(&pool, r, stage, canonical, 1)?.persistent_state;
+                }
                 if let Some(native) = native {
                     if !pool.executions.is_empty() {
                         result.persistent_state = if start {
@@ -536,12 +611,21 @@ fn estimate_speculative_inner(
                     }
                 }
             }
+            if execution_pool && shared_draft {
+                let shared = plan.shared_backbone.as_ref().unwrap();
+                p.workspace = p.workspace.add(&shared.adapter_workspace(add(1, lookahead)?)?)?;
+            }
             if execution_pool && !start {
                 // The ordinary workspace already includes cache-update overlap.
                 // These *additional* copies envelope durable checkpoints, seed,
                 // proposal restore/replacement, rollback and optimistic branches.
                 let target_copies = if prefill {
                     1
+                } else if plan.max_draft_tokens == 0 && plan.draft.is_none()
+                    && plan.embedded.is_none() && plan.shared_backbone.is_none() {
+                    // A causal-only append retains its isolated lane and rollback
+                    // checkpoint, without an assistant seed checkpoint.
+                    2
                 } else {
                     add(3, mul(2, lookahead)?)?
                 };
@@ -580,12 +664,14 @@ fn estimate_speculative_inner(
                             .map(|(a, b)| a.max(b));
                     }
                 }
-                let distributions = match vocab {
+                let distributions = if settlement_only { MemoryBytes::exact(0) } else { match vocab {
                     Some(v) => interval(&plan.sampling_bytes_per_vocabulary_entry,
-                        mul(v, mul(width, add(2,lookahead)?)?)?,
+                        mul(v, if let Some(shared) = plan.shared_backbone.as_ref().filter(|_| plan.max_draft_tokens > 0) {
+                            add(mul(shared.canvas_positions, add(1, lookahead)?)?, mul(width, add(2,lookahead)?)?)?
+                        } else { mul(width, add(2,lookahead)?)? })?,
                         &format!("proposal, verification and residual distributions including optimistic overlap: {}", plan.sampling_bytes_per_vocabulary_entry.detail))?,
                     None => MemoryBytes::unknown("speculative sampling vocabulary geometry unavailable"),
-                };
+                }};
                 p.staging = p.staging.add(&distributions)?;
             }
             // The frontier includes uncommitted positions and worst-case replay.

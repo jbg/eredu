@@ -36,3 +36,72 @@ where
         mask: Option<&'a B::Tensor>,
     ) -> Self::Input<'a>;
 }
+
+/// Architecture-declared ordinary refinement, separate from speculative drafting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefinementExecutionPolicy {
+    /// Complete trained invocation geometry.
+    pub geometry: BlockRefinementGeometry,
+    /// Validated numerical defaults.
+    pub policy: eredu_core::refinement::RefinementPolicy,
+    /// Whether the same architecture also supplies causal conditional sampling.
+    pub causal_sampling: bool,
+    /// Whether context scores seed the first tentative masked position.
+    pub seed_first: bool,
+}
+impl RefinementExecutionPolicy {
+    /// Independent numerical stream used by the ordinary refinement policy.
+    /// Entropy feedback retains its published root seed; masked refinement uses
+    /// a separate stream from causal target sampling.
+    pub const fn randomness_substream(self) -> Option<usize> {
+        use eredu_core::refinement::RefinementPolicy;
+        match self.policy {
+            RefinementPolicy::EntropyFeedback(_) => None,
+            RefinementPolicy::MaskedUnmasking { .. } => Some(1),
+        }
+    }
+    /// Resolves request controls without touching parameters or mutable state.
+    pub fn prepare(
+        self,
+        requested: Option<eredu_core::refinement::RefinementPolicy>,
+        temperature: f32,
+    ) -> Result<eredu_core::refinement::RefinementPolicy, eredu_core::decoding::DecodingModeError>
+    {
+        use eredu_core::refinement::RefinementPolicy as P;
+        let policy = match (self.policy, requested) {
+            (P::EntropyFeedback(default), None) => P::EntropyFeedback(default),
+            (P::EntropyFeedback(_), Some(policy @ P::EntropyFeedback(_))) => policy,
+            (
+                P::MaskedUnmasking {
+                    config,
+                    mask_token_id,
+                },
+                None,
+            ) => {
+                let mut options = config.options();
+                options.temperature = temperature;
+                P::MaskedUnmasking {
+                    config: options.try_into().map_err(|_| {
+                        eredu_core::decoding::DecodingModeError::Unsupported(
+                            "refinement temperature",
+                        )
+                    })?,
+                    mask_token_id,
+                }
+            }
+            (
+                P::MaskedUnmasking {
+                    mask_token_id: expected,
+                    ..
+                },
+                Some(policy @ P::MaskedUnmasking { mask_token_id, .. }),
+            ) if expected == mask_token_id => policy,
+            _ => {
+                return Err(eredu_core::decoding::DecodingModeError::Unsupported(
+                    "refinement equations differ from retained architecture",
+                ));
+            }
+        };
+        Ok(policy)
+    }
+}

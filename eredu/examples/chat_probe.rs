@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
             )
         } else {
             let request = PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&prepared),
                 settings,
                 caller_stop_sequences: &[],

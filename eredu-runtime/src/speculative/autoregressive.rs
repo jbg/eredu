@@ -1,11 +1,19 @@
-//! Speculative transactions between two independently executable language models.
+//! Ordinary causal execution and speculation between independent language models.
 //!
 //! Models retain their ordinary equations, residency and state geometry. This
 //! mechanism owns only proposal isolation, verification and accepted-prefix replay.
+use super::{CausalVerification, causal_verification};
 use eredu_core::{
-    execution_control::SnapshotEstimate, BoundedCompletion, SpeculativeCommit, SpeculativeExecutor,
-    SpeculativePrefill, Submission,
+    BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
+    execution_control::SnapshotEstimate,
 };
+
+mod refinement;
+pub use refinement::{
+    NoTargetRefinement, SharedTargetRefinement, SharedTargetRefinementState, TargetRefinement,
+};
+mod causal;
+pub use causal::{CausalExecutor, CausalSeed};
 
 /// Attribution of a model invocation within an independent-draft transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +36,38 @@ pub enum AutoregressivePass {
 /// Checkpoints are immutable and cloning one must preserve branch isolation.
 /// Methods retaining native work must retain all inputs through exact completion.
 pub trait AutoregressiveMechanisms {
+    /// Common asynchronous scheduling facts for the retained target topology.
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        _context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
+    /// Agrees host readiness before the next source invocation.
+    fn agree_text_preparation(
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        let _ = stage;
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
+        Ok(match status {
+            S::Ready => O::Ready,
+            S::Cancelled => O::Cancelled,
+            S::Failed => O::Rejected { rank: 0 },
+        })
+    }
+    /// Agrees per-request controls through the retained execution transport.
+    fn coordinate_decoding_control(
+        local: eredu_core::decoding::DecodingCoordination,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        Ok(local)
+    }
     /// An ordinary executable; no model-family dispatch occurs in this mechanism.
     type Model: ?Sized;
     /// Prepared input reusable by both tokenizer-compatible models.
@@ -39,7 +79,7 @@ pub trait AutoregressiveMechanisms {
     /// Complete sequence logits.
     type Output;
     /// One sampling distribution.
-    type Logits;
+    type Logits: Clone;
     /// Selected native placement.
     type Context<'a>: Copy;
     /// Exact verification completion.
@@ -48,6 +88,11 @@ pub trait AutoregressiveMechanisms {
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Retention/copy allowance for a handoff's immutable causal score row.
+    fn logits_snapshot_estimate(_logits: &Self::Logits) -> Option<SnapshotEstimate> {
+        None
+    }
 
     /// Realizes one empty ordinary state using the model's retained selection.
     fn empty(
@@ -78,6 +123,16 @@ pub trait AutoregressiveMechanisms {
         saved: &Self::Checkpoint,
         context: Self::Context<'_>,
     ) -> Result<Self::State, Self::Error>;
+    /// Retains the verified prefix in place when the state has an exact truncation
+    /// mechanism. `false` leaves state unchanged and selects checkpoint replay.
+    fn retain_verified_prefix(
+        _state: &mut Self::State,
+        _saved: &Self::Checkpoint,
+        _accepted_inputs: usize,
+        _context: Self::Context<'_>,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
     /// Reports a complete logical bound for a durable checkpoint copy.
     fn estimate(saved: &Self::Checkpoint) -> Option<SnapshotEstimate>;
     /// Retained immutable seed including native backing capacity; no checkpoint
@@ -149,34 +204,52 @@ pub struct AutoregressiveCheckpoint<C> {
 
 /// Private draft branch. Cloning never shares mutable cache storage.
 #[derive(Clone)]
-pub struct AutoregressiveProposal<C> {
+pub struct AutoregressiveProposal<C, R> {
     saved: C,
+    refinement: R,
 }
 
-/// Retained target outputs and their exact verification inputs.
-pub struct AutoregressiveVerification<O> {
-    output: O,
-    tokens: Vec<u32>,
+/// Prepared prompt and its independent target refinement state.
+pub struct AutoregressiveInput<I, R> {
+    input: I,
+    refinement: R,
+}
+impl<I, R> AutoregressiveInput<I, R> {
+    /// Moves prepared inputs and numerical authority into one request.
+    pub fn new(input: I, refinement: R) -> Self {
+        Self { input, refinement }
+    }
+}
+
+/// Causal target prefix, aligned assistant prefix and request-local refinement.
+#[derive(Clone)]
+pub struct AutoregressiveSeed<C, R> {
+    target: Option<C>,
+    draft: C,
+    refinement: R,
 }
 
 /// Independent drafting through the shared ordinary and controlled drivers.
-pub struct AutoregressiveExecutor<'a, M: AutoregressiveMechanisms> {
+pub struct AutoregressiveExecutor<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> {
     target: &'a mut M::Model,
     draft: &'a mut M::Model,
     capacity: std::num::NonZeroUsize,
+    refinement: R,
 }
 
-impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
+impl<'a, M: AutoregressiveMechanisms, R: TargetRefinement<M>> AutoregressiveExecutor<'a, M, R> {
     /// Binds ordinary executables after tokenizer and placement admission.
     pub fn new(
         target: &'a mut M::Model,
         draft: &'a mut M::Model,
         capacity: std::num::NonZeroUsize,
+        refinement: R,
     ) -> Self {
         Self {
             target,
             draft,
             capacity,
+            refinement,
         }
     }
     /// Realizes an isolated pair of ordinary lane caches.
@@ -191,15 +264,86 @@ impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
     }
 }
 
-impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor<'_, M> {
-    type Input = M::Input;
+impl<M: AutoregressiveMechanisms, R: TargetRefinement<M>> SpeculativeExecutor
+    for AutoregressiveExecutor<'_, M, R>
+{
+    fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
+        let ordinary = self.refinement.capabilities(self.target);
+        let mut capabilities =
+            eredu_core::decoding::DecodingCapabilities::causal_drafting(self.capacity.get());
+        capabilities.autoregressive &= ordinary.autoregressive;
+        capabilities.speculation &= ordinary.autoregressive;
+        capabilities.diffusion = ordinary.diffusion;
+        capabilities.entropy_feedback = ordinary.entropy_feedback;
+        capabilities.masked_unmasking = ordinary.masked_unmasking;
+        capabilities.mask_token_id = ordinary.mask_token_id;
+        capabilities.with_completion_support(
+            M::Completion::supports_cancellation(
+                eredu_core::CompletionCancellationMode::NativeCancel,
+            ),
+            M::Completion::supports_cancellation(
+                eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+            ),
+        )
+    }
+    fn refine_block<'a>(
+        &mut self,
+        state: &mut Self::TargetState,
+        logits: &Self::Logits,
+        committed: &[u32],
+        policy: Option<eredu_core::refinement::RefinementPolicy>,
+        temperature: f32,
+        context: Self::Context<'a>,
+    ) -> Result<Option<eredu_core::speculative::RefinementProgress<Self::Logits>>, Self::Error>
+     where Self: 'a {
+        let Some(prefix) = &state.target else {
+            return Ok(None);
+        };
+        self.refinement.advance(
+            self.target,
+            prefix,
+            &mut state.refinement,
+            logits,
+            committed,
+            policy,
+            temperature,
+            context,
+        )
+    }
+    fn logits_snapshot_estimate(&self, logits: &Self::Logits) -> Option<SnapshotEstimate> {
+        M::logits_snapshot_estimate(logits)
+    }
+    fn coordinate_speculative_step<'context>(
+        &mut self,
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'context>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'context {
+        M::coordinate_speculative_step(local, context)
+    }
+    fn agree_text_preparation<'context>(
+        &mut self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'context>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+     where Self: 'context {
+        M::agree_text_preparation(stage, status, context)
+    }
+    fn coordinate_decoding_control<'context>(
+        &mut self,
+        local: eredu_core::decoding::DecodingCoordination,
+        context: Self::Context<'context>,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure>  where Self: 'context {
+        M::coordinate_decoding_control(local, context)
+    }
+    type Input = AutoregressiveInput<M::Input, R::State>;
     type Cache = AutoregressiveCache<M::State>;
-    type TargetState = M::Checkpoint;
-    type DraftState = AutoregressiveProposal<M::Checkpoint>;
+    type TargetState = AutoregressiveSeed<M::Checkpoint, R::State>;
+    type DraftState = AutoregressiveProposal<M::Checkpoint, R::State>;
     type CacheCheckpoint = AutoregressiveCheckpoint<M::Checkpoint>;
-    type Verification = AutoregressiveVerification<M::Output>;
+    type Verification = CausalVerification<M::Output>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a>;
+    type Context<'a> = M::Context<'a> where Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -212,15 +356,15 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         true
     }
 
-    fn prefill(
+    fn prefill<'context>(
         &mut self,
         input: Self::Input,
         cache: &mut Self::Cache,
-        context: Self::Context<'_>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
+        context: Self::Context<'context>,
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
         let (output, count) = M::prefill(
             self.target,
-            &input,
+            &input.input,
             &mut cache.target,
             AutoregressivePass::TargetPrefill,
             context,
@@ -232,7 +376,7 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         }
         let (_, draft_count) = M::prefill(
             self.draft,
-            &input,
+            &input.input,
             &mut cache.draft,
             AutoregressivePass::DraftPrefill,
             context,
@@ -242,32 +386,41 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         }
         Ok(SpeculativePrefill::new(
             M::logits(&output, count - 1, context)?,
-            M::checkpoint(&cache.draft)?,
+            AutoregressiveSeed {
+                target: if self.refinement.capabilities(self.target).diffusion {
+                    Some(M::checkpoint(&cache.target)?)
+                } else {
+                    None
+                },
+                draft: M::checkpoint(&cache.draft)?,
+                refinement: input.refinement,
+            },
             count,
         ))
     }
 
-    fn begin_proposal(
+    fn begin_proposal<'context>(
         &mut self,
         state: &Self::TargetState,
         _: u32,
         capacity: usize,
-        _: Self::Context<'_>,
-    ) -> Result<Self::DraftState, Self::Error> {
-        if capacity == 0 || capacity > self.capacity.get() {
+        _: Self::Context<'context>,
+    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
+        if capacity > self.capacity.get() {
             return Err(M::invalid("invalid independent draft proposal capacity"));
         }
         Ok(AutoregressiveProposal {
-            saved: state.clone(),
+            saved: state.draft.clone(),
+            refinement: state.refinement.clone(),
         })
     }
 
-    fn proposal_logits(
+    fn proposal_step<'context>(
         &mut self,
         proposal: &mut Self::DraftState,
         last_token: u32,
-        context: Self::Context<'_>,
-    ) -> Result<Self::Logits, Self::Error> {
+        context: Self::Context<'context>,
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
         let mut state = M::restore(&proposal.saved, context)?;
         let output = M::decode(
             self.draft,
@@ -278,6 +431,7 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         )?;
         proposal.saved = M::checkpoint(&state)?;
         M::logits(&output, 0, context)
+            .map(eredu_core::speculative::SpeculativeProposalStep::CausalLogits)
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -287,12 +441,12 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         })
     }
 
-    fn restore_checkpoint(
+    fn restore_checkpoint<'context>(
         &mut self,
         cache: &mut Self::Cache,
         saved: &Self::CacheCheckpoint,
-        context: Self::Context<'_>,
-    ) -> Result<(), Self::Error> {
+        context: Self::Context<'context>,
+    ) -> Result<(), Self::Error>  where Self: 'context {
         // Prepare both copies before replacing either installed state.
         let target = M::restore(&saved.target, context)?;
         let draft = M::restore(&saved.draft, context)?;
@@ -300,58 +454,41 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         Ok(())
     }
 
-    fn submit_verification(
+    fn submit_verification<'context>(
         &mut self,
         tokens: &[u32],
         cache: &mut Self::Cache,
-        context: Self::Context<'_>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
+        context: Self::Context<'context>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
         if tokens.is_empty() || tokens.len() > self.capacity.get().saturating_add(1) {
             return Err(M::invalid("invalid independent draft verification width"));
         }
-        let output = M::decode(
-            self.target,
-            tokens,
-            &mut cache.target,
-            AutoregressivePass::Verification,
-            context,
-        )?;
-        let completion = M::completion(&output, context)?;
-        Ok(Submission {
-            output: AutoregressiveVerification {
-                output,
-                tokens: tokens.to_vec(),
-            },
-            completion,
-        })
+        causal_verification::submit::<M>(self.target, tokens, &mut cache.target, context)
     }
 
-    fn verification_logits(
+    fn verification_logits<'context>(
         &self,
         output: &Self::Verification,
         index: usize,
-        context: Self::Context<'_>,
-    ) -> Result<Self::Logits, Self::Error> {
-        if index >= output.tokens.len() {
-            return Err(M::invalid("independent verification index is out of range"));
-        }
-        M::logits(&output.output, index, context)
+        context: Self::Context<'context>,
+    ) -> Result<Self::Logits, Self::Error>  where Self: 'context {
+        causal_verification::logits::<M>(output, index, context)
     }
 
-    fn commit_verification(
+    fn commit_verification<'context>(
         &mut self,
         output: Self::Verification,
-        _: Self::DraftState,
+        proposal: Self::DraftState,
         cache: &mut Self::Cache,
         saved: &Self::CacheCheckpoint,
         verified: usize,
-        context: Self::Context<'_>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
-        if verified == 0 || verified > output.tokens.len() {
+        context: Self::Context<'context>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+        if verified == 0 || verified > output.inputs.len() {
             return Err(M::invalid("invalid independent verification commitment"));
         }
-        let tokens = &output.tokens[..verified];
-        let replayed = if verified < output.tokens.len() {
+        let tokens = &output.inputs[..verified];
+        let replayed = if verified < output.inputs.len() {
             let mut state = M::restore(&saved.target, context)?;
             M::decode(
                 self.target,
@@ -375,7 +512,18 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         )?;
         let seed = M::checkpoint(&draft)?;
         cache.draft = draft;
-        Ok(SpeculativeCommit::new(seed, replayed))
+        Ok(SpeculativeCommit::new(
+            AutoregressiveSeed {
+                target: if self.refinement.capabilities(self.target).diffusion {
+                    Some(M::checkpoint(&cache.target)?)
+                } else {
+                    None
+                },
+                draft: seed,
+                refinement: proposal.refinement,
+            },
+            replayed,
+        ))
     }
 
     /// Releases optional conversions; caller must establish a settled boundary.
@@ -430,7 +578,20 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
                 draft: Some(draft),
                 embedded: None,
                 parameter_conversions: None,
-                seed_bytes: M::checkpoint_retained_bytes(state),
+                seed_bytes: M::checkpoint_retained_bytes(&state.draft)
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            state
+                                .target
+                                .as_ref()
+                                .map_or(Some(0), M::checkpoint_retained_bytes)?,
+                        )
+                    })
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            self.refinement.estimate(&state.refinement)?.retained_bytes,
+                        )
+                    }),
             },
         ))
     }
@@ -443,7 +604,15 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         [
             M::estimate_state(&cache.target)?,
             M::estimate_state(&cache.draft)?,
-            M::estimate(state)?,
+            M::estimate(&state.draft)?,
+            state.target.as_ref().map_or(
+                Some(SnapshotEstimate {
+                    retained_bytes: 0,
+                    copy_bytes: 0,
+                }),
+                M::estimate,
+            )?,
+            self.refinement.estimate(&state.refinement)?,
         ]
         .into_iter()
         .try_fold(
@@ -460,15 +629,15 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         )
     }
 
-    fn control_snapshot(
+    fn control_snapshot<'context>(
         &self,
         cache: &Self::Cache,
         state: &Self::TargetState,
-        _: Self::Context<'_>,
+        _: Self::Context<'context>,
     ) -> Result<
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    > {
+    >  where Self: 'context {
         Ok(Some((
             self.checkpoint(cache)
                 .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
@@ -476,13 +645,13 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         )))
     }
 
-    fn restore_control_snapshot(
+    fn restore_control_snapshot<'context>(
         &mut self,
         cache: &mut Self::Cache,
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
-        context: Self::Context<'_>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
+        context: Self::Context<'context>,
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'context {
         self.restore_checkpoint(cache, saved, context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some(state.clone()))

@@ -1,15 +1,15 @@
 use eredu_core::{
-    capture::CaptureError, component::ComponentExecutionScopeKind, ArchitectureDescriptor,
-    ArchitectureNodeKind,
+    ArchitectureDescriptor, ArchitectureNodeKind, capture::CaptureError,
+    component::ComponentExecutionScopeKind,
 };
 use eredu_runtime::capture::SpeculativeCaptureScope;
 
-/// Complete internal hook coverage of one architecture-selected prediction
-/// executor. Only the sealed materialized extension contract constructs it.
+/// Complete internal hook coverage of an architecture-selected generation source.
+/// Embedded construction and retained shared-backbone declarations supply its semantics.
 #[derive(Debug, Clone)]
 pub struct SpeculativeActivationExecution {
     pub(crate) depth: usize,
-    pub(crate) strategy: eredu_runtime::SpeculativeStrategyClass,
+    pub(crate) strategy: Option<eredu_runtime::SpeculativeStrategyClass>,
 }
 
 impl SpeculativeActivationExecution {
@@ -26,7 +26,23 @@ impl SpeculativeActivationExecution {
                 eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
                     | eredu_runtime::SpeculativeStrategyClass::EmbeddedFused
             ))
-        .then_some(Self { depth, strategy })
+        .then_some(Self {
+            depth,
+            strategy: Some(strategy),
+        })
+    }
+
+    pub(crate) fn shared_backbone() -> Self {
+        Self {
+            depth: 0,
+            strategy: None,
+        }
+    }
+
+    /// The causal target, ordinary refinement and masked drafts invoke the same
+    /// declared hooks and producer placement, with independent invocation records.
+    pub(crate) fn is_shared_backbone(&self) -> bool {
+        self.strategy.is_none()
     }
 
     pub(crate) fn validate_scope(
@@ -37,10 +53,10 @@ impl SpeculativeActivationExecution {
         let valid = match scope {
             SpeculativeCaptureScope::Target => true,
             SpeculativeCaptureScope::Prediction { depth } => {
-                self.strategy == Strategy::EmbeddedSequential && depth < self.depth
+                self.strategy == Some(Strategy::EmbeddedSequential) && depth < self.depth
             }
             SpeculativeCaptureScope::PredictionContext | SpeculativeCaptureScope::FusedProposal => {
-                self.strategy == Strategy::EmbeddedFused
+                self.strategy == Some(Strategy::EmbeddedFused)
             }
         };
         if valid {

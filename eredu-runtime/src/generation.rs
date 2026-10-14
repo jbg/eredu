@@ -12,6 +12,13 @@ mod memory;
 pub mod refinement;
 pub use memory::sampling_invocation;
 
+/// Conservative logical retention for an independently owned command mailbox.
+/// Includes its mutex, saved policy and shared-owner bookkeeping.
+pub fn mode_mailbox_bytes() -> u64 {
+    (std::mem::size_of::<std::sync::Mutex<eredu_core::decoding::DecodingState>>()
+        + 4 * std::mem::size_of::<usize>()) as u64
+}
+
 /// Monomorphized causal model used by generation sessions.
 pub trait CausalModel<S> {
     /// Backend-native tensor handle containing logits and decode token ids.
@@ -292,6 +299,22 @@ pub trait SpeculativeSampler<B: SamplingBackend> {
         Ok(false)
     }
 
+    /// Position-wise output restrictions for refinement, without causal sampling
+    /// transformations. Unknown policies must explicitly supply this contract.
+    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
+        Err(B::error("sampler has no refinement commitment filter".into()))
+    }
+
+    /// Observes/intervenes on raw position scores, then applies only output
+    /// restrictions. Causal penalties, truncation and temperature are excluded.
+    fn refinement_scores_with_capture(
+        &mut self, logits: &B::Logits, history: &[u32], context: &B::Context,
+        capture: impl FnOnce(&B::Logits, Option<eredu_core::capture::CaptureTokenDomain<'_>>) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error> where Self: Sized {
+        let effective = capture(logits, None)?;
+        B::apply_token_filter(&effective, &self.refinement_filter(history)?, context)
+    }
+
     /// Applies penalties, filters, and temperature.
     fn process_logits(
         &mut self,
@@ -421,6 +444,19 @@ where
     S: SpeculativeSampler<B> + Clone,
     C: SpeculativeTokenFilterController,
 {
+    fn refinement_filter(&mut self, history: &[u32]) -> Result<TokenFilter, B::Error> {
+        self.controller.filter_at(history).map_err(|error| B::error(error.to_string()))
+    }
+
+    fn refinement_scores_with_capture(
+        &mut self, logits: &B::Logits, history: &[u32], context: &B::Context,
+        capture: impl FnOnce(&B::Logits, Option<eredu_core::capture::CaptureTokenDomain<'_>>) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error> {
+        let decision = self.controller.decision_at(history).map_err(|error| B::error(error.to_string()))?;
+        let effective = capture(logits, decision.capture_domain())?;
+        B::apply_token_filter(&effective, decision.filter(), context)
+    }
+
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         self.policy.control_requires_positive_temperature()
     }
@@ -594,6 +630,11 @@ where
 pub struct DefaultSampler;
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for DefaultSampler {
+    fn control_snapshot_bytes(&self) -> Option<u64> { Some(0) }
+    fn continuation_storage_bytes(&self, _additional_tokens: u64) -> Option<u64> { Some(0) }
+    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
+        Ok(TokenFilter::All)
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(false)
     }
@@ -774,6 +815,9 @@ impl GenerationSampler {
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for GenerationSampler {
+    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
+        Ok(TokenFilter::All)
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(false)
     }
@@ -963,6 +1007,9 @@ impl<B: SamplingBackend> Sampler<B> for MirostatV2Sampler {
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for MirostatV2Sampler {
+    fn refinement_filter(&mut self, _history: &[u32]) -> Result<TokenFilter, B::Error> {
+        Ok(TokenFilter::All)
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(true)
     }

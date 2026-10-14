@@ -365,6 +365,17 @@ pub struct TranslatedTensorLayout {
 }
 
 impl Checkpoint {
+    /// Selects a conversion allocation ceiling without reopening source members.
+    /// Header, shard and encoded-range validation remain unchanged; the ceiling
+    /// applies to subsequent logical tensor decoding and bounded selections.
+    pub fn into_allocation_limit(mut self, bytes: u64) -> Result<Self> {
+        if bytes == 0 || bytes > isize::MAX as u64 {
+            return Err(Error::tensor("conversion", "allocation ceiling must fit a positive host allocation"));
+        }
+        self.limits.max_allocation_bytes = bytes;
+        Ok(self)
+    }
+
     /// Selects an explicit representation for named quantized tensors.
     /// This header-only projection replaces converted companions with one output
     /// under the physical name. Other tensors keep their selected layouts.

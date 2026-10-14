@@ -228,3 +228,35 @@ pub(super) fn with_invocation_observer<R>(
         Err(error) => submit(session, &mut RejectedCapture(error)),
     }
 }
+
+/// Causal and iterative passes share invocation admission when the selected
+/// execution supplies a complete canvas bound. Ordinary captures keep their
+/// single-prediction admission contract.
+pub(super) fn with_text_observer<R>(
+    session: &mut MlxModelSession,
+    capture: &mut CaptureSession,
+    stream: &Stream,
+    domain: Option<CaptureTokenDomain<'_>>,
+    prediction: u64,
+    phase: CapturePhase,
+    geometry: Result<(u64, Option<CaptureMediaShape>), CaptureError>,
+    submit: impl FnOnce(&mut MlxModelSession, &mut dyn RuntimeActivationObserver<MlxTensor, Error>) -> Result<R, Error>,
+) -> Result<R, Error> {
+    if capture.plan().invocation_bounds().is_some() {
+        let invocation = geometry.and_then(|(sequence, media)| {
+            let mut shape = session.refinement_capture_shape(sequence)?;
+            shape.media = media;
+            Ok((phase, shape))
+        });
+        let admitted = invocation.and_then(|(phase, shape)| {
+            capture.set_commitment_boundary(prediction)?;
+            capture.begin_invocation(phase, prediction, shape, Default::default())
+        });
+        match admitted {
+            Ok(()) => with_observer(session, capture, stream, domain, prediction, submit),
+            Err(error) => submit(session, &mut RejectedCapture(error)),
+        }
+    } else {
+        with_observer(session, capture, stream, domain, prediction, submit)
+    }
+}

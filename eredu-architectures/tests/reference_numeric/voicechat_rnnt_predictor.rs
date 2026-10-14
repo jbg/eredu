@@ -606,6 +606,7 @@ fn voicechat_rnnt_predictor_rejects_cut_step_and_foreign_or_non_f32_parent_befor
             &mut pass,
             &route,
             vec![incoming, input.clone(), metadata],
+            &context,
         );
         if accepted.is_ok() {
             assert!(executor
@@ -655,6 +656,7 @@ fn voicechat_rnnt_predictor_rejects_cut_step_and_foreign_or_non_f32_parent_befor
         &mut pass,
         &route,
         vec![input.clone(), input.clone(), header(&words)],
+        &context,
     )
     .unwrap();
     executor

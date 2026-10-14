@@ -25,9 +25,13 @@ fn full_acceptance_promotes_shared_optimistic_branch() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -88,9 +92,13 @@ fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 6,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -123,6 +131,7 @@ fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
     assert_eq!(
         retained.proposals()[0]
             .distribution()
+            .unwrap()
             .try_index_device((0, 0, 1), draft.stream())
             .unwrap()
             .item::<f32>(draft.stream()),
@@ -196,9 +205,13 @@ fn mismatching_bonus_restores_exact_non_lookahead_state() {
                 .submit(
                     &mut cache,
                     ModelInput::new(&parts),
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens: 7,
-                        max_draft_tokens: 2,
+                        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
                     },
@@ -273,9 +286,13 @@ fn promoted_round_leaves_last_emitted_token_out_of_target_cache() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -339,9 +356,13 @@ fn rejection_discards_branch_sampler_prng_history_and_cache_state() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -408,9 +429,13 @@ fn rejection_matches_execution_with_lookahead_disabled() {
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 5,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -466,9 +491,13 @@ fn target_eos_discards_in_flight_lookahead() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 1,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: vec![0],
             },
@@ -519,9 +548,13 @@ fn bonus_eos_completes_only_its_request_and_discards_continuation() {
             .submit(
                 &mut cache_a,
                 ModelInput::new(&parts_a),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 6,
-                    max_draft_tokens: 1,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: vec![0],
                 },
@@ -537,9 +570,13 @@ fn bonus_eos_completes_only_its_request_and_discards_continuation() {
             .submit(
                 &mut cache_b,
                 ModelInput::new(&parts_b),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 5,
-                    max_draft_tokens: 1,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -593,9 +630,13 @@ fn consumed_one_token_branch_never_submits_empty_verification() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 5,
-                max_draft_tokens: 1,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -648,9 +689,13 @@ fn max_token_boundary_does_not_draft_unusable_lookahead() {
         .submit(
             &mut cache,
             ModelInput::new(&parts),
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 3,
-                max_draft_tokens: 1,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },
@@ -690,7 +735,7 @@ fn stale_optimistic_prefix_is_an_error_not_a_fallback() {
                 step: 1,
                 storage: Arc::new(()),
             },
-            vec![SpeculativeProposal::new(
+            vec![SpeculativeProposal::causal(
                 0,
                 Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 1, 3]),
             )],

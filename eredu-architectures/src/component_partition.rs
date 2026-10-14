@@ -525,6 +525,28 @@ impl ComponentPartitionLayout {
             topology,
             &owns_parameter_invocation,
         )?;
+        // A residual addition executes in its containing architecture unit,
+        // after any TP reduction. Its complete hidden value is replicated on
+        // that unit's ranks, regardless of the contribution's parameter owner.
+        for node in descriptor.nodes.iter().filter(|node| node.kind == eredu_core::ArchitectureNodeKind::ResidualAdd) {
+            if crate::speculative_execution::speculative_capture_scope(descriptor, &node.id)?
+                != eredu_core::speculative::SpeculativeCaptureScope::Target { continue; }
+            let points = descriptor.observations.points.iter().filter(|point| point.node_id == node.id
+                && point.axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| axis.name == "hidden")))
+                .collect::<Vec<_>>();
+            if points.is_empty() { continue; }
+            let owner = residual_invocation_owner(descriptor, parameters, &node.id)?;
+            let local = owner.is_owned_by(ownership, |group, unit| owned_groups.iter()
+                .any(|owned| owned.group() == group && owned.units().contains(&unit)));
+            for point in points {
+                replicated_observation(&mut observations, descriptor, &point.path, "hidden", local, ObservationHookSite::Unit)?;
+            }
+        }
+        for point in descriptor.observations.points.iter().filter(|point| point.axes.as_ref().is_some_and(|axes| axes.iter().any(|axis| matches!(axis.dimension, eredu_core::SymbolicDimension::MediaPositions | eredu_core::SymbolicDimension::ProjectedMediaPositions)))) {
+            let owner = residual_invocation_owner(descriptor, parameters, &point.node_id)?;
+            let local = owner.is_owned_by(ownership, |group, unit| owned_groups.iter().any(|owned| owned.group() == group && owned.units().contains(&unit)));
+            replicated_observation(&mut observations, descriptor, &point.path, "hidden", local, ObservationHookSite::Unit)?;
+        }
         register_routed_boundaries(
             &mut observations,
             descriptor,
@@ -1025,6 +1047,22 @@ fn register_routed_boundaries(
         }
     }
     Ok(())
+}
+
+fn residual_invocation_owner<'a>(
+    descriptor: &ArchitectureDescriptor, parameters: &'a ArchitectureParameterDescription, node_id: &str,
+) -> Result<&'a eredu_runtime::ParameterGroupOwner, ComponentPartitionError> {
+    use eredu_core::capture::CaptureError;
+    let mut current = Some(node_id);
+    for _ in 0..=descriptor.nodes.len() {
+        let Some(id) = current else { break; };
+        let node = descriptor.node(id).ok_or_else(|| CaptureError::Invalid("residual ancestry contains an unknown node".into()))?;
+        if !node.parameter_groups.is_empty() {
+            return node_invocation_owner(descriptor, parameters, id);
+        }
+        current = node.parent.as_deref();
+    }
+    Err(CaptureError::Invalid("residual addition has no containing execution unit".into()).into())
 }
 
 fn node_invocation_owner<'a>(
@@ -2043,6 +2081,7 @@ mod tests {
                 .unwrap();
             for rows in [1, 3, 5] {
                 let invocation = Some(CaptureInvocationShape {
+            media: None,
                     batch: 1,
                     sequence: rows,
                     context: None,
@@ -2302,6 +2341,7 @@ mod tests {
             };
             for rows in [1, 3, 5] {
                 let invocation = Some(CaptureInvocationShape {
+            media: None,
                     batch: 1,
                     sequence: rows,
                     context: Some(19),

@@ -540,6 +540,7 @@ enum ArtifactFamilyPlan {
 
 #[derive(Debug, Clone)]
 enum NormalizedProcessorPlan {
+    NemotronLabsDiffusion(crate::nemotron_labs_diffusion::processing::ImageProcessor),
     Gemma4(Gemma4ProcessorPlan),
     Inkling(InklingProcessorPlan),
     Muse(MuseProcessorPlan),
@@ -557,9 +558,39 @@ pub struct ArtifactArchitecturePlan {
     media_projector: Option<crate::gguf_companion::GgufMediaProjectorPlan>,
     processor: Option<NormalizedProcessorPlan>,
     prediction_extension: Option<crate::configuration::PredictionExtensionPlan>,
+    draft_adapter: Option<std::sync::Arc<crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter>>,
 }
 
 impl ArtifactArchitecturePlan {
+    pub(crate) fn draft_adapter(&self) -> Option<&crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter> {
+        self.draft_adapter.as_deref()
+    }
+
+    pub(crate) fn with_draft_adapter(mut self, source: &eredu_core::DraftAdapterSource) -> Result<Self, String> {
+        use crate::configuration::{SafetensorsModelConfig, GgufModelConfig};
+        let config = match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => match plan.model() {
+                SafetensorsModelConfig::NemotronLabsDiffusion(config) => config,
+                _ => return Err("draft adapter requires shared-backbone low-rank support".into()),
+            },
+            ArtifactFamilyPlan::Gguf(plan) => match plan.model() {
+                GgufModelConfig::NemotronLabsDiffusion(plan) => plan.text_config(),
+                _ => return Err("draft adapter requires shared-backbone low-rank support".into()),
+            },
+        };
+        let adapter = crate::nemotron_labs_diffusion::adapter::AdmittedDraftAdapter::admit(config, source)?;
+        self.family = match self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => ArtifactFamilyPlan::Safetensors(plan.with_draft_adapter(adapter.config.clone())?),
+            ArtifactFamilyPlan::Gguf(plan) => ArtifactFamilyPlan::Gguf(plan.with_draft_adapter(adapter.config.clone())?),
+        };
+        if let Some(projector) = &mut self.media_projector {
+            projector.attach_draft_adapter(adapter.config.clone())?;
+        }
+        self.draft_adapter = Some(std::sync::Arc::new(adapter));
+        self.validation = Default::default();
+        Ok(self)
+    }
+
     pub(crate) fn validation(
         &self,
         token: eredu_core::artifact::ArtifactAdmissionToken,
@@ -582,6 +613,7 @@ impl ArtifactArchitecturePlan {
             media_projector: None,
             processor: None,
             prediction_extension: None,
+            draft_adapter: None,
         }
     }
 
@@ -595,6 +627,7 @@ impl ArtifactArchitecturePlan {
             media_projector: None,
             processor: None,
             prediction_extension: None,
+            draft_adapter: None,
         }
     }
 
@@ -643,6 +676,7 @@ impl ArtifactArchitecturePlan {
                 media_projector: self.media_projector.clone(),
                 processor: self.processor.clone(),
                 prediction_extension: Some(extension.clone()),
+                draft_adapter: self.draft_adapter.clone(),
             },
             extension,
         )))
@@ -696,6 +730,17 @@ impl ArtifactArchitecturePlan {
         })?;
         let kind = architecture.model_kind();
         let processor = match kind {
+            ModelKind::NemotronLabsDiffusion => {
+                let crate::configuration::SafetensorsModelConfig::NemotronLabsDiffusion(config) = architecture.model() else {
+                    return Err(invalid("masked model processor requires its admitted configuration"));
+                };
+                config.vision.as_ref().map(|vision| {
+                    crate::nemotron_labs_diffusion::processing::ImageProcessor::new(config, 1400.min(vision.image_size as u32))
+                        .map(NormalizedProcessorPlan::NemotronLabsDiffusion)
+                        .map_err(|error| invalid(error.to_string()))
+                }).transpose()?
+            }
+
             ModelKind::DiffusionGemma | ModelKind::Gemma4 => {
                 Gemma4ProcessorPlan::from_hf_json(model, image, video)?
                     .map(NormalizedProcessorPlan::Gemma4)
@@ -735,6 +780,14 @@ impl ArtifactArchitecturePlan {
                 .collect::<HashMap<_, _>>()
         };
         let processor = match architecture {
+            GgufArchitecture::NemotronLabsDiffusion => self.media_projector.as_ref().map(|projector| {
+                let crate::gguf_companion::GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } = projector.model() else {
+                    return Err(invalid("masked image processor requires its admitted companion"));
+                };
+                crate::nemotron_labs_diffusion::processing::ImageProcessor::new(config, 1400)
+                    .map(NormalizedProcessorPlan::NemotronLabsDiffusion).map_err(|error| invalid(error.to_string()))
+            }).transpose()?,
+
             GgufArchitecture::Gemma4 => projector
                 .map(|projector| {
                     Gemma4ProcessorPlan::from_gguf_metadata(
@@ -920,6 +973,13 @@ impl ArtifactArchitecturePlan {
             }
         }
         Ok(())
+    }
+
+    /// Returns the admitted Pixtral pixel, patch and marker policy.
+    pub const fn nemotron_labs_diffusion(&self) -> Option<&crate::nemotron_labs_diffusion::processing::ImageProcessor> {
+        match &self.processor {
+            Some(NormalizedProcessorPlan::NemotronLabsDiffusion(plan)) => Some(plan), _ => None,
+        }
     }
 
     /// Returns the retained Gemma 4 processor plan, when admitted.

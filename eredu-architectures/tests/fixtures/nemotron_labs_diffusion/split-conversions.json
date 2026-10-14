@@ -1,0 +1,64 @@
+[
+  {
+    "original_repository": "IntellAgents/Nemotron-Labs-Diffusion-3B-GGUF",
+    "original_revision": "b1367a57265c62f63e18f0faacaac202731ee0c4",
+    "original_sha256": "f0a4db3dc37dc80de075eb36554f25ec80147d6f0e4bfc65ecfc42147b321224",
+    "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "writer_sha256": "3f0f759149dbd9b1d860cc18667f6b3a4efd4bc25fb5449c07665482073363d8",
+    "repack_script_sha256": "13502bb1d37bc6d9c03958cd5eb298324107973367497dc33c65e28a60f6838c",
+    "maximum_bytes": 1000000000,
+    "members": [
+      {
+        "name": "3B-Q4_K_M-00001-of-00003.gguf",
+        "size": 997517408,
+        "sha256": "fbc489b6bd1d20453d96909c51bf1d50d700ee4cf1f845bea54304654d68511f"
+      },
+      {
+        "name": "3B-Q4_K_M-00002-of-00003.gguf",
+        "size": 818669792,
+        "sha256": "d7e2b1515a55c18274f45c48804086f4f87ca7237480813b89f4c959a606a592"
+      },
+      {
+        "name": "3B-Q4_K_M-00003-of-00003.gguf",
+        "size": 556806432,
+        "sha256": "0cf54db56818f8b51330d6acb05bedf4c99032c59ce4ea7c34e71f3359497955"
+      }
+    ]
+  },
+  {
+    "original_repository": "IntellAgents/Nemotron-Labs-Diffusion-VLM-8B-GGUF",
+    "original_revision": "a436a745feda80389c99c7a15ba3cc46fbfee8e0",
+    "original_sha256": "0705006bdaac2a3e330a9e0b80767653fce5a07fedd99995c869082b0278ff75",
+    "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "writer_sha256": "3f0f759149dbd9b1d860cc18667f6b3a4efd4bc25fb5449c07665482073363d8",
+    "repack_script_sha256": "13502bb1d37bc6d9c03958cd5eb298324107973367497dc33c65e28a60f6838c",
+    "maximum_bytes": 200000000,
+    "members": [
+      {
+        "name": "mmproj-F16-00001-of-00005.gguf",
+        "size": 199282976,
+        "sha256": "1a75e2d4c54b050e9be891f6d3d357aa0a8e37517b0d6ec77e4d508a672f3e80"
+      },
+      {
+        "name": "mmproj-F16-00002-of-00005.gguf",
+        "size": 199281888,
+        "sha256": "304d2ce1e4959c2fcc3a688d5aac353a2b77b26be4b49fb48ccdbca187cdead0"
+      },
+      {
+        "name": "mmproj-F16-00003-of-00005.gguf",
+        "size": 199281888,
+        "sha256": "7bec9928164e30200759333bf167637c7d393fc1265be126831a79c5679a351a"
+      },
+      {
+        "name": "mmproj-F16-00004-of-00005.gguf",
+        "size": 199281888,
+        "sha256": "9f56c1cded37ac5f28fcfec78d000966502196884dcada1c400778fc1d30cd11"
+      },
+      {
+        "name": "mmproj-F16-00005-of-00005.gguf",
+        "size": 59949824,
+        "sha256": "809839b03efd676df7259ef30da65d1a703bf52e8574f27528b4254b82302413"
+      }
+    ]
+  }
+]

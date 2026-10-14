@@ -339,6 +339,7 @@ pub fn inspected_speculative_generation_memory_plan(
     Ok((
         request,
         SpeculativeMemoryPlan {
+            shared_backbone: None,
             embedded: Some(embedded),
             draft: None,
             auxiliary_bytes_per_position: MemoryBytes::exact(0),

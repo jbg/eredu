@@ -1189,3 +1189,35 @@ fn resident_indexed_decode_preserves_slots_and_deferred_validation() {
     safemlx::transforms::eval(validations.arrays().chain(std::iter::once(&output))).unwrap();
     assert!(validations.validate_completed().is_err());
 }
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn floating_visibility_masks_preserve_fused_attention_precision() {
+    use safemlx::Dtype;
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+        let q = Array::from_slice(&[1.0f32,0.0], &[1,1,1,2]).as_dtype(dtype, stream).unwrap();
+        let k = Array::from_slice(&[0.0f32,0.0,1.0,0.0], &[1,1,2,2]).as_dtype(dtype, stream).unwrap();
+        let v = Array::from_slice(&[1.0f32,0.0,0.0,1.0], &[1,1,2,2]).as_dtype(dtype, stream).unwrap();
+        let wide = Array::from_slice(&[0.0f32,0.0], &[1,2]);
+        let boolean = Array::from_slice(&[true,true], &[1,2]);
+        let blocked = Array::from_slice(&[0.0f32,f32::NEG_INFINITY], &[1,2]);
+        let rounded = |x: f32| match dtype {
+            Dtype::Float16 => half::f16::from_f32(x).to_f32(),
+            _ => half::bf16::from_f32(x).to_f32(),
+        };
+        let probability = 1.0/(1.0+1.0f32.exp());
+        let expected = [rounded(probability), rounded(1.0-probability)];
+        for mask in [None, Some(&wide), Some(&boolean)] {
+            let output = super::attention_with_softcap(&q,&k,&v,1.0,mask,None,None,eredu_nn::AttentionArithmetic::Fused,stream).unwrap();
+            assert_eq!(output.dtype(), dtype, "visibility representation cannot select output precision");
+            let output = output.as_dtype(Dtype::Float32, stream).unwrap().into_evaluated().unwrap();
+            assert_eq!(output.as_slice::<f32>(), expected);
+        }
+        let output = super::attention_with_softcap(&q,&k,&v,1.0,Some(&blocked),None,None,eredu_nn::AttentionArithmetic::Fused,stream).unwrap();
+        assert_eq!(output.dtype(), dtype);
+        let output = output.as_dtype(Dtype::Float32, stream).unwrap().into_evaluated().unwrap();
+        assert_eq!(output.as_slice::<f32>(), [1.0,0.0]);
+    }
+}

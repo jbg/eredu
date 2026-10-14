@@ -173,6 +173,9 @@ impl NormalizedLoadRequest {
             .with_required_session_capabilities(*plan.required_session_capabilities())
             .with_prompt_cache_persistence(plan.prompt_cache_persistence())
             .with_drafting_plan(plan.drafting())?;
+        if let Some(source) = plan.draft_adapter() {
+            request = request.with_draft_adapter(source.clone());
+        }
         if let Some(source) = plan.prediction_source() {
             request = request.with_prediction_source(source);
         }

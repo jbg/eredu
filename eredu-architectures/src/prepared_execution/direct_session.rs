@@ -62,7 +62,7 @@ where
     M::Error: std::fmt::Display,
 {
     let facts = PreparedTextSessionFacts::from_parts(
-        prepared.prompt_cache_identity().clone(),
+        Some(prepared.prompt_cache_identity().clone()),
         prepared.capability_estimate().clone(),
         prepared.effective_model_type().to_owned(),
         prepared.selected().residency(),

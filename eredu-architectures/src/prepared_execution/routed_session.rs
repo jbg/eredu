@@ -16,7 +16,7 @@ use crate::routed_text::{
 /// Retained architecture facts for final adaptation of a constructed text session.
 #[derive(Debug, Clone)]
 pub struct PreparedTextSessionFacts {
-    prompt_cache_identity: eredu_core::cache::PromptCacheModelIdentity,
+    prompt_cache_identity: Option<eredu_core::cache::PromptCacheModelIdentity>,
     capability: crate::capability::CapabilityEstimate,
     effective_model_type: String,
     residency: eredu_runtime::LayerWeightResidency,
@@ -160,7 +160,7 @@ where
 
 impl PreparedTextSessionFacts {
     pub(super) fn from_parts(
-        prompt_cache_identity: eredu_core::cache::PromptCacheModelIdentity,
+        prompt_cache_identity: Option<eredu_core::cache::PromptCacheModelIdentity>,
         capability: crate::capability::CapabilityEstimate,
         effective_model_type: String,
         residency: eredu_runtime::LayerWeightResidency,
@@ -178,16 +178,16 @@ impl PreparedTextSessionFacts {
         prepared: &crate::replicated_text::PreparedReplicatedTextArchitecture<A>,
     ) -> Self {
         Self {
-            prompt_cache_identity: prepared.prompt_cache_identity().clone(),
+            prompt_cache_identity: Some(prepared.prompt_cache_identity().clone()),
             capability: prepared.capability_estimate().clone(),
             effective_model_type: prepared.effective_model_type().to_owned(),
             residency: prepared.selected().residency(),
         }
     }
 
-    /// Exact prompt-cache model identity retained during architecture preparation.
-    pub const fn prompt_cache_identity(&self) -> &eredu_core::cache::PromptCacheModelIdentity {
-        &self.prompt_cache_identity
+    /// Exact shard identity, absent for a partition with no mutable cache.
+    pub const fn prompt_cache_identity(&self) -> Option<&eredu_core::cache::PromptCacheModelIdentity> {
+        self.prompt_cache_identity.as_ref()
     }
 
     /// Capability estimate retained by the selected target architecture.
@@ -209,7 +209,7 @@ impl PreparedTextSessionFacts {
     pub fn into_parts(
         self,
     ) -> (
-        eredu_core::cache::PromptCacheModelIdentity,
+        Option<eredu_core::cache::PromptCacheModelIdentity>,
         crate::capability::CapabilityEstimate,
         String,
         eredu_runtime::LayerWeightResidency,

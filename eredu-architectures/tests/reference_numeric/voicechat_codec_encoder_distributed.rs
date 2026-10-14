@@ -651,6 +651,7 @@ fn voicechat_codec_encoder_partition_rejects_malformed_route_cut_and_frame_metad
             &mut pass,
             &selected_route,
             vec![incoming, metadata],
+            &context,
         );
         if accepted.is_ok() {
             assert!(executor
@@ -698,6 +699,7 @@ fn voicechat_codec_encoder_partition_rejects_malformed_route_cut_and_frame_metad
         &mut pass,
         &route,
         vec![hidden, header(&[3, 2, 24])],
+        &context,
     )
     .unwrap();
     executor

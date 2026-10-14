@@ -101,6 +101,19 @@ struct AdmittedArtifactFile {
 }
 
 impl ArtifactFingerprintSource {
+    /// Checks the original member identities without reading payloads. Use after
+    /// a prepared store has captured its own file guards to preserve continuity
+    /// between content fingerprinting and later guarded tensor leases.
+    pub fn validate_unchanged(&self) -> Result<(), ArtifactFingerprintError> {
+        for pinned in &self.files {
+            let path = pinned.member.path();
+            let file = File::open(path).map_err(|source| io_error("open", path, source))?;
+            if StableFileMetadata::read(path, &file)? != pinned.admitted {
+                return Err(ArtifactFingerprintError::Changed { path: path.to_path_buf() });
+            }
+        }
+        Ok(())
+    }
     /// Records original file identities and cheap change-detection facts.
     pub fn new(
         files: impl IntoIterator<Item = ArtifactFile>,
@@ -380,9 +393,11 @@ mod tests {
         let path = directory.path().join("member");
         std::fs::write(&path, b"original").unwrap();
         let source = ArtifactFingerprintSource::new([ArtifactFile::new("weights", &path)]).unwrap();
+        source.validate_unchanged().unwrap();
         let replacement = directory.path().join("replacement");
         std::fs::write(&replacement, b"different file contents").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        assert!(matches!(source.validate_unchanged(), Err(ArtifactFingerprintError::Changed { .. })));
         assert!(matches!(
             source.fingerprint(),
             Err(ArtifactFingerprintError::Changed { .. })

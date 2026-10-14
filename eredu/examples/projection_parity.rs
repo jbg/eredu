@@ -216,10 +216,13 @@ fn main() -> anyhow::Result<()> {
         })?;
         let output =
             model.generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
@@ -237,10 +240,13 @@ fn main() -> anyhow::Result<()> {
         let output = model
             .with_controlled_text_speculative(
                 PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings,
-                    options,
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+                        ..settings
+                    },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},

@@ -210,6 +210,15 @@ pub(crate) fn source_declarations(
             }
             _ => return Err(invalid("unsupported artifact container".into())),
         }
+        if let Some(adapter) = plan.draft_adapter() {
+            let id = PhysicalArtifactId::Companion(GgufCompanionRole::Named("draft_adapter".into()));
+            let keys = adapter.resolution.source_keys().clone();
+            declarations.roles.get_mut(&ArtifactSourceRole::Target).expect("target role").insert(id.clone(), keys.clone());
+            declarations.roles.insert(ArtifactSourceRole::Component("draft_adapter"), BTreeMap::from([(id.clone(), keys)]));
+            declarations.artifacts.insert(id, PhysicalArtifactPreparation::Safetensors {
+                catalog: adapter.catalog.tensors().clone(), shards: adapter.catalog.admitted_shards(), resolution: adapter.resolution.clone(),
+            });
+        }
         Ok(Arc::new(declarations))
     }).clone()
 }

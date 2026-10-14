@@ -10,6 +10,8 @@ pub use profiles::{
     SharedReplicatedTextVisitor,
 };
 
+use crate::decoder::Config as _;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
@@ -1106,6 +1108,7 @@ where
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
+        | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -1867,6 +1870,7 @@ where
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
+        | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -2256,6 +2260,34 @@ where
     S::LayerState: eredu_nn::ReadOnlyAttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
+    if let Some(config) = plan.safetensors_architecture().and_then(|plan| match plan.model() {
+        SafetensorsModelConfig::NemotronLabsDiffusion(config) => Some(config),
+        _ => None,
+    }).or_else(|| plan.gguf_plan().and_then(|plan| match plan.model() {
+        GgufModelConfig::NemotronLabsDiffusion(plan) => Some(plan.text_config()), _ => None,
+    })) {
+        let requirements = selected.requirements().clone();
+        validate_plan_identity(&requirements, &EligibleConfig::NemotronLabsDiffusion(config))
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        validate_store_handoff(&requirements, store.as_ref(), StoreHandoffScope::Primary)
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        visitor.construction_started();
+        let source = selected_uses_transform(&selected)
+            .then(|| crate::nemotron_labs_diffusion::model::TextModel::<B>::new(config.clone(), context))
+            .transpose().map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let target = config.with_checkpoint_formats(selected_formats(&selected))
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let identity = target.architecture_fingerprint();
+        let capability = crate::capability::nemotron_labs_diffusion(&target, false)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let effective_model_type = target.model_identity().to_owned();
+        let architecture = crate::nemotron_labs_diffusion::model::TextModel::<B>::new(target, context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let prepared = prepare_architecture_handoff::<B, S, _>(architecture, source, requirements,
+            selected, capability, effective_model_type, identity, context)
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+        return visitor.visit(prepared, store).map_err(ReplicatedTextDispatchError::Backend);
+    }
     let config = match (plan.safetensors_architecture(), plan.gguf_plan()) {
         (Some(plan), None) => match plan.model() {
             SafetensorsModelConfig::DiffusionGemma(config) => config,
@@ -2553,6 +2585,7 @@ where
 }
 
 enum EligibleConfig<'a> {
+    NemotronLabsDiffusion(&'a crate::nemotron_labs_diffusion::FamilyConfig),
     K2Horizon(&'a crate::k2_horizon::ModelArgs),
     Llama(&'a crate::llama::ModelArgs),
     Gemma2(&'a crate::gemma2::ModelArgs),
@@ -2579,6 +2612,7 @@ impl EligibleConfig<'_> {
     ) -> Result<Option<eredu_runtime::execution_topology::TextExecutionTopology>, eredu_nn::Error>
     {
         let topology = match self {
+            Self::NemotronLabsDiffusion(args) => crate::decoder::topology::text(*args)?,
             Self::DiffusionGemma(args) => crate::diffusion_gemma::topology::text(args)?,
             Self::Llama(args) => crate::decoder::topology::text(*args)?,
             Self::Nanbeige(args) => crate::decoder::topology::text(*args)?,
@@ -2600,6 +2634,7 @@ impl EligibleConfig<'_> {
                     == crate::diffusion_gemma::EncoderAttention::CausalWithVisionSpans
             }
             Self::Llama(_)
+            | Self::NemotronLabsDiffusion(_)
             | Self::Nanbeige(_)
             | Self::Qwen(_)
             | Self::Gemma2(_)
@@ -2625,6 +2660,7 @@ impl EligibleConfig<'_> {
                 .map_err(|error| error.to_string())
         };
         match self {
+            Self::NemotronLabsDiffusion(args) => crate::nemotron_labs_diffusion::partitioned::TextBoundarySchema::new(args.hidden_size()).wire_schema().map_err(|error| error.to_string()),
             Self::Nanbeige(args) => standard(args.dense_config().hidden_size),
             Self::Gemma2(args) => standard(args.dense_config().hidden_size),
             Self::Llama(args) => standard(args.hidden_size),
@@ -2715,6 +2751,7 @@ impl EligibleConfig<'_> {
             Ok(())
         };
         match self {
+            Self::NemotronLabsDiffusion(_) => extend(crate::nemotron_labs_diffusion::source_recipes(source)?)?,
             Self::Gemma2(_) | Self::Llama(_) => {}
             Self::Nanbeige(args) => extend(crate::decoder::repeated::recipes(
                 source,
@@ -2914,6 +2951,7 @@ impl EligibleConfig<'_> {
 
     fn architecture_identity(&self) -> String {
         match self {
+            Self::NemotronLabsDiffusion(args) => args.architecture_fingerprint(),
             Self::Nanbeige(args) => crate::nanbeige::prompt_cache_architecture_fingerprint(args),
             Self::Gemma2(args) => crate::gemma2::prompt_cache_architecture_fingerprint(args),
             Self::Llama(args) => crate::llama::prompt_cache_architecture_fingerprint(args),
@@ -2942,6 +2980,7 @@ impl EligibleConfig<'_> {
     }
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
+        if matches!(self, Self::NemotronLabsDiffusion(_)) { return crate::nemotron_labs_diffusion::canonical_parameter_name(name); }
         if matches!(self, Self::DiffusionGemma(_)) {
             return crate::diffusion_gemma::canonical_safetensors_target(name);
         }
@@ -3020,6 +3059,7 @@ impl EligibleConfig<'_> {
 
     fn parameter_requires_shape_recipe(&self, name: &str) -> bool {
         match self {
+            Self::NemotronLabsDiffusion(_) => false,
             Self::Lfm2(_) => name.ends_with(".conv.conv.weight"),
             Self::KimiLinear(_) => {
                 name.ends_with(".self_attn.A_log")
@@ -3091,6 +3131,7 @@ impl EligibleConfig<'_> {
 
     fn operators(&self) -> NeuralOperatorCapabilities {
         match self {
+            Self::NemotronLabsDiffusion(args) => crate::decoder::operator_requirements(*args).union(NeuralOperatorCapabilities::CAST_FLOAT),
             Self::K2Horizon(args) => crate::decoder::operator_requirements(*args),
             Self::Gemma2(args) => crate::decoder::operator_requirements(*args),
             Self::Llama(_)
@@ -3139,6 +3180,7 @@ impl EligibleConfig<'_> {
 
     fn execution_group(&self) -> &'static str {
         match self {
+            Self::NemotronLabsDiffusion(_) => crate::decoder::TEXT_DECODER_EXECUTION_GROUP,
             Self::Gemma2(_)
             | Self::Llama(_)
             | Self::Nanbeige(_)
@@ -3169,6 +3211,7 @@ impl EligibleConfig<'_> {
 
     fn unit_count(&self) -> Result<usize, String> {
         let count = match self {
+            Self::NemotronLabsDiffusion(args) => args.num_hidden_layers(),
             Self::Nanbeige(args) => args.state_layer_count() as i32,
             Self::Gemma2(args) => args.dense_config().num_hidden_layers,
             Self::Llama(args) => args.num_hidden_layers,
@@ -3239,6 +3282,7 @@ impl EligibleConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
+            Self::NemotronLabsDiffusion(args) => crate::decoder::state_layout(*args).map_err(|error| error.to_string()),
             Self::Nanbeige(args) => {
                 crate::nanbeige::state_layout(args).map_err(|error| error.to_string())
             }
@@ -3319,6 +3363,7 @@ impl EligibleConfig<'_> {
 
     fn native_format(&self, name: &str) -> LinearFormat {
         match self {
+            Self::NemotronLabsDiffusion(args) => return crate::decoder::Config::linear_format(*args, name),
             Self::Nanbeige(args) => args.weight_quantization_for(name),
             Self::Gemma2(args) => args.weight_quantization_for(name),
             Self::Llama(args) => args.weight_quantization_for(name),
@@ -3406,6 +3451,7 @@ impl EligibleConfig<'_> {
 
     fn linear_parameter_shapes(&self) -> Result<BTreeMap<String, Vec<usize>>, String> {
         match self {
+            Self::NemotronLabsDiffusion(args) => decoder_linear_parameter_shapes(*args),
             Self::Nanbeige(args) => decoder_linear_parameter_shapes(*args),
             Self::Gemma2(args) => decoder_linear_parameter_shapes(*args),
             Self::Llama(args) => decoder_linear_parameter_shapes(*args),
@@ -3793,6 +3839,7 @@ impl EligibleConfig<'_> {
 
     fn parameter_root(&self) -> &str {
         match self {
+            Self::NemotronLabsDiffusion(args) => crate::decoder::Config::parameter_root(*args),
             Self::Nanbeige(args) => crate::decoder::Config::parameter_root(*args),
             Self::Gemma2(args) => crate::decoder::Config::parameter_root(*args),
             Self::Llama(args) => crate::decoder::Config::parameter_root(*args),
@@ -3812,6 +3859,7 @@ impl EligibleConfig<'_> {
 
     fn tied_embeddings(&self) -> bool {
         match self {
+            Self::NemotronLabsDiffusion(_) => false,
             Self::Nanbeige(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Gemma2(args) => crate::decoder::Config::tie_word_embeddings(*args),
             Self::Llama(args) => crate::decoder::Config::tie_word_embeddings(*args),
@@ -3835,6 +3883,7 @@ impl EligibleConfig<'_> {
 
     fn embedding_shape(&self) -> Result<Vec<usize>, String> {
         let (vocabulary, hidden) = match self {
+            Self::NemotronLabsDiffusion(args) => (args.vocabulary_size(), args.hidden_size()),
             Self::Nanbeige(args) => (
                 args.dense_config().vocab_size,
                 args.dense_config().hidden_size,
@@ -3873,6 +3922,7 @@ impl EligibleConfig<'_> {
         linear_shapes: &BTreeMap<String, Vec<usize>>,
     ) -> ReplicatedTextParameterRole {
         match self {
+            Self::NemotronLabsDiffusion(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Nanbeige(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Gemma2(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
             Self::Llama(args) => decoder_parameter_role(*args, name, companion, linear_shapes),
@@ -3898,6 +3948,7 @@ impl EligibleConfig<'_> {
 
     fn embedding_name(&self) -> String {
         match self {
+            Self::NemotronLabsDiffusion(_) => "model.embed_tokens.weight".into(),
             Self::NemotronH(_) => "model.embeddings.weight".into(),
             Self::Gemma2(_)
             | Self::Llama(_)
@@ -4266,7 +4317,15 @@ fn derive_replicated_text_requirements(
     }
     let plan = inspection.architecture_plan();
     let config = eligible_config(plan)?;
-    replicated_text_requirements_for_config(inspection, config)
+    let geometry = match &config {
+        EligibleConfig::NemotronLabsDiffusion(config) => Some(config.generation_geometry()),
+        _ => None,
+    };
+    let requirements = replicated_text_requirements_for_config(inspection, config)?;
+    Ok(match geometry {
+        Some(geometry) => requirements.with_block_refinement(geometry),
+        None => requirements,
+    })
 }
 
 pub(crate) fn diffusion_text_requirements(
@@ -5162,6 +5221,8 @@ fn safetensors_eligible_config(
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) if args.vision.is_some() => Err(ReplicatedTextIneligibility::CompositeInput),
+        SafetensorsModelConfig::NemotronLabsDiffusion(args) => Ok(EligibleConfig::NemotronLabsDiffusion(args)),
         SafetensorsModelConfig::DiffusionGemma(_) => {
             Err(ReplicatedTextIneligibility::BlockRefinement)
         }
@@ -5233,6 +5294,7 @@ fn gguf_eligible_config(
     architecture: &crate::configuration::GgufArchitecturePlan,
 ) -> Result<EligibleConfig<'_>, ReplicatedTextIneligibility> {
     match architecture.model() {
+        GgufModelConfig::NemotronLabsDiffusion(plan) => Ok(EligibleConfig::NemotronLabsDiffusion(plan.text_config())),
         GgufModelConfig::DiffusionGemma(_) => Err(ReplicatedTextIneligibility::BlockRefinement),
         GgufModelConfig::VoiceChat(_) => Err(ReplicatedTextIneligibility::Realtime),
         GgufModelConfig::Qwen4Exp(_) => Err(ReplicatedTextIneligibility::Routed),
@@ -5339,6 +5401,7 @@ fn ordinary_eligible_config(
         | EligibleConfig::DeepSeekV3(_)
         | EligibleConfig::DeepSeekV4(_)
         | EligibleConfig::DiffusionGemma(_)
+        | EligibleConfig::NemotronLabsDiffusion(_)
         | EligibleConfig::Gemma4(_)
         | EligibleConfig::Inkling(_)
         | EligibleConfig::MuseGlimmer(_)
@@ -5601,6 +5664,16 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
                 unit,
             })
     };
+    if matches!(config, EligibleConfig::NemotronLabsDiffusion(_)) {
+        if let Some(owner) = execution_unit("draft_adapter.layers.", crate::decoder::TEXT_DECODER_EXECUTION_GROUP) { return owner; }
+        if let Some(owner) = execution_unit("model.vision_tower.transformer.layers.", "vision") { return owner; }
+        if name.starts_with("model.multi_modal_projector.") {
+            return ReplicatedTextParameterOwner::ExecutionUnit { group: "vision_projection".into(), unit: 0 };
+        }
+        if name.starts_with("model.vision_tower.") {
+            return ReplicatedTextParameterOwner::StaticRole("vision_embedding".into());
+        }
+    }
     let composite = match config {
         EligibleConfig::Gemma4(_) => execution_unit(
             "model.vision_tower.encoder.layers.",
@@ -6691,6 +6764,7 @@ where
 }
 
 pub(crate) enum CompositeConfig<'a> {
+    NemotronLabsDiffusion(&'a crate::nemotron_labs_diffusion::FamilyConfig),
     Diffusion(&'a crate::diffusion_gemma::FamilyConfig),
     Gemma4(&'a crate::gemma4::FamilyConfig),
     Inkling(&'a crate::inkling::ModelArgs),
@@ -6702,6 +6776,7 @@ pub(crate) enum CompositeConfig<'a> {
 impl CompositeConfig<'_> {
     fn requirement_config(&self) -> EligibleConfig<'_> {
         match self {
+            Self::NemotronLabsDiffusion(args) => EligibleConfig::NemotronLabsDiffusion(args),
             Self::Diffusion(args) => EligibleConfig::DiffusionGemma(args),
             Self::Gemma4(args) => EligibleConfig::Gemma4(args),
             Self::Inkling(args) => EligibleConfig::Inkling(args),
@@ -6713,6 +6788,7 @@ impl CompositeConfig<'_> {
 
     fn architecture_identity(&self) -> String {
         match self {
+            Self::NemotronLabsDiffusion(args) => args.architecture_fingerprint(),
             Self::Diffusion(args) => args.architecture_fingerprint(),
             Self::Gemma4(args) => args.architecture_fingerprint(),
             Self::Inkling(args) => args.architecture_fingerprint(),
@@ -6726,6 +6802,7 @@ impl CompositeConfig<'_> {
 
     fn input_modalities(&self) -> InputModalities {
         match self {
+            Self::NemotronLabsDiffusion(_) => InputModalities { text: true, image: true, audio: false, video: false },
             Self::Diffusion(args) => args.input_modalities(),
             Self::Gemma4(args) => args.input_modalities(),
             Self::Inkling(args) => args.input_modalities(),
@@ -6746,6 +6823,7 @@ impl CompositeConfig<'_> {
 
     fn routed(&self) -> bool {
         match self {
+            Self::NemotronLabsDiffusion(_) => false,
             Self::Diffusion(args) => args.has_sparse_moe_layers(),
             Self::Gemma4(args) => args.text.num_experts.is_some_and(|count| count > 0),
             Self::Inkling(args) => args.text_config.has_sparse_moe_layers(),
@@ -6757,6 +6835,7 @@ impl CompositeConfig<'_> {
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
         match self {
+            Self::NemotronLabsDiffusion(args) => crate::decoder::state_layout(*args).map_err(|error| error.to_string()),
             Self::Diffusion(args) => {
                 crate::diffusion_gemma::state_layout(args).map_err(|error| error.to_string())
             }
@@ -6808,6 +6887,7 @@ impl CompositeConfig<'_> {
             request_optional: true,
         };
         let (graph, counts, transports) = match self {
+            Self::NemotronLabsDiffusion(args) => { let (graph, _) = crate::nemotron_labs_diffusion::parallel::composite_graph(args).map_err(|error| error.to_string())?; (graph, vec![args.vision.as_ref().unwrap().num_hidden_layers as usize, 1, args.num_hidden_layers() as usize], (0..3).map(crate::nemotron_labs_diffusion::parallel::group_transport).collect()) },
             Self::Diffusion(args) => {
                 let (graph, _) = crate::diffusion_gemma::composite::graph(args)
                     .map_err(|error| error.to_string())?;
@@ -7014,6 +7094,7 @@ pub(crate) fn composite_config(
             GgufMediaProjectorConfig::Gemma4(args) => CompositeConfig::Gemma4(args),
             GgufMediaProjectorConfig::Inkling(args) => CompositeConfig::Inkling(args),
             GgufMediaProjectorConfig::MuseGlimmer(args) => CompositeConfig::Muse(args),
+            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => CompositeConfig::NemotronLabsDiffusion(config),
             GgufMediaProjectorConfig::Qwen3Vl(args) => CompositeConfig::QwenVl(args),
             GgufMediaProjectorConfig::Qwen35(args) => CompositeConfig::QwenHybrid(args),
             GgufMediaProjectorConfig::Qwen4Exp(_) => {
@@ -7035,6 +7116,7 @@ pub(crate) fn composite_config(
         plan.safetensors_architecture().map(|plan| plan.model()),
         plan.gguf_plan().map(|plan| plan.model()),
     ) {
+        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) if args.vision.is_some() => Some(CompositeConfig::NemotronLabsDiffusion(args)),
         (Some(SafetensorsModelConfig::DiffusionGemma(args)), None) if args.vision.is_some() => {
             Some(CompositeConfig::Diffusion(args))
         }
@@ -7156,7 +7238,8 @@ fn composite_processor_requirements(
                 Primitive::TensorF32,
                 Primitive::TensorI32,
             ],
-            CompositeConfig::Diffusion(_)
+            CompositeConfig::NemotronLabsDiffusion(_)
+            | CompositeConfig::Diffusion(_)
             | CompositeConfig::Gemma4(_)
             | CompositeConfig::QwenVl(_) => vec![
                 Primitive::RgbResizeBicubic,
@@ -7368,6 +7451,7 @@ fn composite_routed_requirements(
     }
     let recipe_source = artifact::catalog(inspection)?;
     let (owner_group, plan, catalog, routes_per_token) = match config {
+        CompositeConfig::NemotronLabsDiffusion(_) => return Ok(None),
         CompositeConfig::Diffusion(args) => {
             let owner = eredu_runtime::ExecutionGroupId::new(
                 crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP,
@@ -7569,6 +7653,9 @@ fn derive_composite_text_requirements(
             state_layout.clone(),
         )),
     )?;
+    if let CompositeConfig::NemotronLabsDiffusion(args) = &config {
+        execution = execution.with_block_refinement(args.generation_geometry());
+    }
     if let CompositeConfig::Diffusion(args) = &config {
         execution = execution.with_block_refinement(
             eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
@@ -7828,6 +7915,7 @@ where
         state: std::marker::PhantomData,
     };
     match config {
+        CompositeConfig::NemotronLabsDiffusion(args) => construction.nemotron_labs_diffusion(args),
         CompositeConfig::Diffusion(args) => construction.diffusion(args),
         CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
         CompositeConfig::Gemma4(args) => construction.gemma4(args),
@@ -7949,6 +8037,27 @@ where
             effective_model_type,
             cache_identity,
         )
+    }
+
+    #[inline(never)]
+    fn nemotron_labs_diffusion(
+        self,
+        args: &crate::nemotron_labs_diffusion::FamilyConfig,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let capability = crate::capability::nemotron_labs_diffusion(args, true)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let source = self.has_transform.then(|| {
+            args.with_checkpoint_formats(self.source_formats.clone())
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))
+                .and_then(|config| crate::nemotron_labs_diffusion::composite::Model::<B>::new(config, self.context)
+                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string())))
+        }).transpose()?;
+        let target = args.with_checkpoint_formats(self.target_formats.clone())
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        let identity = target.architecture_fingerprint();
+        let architecture = crate::nemotron_labs_diffusion::composite::Model::<B>::new(target, self.context)
+            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+        self.visit(architecture, source, capability, "nemotron_labs_diffusion_vlm".into(), identity)
     }
 
     #[inline(never)]
@@ -8264,7 +8373,8 @@ where
                 cache_identity
             )
         }
-        CompositeConfig::Diffusion(_)
+        CompositeConfig::NemotronLabsDiffusion(_)
+        | CompositeConfig::Diffusion(_)
         | CompositeConfig::Gemma4(_)
         | CompositeConfig::Muse(_)
         | CompositeConfig::QwenVl(_) => Err(ReplicatedTextDispatchError::Architecture(
