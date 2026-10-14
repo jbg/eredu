@@ -134,8 +134,21 @@ that join parts with newlines. `ChatToolCall::from_json_arguments` parses
 serialized historical function arguments into an object, and selected format
 profiles choose their supported template representation. For controlled or
 observed execution, pass the owned request to `prepare_observed_chat_input` or
-`prepare_intervened_chat_input` instead of splitting it. Image decoding and
-application tool aliases remain caller policy.
+`prepare_intervened_chat_input` instead of splitting it. Image decoding remains
+caller policy.
+
+Both typed preparation and `prepare_chat` automatically normalize tool names.
+Pass original application names in declarations, historical calls and named tool
+results, including names such as `extension.search`. Eredu preserves names the
+selected protocol accepts and assigns deterministic, collision-free aliases to
+the others. LFM2 also normalizes non-identifier names and Python keywords.
+Public semantic `ToolCallStart` events restore the exact original names for
+application dispatch. Arguments, schemas, descriptions, call IDs and ordinary
+text are not rewritten. Rendered prompts and literal token/text output contain
+the actual wire names. Duplicate declarations and missing, empty or non-string
+names are rejected. When an unrecognized tool protocol requires name rewriting,
+preparation returns `TextModelError::ToolNames` with an unsupported-dialect error
+rather than guessing its restrictions.
 
 For templates without recognized semantic support, use
 `model.generate_prepared_text(request)` with `PreparedChatGenerationRequest`.

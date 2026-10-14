@@ -80,6 +80,14 @@ pub(crate) struct ConstraintConfiguration {
 
 /// Internal contract shared by declarative and custom format dialects.
 pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
+    /// Restrictions in addition to the shared wire-name validation.
+    fn tool_name_constraint(
+        &self,
+        _parameters: DialectParameters,
+    ) -> Result<ToolNameConstraint, String> {
+        Ok(ToolNameConstraint::Any)
+    }
+
     fn generation_prompt_behavior(
         &self,
         parameters: DialectParameters,
@@ -249,19 +257,22 @@ pub(crate) struct NamedCallIdEncoding {
     pub(crate) index_separator: &'static str,
 }
 
-/// Declarative restrictions imposed on tool names by an output protocol.
+/// Restrictions imposed on function names by a tool output protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolNameConstraint {
     /// Any non-empty tool name accepted by the shared tool-schema parser.
     Any,
     /// ASCII letters, digits, underscores, and dashes up to an exact maximum.
     AsciiAlphanumericUnderscoreDash { max_length: usize },
+    /// An ASCII Python function identifier, excluding Python keywords.
+    PythonIdentifier,
 }
 
 impl ToolNameConstraint {
-    fn validate(self, name: &str) -> Result<(), String> {
+    pub(super) fn validate(self, name: &str) -> Result<(), String> {
         match self {
             Self::Any => Ok(()),
+            Self::PythonIdentifier => super::lfm2::validate_function_name(name),
             Self::AsciiAlphanumericUnderscoreDash { max_length } => {
                 if max_length == 0 {
                     return Err("declarative tool-name limit must be positive".into());
@@ -1592,6 +1603,16 @@ impl DeclarativeDialect {
 }
 
 impl FormatDialect for DeclarativeDialect {
+    fn tool_name_constraint(
+        &self,
+        parameters: DialectParameters,
+    ) -> Result<ToolNameConstraint, String> {
+        Ok(match Self::spec(parameters)?.payload_shape {
+            DeclarativePayloadShape::NamedJsonArguments(encoding) => encoding.name_constraint,
+            _ => ToolNameConstraint::Any,
+        })
+    }
+
     fn generation_prompt_behavior(
         &self,
         parameters: DialectParameters,

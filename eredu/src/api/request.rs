@@ -1731,6 +1731,13 @@ pub(super) fn prepare_chat_from_parts_with_history(
             profile = recognized;
         }
     }
+    let naming = profile
+        .tool_dialect
+        .zip(profile.tool_dialect_parameters)
+        .map(|(dialect, parameters)| dialect.tool_name_constraint(parameters))
+        .transpose()
+        .map_err(TextModelError::ToolConstraint)?;
+    let tool_names = crate::runtime::chat::ToolNameMap::normalize(&mut request, naming)?;
     if let Some(format) = history {
         super::chat_input::lower_tool_arguments(
             &mut request.messages,
@@ -1940,7 +1947,8 @@ pub(super) fn prepare_chat_from_parts_with_history(
                         profile.stop_sequences.clone(),
                         has_tool_surface,
                     )
-                    .map_err(TextModelError::ToolConstraint)?,
+                    .map_err(TextModelError::ToolConstraint)?
+                    .with_tool_names(tool_names),
             )
         }
         None => None,

@@ -13,7 +13,10 @@ pub(crate) mod ifm;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
 mod tokenizer_env;
+mod tool_names;
 pub(crate) mod tool_schema;
+pub use tool_names::ToolNameNormalizationError;
+pub(crate) use tool_names::ToolNameMap;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -70,7 +73,8 @@ pub enum ParallelToolCallPolicy {
 pub struct ChatTemplateRequest {
     /// JSON-valued chat messages in checkpoint template order.
     pub messages: Vec<Value>,
-    /// JSON Schema tool definitions made available to the chat template.
+    /// JSON Schema tool definitions using original application function names.
+    /// Preparation normalizes names for the selected tool protocol.
     pub tools: Vec<Value>,
     /// Whether native tool calls are forbidden, optional, or required.
     pub tool_choice: ToolChoice,
@@ -133,6 +137,7 @@ pub(crate) struct SemanticRuntimePlan {
     dialect: &'static dyn FormatDialect,
     dialect_parameters: DialectParameters,
     tools: Vec<Value>,
+    tool_names: ToolNameMap,
     structural_tokens: Vec<ResolvedStructuralToken>,
     profile_stop_sequences: Vec<String>,
 }
@@ -154,6 +159,7 @@ impl SemanticRuntimePlan {
             dialect,
             dialect_parameters,
             tools,
+            tool_names: ToolNameMap::default(),
             structural_tokens: structural_token_spellings
                 .into_iter()
                 .zip(resolved_structural_token_ids)
@@ -190,6 +196,7 @@ impl SemanticRuntimePlan {
                 .map(String::as_str),
         )
         .with_tool_schemas(&self.tools)
+        .map(|parser| parser.with_tool_names(self.tool_names.clone()))
     }
 }
 
@@ -208,6 +215,7 @@ impl PartialEq for SemanticRuntimePlan {
         std::ptr::eq(self.dialect, other.dialect)
             && self.dialect_parameters.ptr_eq(other.dialect_parameters)
             && self.tools == other.tools
+            && self.tool_names == other.tool_names
             && self.structural_tokens == other.structural_tokens
             && self.profile_stop_sequences == other.profile_stop_sequences
     }
@@ -244,6 +252,11 @@ pub(crate) struct GenerationRuntimePlanParts {
 }
 
 impl GenerationRuntimePlan {
+    pub(crate) fn with_tool_names(mut self, names: ToolNameMap) -> Self {
+        self.semantic.tool_names = names;
+        self
+    }
+
     pub(crate) fn new(parts: GenerationRuntimePlanParts) -> Self {
         debug_assert_eq!(
             parts.structural_token_spellings.len(),
@@ -323,7 +336,8 @@ impl GenerationRuntimePlan {
                 .map(String::as_str),
             std::iter::empty(),
         )
-        .with_tool_schemas(&self.semantic.tools)?;
+        .with_tool_schemas(&self.semantic.tools)?
+        .with_tool_names(self.semantic.tool_names.clone());
         if self.tool_choice == ToolChoice::None {
             parser.disable_tool_calls();
         }

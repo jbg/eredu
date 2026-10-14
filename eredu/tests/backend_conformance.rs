@@ -88,6 +88,8 @@ mod templates;
 mod text;
 #[path = "backend_conformance/chat_input.rs"]
 mod chat_input;
+#[path = "backend_conformance/tool_names.rs"]
+mod tool_names;
 #[path = "backend_conformance/timing.rs"]
 mod timing;
 

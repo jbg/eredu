@@ -809,6 +809,11 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
 
     /// Renders and validates one JSON-valued chat for generation.
     ///
+    /// Tool declarations and history use application names. Preparation assigns
+    /// protocol-valid wire aliases when needed; semantic tool-call events restore
+    /// application names. Rendered prompts and literal token/text output retain
+    /// the actual wire representation.
+    ///
     /// Returns [`TextModelError::MissingChatTemplate`] when no template is
     /// attached. Supply one through [`TextModelOptions`] while loading
     /// or [`Self::set_chat_template`] before preparing a chat.

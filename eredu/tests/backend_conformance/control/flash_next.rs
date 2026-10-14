@@ -97,6 +97,26 @@ fn settings() -> PreparedChatGenerationSettings {
     }
 }
 
+fn normalized_request(thinking: bool, original: &str) -> (ChatTemplateRequest, String) {
+    let mut request = request(thinking);
+    request.tools[0]["function"]["name"] = json!(original);
+    let mut probe = model(None, &[]);
+    let chat = probe.prepare_chat(request.clone()).unwrap();
+    let declaration: Value = serde_json::from_str(
+        chat.rendered_prompt()
+            .split("<tools>\n")
+            .nth(1)
+            .unwrap()
+            .split("\n</tools>")
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let wire = declaration["function"]["name"].as_str().unwrap().to_owned();
+    assert_ne!(wire, original);
+    (request, wire)
+}
+
 fn arguments(events: &[SemanticEvent]) -> Value {
     let fragments: String = events
         .iter()
@@ -114,17 +134,20 @@ fn arguments(events: &[SemanticEvent]) -> Value {
 #[test]
 fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
     for thinking in [false, true] {
+        let original = "goose.extension.lookup";
+        let (normalized_request, wire) = normalized_request(thinking, original);
+        let call_open = format!("<tool_call>\n<function={wire}>\n<parameter=query>\npar");
         let mut pieces = vec![];
         if thinking {
             pieces.extend(["Check nearby places.", "\n</think>\n\n"]);
         }
         pieces.extend([
-            "<tool_call>\n<function=lookup>\n<parameter=query>\npar",
+            call_open.as_str(),
             "is and nearby\n</parameter>\n<parameter=limit>\n",
             "2\n</parameter>\n</function>\n</tool_call>",
         ]);
         let partial_steps = if thinking { 3 } else { 1 };
-        let (mut model, chat, ids) = setup(request(thinking), &pieces);
+        let (mut model, chat, ids) = setup(normalized_request.clone(), &pieces);
         let mut ordinary_events = vec![];
         let ordinary = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
@@ -163,7 +186,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         let call_id = ordinary_events
             .iter()
             .find_map(|event| match event {
-                SemanticEvent::ToolCallStart { index: 0, id, name } if name == "lookup" => {
+                SemanticEvent::ToolCallStart { index: 0, id, name } if name == original => {
                     Some(id.clone())
                 }
                 _ => None,
@@ -242,10 +265,10 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
 
         // Feed the emitted call back as a checkpoint-native assistant message,
         // then execute the tool-result continuation through the same drivers.
-        let mut next = request(thinking);
+        let mut next = normalized_request;
         next.messages.extend([
             json!({"role":"assistant", "content":"", "reasoning_content":reasoning,
-                "tool_calls":[{"id":call_id, "type":"function", "function":{"name":"lookup", "arguments":expected_arguments}}]}),
+                "tool_calls":[{"id":call_id, "type":"function", "function":{"name":original, "arguments":expected_arguments}}]}),
             json!({"role":"tool", "tool_call_id":call_id, "content":"Found two places."}),
         ]);
         let answer = if thinking {
@@ -308,5 +331,64 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
             .unwrap();
         assert_eq!(controlled.token_ids(), ids);
         assert_eq!(semantic(&records), events);
+    }
+}
+
+#[test]
+fn tool_names_restore_through_ordinary_and_controlled_speculative_visitors() {
+    let original = "goose.extension.lookup";
+    let (request, wire) = normalized_request(false, original);
+    let opening = format!("<tool_call>\n<function={wire}>\n<parameter=query>\nparis");
+    let pieces = [
+        opening.as_str(),
+        "unused_8",
+        "unused_9",
+        "unused_10",
+        "\n</parameter>\n<parameter=limit>\n2\n</parameter>\n</function>\n</tool_call>",
+    ];
+    let mut expected = None;
+    for controlled in [false, true] {
+        let mut model = model(Some(7), &pieces);
+        let chat = model.prepare_chat(request.clone()).unwrap();
+        let mut events = Vec::new();
+        let request = eredu::api::PreparedChatSpeculativeGenerationRequest {
+            input: PreparedChatInput::rendered_prompt(&chat),
+            drafting: SpeculativeDraft::Embedded,
+            settings: PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            control_handle: None,
+            on_event: |event| events.push(event),
+        };
+        let tokens = if controlled {
+            model
+                .with_controlled_chat_speculative(request, Default::default(), |session| {
+                    while session.step()?.is_some() {}
+                    Ok(())
+                })
+                .unwrap()
+                .token_ids()
+                .to_vec()
+        } else {
+            model
+                .generate_prepared_chat_speculative(request)
+                .unwrap()
+                .token_ids
+        };
+        assert_eq!(tokens, vec![7, 11]);
+        assert!(events.iter().any(|event| matches!(event,
+            SemanticEvent::ToolCallStart { name, .. } if name == original)));
+        assert_eq!(arguments(&events), json!({"query":"paris", "limit":2}));
+        if let Some(expected) = &expected {
+            assert_eq!(&events, expected);
+        } else {
+            expected = Some(events);
+        }
     }
 }
