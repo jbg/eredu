@@ -9,7 +9,12 @@ permissions:
   contents: read
 jobs:
   native:
-    name: Native backend and consumers
+    name: Native ${{ matrix.suite }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(inputs.full && '["backend", "consumers", "portable"]' || '["backend", "consumers"]') }}
     runs-on: macos-26
     env:
       # FP32 reference tolerances require FP32 GEMM, including on NAX-capable Macs.
@@ -24,52 +29,67 @@ jobs:
           rustup toolchain install
           rustup component add llvm-tools-preview
       - name: Test Apple target mapping
-        if: inputs.full
+        if: inputs.full && matrix.suite == 'backend'
         run: |
           rustc --edition 2021 --test safemlx-sys/build_support.rs -o /tmp/safemlx-build-support-tests
           /tmp/safemlx-build-support-tests
       - name: Install system audio build tools
         run: brew install meson ninja pkg-config
       - name: Install Metal toolchain when required
+        if: matrix.suite != 'portable'
         run: |
           if xcrun --toolchain Metal metal --version; then exit 0; fi
           if xcrun metal --version; then exit 0; fi
           xcodebuild -downloadComponent MetalToolchain
       - uses: ./.github/actions/build-cache
+        if: matrix.suite != 'portable'
         id: cache
         with:
           variant: macos-metal
           rust: 'true'
+          rust-scope: native-${{ matrix.suite }}
       - name: Build the native library
+        if: matrix.suite != 'portable'
         run: cargo build --locked -p safemlx-sys --no-default-features --features metal,accelerate
       - uses: ./.github/actions/save-native-cache
+        if: matrix.suite != 'portable'
         with:
           key: ${{ steps.cache.outputs.native-key }}
           hit: ${{ steps.cache.outputs.native-hit }}
-      - name: Test scoped native backend and CLI consumers
-        if: ${{ !inputs.full }}
+      - name: Test ordinary native backend units
+        if: matrix.suite == 'backend'
+        timeout-minutes: 25
+        run: python3 validation/run_native_unit_tests.py --suite-timeout 900 --results-dir target/native-results/unit --fail-fast
+      - name: Test native CLI consumers
+        if: ${{ !inputs.full && matrix.suite == 'consumers' }}
+        run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
+      - name: Test native workspace consumers
+        if: inputs.full && matrix.suite == 'consumers'
         run: |
-          python3 validation/run_native_unit_tests.py
-          cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
-      - name: Test the macOS workspace
-        if: inputs.full
-        run: |
-          python3 validation/run_native_unit_tests.py
-          cargo test --locked --workspace --exclude eredu-backend-mlx --timings --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
+          cargo test --locked -p eredu -p eredu-cli -p safemlx -p safemlx-sys -p safemlx-tests \
+            -p safemlx-internal-macros -p eredu-backend-mlx-macros -p eredu-ios --timings \
+            --features eredu-backend-mlx/metal,eredu-backend-mlx/accelerate -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
+      - name: Test portable workspace crates
+        if: matrix.suite == 'portable'
+        run: |
+          cargo test --locked -p eredu-gguf -p eredu-core -p eredu-text -p eredu-checkpoint \
+            -p eredu-nn -p eredu-nn-macros -p eredu-runtime -p eredu-architectures \
+            -p eredu-codec -p eredu-media -p eredu-evaluation --features eredu-media/image,eredu-media/audio --timings
       - name: Test native integration and documentation targets
+        if: matrix.suite == 'backend'
         run: |
           cargo test --locked -p eredu-backend-mlx --features metal,accelerate --test '*' --examples --timings
           cargo test --locked -p eredu-backend-mlx --features metal,accelerate --doc --timings
       - name: Test MLX neutral semantic operator parity
-        if: inputs.full
+        if: inputs.full && matrix.suite == 'backend'
         run: |
           cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::nn::shared::tests::mlx_ -- \
             --ignored
       - name: Test Metal cache residency and prefetch regressions
-        if: inputs.full
+        if: inputs.full && matrix.suite == 'backend'
         run: |
           cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::io::manager::tests::metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets -- \
@@ -77,22 +97,25 @@ jobs:
           cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::io::manager::tests::two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization -- \
             --ignored --exact
-      - name: Test full Ring conformance
-        if: inputs.full
+      - name: Test Ring PR smoke contracts
+        if: matrix.suite == 'backend'
+        timeout-minutes: 10
         run: |
-          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib _ring:: -- \
-            --ignored --skip moshi_ring_tp2_native_model_parity \
-            --skip moshi_ring_tp2_personaplex_model_parity --test-threads=1
+          python3 validation/run_native_unit_tests.py --suite ring-smoke \
+            --test-timeout 180 --suite-timeout 480 --fail-fast --results-dir target/native-results/ring-smoke
       - name: Test concurrent MLX use
-        if: inputs.full
+        if: inputs.full && matrix.suite == 'consumers'
         run: cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-timings
-          path: target/cargo-timings
+          name: native-${{ matrix.suite }}-results
+          path: |
+            target/cargo-timings
+            target/native-results
           retention-days: 7
       - uses: ./.github/actions/save-rust-cache
+        if: matrix.suite != 'portable'
         with:
           key: ${{ steps.cache.outputs.rust-key }}
           hit: ${{ steps.cache.outputs.rust-hit }}

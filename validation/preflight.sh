@@ -3,10 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib \
-  composition::mlx_architecture_conformance::native_mlx_execution_is_available -- --exact
-# Keep normal test-runner parallelism: contention exposed the session defects.
-cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib
-cargo test --locked -p eredu-backend-mlx --features metal,accelerate --lib _ring:: -- \
-  --ignored --skip moshi_ring_tp2_native_model_parity \
-  --skip moshi_ring_tp2_personaplex_model_parity --test-threads=1
+export MLX_ENABLE_TF32="${MLX_ENABLE_TF32:-0}"
+python3 validation/run_native_unit_tests.py --fail-fast
+python3 validation/run_native_unit_tests.py --suite ring-smoke --test-timeout 180 --suite-timeout 480 --fail-fast

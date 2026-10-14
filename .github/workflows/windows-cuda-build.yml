@@ -33,6 +33,7 @@ jobs:
   build:
     name: CUDA ${{ inputs.cuda }} / cuDNN 9 / MSVC
     runs-on: windows-2022
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
