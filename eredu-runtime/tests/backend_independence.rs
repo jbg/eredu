@@ -86,6 +86,13 @@ impl Tensor for FakeTensor {
         &self.0
     }
 
+    fn cast_float(&self, element: eredu_nn::TensorElementType, _: &()) -> Result<Self, Error> {
+        match element {
+            eredu_nn::TensorElementType::F32 => Ok(self.clone()),
+            _ => Err(Error::backend("the fake tensor only supports F32")),
+        }
+    }
+
     fn unloaded_f32(shape: &[i32], _: &()) -> Result<Self, Error> {
         Ok(Self(shape.to_vec()))
     }
