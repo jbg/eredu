@@ -2651,8 +2651,10 @@ uses a separate set of results. Preparation retains both successful selections a
 rejections for each normalized request and the actual neutral mechanism facts
 consulted by that selection; changed backend facts require a new selection. These
 results are local to the admitted artifact's lifetime, not a filesystem or global
-model cache. Retained composite source snapshots do not own their enclosing
-validation storage, avoiding ownership cycles.
+model cache. A selected preparation retains the complete admitted artifact,
+including any embedded predictor, separately from its target execution projection.
+Retained architecture and composite source snapshots keep immutable declarations
+without owning the enclosing selection cache, avoiding ownership cycles.
 
 Automatic planning retains each exact candidate's admission and bounded geometry
 through feedback and final selection. Loading reuses the architecture's selected

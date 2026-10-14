@@ -1187,7 +1187,9 @@ pub struct SelectedPreparation {
 
 impl SelectedPreparation {
     pub(crate) fn with_retained_architecture(mut self, architecture: crate::processor_plan::ArtifactArchitecturePlan) -> Self {
-        self.retained_architecture = Some(architecture);
+        // Source preparation needs the complete admitted artifact, including
+        // its predictor. Retain declarations without the cache that owns this selection.
+        self.retained_architecture = Some(architecture.without_validation());
         self
     }
     pub(crate) fn retained_architecture(&self) -> Option<&crate::processor_plan::ArtifactArchitecturePlan> {
