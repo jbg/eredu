@@ -102,6 +102,41 @@ Supply an explicit template before preparing chat. Calling
 Custom templates use the same rendering and protocol checks as checkpoint
 templates; supplying one does not by itself enable native tools or reasoning.
 
+`prepare_chat_input` accepts typed conversation content and historical tool calls,
+prepares the backend input, and returns separate text-token, media-position and
+total model-position counts. Images use decoded `eredu_core::RgbImage` buffers:
+
+```rust,ignore
+use eredu::api::{ChatInputRequest, ChatMessage, ChatPart, ChatPreparationOptions};
+
+let prepared = model.prepare_chat_input(ChatInputRequest {
+    messages: vec![ChatMessage::User(vec![
+        ChatPart::Text("Describe this image: ".into()),
+        ChatPart::Image(rgb_image),
+    ])],
+    options: ChatPreparationOptions {
+        add_generation_prompt: true,
+        ..Default::default()
+    },
+    ..Default::default()
+})?;
+let input_positions = prepared.count().model_positions;
+let (chat, payload) = prepared.into_parts();
+let input = payload.into_input(&model, &chat)?;
+// Supply `input` to an ordinary or speculative prepared-generation request.
+```
+
+`prepare_typed_chat` exposes rendered semantic/tool support before
+`materialize_chat_input` allocates the media prompt. Text-only backends use
+`prepare_chat_text_input`. Content concatenates without a separator by default;
+set `ChatContentFormat::String { separator: "\n".into() }` when adapting histories
+that join parts with newlines. `ChatToolCall::from_json_arguments` parses
+serialized historical function arguments into an object, and selected format
+profiles choose their supported template representation. For controlled or
+observed execution, pass the owned request to `prepare_observed_chat_input` or
+`prepare_intervened_chat_input` instead of splitting it. Image decoding and
+application tool aliases remain caller policy.
+
 For templates without recognized semantic support, use
 `model.generate_prepared_text(request)` with `PreparedChatGenerationRequest`.
 For supported drafting, use `generate_prepared_text_speculative` or

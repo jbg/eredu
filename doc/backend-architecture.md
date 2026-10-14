@@ -4934,6 +4934,52 @@ and cache persistence before publication.
 
 ## Text and multimodal generation
 
+The facade's `ChatInputRequest` accepts ordered typed `ChatMessage` values,
+decoded text/image/audio/video `ChatPart` values, tool declarations, and parsed
+historical `ChatToolCall` arguments. `ChatPreparationOptions` retains the existing
+tool, thinking, reasoning-effort, generation-prompt and template-variable policy.
+String content concatenates parts with an explicit separator (empty by default);
+`ChatContentFormat::TextParts` supplies ordered text objects to templates that
+expect arrays. These representations use internal media bindings rather than
+checkpoint-specific image URL objects. Templates must preserve each binding
+exactly once and in order. Bindings avoid caller/template spelling collisions,
+are deterministic for unchanged inputs, and never enter tokenization.
+
+`LoadedModel::prepare_typed_chat` performs portable lowering, format-profile
+argument selection, template rendering and binding validation. Its
+`PreparedTypedChat` permits capability inspection before native materialization.
+`materialize_chat_input` consumes this retained conversation through ordinary
+`MultimodalPreparationBackend` mechanisms; `prepare_chat_input` combines both
+phases. Text-only backends use `prepare_chat_text_input` or
+`materialize_chat_text_input`, without implementing media or capability traits.
+`PreparedChatRequest` owns the rendered `PreparedChat` and an opaque payload
+with `InputTokenCount`: context admission uses `model_positions`, while
+`text_tokens` and `media_positions` retain their separate meanings. Splitting
+the request and converting its payload with `into_input` produces the existing
+generation input. Typed payloads retain their loaded-session and rendered-chat
+identities through ordinary, speculative and forecast admission.
+
+Typed tool arguments are JSON objects. `ChatToolCall::from_json_arguments`
+parses serialized history once, rejecting malformed JSON and non-object values.
+Automatic lowering prefers established mapping support, then established
+serialized-string support, and uses mappings for unrecognized custom templates.
+An explicit argument format overrides that representation; existing protocol
+validation still applies. The raw JSON-valued `ChatTemplateRequest` entry point
+keeps caller-provided message representation unchanged. Application visibility,
+tool aliases, emulation, fallback choice and encoded-media transport remain
+caller policy; the typed API accepts decoded portable buffers without optional
+host codec dependencies.
+
+`prepare_observed_chat_input` and `prepare_intervened_chat_input` admit the same
+counted typed request for observed or controlled execution. Text retains its
+encoded IDs; media uses `ModelCapabilityBackend::prepared_input_token_ids` for
+complete decoder alignment, whose length must equal the counted model positions.
+The MLX adapter delegates to architecture-owned semantic token construction,
+including declared media placeholders and original projected-input IDs. Native
+inspection reads those integer IDs rather than inferring IDs from embeddings.
+Adapters without alignment observation return `BackendFailureKind::Unsupported`.
+Public preparation errors retain native failures as `BackendFailure` sources.
+
 `TextGenerationBackend` submits complete prefill-and-sample and
 decode-and-sample operations. The backend owns logits, sampler state,
 randomness, and token handles. Portable generation code owns token budgets,

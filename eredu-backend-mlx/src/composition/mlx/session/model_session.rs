@@ -1050,6 +1050,15 @@ impl MlxModelSession {
         self.payload.model.architecture_capability_estimate()
     }
 
+    pub(in crate::composition::mlx) fn prepared_input_token_ids(
+        &self,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Vec<u32>, Error> {
+        self.ensure_no_submission_in_flight()?;
+        self.payload.model.prepared_input_token_ids(input, stream)
+    }
+
     pub(in crate::composition::mlx) fn prepared_input_plans(
         &self,
         input: crate::backend::runtime::media::input::ModelInput<'_>,

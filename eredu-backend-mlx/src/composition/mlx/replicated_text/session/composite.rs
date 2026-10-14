@@ -850,6 +850,19 @@ where
         Ok(self.published(output))
     }
 
+    fn prepared_input_token_ids(
+        &self,
+        input: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Vec<u32>, Error> {
+        let (prepared, admitted, _) = self.prepare(input)?;
+        let paired = PreparedCompositeInput::new(&prepared, &admitted)
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let tokens = A::prepared_prediction_token_ids(paired, stream)
+            .map_err(|error| Error::Other(Box::new(error)))?;
+        input::host_token_ids(tokens.as_array())
+    }
+
     fn prepared_input_plans(
         &self,
         input: input::ModelInput<'_>,

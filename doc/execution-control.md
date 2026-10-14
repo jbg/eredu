@@ -1,5 +1,19 @@
 # Execution control
 
+Typed chat preparation uses the ordinary shared drivers. A counted
+`PreparedChatRequest` enters capture/control admission through
+`prepare_observed_chat_input`, or `prepare_intervened_chat_input` for prospective
+interventions, and then uses `start_controlled_chat` or `start_controlled_text`.
+The request retains the exact text IDs or native prepared media prompt;
+controlled startup does not render or encode it again. Media alignment includes
+architecture-declared placeholder IDs and must cover every counted decoder
+position. MLX obtains these IDs through the architecture's existing semantic
+token construction. An adapter without `prepared_input_token_ids` observation
+rejects typed media capture/control admission with
+`BackendFailureKind::Unsupported`; ordinary and speculative execution can still
+consume its counted payload. Missing alignment is an adapter observation gap,
+not a model-family limitation.
+
 Prepared source-backed requests and ordinary requests use
 `PreparedChatGenerationSettings.decoding_mode` for initial selection. Omission
 selects AR for a causal target; self-speculation carries its options in the mode.

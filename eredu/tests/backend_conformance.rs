@@ -86,6 +86,8 @@ mod preparation;
 mod templates;
 #[path = "backend_conformance/text.rs"]
 mod text;
+#[path = "backend_conformance/chat_input.rs"]
+mod chat_input;
 #[path = "backend_conformance/timing.rs"]
 mod timing;
 
@@ -718,6 +720,12 @@ impl MultimodalPreparationBackend for MockBackend {
 }
 
 impl ModelCapabilityBackend for MockBackend {
+    fn prepared_input_token_ids(
+        _: &ModelRuntime<Self>,
+        input: &Self::Prompt,
+    ) -> Result<Vec<u32>, eredu_core::BackendFailure> {
+        Ok(input.clone())
+    }
     fn trim_parameter_conversions(
         runtime: &mut ModelRuntime<Self>,
     ) -> Result<
@@ -777,7 +785,14 @@ impl ModelCapabilityBackend for MockBackend {
         _: &ModelRuntime<Self>,
         input: &Self::Prompt,
     ) -> Result<InputTokenCount, CapabilityError> {
-        Ok(InputTokenCount::text(input.len() as u64))
+        let media = input.iter().filter(|id| **id == 2_001).count() as u64;
+        Ok(InputTokenCount::prepared(
+            input.len() as u64 - media,
+            media,
+            input.len() as u64,
+            0,
+            eredu_core::ObservationKind::Exact,
+        ))
     }
 
     fn estimate_runtime_state(

@@ -21,6 +21,30 @@ pub type InputPart = RuntimeInputPart<Array>;
 /// MLX specialization of the backend-neutral runtime payload container.
 pub type InputPayload = PreparedInputPayload<Array>;
 
+/// Reads original or architecture-declared token IDs, without interpreting embeddings.
+pub(crate) fn host_token_ids(tokens: &Array) -> Result<Vec<u32>, crate::backend::error::Error> {
+    use crate::backend::error::Error;
+    let evaluated = tokens.evaluated()?;
+    match tokens.dtype() {
+        Dtype::Uint32 => evaluated
+            .try_to_vec::<u32>()
+            .map_err(|error| Error::Other(Box::new(error))),
+        Dtype::Int32 => evaluated
+            .try_to_vec::<i32>()
+            .map_err(|error| Error::Other(Box::new(error)))?
+            .into_iter()
+            .map(|id| {
+                u32::try_from(id).map_err(|_| Error::ArchitectureModel(
+                    "decoder alignment contains a negative token ID".into(),
+                ))
+            })
+            .collect(),
+        _ => Err(Error::ArchitectureModel(
+            "decoder alignment requires integer token IDs".into(),
+        )),
+    }
+}
+
 /// Ordered runtime input for model prefill.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelInput<'a> {
