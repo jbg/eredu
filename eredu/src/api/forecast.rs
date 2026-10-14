@@ -302,7 +302,11 @@ impl<B: GenerationForecastBackend> LoadedModel<B> {
         options: &GenerationForecastOptions,
         instrumented: bool,
     ) -> Result<GenerationForecast, GenerationForecastError> {
+        input
+            .validate_session(&self.session_identity)
+            .map_err(|error| CapabilityError::Observation(error.to_string()))?;
         let count = match input {
+            PreparedChatInput::SessionBound { payload, .. } => payload.count(),
             PreparedChatInput::RenderedPrompt(chat) => self.count_prepared_chat(chat)?,
             PreparedChatInput::TokenIds { token_ids, .. } => self.count_token_ids(token_ids)?,
             PreparedChatInput::PreparedBackendInput { prompt, .. } => {

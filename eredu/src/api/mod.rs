@@ -13,6 +13,8 @@ mod errors;
 pub use errors::{DevicePlanError, ExpertCacheBenchmarkError};
 
 mod media;
+mod chat_input;
+pub use chat_input::*;
 mod metadata;
 mod portable;
 pub mod realtime;

@@ -975,6 +975,23 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         ))
     }
 
+    fn prepared_input_token_ids(
+        &self,
+        input: input::ModelInput<'_>,
+        _stream: &Stream,
+    ) -> Result<Vec<u32>, Error> {
+        let mut ids = Vec::new();
+        for part in input.parts {
+            let input::InputPayload::TokenIds(tokens) = part.payload() else {
+                return Err(Error::ArchitectureModel(
+                    "text executable requires token-ID input for decoder alignment".into(),
+                ));
+            };
+            ids.extend(input::host_token_ids(tokens)?);
+        }
+        Ok(ids)
+    }
+
     fn prepared_input_plans(
         &self,
         input: input::ModelInput<'_>,

@@ -68,6 +68,14 @@ fn estimate_mlx_runtime_state(
 }
 
 impl Executable {
+    pub(super) fn prepared_input_token_ids(
+        &self,
+        input: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<Vec<u32>, crate::backend::error::Error> {
+        self.erased().prepared_input_token_ids(input, stream)
+    }
+
     pub(super) fn prepared_input_plans(
         &self,
         input: input::ModelInput<'_>,
@@ -371,6 +379,17 @@ fn add_parameter_observation(
 }
 
 impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
+    fn prepared_input_token_ids(
+        runtime: &ModelRuntime<Self>,
+        input: &Self::Prompt,
+    ) -> Result<Vec<u32>, eredu_core::BackendFailure> {
+        input
+            .with_borrowed(|input| {
+                runtime.session().prepared_input_token_ids(input, runtime.backend().stream())
+            })
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
     fn trim_parameter_conversions(
         runtime: &mut eredu_core::ModelRuntime<Self>,
     ) -> Result<

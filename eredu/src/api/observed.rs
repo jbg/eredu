@@ -347,7 +347,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.admit_prepared_interventions(prepared, intervention)
     }
 
-    fn admit_prepared_interventions(
+    pub(super) fn admit_prepared_interventions(
         &self,
         mut prepared: PreparedObservedGeneration<B>,
         intervention: InterventionPlan,

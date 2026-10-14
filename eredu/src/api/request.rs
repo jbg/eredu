@@ -56,6 +56,13 @@ pub struct PreparedChatGenerationSettings {
 /// The generation method selects semantic parsing or literal text output.
 /// The selected variant determines only how the model prompt is prefetched.
 pub enum PreparedChatInput<'a, B: eredu_core::TextGenerationBackend> {
+    /// Counted typed input whose loaded-session and chat identity are checked at execution.
+    SessionBound {
+        /// Exact rendered chat paired with the payload.
+        prepared_chat: &'a PreparedChat,
+        /// Opaque counted prompt from typed preparation.
+        payload: super::PreparedChatPayload<B>,
+    },
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
     RenderedPrompt(&'a PreparedChat),
     /// Prefill exact token IDs with the chat's semantic and termination policy.
@@ -106,6 +113,7 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
         match self {
             Self::RenderedPrompt(prepared_chat)
             | Self::TokenIds { prepared_chat, .. }
+            | Self::SessionBound { prepared_chat, .. }
             | Self::PreparedBackendInput { prepared_chat, .. } => prepared_chat,
         }
     }
@@ -113,8 +121,26 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
     /// Returns the explicitly prepared backend prompt, when present.
     pub const fn backend_prompt(&self) -> Option<&B::Prompt> {
         match self {
+            Self::SessionBound { payload, .. } => payload.backend_prompt(),
             Self::RenderedPrompt(_) | Self::TokenIds { .. } => None,
             Self::PreparedBackendInput { prompt, .. } => Some(prompt),
+        }
+    }
+
+    pub(super) fn validate_session(
+        &self,
+        session: &str,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        if let Self::SessionBound { prepared_chat, payload } = self {
+            payload.validate_session(session, prepared_chat)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_unbound(self) -> Self {
+        match self {
+            Self::SessionBound { prepared_chat, payload } => payload.into_unbound(prepared_chat),
+            input => input,
         }
     }
 }
@@ -1666,6 +1692,20 @@ pub(crate) fn prepare_chat_from_parts(
     constraint_compiler: Option<&Result<ConstraintCompiler, String>>,
     request: ChatTemplateRequest,
 ) -> Result<PreparedChat, TextModelError> {
+    prepare_chat_from_parts_with_history(
+        tokenizer, template, model_id, eos_token_ids, constraint_compiler, request, None,
+    )
+}
+
+pub(super) fn prepare_chat_from_parts_with_history(
+    tokenizer: &mut ChatTokenizer,
+    template: ModelChatTemplate,
+    model_id: &str,
+    eos_token_ids: &[u32],
+    constraint_compiler: Option<&Result<ConstraintCompiler, String>>,
+    mut request: ChatTemplateRequest,
+    history: Option<super::ChatToolArgumentFormat>,
+) -> Result<PreparedChat, TextModelError> {
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let selected_template = match &template_identity {
@@ -1690,6 +1730,14 @@ pub(crate) fn prepare_chat_from_parts(
         {
             profile = recognized;
         }
+    }
+    if let Some(format) = history {
+        super::chat_input::lower_tool_arguments(
+            &mut request.messages,
+            format,
+            profile.supports_mapping_tool_arguments,
+            profile.supports_string_tool_arguments,
+        )?;
     }
     if profile
         .identity

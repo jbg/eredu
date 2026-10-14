@@ -294,6 +294,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             if cancellation.is_cancelled() {
                 return Ok(None);
             }
+            input
+                .validate_session(&self.session_identity)
+                .map_err(PreparedChatError::Backend)?;
             let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
             self.validate_refinement_canvas(canvas.as_deref())?;
             let config = config.with_refinement_canvas(canvas);
@@ -306,7 +309,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                 .map_err(map_prepared_chat_setup_error)?;
             // Tokenization is part of host readiness. Native construction follows
             // only after every rank accepted its local policy and exact prefix.
-            let input = match input {
+            let input = match input.into_unbound() {
                 PreparedChatInput::RenderedPrompt(chat) => PreparedChatInput::token_ids(
                     chat,
                     self.tokenizer
@@ -350,6 +353,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
             PreparedChatInput::PreparedBackendInput { prompt, .. } => Ok(prompt),
             PreparedChatInput::RenderedPrompt(_) => {
                 unreachable!("host preparation tokenized the prompt")
+            }
+            PreparedChatInput::SessionBound { .. } => {
+                unreachable!("host preparation validated the session")
             }
         };
         let prompt = self.runtime.finish_text_preparation(
@@ -679,6 +685,9 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
                         PreparedChatInput::RenderedPrompt(_) => {
                             unreachable!("host preparation tokenized the prompt")
                         }
+                        PreparedChatInput::SessionBound { .. } => {
+                            unreachable!("host preparation validated the session")
+                        }
                     };
                     Ok(SpeculativeGenerationLane::new(
                         prompt,
@@ -716,6 +725,10 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         ),
         PreparedChatSpeculativeError,
     > {
+        input
+            .validate_session(&self.session_identity)
+            .map_err(PreparedChatSpeculativeError::Backend)?;
+        let input = input.into_unbound();
         let prepared_chat = input.prepared_chat();
         let control = mode
             .prepare_control(

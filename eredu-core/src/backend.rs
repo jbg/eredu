@@ -2210,6 +2210,23 @@ pub trait ModelCapabilityBackend: TextGenerationBackend {
         input: &Self::Prompt,
     ) -> Result<InputTokenCount, CapabilityError>;
 
+    /// Observes complete ordered decoder IDs for capture and controlled admission.
+    /// Includes architecture-declared media placeholders and supplied original
+    /// IDs for projected text. Never reconstructs IDs from embeddings. An adapter
+    /// without alignment observation returns a typed unavailable-capability failure.
+    fn prepared_input_token_ids(
+        _runtime: &ModelRuntime<Self>,
+        _input: &Self::Prompt,
+    ) -> Result<Vec<u32>, crate::BackendFailure> {
+        Err(crate::BackendFailure::new(
+            crate::BackendFailureKind::Unsupported,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "prepared decoder token alignment is unavailable",
+            ),
+        ))
+    }
+
     /// Estimates persistent and transient request state for this session.
     fn estimate_runtime_state(
         runtime: &ModelRuntime<Self>,
