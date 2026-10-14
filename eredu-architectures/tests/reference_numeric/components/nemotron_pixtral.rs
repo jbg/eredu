@@ -215,9 +215,9 @@ impl LayerwisePolicy<NumericBackend, CompositeUnit> for FixturePolicy {
 #[test]
 fn prepared_pixtral_ingress_observes_independent_patch_embeddings() {
     use eredu_architectures::composite_execution::PreparedCompositeArchitecture;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     let context = NumericContext::default();
@@ -279,9 +279,9 @@ fn prepared_pixtral_ingress_observes_independent_patch_embeddings() {
 
 #[test]
 fn vlm_image_markers_and_cached_modes_match_independent_context_in_resident_bounded_and_tp2() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let mut config_json = fixture["config"].clone();
     config_json["num_key_value_heads"] = 2.into();
@@ -573,9 +573,9 @@ fn vlm_image_markers_and_cached_modes_match_independent_context_in_resident_boun
 fn vlm_rejects_conflicting_image_positions_and_projected_patch_counts() {
     use eredu_core::{CapabilityError, InputExtent, InputModality};
     use eredu_runtime::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     for projected in [false, true] {
@@ -658,9 +658,9 @@ fn populate<M: Parameterized<NumericTensor>>(module: &mut M, fixture: &serde_jso
 
 #[test]
 fn pixtral_head_and_channel_shards_match_published_image_outputs() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     let vision = config.vision.as_ref().unwrap();
@@ -771,9 +771,9 @@ fn pixtral_head_and_channel_shards_match_published_image_outputs() {
 
 #[test]
 fn pixtral_layers_and_spatial_projector_match_published_equations() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     let context = NumericContext::default();
@@ -850,9 +850,9 @@ fn pixtral_layers_and_spatial_projector_match_published_equations() {
 #[test]
 fn pixtral_internal_hooks_consume_interventions_at_independent_media_extents() {
     use eredu_runtime::ActivationObserver;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     let context = NumericContext::default();
@@ -946,9 +946,9 @@ fn vlm_pipeline_cuts_keep_vision_projector_and_text_storage_local_across_all_mod
         LayeredPartitionInput, LayeredPartitionOutput, PartitionOwnership,
         PartitionedLayeredArchitecture,
     };
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let mut value = fixture["config"].clone();
     value["num_key_value_heads"] = 2.into();
@@ -1049,7 +1049,7 @@ fn vlm_pipeline_cuts_keep_vision_projector_and_text_storage_local_across_all_mod
                         let mut owned = Vec::new();
                         for address in selected.units() { let mut unit = model.construct_unit(address.group(), address.index(), &context).unwrap(); populate_vision(&mut unit, fixture, Some(&layout)); owned.push((address.group(), address.index(), unit)); }
                         assert!(model.construct_unit(0, 2, &context).is_err());
-                        if stage < 2 { assert!(model.state_layout().is_err(), "vision owners allocate no fake text cache"); }
+                        if stage < 2 { assert!(state.as_ref().is_empty(), "vision owners allocate no fake text cache"); }
                         parts.push(model); states.push(state); units.push(owned);
                     }
                     let storage = |parts: &[Part<NumericBackend>], units: &[Vec<(usize,usize,CompositeUnit)>]| {

@@ -221,40 +221,50 @@ fn prepared_partition_equations(with_adapter: bool) {
                         let (inspection, plan, parameters, calls) =
                             (&inspection, &plan, &parameters, &calls);
                         let world = Arc::clone(&world);
-                        scope.spawn(move || {
-                            let sources = partitioned_adapter::prepare_plan(
-                                inspection,
-                                plan,
-                                rank,
-                                std::time::Duration::from_secs(30),
-                            )
-                            .unwrap();
-                            let layout = eredu_runtime::derive_partitioned_local_layout(
-                                parameters,
-                                ParallelRankTopology::new(topology, rank).unwrap(),
-                            )
-                            .unwrap();
-                            let mut context = NumericContext::with_partition(layout, rank, world);
-                            context.bind_checkpoint_values = true;
-                            let mut executable =
-                                partitioned_adapter::dense(sources, &context).unwrap();
-                            calls
-                                .iter()
-                                .map(|(tokens, invocation, frontier)| {
-                                    let output = executable
-                                        .attention(&NumericTensor::token_ids(tokens), *invocation)
-                                        .unwrap();
-                                    assert!(
-                                        executable
-                                            .positions()
-                                            .unwrap()
-                                            .iter()
-                                            .all(|offset| offset == frontier)
-                                    );
-                                    output
-                                })
-                                .collect::<Vec<_>>()
-                        })
+                        // Generic prepared construction needs the same bounded worker
+                        // stack as the DiffusionGemma partition fixture on Linux.
+                        std::thread::Builder::new()
+                            .name(format!("nemotron-prepared-rank-{rank}"))
+                            .stack_size(8 << 20)
+                            .spawn_scoped(scope, move || {
+                                let sources = partitioned_adapter::prepare_plan(
+                                    inspection,
+                                    plan,
+                                    rank,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .unwrap();
+                                let layout = eredu_runtime::derive_partitioned_local_layout(
+                                    parameters,
+                                    ParallelRankTopology::new(topology, rank).unwrap(),
+                                )
+                                .unwrap();
+                                let mut context =
+                                    NumericContext::with_partition(layout, rank, world);
+                                context.bind_checkpoint_values = true;
+                                let mut executable =
+                                    partitioned_adapter::dense(sources, &context).unwrap();
+                                calls
+                                    .iter()
+                                    .map(|(tokens, invocation, frontier)| {
+                                        let output = executable
+                                            .attention(
+                                                &NumericTensor::token_ids(tokens),
+                                                *invocation,
+                                            )
+                                            .unwrap();
+                                        assert!(
+                                            executable
+                                                .positions()
+                                                .unwrap()
+                                                .iter()
+                                                .all(|offset| offset == frontier)
+                                        );
+                                        output
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap()
                     })
                     .collect::<Vec<_>>();
                 handles
@@ -285,10 +295,9 @@ pub(crate) fn draft_adapter_fixture(
 ) {
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     let root = tempfile::tempdir().unwrap();
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    ))
-    .unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON)
+            .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 4.into();
     let bytes = serde_json::to_vec(&json).unwrap();

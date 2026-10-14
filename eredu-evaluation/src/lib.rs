@@ -8,6 +8,7 @@ mod checkpoint;
 pub mod component_attribution;
 mod distribution;
 mod evidence;
+pub mod nemotron_labs_diffusion;
 pub mod execution_control;
 pub mod gguf;
 pub mod intervention;

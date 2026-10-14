@@ -720,10 +720,9 @@ fn ring_matrix(adapter: bool, bfloat: bool) {
             }
         }
     }
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let combined_only = adapter || std::env::var_os("EREDU_NEMOTRON_RING_COMBINED_ONLY").is_some();
     for (vision, mut config) in [(false, config()), (true, fixture["config"].clone())] {

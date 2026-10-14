@@ -628,10 +628,9 @@ fn loaded_nemotron_shared_drafts_preserve_causal_frontier_across_residency_polic
 
 #[test]
 fn loaded_pixtral_context_survives_shared_backbone_drafting_in_bounded_execution() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    )))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let mut config = fixture["config"].clone();
     config["block_size"] = 3.into();

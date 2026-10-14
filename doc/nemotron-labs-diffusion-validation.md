@@ -670,7 +670,7 @@ cargo run -p eredu-backend-mlx --no-default-features --features metal \
 ```sh
 python eredu-evaluation/scripts/nemotron_pixtral_fixture.py \
   /private/tmp/eredu-nemotron-reference/VLM-8B \
-  eredu-architectures/tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json
+  eredu-evaluation/fixtures/nemotron_labs_diffusion/pixtral-numeric.json
 cargo test -p eredu-architectures --test reference_numeric nemotron_pixtral::
 ```
 

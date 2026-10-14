@@ -28,10 +28,9 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
     let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
     write_tensor_plan(&root.0, resolved.architecture.checkpoint());
     let adapter = fixture(false);
-    let mut declaration: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    )))
+    let mut declaration: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     declaration["r"] = 2.into();
     declaration["lora_alpha"] = 4.into();

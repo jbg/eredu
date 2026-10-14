@@ -276,9 +276,9 @@ fn nemotron_draft_adapter_is_invocation_local_and_preserves_base_storage() {
     use eredu_architectures::nemotron_labs_diffusion::adapter::DraftAdapterConfig;
     let config = family();
     let context = NumericContext::default();
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    ))
+    let mut json: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 8.into();
@@ -485,9 +485,9 @@ fn nemotron_tp2_alternates_causal_diffusion_and_adapted_draft_on_one_base() {
         source[key] = value.into();
     }
     let config = FamilyConfig::from_hf_value(&source).unwrap();
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    ))
+    let mut json: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 8.into();
@@ -618,9 +618,9 @@ fn nemotron_pp2_and_tp2_pp2_transport_modes_frontiers_and_complete_canvases() {
     ] {
         source[key] = value.into();
     }
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    ))
+    let mut json: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 8.into();

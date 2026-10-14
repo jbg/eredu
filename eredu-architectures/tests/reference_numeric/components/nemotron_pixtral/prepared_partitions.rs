@@ -13,10 +13,9 @@ fn pixtral_prepared_draft_adapter_keeps_media_context_and_exact_rank_collective_
 
 fn pixtral_prepared_partition_equations(with_adapter: bool) {
     use eredu_architectures::composite_execution::CompositeArchitecture;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON)
+            .unwrap();
     let mut config_json = fixture["config"].clone();
     config_json["num_attention_heads"] = 4.into();
     config_json["num_key_value_heads"] = 2.into();
@@ -167,7 +166,12 @@ fn pixtral_prepared_partition_equations(with_adapter: bool) {
                         let (inspection, plan, description, inputs, expected) =
                             (&inspection, &plan, &description, &inputs, &expected);
                         let world = Arc::clone(&world);
-                        scope.spawn(move || {
+                        // Generic prepared construction needs the same bounded worker
+                        // stack as the DiffusionGemma partition fixture on Linux.
+                        std::thread::Builder::new()
+                            .name(format!("pixtral-prepared-rank-{rank}"))
+                            .stack_size(8 << 20)
+                            .spawn_scoped(scope, move || {
                             let sources =
                                 partitioned_adapter::prepare_plan_with_banks_and_sequence_maximum(
                                     inspection,
@@ -203,7 +207,8 @@ fn pixtral_prepared_partition_equations(with_adapter: bool) {
                                     output
                                 })
                                 .collect::<Vec<_>>()
-                        })
+                            })
+                            .unwrap()
                     })
                     .collect::<Vec<_>>();
                 handles

@@ -178,7 +178,8 @@ fn optimistic_semantic_stop_truncates_an_accepted_block_transactionally() {
     assert_eq!(request.sampler.process_calls, 2);
     assert_eq!(request.stats.optimistic_draft_blocks(), 1);
     assert_eq!(request.stats.discarded_optimistic_blocks(), 1);
-    assert_eq!(cache, 2);
+    // The prompt and both committed tokens already have causal K/V.
+    assert_eq!(cache, 3);
     assert_eq!(
         events.borrow().as_slice(),
         [
@@ -248,7 +249,8 @@ fn grammar_completion_mid_block_matches_the_committed_prefix() {
         1,
         "drafting must stop as soon as the logical prefix completes the grammar"
     );
-    assert_eq!(cache, 2);
+    // The prompt and both committed tokens already have causal K/V.
+    assert_eq!(cache, 3);
 
     let mut ordinary = GrammarCountingSampler {
         inner: CountingSampler::default(),
@@ -557,13 +559,13 @@ fn no_lookahead_full_acceptance_bonus_eos_and_max_tokens_use_safe_boundaries() {
     assert_eq!(eos.0, vec![1, 2]);
     assert_eq!(eos.1, FinishReason::Eos);
     assert_eq!(eos.2.accept_lens(), vec![1]);
-    assert_eq!(eos.3, 2);
+    assert_eq!(eos.3, 3, "retain the accepted EOS token alongside prompt and first output");
 
     let max = run(2, Vec::new());
     assert_eq!(max.0, vec![1, 2]);
     assert_eq!(max.1, FinishReason::MaxTokens);
     assert_eq!(max.2.accept_lens(), vec![1]);
-    assert_eq!(max.3, 2);
+    assert_eq!(max.3, 3, "retain the accepted terminal token at the output limit");
 
     let bonus = run(4, Vec::new());
     assert_eq!(bonus.0, vec![1, 2, 0, 1]);
