@@ -1,6 +1,20 @@
 //! Real cold selection distinguishes shared provider addresses from decoder owners.
 use super::*;
 
+// Generic scalar construction has larger debug frames than native bindings.
+// Keep every prepared-rank worker's stack bounded independently of its caller.
+fn spawn_prepared_rank<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    rank: usize,
+    run: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(format!("inkling-prepared-rank-{rank}"))
+        .stack_size(8 << 20)
+        .spawn_scoped(scope, run)
+        .unwrap()
+}
+
 #[test]
 fn inkling_selected_component_placement_preserves_shared_and_routed_invocations() {
     for shared in [1, 4] {
@@ -337,7 +351,7 @@ fn inkling_selected_provider_components_match_cold_placement_and_masked_executio
                             let inspection = &inspection;
                             let parameters = &parameters;
                             let world = world.clone();
-                            scope.spawn(move || {
+                            spawn_prepared_rank(scope, rank, move || {
                                 let sources = partitioned_adapter::prepare_with_timeout(
                                     inspection,
                                     topology,
@@ -470,7 +484,7 @@ fn inkling_selected_shared_provider_failure_rejects_every_replica_before_commit(
                     let inspection = &inspection;
                     let parameters = &parameters;
                     let world = world.clone();
-                    scope.spawn(move || {
+                    spawn_prepared_rank(scope, rank, move || {
                         let sources = partitioned_adapter::prepare_with_timeout(
                             inspection,
                             topology,
@@ -691,7 +705,7 @@ fn inkling_partition_bank_trials(
                         let parameters = &parameters;
                         let args = &args;
                         let world = world.clone();
-                        scope.spawn(move || {
+                        spawn_prepared_rank(scope, rank, move || {
                             let sources = partitioned_adapter::prepare_plan_with_banks(inspection, &plan, rank, std::time::Duration::from_secs(30), independent_banks.then(|| ParameterBankLoadOptions::new(eredu_core::residency::OffloadConfig::new(Some(bank_budget), Some(1 << 20), 1).unwrap(), bank_budget, bank_budget).unwrap())).unwrap();
                             let selected = sources.selected().execution().text_realization();
                             assert_eq!(selected.parameters().iter().any(|parameter| matches!(parameter.lowering(), eredu_runtime::WeightLoweringKind::Transform | eredu_runtime::WeightLoweringKind::DerivedTransform)), quantization.is_some());

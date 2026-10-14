@@ -14451,7 +14451,8 @@ fn reference_attention_obeys_causal_and_sliding_semantics() {
     let keys = NumericTensor::new(vec![1, 1, 2, 1], vec![0.0, 3.0_f32.ln()]);
     let values = NumericTensor::new(vec![1, 1, 2, 1], vec![2.0, 10.0]);
 
-    let causal = attention(&queries, &keys, &values, 1.0, None, None, 0).unwrap();
+    let mask = NumericBackend::causal_mask(2, 0, None, &NumericContext::default()).unwrap();
+    let causal = attention(&queries, &keys, &values, 1.0, Some(&mask), None, 0).unwrap();
     assert_close(causal.data[0], 2.0);
     assert_close(causal.data[1], 8.0);
 
@@ -27428,7 +27429,8 @@ fn gemma4_composite_partition_preserves_tasks_boundary_values_and_prepared_ident
         ],
         prepared,
     );
-    assert_eq!(inactive, [false, false, false]);
+    // Decoder request activity is independent of media ingress readiness.
+    assert_eq!(inactive, [false, false, true]);
 
     let media = eredu_runtime::PreparedModelInput::new(
         vec![
@@ -27487,7 +27489,7 @@ fn gemma4_composite_partition_preserves_tasks_boundary_values_and_prepared_ident
         )
         .unwrap(),
     );
-    assert_eq!(active, [true, false, false]);
+    assert_eq!(active, [true, false, true]);
     let changed = eredu_runtime::PreparedModelInput::new(
         vec![eredu_runtime::PreparedInputPart::new(
             eredu_core::InputModality::Text,
@@ -28532,7 +28534,8 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         ],
         prepared,
     );
-    assert_eq!(active, [true, false]);
+    // Decoder request activity is independent of media ingress readiness.
+    assert_eq!(active, [true, true]);
     let changed = eredu_runtime::PreparedModelInput::new(
         vec![eredu_runtime::PreparedInputPart::new(
             eredu_core::InputModality::Text,
@@ -28571,7 +28574,7 @@ fn qwen_vl_dense_partition_preserves_deepstack_state_and_prepared_identity() {
         )
         .unwrap(),
     );
-    assert_eq!(inactive, [false, false]);
+    assert_eq!(inactive, [false, true]);
 }
 
 #[test]

@@ -117,6 +117,24 @@ pub(crate) fn catalog(
         })
         .clone()
 }
+/// Target recipes cannot name an additive predictor's admitted tensors.
+pub(crate) fn target_catalog(
+    inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
+) -> Result<Arc<ArtifactRecipeCatalog>, ReplicatedTextRequirementsError> {
+    let catalog = catalog(inspection)?;
+    if inspection.architecture_plan().prediction_extension().is_none() {
+        return Ok(catalog);
+    }
+    let sources = crate::artifact_preparation::source_declarations(inspection)?;
+    Ok(Arc::new(ArtifactRecipeCatalog {
+        source: catalog.source.clone(),
+        allowed_keys: sources
+            .role(crate::artifact_preparation::ArtifactSourceRole::Target)
+            .map(|artifacts| artifacts.values().flatten().cloned().collect()),
+        recipes: Default::default(),
+    }))
+}
+
 pub(super) fn normalize(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     config: &EligibleConfig<'_>,
@@ -132,14 +150,8 @@ pub(super) fn normalize(
             // may inspect only their own role; predictor recipes use the complete
             // architecture and a separate catalog below.
             let sources = crate::artifact_preparation::source_declarations(inspection)?;
-            let target_catalog = plan.prediction_extension().map(|_| ArtifactRecipeCatalog {
-                source: catalog.source.clone(),
-                allowed_keys: sources
-                    .role(crate::artifact_preparation::ArtifactSourceRole::Target)
-                    .map(|artifacts| artifacts.values().flatten().cloned().collect()),
-                recipes: Default::default(),
-            });
-            let recipe_source = target_catalog.as_ref().unwrap_or(catalog.as_ref());
+            let target_catalog = target_catalog(inspection)?;
+            let recipe_source = target_catalog.as_ref();
             let mut parameters = match (
                 plan.safetensors_architecture(),
                 plan.gguf_plan(),

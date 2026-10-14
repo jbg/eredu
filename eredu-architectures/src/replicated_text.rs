@@ -4377,7 +4377,7 @@ pub(crate) fn diffusion_execution_requirements(
         return Ok(ReplicatedTextExecutionClass::Replicated(text));
     }
     let invalid = |error: String| ReplicatedTextRequirementsError::InvalidArchitecture(error);
-    let source = artifact::catalog(inspection)?;
+    let source = artifact::target_catalog(inspection)?;
     let owner =
         eredu_runtime::ExecutionGroupId::new(crate::diffusion_gemma::model::TEXT_EXECUTION_GROUP)
             .map_err(|error| invalid(error.to_string()))?;
@@ -7449,7 +7449,7 @@ fn composite_routed_requirements(
     if !config.routed() {
         return Ok(None);
     }
-    let recipe_source = artifact::catalog(inspection)?;
+    let recipe_source = artifact::target_catalog(inspection)?;
     let (owner_group, plan, catalog, routes_per_token) = match config {
         CompositeConfig::NemotronLabsDiffusion(_) => return Ok(None),
         CompositeConfig::Diffusion(args) => {

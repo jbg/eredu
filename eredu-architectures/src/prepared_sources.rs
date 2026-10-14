@@ -698,7 +698,8 @@ impl PreparedModelSources {
             observation_context,
             intervention_points: self.architecture().intervention_points(),
             prediction: self.selected().prediction_realization().map(|_| {
-                let complete = self.inspection.architecture_plan();
+                let complete = self.selected().retained_architecture()
+                    .unwrap_or_else(|| self.inspection.architecture_plan());
                 PreparedPredictionDiscovery {
                     resources: self
                         .selected()
