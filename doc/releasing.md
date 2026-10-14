@@ -136,7 +136,7 @@ PR and main gates run seven representative Ring smoke tests: partition loading,
 bounded consensus, expert exchange, Cartesian topology, resident GGUF pipeline
 execution, disk-streamed prediction across tensor/pipeline partitions, and
 provider failure handling. The Ring smoke step has an eight-minute execution
-budget and a three-minute limit per test. It fails at the first error and retains
+budget and a four-minute limit per test. It fails at the first error and retains
 per-test logs and timings. Ordinary backend tests also use fresh processes and
 prepared-cache directories, preventing native stream and allocator state from
 accumulating across unrelated tests.

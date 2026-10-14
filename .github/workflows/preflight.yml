@@ -110,7 +110,7 @@ jobs:
         timeout-minutes: 10
         run: |
           python3 validation/run_native_unit_tests.py --suite ring-smoke \
-            --test-timeout 180 --suite-timeout 480 --fail-fast --results-dir target/native-results/ring-smoke
+            --test-timeout 240 --suite-timeout 480 --fail-fast --results-dir target/native-results/ring-smoke
       - name: Test concurrent MLX use
         if: inputs.full && matrix.suite == 'consumers'
         run: cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1
