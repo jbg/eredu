@@ -87,6 +87,13 @@ sudo apt-get install git cmake build-essential \
 cargo build --release -p eredu --no-default-features --features mlx
 ```
 
+Header discovery uses optional `pkg-config` metadata for CBLAS/OpenBLAS and
+LAPACKE. This includes Arch Linux's `/usr/include/openblas` layout without
+setting `CMAKE_INCLUDE_PATH`. Install `pkgconf` on Arch to enable metadata
+discovery. Without pkg-config, CMake searches its normal include paths and
+their `openblas` subdirectories. Explicit `BLAS_INCLUDE_DIRS`,
+`LAPACK_INCLUDE_DIRS`, and `CMAKE_INCLUDE_PATH` settings remain available.
+
 ## Linux CUDA
 
 The `cuda` feature requires an x86-64 NVIDIA GPU with compute capability 7.5 or
@@ -110,6 +117,24 @@ SAFEMLX_CUDA_ARCHITECTURES=80 \
 The build also honors `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT`,
 `CUDNN_INCLUDE_PATH`, and `CUDNN_LIBRARY_PATH`. CUDA and cuDNN shared libraries
 must be visible to the dynamic loader when the application runs.
+
+CUDA kernel compilation also needs toolkit and CCCL headers at runtime. On
+Linux, Eredu locates the loaded NVRTC library, resolves library symlinks, and
+checks its installation's sibling `include` directory. If those headers are
+unavailable, it checks adjacent Python-package headers and the toolkit include
+directory discovered by CMake at build time. `/usr/local/cuda` and `/opt/cuda`
+are final fallbacks. Candidates must contain `cuda_runtime.h`.
+CCCL discovery checks bundled headers and the source directory discovered at
+build time, then the selected toolkit's `include/cccl` and `include` directories.
+`/usr/include/cccl` and `/usr/local/include/cccl` are final fallbacks. Each
+candidate must contain `cuda/std/tuple`.
+Arch Linux's standard `cuda` and `cccl` installations need no runtime
+environment variables, including under WSL2.
+
+For nonstandard installations, `CUDA_HOME` or `CUDA_PATH` overrides automatic
+toolkit discovery.
+`MLX_CUDA_JIT_INCLUDE_DIRS` adds include directories ahead of automatic
+discovery (colon-separated on Linux, semicolon-separated on Windows).
 
 NCCL is opt-in because it adds native link requirements. Enable `nccl` and use
 `NCCL_ROOT_DIR`, `NCCL_INCLUDE_DIR`, or `NCCL_LIB_DIR` when discovery needs

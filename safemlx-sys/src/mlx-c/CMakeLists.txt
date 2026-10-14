@@ -76,6 +76,7 @@ else()
       mlx-host-transfer-umbrella.patch
       mlx-timing-events.patch
       mlx-cuda-jit-include-dirs.patch
+      mlx-blas-header-discovery.patch
       mlx-embedded-metallib.patch
       mlx-host-transfer-noexcept-move.patch
       mlx-cpu-submission-progress.patch
@@ -123,6 +124,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/array_storage_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/timing_summary_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/cuda_jit_include_paths_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
     ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
@@ -135,9 +137,13 @@ if(MLX_C_BUILD_PATCH_TESTS)
   add_custom_target(
     mlx-patch-tests
     COMMAND
+      ${CMAKE_COMMAND} "-DMLX_SOURCE_DIR=${mlx_SOURCE_DIR}"
+      "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/blas-header-tests"
+      -P "${CMAKE_CURRENT_LIST_DIR}/tests/blas_header_discovery.cmake"
+    COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*,*timing interval union*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*,*timing interval union*,*CUDA JIT*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")
