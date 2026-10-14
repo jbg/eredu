@@ -125,8 +125,10 @@ Full compatibility validation retains workspace tests, all six Apple cross
 targets, Linux CPU/MSRV/CUDA/NCCL, and Windows CPU plus CUDA 12.9.1 and 13.0.2.
 Nightly runs and the dispatch `full` input select that compatibility matrix.
 Self-hosted GPU execution remains explicit opt-in through `run_windows_gpu` and
-`run_linux_gpu`. Native backend, native consumers, and portable workspace tests
-run in separate jobs, each with a 45-minute ceiling. Other compatibility jobs
+`run_linux_gpu`. Native backend and consumers run in separate macOS jobs; portable workspace
+tests run on Linux, including optional host-media processing. Each has a
+45-minute ceiling. Apple cross-builds use at most three concurrent macOS slots,
+reserving two for the native jobs. Other compatibility jobs
 have a 60-minute ceiling; a timeout fails validation.
 
 PR and main gates run seven representative Ring smoke tests: partition loading,
