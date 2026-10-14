@@ -9,13 +9,13 @@ permissions:
   contents: read
 jobs:
   native:
-    name: Native ${{ matrix.suite }}
+    name: ${{ matrix.suite == 'portable' && 'Portable workspace' || format('Native {0}', matrix.suite) }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         suite: ${{ fromJSON(inputs.full && '["backend", "consumers", "portable"]' || '["backend", "consumers"]') }}
-    runs-on: macos-26
+    runs-on: ${{ matrix.suite == 'portable' && 'ubuntu-22.04' || 'macos-26' }}
     env:
       # FP32 reference tolerances require FP32 GEMM, including on NAX-capable Macs.
       MLX_ENABLE_TF32: "0"
@@ -34,7 +34,15 @@ jobs:
           rustc --edition 2021 --test safemlx-sys/build_support.rs -o /tmp/safemlx-build-support-tests
           /tmp/safemlx-build-support-tests
       - name: Install system audio build tools
+        if: matrix.suite != 'portable'
         run: brew install meson ninja pkg-config
+      - name: Install portable host audio build tools
+        if: matrix.suite == 'portable'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libclang-dev pkg-config
+          python3 -m pip install --user "meson>=0.63" ninja
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Install Metal toolchain when required
         if: matrix.suite != 'portable'
         run: |
@@ -76,7 +84,7 @@ jobs:
         run: |
           cargo test --locked -p eredu-gguf -p eredu-core -p eredu-text -p eredu-checkpoint \
             -p eredu-nn -p eredu-nn-macros -p eredu-runtime -p eredu-architectures \
-            -p eredu-codec -p eredu-media -p eredu-evaluation --features eredu-media/image,eredu-media/audio --timings
+            -p eredu-codec -p eredu-media -p eredu-evaluation --features eredu-architectures/image,eredu-architectures/audio,eredu-media/system-audio --timings
       - name: Test native integration and documentation targets
         if: matrix.suite == 'backend'
         run: |

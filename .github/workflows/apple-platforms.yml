@@ -12,7 +12,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Reserve two macOS slots for native backend and consumer validation.
+      max-parallel: 3
       matrix:
         target:
           - aarch64-apple-ios
