@@ -482,6 +482,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     /// Constructs a child continuation from independently prepared components.
     /// Its native model state must be installed before advancing it. A child has
     /// a fresh run identity and shares only this driver's execution authority.
+    #[allow(clippy::too_many_arguments)]
     pub fn fork_host_state(
         &self,
         backend_state: B::TextGenerationState,

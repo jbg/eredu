@@ -209,14 +209,11 @@ fn normal_loader_released_pixtral_prepared_context_matches_independent_rows() {
                 Some("vision.embedding".into())
             } else if path == "model.multi_modal_projector.output" {
                 Some("vision.projected".into())
-            } else if let Some(index) = path
-                .strip_prefix("model.layers.")
-                .and_then(|s| s.strip_suffix(".output"))
-                .filter(|s| s.parse::<usize>().is_ok())
-            {
-                Some(format!("causal.0.layer.{index}"))
             } else {
-                None
+                path.strip_prefix("model.layers.")
+                    .and_then(|s| s.strip_suffix(".output"))
+                    .filter(|s| s.parse::<usize>().is_ok())
+                    .map(|index| format!("causal.0.layer.{index}"))
             };
             if let Some(key) = key.filter(|key| self.reference.contains_key(key)) {
                 self.values.insert(key.clone(), value.clone());

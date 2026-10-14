@@ -120,7 +120,7 @@ fn prepared_prompt(
             image(1, 4, 2),
             text(&[7]),
         ],
-        &|tensor: &NumericTensor| {
+        |tensor: &NumericTensor| {
             eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
         },
     )
@@ -136,7 +136,7 @@ fn prepared_text(ids: &[usize]) -> eredu_runtime::PreparedModelInput<NumericTens
             )
             .unwrap(),
         ],
-        &|tensor: &NumericTensor| {
+        |tensor: &NumericTensor| {
             eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
         },
     )
@@ -610,7 +610,7 @@ fn vlm_rejects_conflicting_image_positions_and_projected_patch_counts() {
             [extent],
         )
         .unwrap();
-        let malformed = PreparedModelInput::new(parts, &|tensor: &NumericTensor| {
+        let malformed = PreparedModelInput::new(parts, |tensor: &NumericTensor| {
             eredu_runtime::PreparedInputInspector::identity(&NumericInputInspector, tensor)
         })
         .unwrap();

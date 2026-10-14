@@ -174,8 +174,7 @@ where
             self, group, input,
         )?;
         let mut stages = Vec::with_capacity(pipeline_stages);
-        for stage in 0..pipeline_stages {
-            let range = stage_units[stage].clone();
+        for range in &stage_units[..pipeline_stages] {
             let mut operations = vec![
                 crate::composite_execution::CompositeTensorCollective::Sum {
                     shape: vec![patches, width]

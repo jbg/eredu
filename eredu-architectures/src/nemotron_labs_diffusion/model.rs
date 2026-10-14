@@ -233,7 +233,7 @@ impl<B: NeuralBackend> TextModel<B> {
             hidden: forward.hidden,
             context: ForwardContext {
                 mask: forward.context.visibility_mask().cloned(),
-                invocation: invocation,
+                invocation,
             },
         })
     }

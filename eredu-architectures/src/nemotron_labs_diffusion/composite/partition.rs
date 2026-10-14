@@ -1078,8 +1078,7 @@ where
         let patches = native_patch_positions(input)?;
         let vision = self.config.vision.as_ref().expect("validated tower");
         let mut stages = Vec::with_capacity(pipeline_stages);
-        for stage in 0..pipeline_stages {
-            let range = stage_units[stage].clone();
+        for range in &stage_units[..pipeline_stages] {
             stages.push(if patches == 0 {
                 Vec::new()
             } else {

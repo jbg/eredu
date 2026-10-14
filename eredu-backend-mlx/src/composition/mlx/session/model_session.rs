@@ -1994,7 +1994,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             mask_token_id: ordinary.and_then(|policy| match policy.policy { eredu_core::refinement::RefinementPolicy::MaskedUnmasking { mask_token_id, .. } => Some(mask_token_id), _ => None }),
             mode_changes: shared.is_some(), speculation: shared.is_some(), draft_adapter: shared.is_some_and(|policy| policy.adapter_available()),
             max_draft_tokens: shared.map(|policy| policy.proposal_capacity()),
-            completion_cancellation: Some(eredu_core::CompletionCancellationMode::QuarantineUntilComplete), ..Default::default()
+            completion_cancellation: Some(eredu_core::CompletionCancellationMode::QuarantineUntilComplete),
         }
     }
 

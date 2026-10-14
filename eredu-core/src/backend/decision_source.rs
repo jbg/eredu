@@ -905,6 +905,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
             request: crate::SpeculativeRequestId::new(0),
         }
     }
+    #[allow(clippy::type_complexity)]
     pub(super) fn next_physical_committed(
         &mut self,
         runtime: &mut ModelRuntime<B>,
@@ -958,6 +959,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextRequestDriver<B, C>
             CompletedDecisionProgress::Finished => None,
         }
     }
+    #[allow(clippy::type_complexity)]
     pub(super) fn next_committed(
         &mut self,
         runtime: &mut ModelRuntime<B>,

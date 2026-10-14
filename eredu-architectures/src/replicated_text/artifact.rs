@@ -26,6 +26,7 @@ impl NormalizedArtifactPreparation {
                     metadata,
                     physical: physical.clone(),
                 }),
+                allowed_keys: None,
                 recipes: Default::default(),
             }),
             physical,
@@ -70,13 +71,29 @@ impl NormalizedArtifactPreparation {
 #[derive(Debug)]
 pub(crate) struct ArtifactRecipeCatalog {
     source: Arc<dyn ColdCatalog>,
+    allowed_keys: Option<BTreeSet<String>>,
     recipes: RecipeInferenceCache,
+}
+impl ArtifactRecipeCatalog {
+    fn check_key(&self, key: &str) -> Result<(), eredu_checkpoint::store::StoreError> {
+        if self
+            .allowed_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.contains(key))
+        {
+            return Err(eredu_checkpoint::store::StoreError::UnknownTensor {
+                key: key.into(),
+            });
+        }
+        Ok(())
+    }
 }
 impl RecipeCatalog for ArtifactRecipeCatalog {
     fn tensor_metadata(
         &self,
         key: &str,
     ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        self.check_key(key)?;
         self.source.source_metadata(key)
     }
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
@@ -94,6 +111,7 @@ pub(crate) fn catalog(
         .get_or_init(|| {
             Ok(Arc::new(ArtifactRecipeCatalog {
                 source: derive_recipe_source(inspection)?,
+                allowed_keys: None,
                 recipes: Default::default(),
             }))
         })
@@ -110,7 +128,18 @@ pub(super) fn normalize(
         .get_or_init(|| {
             let plan = inspection.architecture_plan();
             let catalog = catalog(inspection)?;
-            let recipe_source = &catalog;
+            // Physical admission includes the additive predictor. Target recipes
+            // may inspect only their own role; predictor recipes use the complete
+            // architecture and a separate catalog below.
+            let sources = crate::artifact_preparation::source_declarations(inspection)?;
+            let target_catalog = plan.prediction_extension().map(|_| ArtifactRecipeCatalog {
+                source: catalog.source.clone(),
+                allowed_keys: sources
+                    .role(crate::artifact_preparation::ArtifactSourceRole::Target)
+                    .map(|artifacts| artifacts.values().flatten().cloned().collect()),
+                recipes: Default::default(),
+            });
+            let recipe_source = target_catalog.as_ref().unwrap_or(catalog.as_ref());
             let mut parameters = match (
                 plan.safetensors_architecture(),
                 plan.gguf_plan(),
@@ -120,7 +149,7 @@ pub(super) fn normalize(
                     architecture,
                     inspection.tensors(),
                     config,
-                    recipe_source.as_ref(),
+                    recipe_source,
                 )?,
                 (None, Some(architecture), Some(checkpoint)) => {
                     let checkpoint = architecture.prepared_checkpoint(checkpoint);
@@ -135,7 +164,7 @@ pub(super) fn normalize(
                         &metadata_sources,
                         checkpoint,
                         config,
-                        recipe_source.as_ref(),
+                        recipe_source,
                     )?;
                     if let Some(projector_plan) = plan.gguf_media_projector() {
                         let companion = inspection
@@ -156,7 +185,7 @@ pub(super) fn normalize(
                                 &metadata_source_keys(projector_plan.checkpoint()),
                                 companion.checkpoint(),
                                 config,
-                                recipe_source.as_ref(),
+                                recipe_source,
                             )?
                             .into_iter()
                             .filter(|parameter| parameter.presence().has_physical_source()),
@@ -174,12 +203,12 @@ pub(super) fn normalize(
 
             if let Some(adapter) = plan.draft_adapter() {
                 parameters.extend(safetensors_schema_parameters(
-                    &adapter.schema, &adapter.resolution, &adapter.tensors, config, recipe_source.as_ref(),
+                    &adapter.schema, &adapter.resolution, &adapter.tensors, config, recipe_source,
                 )?);
                 parameters = finish_parameters(parameters)?;
             }
             let parameters =
-                finalize_materialization_parameters(config, parameters, recipe_source.as_ref())?;
+                finalize_materialization_parameters(config, parameters, recipe_source)?;
             let shared_source_keys = config.shared_derived_source_keys(&parameters.1);
             let prediction = plan
                 .prediction_extension()
@@ -194,7 +223,7 @@ pub(super) fn normalize(
                 .collect::<Result<_, ReplicatedTextRequirementsError>>()?;
             Ok(Arc::new(NormalizedArtifactPreparation {
                 physical,
-                sources: crate::artifact_preparation::source_declarations(inspection)?,
+                sources,
                 catalog,
                 parameters,
                 prediction,
@@ -294,7 +323,10 @@ pub(super) trait ColdCatalog: ArtifactCatalog + std::fmt::Debug + Send + Sync {}
 impl<T: ArtifactCatalog + std::fmt::Debug + Send + Sync> ColdCatalog for T {}
 impl ArtifactCatalog for ArtifactRecipeCatalog {
     fn source_keys(&self) -> Vec<String> {
-        self.source.source_keys()
+        self.allowed_keys.as_ref().map_or_else(
+            || self.source.source_keys(),
+            |keys| keys.iter().cloned().collect(),
+        )
     }
     fn source_backend(
         &self,
@@ -307,6 +339,7 @@ impl ArtifactCatalog for ArtifactRecipeCatalog {
         key: &str,
     ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, eredu_checkpoint::store::StoreError>
     {
+        self.check_key(key)?;
         self.source.source_provenance(key)
     }
 }
