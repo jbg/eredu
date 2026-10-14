@@ -27,7 +27,8 @@ snapshot_fields!(SemanticEventSink {
     active_tool_call,
     next_tool_index,
     tool_calls_enabled,
-    tool_schemas
+    tool_schemas,
+    tool_names
 });
 snapshot_fields!(ToolRuntimeParser { stream });
 
@@ -129,6 +130,9 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
             .stream
             .parser
             .continuation_event_storage_bytes(input, max_predictions)
+            .and_then(|bytes| {
+                bytes.checked_add(self.parser.stream.sink.tool_names.event_growth_bytes(input)?)
+            })
     }
 
     pub(crate) fn continuation_storage_bytes(&self, max_predictions: u64) -> Option<u64> {
@@ -149,6 +153,7 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
             .checked_add(parser)?
             .checked_add(input.checked_mul(10)?)?
             .checked_add(64)?
-            .checked_add(max_predictions.checked_mul(4)?)
+            .checked_add(max_predictions.checked_mul(4)?)?
+            .checked_add(self.parser.stream.sink.tool_names.event_growth_bytes(input)?)
     }
 }

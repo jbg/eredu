@@ -198,7 +198,7 @@ pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String
         .collect()
 }
 
-fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
+pub(super) fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
     if name.len() > 64 {
         return Err(format!("{path} must be at most 64 bytes"));
     }

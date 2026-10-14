@@ -62,10 +62,10 @@ impl ChatToolCall {
     }
 }
 
-/// Checkpoint-template tool declaration. Tool aliases remain application policy.
+/// Tool declaration using an application name. Preparation supplies a protocol-valid wire name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatToolDefinition {
-    /// Function name supplied to the template and constraint compiler.
+    /// Original application function name, restored in public semantic tool-call events.
     pub name: String,
     /// Optional function description.
     pub description: Option<String>,

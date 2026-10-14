@@ -131,6 +131,14 @@ PY_DOUBLE_STRING: /"([^"\\\x00-\x1f]|\\(['"\\\/bfnrt]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-
 }
 
 impl FormatDialect for Lfm2Dialect {
+    fn tool_name_constraint(
+        &self,
+        parameters: DialectParameters,
+    ) -> Result<super::dialect::ToolNameConstraint, String> {
+        Self::parameters(parameters)?;
+        Ok(super::dialect::ToolNameConstraint::PythonIdentifier)
+    }
+
     fn generation_prompt_behavior(
         &self,
         parameters: DialectParameters,
@@ -289,7 +297,7 @@ fn validate_identifier(name: &str, kind: &str) -> Result<(), String> {
     }
 }
 
-fn validate_function_name(name: &str) -> Result<(), String> {
+pub(super) fn validate_function_name(name: &str) -> Result<(), String> {
     validate_identifier(name, "tool function name")?;
     if PYTHON_KEYWORDS.contains(&name) {
         return Err(format!(

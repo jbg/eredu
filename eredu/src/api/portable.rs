@@ -13,6 +13,9 @@ use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 /// Backend-independent failure from tokenizer-aware text facade operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TextModelError {
+    /// Tool names could not be normalized for the selected checkpoint protocol.
+    #[error(transparent)]
+    ToolNames(#[from] crate::runtime::chat::ToolNameNormalizationError),
     /// Portable generation configuration was invalid.
     #[error(transparent)]
     Generation(#[from] eredu_core::generation::GenerationError),

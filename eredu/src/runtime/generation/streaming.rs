@@ -517,6 +517,7 @@ pub(crate) struct SemanticEventSink {
     next_tool_index: usize,
     tool_calls_enabled: bool,
     tool_schemas: Option<crate::runtime::chat::tool_schema::ToolSchemas>,
+    tool_names: crate::runtime::chat::ToolNameMap,
 }
 
 impl Default for SemanticEventSink {
@@ -527,6 +528,7 @@ impl Default for SemanticEventSink {
             next_tool_index: 0,
             tool_calls_enabled: true,
             tool_schemas: None,
+            tool_names: Default::default(),
         }
     }
 }
@@ -562,7 +564,13 @@ impl SemanticEventSink {
         if !self.tool_calls_enabled {
             return;
         }
-        self.events.push(call.start_event());
+        let mut event = call.start_event();
+        if let SemanticEvent::ToolCallStart { name, .. } = &mut event {
+            if let Some(original) = self.tool_names.original(name) {
+                *name = original.to_owned();
+            }
+        }
+        self.events.push(event);
         self.active_tool_call = Some(call);
     }
 
@@ -900,6 +908,11 @@ impl ToolRuntimeParser {
         self.stream.sink.tool_schemas =
             Some(crate::runtime::chat::tool_schema::ToolSchemas::new(tools)?);
         Ok(self)
+    }
+
+    pub(crate) fn with_tool_names(mut self, names: crate::runtime::chat::ToolNameMap) -> Self {
+        self.stream.sink.tool_names = names;
+        self
     }
 
     #[cfg(test)]

@@ -1,5 +1,15 @@
 # Execution control
 
+Tool-name normalization is prepared-request policy shared by JSON and typed chat.
+Controlled semantic events expose original application names just like ordinary
+and speculative execution. Grammar and schema validation retain wire aliases.
+The immutable restoration map belongs to the semantic plan and is shared by
+parser snapshots/forks; mutable partial-call state remains independently copied.
+Host continuation bounds include restored-name expansion, so aliases cannot
+understate delivery/history storage. The existing active/automatic llguidance
+grammar snapshot rejection still applies when a complete mutable grammar storage
+estimate is unavailable; normalization does not bypass that capability check.
+
 Typed chat preparation uses the ordinary shared drivers. A counted
 `PreparedChatRequest` enters capture/control admission through
 `prepare_observed_chat_input`, or `prepare_intervened_chat_input` for prospective

@@ -4965,10 +4965,35 @@ Automatic lowering prefers established mapping support, then established
 serialized-string support, and uses mappings for unrecognized custom templates.
 An explicit argument format overrides that representation; existing protocol
 validation still applies. The raw JSON-valued `ChatTemplateRequest` entry point
-keeps caller-provided message representation unchanged. Application visibility,
-tool aliases, emulation, fallback choice and encoded-media transport remain
+keeps caller-provided argument representation unchanged. Application visibility,
+emulation, fallback choice and encoded-media transport remain
 caller policy; the typed API accepts decoded portable buffers without optional
 host codec dependencies.
+
+Both preparation APIs normalize application tool names before template rendering
+and grammar construction. Dialects declare their additional naming restrictions;
+normalization and wire validation use the same constraints. Shared wire names are
+nonempty ASCII letters, digits, underscores or dashes within 64 bytes; LFM2 adds
+Python identifier syntax and reserved-word exclusions. Accepted original names
+are reserved first. Other names receive deterministic bounded aliases derived
+from their complete original identities, with checked collision suffixes.
+Declaration ordering does not change the mapping. Historical-only functions and
+named tool results participate in the same namespace without adding tools to
+the current executable schema registry. Only structural name fields are
+rewritten; arguments, descriptions, schema properties, call IDs and text retain
+their values. Missing/empty/non-string names and duplicate declarations fail
+with `ToolNameNormalizationError`. An unrecognized tool protocol requiring
+rewriting returns its typed unsupported-dialect error.
+
+The immutable mapping belongs to the prepared semantic runtime plan and its
+identity. The shared parser retains wire names for grammar and argument-schema
+validation, and restores original application names in public `ToolCallStart`
+events. Ordinary, speculative, observed and controlled execution use this same
+sink. Parser forks share the immutable mapping while copying mutable call state.
+Continuation event/storage bounds include expansion when a restored name is
+larger than its alias. Raw tokens and literal text expose the actual model wire
+representation; restoration does not replace text substrings. Backend and
+architecture crates do not own alias allocation or application-name restoration.
 
 `prepare_observed_chat_input` and `prepare_intervened_chat_input` admit the same
 counted typed request for observed or controlled execution. Text retains its
