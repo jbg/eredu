@@ -145,6 +145,7 @@ def run_batches(executable: str, batch_size: int, *, suite: str = "unit",
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", default="metal,accelerate")
+    parser.add_argument("--profile", default="test")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--executable", help="reuse an already built test executable")
     parser.add_argument("--suite", choices=["unit", "ring-smoke", "ring"], default="unit")
@@ -167,7 +168,7 @@ def main() -> int:
     executable = args.executable
     if not executable:
         command = ["cargo", "test", "--locked", "-p", "eredu-backend-mlx", "--lib",
-                   "--no-run", "--timings", "--message-format=json"]
+                   "--no-run", "--timings", "--message-format=json", "--profile", args.profile]
         if args.features:
             command += ["--features", args.features]
         result = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
