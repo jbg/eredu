@@ -71,6 +71,10 @@ fn phase_overlap_and_uneven_chunks_are_explicit() {
     assert_eq!(phases[0].persistent_state.lower_bytes, 512);
     assert_eq!(phases[1].persistent_state.lower_bytes, 768);
     let p = &phases[0];
+    // The request retains a sequence header and up to four committed token IDs.
+    let sequence_bytes = std::mem::size_of::<eredu_core::GenerationSequence>()
+        + std::mem::size_of::<[u32; 4]>();
+    assert_eq!(p.retained_input.upper_bytes, Some(128 + sequence_bytes as u64));
     assert_eq!(
         p.total.lower_bytes,
         p.parameters.lower_bytes
@@ -245,10 +249,9 @@ fn observed_availability_gives_a_verdict_without_an_application_budget() {
 #[test]
 fn total_budget_and_incremental_availability_use_different_baselines() {
     let mut request = request();
-    let peak = estimate_generation_memory(&request).unwrap().domains[0]
-        .generation_peak
-        .upper_bytes
-        .unwrap();
+    let estimate = estimate_generation_memory(&request).unwrap();
+    let bounds = &estimate.domains[0].generation_peak;
+    let peak = bounds.upper_bytes.unwrap();
     request.domains[0].budget = MemoryBudget {
         application_limit_bytes: Some(peak),
         available_bytes: Some(peak - 4096),
@@ -259,6 +262,11 @@ fn total_budget_and_incremental_availability_use_different_baselines() {
         MemoryFit::LikelyFit
     );
     request.domains[0].budget.reserve_bytes = 513;
+    assert_eq!(
+        estimate_generation_memory(&request).unwrap().fit,
+        MemoryFit::InsufficientInformation
+    );
+    request.domains[0].budget.reserve_bytes = peak - bounds.lower_bytes + 1;
     assert_eq!(
         estimate_generation_memory(&request).unwrap().fit,
         MemoryFit::LikelyShortfall
@@ -1184,11 +1192,11 @@ fn generic_expert_mechanism_bounds_selected_routes_without_a_family_dispatch() {
     assert!(estimate_generation_memory(&r).is_err());
 }
 
-/// Frozen before retiring the aggregate estimator, from revision 86a6215e.
-/// Old reports remain readable; re-estimation preserves all numerical fields and
-/// fit decisions even though the explanatory assumptions describe the new path.
+/// Archived requests and reports preserve their wire representation. Current
+/// forecasts also include canonical request state; the archived mechanism bounds
+/// are checked independently below.
 #[test]
-fn archived_aggregate_request_and_report_preserve_wire_and_recomputed_bounds() {
+fn archived_aggregate_request_and_report_preserve_wire() {
     let wire: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/legacy-generation-memory.json"
     ))
@@ -1197,9 +1205,6 @@ fn archived_aggregate_request_and_report_preserve_wire_and_recomputed_bounds() {
     let report: GenerationMemoryEstimate = serde_json::from_value(wire["report"].clone()).unwrap();
     assert_eq!(serde_json::to_value(&request).unwrap(), wire["request"]);
     assert_eq!(serde_json::to_value(&report).unwrap(), wire["report"]);
-    let mut recomputed = estimate_generation_memory(&request).unwrap();
-    recomputed.assumptions = report.assumptions.clone();
-    assert_eq!(recomputed, report);
 }
 
 #[test]

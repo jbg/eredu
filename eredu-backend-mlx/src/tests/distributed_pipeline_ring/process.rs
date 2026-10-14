@@ -1594,7 +1594,10 @@ fn run_ring_pipeline_processes(
                 command.env(PROMPT_CACHE_PREPARE_FAILURE, "1");
             }
         }
-        children.push(command.spawn().unwrap());
+        children.push(
+            command.spawn().unwrap(),
+            matches!(mode, WorkerMode::OpaquePredictionSession),
+        );
     }
     // Component trials include complete parameter/query passes, coordinated
     // edits and many snapshot branches. Keep a bounded whole-case watchdog
@@ -1615,6 +1618,13 @@ fn run_ring_pipeline_processes(
         .and_then(|fixture| fixture.get("case_timeout_seconds"))
         .map(|seconds| seconds.as_u64().expect("fixture timeout must be seconds"))
         .unwrap_or(case_seconds);
+    // Finish the four-rank prediction watchdog before the smoke runner's outer
+    // deadline so it can report every worker's last phase and buffered output.
+    let case_seconds = if world_size == 4 && matches!(mode, WorkerMode::OpaquePredictionSession) {
+        case_seconds.min(180)
+    } else {
+        case_seconds
+    };
     assert!(case_seconds > 0, "fixture timeout must be positive");
     let deadline = Instant::now() + Duration::from_secs(case_seconds);
     let mut timed_out = false;

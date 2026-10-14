@@ -1313,20 +1313,35 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    fn push(&mut self, mut child: Child) {
+    fn push(&mut self, mut child: Child, live_stderr: bool) {
         fn drain(
             mut pipe: impl std::io::Read + Send + 'static,
+            live: bool,
         ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
             thread::spawn(move || {
+                use std::io::Write;
                 let mut bytes = Vec::new();
-                pipe.read_to_end(&mut bytes)?;
+                let mut chunk = [0; 8192];
+                loop {
+                    let count = match pipe.read(&mut chunk) {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => result?,
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if live {
+                        let _ = std::io::stderr().write_all(&chunk[..count]);
+                    }
+                }
                 Ok(bytes)
             })
         }
         // Workers can fill either pipe while the parent polls their status.
         // Drain both immediately so diagnostics cannot block a collective.
-        let stdout = drain(child.stdout.take().expect("piped worker stdout"));
-        let stderr = drain(child.stderr.take().expect("piped worker stderr"));
+        let stdout = drain(child.stdout.take().expect("piped worker stdout"), false);
+        let stderr = drain(child.stderr.take().expect("piped worker stderr"), live_stderr);
         self.children.push(child);
         self.output_readers.push((stdout, stderr));
     }
@@ -1385,6 +1400,7 @@ fn ring_worker_output_drains_while_running() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
+        false,
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     while children.children[0].try_wait().unwrap().is_none() {
