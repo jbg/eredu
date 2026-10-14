@@ -349,9 +349,14 @@ fn gguf_llama_pp_selects_neutral_partitioned_execution() {
         ]
     );
     let broadcast = &descriptor.requirements().operations()[0];
+    // Publication retains the model's F16 output arithmetic even when the
+    // activation wire uses F32; F32 promotion remains admitted as well.
     assert_eq!(
         broadcast.dtypes(),
-        [eredu_core::checkpoint::TensorDtype::F32]
+        [
+            eredu_core::checkpoint::TensorDtype::F32,
+            eredu_core::checkpoint::TensorDtype::F16,
+        ]
     );
     assert!(broadcast.exact_completion());
     assert_eq!(broadcast.limits().unwrap().max_tensors(), 1);
