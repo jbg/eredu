@@ -212,7 +212,8 @@ impl RowLookupBank<MlxNeuralBackend> for MlxRowBank {
                         decoder
                             .decode_into(bytes, &mut decoded)
                             .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
-                        Array::from_slice(&decoded, &[rows, spec.dimensions]).copy(stream)?
+                        Array::from_slice(&decoded, &[rows, spec.dimensions])
+                            .ensure_device_storage(stream)?
                     } else {
                         let matrix = NativeQuantizedTensor::from_iq_array(
                             encoded,

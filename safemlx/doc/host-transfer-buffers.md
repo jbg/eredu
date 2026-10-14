@@ -1,5 +1,13 @@
 # Host-transfer buffers
 
+`Array::ensure_device_storage` prepares ordinary arrays for execution without
+an intermediate host-transfer buffer. It is lazy and uses ordinary evaluation
+and completion ownership. CPU/Metal storage, CUDA managed storage with concurrent
+managed access, coherent integrated host storage, and storage already on the
+selected GPU are shared. Other CUDA host backing is copied into a device-local
+allocation. `Array::copy` is an identity node that shares its input backing;
+selecting a GPU stream for it does not establish physical device placement.
+
 `HostTransferBuffer` is typed, host-addressable storage for explicit
 array-to-host and host-to-array transfers. It is separate from ordinary MLX
 arrays and uses the normal lazy evaluator and completion events for ordering.

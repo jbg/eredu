@@ -4978,3 +4978,11 @@ unsafe extern "C" {
     ) -> ::std::os::raw::c_int;
     pub fn mlx_detail_compile_release_caches(caches: *mut ::std::os::raw::c_void, fun_id: usize);
 }
+
+unsafe extern "C" {
+    pub fn mlx_ensure_device_storage(
+        array: *mut mlx_array,
+        source: mlx_array,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+}

@@ -99,7 +99,7 @@ impl IndexedMovement<MlxNeuralBackend> for MlxIndexedMovement {
             }
             lookup[source] = destination;
         }
-        let lookup = Array::from_slice(&lookup, &[span as i32]).copy(stream)?;
+        let lookup = Array::from_slice(&lookup, &[span as i32]).ensure_device_storage(stream)?;
         let normalized = if indices.as_array().dtype() == Dtype::Int32 {
             indices.as_array().clone()
         } else {

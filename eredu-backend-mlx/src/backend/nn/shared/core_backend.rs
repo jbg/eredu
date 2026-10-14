@@ -59,7 +59,7 @@ impl ParameterBackend for MlxNeuralBackend {
         let output = if context.source_stream() == context.execution_stream() {
             prepared.inputs()[0].clone()
         } else {
-            prepared.inputs()[0].copy(context.execution_stream())?
+            prepared.inputs()[0].ensure_device_storage(context.execution_stream())?
         };
         Ok(prepared.submit_outputs(vec![output])?)
     }

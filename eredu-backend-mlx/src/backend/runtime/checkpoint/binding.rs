@@ -279,7 +279,7 @@ fn submit_module_binding(
             prepared.inputs()[0].clone()
         } else {
             prepared.inputs()[0]
-                .copy(execution_stream)
+                .ensure_device_storage(execution_stream)
                 .map_err(WeightRecipeError::from)?
         };
         Ok(prepared.submit_outputs(vec![output])?)

@@ -2781,8 +2781,20 @@ per-expert native arrays or checkpoint-sized staging copy on this path. The
 optimization follows each selected binding's recipe, so it neither changes
 residency selection nor eagerly reads otherwise nonresident banks. Native
 allocation and pointer access remain inside `safemlx`/`safemlx-sys`; checkpoint
-code only receives bounded, disjoint mutable byte slices. CUDA retains its
-existing materialization and transfer path.
+code only receives bounded, disjoint mutable byte slices.
+
+Checkpoint publication uses `Array::ensure_device_storage`, a lazy native
+placement operation, rather than treating MLX's storage-sharing `copy` as a
+host-to-device transfer. CPU and shared Metal backing remain shared. CUDA also
+shares allocations already on the selected device, migratable managed memory,
+and host-addressable storage on integrated or host-page-table-coherent devices.
+Other host backing, including WSL's pinned system memory, is copied into the
+selected GPU's device allocation. Placement requests exclude host and other-GPU
+allocations from size-only cache reuse. Contiguous layouts retain their strides;
+noncontiguous inputs are copied by logical indexing. Source leases, native
+input arrays and destination arrays remain under the existing materialization
+completion/recovery owner until submission is safely complete. Resident,
+bounded-residency and controlled sessions consume the same placed parameters.
 
 After selection, `PreparedModelSources` is the sole architecture-aware
 SafeTensors/GGUF source factory for model loading. It opens every admitted

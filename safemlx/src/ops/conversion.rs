@@ -3,10 +3,23 @@ use safemlx_internal_macros::generate_macro;
 use crate::{error::Result, utils::guard::Guarded, Array, ArrayElement, Dtype, Stream};
 
 impl Array {
-    /// Copy the array onto the given stream.
+    /// Create an identity node on the given stream, sharing its input storage.
+    /// Use [`Self::ensure_device_storage`] when execution storage must be placed.
     pub fn copy(&self, stream: impl AsRef<Stream>) -> Result<Array> {
         Array::try_from_op(|res| unsafe {
             safemlx_sys::mlx_copy(res, self.as_ptr(), stream.as_ref().as_ptr())
+        })
+    }
+
+    /// Ensure execution storage without copying unified or already-local backing.
+    ///
+    /// CPU and Metal share the input. CUDA retains migratable managed storage,
+    /// coherent host storage and allocations already on the selected GPU; other
+    /// host/device allocations are copied to that GPU. Placement is lazy and
+    /// participates in ordinary evaluation and completion ownership.
+    pub fn ensure_device_storage(&self, stream: impl AsRef<Stream>) -> Result<Array> {
+        Array::try_from_op(|res| unsafe {
+            safemlx_sys::mlx_ensure_device_storage(res, self.as_ptr(), stream.as_ref().as_ptr())
         })
     }
 
@@ -117,6 +130,25 @@ mod tests {
     use crate::complex64;
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
+
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+    #[test]
+    fn device_placement_shares_unified_metal_storage() {
+        use crate::{array::inspect_storage, Device, DeviceType};
+
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let source = Array::from_slice(&[1.0f32, -2.0, 3.0, 4.0], &[2, 2]);
+        let view = source.transpose(&stream).unwrap();
+        let placed = view.ensure_device_storage(&stream).unwrap();
+        let again = placed.ensure_device_storage(&stream).unwrap();
+        crate::transforms::eval([&placed, &again]).unwrap();
+        let storage = inspect_storage(&[&source, &view, &placed, &again]).unwrap();
+        assert_eq!(storage.backings.len(), 1);
+        assert!(storage.values.iter().all(Option::is_some));
+        assert_eq!(placed.shape(), &[2, 2]);
+        let total = placed.sum(false, &stream).unwrap();
+        assert_eq!(total.try_item::<f32>(&stream).unwrap(), 6.0);
+    }
 
     macro_rules! test_as_type {
         ($src_type:ty, $src_val:expr, $dst_type:ty, $dst_val:expr, $len:expr) => {

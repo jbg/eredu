@@ -495,7 +495,7 @@ pub(super) fn materialize_range(
             .map_err(|source| mlx_error(key, "range compaction", source))?
     };
     selected
-        .copy(execution_stream)
+        .ensure_device_storage(execution_stream)
         .map_err(|source| mlx_error(key, "copy", source))
 }
 
@@ -518,7 +518,7 @@ pub(super) fn materialize_indices(
         .map_err(|source| mlx_error(key, "index upload", source))?;
     source
         .take_axis(&index_array, axis, source_stream)
-        .and_then(|selected| selected.copy(execution_stream))
+        .and_then(|selected| selected.ensure_device_storage(execution_stream))
         .map_err(|source| mlx_error(key, "ordered index selection", source))
 }
 

@@ -1,0 +1,256 @@
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -184,7 +184,8 @@
+ }
+ 
+ Buffer
+-CudaAllocator::malloc_async(size_t size, int device, cudaStream_t stream) {
++CudaAllocator::malloc_async(
++    size_t size, int device, cudaStream_t stream, bool require_device) {
+   if (size == 0) {
+     return Buffer{new CudaBuffer{nullptr, 0, -1}};
+   }
+@@ -197,13 +198,19 @@
+     size = page_size * ((size + page_size - 1) / page_size);
+   }
+ 
+-  if (size <= small_block_size || stream == nullptr) {
++  if ((!require_device && size <= small_block_size) || stream == nullptr) {
+     device = -1;
+   }
+ 
+   // Find available buffer from cache.
+   std::unique_lock lock(mutex_);
+   CudaBuffer* buf = buffer_cache_.reuse_from_cache(size);
++  // A placement operation must not receive pinned host storage or another GPU's
++  // allocation from the size-only cache. Reused contents are uninitialized.
++  if (buf && require_device && buf->device != device) {
++    free_cuda_buffer(buf);
++    buf = nullptr;
++  }
+   if (!buf) {
+     // If we have a lot of memory pressure try to reclaim memory from the cache.
+     int64_t mem_to_free =
+@@ -213,7 +220,7 @@
+     }
+ 
+     // Try the scalar pool first
+-    if (size <= small_block_size) {
++    if (!require_device && size <= small_block_size) {
+       buf = scalar_pool_.malloc();
+     }
+     lock.unlock();
+diff --git a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+--- a/mlx/backend/cuda/allocator.h
++++ b/mlx/backend/cuda/allocator.h
+@@ -51,7 +51,8 @@
+ class CudaAllocator : public allocator::Allocator {
+  public:
+   Buffer malloc(size_t size) override;
+-  Buffer malloc_async(size_t size, int device, cudaStream_t stream);
++  Buffer malloc_async(
++      size_t size, int device, cudaStream_t stream, bool require_device = false);
+   void free(Buffer buffer) override;
+   size_t size(Buffer buffer) const override;
+   Buffer malloc_host_transfer(
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -50,6 +50,10 @@
+       &host_native_atomic_, cudaDevAttrHostNativeAtomicSupported, device_));
+   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
+       &managed_memory_, cudaDevAttrManagedMemory, device_));
++  CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
++      &integrated_, cudaDevAttrIntegrated, device_));
++  CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
++      &host_page_tables_, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device_));
+   CHECK_CUDA_ERROR(cudaDeviceGetAttribute(
+       &memory_pools_, cudaDevAttrMemoryPoolsSupported, device_));
+ }
+diff --git a/mlx/backend/cuda/device.h b/mlx/backend/cuda/device.h
+--- a/mlx/backend/cuda/device.h
++++ b/mlx/backend/cuda/device.h
+@@ -216,6 +216,9 @@
+   bool managed_memory() const {
+     return managed_memory_ == 1;
+   }
++  bool coherent_host_memory() const {
++    return integrated_ == 1 || host_page_tables_ == 1;
++  }
+   bool memory_pools() const {
+     return memory_pools_ == 1;
+   }
+@@ -228,6 +231,8 @@
+   int host_native_atomic_;
+   int managed_memory_;
+   int memory_pools_;
++  int integrated_;
++  int host_page_tables_;
+   std::string device_name_;
+ };
+ 
+diff --git a/mlx/backend/cuda/host_transfer.cpp b/mlx/backend/cuda/host_transfer.cpp
+--- a/mlx/backend/cuda/host_transfer.cpp
++++ b/mlx/backend/cuda/host_transfer.cpp
+@@ -3,6 +3,8 @@
+ #include "mlx/backend/gpu/host_transfer.h"
+ 
+ #include "mlx/backend/cuda/allocator.h"
++#include "mlx/backend/common/copy.h"
++#include "mlx/backend/gpu/copy.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/backend/cuda/utils.h"
+ 
+@@ -23,13 +25,47 @@
+ 
+ } // namespace
+ 
++void ensure_gpu_storage(const array& input, array& output, const Stream& stream) {
++  if (input.size() == 0) {
++    output.copy_shared_buffer(input);
++    return;
++  }
++  auto& encoder = cu::get_command_encoder(stream);
++  auto& device = encoder.device();
++  cudaPointerAttributes attributes{};
++  CHECK_CUDA_ERROR(cudaPointerGetAttributes(&attributes, gpu_ptr<void>(input)));
++  const bool local = attributes.type == cudaMemoryTypeDevice &&
++      attributes.device == device.cuda_device();
++  const bool managed = attributes.type == cudaMemoryTypeManaged &&
++      device.concurrent_managed_access();
++  const bool shared = device.coherent_host_memory() &&
++      (attributes.type == cudaMemoryTypeHost ||
++       attributes.type == cudaMemoryTypeUnregistered ||
++       attributes.type == cudaMemoryTypeManaged);
++  if (local || managed || shared) {
++    output.copy_shared_buffer(input);
++    return;
++  }
++  const bool contiguous = input.flags().contiguous && input.data_size() == input.size();
++  auto storage = cu::allocator().malloc_async(
++      output.nbytes(), device.cuda_device(), encoder.stream(), true);
++  if (contiguous) {
++    output.set_data(storage, input.data_size(), input.strides(), input.flags());
++    copy_bytes(input, output, stream);
++  } else {
++    output.set_data(storage);
++    copy_gpu_inplace(input, output, CopyType::General, stream);
++  }
++}
++
+ void copy_gpu_to_host(const array& input, array& output, const Stream& stream) {
+   copy_bytes(input, output, stream);
+ }
+ 
+ void copy_host_to_gpu(const array& input, array& output, const Stream& stream) {
+   auto& encoder = cu::get_command_encoder(stream);
+-  output.set_data(cu::malloc_async(output.nbytes(), encoder));
++  output.set_data(cu::allocator().malloc_async(
++      output.nbytes(), encoder.device().cuda_device(), encoder.stream(), true));
+   copy_bytes(input, output, stream);
+ }
+ 
+diff --git a/mlx/backend/gpu/host_transfer.h b/mlx/backend/gpu/host_transfer.h
+--- a/mlx/backend/gpu/host_transfer.h
++++ b/mlx/backend/gpu/host_transfer.h
+@@ -6,6 +6,8 @@
+ 
+ namespace mlx::core {
+ 
++void ensure_gpu_storage(const array& input, array& output, const Stream& stream);
++
+ void copy_gpu_to_host(const array& input, array& output, const Stream& stream);
+ void copy_host_to_gpu(const array& input, array& output, const Stream& stream);
+ 
+diff --git a/mlx/backend/gpu/primitives.cpp b/mlx/backend/gpu/primitives.cpp
+--- a/mlx/backend/gpu/primitives.cpp
++++ b/mlx/backend/gpu/primitives.cpp
+@@ -65,6 +65,11 @@
+ void Copy::eval_gpu(const std::vector<array>& inputs, array& out) {
+   MLX_PROFILER_RANGE("Copy::eval_gpu");
+   eval(inputs, out);
++}
++
++void EnsureDeviceStorage::eval_gpu(const std::vector<array>& inputs, array& out) {
++  MLX_PROFILER_RANGE("EnsureDeviceStorage::eval_gpu");
++  ensure_gpu_storage(inputs[0], out, stream());
+ }
+ 
+ void CopyToHostTransfer::eval_gpu(
+diff --git a/mlx/backend/metal/host_transfer.cpp b/mlx/backend/metal/host_transfer.cpp
+--- a/mlx/backend/metal/host_transfer.cpp
++++ b/mlx/backend/metal/host_transfer.cpp
+@@ -6,6 +6,11 @@
+ #include "mlx/backend/gpu/copy.h"
+ 
+ namespace mlx::core {
++
++void ensure_gpu_storage(const array& input, array& output, const Stream&) {
++  // Apple CPU/Metal storage is shared. Preserve strides, aliases and allocation.
++  output.copy_shared_buffer(input);
++}
+ 
+ void copy_gpu_to_host(const array& input, array& output, const Stream& stream) {
+   copy_gpu_inplace(input, output, CopyType::Vector, stream);
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -90,6 +90,7 @@
+ NO_GPU(Contiguous)
+ NO_GPU(Convolution)
+ NO_GPU(Copy)
++NO_GPU(EnsureDeviceStorage)
+ NO_GPU(CopyToHostTransfer)
+ NO_GPU(CopyFromHostTransfer)
+ NO_GPU(Cos)
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -224,6 +224,13 @@
+       [owner = std::move(owner)](allocator::Buffer) mutable { owner.reset(); });
+ }
+ 
++array ensure_device_storage(array source, StreamOrDevice stream) {
++  auto shape = source.shape();
++  auto dtype = source.dtype();
++  return array(std::move(shape), dtype,
++      std::make_shared<EnsureDeviceStorage>(to_stream(stream)), {std::move(source)});
++}
++
+ HostTransfer copy_to_host(
+     array source,
+     HostTransferPolicy policy,
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -106,6 +106,12 @@
+   Completion completion;
+ };
+ 
++/** Ensure backend-appropriate execution storage, sharing unified/already-local
++ * backing and copying host backing only when the selected GPU requires it.
++ * The operation is lazy; ordinary evaluation/completion retains its inputs.
++ */
++MLX_API array ensure_device_storage(array source, StreamOrDevice stream = {});
++
+ /** Allocate a transfer buffer and asynchronously copy `source` into it. */
+ MLX_API HostTransfer copy_to_host(
+     array source,
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -803,6 +803,13 @@
+ 
+  private:
+   void eval(const std::vector<array>& inputs, array& out);
++};
++
++class EnsureDeviceStorage : public Copy {
++ public:
++  explicit EnsureDeviceStorage(Stream stream) : Copy(stream) {}
++  void eval_gpu(const std::vector<array>& inputs, array& out) override;
++  DEFINE_NAME(EnsureDeviceStorage)
+ };
+ 
+ class CopyToHostTransfer : public UnaryPrimitive {
