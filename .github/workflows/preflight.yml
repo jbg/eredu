@@ -4,7 +4,7 @@ on:
     inputs:
       full:
         type: boolean
-        default: true
+        default: false
 permissions:
   contents: read
 jobs:
@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(inputs.full && '["backend", "consumers", "portable"]' || '["backend", "consumers"]') }}
+        suite: ${{ fromJSON(inputs.full && '["backend", "consumers", "portable"]' || '["backend", "portable"]') }}
     runs-on: ${{ matrix.suite == 'portable' && 'ubuntu-22.04' || 'macos-26' }}
     env:
       # FP32 reference tolerances require FP32 GEMM, including on NAX-capable Macs.
@@ -69,8 +69,8 @@ jobs:
         timeout-minutes: 25
         run: python3 validation/run_native_unit_tests.py --suite-timeout 900 --results-dir target/native-results/unit --fail-fast
       - name: Test native CLI consumers
-        if: ${{ !inputs.full && matrix.suite == 'consumers' }}
-        run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
+        if: ${{ !inputs.full && matrix.suite == 'backend' }}
+        run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal,eredu-backend-mlx/accelerate --timings
       - name: Test native workspace consumers
         if: inputs.full && matrix.suite == 'consumers'
         run: |
@@ -85,8 +85,16 @@ jobs:
           cargo test --locked -p eredu-gguf -p eredu-core -p eredu-text -p eredu-checkpoint \
             -p eredu-nn -p eredu-nn-macros -p eredu-runtime -p eredu-architectures \
             -p eredu-codec -p eredu-media -p eredu-evaluation --features eredu-architectures/image,eredu-architectures/audio,eredu-media/system-audio --timings
+      - name: Test portable facade contracts
+        if: matrix.suite == 'portable'
+        run: cargo test --locked -p eredu --no-default-features --test portable_facade --test backend_conformance
+      - name: Check validation tooling
+        if: matrix.suite == 'portable'
+        run: |
+          python3 -m unittest discover -s validation -p 'test_release_*.py'
+          python3 -m unittest discover -s validation -p 'test_native_unit_batches.py'
       - name: Test native integration and documentation targets
-        if: matrix.suite == 'backend'
+        if: inputs.full && matrix.suite == 'backend'
         run: |
           cargo test --locked -p eredu-backend-mlx --features metal,accelerate --test '*' --examples --timings
           cargo test --locked -p eredu-backend-mlx --features metal,accelerate --doc --timings
@@ -105,8 +113,8 @@ jobs:
           cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::io::manager::tests::two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization -- \
             --ignored --exact
-      - name: Test Ring PR smoke contracts
-        if: matrix.suite == 'backend'
+      - name: Test Ring release smoke contracts
+        if: inputs.full && matrix.suite == 'backend'
         timeout-minutes: 20
         run: |
           python3 validation/run_native_unit_tests.py --suite ring-smoke \

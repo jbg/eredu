@@ -25,7 +25,7 @@ def test_names(listing: str) -> list[str]:
             if line.endswith(": test")]
 
 
-# PR coverage samples contracts, not every model/encoding/topology combination.
+# Release smoke coverage samples contracts, not every model/encoding/topology combination.
 RING_SMOKE = [
     "tests::distributed_partition_ring::ring_two_process_partition_load",
     "tests::distributed_partition_ring::ring_two_process_bounded_consensus_transport",
