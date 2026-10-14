@@ -65,7 +65,7 @@ impl VisionGgufPlan {
             || member.length() != 857_077_888
             || digest != "0705006bdaac2a3e330a9e0b80767653fce5a07fedd99995c869082b0278ff75"
         {
-            let digest = eredu_checkpoint::gguf_fingerprint::fingerprint_gguf_catalog(&checkpoint)
+            let digest = eredu_checkpoint::gguf_fingerprint::fingerprint_gguf_catalog(checkpoint)
                 .map_err(|e| invalid(e.to_string()))?;
             let hash = digest
                 .iter()

@@ -446,8 +446,7 @@ where
             }
         }
         let mut stages = Vec::with_capacity(pipeline_stages);
-        for stage in 0..pipeline_stages {
-            let range = stage_units[stage].clone();
+        for range in &stage_units[..pipeline_stages] {
             let mut operations = ingress_operations.clone();
             for layer in range.clone() {
                 operations.extend([

@@ -2653,6 +2653,9 @@ consulted by that selection; changed backend facts require a new selection. Thes
 results are local to the admitted artifact's lifetime, not a filesystem or global
 model cache. A selected preparation retains the complete admitted artifact,
 including any embedded predictor, separately from its target execution projection.
+Target recipe construction sees only the admitted target source role; predictor
+recipes use the complete architecture's separate catalog. Both views share the
+same physical source ownership.
 Retained architecture and composite source snapshots keep immutable declarations
 without owning the enclosing selection cache, avoiding ownership cycles.
 

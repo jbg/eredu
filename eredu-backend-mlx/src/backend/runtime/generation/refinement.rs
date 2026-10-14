@@ -193,7 +193,7 @@ impl RefinementBackend for MlxSamplingBackend {
         let token_shape = [shape[0]];
         Ok(Some(MaskedRefinementStep {
             canvas: MlxTensor::from_array(Array::from_slice(&tokens, &token_shape)),
-            scores: MlxTensor::from_array(Array::from_slice(&scores, &shape)),
+            scores: MlxTensor::from_array(Array::from_slice(&scores, shape)),
             transfer: MlxTensor::from_array(Array::from_slice(&transfer, &token_shape)),
             remaining,
         }))

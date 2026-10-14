@@ -93,6 +93,7 @@ pub(super) fn settle(
     Ok(true)
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn submit(
     runtime: &mut ModelRuntime<MockBackend>,
     input: PendingTextInput<Vec<u32>, MockToken>,

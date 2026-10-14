@@ -123,14 +123,14 @@ impl GenerationForecastBackend for MlxBackend<'_> {
     }
     fn shared_backbone_memory_profile(runtime: &ModelRuntime<Self>) -> Result<Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>, GenerationForecastError> {
         let Some(policy) = runtime.session().capability_estimate().map_err(|error| CapabilityError::Observation(error.to_string()))?.shared_backbone_draft() else { return Ok(None); };
-        return Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+        Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
             refinement: Self::refinement_memory_plan(runtime, None)?,
             shared_backbone: Some(eredu_runtime::memory_forecast::SharedBackboneMemoryPlan::from_policy(policy)),
             embedded: None, draft: None, parameter_conversions: None,
             auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(0),
             sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
             proposal_capacity: policy.proposal_capacity().get() as u64, shared_allocator: true,
-        }));
+        }))
     }
 
     fn capture_memory_projection(

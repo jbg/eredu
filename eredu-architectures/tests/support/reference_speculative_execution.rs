@@ -251,7 +251,9 @@ pub(crate) fn gemma_runs_the_inspected_materialized_scheduler_path() {
             .expect("Gemma executor must reach the shared scheduler");
             assert_construction_stages(&outcome);
             assert_eq!(outcome.accepted, [2]);
-            assert_eq!(outcome.target_tokens, 6);
+            // One prompt token plus three verification inputs; full acceptance
+            // retains the verified cache without replaying the accepted prefix.
+            assert_eq!(outcome.target_tokens, 4);
             assert!(!reference_trace().linear_outputs.is_empty());
         })
         .unwrap()
@@ -295,8 +297,8 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
                 delayed_evidence.retained_at_wait
             );
             assert_eq!(delayed_evidence.publications, delayed.publications);
-            assert_eq!(delayed_evidence.restores, 1);
-            assert_eq!(delayed_evidence.exact_restores, 1);
+            assert_eq!(delayed_evidence.restores, 0, "full acceptance retains the verified cache");
+            assert_eq!(delayed_evidence.exact_restores, 0);
             assert_eq!(delayed_evidence.lifecycle, delayed.execution_stages);
 
             let failed_assistant = reference_gemma_assistant_artifact();

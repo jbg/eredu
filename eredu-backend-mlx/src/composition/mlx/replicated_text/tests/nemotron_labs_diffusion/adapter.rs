@@ -287,12 +287,12 @@ pub(super) fn compare_bfloat_scores(
     use safemlx::Dtype;
     let dtype = value.dtype();
     let actual = value
-        .as_dtype(Dtype::Float32, &stream)?
+        .as_dtype(Dtype::Float32, stream)?
         .into_evaluated()?
         .as_slice::<f32>()
         .to_vec();
     let expected = expected
-        .as_dtype(Dtype::Float32, &stream)?
+        .as_dtype(Dtype::Float32, stream)?
         .into_evaluated()?
         .as_slice::<f32>()
         .to_vec();

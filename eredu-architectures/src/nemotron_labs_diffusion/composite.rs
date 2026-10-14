@@ -869,8 +869,7 @@ where
             .as_ref()
             .ok_or("Pixtral schedule has no vision geometry")?;
         let mut stages = Vec::with_capacity(pipeline_stages);
-        for stage in 0..pipeline_stages {
-            let layers = stage_units[stage].clone();
+        for layers in &stage_units[..pipeline_stages] {
             let operations = if patches == 0 {
                 Vec::new()
             } else {

@@ -161,7 +161,7 @@ impl SharedBackboneMechanisms for Mechanisms {
         model.random_seeds.push(*randomness);
         *randomness += 1;
         let mut cache = prefix.clone();
-        let mut canvas = vec![last, 0, 0];
+        let mut canvas = [last, 0, 0];
         let mut eligible = vec![false, true, true];
         for _ in 0..2 {
             let tokens =

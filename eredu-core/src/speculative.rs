@@ -1314,10 +1314,10 @@ impl<'a, T> From<&'a mut T> for GenerationCache<'a, T> {
 }
 impl<T> std::ops::Deref for GenerationCache<'_, T> {
     type Target = T;
-    fn deref(&self) -> &T { match self { Self::Borrowed(cache) => &**cache.as_ref(), Self::Owned(cache) => cache } }
+    fn deref(&self) -> &T { match self { Self::Borrowed(cache) => cache.as_ref(), Self::Owned(cache) => cache } }
 }
 impl<T> std::ops::DerefMut for GenerationCache<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { match self { Self::Borrowed(cache) => &mut **cache.as_mut(), Self::Owned(cache) => cache } }
+    fn deref_mut(&mut self) -> &mut T { match self { Self::Borrowed(cache) => cache.as_mut(), Self::Owned(cache) => cache } }
 }
 
 /// One backend-prepared lane lent to neutral speculative orchestration.
@@ -2770,6 +2770,7 @@ pub struct SettledCommittedSuffix<S, L, T> {
 /// Appends a nonempty committed suffix through the executor's zero-proposal
 /// transaction. On failure the checkpoint restores the canonical frontier; an
 /// executor whose native disposition prevents restoration returns that failure.
+#[allow(clippy::type_complexity)]
 pub fn settle_committed_suffix<'a, E: SpeculativeExecutor + 'a>(
     executor: &mut E,
     cache: &mut E::Cache,

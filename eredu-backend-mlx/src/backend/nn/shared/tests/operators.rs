@@ -1742,7 +1742,7 @@ fn reduced_precision_gelu_preserves_vector_reference_tail_saturation() {
 fn exact_gelu_preserves_low_precision_with_one_output_rounding_boundary() {
     let values = [-3.0f32, -1.0, 0.0, 0.5, 1.0, 3.0];
     // Independent x * standard-normal CDF(x), evaluated in FP64.
-    let expected = [-0.00404969409489028f32, -0.15865525393145705, 0.0, 0.34573123063700655, 0.8413447460685429, 2.9959503059051097];
+    let expected = [-0.004_049_694_f32, -0.158_655_26, 0.0, 0.345_731_23, 0.841_344_8, 2.995_950_2];
     for device in [DeviceType::Cpu, DeviceType::Gpu] {
         let execution = ExecutionContext::new(Device::new(device, 0));
         let stream = execution.stream();

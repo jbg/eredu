@@ -47,7 +47,7 @@ fn bindings<M: Parameterized<MlxTensor>>(
     source: &dyn CheckpointSource,
 ) -> Result<Vec<eredu_runtime::WeightBinding>, eredu_backend_mlx::backend::error::Error> {
     let mut recipes = nemotron_labs_diffusion::source_recipes(source)
-        .map_err(|e| eredu_backend_mlx::backend::error::Error::Parallel(e))?;
+        .map_err(eredu_backend_mlx::backend::error::Error::Parallel)?;
     for key in source.source_keys() {
         let canonical = nemotron_labs_diffusion::canonical_parameter_name(&key);
         if canonical == key
@@ -514,7 +514,7 @@ where
                 stream,
                 &mut Observer {
                     label: &label,
-                    reference: &reference,
+                    reference,
                     stream,
                 },
             )?;
