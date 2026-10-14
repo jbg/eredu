@@ -287,7 +287,16 @@ pub(super) fn worker(
     stream: &Stream,
     weights_stream: &Stream,
 ) {
+    let started = std::time::Instant::now();
+    let phase = |name: &str| {
+        eprintln!(
+            "Flash-Next MTP rank {} [{:.2?}]: {name}",
+            topology.global_rank(),
+            started.elapsed()
+        );
+    };
     let media = super::media::is_fixture(checkpoint);
+    phase("prepare single-rank baseline");
     let backend = crate::native::backend(stream, weights_stream);
     let prepared = eredu_core::prepare_inspected_model(
         &backend,
@@ -299,6 +308,7 @@ pub(super) fn worker(
     )
     .unwrap();
     let mut baseline = ModelRuntime::from_prepared(backend, prepared).unwrap();
+    phase("generate single-rank baseline");
     let expected = generate(&mut baseline, media);
     assert_eq!(expected.token_ids().len(), generation_config().max_tokens);
     assert!(
@@ -314,12 +324,6 @@ pub(super) fn worker(
             expected.stats().rounds()
         );
     }
-    let started = std::time::Instant::now();
-    let phase = |name: &str| {
-        if topology.global_rank() == 0 {
-            eprintln!("Flash-Next MTP [{:.2?}]: {name}", started.elapsed());
-        }
-    };
     phase("baseline captures");
     let baseline_captures = captures::baseline(&mut baseline, media, &expected);
     drop(baseline);
@@ -349,6 +353,7 @@ pub(super) fn worker(
         )
         .unwrap();
     let backend = crate::native::distributed_backend(stream, weights_stream, group);
+    phase("prepare distributed model");
     let prepared = eredu_core::prepare_inspected_model(
         &backend,
         component_fixture_inspection(checkpoint),
