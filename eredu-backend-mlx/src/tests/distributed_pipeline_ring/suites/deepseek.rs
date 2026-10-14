@@ -1,3 +1,59 @@
+// Each distributed configuration is a libtest case, so CI can isolate, time,
+// shard and diagnose it without waiting for the remaining matrix configurations.
+macro_rules! deepseek_component_case {
+    ($name:ident, $run:expr, $axes:literal, $residency:ident) => {
+        #[test]
+        #[ignore = "requires native MLX and up to eight local Ring ranks; run explicitly"]
+        fn $name() {
+            ($run)($axes, WorkerResidency::$residency);
+        }
+    };
+}
+
+macro_rules! deepseek_all_residencies {
+    ($name:ident, $run:expr) => {
+        mod $name {
+            use super::*;
+            deepseek_component_case!(tp_resident, $run, "tp", FullyResident);
+            deepseek_component_case!(tp_host, $run, "tp", LayerwiseHost);
+            deepseek_component_case!(tp_disk, $run, "tp", DenseDiskStream);
+            deepseek_component_case!(pp_resident, $run, "pp", FullyResident);
+            deepseek_component_case!(pp_host, $run, "pp", LayerwiseHost);
+            deepseek_component_case!(pp_disk, $run, "pp", DenseDiskStream);
+            deepseek_component_case!(ep_resident, $run, "ep", FullyResident);
+            deepseek_component_case!(ep_host, $run, "ep", LayerwiseHost);
+            deepseek_component_case!(ep_disk, $run, "ep", DenseDiskStream);
+            deepseek_component_case!(tp_pp_resident, $run, "tp-pp", FullyResident);
+            deepseek_component_case!(tp_pp_host, $run, "tp-pp", LayerwiseHost);
+            deepseek_component_case!(tp_pp_disk, $run, "tp-pp", DenseDiskStream);
+            deepseek_component_case!(tp_ep_resident, $run, "tp-ep", FullyResident);
+            deepseek_component_case!(tp_ep_host, $run, "tp-ep", LayerwiseHost);
+            deepseek_component_case!(tp_ep_disk, $run, "tp-ep", DenseDiskStream);
+            deepseek_component_case!(pp_ep_resident, $run, "pp-ep", FullyResident);
+            deepseek_component_case!(pp_ep_host, $run, "pp-ep", LayerwiseHost);
+            deepseek_component_case!(pp_ep_disk, $run, "pp-ep", DenseDiskStream);
+            deepseek_component_case!(tp_pp_ep_resident, $run, "tp-pp-ep", FullyResident);
+            deepseek_component_case!(tp_pp_ep_host, $run, "tp-pp-ep", LayerwiseHost);
+            deepseek_component_case!(tp_pp_ep_disk, $run, "tp-pp-ep", DenseDiskStream);
+        }
+    };
+}
+
+macro_rules! deepseek_component_cases {
+    ($name:ident, $run:expr) => {
+        mod $name {
+            use super::*;
+            deepseek_component_case!(tp_resident, $run, "tp", FullyResident);
+            deepseek_component_case!(pp_disk, $run, "pp", DenseDiskStream);
+            deepseek_component_case!(ep_resident, $run, "ep", FullyResident);
+            deepseek_component_case!(tp_pp_host, $run, "tp-pp", LayerwiseHost);
+            deepseek_component_case!(tp_ep_host, $run, "tp-ep", LayerwiseHost);
+            deepseek_component_case!(pp_ep_host, $run, "pp-ep", LayerwiseHost);
+            deepseek_component_case!(tp_pp_ep_disk, $run, "tp-pp-ep", DenseDiskStream);
+        }
+    };
+}
+
 /// Verifies DeepSeek MLA paged-prefix persistence across two pipeline stages.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
@@ -483,61 +539,67 @@ fn run_deepseek_v3_component_axes(family: FixtureFamily, mode: WorkerMode, axes:
     }
 }
 
-/// Public internal activation admission compares each selected partition with
-/// ordinary local execution, including sparse units and causal channel masks.
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v3_mtp_component_capture_residency_and_parallel_matrix() {
-    run_deepseek_prediction_components(
+// Public internal activation admission compares each selected partition with
+// ordinary local execution, including sparse units and causal channel masks.
+deepseek_component_cases!(
+    ring_deepseek_v3_mtp_component_capture_residency_and_parallel_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeek,
         WorkerMode::OpaqueDeepSeekMtpTarget,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v3_mtp_affine_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v3_mtp_affine_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeek,
         WorkerMode::OpaqueDeepSeekMtpTargetRequantize,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v3_mtp_mxfp4_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v3_mtp_mxfp4_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeek,
         WorkerMode::OpaqueDeepSeekMtpTargetMxFp4,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_mtp_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v4_mtp_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekMtpTarget,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_mtp_affine_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v4_mtp_affine_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekMtpTargetRequantize,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_mtp_mxfp4_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v4_mtp_mxfp4_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekMtpTargetMxFp4,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
 #[test]
 #[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
@@ -561,38 +623,37 @@ fn run_deepseek_v4_target_components(mode: WorkerMode) {
     run_component_matrix_with_mode(FixtureFamily::DeepSeekV4, true, mode);
 }
 
-fn run_deepseek_prediction_components(family: FixtureFamily, mode: WorkerMode) {
-    run_component_matrix_with_mode(family, true, mode);
-}
-
-/// Multi-block fused context/proposal captures, selected-position interventions,
-/// effective parameter queries and atomic overlays across all native CPU axes.
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_dspark_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+// Multi-block fused context/proposal captures, selected-position interventions,
+// effective parameter queries and atomic overlays across all native CPU axes.
+deepseek_component_cases!(
+    ring_deepseek_v4_dspark_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekDsparkTarget,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_dspark_affine_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v4_dspark_affine_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekDsparkTargetRequantize,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
-#[test]
-#[ignore = "spawns two to eight local processes and opens loopback sockets; run explicitly"]
-fn ring_deepseek_v4_dspark_mxfp4_components_and_parameters_matrix() {
-    run_deepseek_prediction_components(
+deepseek_component_cases!(
+    ring_deepseek_v4_dspark_mxfp4_components_and_parameters_matrix,
+    |axes, residency| run_component_case_with_mode(
         FixtureFamily::DeepSeekV4,
         WorkerMode::OpaqueDeepSeekDsparkTargetMxFp4,
-    );
-}
+        axes,
+        residency,
+    )
+);
 
 fn run_v4_fp8_component_case(
     dspark: bool,
@@ -630,21 +691,12 @@ fn ring_deepseek_v4_fp8_components_focused() {
 
 macro_rules! v4_fp8_component_matrix {
     ($name:ident, $dspark:expr, $ue8m0:expr) => {
-        #[test]
-        #[ignore = "requires native MLX and up to eight local Ring ranks; run explicitly"]
-        fn $name() {
-            for axes in ["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
-                for residency in [
-                    WorkerResidency::FullyResident,
-                    WorkerResidency::LayerwiseHost,
-                    WorkerResidency::DenseDiskStream,
-                ] {
-                    run_v4_fp8_component_case($dspark, $ue8m0, axes, residency);
-                }
-            }
-        }
+        deepseek_all_residencies!($name, |axes, residency| {
+            run_v4_fp8_component_case($dspark, $ue8m0, axes, residency)
+        });
     };
 }
+
 v4_fp8_component_matrix!(
     ring_deepseek_v4_mtp_fp8_float_components_matrix,
     false,
@@ -711,21 +763,12 @@ fn ring_deepseek_additional_fp8_components_focused() {
 
 macro_rules! additional_deepseek_fp8_matrix {
     ($name:ident, $v3:expr, $dspark:expr) => {
-        #[test]
-        #[ignore = "requires native MLX and up to eight local Ring ranks; run explicitly"]
-        fn $name() {
-            for axes in ["tp", "pp", "ep", "tp-pp", "tp-ep", "pp-ep", "tp-pp-ep"] {
-                for residency in [
-                    WorkerResidency::FullyResident,
-                    WorkerResidency::LayerwiseHost,
-                    WorkerResidency::DenseDiskStream,
-                ] {
-                    run_deepseek_additional_fp8_case($v3, $dspark, axes, residency);
-                }
-            }
-        }
+        deepseek_all_residencies!($name, |axes, residency| {
+            run_deepseek_additional_fp8_case($v3, $dspark, axes, residency)
+        });
     };
 }
+
 additional_deepseek_fp8_matrix!(ring_deepseek_v3_fp8_components_matrix, true, false);
 additional_deepseek_fp8_matrix!(
     ring_deepseek_v4_mtp_mixed_fp8_components_matrix,

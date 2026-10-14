@@ -350,16 +350,25 @@ fn run_qwen_prediction_components(family: FixtureFamily, routed: bool) {
 
 fn run_component_matrix_with_mode(family: FixtureFamily, routed: bool, mode: WorkerMode) {
     for &(axes, residency) in component_cases(routed) {
-        match residency {
-            WorkerResidency::FullyResident => {
-                run_ring_cartesian_pipeline_mode(false, family, axes, mode)
-            }
-            WorkerResidency::LayerwiseHost => {
-                run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode)
-            }
-            WorkerResidency::DenseDiskStream => {
-                run_ring_cartesian_pipeline_mode(true, family, axes, mode)
-            }
+        run_component_case_with_mode(family, mode, axes, residency);
+    }
+}
+
+fn run_component_case_with_mode(
+    family: FixtureFamily,
+    mode: WorkerMode,
+    axes: &'static str,
+    residency: WorkerResidency,
+) {
+    match residency {
+        WorkerResidency::FullyResident => {
+            run_ring_cartesian_pipeline_mode(false, family, axes, mode)
+        }
+        WorkerResidency::LayerwiseHost => {
+            run_ring_layerwise_host_cartesian_pipeline_mode(family, axes, mode)
+        }
+        WorkerResidency::DenseDiskStream => {
+            run_ring_cartesian_pipeline_mode(true, family, axes, mode)
         }
     }
 }

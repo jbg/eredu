@@ -56,19 +56,12 @@ fn run_deepseek_encoded_bank_case(
 
 macro_rules! deepseek_encoded_bank_matrix {
     ($name:ident, $encoding:ident) => {
-        #[test]
-        #[ignore = "requires native MLX and up to eight local Ring ranks; run explicitly"]
-        fn $name() {
-            for &(axes, residency) in component_cases(true) {
-                run_deepseek_encoded_bank_case(
-                    DeepSeekEncodedBankFixture::$encoding,
-                    axes,
-                    residency,
-                );
-            }
-        }
+        deepseek_component_cases!($name, |axes, residency| {
+            run_deepseek_encoded_bank_case(DeepSeekEncodedBankFixture::$encoding, axes, residency)
+        });
     };
 }
+
 deepseek_encoded_bank_matrix!(ring_deepseek_v3_fp8_independent_banks_matrix, V3);
 deepseek_encoded_bank_matrix!(ring_deepseek_v4_fp8_float_independent_banks_matrix, V4Float);
 deepseek_encoded_bank_matrix!(ring_deepseek_v4_fp8_ue8m0_independent_banks_matrix, V4Ue8m0);
