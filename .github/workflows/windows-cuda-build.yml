@@ -33,7 +33,8 @@ jobs:
   build:
     name: CUDA ${{ inputs.cuda }} / cuDNN 9 / MSVC
     runs-on: windows-2022
-    timeout-minutes: 60
+    # A cold, serialized MLX CUDA build can exceed one hour on hosted runners.
+    timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_INCREMENTAL: "0"
@@ -101,7 +102,7 @@ jobs:
         with:
           variant: cuda${{ inputs.toolkit_version }}-cudnn${{ inputs.cudnn_version }}-sm${{ inputs.cuda_architectures }}
       - name: Build the native CUDA library
-        run: cargo build --locked -j 1 -p safemlx-sys --no-default-features --features cuda
+        run: cargo build --locked -vv -j 1 -p safemlx-sys --no-default-features --features cuda
       - uses: ./.github/actions/save-native-cache
         with:
           key: ${{ steps.cache.outputs.native-key }}

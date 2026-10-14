@@ -1611,6 +1611,14 @@ fn run_ring_pipeline_processes(
     } else {
         1
     };
+    // Four-rank prediction includes two generations, three controlled replays,
+    // verification cancellation and recovery on the same small host. Bound the
+    // complete lifecycle before the smoke runner's ten-minute outer deadline.
+    let case_seconds = if world_size == 4 && matches!(mode, WorkerMode::OpaquePredictionSession) {
+        540
+    } else {
+        case_seconds
+    };
     // Published-size projector fixtures may spend much longer in bounded host
     // decoding than tiny synthetic models. This affects only the test watchdog.
     let case_seconds = media_fixture
@@ -1618,13 +1626,6 @@ fn run_ring_pipeline_processes(
         .and_then(|fixture| fixture.get("case_timeout_seconds"))
         .map(|seconds| seconds.as_u64().expect("fixture timeout must be seconds"))
         .unwrap_or(case_seconds);
-    // Finish the four-rank prediction watchdog before the smoke runner's outer
-    // deadline so it can report every worker's last phase and buffered output.
-    let case_seconds = if world_size == 4 && matches!(mode, WorkerMode::OpaquePredictionSession) {
-        case_seconds.min(180)
-    } else {
-        case_seconds
-    };
     assert!(case_seconds > 0, "fixture timeout must be positive");
     let deadline = Instant::now() + Duration::from_secs(case_seconds);
     let mut timed_out = false;
