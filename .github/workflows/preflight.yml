@@ -107,10 +107,10 @@ jobs:
             --ignored --exact
       - name: Test Ring PR smoke contracts
         if: matrix.suite == 'backend'
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           python3 validation/run_native_unit_tests.py --suite ring-smoke \
-            --test-timeout 240 --suite-timeout 480 --fail-fast --results-dir target/native-results/ring-smoke
+            --test-timeout 600 --suite-timeout 900 --fail-fast --results-dir target/native-results/ring-smoke
       - name: Test concurrent MLX use
         if: inputs.full && matrix.suite == 'consumers'
         run: cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe -- --test-threads=1

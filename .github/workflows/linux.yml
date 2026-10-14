@@ -103,7 +103,8 @@ jobs:
     if: inputs.full
     name: Rust 1.89 CUDA and NCCL compatibility
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    # Keep memory-heavy CUDA compilation serialized, with room for a cold build.
+    timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: "0"
       SAFEMLX_CUDA_ARCHITECTURES: "80"
@@ -137,7 +138,7 @@ jobs:
         with:
           variant: cuda12.9-cudnn9-nccl-sm80
       - name: Build the native CUDA library
-        run: cargo build --locked -j 1 -p safemlx-sys --no-default-features --features nccl
+        run: cargo build --locked -vv -j 1 -p safemlx-sys --no-default-features --features nccl
       - uses: ./.github/actions/save-native-cache
         with:
           key: ${{ steps.cache.outputs.native-key }}
