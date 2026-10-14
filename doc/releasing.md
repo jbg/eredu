@@ -94,56 +94,51 @@ while Cargo's normal package verification still compiles each crate's default
 packaged targets. Packaging does not need an Apple or NVIDIA runner:
 target-native Metal and CUDA coverage remains in the platform workflows.
 
-The Linux build workflow separately denies all workspace Clippy warnings and
-checks each weakly forwarded facade feature (`metal`, `cuda`, `nccl`, `image`,
-and `audio`) without `mlx` at the minimum supported Rust version. These checks
-keep optional facade features from accidentally activating the native backend
-or depending on its availability.
+Routine **CI** runs two jobs on code pull requests and main pushes:
 
-The `Native release gate` is the compatibility CI entry point. It runs on main and
-pull requests, nightly, and by manual dispatch. A small planning job compares the
-candidate with the most recent successful **full** main gate; a version-only
-follow-up therefore cannot hide the preceding source change. The plan is printed
-in the job summary and retained as the `release-plan` artifact. Before the first
-new full run, the baseline is `084458c3`, verified by
-[the September 7 full gate](https://github.com/jbg/eredu/actions/runs/34130046331).
-Expired or missing newer receipts fall back to that older baseline.
+- **Portable workspace** on Linux runs the portable crate tests, including host
+  media processing, facade/backend conformance, and validation-tooling tests.
+- **Native backend** on macOS runs the ordinary isolated Metal backend units and
+  native CLI tests, sharing one native build and Rust cache.
 
-Scoped eligibility is intentionally narrow and follows changed source, not the
-SemVer number. Changes spanning more than 20 files or 1,000 added/deleted lines
-require full validation. The initial reviewed scope covers Qwen hybrid checkpoint recipes,
-replicated-text lowering, and the private grouped/binding implementations used by
-the FP8 fix. It still runs architecture tests, the ordinary native Metal backend
-suite (including FP8 resident/addressable regressions and required native-device
-admission), portable facade conformance, and native CLI consumers on macOS,
-Linux, and Windows. Changing public declarations, platform/feature attributes,
-external dependencies, native/build/toolchain inputs, other production code, or
-the scope rules themselves requires the full matrix. The classifier is a
-conservative verification selector, not an API compatibility checker.
+Documentation-only changes skip these jobs. New commits cancel superseded runs.
+Vendored MLX patch, test, or archive changes add one focused Linux patch-test job
+on the PR; this job does not repeat on the merge push. Routine CI does not run a
+release planner, cross-compilation matrix, CUDA builds, Windows builds, MSRV
+matrix, package archives, ignored Ring smoke tests, or native integration/doctest
+sweeps.
 
-Full compatibility validation retains workspace tests, all six Apple cross
-targets, Linux CPU/MSRV/CUDA/NCCL, and Windows CPU plus CUDA 12.9.1 and 13.0.2.
-Nightly runs and the dispatch `full` input select that compatibility matrix.
-Self-hosted GPU execution remains explicit opt-in through `run_windows_gpu` and
-`run_linux_gpu`. Native backend and consumers run in separate macOS jobs; portable workspace
-tests run on Linux, including optional host-media processing. Each has a
-45-minute ceiling. PR backend and consumer validation use the ordinary test
-profile to keep compilation of integration targets bounded. Apple cross-builds use at most three concurrent macOS slots,
-reserving two for the native jobs. Other compatibility jobs
-have a 60-minute ceiling; a timeout fails validation.
+The **Native release gate** runs weekly and by manual dispatch or reusable-workflow
+call. Run it once for the exact release commit before publication. Its `full` input
+is enabled by default and selects workspace tests, all six Apple cross targets
+(including tvOS and visionOS device/simulator pairs), Linux CPU/MSRV/CUDA/NCCL,
+Windows CPU and CUDA 12.9.1/13.0.2, and package validation on stable and Rust 1.89.
+These compatibility jobs have no PR, main-push, or nightly triggers. The weekly
+sweep retains active-platform coverage, including iOS, but excludes tvOS and
+visionOS: those four device/simulator builds run only for releases. The separate
+Windows CUDA compatibility workflow is manual, for focused checks without
+repeating the weekly or release gate. Self-hosted GPU execution remains opt-in
+through `run_windows_gpu` and `run_linux_gpu`.
 
-PR and main gates run seven representative Ring smoke tests: partition loading,
-bounded consensus, expert exchange, Cartesian topology, resident GGUF pipeline
-execution, disk-streamed prediction across tensor/pipeline partitions, and
-provider failure handling. The Ring smoke step has an eight-minute execution
-budget and a four-minute limit per test. It fails at the first error and retains
-per-test logs and timings. Ordinary backend tests also use fresh processes and
-prepared-cache directories, preventing native stream and allocator state from
-accumulating across unrelated tests.
+The release gate's Linux build denies workspace Clippy warnings and checks each
+weakly forwarded facade feature (`metal`, `cuda`, `nccl`, `image`, and `audio`)
+without `mlx` at the minimum supported Rust version. Full native validation
+includes integration and documentation targets, ignored semantic/cache tests,
+and seven representative Ring smoke contracts. Backend, consumer, and portable
+workspace suites run in separate jobs for this full release check.
+
+For a deliberately scoped release check, disable `full`. The planner compares
+the candidate with the most recent successful full main gate, retaining the
+plan as the `release-plan` artifact. Only its narrow reviewed implementation
+scope is eligible: public surface, native/build/toolchain, external dependency,
+and unrecognized changes require the complete matrix. More than 20 files or
+1,000 changed lines also requires full coverage. This classifier never expands routine PR CI.
+Weekly checks always select full coverage, apart from the release-only targets. Missing or expired receipts fall back to the
+verified baseline `084458c34eabd80eb3bf8d85d13d3c7ea1c5b499`.
 
 The **Extended Ring conformance** workflow runs the complete synthetic Ring suite
-weekly and on manual dispatch, independently of the PR/release compatibility
-gate. Use it for broad distributed-runtime or model-matrix validation. It builds
+weekly and on manual dispatch, independently of routine CI and the release
+compatibility gate. Use it for broad distributed-runtime or model-matrix validation. It builds
 the test executable once using the optimized `conformance` profile, retaining
 debug assertions and overflow checks, and distributes every ignored Ring test across 32
 shards, excluding only the two explicitly opt-in released Moshi checkpoint tests.
@@ -164,8 +159,8 @@ python3 validation/run_native_unit_tests.py --suite ring \
   --filter ring_two_process_partition_load --results-dir /tmp/eredu-ring-results
 ```
 
-Before publication, require a successful **main push or manual dispatch** gate
-for the exact release commit and inspect its release plan. Either automatically
+Before publication, require a successful **manual dispatch or reusable-call**
+release gate for the exact release commit and inspect its release plan. Either automatically
 selected scope is valid; do not manually omit a failed required check. Reuse that
 successful run rather than launching a second identical matrix. These are
 verification workflows; they never publish crates or create release tags.
@@ -183,8 +178,8 @@ Unselected published dependencies resolve from crates.io, rather than being
 repackaged from the workspace. Registry lookup errors fail validation; they do
 not count as proof that a dependency is published. The CI plan supplies pending crate roots in publication order, comparing each
 crate with its own current-version release tag. Previously published scoped
-changes therefore do not accumulate in the next release's archive set. Infrastructure-only full checks and
-nightly audits validate every package. Both stable and Rust 1.89 archive jobs
+changes therefore do not accumulate in the next release's archive set. Full
+release checks validate every package. Both stable and Rust 1.89 archive jobs
 remain mandatory. The target directory can persist across runs. Each staged
 registry is identified by the archive checksum and its complete index record,
 including the exact registry identities of its staged dependencies. Identical
@@ -197,7 +192,8 @@ staging, and temporary sources and registries are removed at the end. Cargo's
 normal package verification, packaged tests, doctests and downstream checks
 remain mandatory on both toolchains.
 
-To run the same preflight locally on an Apple silicon host outside a sandbox:
+To run the native release preflight locally on an Apple silicon host outside a
+sandbox:
 
 ```bash
 bash validation/preflight.sh

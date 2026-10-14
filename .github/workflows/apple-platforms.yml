@@ -2,6 +2,11 @@ name: Apple platform builds
 
 on:
   workflow_call:
+    inputs:
+      release_targets:
+        description: Include tvOS and visionOS device/simulator builds for releases
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -15,13 +20,7 @@ jobs:
       # Reserve two macOS slots for native backend and consumer validation.
       max-parallel: 3
       matrix:
-        target:
-          - aarch64-apple-ios
-          - aarch64-apple-ios-sim
-          - aarch64-apple-tvos
-          - aarch64-apple-tvos-sim
-          - aarch64-apple-visionos
-          - aarch64-apple-visionos-sim
+        target: ${{ fromJSON(inputs.release_targets && '["aarch64-apple-ios", "aarch64-apple-ios-sim", "aarch64-apple-tvos", "aarch64-apple-tvos-sim", "aarch64-apple-visionos", "aarch64-apple-visionos-sim"]' || '["aarch64-apple-ios", "aarch64-apple-ios-sim"]') }}
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain

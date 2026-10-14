@@ -1,47 +1,14 @@
 name: Native release gate
 
 on:
-  pull_request:
-    paths:
-      - '.github/**'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'clippy.toml'
-      - 'LICENSE-*'
-      - 'safemlx/**'
-      - 'safemlx-*/**'
-      - 'eredu/**'
-      - 'eredu-*/**'
-      - 'examples/eredu-ios/**'
-      - 'validation/**'
-      - 'doc/releasing.md'
-      - 'doc/README.md'
-  push:
-    branches: [main]
-    paths:
-      - '.github/**'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'clippy.toml'
-      - 'LICENSE-*'
-      - 'safemlx/**'
-      - 'safemlx-*/**'
-      - 'eredu/**'
-      - 'eredu-*/**'
-      - 'examples/eredu-ios/**'
-      - 'validation/**'
   schedule:
-    - cron: "23 3 * * *"
+    - cron: "23 3 * * 6"
   workflow_dispatch:
     inputs:
       full:
-        description: Force the complete compatibility matrix
+        description: Run the complete release compatibility matrix
         type: boolean
-        default: false
+        default: true
       run_windows_gpu:
         description: Also run on the preconfigured self-hosted Windows NVIDIA runner
         type: boolean
@@ -51,6 +18,10 @@ on:
         type: boolean
         default: false
   workflow_call:
+    inputs:
+      full:
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -78,7 +49,7 @@ jobs:
           python-version: '3.12'
       - name: Install the repository Rust toolchain
         run: rustup toolchain install
-      - name: Select verification from changes since the last full success
+      - name: Select release verification and packages
         id: scope
         env:
           GH_TOKEN: ${{ github.token }}
@@ -106,6 +77,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.full == 'true'
     uses: ./.github/workflows/apple-platforms.yml
+    with:
+      release_targets: ${{ github.event_name != 'schedule' }}
 
   linux:
     needs: plan

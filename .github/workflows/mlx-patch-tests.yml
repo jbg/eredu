@@ -7,14 +7,16 @@ on:
       - "safemlx-sys/scripts/test-mlx-patches.sh"
       - "safemlx-sys/src/mlx-c/CMakeLists.txt"
       - "safemlx-sys/src/mlx-c/patches/**"
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/mlx-patch-tests.yml"
-      - "safemlx-sys/scripts/test-mlx-patches.sh"
-      - "safemlx-sys/src/mlx-c/CMakeLists.txt"
-      - "safemlx-sys/src/mlx-c/patches/**"
+      - "safemlx-sys/src/mlx-c/tests/**"
+      - "safemlx-sys/vendor/**"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlx-patch-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   patched-mlx:
