@@ -146,6 +146,8 @@ gate. Use it for broad distributed-runtime or model-matrix validation. It builds
 the test executable once using the optimized `conformance` profile, retaining
 debug assertions and overflow checks, and distributes every ignored Ring test across 32
 shards, excluding only the two explicitly opt-in released Moshi checkpoint tests.
+Large DeepSeek matrices expose each topology/residency configuration as an
+individual test, preserving every combination while allowing balanced sharding.
 Each test runs in a fresh process with a ten-minute limit; each shard has a
 30-minute execution budget and a 35-minute job ceiling. Timeout terminates the
 entire worker process group. Missing smoke tests, unmatched filters, and unrun
