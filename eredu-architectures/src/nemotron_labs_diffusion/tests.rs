@@ -98,9 +98,9 @@ fn configuration_rejects_missing_head_width_and_conflicting_rotary_aliases() {
 
 #[test]
 fn image_processor_matches_published_float_cubic_and_marker_sequences() {
-    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
     let processor = processing::ImageProcessor::new(&config, 16).unwrap();
@@ -160,7 +160,7 @@ fn official_draft_adapter_has_separate_rank_parameters_and_exact_ancestry() {
     ))
     .unwrap();
     let bytes =
-        include_bytes!("../../tests/fixtures/nemotron_labs_diffusion/3B-adapter-config.json");
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON.as_bytes();
     let adapter =
         adapter::DraftAdapterConfig::from_json(bytes, "nvidia/Nemotron-Labs-Diffusion-3B").unwrap();
     let header = Header(
@@ -343,7 +343,7 @@ fn discovery_expands_pixtral_spatial_projector_and_conditional_draft_parameters(
         .resolve_safetensors(&text)
         .unwrap();
     let adapter = adapter::DraftAdapterConfig::from_json(
-        include_bytes!("../../tests/fixtures/nemotron_labs_diffusion/3B-adapter-config.json"),
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON.as_bytes(),
         "nvidia/Nemotron-Labs-Diffusion-3B",
     )
     .unwrap();
@@ -383,14 +383,14 @@ fn discovery_expands_pixtral_spatial_projector_and_conditional_draft_parameters(
 #[test]
 fn adapter_admission_rejects_changed_sidecars_and_header_preserving_weight_replacement() {
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
-    let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-    ))
+    let fixture: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+    )
     .unwrap();
     let config = FamilyConfig::from_hf_value(&fixture["config"]).unwrap();
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../tests/fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    ))
+    let mut json: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 4.into();

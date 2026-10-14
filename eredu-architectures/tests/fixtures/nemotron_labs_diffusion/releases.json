@@ -83,7 +83,7 @@
         "algorithm": "git_blob_sha1"
       }
     ],
-    "adapter_config_file": "3B-adapter-config.json",
+    "adapter_config_file": "eredu-evaluation/fixtures/nemotron_labs_diffusion/3B-adapter-config.json",
     "adapter_header_file": "3B-adapter-header.json"
   },
   {

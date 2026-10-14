@@ -10158,6 +10158,8 @@ peak nor admission authority.
 Reusable miniature artifacts and comparison fixtures belong to `eredu-evaluation` as development
 dependencies. Codec and architecture tests import packaged fixture constants rather than
 reading sibling workspace paths, so archive validation exercises the same references.
+Nemotron Labs Diffusion's draft adapter configuration and Pixtral numerical reference
+are packaged constants shared by architecture, backend and facade tests.
 Production architectures, facade and backends do not depend on evaluation. Native
 conformance uses ordinary selected constructors and erased executables. Numerical, distributed
 and released-artifact verification scope is recorded in the family validation report.

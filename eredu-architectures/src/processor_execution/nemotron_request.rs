@@ -138,9 +138,9 @@ mod tests {
 
     #[test]
     fn published_pixels_lower_without_duplicate_markers_and_admit_buffers_before_processing() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/nemotron_labs_diffusion/pixtral-numeric.json"
-        ))
+        let fixture: serde_json::Value = serde_json::from_str(
+            eredu_evaluation::nemotron_labs_diffusion::PIXTRAL_REFERENCE_JSON,
+        )
         .unwrap();
         let config =
             crate::nemotron_labs_diffusion::FamilyConfig::from_hf_value(&fixture["config"])

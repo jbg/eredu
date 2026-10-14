@@ -176,9 +176,13 @@ fn adaptive_disabling_stops_unproductive_branches_without_changing_output() {
                 GenerationRequestConfig {
                     max_tokens: 10,
                     decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
-                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
-                        ),
+                        eredu_core::decoding::SpeculationOptionsRequest {
+                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                            scheduler: options,
+                            ..Default::default()
+                        }
+                        .try_into()
+                        .unwrap(),
                     ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),

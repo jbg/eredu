@@ -111,10 +111,9 @@ fn normal_loader_draft_adapter_changes_only_drafting_and_preserves_target_sampli
 pub(super) fn fixture(config_json: serde_json::Value) -> tempfile::TempDir {
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     let adapter = tempfile::tempdir().unwrap();
-    let mut json: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../eredu-architectures/tests/fixtures/nemotron_labs_diffusion/3B-adapter-config.json"
-    )))
+    let mut json: serde_json::Value = serde_json::from_str(
+        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
+    )
     .unwrap();
     json["r"] = 2.into();
     json["lora_alpha"] = 4.into();
