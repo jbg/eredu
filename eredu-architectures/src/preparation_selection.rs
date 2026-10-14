@@ -625,7 +625,7 @@ where
         admission,
         prediction_extension,
         prediction_realization,
-    ).with_retained_architecture(execution_inspection.architecture_plan().clone()))
+    ).with_retained_architecture(inspection.architecture_plan().clone()))
 }
 
 fn admit_inspected_preparation(
