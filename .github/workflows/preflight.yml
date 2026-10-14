@@ -67,7 +67,7 @@ jobs:
       - name: Test ordinary native backend units
         if: matrix.suite == 'backend'
         timeout-minutes: 25
-        run: python3 validation/run_native_unit_tests.py --suite-timeout 900 --results-dir target/native-results/unit --fail-fast
+        run: python3 validation/run_native_unit_tests.py --profile conformance --suite-timeout 900 --results-dir target/native-results/unit --fail-fast
       - name: Test native CLI consumers
         if: ${{ !inputs.full && matrix.suite == 'consumers' }}
         run: cargo test --locked -p eredu-cli --no-default-features --features mlx,metal --timings
@@ -88,28 +88,28 @@ jobs:
       - name: Test native integration and documentation targets
         if: matrix.suite == 'backend'
         run: |
-          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --test '*' --examples --timings
-          cargo test --locked -p eredu-backend-mlx --features metal,accelerate --doc --timings
+          cargo test --locked --profile conformance -p eredu-backend-mlx --features metal,accelerate --test '*' --examples --timings
+          cargo test --locked --profile conformance -p eredu-backend-mlx --features metal,accelerate --doc --timings
       - name: Test MLX neutral semantic operator parity
         if: inputs.full && matrix.suite == 'backend'
         run: |
-          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
+          cargo test --profile conformance -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::nn::shared::tests::mlx_ -- \
             --ignored
       - name: Test Metal cache residency and prefetch regressions
         if: inputs.full && matrix.suite == 'backend'
         run: |
-          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
+          cargo test --profile conformance -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::io::manager::tests::metal_cache_backend_preserves_ordering_persistence_and_aggregate_budgets -- \
             --ignored --exact
-          cargo test -p eredu-backend-mlx --features metal,accelerate --lib \
+          cargo test --profile conformance -p eredu-backend-mlx --features metal,accelerate --lib \
             backend::runtime::cache::residency::io::manager::tests::two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization -- \
             --ignored --exact
       - name: Test Ring PR smoke contracts
         if: matrix.suite == 'backend'
         timeout-minutes: 10
         run: |
-          python3 validation/run_native_unit_tests.py --suite ring-smoke \
+          python3 validation/run_native_unit_tests.py --profile conformance --suite ring-smoke \
             --test-timeout 180 --suite-timeout 480 --fail-fast --results-dir target/native-results/ring-smoke
       - name: Test concurrent MLX use
         if: inputs.full && matrix.suite == 'consumers'
