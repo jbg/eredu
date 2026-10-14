@@ -191,9 +191,9 @@ fn rejects_unsupported_stored_dtype_during_materialization() {
     ));
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal")))]
 #[test]
-fn materializes_from_cpu_to_metal_execution_stream() {
+fn materializes_from_cpu_to_gpu_execution_stream() {
     let dir = tempfile::tempdir().unwrap();
     write_i32(
         &dir.path().join("model.safetensors"),

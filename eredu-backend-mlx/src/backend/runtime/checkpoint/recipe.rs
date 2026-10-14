@@ -9,8 +9,8 @@ use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeDtype};
 use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, TensorSelection};
 
 use safemlx::{
-    Array, Dtype, Stream,
     ops::{concatenate_axis, contiguous, stack_axis},
+    Array, Dtype, Stream,
 };
 
 use crate::backend::runtime::checkpoint::store::{
@@ -1055,8 +1055,11 @@ pub(crate) fn copy_parameter_storage(
     stream: &Stream,
 ) -> Result<Array, safemlx::error::Exception> {
     if layout == eredu_nn::ParameterStorageLayout::TransposedMatrix && input.ndim() == 2 {
-        input.transpose(stream)?.copy(stream)?.transpose(stream)
+        input
+            .transpose(stream)?
+            .ensure_device_storage(stream)?
+            .transpose(stream)
     } else {
-        input.copy(stream)
+        input.ensure_device_storage(stream)
     }
 }

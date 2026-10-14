@@ -61,6 +61,21 @@ mlx::core::HostTransferStorageKind storage_kind_to_cpp(
 
 } // namespace
 
+extern "C" int mlx_ensure_device_storage(
+    mlx_array* result,
+    mlx_array source,
+    mlx_stream stream) {
+  try {
+    mlx_array_output_preparation_ output(*result);
+    output.publish(mlx::core::ensure_device_storage(
+        mlx_array_get_(source), mlx_stream_get_(stream)));
+    return 0;
+  } catch (std::exception& error) {
+    mlx_error(error.what());
+    return 1;
+  }
+}
+
 extern "C" int mlx_host_transfer_memory_stats_get(
     mlx_host_transfer_memory_stats* stats,
     mlx_host_transfer_storage_kind kind) {

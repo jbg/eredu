@@ -61,6 +61,12 @@ int mlx_host_transfer_capacity_upper_bound(
     size_t nbytes,
     mlx_host_transfer_policy policy);
 
+/** Lazily ensure execution storage, sharing unified or already-local backing. */
+int mlx_ensure_device_storage(
+    mlx_array* array,
+    mlx_array source,
+    mlx_stream stream);
+
 /** Allocate an uninitialized typed host transfer buffer. */
 int mlx_host_transfer_buffer_new(
     mlx_host_transfer_buffer* buffer,

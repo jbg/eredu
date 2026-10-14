@@ -90,7 +90,8 @@ else()
       mlx-metal-kernel-selection-trace.patch
       mlx-metal-mixed-storage-gemm.patch
       mlx-timing-summary.patch
-      mlx-prefix-append-exports.patch)
+      mlx-prefix-append-exports.patch
+      mlx-device-storage-placement.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -123,6 +124,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     ${CMAKE_CURRENT_LIST_DIR}/tests/event_submission_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/array_storage_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/device_storage_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/timing_summary_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/cuda_jit_include_paths_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
@@ -133,6 +135,10 @@ if(MLX_C_BUILD_PATCH_TESTS)
                  ${mlx_SOURCE_DIR}/tests/scheduler_recovery_tests.cpp
                  ${mlx_SOURCE_DIR}/tests/gpu_submission_progress_tests.cpp)
   target_link_libraries(mlx-patch-test-binary PRIVATE mlxc mlx doctest)
+  if(MLX_BUILD_CUDA)
+    target_compile_definitions(mlx-patch-test-binary PRIVATE MLX_TEST_CUDA)
+    target_link_libraries(mlx-patch-test-binary PRIVATE CUDA::cudart)
+  endif()
 
   add_custom_target(
     mlx-patch-tests
@@ -143,7 +149,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*,*timing interval union*,*CUDA JIT*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*array storage*,*device storage placement*,*timing interval union*,*CUDA JIT*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")

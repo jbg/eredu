@@ -67,7 +67,9 @@ impl SharedAddressableParameterBank {
                     transfer,
                     stream,
                     |lease| {
-                        let value = lease.device_value(&member.binding)?.copy(stream)?;
+                        let value = lease
+                            .device_value(&member.binding)?
+                            .ensure_device_storage(stream)?;
                         value.evaluated()?;
                         Ok(value)
                     },

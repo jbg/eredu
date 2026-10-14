@@ -11,7 +11,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
     let b = Array::from_slice(&[5.0f32, 6.0, 7.0, 8.0], &[2, 2]);
 
-    let gpu_result = a.matmul(&b, &gpu)?.into_evaluated()?;
+    let gpu_a = a.ensure_device_storage(&gpu)?;
+    let gpu_b = b.ensure_device_storage(&gpu)?;
+    let gpu_result = gpu_a.matmul(&gpu_b, &gpu)?.into_evaluated()?;
     let cpu_result = a.matmul(&b, &cpu)?.into_evaluated()?;
     let gpu_values: &[f32] = gpu_result.as_slice();
     let cpu_values: &[f32] = cpu_result.as_slice();

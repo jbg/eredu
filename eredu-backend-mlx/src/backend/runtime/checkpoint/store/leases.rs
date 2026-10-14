@@ -321,7 +321,7 @@ impl WeightLease {
         pending.set_source(source_value);
         let materialized = pending
             .source()
-            .copy(execution_stream)
+            .ensure_device_storage(execution_stream)
             .map_err(|error| self.mlx_error("copy", error))?;
         pending.prepared(materialized)
     }
@@ -376,12 +376,10 @@ impl WeightLease {
                 ),
             })?;
         pending.set_source(source_value);
-        let materialized = if selection_is_materialized && source_stream == execution_stream {
-            pending.source().clone()
-        } else if selection_is_materialized {
+        let materialized = if selection_is_materialized {
             pending
                 .source()
-                .copy(execution_stream)
+                .ensure_device_storage(execution_stream)
                 .map_err(|source| self.mlx_error("copy", source))?
         } else {
             match &self.selection {
