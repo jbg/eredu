@@ -831,7 +831,7 @@ fn composite_chunked_prefill_commits_whole_prompt_cache_identity() {
         )
         .unwrap(),
     );
-    let mut state = MlxBackend::start_text_generation(runtime.backend(), config).unwrap();
+    let mut state = MlxBackend::start_text_generation(runtime.backend(), config.clone()).unwrap();
     let chunk = NonZeroUsize::new(2).unwrap();
     assert!(MlxBackend::prefill_text_prefix(&mut runtime, &mut prompt, chunk, &mut state).unwrap());
     let destination = cache.path().join("prefix");

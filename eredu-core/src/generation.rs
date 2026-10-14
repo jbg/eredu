@@ -10,6 +10,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod verification;
+pub use verification::{VerificationBoundary, VerificationCursor, VerificationDecision};
+
 /// Host timing shared by ordinary, observed, and speculative terminal outputs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationTiming {
@@ -182,9 +185,18 @@ impl GenerationSequence {
         Self {
             max_tokens,
             eos_token_ids,
-            tokens: Vec::with_capacity(max_tokens),
+            tokens: Vec::new(),
             finish_reason: (max_tokens == 0).then_some(FinishReason::MaxTokens),
         }
+    }
+
+    /// Copies a committed prefix with an explicitly admitted child allowance.
+    pub fn with_remaining(&self, remaining: usize) -> Self {
+        let mut child = self.clone();
+        child.max_tokens = child.tokens.len().saturating_add(remaining);
+        if child.finish_reason == Some(FinishReason::MaxTokens) && remaining > 0 { child.finish_reason = None; }
+        if remaining == 0 && child.finish_reason.is_none() { child.finish_reason = Some(FinishReason::MaxTokens); }
+        child
     }
 
     /// Commits one token and applies stop, grammar, EOS, and budget precedence.
@@ -279,9 +291,9 @@ pub enum SpeculativeTail {
     Bonus,
 }
 
-/// Canonical bookkeeping for one proposal/verification transaction.
+/// Canonical bookkeeping for one causal or proposal/verification transaction.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SpeculativeRound {
+pub struct VerificationRound {
     proposal_count: usize,
     accepted: usize,
     committed_tokens: Vec<u32>,
@@ -289,16 +301,20 @@ pub struct SpeculativeRound {
     terminal: bool,
 }
 
-impl SpeculativeRound {
-    /// Starts a verification round for a non-empty proposal block.
+impl VerificationRound {
+    /// Starts a target verification round. Zero proposals selects one causal
+    /// target token through the same continuation and cache-commit boundary.
     pub fn new(proposal_count: usize) -> Result<Self, GenerationError> {
-        if proposal_count == 0 {
-            return Err(GenerationError::EmptyProposalBlock);
-        }
+        let committed_capacity = proposal_count.checked_add(1).ok_or(
+            GenerationError::ProposalCapacityExceeded {
+                proposed: proposal_count,
+                capacity: usize::MAX - 1,
+            },
+        )?;
         Ok(Self {
             proposal_count,
             accepted: 0,
-            committed_tokens: Vec::with_capacity(proposal_count + 1),
+            committed_tokens: Vec::with_capacity(committed_capacity),
             tail: None,
             terminal: false,
         })
@@ -350,11 +366,7 @@ impl SpeculativeRound {
         Ok(SpeculativeCommitPlan {
             accepted_proposals: self.accepted,
             committed_tokens: &self.committed_tokens,
-            verified_inputs: if self.tail.is_some() {
-                1 + self.accepted
-            } else {
-                self.accepted
-            },
+            verified_inputs: 1 + self.accepted,
             full_acceptance: self.accepted == self.proposal_count,
             tail: self.tail,
             terminal: self.terminal,
@@ -419,40 +431,69 @@ pub fn resolve_optimistic_reuse(
     })
 }
 
-/// Options shared by speculative multi-token backends.
+/// Output policy and initial decoding mode for a retained generation executor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpeculativeConfig {
+pub struct GenerationRequestConfig {
     /// Maximum number of output tokens, including terminal tokens.
     pub max_tokens: usize,
-    /// Maximum assistant proposals per verification round.
-    pub max_draft_tokens: usize,
+    /// Request-local mode and validated proposal controls. Defaults to AR.
+    pub decoding_mode: crate::decoding::DecodingMode,
     /// Sampling temperature. Zero selects greedy verification.
     pub temperature: f32,
     /// Token ids that terminate a sequence.
     pub eos_token_ids: Vec<u32>,
 }
 
-impl Default for SpeculativeConfig {
+impl Default for GenerationRequestConfig {
     fn default() -> Self {
         Self {
             max_tokens: 256,
-            max_draft_tokens: 4,
+            decoding_mode: crate::decoding::DecodingMode::Autoregressive,
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         }
     }
 }
 
-impl SpeculativeConfig {
-    /// Validates backend-independent speculative settings.
+impl GenerationRequestConfig {
+    /// Validates backend-independent sampling settings.
     pub fn validate(&self) -> Result<(), GenerationError> {
-        if self.max_draft_tokens == 0 {
-            return Err(GenerationError::ZeroDraftTokens);
-        }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(GenerationError::InvalidTemperature(self.temperature));
         }
         Ok(())
+    }
+
+    /// Maximum tentative proposals; causal steps retain no draft work.
+    pub const fn proposal_capacity(&self) -> usize {
+        match self.decoding_mode {
+            crate::decoding::DecodingMode::SelfSpeculation(options) => {
+                options.request().max_draft_tokens.get()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Combines per-request policy with the scheduler's shared resource ceiling.
+    pub fn scheduler_options(
+        &self,
+        ceiling: SpeculativeSchedulerOptions,
+    ) -> SpeculativeSchedulerOptions {
+        let crate::decoding::DecodingMode::SelfSpeculation(options) = self.decoding_mode else {
+            return ceiling.with_lookahead(false);
+        };
+        let mut options = options.request().scheduler;
+        options.max_in_flight_verifications = options
+            .max_in_flight_verifications
+            .min(ceiling.max_in_flight_verifications);
+        options.max_optimistic_branches = options
+            .max_optimistic_branches
+            .min(ceiling.max_optimistic_branches);
+        options.lookahead_blocks = options.lookahead_blocks.min(ceiling.lookahead_blocks);
+        options.completion_timeout_milliseconds = options
+            .completion_timeout_milliseconds
+            .min(ceiling.completion_timeout_milliseconds);
+        options
     }
 }
 
@@ -971,6 +1012,12 @@ pub enum SemanticEvent {
 /// Invalid backend-neutral generation configuration or state transition.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GenerationError {
+    /// A settled append needs at least one already committed token.
+    #[error("committed suffix is empty")]
+    EmptyCommittedSuffix,
+    /// Mode admission failed against retained execution facts.
+    #[error(transparent)]
+    DecodingMode(#[from] crate::decoding::DecodingModeError),
     /// Canvas controls require a selected block-refinement realization.
     #[error("selected executable has no block-refinement canvas")]
     RefinementUnavailable,
@@ -986,9 +1033,15 @@ pub enum GenerationError {
     /// A prior prediction or its semantic delivery failed and requires recovery.
     #[error("generation is fenced after a failed prediction or delivery")]
     FailedGeneration,
-    /// A proposal transaction cannot be empty.
-    #[error("speculative verification requires at least one proposal")]
-    EmptyProposalBlock,
+    /// A target choice must settle before another row can be sampled.
+    #[error("verification has a pending target decision")]
+    VerificationDecisionPending,
+    /// Commitment must use the frozen target token.
+    #[error("verification commitment differs from its target decision")]
+    VerificationCommitmentMismatch,
+    /// A replacement, bonus or terminal proposal resolved this cursor.
+    #[error("verification cursor is complete")]
+    VerificationFinished,
     /// Proposal acceptance/rejection order was invalid.
     #[error("invalid speculative verification state transition")]
     InvalidSpeculativeTransition,
@@ -1132,7 +1185,7 @@ mod tests {
 
     #[test]
     fn speculative_commit_plan_preserves_trailing_token_cache_semantics() {
-        let mut rejected = SpeculativeRound::new(3).unwrap();
+        let mut rejected = VerificationRound::new(3).unwrap();
         rejected.accept(10, false).unwrap();
         rejected.reject_with(99, false).unwrap();
         let plan = rejected.commit_plan().unwrap();
@@ -1141,21 +1194,21 @@ mod tests {
         assert_eq!(plan.verified_inputs, 2);
         assert_eq!(plan.tail, Some(SpeculativeTail::Replacement));
 
-        let mut terminal_accept = SpeculativeRound::new(2).unwrap();
+        let mut terminal_accept = VerificationRound::new(2).unwrap();
         terminal_accept.accept(10, false).unwrap();
         terminal_accept.accept(11, true).unwrap();
         let plan = terminal_accept.commit_plan().unwrap();
         assert!(plan.full_acceptance);
-        assert_eq!(plan.verified_inputs, 2);
+        assert_eq!(plan.verified_inputs, 3);
         assert_eq!(plan.tail, None);
 
-        let mut bonus = SpeculativeRound::new(2).unwrap();
+        let mut bonus = VerificationRound::new(2).unwrap();
         bonus.accept(10, false).unwrap();
         bonus.accept(11, false).unwrap();
         bonus.bonus(12, false).unwrap();
         assert_eq!(bonus.commit_plan().unwrap().verified_inputs, 3);
 
-        let mut incomplete = SpeculativeRound::new(2).unwrap();
+        let mut incomplete = VerificationRound::new(2).unwrap();
         incomplete.accept(10, false).unwrap();
         assert!(matches!(
             incomplete.commit_plan(),
@@ -1209,7 +1262,7 @@ mod tests {
             ),
             Err(GenerationError::InvalidFrequencyPenalty(value)) if value.is_nan()
         ));
-        assert!(SpeculativeConfig::default().validate().is_ok());
+        assert!(GenerationRequestConfig::default().validate().is_ok());
         assert!(SpeculativeSchedulerOptions::default().validate().is_ok());
         assert!(matches!(
             SpeculativeSchedulerOptions {

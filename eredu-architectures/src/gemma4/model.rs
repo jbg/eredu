@@ -817,9 +817,10 @@ where
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
-        pipeline_stages: usize,
+        stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let pipeline_stages = stage_units.len();
         if group >= 2 || tensor_partitions <= 1 || pipeline_stages <= 1 {
             return Ok(None);
         }
@@ -899,6 +900,7 @@ where
         schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         values: Vec<B::Tensor>,
         forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Self::Error> {
         if values.len() != 1 + schema.auxiliary().len() {
             return Err(Error::backend(

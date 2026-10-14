@@ -1,0 +1,120 @@
+[
+  {
+    "repo": "mlx-community/Nemotron-Labs-Diffusion-3B-4bit",
+    "revision": "5fd1ad4bcbd02a3fd489ec6e87059e072118548c",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-3B",
+    "conversion_tool": "mlx-vlm",
+    "conversion_version": "0.6.3",
+    "settings": {
+      "mode": "affine",
+      "bits": 4,
+      "group_size": 64
+    },
+    "config_sha256": "55edef28cf1fe84982947b843ccbb9cd340e40f74c07d1ab80cac104ea25b3f5",
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "3c4ec623b793f6f6fba6c8e17547a583ae8d4d13",
+        "size": 2155620090,
+        "lfs": {
+          "sha256": "b575385053dc7230462f23c79643fa1500a4813252cd7f818b758a1a205a3b38",
+          "size": 2155620090,
+          "pointerSize": 135
+        }
+      }
+    ]
+  },
+  {
+    "repo": "spiritbuun/Nemotron-Labs-Diffusion-14B-Q8_0-GGUF",
+    "revision": "7ec2bb277055ffbbcc8cb7e56e179216d3f4952d",
+    "format": "gguf",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-14B",
+    "base_revision": "f8c3e2c078e193599b8882d965b1001c456ba738",
+    "rotary_pairing": "half_heads",
+    "reference_tool": "ggml-org/llama.cpp",
+    "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "reference_quants_sha256": "2c927a1b3d9f0920dcf4007fb686e1b0999333e9f65ce43dcc689900c0beae8b",
+    "settings": {
+      "file_type": "Q8_0"
+    },
+    "weight_files": [
+      {
+        "rfilename": "nemotron-diffusion-14b-Q8_0.gguf",
+        "blobId": "bda33d1be7d2ccfeaa6d84d73709967ee9789e6a",
+        "size": 14359313600,
+        "lfs": {
+          "sha256": "d25119a965e4781b5f1d4b5b2cf446e4102d949d9752d86144b94820368fa4d1",
+          "size": 14359313600,
+          "pointerSize": 136
+        }
+      }
+    ],
+    "conversion_tool": "spiritbuun/buun-llama-cpp; publisher does not specify an exact conversion-tool revision",
+    "independent_reproduction": {
+      "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+      "source_precision": "released",
+      "quantizer_library_sha256": "f79aca8f9891a5ddc9c4fb1339fc536aa2fa9d99305f484dff897da2b7a68956",
+      "compared_bytes": 14351421440,
+      "differing_bytes": 0
+    },
+    "catalog_sha256_v1": "8150e7be3f0ccf2fa5fd698c7c14253b5b43dc073faf0e95c0960c9375542b40"
+  },
+  {
+    "repo": "suzukimain/Nemotron-Labs-Diffusion-14B-GGUF",
+    "revision": "f9fd26730ff276b02361c0f776085f60a122ec70",
+    "format": "gguf",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-14B",
+    "base_revision": "f8c3e2c078e193599b8882d965b1001c456ba738",
+    "rotary_pairing": "half_heads",
+    "reference_tool": "ggml-org/llama.cpp",
+    "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "reference_quants_sha256": "2c927a1b3d9f0920dcf4007fb686e1b0999333e9f65ce43dcc689900c0beae8b",
+    "settings": {
+      "file_type": "Q4_K_M"
+    },
+    "weight_files": [
+      {
+        "rfilename": "Nemotron-Labs-Diffusion-14B-Q4_K_M.gguf",
+        "blobId": "095ffe03db243df98abd48d9fa5bb77bcf788f94",
+        "size": 8239070432,
+        "lfs": {
+          "sha256": "2473a97abba7effed8bd0baf49beed09d988c45c3834885eca12565cce77132e",
+          "size": 8239070432,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "conversion_tool": "spiritbuun/buun-llama-cpp; publisher does not specify an exact conversion-tool revision",
+    "catalog_sha256_v1": "3c80acd729e5d43cec1e5bc5372f73f725365623e830883edb42043f9d76389f"
+  },
+  {
+    "repo": "IntellAgents/Nemotron-Labs-Diffusion-3B-GGUF",
+    "revision": "b1367a57265c62f63e18f0faacaac202731ee0c4",
+    "format": "gguf",
+    "base_repository": "nvidia/Nemotron-Labs-Diffusion-3B",
+    "base_revision": "0d51902da1f8869f83413ce642fab402fa5641e0",
+    "rotary_pairing": "adjacent_pairs",
+    "reference_tool": "ggml-org/llama.cpp",
+    "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "reference_quants_sha256": "2c927a1b3d9f0920dcf4007fb686e1b0999333e9f65ce43dcc689900c0beae8b",
+    "settings": {
+      "file_type": "Q4_K_M"
+    },
+    "weight_files": [
+      {
+        "rfilename": "3B-Q4_K_M.gguf",
+        "blobId": "62a799b13d8f867cbe9e60c1c3b7123e35fbbfa9",
+        "size": 2372993280,
+        "lfs": {
+          "sha256": "f0a4db3dc37dc80de075eb36554f25ec80147d6f0e4bfc65ecfc42147b321224",
+          "size": 2372993280,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "conversion_tool": "ggml-org/llama.cpp with published runtime/convert.py",
+    "conversion_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+    "conversion_script_sha256": "54c3231a31a018f26a606c7d61cebb1b1e9b45aab7605087716e609079998c52",
+    "catalog_sha256_v1": "d12b236198fc2bdb8b1927a966e7b36e95b6431d16313bf332b637fb6969c4ea"
+  }
+]

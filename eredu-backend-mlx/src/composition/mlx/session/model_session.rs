@@ -1,6 +1,7 @@
 use super::*;
 
 mod block_refinement;
+pub(super) mod shared_speculation;
 mod memory_forecast;
 mod partition_capture;
 mod speculative_capture;
@@ -527,12 +528,15 @@ impl eredu_core::execution_control::NativeTextStateBackend for MlxBackend<'_> {
         additional: u64,
     ) -> Result<Option<u64>, Error> {
         Self::validate_native_text_state(runtime, saved)?;
-        runtime
+        let estimate = runtime
             .session()
             .payload
             .model
             .erased()
-            .estimate_native_control_growth(saved.state.as_ref(), additional)
+            .estimate_native_control_growth(saved.state.as_ref(), additional)?;
+        #[cfg(test)]
+        if std::env::var_os("EREDU_TEST_SNAPSHOT_GROWTH_TRACE").is_some() { eprintln!("snapshot native growth: {estimate:?}"); }
+        Ok(estimate)
     }
 
     fn copy_native_text_state(
@@ -720,6 +724,11 @@ impl MlxModelSession {
         &self,
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
         self.payload.model.erased().block_refinement_geometry()
+    }
+
+    pub(super) fn installed_control_growth(&self, positions: u64) -> Result<Option<u64>, Error> {
+        self.ensure_no_submission_in_flight()?;
+        self.payload.model.erased().estimate_installed_control_growth(positions)
     }
 
     pub(in crate::composition::mlx) fn floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
@@ -1918,12 +1927,18 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             })?;
             Ok(MlxTextGenerationState {
                 sampling: super::generation::MlxTextSamplingState {
+                    mode: config.decoding_mode().unwrap_or_default(),
                     temperature: sampling.temperature,
                     prng,
                     sampler,
                     next_prediction: 0,
                     parameter_epoch: None,
                     refinement_seed: config.seed(),
+                    proposal_random: None,
+                    speculative: None,
+                    committed_token_cached: false,
+                    next_logits: None,
+                    refinement_random: None,
                     refinement_policy: config.refinement_policy().unwrap_or_default(),
                     draft_events: config.draft_events(),
                     canvas: config.refinement_canvas().cloned(),
@@ -1968,19 +1983,79 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             .is_some()
     }
 
+    fn decoding_capabilities(runtime: &ModelRuntime<Self>) -> eredu_core::decoding::DecodingCapabilities {
+        let estimate = runtime.session().payload.model.erased().capability_estimate();
+        let shared = estimate.shared_backbone_draft();
+        let ordinary = estimate.ordinary_refinement().filter(|_| Self::supports_block_refinement(runtime));
+        eredu_core::decoding::DecodingCapabilities {
+            autoregressive: ordinary.is_none_or(|policy| policy.causal_sampling), diffusion: ordinary.is_some(),
+            entropy_feedback: ordinary.is_some_and(|policy| matches!(policy.policy, eredu_core::refinement::RefinementPolicy::EntropyFeedback(_))),
+            masked_unmasking: ordinary.is_some_and(|policy| matches!(policy.policy, eredu_core::refinement::RefinementPolicy::MaskedUnmasking { .. })),
+            mask_token_id: ordinary.and_then(|policy| match policy.policy { eredu_core::refinement::RefinementPolicy::MaskedUnmasking { mask_token_id, .. } => Some(mask_token_id), _ => None }),
+            mode_changes: shared.is_some(), speculation: shared.is_some(), draft_adapter: shared.is_some_and(|policy| policy.adapter_available()),
+            max_draft_tokens: shared.map(|policy| policy.proposal_capacity()),
+            completion_cancellation: Some(eredu_core::CompletionCancellationMode::QuarantineUntilComplete), ..Default::default()
+        }
+    }
+
+    fn commit_text_token(runtime: &mut ModelRuntime<Self>, token_id: u32,
+        _: eredu_core::refinement::GenerationPosition, state: &mut Self::TextGenerationState) -> Result<(), Self::Error> {
+        Self::commit_shared_token(runtime, token_id, state)
+    }
+
+    fn coordinate_decoding_control(
+        runtime: &mut ModelRuntime<Self>,
+        local: eredu_core::decoding::DecodingCoordination,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::TextOperationError<Self::Error>> {
+        if !Self::decoding_capabilities(runtime).mode_changes { return Ok(local); }
+        let Some(distributed) = runtime.session().distributed() else { return Ok(local); };
+        distributed.coordinate_decoding_control(local).map_err(|error| match error {
+            eredu_runtime::run_preparation::TextPreparationAgreementError::Decoding(error) =>
+                eredu_core::TextOperationPolicyError::DecodingMode(error).into(),
+            error => eredu_core::TextOperationError::Backend(Error::Exception(Exception::from_source(error))),
+        })
+    }
+
+    fn supports_refinement_policy(runtime: &ModelRuntime<Self>, policy: eredu_core::refinement::RefinementPolicy) -> bool {
+        let capability = Self::decoding_capabilities(runtime);
+        match policy {
+            eredu_core::refinement::RefinementPolicy::EntropyFeedback(_) => capability.entropy_feedback,
+            eredu_core::refinement::RefinementPolicy::MaskedUnmasking { mask_token_id, .. } =>
+                capability.masked_unmasking && capability.mask_token_id == Some(mask_token_id),
+        }
+    }
+
+    fn settle_decoding_mode(
+        runtime: &mut ModelRuntime<Self>,
+        input: &mut Option<eredu_core::PendingTextInput<Self::Prompt, Self::Token>>,
+        state: &mut Self::TextGenerationState,
+        previous: eredu_core::decoding::DecodingMode,
+        requested: eredu_core::decoding::DecodingMode,
+    ) -> Result<bool, eredu_core::TextOperationError<Self::Error>> {
+        Self::settle_shared_decoding_mode(runtime, input, state, previous, requested)
+            .map_err(eredu_core::TextOperationError::Backend)
+    }
+
+    fn generation_score_kind(runtime: &ModelRuntime<Self>) -> eredu_core::refinement::PredictionScoreKind {
+        if runtime.session().payload.model.erased().capability_estimate().shared_backbone_draft().is_some()
+            || !Self::supports_block_refinement(runtime) {
+            eredu_core::refinement::PredictionScoreKind::CausalConditional
+        } else {
+            eredu_core::refinement::PredictionScoreKind::RefinementPosition
+        }
+    }
+
     fn text_operation_kind(
-        runtime: &ModelRuntime<Self>,
-        _: &eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
+        _runtime: &ModelRuntime<Self>,
+        input: &eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
         state: &Self::TextGenerationState,
     ) -> eredu_core::TextOperationKind {
         use eredu_core::refinement::{GenerationPhase, PredictionScoreKind};
-        if runtime
-            .session()
-            .payload
-            .model
-            .erased()
-            .block_refinement_geometry()
-            .is_none()
+        if matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::SelfSpeculation(_))
+            && state.sampling.speculative.is_none() && matches!(input, eredu_core::PendingTextInput::Decode(_)) {
+            return eredu_core::TextOperationKind::Progress(GenerationPhase::Refinement);
+        }
+        if !matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::Diffusion { .. })
         {
             return eredu_core::TextOperationKind::Decision(PredictionScoreKind::CausalConditional);
         }
@@ -2002,6 +2077,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
             eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
@@ -2009,21 +2085,31 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         >,
         eredu_core::TextOperationError<Self::Error>,
     > {
-        if runtime
-            .session()
-            .payload
-            .model
-            .erased()
-            .block_refinement_geometry()
-            .is_some()
+        if matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::Diffusion { .. })
         {
             return Self::submit_block_refinement_operation(runtime, input, decision, state)
+                .map_err(eredu_core::TextOperationError::Backend);
+        }
+        if matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::SelfSpeculation(_))
+            && (state.sampling.speculative.is_some() || matches!(input, eredu_core::PendingTextInput::Decode(_))) {
+            return Self::submit_shared_speculation(runtime, input, decision, state, _remaining_tokens)
                 .map_err(eredu_core::TextOperationError::Backend);
         }
         let decision = decision.ok_or(eredu_core::TextOperationPolicyError::MissingDecision)?;
         let filter = decision.filter();
         if matches!(&input, eredu_core::PendingTextInput::Continue) {
-            return Err(eredu_core::TextOperationPolicyError::UnsupportedContinuation.into());
+            let scores = state.sampling.next_logits.take()
+                .ok_or(eredu_core::TextOperationPolicyError::UnsupportedContinuation)?;
+            let (backend, session) = runtime.parts_mut();
+            let submission = session.submit_settled_logits(backend, scores)
+                .map_err(eredu_core::TextOperationError::Backend)?;
+            let public_output = session.payload.model.erased().partition_public_output();
+            let submission = Submission { output: MlxModelOutput::new(public_output.then(|| MlxTensor::from_array(submission.output))),
+                completion: submission.completion };
+            let sampled = sample_text_submission(session, submission, filter, state, backend.stream().clone())
+                .map_err(eredu_core::TextOperationError::Backend)?;
+            state.sampling.committed_token_cached = false;
+            return Ok(Submission { output: eredu_core::TextOperationOutput::Token(sampled.output), completion: sampled.completion });
         }
         let submission =
             || -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
@@ -2055,12 +2141,22 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             let (backend, session) = runtime.parts_mut();
                             let public_output =
                                 session.payload.model.erased().partition_public_output();
-                            let submission = partition_capture::with_observer(
+                            let sequence = prepared.as_ref().map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))
+                                .and_then(|prompt| prompt.with_borrowed(|input| session.prepared_input_plans(input)
+                                    .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))))
+                                .and_then(|plans| {
+                                    let sequence = plans.iter().try_fold(0u64, |total, part| total.checked_add(part.decoder_positions()).ok_or(eredu_core::capture::CaptureError::Overflow))?;
+                                    let media = eredu_architectures::media_plan::capture_media_shape(&plans).map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
+                                    Ok((sequence, media))
+                                });
+                            let submission = partition_capture::with_text_observer(
                                 session,
                                 capture,
                                 &stream,
                                 decision.capture_domain(),
                                 0,
+                                eredu_core::capture::CapturePhase::Prefill,
+                                sequence,
                                 |session, observer| {
                                     session.submit_prefill_result_with_observer(
                                         backend,
@@ -2118,12 +2214,14 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                             let (backend, session) = runtime.parts_mut();
                             let public_output =
                                 session.payload.model.erased().partition_public_output();
-                            let submission = partition_capture::with_observer(
+                            let submission = partition_capture::with_text_observer(
                                 session,
                                 capture,
                                 &stream,
                                 decision.capture_domain(),
                                 state.sampling.next_prediction,
+                                eredu_core::capture::CapturePhase::Decode,
+                                Ok((1, None)),
                                 |session, observer| {
                                     session.submit_decode_with_observer(
                                         backend,
@@ -2170,6 +2268,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 }
             };
         let submission = submission().map_err(eredu_core::TextOperationError::Backend)?;
+        state.sampling.committed_token_cached = false;
         Ok(Submission {
             output: eredu_core::TextOperationOutput::Token(submission.output),
             completion: submission.completion,

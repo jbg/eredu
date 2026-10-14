@@ -183,15 +183,15 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
             max_new_tokens: Some(3),
             ..Default::default()
         },
-        refinement: Some(
-            RefinementOptions {
+        decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion { policy: Some(
+            EntropyRefinementOptions {
                 max_denoising_steps: 2,
                 stability_threshold: 2,
                 ..Default::default()
             }
             .try_into()
             .unwrap(),
-        ),
+        ) }),
         ..Default::default()
     };
     let mut seed = vec![None; 32];

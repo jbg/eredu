@@ -165,8 +165,12 @@ where
     /// #     drafting: SpeculativeDraft<'_, B::Drafter>) -> Result<SpeculativeGenerationOutput, Box<dyn std::error::Error>> {
     /// let output = model.with_controlled_text_speculative(
     ///     PreparedChatSpeculativeGenerationRequest {
+    ///     control_handle: None,
     ///         input: PreparedChatInput::rendered_prompt(chat), drafting,
-    ///         settings: Default::default(), options: Default::default(),
+    ///         settings: PreparedChatGenerationSettings {
+    ///             decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(Default::default())),
+    ///             ..Default::default()
+    ///         },
     ///         caller_stop_sequences: &[], cancellation: Default::default(),
     ///         on_event: |event| println!("committed: {event:?}"),
     ///     },
@@ -264,7 +268,7 @@ where
             });
         let mut failure = None;
         let driver = eredu_runtime::speculative::DriveControlledSpeculation::new(
-            request.options.scheduler,
+            super::loaded::source_scheduler(request.settings),
             options,
             drive,
             &mut failure,

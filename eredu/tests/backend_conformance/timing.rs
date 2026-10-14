@@ -54,10 +54,15 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
             let (ids, reason, ttft) = if speculative {
                 let output = model
                     .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                        control_handle: None,
                         input,
                         drafting: SpeculativeDraft::Embedded,
-                        settings: settings(),
-                        options: Default::default(),
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                Default::default(),
+                            )),
+                            ..settings()
+                        },
                         caller_stop_sequences: &stops,
                         cancellation: Default::default(),
                         on_event,
@@ -67,6 +72,7 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
             } else {
                 let output = model
                     .generate_prepared_chat(PreparedChatGenerationRequest {
+                        control_handle: None,
                         input,
                         settings: settings(),
                         caller_stop_sequences: &stops,
@@ -105,10 +111,15 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
             let (ids, reason, ttft) = if speculative {
                 let output = model
                     .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                        control_handle: None,
                         input,
                         drafting: SpeculativeDraft::Embedded,
-                        settings: settings(),
-                        options: Default::default(),
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                Default::default(),
+                            )),
+                            ..settings()
+                        },
                         caller_stop_sequences: &[],
                         cancellation,
                         on_event,
@@ -118,6 +129,7 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
             } else {
                 let output = model
                     .generate_prepared_chat(PreparedChatGenerationRequest {
+                        control_handle: None,
                         input,
                         settings: settings(),
                         caller_stop_sequences: &[],
@@ -151,15 +163,25 @@ fn speculative_batch_ttft_uses_a_shared_origin_and_excludes_cancelled_lanes() {
             ]
             .into_iter()
             .map(|cancellation| PreparedChatSpeculativeBatchLane {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
-                settings: settings(),
-                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptionsRequest {
+                            max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                            scheduler: Default::default(),
+                            ..Default::default()
+                        }
+                        .try_into()
+                        .expect("validated speculation options"),
+                    )),
+                    ..settings()
+                },
                 caller_stop_sequences: &[],
                 cancellation,
                 on_event: Box::new(|_| {}),
             })
             .collect(),
-            scheduler: Default::default(),
         })
         .unwrap();
     let first = output.requests()[0].timing().time_to_first_token().unwrap();
@@ -192,24 +214,45 @@ fn speculative_ttft_counts_a_buffered_unicode_token_cancelled_before_text() {
             drafting: SpeculativeDraft::Embedded,
             lanes: vec![
                 PreparedChatSpeculativeBatchLane {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
-                    settings: settings(),
-                    max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                                scheduler: Default::default(),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings()
+                    },
                     caller_stop_sequences: &[],
                     cancellation: cancellation.clone(),
                     on_event: Box::new(|event| events.push(event)),
                 },
                 PreparedChatSpeculativeBatchLane {
+                    control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
-                    settings: settings(),
-                    max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                                scheduler: Default::default(),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings()
+                    },
                     caller_stop_sequences: &[],
                     cancellation: pre_cancelled,
                     // Lane 0 has prefetched a byte fragment, but published no text.
                     on_event: Box::new(|_| cancellation.cancel()),
                 },
             ],
-            scheduler: Default::default(),
         })
         .unwrap();
     assert_eq!(output.requests()[0].token_ids(), [7]);

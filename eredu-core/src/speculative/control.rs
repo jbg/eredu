@@ -6,6 +6,9 @@ use crate::{execution_control::SnapshotEstimate, BackendFailure};
 /// Portable controlled-speculation failure. Native causes remain error sources.
 #[derive(Debug, thiserror::Error)]
 pub enum SpeculativeControlError {
+    /// Mode admission against the retained source or logical lifecycle failed.
+    #[error(transparent)]
+    DecodingMode(#[from] crate::decoding::DecodingModeError),
     /// The selected mechanism cannot implement this operation exactly.
     #[error("controlled speculation is unsupported: {0}")]
     Unsupported(&'static str),
@@ -52,6 +55,22 @@ impl SpeculativeControlError {
     pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Backend(BackendFailure::from_error(error))
     }
+}
+
+/// Host-only tentative canvas state, distinct from committed output and drafts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefinementProposalView {
+    /// Absolute generated position of the next commitment.
+    pub position: usize,
+    /// Finalized positions in the active complete canvas.
+    pub finalized_positions: usize,
+    /// Complete admitted invocation width, even with a shortened output budget.
+    pub canvas_positions: usize,
+    /// Selected dependent suffix, absent during numerical refinement or after
+    /// a constraint invalidates it.
+    pub token_ids: Option<Vec<u32>>,
+    /// Meaning of the numerical position rows retained by this canvas.
+    pub score_kind: crate::refinement::PredictionScoreKind,
 }
 
 /// Host-only view of a proposal block. These tokens are never committed output.
@@ -152,7 +171,11 @@ pub struct SpeculativeControlSnapshot<E: SpeculativeExecutor, S: SpeculativeSamp
     draft_randomness: Option<S::DraftRandomness>,
     lifecycle: SpeculativeRequestLifecycle,
     stats: SpeculativeStats,
-    config: SpeculativeConfig,
+    config: GenerationRequestConfig,
+    pending_committed_tokens: Vec<u32>,
+    next_logits: Option<E::Logits>,
+    refinement: Option<RefinementContinuation<E::Logits>>,
+    decoding: crate::decoding::DecodingState,
 }
 
 impl<E: SpeculativeExecutor, S: SpeculativeSampling, C> SpeculativeControlSnapshot<E, S, C> {
@@ -163,6 +186,10 @@ impl<E: SpeculativeExecutor, S: SpeculativeSampling, C> SpeculativeControlSnapsh
     /// Lifecycle retained with the prefix.
     pub fn status(&self) -> SpeculativeRequestStatus {
         self.lifecycle.status()
+    }
+    /// Logical attention policy retained with the canonical cache and suffix.
+    pub const fn decoding_state(&self) -> crate::decoding::DecodingState {
+        self.decoding
     }
 }
 
@@ -222,6 +249,16 @@ where
             .control_force_next(token, vocabulary, position)
     }
 
+    /// Observes the partially finalized canvas without reading native values.
+    pub fn refinement_proposals(&self) -> Option<RefinementProposalView> {
+        self.refinement.as_ref().map(|canvas| RefinementProposalView {
+            position: self.sequence().tokens().len(), finalized_positions: canvas.committed.len(),
+            canvas_positions: canvas.width,
+            token_ids: canvas.positions.as_ref().map(|rows| rows.iter().skip(canvas.committed.len()).map(|(token, _)| *token).collect()),
+            score_kind: crate::refinement::PredictionScoreKind::RefinementPosition,
+        })
+    }
+
     /// Canonical proposals, including the block retained during verification.
     pub fn proposals(&self) -> Option<SpeculativeProposalView> {
         self.block
@@ -247,7 +284,8 @@ where
             })
     }
 
-    /// Whether no tentative work remains at this canonical boundary.
+    /// Whether no submitted causal verification or speculative draft blocks remain.
+    /// Settled tentative refinement rows remain snapshotable between commitments.
     pub fn is_control_boundary(&self) -> bool {
         self.pending.is_none() && self.block.is_none() && self.target_state.is_some()
     }
@@ -287,7 +325,7 @@ where
             return Some("prefill has not committed");
         };
         if executor
-            .control_snapshot_estimate(self.cache, target)
+            .control_snapshot_estimate(&self.cache, target)
             .is_none()
         {
             return Some(
@@ -325,7 +363,7 @@ where
         self.validate_control_edit()?;
         executor
             .continuation_memory_observation(
-                self.cache,
+                &self.cache,
                 self.target_state
                     .as_ref()
                     .expect("checked canonical boundary"),
@@ -336,7 +374,43 @@ where
 
     /// Configured proposal ceiling, independent of adaptive lookahead decisions.
     pub fn forecast_max_draft_tokens(&self) -> u64 {
-        self.config.max_draft_tokens as u64
+        self.config.proposal_capacity() as u64
+    }
+
+    /// Cache growth required by an admitted handoff, even without further output.
+    /// A previously settled score row needs no second append.
+    pub fn forecast_mode_settlement_positions(&self) -> u64 {
+        if self.decoding.state().pending.is_some() {
+            self.refinement.as_ref().map_or(self.pending_committed_tokens.len(), |canvas| canvas.width) as u64
+        } else { 0 }
+    }
+
+    /// Effective per-request scheduler controls under shared resource ceilings.
+    pub fn forecast_scheduler_options(
+        &self,
+        ceiling: crate::generation::SpeculativeSchedulerOptions,
+    ) -> crate::generation::SpeculativeSchedulerOptions {
+        self.config.scheduler_options(ceiling)
+    }
+
+    /// Active and admitted pending policies over one retained execution.
+    pub fn forecast_decoding_policies(&self, ceiling: crate::generation::SpeculativeSchedulerOptions)
+        -> Vec<(crate::decoding::DecodingMode, crate::generation::SpeculativeSchedulerOptions)> {
+        let state = self.decoding.state();
+        std::iter::once(state.active).chain(state.pending.filter(|mode| *mode != state.active))
+            .map(|mode| {
+                let mut config = self.config.clone();
+                config.decoding_mode = mode;
+                (mode, config.scheduler_options(ceiling))
+            }).collect()
+    }
+
+    /// Immutable next-target row retained independently of the source's seed.
+    pub fn retained_next_scores_estimate(&self, executor: &E) -> Option<SnapshotEstimate> {
+        match &self.next_logits {
+            Some(logits) => executor.logits_snapshot_estimate(logits),
+            None => Some(SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 }),
+        }
     }
 
     /// Retained host/sampling/semantic state, including both random streams.
@@ -351,6 +425,7 @@ where
             .checked_add(self.runtime.constraint().control_snapshot_bytes()?)?
             .checked_add(self.sequence().snapshot_storage_bytes()?)?
             .checked_add((self.config.eos_token_ids.capacity() as u64).checked_mul(4)?)?
+            .checked_add((self.pending_committed_tokens.capacity() as u64).checked_mul(4)?)?
             .checked_add(
                 (self.stats.accept_lens().len() as u64)
                     .checked_mul(std::mem::size_of::<usize>() as u64)?,
@@ -375,8 +450,26 @@ where
             .checked_add(self.sequence().snapshot_storage_bytes()?)?
             .checked_add(additional.checked_mul(32)?)?
             .checked_add((self.config.eos_token_ids.capacity() as u64).checked_mul(4)?)?
+            .checked_add((self.pending_committed_tokens.capacity() as u64).checked_mul(4)?)?
             .checked_add((self.stats.accept_lens().len() as u64).checked_mul(16)?)?
             .checked_add(std::mem::size_of::<Self>() as u64)
+    }
+
+    /// Complete conservative retention and copy bound for tentative position rows
+    /// and their partially finalized commitment cursor.
+    pub fn retained_refinement_estimate(&self, executor: &E) -> Option<SnapshotEstimate> {
+        let Some(canvas) = &self.refinement else { return Some(SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 }); };
+        let host = (std::mem::size_of::<RefinementContinuation<E::Logits>>() as u64)
+            .checked_add((canvas.committed.len() as u64).checked_mul(4)?)?
+            .checked_add((canvas.positions.as_ref().map_or(0, Vec::len) as u64)
+                .checked_mul(std::mem::size_of::<(u32, E::Logits)>() as u64)?)?;
+        let mut estimate = SnapshotEstimate { retained_bytes: host, copy_bytes: host };
+        for (_, logits) in canvas.positions.iter().flatten() {
+            let row = executor.logits_snapshot_estimate(logits)?;
+            estimate.retained_bytes = estimate.retained_bytes.checked_add(row.retained_bytes)?;
+            estimate.copy_bytes = estimate.copy_bytes.checked_add(row.copy_bytes)?;
+        }
+        Some(estimate)
     }
 
     /// Complete conservative copy bound; unknown components fail closed.
@@ -384,7 +477,7 @@ where
         if !self.is_control_boundary() {
             return None;
         }
-        let native = executor.control_snapshot_estimate(self.cache, self.target_state.as_ref()?)?;
+        let native = executor.control_snapshot_estimate(&self.cache, self.target_state.as_ref()?)?;
         let host = self
             .runtime
             .sampler()
@@ -395,14 +488,20 @@ where
             .checked_add(self.runtime.constraint().control_snapshot_bytes()?)?
             .checked_add(self.sequence().snapshot_storage_bytes()?)?
             .checked_add((self.config.eos_token_ids.len() as u64).checked_mul(4)?)?
+            .checked_add((self.pending_committed_tokens.len() as u64).checked_mul(4)?)?
             .checked_add(
                 (self.stats.accept_lens().len() as u64)
                     .checked_mul(std::mem::size_of::<usize>() as u64)?,
             )?
             .checked_add(std::mem::size_of::<SpeculativeControlSnapshot<E, S, C>>() as u64)?;
+        let next = match self.next_logits.as_ref() {
+            Some(logits) => executor.logits_snapshot_estimate(logits)?,
+            None => SnapshotEstimate { retained_bytes: 0, copy_bytes: 0 },
+        };
+        let refinement = self.retained_refinement_estimate(executor)?;
         Some(SnapshotEstimate {
-            retained_bytes: native.retained_bytes.checked_add(host)?,
-            copy_bytes: native.copy_bytes.checked_add(host)?,
+            retained_bytes: native.retained_bytes.checked_add(host)?.checked_add(next.retained_bytes)?.checked_add(refinement.retained_bytes)?,
+            copy_bytes: native.copy_bytes.checked_add(host)?.checked_add(next.copy_bytes)?.checked_add(refinement.copy_bytes)?,
         })
     }
 
@@ -416,7 +515,7 @@ where
         let constraint = self.runtime.constraint().fork()?;
         let (cache, target) = executor
             .control_snapshot(
-                self.cache,
+                &self.cache,
                 self.target_state.as_ref().expect("checked boundary"),
                 context,
             )?
@@ -435,12 +534,56 @@ where
             lifecycle: self.lifecycle.clone(),
             stats: self.stats.clone(),
             config: self.config.clone(),
+            pending_committed_tokens: self.pending_committed_tokens.clone(),
+            next_logits: self.next_logits.clone(),
+            refinement: self.refinement.clone(),
+            decoding: self.decoding.state(),
         })
     }
 
-    /// Restores at a canonical boundary. Native replacement must be atomic;
-    /// failure invalidates the caller's session instead of resuming partial state.
+    /// Command identity of the active logical continuation.
+    pub fn decoding_owner(&self) -> crate::decoding::GenerationCommandOwner {
+        crate::decoding::GenerationCommandOwner {
+            identity: Arc::clone(&self.control_identity), control: self.decoding.clone(),
+        }
+    }
+
+    /// Gives an inactive fork an independent mailbox initialized from its snapshot.
+    pub fn fork_decoding_owner(&self, snapshot: &SpeculativeControlSnapshot<E, S, C>)
+        -> Result<crate::decoding::GenerationCommandOwner, SpeculativeControlError> {
+        if !Arc::ptr_eq(&self.control_identity, &snapshot.identity) {
+            return Err(SpeculativeControlError::IncompatibleSnapshot);
+        }
+        Ok(crate::decoding::GenerationCommandOwner {
+            identity: Arc::clone(&self.control_identity), control: self.decoding.fork(snapshot.decoding),
+        })
+    }
+
+    /// Restores snapshot commands along with matching native and output state.
     pub fn restore_control_snapshot<'a>(
+        &mut self, executor: &mut E, snapshot: &SpeculativeControlSnapshot<E, S, C>, context: E::Context<'a>,
+    ) -> Result<(), SpeculativeControlError> where E: 'a {
+        self.install_snapshot_state(executor, snapshot, context)?;
+        self.decoding.restore(snapshot.decoding);
+        Ok(())
+    }
+
+    /// Exchanges active branch ownership while retaining its independently queued commands.
+    pub fn activate_control_snapshot<'a>(&mut self, executor: &mut E,
+        snapshot: &SpeculativeControlSnapshot<E, S, C>, owner: &crate::decoding::GenerationCommandOwner,
+        context: E::Context<'a>,
+    ) -> Result<(), SpeculativeControlError> where E: 'a {
+        if !Arc::ptr_eq(&self.control_identity, &owner.identity) || owner.state().active != snapshot.decoding.active {
+            return Err(SpeculativeControlError::IncompatibleBranch);
+        }
+        self.install_snapshot_state(executor, snapshot, context)?;
+        self.decoding = owner.control.clone();
+        self.runtime.decoding = Some(self.decoding.clone());
+        Ok(())
+    }
+
+    /// Native replacement is atomic; a failed owner cannot resume partial state.
+    fn install_snapshot_state<'a>(
         &mut self,
         executor: &mut E,
         snapshot: &SpeculativeControlSnapshot<E, S, C>,
@@ -459,7 +602,7 @@ where
         let target_randomness = snapshot.target_randomness.clone();
         let draft_randomness = snapshot.draft_randomness.clone();
         let target = executor
-            .restore_control_snapshot(self.cache, &snapshot.cache, &snapshot.target, context)?
+            .restore_control_snapshot(&mut self.cache, &snapshot.cache, &snapshot.target, context)?
             .ok_or(SpeculativeControlError::Unsupported(
                 "executor has no durable speculative restore",
             ))?;
@@ -471,11 +614,14 @@ where
         self.lifecycle = snapshot.lifecycle.clone();
         self.stats = snapshot.stats.clone();
         self.config = snapshot.config.clone();
+        self.pending_committed_tokens.clone_from(&snapshot.pending_committed_tokens);
+        self.next_logits = snapshot.next_logits.clone();
+        self.refinement = snapshot.refinement.clone();
         Ok(())
     }
 }
 
-impl<'cache, E, S, C, P> SpeculativeRequestTable<'cache, E, S, C, P>
+impl<'cache, E, S, C, P> GenerationRequestTable<'cache, E, S, C, P>
 where
     E: SpeculativeExecutor,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error>,
@@ -500,6 +646,9 @@ pub struct SpeculativePredictionCapture {
     pub role: SpeculativeCaptureRole,
     /// Absolute generated-token prediction position (zero is target prefill).
     pub position: u64,
+    /// Invocation semantics distinguish position scores from causal conditionals.
+    #[serde(default)]
+    pub score_kind: crate::refinement::PredictionScoreKind,
     /// Existing admitted bounded host capture records.
     pub capture: crate::capture::CapturedStep,
 }
@@ -531,6 +680,16 @@ pub enum SpeculativeActivationPhase {
     },
     /// A tentative fused prediction block.
     FusedProposal,
+    /// One adapter-disabled complete-canvas refinement forward.
+    Refinement {
+        /// Zero-based numerical refinement iteration.
+        iteration: u32,
+    },
+    /// One draft-only complete-canvas refinement forward over the shared target.
+    MaskedDraft {
+        /// Zero-based numerical refinement iteration.
+        iteration: u32,
+    },
     /// Ordinary-target evaluation of a tentative proposal block.
     Verification,
     /// Prediction-local replay of retained verified inputs.

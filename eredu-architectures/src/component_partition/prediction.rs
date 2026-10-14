@@ -710,7 +710,7 @@ mod tests {
             Arc::new(crate::deepseek::parallel::v4_parameter_description(&args).unwrap());
         let execution = crate::speculative_execution::SpeculativeActivationExecution {
             depth: 1,
-            strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential,
+            strategy: Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential),
         };
         for (tensor, pipeline, expert) in [
             (1, 1, 1),
@@ -841,7 +841,7 @@ mod tests {
             Arc::new(crate::deepseek::parallel::v4_parameter_description(&args).unwrap());
         let execution = crate::speculative_execution::SpeculativeActivationExecution {
             depth: 2,
-            strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedFused,
+            strategy: Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedFused),
         };
         let scope = &descriptor.component_scopes[0];
         let ComponentResidualBase::Source {
@@ -1074,7 +1074,7 @@ mod tests {
             Arc::new(crate::deepseek::parallel::v3_parameter_description(&args).unwrap());
         let execution = crate::speculative_execution::SpeculativeActivationExecution {
             depth: 2,
-            strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential,
+            strategy: Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential),
         };
         for (tensor, pipeline, expert) in [(1, 2, 2), (2, 1, 2), (2, 2, 2)] {
             let topology = ParallelTopology::new(tensor, pipeline, expert, 1).unwrap();
@@ -1238,7 +1238,7 @@ mod tests {
                     &prepared,
                     &crate::speculative_execution::SpeculativeActivationExecution {
                         depth: 1,
-                        strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential
+                        strategy: Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential)
                     }
                 )
                 .is_err());

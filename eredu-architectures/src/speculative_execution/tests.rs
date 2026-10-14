@@ -202,6 +202,7 @@ impl SpeculativeTensorMechanisms for Mechanisms {
 #[derive(Clone, Debug)]
 struct Strategy {
     fused_rows: Option<usize>,
+    fused_calls: usize,
     corrupt_capture: bool,
     failure: Failure,
 }
@@ -467,6 +468,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
         observer: Option<&mut dyn SpeculativeActivationObserver<Tensor, TestError>>,
     ) -> Result<Option<Tensor>, TestError> {
+        self.fused_calls += 1;
         if observer.is_some() && self.fused_rows.is_some() {
             return Err(Mechanisms::observation_error("fixture fused hooks absent"));
         }
@@ -548,6 +550,7 @@ fn embedded_cache_envelope_owns_prediction_fork_commit_and_target_membership() {
 fn sequential_partial_commit_replays_target_and_commits_prediction_state() {
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::None,
     };
@@ -556,10 +559,16 @@ fn sequential_partial_commit_replays_target_and_commits_prediction_state() {
     let prefill = executor.prefill(vec![1, 2], &mut cache, ()).unwrap();
     let (_, state, _) = prefill.into_parts();
     let mut draft = executor.begin_proposal(&state, 2, 2, ()).unwrap();
-    assert_eq!(executor.proposal_logits(&mut draft, 2, ()).unwrap(), 2);
-    assert_eq!(executor.proposal_logits(&mut draft, 3, ()).unwrap(), 4);
     assert_eq!(
-        executor.proposal_logits(&mut draft, 4, ()).unwrap_err().0,
+        executor.proposal_step(&mut draft, 2, ()).unwrap(),
+        eredu_core::SpeculativeProposalStep::CausalLogits(2)
+    );
+    assert_eq!(
+        executor.proposal_step(&mut draft, 3, ()).unwrap(),
+        eredu_core::SpeculativeProposalStep::CausalLogits(4)
+    );
+    assert_eq!(
+        executor.proposal_step(&mut draft, 4, ()).unwrap_err().0,
         "prediction block exhausted"
     );
     let checkpoint = executor.checkpoint(&cache).unwrap();
@@ -580,6 +589,7 @@ fn sequential_partial_commit_replays_target_and_commits_prediction_state() {
 fn prefill_geometry_failure_restores_target_and_prediction_cache() {
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: true,
         failure: Failure::None,
     };
@@ -592,9 +602,35 @@ fn prefill_geometry_failure_restores_target_and_prediction_cache() {
 }
 
 #[test]
+fn causal_embedded_transaction_keeps_seed_alignment_without_prediction_heads() {
+    for fused_rows in [None, Some(2)] {
+        let mut strategy = Strategy {
+            fused_rows,
+            fused_calls: 0,
+            corrupt_capture: false,
+            failure: Failure::None,
+        };
+        let mut executor = EmbeddedPredictionExecutor::<_, Mechanisms>::new(&mut strategy);
+        let mut cache = cache();
+        let (_, state, _) = executor.prefill(vec![1, 2], &mut cache, ()).unwrap().into_parts();
+        let draft = executor.begin_proposal(&state, 2, 0, ()).unwrap();
+        let checkpoint = executor.checkpoint(&cache).unwrap();
+        let submission = executor.submit_verification(&[2], &mut cache, ()).unwrap();
+        submission.completion.wait().unwrap();
+        assert_eq!(executor.verification_logits(&submission.output, 0, ()).unwrap(), 102);
+        executor.commit_verification(submission.output, draft, &mut cache, &checkpoint, 1, ()).unwrap();
+        assert_eq!(cache.target, [9, 1, 2, 2]);
+        assert_eq!(cache.prediction, [1, 2, 2]);
+        drop(executor);
+        assert_eq!(strategy.fused_calls, 0, "causal target steps do not execute prediction heads");
+    }
+}
+
+#[test]
 fn fused_capacity_is_rejected_before_any_proposal_row() {
     let mut strategy = Strategy {
         fused_rows: Some(1),
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::None,
     };
@@ -610,6 +646,7 @@ fn fused_capacity_is_rejected_before_any_proposal_row() {
 fn commit_failure_restores_exact_preverification_checkpoint() {
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::Advance,
     };
@@ -669,6 +706,7 @@ fn production_observers_reach_causal_embedded_boundaries_and_can_intervene() {
     );
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::None,
     };
@@ -678,7 +716,10 @@ fn production_observers_reach_causal_embedded_boundaries_and_can_intervene() {
     let prefill = executor.prefill(vec![1, 2], &mut cache, ()).unwrap();
     let (_, state, _) = prefill.into_parts();
     let mut draft = executor.begin_proposal(&state, 2, 1, ()).unwrap();
-    assert_eq!(executor.proposal_logits(&mut draft, 2, ()).unwrap(), 102);
+    assert_eq!(
+        executor.proposal_step(&mut draft, 2, ()).unwrap(),
+        eredu_core::SpeculativeProposalStep::CausalLogits(102)
+    );
     let _ = executor
         .submit_verification(&[2, 3], &mut cache, ())
         .unwrap();
@@ -698,6 +739,7 @@ fn production_observers_reach_causal_embedded_boundaries_and_can_intervene() {
 fn settled_embedded_observation_keeps_installed_and_seed_owners_distinct() {
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::Advance,
     };

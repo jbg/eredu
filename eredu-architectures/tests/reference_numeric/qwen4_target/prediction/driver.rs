@@ -1,10 +1,11 @@
 //! Nonzero target and MTP through the shared speculative driver.
+use eredu_core::speculative::GenerationExecutorTypes;
 use super::executor::Materializer;
 use super::installed::*;
 use super::*;
 use eredu_architectures::prediction_extension::*;
 use eredu_architectures::speculative_execution::{
-    EmbeddedExecutorTypes, EmbeddedPredictionExecutor, EmbeddedPredictionOutput,
+    EmbeddedPredictionExecutor, EmbeddedPredictionOutput,
     ReplicatedMaterializedPredictionStrategy, ReplicatedPredictionInput,
     ReplicatedPredictionNative, SpeculativeTensorMechanisms,
 };
@@ -112,8 +113,9 @@ impl eredu_runtime::inspection::SpeculativeActivationObserver<NumericTensor, Err
     fn begin_activation_invocation(
         &mut self,
         phase: eredu_core::speculative::SpeculativeActivationPhase,
-        sequence: usize,
+        geometry: eredu_runtime::inspection::SpeculativeActivationGeometry,
     ) -> Result<(), Error> {
+        let sequence = geometry.sequence;
         self.0.borrow_mut().push((phase, sequence));
         Ok(())
     }
@@ -124,7 +126,7 @@ impl eredu_runtime::inspection::SpeculativeActivationObserver<NumericTensor, Err
         assert!(success);
     }
 }
-impl EmbeddedExecutorTypes for Types {
+impl GenerationExecutorTypes for Types {
     type Input = Input;
     type Logits = NumericTensor;
     type Context<'a> = &'a NumericContext;
@@ -140,7 +142,7 @@ impl ReplicatedPredictionNative<Target, NumericBackend, State, Mechanisms> for M
     type Telemetry = ();
     type ExecutorTypes = Types;
     fn executor_context<'a>(
-        ctx: <Types as EmbeddedExecutorTypes>::Context<'a>,
+        ctx: <Types as GenerationExecutorTypes>::Context<'a>,
     ) -> <Mechanisms as SpeculativeTensorMechanisms>::Context<'a> {
         ctx
     }
@@ -555,8 +557,8 @@ pub(super) fn check(
             "driver prefill logits",
         );
         let mut draft = executor.begin_proposal(&state, 5, 2, ctx).unwrap();
-        executor.proposal_logits(&mut draft, 5, ctx).unwrap();
-        executor.proposal_logits(&mut draft, 9, ctx).unwrap();
+        executor.proposal_step(&mut draft, 5, ctx).unwrap();
+        executor.proposal_step(&mut draft, 9, ctx).unwrap();
         let checkpoint = executor.checkpoint(&cache).unwrap();
         let submission = executor
             .submit_verification(&[5, 9, 11], &mut cache, ctx)
@@ -618,7 +620,7 @@ fn scheduler_check(
 ) {
     use super::sampling::{Constraint, Publisher, Sampling};
     use eredu_core::generation::{
-        GenerationCancellationToken, GenerationSequence, SpeculativeConfig,
+        GenerationCancellationToken, GenerationSequence, GenerationRequestConfig,
         SpeculativeSchedulerOptions,
     };
     use eredu_core::{
@@ -664,9 +666,13 @@ fn scheduler_check(
             let lane = PreparedSpeculativeLane::new(
                 &mut cache,
                 Input::new(&prompt),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 12,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.,
                     eos_token_ids: vec![],
                 },

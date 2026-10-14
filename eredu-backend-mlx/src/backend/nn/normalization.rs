@@ -35,22 +35,16 @@ pub(crate) fn input_precision_rms(
     epsilon: f32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    if input.dtype() == weight.dtype()
-        && matches!(
-            input.dtype(),
-            safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
-        )
+    if matches!(
+        input.dtype(),
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
+    )
         && input
             .shape()
             .last()
             .is_some_and(|width| weight.shape() == [*width])
     {
-        let wide = input.as_dtype(safemlx::Dtype::Float32, stream)?;
-        if let Some(normalized) = f32_weightless_rms(&wide, epsilon, stream)? {
-            return normalized
-                .as_dtype(input.dtype(), stream)?
-                .multiply(weight, stream);
-        }
+        return weightless_rms(input, epsilon, stream)?.multiply(weight, stream);
     }
     safemlx::fast::rms_norm(input, weight, epsilon, stream)
 }
@@ -218,6 +212,32 @@ pub(crate) fn f32_grouped_rms(
 mod tests {
     use super::*;
     use safemlx::{Device, DeviceType, Dtype};
+    #[test]
+    fn input_precision_rms_rounds_before_nonuniform_gain() {
+        let input = [1.0f32, -2.0, 3.0, -4.0];
+        let gain = [1.125f32, 0.875, 1.75, 0.625];
+        let inverse = (7.5f32 + 0.125).sqrt().recip();
+        for input_dtype in [Dtype::Bfloat16, Dtype::Float16] {
+            let round = |x: f32| if input_dtype == Dtype::Bfloat16 {
+                half::bf16::from_f32(x).to_f32()
+            } else { half::f16::from_f32(x).to_f32() };
+            for gain_dtype in [input_dtype, Dtype::Float32] {
+                let output_round = |x| if gain_dtype == Dtype::Float32 { x } else { round(x) };
+                let expected = input.iter().zip(gain).map(|(&x, gain)| output_round(round(x * inverse) * gain)).collect::<Vec<_>>();
+                let fused = input.iter().zip(gain).map(|(&x, gain)| output_round(x * inverse * gain)).collect::<Vec<_>>();
+                assert_ne!(expected, fused, "fixture must distinguish the normalization boundary");
+                for device in [DeviceType::Cpu, DeviceType::Gpu] {
+                    let stream = Stream::new_with_device(&Device::new(device, 0));
+                    let input = Array::from_slice(&input, &[1, 4]).as_dtype(input_dtype, &stream).unwrap();
+                    let gain = Array::from_slice(&gain, &[4]).as_dtype(gain_dtype, &stream).unwrap();
+                    let actual = input_precision_rms(&input, &gain, 0.125, &stream).unwrap();
+                    assert_eq!(actual.dtype(), gain_dtype);
+                    let actual = actual.as_dtype(Dtype::Float32, &stream).unwrap().into_evaluated().unwrap();
+                    assert_eq!(actual.as_slice::<f32>(), expected.as_slice());
+                }
+            }
+        }
+    }
     #[test]
     fn fused_grouped_rms_handles_strided_rows_groups_and_reduction_tails() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));

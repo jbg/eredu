@@ -369,10 +369,13 @@ fn ring_worker() {
     let chat = baseline.prepare_chat(chat_request()).unwrap();
     let expected = baseline
         .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
             drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings,
-            options,
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+                ..settings
+            },
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             on_event: |_| {},
@@ -387,10 +390,13 @@ fn ring_worker() {
     let captured_baseline = baseline
         .with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
                 drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings,
-                options,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
@@ -445,10 +451,13 @@ fn ring_worker() {
     .unwrap();
     let chat = model.prepare_chat(chat_request()).unwrap();
     let request = || PreparedChatSpeculativeGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
         drafting: eredu_core::SpeculativeDraft::Embedded,
-        settings,
-        options,
+        settings: eredu::api::PreparedChatGenerationSettings {
+            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+            ..settings
+        },
         caller_stop_sequences: &[],
         cancellation: Default::default(),
         on_event: |_| {},

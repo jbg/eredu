@@ -579,7 +579,7 @@ fn conditional_pp_decoder_boundaries_preserve_media_ids_and_cached_text_after_in
                 NumericBackend,
                 State,
             >>::partition_boundary_values(
-                &models[0], 0, 0, &schema, &first.hidden, &first.context
+                &models[0], 0, 0, &schema, &first.hidden, &first.context, &context
             )
             .unwrap()
             .unwrap();
@@ -602,6 +602,7 @@ fn conditional_pp_decoder_boundaries_preserve_media_ids_and_cached_text_after_in
                 &schema,
                 wire.into_iter().map(|value| value.into_parts().1).collect(),
                 &mut second.context,
+                &context,
             )
             .unwrap()
             .unwrap();

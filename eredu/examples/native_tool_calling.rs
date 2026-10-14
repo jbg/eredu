@@ -10,7 +10,7 @@ use eredu::{
     api::{
         default_local_device, local_device_plan, LoadedModel, LocalDevice,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeGenerationOptions, PreparedChatSpeculativeGenerationRequest,
+        PreparedChatSpeculativeGenerationRequest,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
@@ -99,14 +99,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         model
             .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&prepared),
                 drafting: drafting
                     .as_speculative_draft()
                     .expect("drafting is enabled"),
-                settings,
-                options: PreparedChatSpeculativeGenerationOptions {
-                    max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                    scheduler,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptionsRequest {
+                            max_draft_tokens: NonZeroUsize::new(3).unwrap(),
+                            scheduler,
+
+                            ..Default::default()
+                        }
+                        .try_into()
+                        .expect("validated speculation options"),
+                    )),
+                    ..settings
                 },
                 caller_stop_sequences: &[],
                 cancellation: GenerationCancellationToken::new(),
@@ -116,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&prepared),
                 settings,
                 caller_stop_sequences: &[],

@@ -314,7 +314,7 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
     /// silently replaced by unrelated request defaults.
     pub fn speculative_generation_options(
         &self,
-    ) -> Result<Option<super::PreparedChatSpeculativeGenerationOptions>, eredu_core::GenerationError>
+    ) -> Result<Option<super::SpeculationOptions>, eredu_core::GenerationError>
     {
         let (maximum, lookahead, adaptive) = match &self.drafting_plan {
             eredu_core::DraftingPlan::Disabled => return Ok(None),
@@ -336,10 +336,11 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
         let mut scheduler =
             eredu_core::SpeculativeSchedulerOptions::default().with_lookahead(lookahead);
         scheduler.adaptive_lookahead = adaptive;
-        Ok(Some(super::PreparedChatSpeculativeGenerationOptions {
+        Ok(Some(eredu_core::decoding::SpeculationOptionsRequest {
             max_draft_tokens,
             scheduler: scheduler.validate()?,
-        }))
+            ..Default::default()
+        }.try_into()?))
     }
 
     /// Mutably borrows the target and drafting resources as one planned session.
@@ -485,7 +486,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         B::refinement_canvas_length(&self.runtime)
     }
 
-    /// Starts asynchronous text generation from tokenizer ids.
+    /// Starts generation of committed native token handles from tokenizer ids.
     /// Only IDs with a consistent mapping in this model's tokenizer may be
     /// sampled, even when the model's output vocabulary is padded or sparse.
     /// Use [`Self::reset`] to establish fresh request state when reusing a model.

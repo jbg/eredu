@@ -396,6 +396,7 @@ where
         schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         values: Vec<B::Tensor>,
         _forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
         if !matches!((source_group, destination_group), (0, 0) | (0, 1) | (1, 1)) {
             return Ok(None);
@@ -415,9 +416,10 @@ where
         group: usize,
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
-        pipeline_stages: usize,
+        stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let pipeline_stages = stage_units.len();
         // Muse-Glimmer's vision blocks and projector are replicated equations.
         // Under TP+PP they still execute on every tensor rank, but emit no tensor
         // collective; the explicit empty waves keep that fact architecture-owned.

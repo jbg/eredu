@@ -592,6 +592,8 @@ where
         Ok(())
     }
 
+    fn realize_stateless_state(&mut self) -> Option<S> { S::stateless() }
+
     fn realize_state(
         &mut self,
         selected: &SelectedStateRealization,

@@ -9,8 +9,8 @@ use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeDtype};
 use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, TensorSelection};
 
 use safemlx::{
-    ops::{concatenate_axis, contiguous, stack_axis},
     Array, Dtype, Stream,
+    ops::{concatenate_axis, contiguous, stack_axis},
 };
 
 use crate::backend::runtime::checkpoint::store::{
@@ -40,6 +40,12 @@ pub(crate) fn native_recipe_workspace<C: RecipeCatalog + ?Sized>(
             .map_err(|error| error.to_string())?
             .byte_len();
         match recipe {
+            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => add(
+                add(buffers(weight, source)?, buffers(scale, source)?)?,
+                output
+                    .checked_mul(2)
+                    .ok_or("tensor FP8 conversion overflow")?,
+            ),
             DerivedWeightRecipe::Source { .. } => add(output, output),
             DerivedWeightRecipe::Stack { inputs, .. }
             | DerivedWeightRecipe::Concatenate { inputs, .. } => inputs
@@ -434,6 +440,10 @@ pub(crate) fn preflight_mlx_recipe_metadata<C: RecipeCatalog + ?Sized>(
         mlx_dtype(metadata.dtype())?;
 
         match recipe {
+            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => {
+                visit(weight, source, encoding)?;
+                visit(scale, source, encoding)?;
+            }
             DerivedWeightRecipe::Source { key, selection } => {
                 validate_selection(selection)?;
                 let source_metadata = source.tensor_metadata(key)?;
@@ -741,6 +751,26 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(array.transpose_axes(&axes, stream)?)
             }
+            Self::DecodeTensorFp8 { weight, scale } => {
+                let weight =
+                    weight.materialize_inner(store, stream, sources, borrow_sources, context)?;
+                let scale =
+                    scale.materialize_inner(store, stream, sources, borrow_sources, context)?;
+                let prepared = WeightMaterialization::prepare_retained(
+                    vec![weight, scale],
+                    std::mem::take(sources),
+                )?;
+                let value = prepared.inputs()[1].clone().try_item::<f32>(stream)?;
+                if !value.is_finite() || value <= 0.0 {
+                    prepared.finish()?;
+                    return Err(WeightRecipeError::InvalidTensorFp8Scale);
+                }
+                let output = prepared.inputs()[0]
+                    .from_fp8(Dtype::Float32, stream)?
+                    .multiply(&prepared.inputs()[1], stream)?;
+                sources.extend(prepared.finish_preparation()?);
+                Ok(output)
+            }
             Self::Cast { input, dtype } => {
                 let array =
                     input.materialize_inner(store, stream, sources, borrow_sources, context)?;
@@ -998,6 +1028,9 @@ pub enum WeightRecipeError {
     /// A transition-rate normalization contained zero or a positive value.
     #[error("log(-x) derived-weight input must contain only negative values")]
     NonNegativeNegLogInput,
+    /// A weight-only FP8 multiplier cannot define finite, positively scaled weights.
+    #[error("tensor FP8 scale must be finite and positive")]
+    InvalidTensorFp8Scale,
     /// Backend-neutral checkpoint inspection or lease acquisition failed.
     #[error(transparent)]
     CheckpointStore(#[from] eredu_checkpoint::store::StoreError),

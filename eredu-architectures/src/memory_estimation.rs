@@ -132,6 +132,10 @@ pub fn generation_memory_geometry(
         plan.safetensors_architecture().map(|p| p.model()),
         plan.gguf_plan().map(|p| p.model()),
     ) {
+        (None, Some(GgufModelConfig::NemotronLabsDiffusion(plan))) => crate::capability::nemotron_labs_diffusion(plan.text_config(), false)?,
+
+        (Some(SafetensorsModelConfig::NemotronLabsDiffusion(args)), None) =>
+            crate::capability::nemotron_labs_diffusion(args, args.vision.is_some())?,
         (Some(SafetensorsModelConfig::Llama(args)), None)
         | (None, Some(GgufModelConfig::Llama(args))) => crate::capability::llama(args)?,
         (Some(SafetensorsModelConfig::Qwen(args)), None)

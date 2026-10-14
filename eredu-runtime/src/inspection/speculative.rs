@@ -2,6 +2,23 @@
 use super::ActivationObserver;
 use eredu_core::speculative::{SpeculativeActivationOrigin, SpeculativeActivationPhase};
 
+/// Host-known physical geometry before any activation transaction begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeculativeActivationGeometry {
+    /// Decoder rows in this physical invocation.
+    pub sequence: usize,
+    /// Independent packed tower and projected row counts.
+    pub media: Option<eredu_core::capture::CaptureMediaShape>,
+}
+impl From<usize> for SpeculativeActivationGeometry {
+    fn from(sequence: usize) -> Self {
+        Self {
+            sequence,
+            media: None,
+        }
+    }
+}
+
 /// Internal observation authority installed separately from raw sampling logits.
 /// Implementations share cumulative allowances across snapshots and speculative
 /// forks; ending a failed invocation never refunds native work or host transport.
@@ -74,7 +91,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
     fn begin_activation_invocation(
         &mut self,
         phase: SpeculativeActivationPhase,
-        sequence: usize,
+        geometry: SpeculativeActivationGeometry,
     ) -> Result<(), E>;
 
     /// Lends one observer for the complete admitted forward. Implementations may
@@ -106,7 +123,7 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
 pub fn with_speculative_activation<T, E, R>(
     observer: Option<&mut dyn SpeculativeActivationObserver<T, E>>,
     phase: SpeculativeActivationPhase,
-    sequence: usize,
+    geometry: impl Into<SpeculativeActivationGeometry>,
     operation: impl FnOnce(Option<&mut dyn ActivationObserver<T, E>>) -> Result<R, E>,
 ) -> Result<R, E> {
     let Some(observer) = observer else {
@@ -127,7 +144,7 @@ pub fn with_speculative_activation<T, E, R>(
     };
     guard
         .observer
-        .begin_activation_invocation(phase, sequence)?;
+        .begin_activation_invocation(phase, geometry.into())?;
     let mut operation = Some(operation);
     let mut output = None;
     guard.observer.with_activation_observer(&mut |observer| {
@@ -187,8 +204,9 @@ mod tests {
         fn begin_activation_invocation(
             &mut self,
             phase: SpeculativeActivationPhase,
-            sequence: usize,
+            geometry: SpeculativeActivationGeometry,
         ) -> Result<(), &'static str> {
+            let sequence = geometry.sequence;
             self.phases.push((phase, sequence));
             self.remaining = self.remaining.checked_sub(sequence).ok_or("budget")?;
             Ok(())

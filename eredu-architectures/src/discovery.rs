@@ -6,6 +6,7 @@ use eredu_core::*;
 
 mod components;
 mod families;
+mod nemotron_labs_diffusion;
 mod routed_components;
 mod voicechat;
 

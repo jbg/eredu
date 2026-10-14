@@ -67,10 +67,15 @@ fn native_embedded_continuation_forecasts_preserve_settled_state_and_bound_growt
             macro_rules! request {
                 () => {
                     PreparedChatSpeculativeGenerationRequest {
+                        control_handle: None,
                         input: PreparedChatInput::token_ids(&chat, ids.clone()),
                         drafting: drafting.as_speculative_draft().unwrap(),
-                        settings,
-                        options: generation,
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                generation,
+                            )),
+                            ..settings
+                        },
                         caller_stop_sequences: &[],
                         cancellation: Default::default(),
                         on_event: |_| {},
@@ -287,17 +292,22 @@ fn native_embedded_continuation_forecasts_keep_uncovered_mechanisms_unknown() {
         model
             .with_controlled_text_speculative(
                 PreparedChatSpeculativeGenerationRequest {
+                    control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![1, 2, 3, 4]),
                     drafting: drafting.as_speculative_draft().unwrap(),
-                    settings: PreparedChatGenerationSettings {
-                        overrides: GenerationConfigOverrides {
-                            max_new_tokens: Some(8),
-                            temperature: Some(0.0),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            generation,
+                        )),
+                        ..PreparedChatGenerationSettings {
+                            overrides: GenerationConfigOverrides {
+                                max_new_tokens: Some(8),
+                                temperature: Some(0.0),
+                                ..Default::default()
+                            },
                             ..Default::default()
-                        },
-                        ..Default::default()
+                        }
                     },
-                    options: generation,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},

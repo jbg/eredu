@@ -204,6 +204,7 @@ impl TextGenerationBackend for MockBackend {
         input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         _state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
             eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
@@ -322,6 +323,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
                 overrides: GenerationConfigOverrides {
@@ -492,6 +494,7 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                 let mut events = Vec::new();
                 let output = model
                     .generate_prepared_chat(PreparedChatGenerationRequest {
+                        control_handle: None,
                         input: PreparedChatInput::rendered_prompt(&prepared),
                         settings: PreparedChatGenerationSettings {
                             overrides: GenerationConfigOverrides {
@@ -666,6 +669,7 @@ fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
             .unwrap();
         let semantic = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: PreparedChatGenerationSettings {
                     overrides,

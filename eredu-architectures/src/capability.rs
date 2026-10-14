@@ -805,9 +805,30 @@ pub struct CapabilityEstimate {
     capabilities: ModelCapabilities,
     state_layout: StateMemoryLayout,
     draft_source: Option<SpeculativeDraftSource>,
+    shared_backbone: Option<eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy>,
+    ordinary_refinement: Option<eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy>,
 }
 
 impl CapabilityEstimate {
+    /// Attaches an admitted shared-backbone draft policy to the family declaration.
+    pub(crate) fn with_shared_backbone_draft(mut self, policy: eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy) -> Self {
+        self.ordinary_refinement = Some(eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy {
+            geometry: policy.geometry(), policy: policy.diffusion_policy(0.0).expect("validated family policy"),
+            causal_sampling: true, seed_first: policy.seed_first(),
+        });
+        self.shared_backbone = Some(policy);
+        self.draft_source = Some(SpeculativeDraftSource::SharedBackbone);
+        self
+    }
+    /// Source-free masked draft defaults consumed by native construction adapters.
+    pub const fn shared_backbone_draft(&self) -> Option<eredu_runtime::speculative::shared_backbone::SharedBackboneExecutionPolicy> { self.shared_backbone }
+    /// Retained ordinary numerical equations, independent of any draft source.
+    pub const fn ordinary_refinement(&self) -> Option<eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy> { self.ordinary_refinement }
+    /// Complete target-stack observation semantics for a retained shared draft.
+    /// All modes reuse ordinary target hook identities and producer ownership.
+    pub fn shared_backbone_activation_execution(&self) -> Option<crate::speculative_execution::SpeculativeActivationExecution> {
+        self.shared_backbone.map(|_| crate::speculative_execution::SpeculativeActivationExecution::shared_backbone())
+    }
     /// Projects memory accounting onto the exact selected rank-local state.
     /// Family capabilities and context limits remain global model properties.
     pub(crate) fn for_selected_state(
@@ -877,6 +898,8 @@ fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
         },
         state_layout,
         draft_source: None,
+        shared_backbone: None,
+        ordinary_refinement: None,
     }
 }
 
@@ -895,6 +918,19 @@ fn embedded_mtp_draft_source(layers: i32) -> Option<SpeculativeDraftSource> {
 /// Derives Llama/Mistral capabilities from normalized architecture policy.
 pub fn llama(args: &crate::llama::ModelArgs) -> Result<CapabilityEstimate, CapabilityError> {
     Ok(finish(args.model_type.clone(), llama_spec(args, false)?))
+}
+
+/// Derives one shared causal cache and the retained masked-draft declaration.
+/// Image input is advertised only for construction with admitted vision sources.
+pub fn nemotron_labs_diffusion(args: &crate::nemotron_labs_diffusion::FamilyConfig, image_input: bool) -> Result<CapabilityEstimate, CapabilityError> {
+    use crate::decoder::Config;
+    if image_input && args.vision.is_none() {
+        return Err(CapabilityError::InvalidConfiguration { field: "vision", detail: "image input requires an admitted Pixtral tower".into() });
+    }
+    let estimate = finish(args.model_identity().to_owned(), llama_spec(args.dense(), image_input)?);
+    if args.block_size.get() < 2 { return Ok(estimate); }
+    let policy = args.shared_backbone_draft_policy().map_err(|error| CapabilityError::InvalidConfiguration { field: "shared_backbone", detail: error.to_string() })?;
+    Ok(estimate.with_shared_backbone_draft(policy))
 }
 
 /// Derives state memory for every logical decoder invocation.
@@ -1021,7 +1057,14 @@ pub fn diffusion_gemma(
         256,
         EstimationCompleteness::Complete,
     )?;
-    Ok(finish("diffusion_gemma_text".into(), spec))
+    let mut estimate = finish("diffusion_gemma_text".into(), spec);
+    estimate.ordinary_refinement = Some(eredu_runtime::generation::refinement::architecture::RefinementExecutionPolicy {
+        geometry: eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry {
+            canvas_length: args.canvas_length, vocabulary_size: std::num::NonZeroU32::new(u32::try_from(args.text.vocab_size).map_err(|_| CapabilityError::InvalidConfiguration { field: "vocab_size", detail: "outside refinement domain".into() })?).ok_or_else(|| CapabilityError::InvalidConfiguration { field: "vocab_size", detail: "empty refinement domain".into() })?,
+        },
+        policy: eredu_core::refinement::RefinementPolicy::default(), causal_sampling: false, seed_first: false,
+    });
+    Ok(estimate)
 }
 
 /// Derives Gemma 4 capabilities from its complete normalized family policy.

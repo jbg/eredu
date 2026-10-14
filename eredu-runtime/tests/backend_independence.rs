@@ -4058,6 +4058,7 @@ impl
         _: &mut Self::Pass<'_>,
         _: &eredu_runtime::PartitionBoundaryRoute,
         _: Vec<FakeTensor>,
+        _: &(),
     ) -> Result<(), Error> {
         Err(Error::backend("reference path has no pipeline boundary"))
     }
@@ -4236,6 +4237,7 @@ impl
         pass: &mut Self::Pass<'_>,
         _: &PartitionBoundaryRoute,
         mut values: Vec<FakeTensor>,
+        _: &(),
     ) -> Result<(), Error> {
         self.trace.borrow_mut().push("accept");
         pass.hidden = values

@@ -2,7 +2,7 @@
 
 use super::{RefinementBackend, RefinementError, RefinementState};
 use crate::generation::TokenDomain;
-use eredu_core::refinement::{GenerationPhase, RefinementConfig};
+use eredu_core::refinement::{GenerationPhase, RefinementPolicy};
 use std::num::NonZeroU32;
 
 /// A transition requested outside its architecture-declared phase.
@@ -27,7 +27,7 @@ pub enum BlockRefinementError<E> {
 /// sharing immutable numerical values. Native snapshots additionally isolate the
 /// architecture's retained context and completion resources.
 pub struct BlockRefinementState<B: RefinementBackend> {
-    config: RefinementConfig,
+    config: RefinementPolicy,
     canvas_layout: Option<std::sync::Arc<eredu_core::refinement::RefinementCanvas>>,
     canvas_length: NonZeroU32,
     domain: TokenDomain,
@@ -99,6 +99,13 @@ where
         self.random = random;
     }
 
+    /// Independent numerical stream at the last settled block boundary.
+    pub fn random(&self) -> &B::RandomState { &self.random }
+    /// Carries spent draws through a policy handoff after the block settles.
+    pub fn into_random(self) -> B::RandomState {
+        self.refinement.map_or(self.random, RefinementState::into_random)
+    }
+
     /// Exact authoritative context growth needed to emit a finite future prefix.
     /// A partially finalized block is encoded together, including its already
     /// committed positions, only if generation proceeds beyond that block.
@@ -125,7 +132,7 @@ where
 
     /// Retains validated policy without submitting work or drawing initial noise.
     pub fn new(
-        config: RefinementConfig,
+        config: RefinementPolicy,
         canvas_length: NonZeroU32,
         domain: TokenDomain,
         conditioning_format: B::ConditioningFormat,
@@ -177,6 +184,7 @@ where
     pub fn context_encoded(
         &mut self,
         context: &B::Context,
+        seeds: Option<&eredu_core::refinement::RefinementCanvas>,
     ) -> Result<(), BlockRefinementError<B::Error>> {
         if self.phase != GenerationPhase::Context {
             return Err(BlockRefinementError::Phase);
@@ -187,7 +195,7 @@ where
             self.domain,
             self.conditioning_format.clone(),
             self.random.clone(),
-            self.canvas_layout.as_deref(),
+            seeds.or(self.canvas_layout.as_deref()),
             context,
         )?;
         self.refinement = Some(refinement);
@@ -238,7 +246,12 @@ where
     /// generation machine owns controller commitment and terminal failure fencing.
     /// A completed block transitions to context encoding with the exact RNG that
     /// follows the last refinement, including draws from the stopping iteration.
-    pub fn finalize(&mut self, token: B::Token) -> Result<(), BlockRefinementError<B::Error>> {
+    pub fn finalize(
+        &mut self,
+        token: B::Token,
+        candidate_replaced: bool,
+        context: &B::Context,
+    ) -> Result<(), BlockRefinementError<B::Error>> {
         if self.phase != GenerationPhase::Finalization {
             return Err(BlockRefinementError::Phase);
         }
@@ -252,6 +265,12 @@ where
         } else {
             None
         };
+        if candidate_replaced && !completed {
+            self.refinement
+                .as_mut()
+                .ok_or(BlockRefinementError::Phase)?
+                .invalidate_suffix(self.position, &token, context)?;
+        }
         self.authoritative.push(token);
         self.position += 1;
         if let Some(block) = next_block {
@@ -262,6 +281,12 @@ where
                 .into_random();
             self.block = block;
             self.phase = GenerationPhase::Context;
+        } else if self
+            .refinement
+            .as_ref()
+            .is_some_and(|state| !state.is_finished())
+        {
+            self.phase = GenerationPhase::Refinement;
         }
         Ok(())
     }

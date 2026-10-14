@@ -181,7 +181,7 @@ fn routed_deepseek_v4_pooling_state_uses_shared_checkpoint_and_prompt_cache_cont
     assert_eq!(probe.3, probe.5);
 
     let descriptor = PromptCacheDescriptor::from_model_identity(
-        generic.prompt_cache_model_identity().clone(),
+        generic.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone(),
         "deepseek-v4-checkpoint",
         "tokens:1,2,3,4,5",
         1,

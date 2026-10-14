@@ -8,7 +8,8 @@ pub use continuation::{
     TextGenerationContinuation, TextGenerationDriver,
 };
 pub use failure::{BackendFailure, BackendFailureKind};
-use steps::PhysicalTextOutput;
+mod decision_source;
+use decision_source::TextRequestDriver;
 pub use steps::{
     TextAdvancement, TextOperationError, TextOperationKind, TextOperationOutput,
     TextOperationPolicyError, TextProgress,
@@ -1098,7 +1099,7 @@ pub trait BackendSession<B: BackendProvider> {
 ///
 /// This is a general diagnostics and observability capability. Implementations
 /// execute the requested operation to completion and materialize only selected
-/// observation points. It is intentionally separate from ordinary asynchronous
+/// observation points. It is intentionally separate from ordinary native
 /// submission so production inference pays no instrumentation cost.
 pub trait InspectableBackendSession<B: BackendProvider>: BackendSession<B> {
     /// Executes and inspects one prompt prefill operation.
@@ -1397,7 +1398,7 @@ pub struct TextGenerationConfig {
     seed: u64,
     strategy: TextSamplingStrategy,
     prefill: PrefillChunkPolicy,
-    refinement: Option<crate::refinement::RefinementConfig>,
+    decoding_mode: Option<crate::decoding::DecodingMode>,
     draft_events: bool,
     canvas: Option<std::sync::Arc<crate::refinement::RefinementCanvas>>,
 }
@@ -1445,7 +1446,7 @@ impl TextGenerationConfig {
             seed: 0,
             strategy: TextSamplingStrategy::Standard,
             prefill: PrefillChunkPolicy::Bounded(std::num::NonZeroUsize::new(512).unwrap()),
-            refinement: None,
+            decoding_mode: None,
             draft_events: false,
             canvas: None,
         }
@@ -1473,19 +1474,27 @@ impl TextGenerationConfig {
         self
     }
 
-    /// Overrides the iterative architecture's refinement policy. An absent value
-    /// selects its ordinary trained policy; causal execution rejects an override.
-    pub const fn with_refinement_policy(
+    /// Selects the initial execution policy. Absent uses causal generation when
+    /// available, or the trained policy of an intrinsically iterative architecture.
+    pub const fn with_decoding_mode(
         mut self,
-        policy: Option<crate::refinement::RefinementConfig>,
+        mode: Option<crate::decoding::DecodingMode>,
     ) -> Self {
-        self.refinement = policy;
+        self.decoding_mode = mode;
         self
     }
 
+    /// Explicit initial mode; the selected architecture resolves an absent value.
+    pub const fn decoding_mode(&self) -> Option<crate::decoding::DecodingMode> {
+        self.decoding_mode
+    }
+
     /// Explicit iterative policy, independently of authoritative token sampling.
-    pub const fn refinement_policy(&self) -> Option<crate::refinement::RefinementConfig> {
-        self.refinement
+    pub const fn refinement_policy(&self) -> Option<crate::refinement::RefinementPolicy> {
+        match self.decoding_mode {
+            Some(mode) => mode.refinement_policy(),
+            None => None,
+        }
     }
 
     /// Requests tentative IDs for bounded facade observation. Commitments and
@@ -2022,6 +2031,72 @@ pub trait TextGenerationBackend: BackendProvider {
         false
     }
 
+    /// Source-free facts for all modes already realized by this loaded execution.
+    fn decoding_capabilities(runtime: &ModelRuntime<Self>) -> crate::decoding::DecodingCapabilities {
+        let iterative = Self::supports_block_refinement(runtime);
+        crate::decoding::DecodingCapabilities {
+            autoregressive: !iterative,
+            diffusion: iterative,
+            entropy_feedback: iterative,
+            ..Default::default()
+        }
+    }
+
+    /// Agrees pending commands and cancellation before entering distributed work.
+    /// The default is a single-owner execution with no transport.
+    fn coordinate_decoding_control(
+        _runtime: &mut ModelRuntime<Self>,
+        local: crate::decoding::DecodingCoordination,
+    ) -> Result<crate::decoding::DecodingCoordination, TextOperationError<Self::Error>> {
+        Ok(local)
+    }
+
+    /// Trained initial policy when the request has no explicit mode.
+    fn default_decoding_mode(runtime: &ModelRuntime<Self>) -> crate::decoding::DecodingMode {
+        if Self::decoding_capabilities(runtime).autoregressive {
+            crate::decoding::DecodingMode::Autoregressive
+        } else {
+            crate::decoding::DecodingMode::Diffusion { policy: None }
+        }
+    }
+
+    /// Settles a queued handoff without sampling or advancing commitment controls.
+    /// `false` leaves a diffusion block or verification transaction active. `true`
+    /// replaces pending input after appending its committed suffix exactly once,
+    /// preserving next-target logits and removing all tentative output. Returned
+    /// work must have exact completion before this method returns. Admission uses
+    /// `decoding_capabilities` before this method can be called.
+    fn settle_decoding_mode(
+        _runtime: &mut ModelRuntime<Self>,
+        _input: &mut Option<PendingTextInput<Self::Prompt, Self::Token>>,
+        _state: &mut Self::TextGenerationState,
+        _previous: crate::decoding::DecodingMode,
+        _requested: crate::decoding::DecodingMode,
+    ) -> Result<bool, TextOperationError<Self::Error>> {
+        Err(TextOperationPolicyError::DecodingMode(crate::decoding::DecodingModeError::Unsupported("settled execution handoff")).into())
+    }
+
+    /// Publishes backend state for one controller-accepted token. It settles native
+    /// work before returning and retains no unaccepted verification suffix in the
+    /// canonical cache. Ordinary causal execution needs no additional publication.
+    fn commit_text_token(
+        _runtime: &mut ModelRuntime<Self>, _token_id: u32,
+        _position: crate::refinement::GenerationPosition, _state: &mut Self::TextGenerationState,
+    ) -> Result<(), Self::Error> { Ok(()) }
+
+    /// Exact numerical policy supported by the retained iterative architecture.
+    /// A mechanism implementing unmasking does not imply family support for it.
+    fn supports_refinement_policy(
+        runtime: &ModelRuntime<Self>,
+        policy: crate::refinement::RefinementPolicy,
+    ) -> bool {
+        Self::supports_block_refinement(runtime)
+            && matches!(
+                policy,
+                crate::refinement::RefinementPolicy::EntropyFeedback(_)
+            )
+    }
+
     /// Meaning of scores produced by the retained generation realization.
     fn generation_score_kind(
         runtime: &ModelRuntime<Self>,
@@ -2050,6 +2125,7 @@ pub trait TextGenerationBackend: BackendProvider {
         input: PendingTextInput<Self::Prompt, Self::Token>,
         decision: Option<&TokenSamplingDecision<'_>>,
         state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
         TextOperationError<Self::Error>,
@@ -2230,23 +2306,9 @@ where
     C: TokenFilterController,
 {
     runtime: &'a mut ModelRuntime<B>,
-    inner: TextGenerationMachine<B, C>,
+    inner: TextRequestDriver<B, C>,
 }
 
-struct TextGenerationMachine<B, C>
-where
-    B: TextGenerationBackend,
-    C: TokenFilterController,
-{
-    backend_state: B::TextGenerationState,
-    controller: C,
-    step: Option<PendingTextInput<B::Prompt, B::Token>>,
-    completions: Vec<B::TextCompletion>,
-    remaining_tokens: Option<usize>,
-    prefill: PrefillChunkPolicy,
-    position: crate::refinement::GenerationPosition,
-    cancellation: Option<crate::GenerationCancellationToken>,
-}
 
 type ControlledGenerationResult<B, C> = Result<
     <B as TextGenerationBackend>::Token,
@@ -2264,6 +2326,12 @@ where
     /// Independent completed-work and authoritative-output coordinates.
     pub fn position(&self) -> crate::refinement::GenerationPosition {
         self.inner.position
+    }
+    /// Active/pending mode and effective handoff position of this shared driver.
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState { self.inner.decoding.state() }
+    /// Binds cross-thread mode commands to uninterrupted or explicit advancement.
+    pub fn bind_control_handle(&self, handle: &crate::execution_control::GenerationControlHandle) -> Result<(), crate::decoding::DecodingModeError> {
+        handle.bind_decoding(self.inner.decoding.clone(), self.inner.cancellation.as_ref())
     }
 
     /// Advances one physical operation using the same driver as the token iterator.
@@ -2298,7 +2366,7 @@ where
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let inner = TextGenerationMachine::new(runtime, prompt, config, controller)?;
+        let inner = TextRequestDriver::new(runtime, prompt, config, controller)?;
         Ok(Self { runtime, inner })
     }
 
@@ -2309,7 +2377,7 @@ where
 
     /// Observes cancellation between completed prefill chunks and predictions.
     pub fn set_cancellation_token(&mut self, cancellation: crate::GenerationCancellationToken) {
-        self.inner.cancellation = Some(cancellation);
+        self.inner.set_cancellation_token(cancellation);
     }
 
     /// Completes additional fallible host preparation before advancing this run.
@@ -2395,307 +2463,6 @@ where
         }
         self.inner
             .advance_prefill(self.runtime)
-            .map_err(ControlledTextGenerationError::Backend)
-    }
-}
-
-impl<B, C> TextGenerationMachine<B, C>
-where
-    B: TextGenerationBackend,
-    C: TokenFilterController,
-{
-    fn new(
-        runtime: &ModelRuntime<B>,
-        prompt: B::Prompt,
-        config: TextGenerationConfig,
-        controller: C,
-    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let block_refinement = B::supports_block_refinement(runtime);
-        let admission = if (config.refinement_policy().is_some()
-            || config.refinement_canvas().is_some())
-            && !block_refinement
-        {
-            Err(ControlledTextGenerationError::Operation(
-                TextOperationPolicyError::RequiresBlockRefinementArchitecture,
-            ))
-        } else if block_refinement
-            && matches!(config.strategy(), TextSamplingStrategy::MirostatV2 { .. })
-        {
-            Err(ControlledTextGenerationError::Operation(
-                TextOperationPolicyError::RequiresCausalConditionalScores,
-            ))
-        } else {
-            Ok(())
-        };
-        let admission = admission.and_then(|()| {
-            if let Some(canvas) = config.refinement_canvas() {
-                let length = B::refinement_canvas_length(runtime).ok_or(
-                    ControlledTextGenerationError::Operation(
-                        TextOperationPolicyError::RequiresBlockRefinementArchitecture,
-                    ),
-                )?;
-                let vocabulary = B::refinement_vocabulary_size(runtime).ok_or(
-                    ControlledTextGenerationError::Operation(
-                        TextOperationPolicyError::RequiresBlockRefinementArchitecture,
-                    ),
-                )?;
-                canvas
-                    .validate(length.get(), vocabulary.get() as usize)
-                    .map_err(|e| {
-                        ControlledTextGenerationError::Operation(
-                            TextOperationPolicyError::InvalidRefinementCanvas(e),
-                        )
-                    })?;
-            }
-            Ok(())
-        });
-        // Agree portable admission before configuring native state or drawing noise.
-        runtime.finish_text_preparation(
-            crate::run_preparation::TextPreparationStage::Sampling,
-            admission,
-            ControlledTextGenerationError::Preparation,
-        )?;
-        let backend_state = B::start_text_generation(runtime.backend(), config.clone())
-            .map_err(ControlledTextGenerationError::Backend);
-        let backend_state = runtime.finish_text_preparation(
-            crate::run_preparation::TextPreparationStage::Sampling,
-            backend_state,
-            ControlledTextGenerationError::Preparation,
-        )?;
-        Ok(Self {
-            backend_state,
-            controller,
-            step: Some(PendingTextInput::Prefill(prompt)),
-            completions: Vec::new(),
-            position: crate::refinement::GenerationPosition::default(),
-            remaining_tokens: config.sampling().max_new_tokens,
-            prefill: config.prefill_chunk_policy(),
-            cancellation: None,
-        })
-    }
-
-    fn retain_completion(&mut self, completion: B::TextCompletion) -> Result<(), B::Error> {
-        let existing = std::mem::take(&mut self.completions);
-        let mut retained = Vec::with_capacity(existing.len() + 1);
-        for pending in existing {
-            match pending.is_complete() {
-                Ok(true) => {}
-                Ok(false) => retained.push(pending),
-                Err(error) => {
-                    let _ = pending.wait();
-                    for retained_completion in retained.drain(..) {
-                        let _ = retained_completion.wait();
-                    }
-                    let _ = completion.wait();
-                    return Err(error);
-                }
-            }
-        }
-        retained.push(completion);
-        self.completions = retained;
-        Ok(())
-    }
-
-    fn resolve_completions_before_decode(&mut self) -> Result<(), B::Error> {
-        let existing = std::mem::take(&mut self.completions);
-        let mut remaining = existing.into_iter();
-        while let Some(completion) = remaining.next() {
-            let result = match completion.is_complete() {
-                Ok(true) => Ok(()),
-                Ok(false) => completion.wait(),
-                Err(error) => {
-                    let _ = completion.wait();
-                    Err(error)
-                }
-            };
-            if let Err(error) = result {
-                for pending in remaining {
-                    let _ = pending.wait();
-                }
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn next_committed(
-        &mut self,
-        runtime: &mut ModelRuntime<B>,
-    ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
-    {
-        loop {
-            match self.next_physical_committed(runtime)? {
-                Ok(TextAdvancement::Token(token)) => return Some(Ok(token)),
-                Ok(TextAdvancement::Progress(_)) => {}
-                Err(error) => return Some(Err(error)),
-            }
-        }
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn next_physical_committed(
-        &mut self,
-        runtime: &mut ModelRuntime<B>,
-    ) -> Option<Result<TextAdvancement<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
-    {
-        let (token, score_kind) = match self.next_physical_output(runtime)? {
-            Ok(PhysicalTextOutput::Progress(progress)) => {
-                return Some(Ok(TextAdvancement::Progress(progress)))
-            }
-            Ok(PhysicalTextOutput::Token { token, score_kind }) => (token, score_kind),
-            Err(error) => return Some(Err(error)),
-        };
-        let token_id = match token.token_id() {
-            Ok(token_id) => token_id,
-            Err(error) => {
-                self.step = None;
-                return Some(Err(ControlledTextGenerationError::Backend(error)));
-            }
-        };
-        if let Err(error) = self.controller.commit_token(token_id) {
-            self.step = None;
-            return Some(Err(ControlledTextGenerationError::Controller(error)));
-        }
-        self.position.committed_tokens += 1;
-        Some(Ok(TextAdvancement::Token(ControlledToken {
-            output: token,
-            token_id,
-            score_kind,
-            position: self.position,
-        })))
-    }
-
-    /// Completes one nonfinal prefix, preserving the remaining prompt and all
-    /// sampling/controller state. Backends return only after native completion.
-    fn advance_prefill(&mut self, runtime: &mut ModelRuntime<B>) -> Result<bool, B::Error> {
-        let max_tokens = match self.prefill {
-            PrefillChunkPolicy::Unchunked => std::num::NonZeroUsize::MAX,
-            PrefillChunkPolicy::Bounded(max_tokens) => max_tokens,
-        };
-        if self.remaining_tokens == Some(0)
-            || self
-                .cancellation
-                .as_ref()
-                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
-        {
-            return Ok(false);
-        }
-        let Some(step) = self.step.take() else {
-            return Ok(false);
-        };
-        let PendingTextInput::Prefill(mut prompt) = step else {
-            self.step = Some(step);
-            return Ok(false);
-        };
-        let advanced =
-            B::prefill_text_prefix(runtime, &mut prompt, max_tokens, &mut self.backend_state)?;
-        self.step = Some(PendingTextInput::Prefill(prompt));
-        if advanced {
-            self.position.execution_step += 1;
-        }
-        Ok(advanced)
-    }
-
-    fn next_output(
-        &mut self,
-        runtime: &mut ModelRuntime<B>,
-    ) -> Option<ControlledGenerationResult<B, C>> {
-        self.next_committed(runtime)
-            .map(|result| result.map(ControlledToken::into_output))
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn next_physical_output(
-        &mut self,
-        runtime: &mut ModelRuntime<B>,
-    ) -> Option<
-        Result<PhysicalTextOutput<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>,
-    > {
-        if self.remaining_tokens == Some(0)
-            || self
-                .cancellation
-                .as_ref()
-                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
-        {
-            self.step = None;
-            return None;
-        }
-        if self.position.execution_step == u64::MAX || self.position.committed_tokens == u64::MAX {
-            self.step = None;
-            return Some(Err(TextOperationPolicyError::PositionOverflow.into()));
-        }
-        match self.advance_prefill(runtime) {
-            Ok(true) => {
-                return Some(Ok(PhysicalTextOutput::Progress(TextProgress {
-                    phase: crate::refinement::GenerationPhase::Context,
-                    block: 0,
-                    iteration: 0,
-                    tentative_token_ids: None,
-                })))
-            }
-            Ok(false) => {}
-            Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
-        }
-        let step = self.step.take()?;
-        if matches!(
-            step,
-            PendingTextInput::Decode(_) | PendingTextInput::Continue
-        ) {
-            if let Err(error) = self.resolve_completions_before_decode() {
-                return Some(Err(ControlledTextGenerationError::Backend(error)));
-            }
-        }
-        let kind = B::text_operation_kind(runtime, &step, &self.backend_state);
-        let decision = match kind {
-            TextOperationKind::Progress(_) => None,
-            TextOperationKind::Decision(_) => match self.controller.current_decision() {
-                Ok(decision) => Some(decision),
-                Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
-            },
-        };
-        let submission =
-            B::submit_text_operation(runtime, step, decision.as_ref(), &mut self.backend_state);
-        drop(decision);
-        let submission = match submission {
-            Ok(submission) => submission,
-            Err(TextOperationError::Backend(error)) => {
-                return Some(Err(ControlledTextGenerationError::Backend(error)))
-            }
-            Err(TextOperationError::Policy(error)) => {
-                return Some(Err(ControlledTextGenerationError::Operation(error)))
-            }
-        };
-        if let Err(error) = self.retain_completion(submission.completion) {
-            return Some(Err(ControlledTextGenerationError::Backend(error)));
-        }
-        match submission.output {
-            TextOperationOutput::Progress { pending, progress } => {
-                if kind != TextOperationKind::Progress(progress.phase) {
-                    return Some(Err(TextOperationPolicyError::OutcomeMismatch.into()));
-                }
-                self.position.execution_step += 1;
-                self.position.block = progress.block;
-                self.position.iteration = progress.iteration;
-                self.step = Some(pending);
-                Some(Ok(PhysicalTextOutput::Progress(progress)))
-            }
-            TextOperationOutput::Token(token) => {
-                if !matches!(kind, TextOperationKind::Decision(_)) {
-                    return Some(Err(TextOperationPolicyError::OutcomeMismatch.into()));
-                }
-                self.position.execution_step += 1;
-                self.step = Some(PendingTextInput::Decode(token.clone()));
-                if let Some(remaining_tokens) = &mut self.remaining_tokens {
-                    *remaining_tokens -= 1;
-                }
-                let TextOperationKind::Decision(score_kind) = kind else {
-                    unreachable!()
-                };
-                Some(Ok(PhysicalTextOutput::Token { token, score_kind }))
-            }
-            TextOperationOutput::Finished => None,
-        }
     }
 }
 
@@ -2712,29 +2479,18 @@ where
     }
 }
 
-impl<B, C> Drop for TextGenerationMachine<B, C>
-where
-    B: TextGenerationBackend,
-    C: TokenFilterController,
-{
-    fn drop(&mut self) {
-        for completion in self.completions.drain(..) {
-            let _ = completion.wait();
-        }
-    }
-}
 
-/// Backend-generic asynchronous token-generation iterator.
+/// Backend-generic iterator over committed native token handles.
 ///
-/// Every yielded token handle may be fed into the following decode without
-/// first reading its id on the host. The preceding completion resolves before
-/// that state-mutating decode is submitted, and dropping the iterator waits
-/// for every still-retained submission. Drop cannot report settlement errors;
-/// use [`ModelRuntime::synchronize`] to establish successful settlement before
-/// reuse or eviction, and [`ModelRuntime::reset`] for fresh request state.
+/// Exact prediction completion and canonical identity validation precede each
+/// yield through the common request driver. The native handle remains available
+/// for the following decode; callers need not reconstruct or copy token tensors.
+/// Dropping the iterator settles retained submissions. Drop cannot report
+/// settlement errors; use [`ModelRuntime::synchronize`] to establish successful
+/// settlement before reuse or eviction, and [`ModelRuntime::reset`] for a fresh run.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
     runtime: &'a mut ModelRuntime<B>,
-    inner: TextGenerationMachine<B, FixedTokenFilter>,
+    inner: TextRequestDriver<B, FixedTokenFilter>,
 }
 
 impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
@@ -2773,6 +2529,12 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         )
     }
 
+    /// Canonical sequence owned by the common request driver.
+    pub fn committed_sequence(&self) -> &crate::GenerationSequence { self.inner.sequence() }
+
+    /// Read-only active and queued policies of this logical generation.
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState { self.inner.decoding.state() }
+
     /// Starts generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,
@@ -2784,7 +2546,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
 
     /// Starts ordinary generation with a fixed portable validity restriction.
     /// Tokenizer-owning callers supply their mapped IDs here; sampling, history,
-    /// completions and limits use the same machine as controlled generation.
+    /// completions and limits use the same request driver as controlled generation.
     pub fn with_token_filter(
         runtime: &'a mut ModelRuntime<B>,
         prompt_token_ids: Vec<u32>,
@@ -2798,7 +2560,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
             prompt,
             std::convert::identity,
         )?;
-        let inner = TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(filter))
+        let inner = TextRequestDriver::new(runtime, prompt, config, FixedTokenFilter(filter))
             .map_err(unreachable_unconstrained_error)?;
         Ok(Self { runtime, inner })
     }
@@ -2810,7 +2572,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         config: TextGenerationConfig,
     ) -> Result<Self, BackendFailure> {
         let inner =
-            TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(TokenFilter::All))
+            TextRequestDriver::new(runtime, prompt, config, FixedTokenFilter(TokenFilter::All))
                 .map_err(unreachable_unconstrained_error)?;
         Ok(Self { runtime, inner })
     }
@@ -3351,6 +3113,7 @@ mod tests {
             input: crate::PendingTextInput<Self::Prompt, Self::Token>,
             decision: Option<&crate::TokenSamplingDecision<'_>>,
             state: &mut Self::TextGenerationState,
+            _remaining_tokens: Option<usize>,
         ) -> Result<
             Submission<crate::TextOperationOutput<Self::Prompt, Self::Token>, Self::TextCompletion>,
             crate::TextOperationError<Self::Error>,
@@ -3585,6 +3348,13 @@ mod tests {
         }
     }
 
+    impl TokenFilterController for &mut FixedController {
+        type Error = Infallible;
+        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> { (**self).current_filter() }
+        fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> { (**self).commit_token(token) }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> { (**self).is_complete() }
+    }
+
     struct PhasedMock;
     impl BackendProvider for PhasedMock {
         type ModelConfig = u32;
@@ -3645,6 +3415,9 @@ mod tests {
         type Token = u32;
         type TextGenerationState = PhasedState;
         type TextCompletion = Done;
+        fn supports_block_refinement(_: &ModelRuntime<Self>) -> bool {
+            true
+        }
         fn reset_session(_: &Self, session: &mut MockSession) -> Result<(), BackendFailure> {
             Mock::reset_session(&Mock, session)
         }
@@ -3683,6 +3456,7 @@ mod tests {
             input: PendingTextInput<Vec<u32>, u32>,
             decision: Option<&TokenSamplingDecision<'_>>,
             state: &mut PhasedState,
+            _remaining_tokens: Option<usize>,
         ) -> Result<
             Submission<TextOperationOutput<Vec<u32>, u32>, Done>,
             TextOperationError<Infallible>,
@@ -3733,6 +3507,34 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_refinement_policy_is_rejected_before_context_or_sampling() {
+        let sampling =
+            crate::resolve_generation_config(None, crate::GenerationConfigOverrides::default())
+                .unwrap();
+        let config = TextGenerationConfig::new(sampling).with_decoding_mode(Some(crate::decoding::DecodingMode::Diffusion { policy: Some(
+            crate::refinement::RefinementPolicy::MaskedUnmasking {
+                config: Default::default(),
+                mask_token_id: 2,
+            },
+        ) }));
+        let mut runtime = ModelRuntime::prepare(PhasedMock, 10).unwrap();
+        let controller = FixedController {
+            queries: 0,
+            tokens: vec![5],
+            committed: 0,
+        };
+        let result = ControlledTextGeneration::new(&mut runtime, vec![1, 2], config, controller);
+        assert!(matches!(
+            result,
+            Err(ControlledTextGenerationError::Operation(
+                TextOperationPolicyError::DecodingMode(crate::decoding::DecodingModeError::Unsupported("refinement numerical policy"))
+            ))
+        ));
+        drop(result);
+        assert!(runtime.session().tokens.is_empty());
+    }
+
+    #[test]
     fn physical_advancement_preserves_commitment_controller_and_ordinary_parity() {
         use crate::refinement::{GenerationPhase, PredictionScoreKind};
         let sampling = crate::resolve_generation_config(
@@ -3771,6 +3573,7 @@ mod tests {
         while let Some(advance) = driver.advance_operation(&mut state).unwrap() {
             match advance {
                 TextAdvancement::Progress(progress) => phases.push(progress.phase),
+                TextAdvancement::ModeChanged(_) => panic!("no transition was requested"),
                 TextAdvancement::Token(token) => {
                     assert_eq!(
                         token.score_kind(),
@@ -3958,7 +3761,7 @@ mod tests {
             },
         )
         .unwrap();
-        let controller = FixedController {
+        let mut controller = FixedController {
             queries: 0,
             tokens: vec![7, 8],
             committed: 0,
@@ -3967,13 +3770,22 @@ mod tests {
             &mut runtime,
             vec![1, 2],
             TextGenerationConfig::new(sampling),
-            controller,
+            &mut controller,
         )
         .unwrap();
+        let handle = crate::execution_control::GenerationControlHandle::default();
+        generation.bind_control_handle(&handle).unwrap();
         assert_eq!(generation.next().unwrap().unwrap().token_id(), 7);
+        assert!(!handle.decoding_state().unwrap().terminal);
         assert_eq!(generation.next().unwrap().unwrap().token_id(), 8);
+        assert!(handle.decoding_state().unwrap().terminal);
+        assert_eq!(handle.request_decoding_mode(crate::decoding::DecodingMode::Autoregressive),
+            Err(crate::decoding::DecodingModeError::Terminal));
         assert!(generation.controller_mut().is_complete().unwrap());
         assert!(generation.next().is_none());
+        drop(generation);
+        assert_eq!(controller.queries, 2);
+        assert_eq!(controller.committed, 2);
     }
 
     fn continuation_config(limit: usize) -> TextGenerationConfig {
@@ -4032,6 +3844,8 @@ mod tests {
                 Some(PendingTextInput::Prefill(pending.clone())),
                 Some(2),
                 boundary.position(),
+                boundary.decoding_state(),
+                boundary.sequence().clone(),
             )
         };
         // The child shares only execution authority, with its own remaining cursor.

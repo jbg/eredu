@@ -173,6 +173,8 @@ pub mod kimi_linear;
 /// LFM2 and LFM2-MoE hybrid decoder architecture.
 pub mod lfm2;
 pub mod nemotron_h;
+/// Shared text and Pixtral geometry for Nemotron-Labs-Diffusion.
+pub mod nemotron_labs_diffusion;
 
 /// Qwen2, Qwen3, and Qwen3-MoE text decoder architecture.
 pub mod qwen;

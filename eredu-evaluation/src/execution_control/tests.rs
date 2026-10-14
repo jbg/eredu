@@ -210,6 +210,7 @@ impl TextGenerationBackend for Host {
         input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
             eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,

@@ -71,10 +71,15 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
         };
         let expected = model
             .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options: speculative_options,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        speculative_options,
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
@@ -89,10 +94,15 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
         };
         let output = model.with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options: speculative_options,
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        speculative_options,
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},

@@ -1,0 +1,22 @@
+//! Shared-backbone Nemotron-Labs-Diffusion equations and artifact contracts.
+
+pub mod adapter;
+pub mod generation;
+pub mod composite;
+pub mod input;
+pub mod gguf;
+mod checkpoint;
+mod config;
+pub mod model;
+pub mod parallel;
+pub mod partitioned;
+pub mod processing;
+pub mod tokenizer;
+pub mod vision;
+pub mod vision_gguf;
+
+pub use checkpoint::{canonical_parameter_name, safetensors_plan, source_recipes};
+pub use config::{ConfigError, FamilyConfig, PixtralConfig};
+
+#[cfg(test)]
+mod tests;

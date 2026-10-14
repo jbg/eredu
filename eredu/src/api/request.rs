@@ -1,12 +1,10 @@
 //! Prepared-chat request types and semantic generation machinery.
 
-use std::num::NonZeroUsize;
-
 use eredu_core::{
     generation::{
         FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
     },
-    SpeculativeDraft, SpeculativeOutputError, SpeculativeSchedulerOptions,
+    SpeculativeDraft, SpeculativeOutputError,
     SpeculativeSemanticState, TokenFilter, TokenFilterController,
 };
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
@@ -45,8 +43,9 @@ pub struct PreparedChatGenerationSettings {
     /// Prompt chunking for eligible ordinary text execution (default: 512 tokens).
     /// Media, bounded observations, and speculative execution retain their full pass.
     pub prefill: eredu_core::PrefillChunkPolicy,
-    /// Iterative canvas policy; absent selects the architecture's default schedule.
-    pub refinement: Option<eredu_core::refinement::RefinementConfig>,
+    /// Initial decoding policy. Absence selects causal generation when available,
+    /// or the trained policy of an intrinsically iterative architecture.
+    pub decoding_mode: Option<eredu_core::decoding::DecodingMode>,
     /// Emits replaceable tentative blocks through bounded observed delivery.
     /// Draft IDs never enter committed text, tool constraints, or semantic parsing.
     pub draft_events: bool,
@@ -135,6 +134,8 @@ pub struct PreparedChatGenerationRequest<'a, B: eredu_core::TextGenerationBacken
     pub caller_stop_sequences: &'a [String],
     /// One-shot cooperative-cancellation token for this request.
     pub cancellation: GenerationCancellationToken,
+    /// Optional thread-safe mode commands shared with uninterrupted advancement.
+    pub control_handle: Option<&'a eredu_core::execution_control::GenerationControlHandle>,
     /// Called synchronously as each semantic event becomes available.
     pub on_event: F,
 }
@@ -150,6 +151,9 @@ pub type PreparedChatGenerationOutput = eredu_core::GenerationOutput;
 /// failures have distinct variants.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatError {
+    /// Neutral physical-operation or retained mode-admission failure.
+    #[error(transparent)]
+    Operation(#[from] eredu_core::TextOperationPolicyError),
     /// Capture admission, accounting, or transport bounds rejected the request.
     #[error(transparent)]
     Capture(#[from] eredu_core::capture::CaptureError),
@@ -194,31 +198,12 @@ pub(super) enum PreparedChatSetupError {
     Semantic(String),
 }
 
-/// Speculative-decoding controls for one prepared-chat request.
-#[derive(Debug, Clone, Copy)]
-pub struct PreparedChatSpeculativeGenerationOptions {
-    /// Maximum assistant proposals verified in one target block.
-    pub max_draft_tokens: NonZeroUsize,
-    /// Canonical scheduler controls.
-    pub scheduler: SpeculativeSchedulerOptions,
-}
-
-impl Default for PreparedChatSpeculativeGenerationOptions {
-    fn default() -> Self {
-        Self {
-            max_draft_tokens: NonZeroUsize::new(4).expect("4 is non-zero"),
-            scheduler: SpeculativeSchedulerOptions::default(),
-        }
-    }
-}
-
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatSpeculativeError {
-    /// A sampling strategy is unavailable for prepared speculative generation.
-    /// Retained for source compatibility; all current strategies are supported.
-    #[error("prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation")]
-    UnsupportedSamplingStrategy(eredu_core::TextSamplingStrategy),
+    /// Requested mode or options differ from the retained speculative source.
+    #[error(transparent)]
+    Decoding(#[from] eredu_core::decoding::DecodingModeError),
     /// The selected backend failed prompt preparation or speculative execution.
     #[error("selected backend failed prepared-chat speculative generation: {0}")]
     Backend(#[source] eredu_core::BackendFailure),
@@ -257,12 +242,12 @@ pub struct PreparedChatSpeculativeGenerationRequest<'a, B: eredu_core::TextGener
     pub drafting: SpeculativeDraft<'a, D>,
     /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
-    /// Proposal-block and scheduler controls.
-    pub options: PreparedChatSpeculativeGenerationOptions,
     /// Additional decoded text sequences that terminate generation.
     pub caller_stop_sequences: &'a [String],
     /// One-shot cooperative-cancellation token for this request.
     pub cancellation: GenerationCancellationToken,
+    /// Mode commands shared with uninterrupted and controlled advancement.
+    pub control_handle: Option<&'a eredu_core::execution_control::GenerationControlHandle>,
     /// Called synchronously for each event after its cache transaction commits.
     pub on_event: F,
 }
@@ -279,12 +264,12 @@ pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBac
     pub input: PreparedChatInput<'a, B>,
     /// Portable sampling configuration, token limit, and independent random root.
     pub settings: PreparedChatGenerationSettings,
-    /// Maximum assistant proposals verified in one target block.
-    pub max_draft_tokens: NonZeroUsize,
     /// Additional decoded text sequences that terminate only this lane.
     pub caller_stop_sequences: &'a [String],
     /// One-shot cooperative-cancellation token owned only by this lane.
     pub cancellation: GenerationCancellationToken,
+    /// Independent command mailbox for this lane.
+    pub control_handle: Option<&'a eredu_core::execution_control::GenerationControlHandle>,
     /// Called synchronously for canonical events from only this lane.
     pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
@@ -297,8 +282,6 @@ pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGeneration
     pub drafting: SpeculativeDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
     pub lanes: Vec<PreparedChatSpeculativeBatchLane<'a, B>>,
-    /// Bounded scheduler and optimistic-lookahead controls.
-    pub scheduler: SpeculativeSchedulerOptions,
 }
 
 /// Facade-prepared speculative grammar state consumed by a backend sampler.
@@ -562,6 +545,7 @@ pub(super) fn prepared_text_control_runtime(
 }
 
 pub(super) enum GenerationStepKind {
+    ModeChanged { acknowledgement: eredu_core::decoding::ModeChangeAcknowledgement, position: eredu_core::refinement::GenerationPosition },
     Token {
         token: u32,
         score_kind: eredu_core::refinement::PredictionScoreKind,
@@ -637,6 +621,9 @@ where
             .take_captured_step()
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
         let (outcome, record) = match advance {
+            Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => (
+                SourceAdvancement::Progress, GenerationStepKind::ModeChanged { acknowledgement, position: self.generator.position() }
+            ),
             None => return Ok(SourceAdvancement::Finished),
             Some(eredu_core::TextAdvancement::Progress(progress)) => (
                 SourceAdvancement::Progress,

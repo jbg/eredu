@@ -1,5 +1,29 @@
 # Language-model backend architecture
 
+Prepared generation, including retained external and embedded draft sources,
+uses the request-local `DecodingMode` in shared generation settings. The
+self-speculation variant owns its validated proposal and scheduler options.
+Forecasts consume that same mode; ordinary diffusion retains full refinement
+geometry and uses zero draft proposals.
+Prepared target sources retain a declared shared-backbone draft automatically;
+targets with ordinary refinement alone enter the causal/refinement executor.
+Continuation forecasts retain complete adapter declarations and select workspace
+from both the active and pending modes. Cold source forecasts compose refinement
+and source phases while preserving loading peaks and counting shared parameters
+once. Separately retained source state uses an explicit conservative upper allowance.
+
+Decoding modes and their validated options are portable contracts in
+`eredu-core::decoding`. A generation owns one command mailbox with immutable
+realized capabilities; commands contain no native handles or checkpoint paths.
+The shared physical driver attempts handoff through `settle_decoding_mode` only
+after preceding completions settle. A deferred handoff retains the pending
+command through the current block or verification transaction. Successful handoff
+appends any committed suffix once, preserves next-target logits and clears
+tentative state before `ModeChanged` delivery. Cancellation fences unacknowledged
+commands. Native failures retain their existing completion and recovery owners.
+Portable snapshots copy logical modes with cache, sampler and pending input;
+branches retain independent command owners and charge their storage separately.
+
 The core text machine advances architecture-declared physical operations through
 `TextGenerationBackend::submit_text_operation`. Progress retains pending input
 without querying or committing the token controller. A selecting operation alone
@@ -33,13 +57,70 @@ feedback; snapshot reservations cover both immutable native pins and host layout
 The CLI owns question schemas, letter-template compilation, normalized option
 probabilities and numeric level expectations. See [canvas controls](refinement-canvases.md).
 
+`RefinementPolicy` distinguishes entropy feedback from masked-token unmasking.
+The shared runtime owns both numerical schedules, immutable selected-token state,
+score retention, exact-settlement publication and dependent-suffix invalidation.
+Entropy feedback uses `EntropyRefinementOptions`; masked selection uses validated
+`MaskedRefinementOptions` with an even transfer schedule or confidence threshold.
+Native numerical implementations do not imply that a loaded architecture supports
+a policy. Session admission checks the retained family contract and returns
+`RefinementPolicyMismatch` before context execution for an incompatible policy.
+DiffusionGemma selects entropy feedback. No loaded Nemotron-Labs-Diffusion family
+is advertised by the architecture registry.
+
+The portable `nemotron_labs_diffusion` modules declare one dense parameter catalog
+for causal append and prefix-plus-block transient attention. Invocation values
+carry visibility, cache-write policy, adapter scope and score semantics; shared
+modules retain no mutable decoding-mode flag. Exact source-only recipes normalize
+NVIDIA checkpoint names. Pixtral layers, patch embedding and the spatial projector
+are separately addressable portable modules. The optional vision graph precedes
+the canonical text group, and its ingress and projector have distinct first/last
+pipeline-owner roles. Cold topology shards vision attention heads and MLP channels;
+each branch reduces its residual write while preserving complete-width RMS norms.
+Image admission proves patch payload geometry, grid metadata, host extent and the
+complete delimiter/row-break sequence together. Context assembly replaces pad
+embeddings with projected patches and retains ordinary embeddings for delimiters.
+Image processing is owned by the family and floating cubic resizing by
+`eredu-media`. Prepared composite input carries optional immutable attention
+invocation authority without changing the admitted tensor identity. See
+[released numerical evidence](nemotron-labs-diffusion-validation.md).
+
+Nemotron text GGUF admission binds incomplete legacy metadata to an exact content
+fingerprint produced by `eredu-checkpoint`. A generic `dream` or `mistral3` tag
+does not identify this family. The family checks independent head width, YaRN,
+reserved tokenizer IDs and every physical tensor before constructing one canonical
+source mapping. Its explicit bounded fallback decodes selected quantized matrices
+to F32. The largest 14B vocabulary projection requires 2,684,354,560 decoded bytes;
+the selected reader allocation bound covers that matrix rather than the complete
+model. Prepared binding and layer residency use the ordinary native mechanisms.
+
+`eredu-nn::low_rank::LowRankProjection` retains its down/up parameters independently
+of a base affine operator. Invocation owners borrow it explicitly. TP shards its
+input matrix and reduces rank activations before applying the replicated output
+matrix. The shared decoder composes this delta before the ordinary attention
+residual and restores the base output precision after the sum. Family-owned cold
+topology puts optional Nemotron draft matrices in their corresponding text-layer
+residency units. Its pipeline boundary carries immutable invocation semantics and
+the original canonical prefix position alongside the complete activation span.
+
+The MLX masked numerical mechanism uses fixed-canvas host score copies and float64
+noise arithmetic with an explicit 53-bit proposal stream. These temporary host
+copies are separate from parameters and cache storage. Selected tokens and their
+position-score rows remain fixed across later invocations. Finalization preserves
+an admissible selected token; a constrained replacement remasks the dependent
+suffix, preserves pinned positions and advances the existing cumulative invocation
+count. The local transfer schedule restarts for that suffix without rewinding RNG
+or outer capture, transport and commitment ledgers. Unresolved mask identities
+cannot become finalized tokens, even when an output constraint permits only a mask.
+
 Iterative token-block policy lives in `eredu-core::refinement` and
 `eredu-runtime::generation::refinement`. The portable engine owns temperature,
 entropy acceptance, confidence/stability stopping, feedback precision and RNG
-adoption. Native settlement precedes publication of a new iteration. Final
-candidates come from the last argmax prediction, independently of the noisy
-canvas retained for the next iteration. `BlockRefinementState` retains the explicit
-random stream, feedback, stopping history, finalization cursor and authoritative
+adoption. Native settlement precedes publication of a new iteration. Entropy
+feedback finalizes the last argmax prediction independently of its noisy canvas;
+masked refinement finalizes retained unmasked selections. `BlockRefinementState`
+retains the explicit random stream, optional feedback, stopping history,
+transfer schedule, finalization cursor and authoritative
 block. Context encoding consumes only finalized tokens. Position-wise constrained
 finalization preserves the final argmax when allowed, otherwise selects the
 highest-scoring currently admissible token from that position's final scores.
@@ -6091,6 +6172,9 @@ propagation and transport support in addition to the operator hooks.
 
 Direct pipeline and composite unit strategies forward the supplied observer
 to the selected architecture's serial or tensor-parallel internal-unit entry.
+Prepared composite adapters also forward observed serial and tensor-parallel
+ingress. Nemotron image ingress exposes the normalized patch embeddings before
+the first vision layer through this contract.
 The partition executor retains its existing boundary, residency and completion
 sequence. Local shared decoder blocks validate ownership and index local state
 before using the shared observed equations. These entries propagate unit internals;
@@ -6099,7 +6183,7 @@ Its existing optional-observer implementation shares state-layout validation,
 group entry/exit and output ownership. Shared decoder ingress marks embeddings
 only when it actually looks up tokens; upstream hidden boundaries are not
 relabelled as embeddings. Final readout runs only on its output owner.
-Specialized routed strategies, composite ingress and global capture transport
+Specialized routed strategies and global capture transport
 require further integration.
 
 The default bounded serial and parallel traversal-hook entries also dispatch
@@ -6902,11 +6986,13 @@ at each addition. Both replicated and placement-resolved construction retain
 these choices; reusable native operators implement them without family dispatch.
 
 The shared native learned RMS operator preserves its input-precision rounding
-boundary before multiplying the gain. On Metal, matching half-precision inputs
-and gains use the existing float32 row reduction so reduction-order differences
+boundary before multiplying the gain. Half-precision inputs use float32
+normalization followed by an explicit input-dtype cast on CPU and
+Metal. Metal uses the existing float32 row reduction so reduction-order differences
 near a rounding midpoint do not change downstream component experiments. The
 parameterized operator, learned-offset form and direct weighted operation share
-that mechanism; mixed-precision gains retain the native promotion behavior.
+that mechanism. FP32 gains promote the rounded normalized values to FP32;
+their precision does not remove the preceding input-dtype rounding boundary.
 
 On Metal, F32 grouped and learned-offset RMS normalization combines the ordered four-level
 reduction, normalization and optional gain in one native kernel. One lane reduces
@@ -10113,3 +10199,404 @@ Larger route batches retain the grouped prefill kernel. Encoded blocks and row
 views remain unchanged; FP32 accumulation precedes the requested activation dtype.
 The ignored `q4k_grouped_decode_benchmark` compares device timeline durations for
 both kernels after warmup; its fixture is a `[32,640,2560]` bank with ten routes.
+
+Scalar-scaled E4M3 weight-only conversion is a portable checkpoint recipe.
+`DecodeTensorFp8` validates encoded weight/scalar scale metadata, preserves both
+source dependencies and pushes bounded selections into the weight source. The
+MLX recipe materializer owns E4M3 decoding, positive finite-scale validation,
+completion retention and FP32 output allocation. Its workspace report counts
+encoded inputs, decoded intermediates and the final output. This checkpoint
+conversion does not select or imply an activation quantizer.
+
+The speculative executor returns `SpeculativeProposalStep` through its native or
+erased adapter. Causal sources expose logits for ordinary draft processing and
+sampling. Masked sources expose the selected token with target-matching evidence;
+the shared proposal driver preserves that token and does not create a causal
+draft distribution or consume causal draft sampling draws. Both variants enter
+the same verification, completion, cache-commit and publication transaction.
+
+Pixtral optional-group transport declares its tensor-sharded subgroup. Each image
+block contributes two residual projection sums over the complete unmerged patch
+activation. The architecture supplies their exact shapes and per-stage order;
+replicated patch ingress and projector contribute no sums. Stages without image
+units have empty collective waves, and projected-only image input skips the tower.
+
+The Nemotron VLM graph independently addresses the vision layers, one projection
+unit, and the causal text layers. Only the first image owner retains patch ingress;
+the projection owner retains the pre-merger norm, spatial merger and projection
+parameters. Decoder embedding and readout belong to their selected first and last
+text owners. Stateless image stages have no decoder cache layout. Image boundaries
+carry their declared patch or projected-feature width; decoder continuations carry
+attention invocation and causal frontier metadata validated against local ownership.
+
+`eredu-runtime::speculative::shared_backbone` borrows one ordinary executable and
+retains one canonical mutable cache. Masked drafting reads an immutable prefix
+checkpoint, seeds the pending committed token, and returns selected proposals with
+target-matching evidence. Verification appends causal inputs with adapters disabled;
+partial commitment restores and replays only the accepted inputs transactionally.
+The request seed retains proposal randomness independently of target sampling.
+Conversion-retention and memory observations attribute the base only to the target.
+
+Pinned GGUF admission retains its original artifact fingerprint source until the
+lazy store captures bounded-read file guards. A payload-free identity check after
+store construction closes that handoff. Nemotron's explicit Pixtral companion
+validates its complete tensor/processor metadata and keeps the image-break vector
+as artifact metadata. Q/K source coordinates receive architecture-owned bounded
+reshape/transpose recipes into the same canonical vision parameter catalog.
+
+`eredu-checkpoint::gguf_fingerprint` streams encoded tensor ranges through one
+8 MiB host buffer to establish a shard-layout-independent catalog identity.
+Canonical semantic metadata includes the complete tokenizer; sorted tensor names,
+encodings, dimensions, endianness and exact payload bytes contribute. Split
+ordinals/counts, alignment and offsets do not. Current headers must match retained
+descriptors, secondary semantic metadata must agree with the first owner, and file
+guards fence the complete pass. Family admission compares this identity with its
+pinned conversions while retaining separate fingerprints of every actual member.
+
+Shared-backbone execution declarations retain separate ordinary unmasking and
+speculative draft policies. Family construction supplies seeding, mask identity,
+complete canvas geometry and draft-only adapter availability. Native generation
+consumes these declarations without inspecting family configuration. A settled
+AR/diffusion handoff retains next-token logits separately from any committed token
+awaiting cache append; the target sampler history and independent refinement RNG
+survive the handoff. Pixtral preprocessing performs complete host-buffer admission
+before floating cubic resize and emits patches/grid metadata; the architecture
+owns image-marker insertion.
+
+GGUF allocation ceilings are header-preserving checkpoint projections. They
+select the logical conversion allocation bound without reopening source members
+or changing validated encoded tensor ranges. Nemotron's content-backed admission
+accepts an already-open checkpoint and retains its F32 conversion header catalog.
+
+The shared physical driver supplies the remaining commitment budget to each
+backend operation. A speculative invocation keeps its complete draft canvas while
+shortening proposal capacity; a one-token budget uses causal target sampling.
+Exact submission completion precedes controller commitment. The backend's
+`commit_text_token` publication hook runs only after controller acceptance and
+settles canonical cache state before returning the committed token. Full-attention
+native state can transactionally retain a verified prefix without re-running its
+equations; other state profiles retain checkpoint replay semantics.
+
+The shared-backbone native queue context borrows a request-local target observer
+only for its verification invocation. Its erased borrowing contract keeps queue
+assignments covariant and does not install a mutable observer on shared model
+modules. Causal sampling takes the last conditional row when instrumented prefill
+retains the complete score matrix. Capture admission and commitment coordinates
+are shared across causal and masked modes; a snapshot after an accepted verification
+decision retains the correct next commitment coordinate. Native growth forecasts
+include verification overshoot and the baseline, verified, restoration and rollback
+cache allocations; those transient state copies do not duplicate base parameters.
+
+Decoding commands use the retained text-preparation transport before physical
+model work. `eredu-core` owns exact active/pending mode and committed-position
+agreement. `eredu-runtime` frames scalar controls within a fixed 4 KiB per-rank
+encoding bound, confirms each native exchange and the complete resolved command,
+and charges topology-sized host buffers plus fixed native/host frame credits before
+allocation. MLX supplies the existing admitted world transport; it does not select
+family mode semantics. The session ledger survives model restore and fork. A
+completed conflicting-command rejection permits a corrected request; unagreed
+transport or protocol failure fences subsequent work.
+
+Selected native residency maps every exact architecture-owned execution address
+to its policy-local slot for both resident and bounded acquisition. A pipeline cut
+can own global unit one at local ordinal zero. Parameter inspection and execution
+use the same retained address map and reject another global owner even when its
+group happens to match.
+
+`ArchitectureGroupPlacement::PipelineSequence` partitions an ordered dependency
+chain as one contiguous sequence of independently addressable units. The same
+portable placement result determines route endpoints, first/last static roles,
+local state slices and output ownership. Prepared session facts carry an optional
+prompt-cache shard identity. Stateless stages have no shard identity and participate
+in coordinated execution without claiming a decoder cache. The runtime factory
+requests an explicit stateless mechanism realization; native hybrid storage retains
+no layout, layers or cache manager for that owner. A stage may own only stateless vision or
+projector units. Such a stage reports complete architecture state geometry while
+its selected local state is empty; it does not constrain a decoder owner's causal
+frontier. Ordinary per-group pipeline placement remains available for independent
+roots. A sequence requires nonempty groups and at least one unit per selected stage.
+Prepared media collective schedules consume the exact retained stage ranges.
+Communication admission bounds reductions by native encoder sequence and width
+as well as decoder activations, including spatial merge expansion.
+
+Nemotron VLM places vision, projector and decoder in this ordered sequence. Its
+projector follows vision request activity, so cached text continuation requires no
+new media output. Composite dependency checks use architecture-owned invocation
+activity for every producer. Nemotron construction dispatches before the larger
+other-family constructor frame, keeping its debug construction within the default
+Rust worker stack without changing tensor or parameter ownership.
+
+Cartesian pipeline boundaries with more than two stages and tensor replicas select
+explicit world-participating source broadcasts. The retained route still names
+one producer and one consumer; every rank submits bounded, role-exact framing in
+singleton route order. Idle ranks retain no transferred architecture state. This
+transport requires an advertised world-boundary mechanism and all-rank failure
+agreement before submission. MLX preserves the byte frame through a single-source
+integer reduction on the retained world communicator, with the same exact
+completion, header validation and quarantine ownership as endpoint transport.
+Each byte frame reaches bounded exact completion before submitting the next role,
+so independently lazy source and consumer graphs cannot reorder a multi-role route.
+
+Dense composite decoder waves declare embedding reductions, per-layer residual
+reductions and vocabulary gathering alongside media collectives. Inactive stages
+submit matching bounded tensors using the declared peer counts. Wave ordinals map
+to retained physical owners, so a decoder starting after vision/projector stages
+uses its actual first owner's schedule. These invocation schedules contain no
+parameter bindings and allocate no duplicate base weights.
+
+The portable `DraftAdapterSource` names a separately admitted low-rank artifact
+and its expected base repository. Architecture cold selection retains its strict
+PEFT equations, exact tensor geometry, source aliases, shard admissions and
+configuration bytes. The target role joins these parameters with the unchanged
+base catalog; each physical artifact opens once. Mixed GGUF/SafeTensors catalogs
+preserve encoding and provenance per source tensor. Prepared construction consumes
+the retained architecture projection, including adapters, and rejects changed
+adapter configuration before binding. Mode transitions consume this retained
+selection without artifact discovery or merged base weights.
+
+`SharedBackboneMemoryPlan` separates immutable canvas and additive-projection
+geometry from target parameter residency. The ordinary generation forecast hook
+and speculative source hook consume the same retained policy. Source-specific
+continuation forecasts accept one shared target cache without inventing a causal
+draft cache. Nemotron cold inspection reports selected rank parameters and local
+KV bytes independently from the unsharded artifact resource profile; stateless
+media owners report zero local KV payload.
+
+`RefinementMemoryPlan` retains the admitted canvas, token domain, numerical
+storage envelope and entropy-stability history. Fresh diffusion forecasts include
+full-canvas transient block K/V and score storage, followed by causal append;
+shortened output budgets preserve the trained invocation width. Continuation
+forecasts combine active and pending policies over observed native cache capacity,
+including pending block append and verification overshoot. Parameter residency
+appears once in each phase; tentative state and snapshot retention have separate
+contributions.
+
+The native fused-attention adapter casts floating visibility masks to the promoted
+query/key/value precision while preserving Boolean masks. Visibility representation therefore
+keeps the same output/cache precision as the unmasked invocation. Mechanism
+memory includes an optional mask-conversion envelope; its exact bound mask shape,
+source dtype and aliasing remain runtime observations.
+
+Nemotron's published text and Pixtral equations use input-precision rotary
+products, scores and probabilities. Pixtral learned RMS normalization rounds
+the normalized value to input precision before multiplying by the learned gain.
+Its exact GELU projector restores input precision after FP32 pointwise arithmetic.
+Image patches enter the patch projection in
+its parameter precision, and image features enter text token positions in text
+embedding precision. Caller-prepared text embeddings use that same embedding
+precision. Scalar-scaled weight-only FP8 projections decode to F32;
+their scalar scales remain mandatory provenance-guarded source companions
+consumed by conversion recipes, outside the executable parameter catalog.
+The neutral checkpoint schema marks such tensors as `RecipeInput`: exact
+admission retains access for recipe dependency resolution, while prepared
+parameter normalization excludes them from resident neural bindings.
+The admitted F32 scale therefore establishes text cache storage precision even
+when embedding and normalization parameters retain BF16 source storage.
+Converted FP32 text queries select FP32 text rotary tables and products; the
+vision tower retains its BF16 input-precision rotary arithmetic. Independent
+mixed-precision comparisons use these selected arithmetic boundaries.
+
+The portable `VerificationRound` accounts for causal target steps and proposal
+verification. Zero proposals retains the pending committed input and samples its
+single causal target row through the ordinary processed-target and publication
+transaction. A zero-capacity draft-source state preserves alignment without
+proposal execution or proposal RNG draws. Completion, cache rollback and semantic
+commitment have the same ownership contract in both cases.
+
+`GenerationRequestConfig` carries the initial `DecodingMode` and output sampling
+policy. Its default is AR. `GenerationRequestTable` schedules causal steps with
+zero proposals and speculative transactions with the mode's validated allowance.
+Causal requests require no draft capacity and never enter optimistic drafting.
+Ordinary fused samplers enter the same table as completed-decision sources.
+They retain opaque sampler state, non-cloneable commitment controllers, native
+output handles and exact completions. A numerical progress operation never
+queries or advances a controller. Completed tokens enter the table's canonical
+sequence after exact settlement and native commitment; no sampled token is
+represented as logits or probability evidence. Score-backed sources retain
+transactional causal verification and independent proposal/target randomness.
+Scoped executor contexts borrow the loaded runtime without requiring a static
+backend or cloning parameters. Owned lane caches may contain borrowed controller
+state; exclusive borrowed caches retain a move-only dereference lease.
+`GenerationCache` gives each lane exclusive borrowed or owned canonical state.
+Prepared native batch requests move their fresh caches into the common driver;
+cache and parameter owners are not cloned when entering controlled execution.
+Borrowed caches retain their enclosing scope's final state through the same
+request lifecycle and completion guards.
+The shared-backbone executor also supplies complete ordinary diffusion through
+`refine_block`. Initial diffusion retains causal prefill scores without sampling
+or publishing an AR token. Complete admitted canvases remain separate from the
+canonical causal cache; selected identities and position rows survive successive
+left-to-right commitments. A replaced candidate invalidates the dependent suffix,
+which is refined over the same immutable causal prefix with the corrected
+committed canvas positions pinned. Ordinary diffusion disables draft adapters.
+Target, proposal and ordinary refinement randomness have independent owners.
+
+`RefinementProgress` separates settled numerical work from selected-row finalization.
+A numerical advancement returns a pending complete canvas or its final selected
+rows; finalization runs in a subsequent advancement. The shared executor retains
+immutable numerical values and the refinement RNG in its request seed, charges
+them in continuation and snapshot estimates, and restores them with the prefix.
+Each table advancement commits at most one diffusion position. Partially finalized
+canvases retain their selected rows, complete width and commitment cursor in
+snapshots and forks. Mode commands wait for the active canvas to finish, then
+append its complete finalized suffix through the common causal transaction before
+acknowledging the effective commitment position. Cancellation is coordinated
+before tentative selections become output, including a budget-terminal candidate.
+Failed publication leaves the canonical sequence and cache unchanged and fences
+further mode commands. Refinement counters record complete evaluated canvases and
+numerical invocations separately from causal target and draft-token work.
+
+`CausalExecutor` binds an ordinary model to the same request table and append
+contract, with no assistant parameters, seed cache or proposal RNG.
+Final generation-executor erasure belongs to `eredu-core`.
+`GenerationExecutorTypes`, `GenerationExecutorCacheFactory` and
+`DynGenerationExecutor` carry the complete constructed executor contract for
+causal, refinement and speculative sources. They preserve source verification
+policy, request-local mode configuration, full position-row refinement,
+completion ownership and state/copy estimates. `eredu-architectures` retains
+family pairing and typed cache construction; backends supply the fixed input,
+score, stream, completion and telemetry types. Context-aware cache construction
+uses the retained device/group binding. Erasure does not select a family or
+materialize another model.
+`CausalVerification` owns the exact causal inputs and immutable output for
+causal-only, independent-model, shared-backbone, embedded-prediction and
+feature-conditioned external executors. It retains either host token IDs or
+native token tensors together with the source's complete output, including
+auxiliary features. Ordinary-model executors use the same submission and
+score-row mechanisms; family feature equations, proposal evidence and
+accepted-prefix state remain separate. Native
+shared-backbone mode settlement uses this causal executor for its finalized suffix.
+Per-request lookahead and completion deadlines remain bounded by the shared
+scheduler's resource ceilings. Released draft-source preparation retains the
+same mode options used by the facade, including draft adapter and refinement
+selection; it does not reconstruct a second proposal policy from a draft count.
+The request and its durable snapshot retain the committed suffix awaiting
+cache append explicitly. Causal settlement consumes the complete suffix once,
+independently of proposal capacity; proposal transactions consume their pending
+input once. Parser output is not used to reconstruct cache alignment.
+Zero-width causal continuation forecasts omit draft adapter workspace and
+optimistic overshoot while retaining the selected parameter owners and causal
+verification/checkpoint allowances. Active or admitted pending diffusion retains
+its full-canvas forecast independently of proposal width; partial canvas score
+rows and their commitment cursor remain charged alongside snapshot reservations.
+Settled mode changes reuse this transaction to append the complete committed suffix and
+retain its causal next-token row without sampling. Ordinary shared-backbone
+handoffs use this same portable append transaction; native composition only
+publishes its settled cache and score row. Typed executor erasure
+preserves mode facts, bounded command agreement and score-row storage estimates.
+Request-local draft policy updates consume retained architecture declarations;
+native adapters supply transport and storage mechanisms. The numerical masked
+draft capability is distinct from complete diffusion commitment. Incremental
+verification cursors live in `eredu-runtime` as
+`SharedBackboneTransaction`: they retain completed evidence, enforce sampled-target
+commitment, and select the accepted cache prefix. MLX binds its ordinary sampler,
+observer and cache publication to that portable cursor without duplicating the
+proposal-matching or rollback equations. Cursor snapshots isolate writable
+progress while sharing immutable checkpoint evidence. Unsupported completion
+dispositions reject before proposal execution. Failed submission, completion or
+evidence retention restores the canonical checkpoint while retaining native
+outputs through rollback; indeterminate native restoration propagates its failure.
+The normalizer excludes declared GGUF artifact metadata and recipe-only inputs
+from neural binding for both primary and companion sources. Admission retains
+their exact source authority and schema obligations. A companion metadata entry
+does not acquire a canonical parameter or a duplicate embedding allocation.
+Independent branch command owners carry queued modes through serial exchange without
+sharing writable mailbox state or reopening parameters. Closing command
+ownership does not establish native completion.
+
+Composite boundary encoding and acceptance receive the invocation's neutral
+tensor context. Architectures use it to construct declared metadata and restore
+activation precision after wire conversion. Nemotron text boundaries carry mode,
+causal frontier and activation precision; vision and projector boundaries carry
+activation precision. The receiver restores the declared floating element type
+before local layers execute. Every metadata tensor belongs to the admitted wire
+schema and its transport/copy accounting.
+
+Partition collective requirements distinguish wire encoding from native
+arithmetic. Reduction, readout gather and publication contracts admit the
+selected floating parameter/recipe widths and F32 promotion. Boundary transfer
+roles retain their exact wire dtype; the broader compute contract does not
+expand boundary tensor geometry or communication limits.
+
+Distributed output owners and destination placeholders prepare the same selected
+wire dtype before publication. Local computation and cache storage preserve
+their own precision. Native cast failures retain their original source through
+the neutral `OutputPreparationFailed` error and enter ordinary execution-failure
+agreement before publication.
+
+The shared exact GELU primitive evaluates low-precision inputs in F32 and rounds
+once to the input dtype at its output, matching the pointwise activation
+contract. It preserves BF16/F16 through projector and other exact-GELU layers.
+
+Shared-backbone activation discovery uses the ordinary target descriptor and
+producer placement. It adds no prediction parameter owner or second component
+layout. `SharedBackboneExecutor` owns request-scoped admitted observers; native
+mechanisms bridge tensor and error domains while the portable collector owns
+reservation, provenance and delivery. Activation schema version 3 distinguishes
+ordinary `Refinement` iterations from draft-only `MaskedDraft` iterations. Each
+complete-canvas forward has its own physical width and monotonically increasing
+invocation identity. Prefill, verification and accepted-prefix replay retain
+causal attribution. Internal edits apply within their actual forward, before
+refinement selection or verification decisions.
+
+Shared-executor snapshots retain admitted observation authority alongside native
+cache and sampling state. Restore prepares authority replacement before native
+state publication and commits it after a successful replacement. Authority
+restoration never rewinds invocation identities or cumulative capture usage.
+Observer checkpoint storage contributes to the complete snapshot estimate.
+
+Residual capture placement follows the containing architecture execution unit.
+A residual addition has a complete hidden value after its TP reduction and emits
+that value on the executing unit's replicas. Parameter sharing and earlier
+contribution producers do not move this invocation to another pipeline stage.
+Neutral component layouts derive the unit through declared node ancestry and
+prove its parameter ownership before exposing global capture. Prediction scopes
+retain their separate invocation placement.
+
+`eredu-core::generation::VerificationCursor` owns frozen target decisions and
+accepted-prefix bookkeeping for both batched resolution and explicitly advanced
+verification. Native evidence and sampling remain outside the cursor. Staging a
+choice exposes the exact accepted cache boundary without publishing it; only a
+successful enclosing commitment advances the cursor. A pending choice rejects
+another score read or draw, and replacement, bonus or terminal acceptance closes
+the transaction. Cloned cursors isolate writable progress. Their additional host
+backing contributes to snapshot and continuation storage estimates.
+
+Capture schema version 3 carries independent raw-patch and projected-media extents
+in each physical invocation. Prepared architecture media plans supply these host
+counts before observation transaction admission; decoder delimiter positions do
+not enter either count. Pixtral tower normalization, reduced attention and MLP
+writes, residuals, spatial-merger output, projector projections and GELU have
+original and effective hooks. Their media axes resolve from the invocation and
+complete values have replicated producer ownership on the containing execution
+unit. Capture reservations bound the actual resolved tensors before retention,
+transformation or receipt transport.
+
+The independent causal executor composes `TargetRefinement` with its retained
+assistant. The policy supplies complete target refinement state and actual
+capabilities without changing proposal probabilities. `AutoregressiveInput`
+moves the prepared prompt and independent refinement stream into the request;
+its seed retains an immutable target prefix when refinement is realized, the
+aligned assistant prefix and numerical continuation. Snapshot and continuation
+estimates charge those seeds and numerical values separately from base weights.
+Native preparation moves lane samplers, semantic state and callbacks through the
+input handoff; it does not clone either model owner. Both canonical caches advance
+through the same causal settlement transaction after diffusion commitment.
+
+Ordinary causal checkpoints settle retained native values and use the cache's
+immutable-prefix checkpoint mechanism. Published append-only KV roots remain
+shared across causal, diffusion and verification seeds; mutable overwrite-capable
+state receives the mechanism's isolated copy. Restoring a numerical invocation
+creates independent host state without duplicating immutable KV backing. Durable
+snapshot estimates remain conservative isolated-copy bounds, and paid snapshot
+allowances remain cumulative.
+
+`RefinementExecutionPolicy` retains ordinary numerical equations independently of
+speculative drafting. Family declarations supply complete geometry, defaults,
+causal-sampling support and masked seed policy. Backend adapters project these
+facts through the selected execution rather than inferring entropy semantics from
+the absence of a draft source. The ordinary single-model executor composes the
+same `TargetRefinement` contract as independent drafting. Entropy feedback uses
+full batch/canvas/vocabulary geometry and the context output's conditioning
+precision; masked unmasking keeps its selected-token and pinned-prefix semantics.
+All numerical continuation values settle before a paused advancement is exposed.

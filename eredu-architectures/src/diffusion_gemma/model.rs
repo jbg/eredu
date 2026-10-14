@@ -1417,11 +1417,16 @@ where
     ) -> Option<eredu_runtime::generation::refinement::architecture::BlockRefinementGeometry> {
         Some(<Self as eredu_runtime::generation::refinement::architecture::BlockRefinementArchitecture<B, S>>::refinement_geometry(self))
     }
-    fn block_refinement_input<'a>(
+    fn invocation_input<'a>(
         tokens: &'a B::Tensor,
         feedback: Option<&'a B::Tensor>,
         mask: Option<&'a B::Tensor>,
+        invocation: eredu_core::decoding::AttentionInvocation,
     ) -> Option<Self::Input<'a>> {
+        if invocation == eredu_core::decoding::AttentionInvocation::CAUSAL && feedback.is_none() {
+            return Some(TextInput::Context { tokens, mask });
+        }
+        if invocation != eredu_core::decoding::AttentionInvocation::DIFFUSION { return None; }
         Some(TextInput::Refinement {
             tokens,
             feedback,

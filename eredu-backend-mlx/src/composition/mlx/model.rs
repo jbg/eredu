@@ -97,6 +97,9 @@ impl Executable {
     }
 
     pub fn speculative_capability(&self) -> SpeculativeCapability {
+        if self.erased().capability_estimate().shared_backbone_draft().is_some() {
+            return SpeculativeCapability::Ready { draft_source: SpeculativeDraftSource::SharedBackbone };
+        }
         if self.erased().block_refinement_geometry().is_some() {
             return SpeculativeCapability::IncompatibleScores {
                 score_kind: eredu_core::refinement::PredictionScoreKind::RefinementPosition,
@@ -153,7 +156,7 @@ impl Executable {
     pub fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Exception> {
-        Ok(self.erased().prompt_cache_model_identity().clone())
+        self.erased().prompt_cache_model_identity().cloned().ok_or_else(|| Exception::from_source(eredu_core::cache::PromptCacheError::StatelessPartition))
     }
 
     pub fn reset_cache_with_options(

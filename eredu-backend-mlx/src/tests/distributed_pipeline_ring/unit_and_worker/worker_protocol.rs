@@ -1692,13 +1692,17 @@ fn pipeline_ring_worker() {
                 let (result, publications) = execute_neutral_embedded_mtp(
                     &mut runtime,
                     synthetic_prediction_input(&parts, &prefix_tokens),
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens,
-                        max_draft_tokens: if expected_rank == 0 {
-                            usize::MAX
-                        } else {
-                            proposal_capacity
-                        },
+                        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(if expected_rank == 0 {
+                                    usize::MAX
+                                } else {
+                                    proposal_capacity
+                                }).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
                     },
@@ -1754,9 +1758,13 @@ fn pipeline_ring_worker() {
                     max_in_flight_verifications: if expected_rank == 0 { 0 } else { 1 },
                     ..Default::default()
                 };
-                let config = SpeculativeConfig {
+                let config = GenerationRequestConfig {
                     max_tokens,
-                    max_draft_tokens: proposal_capacity,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(proposal_capacity).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 };
@@ -1826,9 +1834,13 @@ fn pipeline_ring_worker() {
             let output = run_neutral_embedded_mtp(
                 &mut runtime,
                 synthetic_prediction_input(&parts, &prefix_tokens),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens,
-                    max_draft_tokens: proposal_capacity,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(proposal_capacity).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -1859,9 +1871,13 @@ fn pipeline_ring_worker() {
                 let replay = run_neutral_embedded_mtp(
                     &mut runtime,
                     synthetic_prediction_input(&parts, &prefix_tokens),
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens,
-                        max_draft_tokens: 1,
+                        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
                     },
@@ -1944,9 +1960,13 @@ fn pipeline_ring_worker() {
                         &invalid_parts,
                         &[u32::try_from(vocabulary_size).unwrap()],
                     ),
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens,
-                        max_draft_tokens: 1,
+                        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
                     },
@@ -1972,9 +1992,13 @@ fn pipeline_ring_worker() {
                 let retry = match run_neutral_embedded_mtp(
                     &mut runtime,
                     synthetic_prediction_input(&parts, &prefix_tokens),
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens,
-                        max_draft_tokens: 1,
+                        decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
                     },
@@ -2040,9 +2064,13 @@ fn pipeline_ring_worker() {
             let output = run_neutral_embedded_mtp(
                 &mut runtime,
                 synthetic_prediction_input(&suffix_parts, &suffix),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 3,
-                    max_draft_tokens: 1,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },

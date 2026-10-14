@@ -521,6 +521,8 @@ pub enum ExternalAssistantTransfer {
 /// executor choice remain owned by [`ExternalAssistantArchitecture`]. A backend supplies this
 /// contract once for every sealed architecture it can materialize.
 pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>: 'static {
+    /// Full score-row backing allowance for settled decoding handoffs.
+    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
     /// Neutral neural backend used by the materialized assistant module.
     type NeuralBackend: eredu_nn::GroupedNeuralBackend<Tensor = Self::Tensor>
         + eredu_nn::DistributedNeuralBackend
@@ -540,7 +542,7 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     /// Retained native tensor.
     type Tensor: eredu_nn::Tensor + Clone;
     /// Native logits consumed by sampling.
-    type Logits;
+    type Logits: Clone;
     /// Selected target/draft execution assignment.
     type Context<'a>: Copy
     where

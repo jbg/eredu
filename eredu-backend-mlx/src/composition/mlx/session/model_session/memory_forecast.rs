@@ -29,6 +29,23 @@ impl
         Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>,
         GenerationForecastError,
     > {
+        if matches!(drafting, eredu_core::SpeculativeDraft::Target) {
+            if Self::decoding_capabilities(runtime).speculation {
+                return Self::shared_backbone_memory_profile(runtime);
+            }
+            return Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                refinement: Self::refinement_memory_plan(runtime, None)?,
+                shared_backbone: None,
+                embedded: None,
+                parameter_conversions: None,
+                draft: None,
+                auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(0),
+                sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
+                proposal_capacity: 0,
+                shared_allocator: true,
+            }));
+        }
+        if matches!(drafting, eredu_core::SpeculativeDraft::SharedBackbone) { return Self::shared_backbone_memory_profile(runtime); }
         let eredu_core::SpeculativeDraft::External(drafter) = drafting else {
             let Some(discovery) = runtime.session().capture_discovery.as_ref() else {
                 return Ok(None);
@@ -41,6 +58,8 @@ impl
             };
             return Ok(Some(
                 eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                    refinement: Self::refinement_memory_plan(runtime, None)?,
+                    shared_backbone: None,
                     embedded: Some(topology.clone()),
                     parameter_conversions: runtime
                         .session()
@@ -72,6 +91,8 @@ impl
         };
         Ok(Some(
             eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+                refinement: Self::refinement_memory_plan(runtime, None)?,
+                shared_backbone: None,
                 embedded: None,
                 parameter_conversions: None,
                 draft: Some(draft),
@@ -92,6 +113,26 @@ impl
 }
 
 impl GenerationForecastBackend for MlxBackend<'_> {
+    fn refinement_memory_plan(runtime: &ModelRuntime<Self>, policy: Option<eredu_core::refinement::RefinementPolicy>) -> Result<Option<eredu_runtime::memory_forecast::RefinementMemoryPlan>, GenerationForecastError> {
+        Ok(runtime.session().payload.model.erased().block_refinement_geometry().map(|geometry| eredu_runtime::memory_forecast::RefinementMemoryPlan {
+            canvas_positions: geometry.canvas_length,
+            vocabulary_size: geometry.vocabulary_size,
+            stability_history: policy.unwrap_or_default().stability_history_length(),
+            bytes_per_vocabulary_entry: eredu_runtime::memory_estimation::MemoryBytes::estimated(0, 64, "native full-score/feedback, retained selection rows, categorical/noise and processing scratch envelope; F32 upper width"),
+        }))
+    }
+    fn shared_backbone_memory_profile(runtime: &ModelRuntime<Self>) -> Result<Option<eredu_runtime::memory_forecast::SpeculativeMemoryProfile>, GenerationForecastError> {
+        let Some(policy) = runtime.session().capability_estimate().map_err(|error| CapabilityError::Observation(error.to_string()))?.shared_backbone_draft() else { return Ok(None); };
+        return Ok(Some(eredu_runtime::memory_forecast::SpeculativeMemoryProfile {
+            refinement: Self::refinement_memory_plan(runtime, None)?,
+            shared_backbone: Some(eredu_runtime::memory_forecast::SharedBackboneMemoryPlan::from_policy(policy)),
+            embedded: None, draft: None, parameter_conversions: None,
+            auxiliary_bytes_per_position: eredu_runtime::memory_estimation::MemoryBytes::exact(0),
+            sampling_bytes_per_vocabulary_entry: speculative_sampling_memory(),
+            proposal_capacity: policy.proposal_capacity().get() as u64, shared_allocator: true,
+        }));
+    }
+
     fn capture_memory_projection(
         runtime: &ModelRuntime<Self>,
         capture: &eredu_core::capture::AdmittedCapturePlan,

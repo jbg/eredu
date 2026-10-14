@@ -295,6 +295,7 @@ fn verify_native_partition_components(
                 1
             };
             let invocation = independent.then_some(CaptureInvocationShape {
+            media: None,
                 batch: 1,
                 sequence,
                 context: (!speculative).then_some(if step_index == 0 {
@@ -593,6 +594,7 @@ fn ordinary_generation_prefill_revalidates_exact_core_session_admission() {
         eredu_core::PendingTextInput::Prefill(prompt),
         Some(&eredu_core::TokenSamplingDecision::new(TokenFilter::All)),
         &mut state,
+        Some(1),
     ) {
         Err(error) => error,
         Ok(_) => panic!("changed session admission entered native generation"),
@@ -609,6 +611,7 @@ fn ordinary_generation_prefill_revalidates_exact_core_session_admission() {
         eredu_core::PendingTextInput::Prefill(prompt),
         Some(&eredu_core::TokenSamplingDecision::new(TokenFilter::All)),
         &mut state,
+        Some(1),
     )
     .unwrap()
     .wait()

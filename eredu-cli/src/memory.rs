@@ -1,9 +1,9 @@
 //! Application memory advice; estimation never changes backend validity checks.
 use super::*;
 use eredu::api::{
-    forecast_inspected_generation, ForecastCalibration, GenerationForecast,
-    GenerationForecastOptions, GenerationMemoryEstimate, GenerationMemoryOptions, MemoryBudget,
-    MemoryBytes, MemoryDomain, MemoryFit, SpeculativeForecastBackend,
+    ForecastCalibration, GenerationForecast, GenerationForecastOptions, GenerationMemoryEstimate,
+    GenerationMemoryOptions, MemoryBudget, MemoryBytes, MemoryDomain, MemoryFit,
+    SpeculativeForecastBackend, forecast_inspected_generation,
 };
 
 #[derive(Serialize)]
@@ -65,7 +65,6 @@ pub(super) fn report_loaded<B: SpeculativeForecastBackend<D>, D>(
     tokens: &[u32],
     settings: PreparedChatGenerationSettings,
     drafting: Option<&eredu_core::SpeculativeDraft<'_, D>>,
-    speculative: PreparedChatSpeculativeGenerationOptions,
 ) -> Result<Report> {
     let options = GenerationForecastOptions {
         budget: MemoryBudget {
@@ -80,13 +79,9 @@ pub(super) fn report_loaded<B: SpeculativeForecastBackend<D>, D>(
         ..GenerationForecastOptions::default()
     };
     let forecast = match drafting {
-        Some(drafting) => model.forecast_speculative_token_ids(
-            tokens,
-            settings,
-            drafting,
-            speculative,
-            &options,
-        )?,
+        Some(drafting) => {
+            model.forecast_speculative_token_ids(tokens, settings, drafting, &options)?
+        }
         None => model.forecast_token_ids(tokens, settings, &options)?,
     };
     finish_report(args, forecast)
@@ -201,7 +196,9 @@ pub(super) fn advise(args: &Cli, report: &Report) -> Result<()> {
     if matches!(args.memory_policy, MemoryPolicy::Refuse)
         && report.estimate.fit == MemoryFit::LikelyShortfall
     {
-        bail!("memory policy refused a predicted shortfall; inspect the memory report or choose a smaller supported request/plan");
+        bail!(
+            "memory policy refused a predicted shortfall; inspect the memory report or choose a smaller supported request/plan"
+        );
     }
     Ok(())
 }

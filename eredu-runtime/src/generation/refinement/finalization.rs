@@ -1,11 +1,31 @@
 //! Constrained commitment of one position from a completed refinement block.
 
 use crate::generation::{SamplingBackend, TokenDomain};
-use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
+use eredu_core::{TokenFilter, refinement::PredictionScoreKind};
 use eredu_nn::{Index, Tensor};
+
+/// Selected masked tokens and the identity reserved for unresolved positions.
+pub struct RefinementSelection<'a, T> {
+    /// Complete selected canvas.
+    pub tokens: &'a T,
+    /// A mask denotes tentative state and cannot become a finalized token.
+    pub mask_token_id: u32,
+}
 
 /// Native candidate validation for position-wise constrained finalization.
 pub trait RefinementFinalizationBackend: SamplingBackend {
+    /// Borrows one already selected canvas position as an immutable scalar token.
+    fn candidate_at(
+        candidates: &Self::Token,
+        position: usize,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error>;
+    /// Whether a selected token still has a finite score after current filtering.
+    fn candidate_is_admissible(
+        candidate: &Self::Token,
+        scores: &Self::Logits,
+        context: &Self::Context,
+    ) -> Result<bool, Self::Error>;
     /// Rejects NaN/positive infinity and reports whether a finite candidate remains.
     fn position_has_candidate(
         scores: &Self::Logits,
@@ -23,6 +43,8 @@ pub struct FinalizedPosition<T, L> {
     pub scores: L,
     /// Meaning of probabilities derived from these scores.
     pub score_kind: PredictionScoreKind,
+    /// Current constraints replace a selected token, invalidating its dependent suffix.
+    pub candidate_replaced: bool,
 }
 
 /// Invalid position geometry or a native filtering/selection failure.
@@ -39,14 +61,16 @@ pub enum FinalizationError<E> {
     Backend(#[source] E),
 }
 
-/// Chooses the highest-scoring currently admissible token at one final position.
-/// With an unrestricted filter this preserves the final argmax candidate. A
-/// rejected candidate is replaced from the same position's complete scores.
+/// Preserves a selected masked token when current constraints admit it. Without
+/// a selected token, chooses the highest-scoring admissible position token.
+/// A rejected selection is replaced from the same position's complete scores;
+/// the caller invalidates its dependent tentative suffix before continuing.
 /// Each commitment queries the evolving controller separately; refinement never
 /// applies output constraints or consumes finalization randomness.
 pub fn finalize_refinement_position<B>(
     scores: &B::Logits,
     position: usize,
+    selected: Option<RefinementSelection<'_, B::Token>>,
     domain: TokenDomain,
     filter: &TokenFilter,
     context: &B::Context,
@@ -73,17 +97,44 @@ where
             context,
         )
         .map_err(|error| FinalizationError::Backend(B::error(error.to_string())))?;
-    let scores =
+    let mut scores =
         B::apply_token_filter(&scores, filter, context).map_err(FinalizationError::Backend)?;
+    if let Some(selection) = &selected {
+        if selection.mask_token_id as usize >= domain.cardinality() {
+            return Err(FinalizationError::Geometry);
+        }
+        if domain.cardinality() == 1 {
+            return Err(FinalizationError::NoAdmissibleToken);
+        }
+        let mut allowed = vec![true; domain.cardinality()];
+        allowed[selection.mask_token_id as usize] = false;
+        scores = B::apply_token_filter(&scores, &TokenFilter::Allowed(allowed), context)
+            .map_err(FinalizationError::Backend)?;
+    }
     if !B::position_has_candidate(&scores, context).map_err(FinalizationError::Backend)? {
         return Err(FinalizationError::NoAdmissibleToken);
     }
-    let token =
-        B::sample_processed(&scores, 0.0, None, context).map_err(FinalizationError::Backend)?;
+    let candidate = selected
+        .map(|selection| B::candidate_at(selection.tokens, position, context))
+        .transpose()
+        .map_err(FinalizationError::Backend)?;
+    let admissible = candidate
+        .as_ref()
+        .map(|candidate| B::candidate_is_admissible(candidate, &scores, context))
+        .transpose()
+        .map_err(FinalizationError::Backend)?
+        .unwrap_or(false);
+    let candidate_replaced = candidate.is_some() && !admissible;
+    let token = if admissible {
+        candidate.expect("admitted candidate")
+    } else {
+        B::sample_processed(&scores, 0.0, None, context).map_err(FinalizationError::Backend)?
+    };
     let token = B::validate_token(&token, domain, context).map_err(FinalizationError::Backend)?;
     Ok(FinalizedPosition {
         token,
         scores,
         score_kind: PredictionScoreKind::ConstrainedFinalization,
+        candidate_replaced,
     })
 }

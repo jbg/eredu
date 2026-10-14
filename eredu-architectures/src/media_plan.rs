@@ -166,10 +166,28 @@ impl PreparedInputPartPlan {
 /// Architecture-derived geometry and conservative execution workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaShapePlan {
+    /// Exact packed capture axes for towers with declared internal hooks.
+    pub capture_media: Option<eredu_core::capture::CaptureMediaShape>,
     /// Decoder positions occupied by the projected media.
     pub decoder_positions: u64,
     /// Conservative count of temporary execution scalars.
     pub execution_workspace_scalars: u64,
+}
+
+/// Resolves independently packed tower axes before observation transaction admission.
+/// Projected caller inputs contribute no tower invocation.
+pub fn capture_media_shape(plans: &[PreparedInputPartPlan]) -> Result<Option<eredu_core::capture::CaptureMediaShape>, CapabilityError> {
+    let mut result: Option<eredu_core::capture::CaptureMediaShape> = None;
+    for plan in plans {
+        if let PreparedInputPartPlan::Media { shape } = plan {
+            if let Some(media) = shape.capture_media {
+                let current = result.get_or_insert(eredu_core::capture::CaptureMediaShape { patches: 0, projected: 0 });
+                current.patches = current.patches.checked_add(media.patches).ok_or(CapabilityError::ArithmeticOverflow { operation: "capture media patches" })?;
+                current.projected = current.projected.checked_add(media.projected).ok_or(CapabilityError::ArithmeticOverflow { operation: "capture projected media" })?;
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Architecture-owned Qwen image/video ingress policy for one prepared tensor.
@@ -954,6 +972,7 @@ fn qwen_vision(
         "Qwen vision graph workspace",
     )?;
     Ok(MediaShapePlan {
+                capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1519,6 +1538,7 @@ fn gemma_vision(
         "Gemma vision graph workspace",
     )?;
     Ok(MediaShapePlan {
+                capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1664,6 +1684,7 @@ fn gemma_audio(
         "Gemma audio graph workspace",
     )?;
     Ok(MediaShapePlan {
+                capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: graph_scalars,
     })
@@ -1755,6 +1776,7 @@ fn inkling(
                 )
             })?;
             Ok(MediaShapePlan {
+                capture_media: None,
                 decoder_positions: patches,
                 execution_workspace_scalars: graph_scalars,
             })
@@ -1823,6 +1845,7 @@ fn inkling(
                 "Inkling audio graph workspace",
             )?;
             Ok(MediaShapePlan {
+                capture_media: None,
                 decoder_positions: frames,
                 execution_workspace_scalars: graph_scalars,
             })
@@ -2017,6 +2040,7 @@ fn muse_glimmer(
         "Muse vision activation scalars",
     )?;
     Ok(MediaShapePlan {
+                capture_media: None,
         decoder_positions: positions,
         execution_workspace_scalars: checked_mul(graph, 8, "Muse vision graph multiplier")?,
     })

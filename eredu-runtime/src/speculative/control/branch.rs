@@ -27,8 +27,12 @@ pub struct SpeculativeBranchInfo {
 
 pub(super) struct Branch<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
     state: Rc<Saved<E, S, C>>,
+    control: eredu_core::decoding::GenerationCommandOwner,
     run_id: u64,
     _reservation: SnapshotReservation,
+}
+impl<E: SpeculativeExecutor, S: SpeculativeSampling, C> Drop for Branch<E, S, C> {
+    fn drop(&mut self) { self.control.close(); }
 }
 
 impl<'a, E, S, C, P> Session<'a, E, S, C, P>
@@ -77,15 +81,18 @@ where
             SnapshotResourceKind::Branch,
             Some(SnapshotEstimate {
                 retained_bytes: overhead,
-                copy_bytes: 0,
+                copy_bytes: overhead,
             }),
         )?;
+        let control = self.request().expect("checked canonical request")
+            .fork_decoding_owner(&self.snapshots[&handle.id].state)?;
         // Immutable state can be shared until activation. The payload's original
         // reservation remains live even if the source snapshot is released.
         self.branches.insert(
             id,
             Branch {
                 state: Rc::clone(&self.snapshots[&handle.id]),
+                control,
                 run_id: id,
                 _reservation: reservation,
             },
@@ -109,9 +116,11 @@ where
             .ok_or(ExecutionControlError::Overflow)?;
         let incoming = Rc::clone(&self.branches[&handle.id].state);
         let incoming_run = self.branches[&handle.id].run_id;
+        let incoming_control = self.branches[&handle.id].control.clone();
         // Reserve both copies before replacing anything. Every switch prices
         // the actual outgoing state, including growth since its last activation.
         let outgoing = self.save_state(SnapshotResourceKind::BranchCopy)?;
+        let outgoing_control = self.request().expect("checked canonical request").decoding_owner();
         let _restore = self
             .budget
             .as_ref()
@@ -123,15 +132,19 @@ where
             .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
             .expect("submitted request");
         self.failed = true;
-        request.restore_control_snapshot(
+        request.activate_control_snapshot(
             self.scheduler.executor,
             &incoming.state,
+            &incoming_control,
             self.scheduler.context,
         )?;
         let slot = self.branches.get_mut(&handle.id).expect("owned branch");
         slot.state = outgoing;
+        slot.control = outgoing_control;
         slot.run_id = self.run_id;
         self.run_id = incoming_run;
+        if self.timing.time_to_first_token().is_none() { self.timing = incoming.timing; }
+        self.first_token_work = self.first_token_work.max(incoming.first_token_work);
         self.epoch = epoch;
         self.failed = false;
         Ok(SpeculativeBranchInfo {

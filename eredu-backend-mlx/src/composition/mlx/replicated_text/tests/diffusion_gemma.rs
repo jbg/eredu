@@ -115,6 +115,9 @@ fn loaded_refinement_queries_constraints_only_for_finalization_and_encodes_autho
             let mut tokens = Vec::new();
             while let Some(step) = generation.advance_operation().unwrap() {
                 match step {
+                    eredu_core::TextAdvancement::ModeChanged(_) => {
+                        panic!("no transition requested")
+                    }
                     eredu_core::TextAdvancement::Progress(progress) => {
                         assert_eq!(queries.get(), commits.get());
                         match progress.phase {
@@ -233,9 +236,12 @@ fn loaded_padded_media_context_and_refinement_match_across_residency_policies() 
                 let scores = runtime
                     .session_mut()
                     .with_model_operation(|model| {
-                        let output = model.erased_mut().refine_block_with_observer(
+                        let output = model.erased_mut().attention_forward_with_observer(
                             &canvas,
                             feedback.as_ref(),
+                            eredu_core::decoding::AttentionInvocation::DIFFUSION,
+                            None,
+                            false,
                             &stream,
                             &mut eredu_runtime::NoopObserver,
                         )?;
@@ -287,9 +293,12 @@ fn loaded_padded_media_context_and_refinement_match_across_residency_policies() 
             let scores = runtime
                 .session_mut()
                 .with_model_operation(|model| {
-                    let output = model.erased_mut().refine_block_with_observer(
+                    let output = model.erased_mut().attention_forward_with_observer(
                         &canvas,
                         None,
+                        eredu_core::decoding::AttentionInvocation::DIFFUSION,
+                        None,
+                        false,
                         &stream,
                         &mut eredu_runtime::NoopObserver,
                     )?;
@@ -375,7 +384,7 @@ impl eredu_runtime::execution_control::SnapshotTokenController for SnapshotContr
 
 #[test]
 fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finalization() {
-    use eredu_core::{execution_control::SnapshotLimits, TextGenerationDriver};
+    use eredu_core::{TextGenerationDriver, execution_control::SnapshotLimits};
     use eredu_runtime::execution_control::{
         ManagedTextContinuation, SnapshotBudget, TextBranchRequest, TextContinuationSnapshot,
     };
@@ -400,7 +409,7 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
         },
     )
     .unwrap();
-    let policy = eredu_core::refinement::RefinementOptions {
+    let policy = eredu_core::refinement::EntropyRefinementOptions {
         max_denoising_steps: 2,
         stability_threshold: 10,
         ..Default::default()
@@ -469,7 +478,9 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
                 prompt,
                 eredu_core::TextGenerationConfig::new(sampling)
                     .with_seed(13)
-                    .with_refinement_policy(Some(policy))
+                    .with_decoding_mode(Some(eredu_core::decoding::DecodingMode::Diffusion {
+                        policy: Some(policy),
+                    }))
                     .with_draft_events(true)
                     .with_refinement_canvas(Some(std::sync::Arc::new(
                         eredu_core::refinement::RefinementCanvas {
@@ -526,13 +537,18 @@ fn loaded_block_snapshots_replay_and_fork_context_refinement_and_partial_finaliz
             while let Some(step) = state.advance_operation(driver).unwrap() {
                 let captured = state.take_completed_step(driver).unwrap();
                 let value = match step {
+                    eredu_core::TextAdvancement::ModeChanged(_) => {
+                        panic!("no transition requested")
+                    }
                     eredu_core::TextAdvancement::Progress(progress) => {
                         let captured = captured.expect("one physical invocation capture");
                         let shape = captured.invocation.unwrap();
-                        assert!(captured
-                            .records
-                            .iter()
-                            .all(|record| record.outcome == CaptureOutcome::Captured));
+                        assert!(
+                            captured
+                                .records
+                                .iter()
+                                .all(|record| record.outcome == CaptureOutcome::Captured)
+                        );
                         assert_eq!(
                             shape.sequence,
                             if progress.phase == GenerationPhase::Context && progress.block == 0 {
@@ -681,11 +697,15 @@ fn released_public_loader_reference(gguf: bool) {
             / expected.len() as f64)
             .sqrt();
         let relative_rms = rms / reference_rms.max(f64::MIN_POSITIVE);
-        println!("{label}: max_absolute_error={maximum} rms_error={rms} relative_rms_error={relative_rms}");
-        assert!(actual
-            .iter()
-            .chain(&expected)
-            .all(|value| value.is_finite()));
+        println!(
+            "{label}: max_absolute_error={maximum} rms_error={rms} relative_rms_error={relative_rms}"
+        );
+        assert!(
+            actual
+                .iter()
+                .chain(&expected)
+                .all(|value| value.is_finite())
+        );
         assert!(maximum <= tolerance, "{label}: {maximum}");
         if label.starts_with("logits.") || label.starts_with("shared_feedback.") {
             let width = expected.len() / 2;
@@ -740,9 +760,12 @@ fn released_public_loader_reference(gguf: bool) {
             let probe = runtime
                 .session_mut()
                 .with_model_operation(|model| {
-                    let output = model.erased_mut().refine_block_with_observer(
+                    let output = model.erased_mut().attention_forward_with_observer(
                         &canvas,
                         Some(shared_feedback),
+                        eredu_core::decoding::AttentionInvocation::DIFFUSION,
+                        None,
+                        false,
                         &stream,
                         &mut eredu_runtime::NoopObserver,
                     )?;
@@ -762,9 +785,12 @@ fn released_public_loader_reference(gguf: bool) {
         let decoded = runtime
             .session_mut()
             .with_model_operation(|model| {
-                let output = model.erased_mut().refine_block_with_observer(
+                let output = model.erased_mut().attention_forward_with_observer(
                     &canvas,
                     feedback.as_ref(),
+                    eredu_core::decoding::AttentionInvocation::DIFFUSION,
+                    None,
+                    false,
                     &stream,
                     &mut eredu_runtime::NoopObserver,
                 )?;
@@ -805,5 +831,268 @@ fn released_public_loader_reference(gguf: bool) {
                 .unwrap(),
             Some([3, 4, 6][step])
         );
+    }
+}
+
+#[test]
+fn common_refinement_driver_preserves_entropy_feedback_outputs_iterations_and_snapshot_state() {
+    use crate::composition::mlx::speculative::{
+        MlxSpeculativeSampling, SpeculativeExecutionStreams,
+        autoregressive::MlxAutoregressiveMechanisms,
+    };
+    use eredu_core::{
+        GenerationRequestConfig, GenerationRequestTable, SpeculativeCallbackPublisher,
+        SpeculativeExecutor, SpeculativeOutputRuntime, SpeculativeRandomness,
+        SpeculativeSemanticConstraint, TextAdvancement, decoding::DecodingMode,
+    };
+    use eredu_runtime::{
+        ConstrainedSampler, DefaultSampler,
+        speculative::autoregressive::{
+            AutoregressiveInput, CausalExecutor, SharedTargetRefinement,
+            SharedTargetRefinementState,
+        },
+    };
+    #[derive(Clone)]
+    struct All;
+    impl eredu_core::TokenFilterController for All {
+        type Error = std::convert::Infallible;
+        fn current_filter(&mut self) -> Result<eredu_core::TokenFilter, Self::Error> {
+            Ok(eredu_core::TokenFilter::All)
+        }
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+    impl eredu_core::SpeculativeTokenFilterController for All {
+        fn control_snapshot_bytes(&self) -> Option<u64> { Some(0) }
+        fn filter_at(&self, _: &[u32]) -> Result<eredu_core::TokenFilter, Self::Error> {
+            Ok(eredu_core::TokenFilter::All)
+        }
+        fn prefix_is_complete(&self, _: &[u32]) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+    struct Semantic;
+    impl eredu_core::SpeculativeSemanticState for Semantic {
+        fn control_snapshot_bytes(&self) -> Option<u64> { Some(0) }
+        fn fork_box(&self) -> Result<Box<dyn eredu_core::SpeculativeSemanticState>, eredu_core::SpeculativeOutputError> { Ok(Box::new(Self)) }
+        fn push_token(&mut self, _: u32) -> Result<bool, eredu_core::SpeculativeOutputError> { Ok(false) }
+        fn finish(&mut self, _: eredu_core::FinishReason) -> Result<(), eredu_core::SpeculativeOutputError> { Ok(()) }
+        fn cancel(&mut self) -> Result<(), eredu_core::SpeculativeOutputError> { Ok(()) }
+        fn take_events(&mut self) -> Vec<eredu_core::SemanticEvent> { vec![] }
+    }
+    let root = checkpoint_with_sparse(false);
+    let policy = eredu_core::refinement::RefinementPolicy::EntropyFeedback(
+        eredu_core::refinement::EntropyRefinementOptions {
+            max_denoising_steps: 3,
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap(),
+    );
+    let mode = DecodingMode::Diffusion {
+        policy: Some(policy),
+    };
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            max_new_tokens: Some(5),
+            temperature: Some(0.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for residency in [
+        eredu_runtime::OrdinaryWeightResidency::FullyResident,
+        eredu_runtime::OrdinaryWeightResidency::LayerwiseHost(Default::default()),
+        eredu_runtime::OrdinaryWeightResidency::DenseDiskStream(Default::default()),
+    ] {
+        let (stream, weights) = execution_streams();
+        let backend = crate::native::backend(&stream, &weights);
+        let loaded = eredu_core::load_model(
+            &backend,
+            root.path(),
+            crate::MlxLoadRequest::from_normalized(
+                eredu_runtime::NormalizedLoadRequest::default().with_weight_residency(
+                    eredu_runtime::WeightResidency::with_layers(residency.layers()),
+                ),
+            ),
+        )
+        .unwrap();
+        let mut runtime = ModelRuntime::from_prepared(backend, loaded).unwrap();
+        let mut physical = ControlledTextGeneration::new(
+            &mut runtime,
+            vec![1, 4, 2],
+            eredu_core::TextGenerationConfig::new(sampling)
+                .with_seed(31)
+                .with_decoding_mode(Some(mode)),
+            All,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        let mut expected_iterations = 0;
+        while let Some(output) = physical.advance_operation().unwrap() {
+            match output {
+                TextAdvancement::Token(token) => {
+                    expected.push(token.token_id());
+                    assert_eq!(token.score_kind(), PredictionScoreKind::ConstrainedFinalization);
+                }
+                TextAdvancement::Progress(progress) if progress.phase == GenerationPhase::Refinement => expected_iterations += 1,
+                _ => {}
+            }
+        }
+        drop(physical);
+        runtime.reset().unwrap();
+        let prompt = <MlxBackend<'_> as TextGenerationBackend>::prepare_text_prompt(
+            runtime.backend(),
+            vec![1, 4, 2],
+        )
+        .unwrap();
+        runtime
+            .session_mut()
+            .with_model_operation(|model| {
+                let context = SpeculativeExecutionStreams::single(&stream);
+                let mut executor =
+                    CausalExecutor::<MlxAutoregressiveMechanisms, SharedTargetRefinement>::new(
+                        model.erased_mut(),
+                        SharedTargetRefinement,
+                    );
+                let capabilities = executor.decoding_capabilities();
+                assert!(capabilities.entropy_feedback && capabilities.diffusion);
+                assert!(!capabilities.autoregressive && !capabilities.speculation);
+                let mut cache = executor.new_cache(context)?;
+                let output = SpeculativeOutputRuntime::new(
+                    MlxSpeculativeSampling::new(ConstrainedSampler::new(DefaultSampler, All)),
+                    eredu_core::GenerationSequence::new(5, []),
+                    SpeculativeSemanticConstraint::plain(),
+                    SpeculativeCallbackPublisher::tokens(|_| Ok(())),
+                    Default::default(),
+                );
+                let mut table =
+                    GenerationRequestTable::new(Default::default(), context.topology()).unwrap();
+                let id = table
+                    .submit(
+                        &mut executor,
+                        &mut cache,
+                        AutoregressiveInput::new(
+                            prompt,
+                            SharedTargetRefinementState::new(
+                                crate::backend::random::RandomState::with_seed(31)?,
+                            ),
+                        ),
+                        GenerationRequestConfig {
+                            max_tokens: 5,
+                            decoding_mode: mode,
+                            ..Default::default()
+                        },
+                        output,
+                        SpeculativeRandomness::new(None, None),
+                        false,
+                        context,
+                    )
+                    .unwrap();
+                assert!(table.request(id).unwrap().sequence().tokens().is_empty());
+                table.step(&mut executor, false, context).unwrap();
+                assert!(table.request(id).unwrap().sequence().tokens().is_empty());
+                assert_eq!(table.request(id).unwrap().stats().refinement_steps(), 1);
+                let budget = eredu_runtime::execution_control::SnapshotBudget::new(
+                    eredu_core::execution_control::SnapshotLimits {
+                        max_snapshots: 1,
+                        max_branches: 0,
+                        retained_bytes: 128 << 20,
+                        cumulative_copy_bytes: 512 << 20,
+                    },
+                );
+                let estimate = table
+                    .request(id)
+                    .unwrap()
+                    .control_snapshot_estimate(&executor)
+                    .unwrap();
+                let _saved_budget = budget
+                    .reserve(
+                        eredu_core::execution_control::SnapshotResourceKind::Snapshot,
+                        Some(estimate),
+                    )
+                    .unwrap();
+                let saved = table
+                    .request(id)
+                    .unwrap()
+                    .control_snapshot(&executor, context)
+                    .unwrap();
+                table.run(&mut executor, false, context).unwrap();
+                assert_eq!(table.request(id).unwrap().sequence().tokens(), expected);
+                assert_eq!(
+                    table.request(id).unwrap().stats().refinement_steps(),
+                    expected_iterations
+                );
+                let _restore_budget = budget
+                    .reserve(
+                        eredu_core::execution_control::SnapshotResourceKind::Restore,
+                        Some(estimate),
+                    )
+                    .unwrap();
+                table
+                    .request_mut(id)
+                    .unwrap()
+                    .restore_control_snapshot(&mut executor, &saved, context)
+                    .unwrap();
+                table.run(&mut executor, false, context).unwrap();
+                assert_eq!(table.request(id).unwrap().sequence().tokens(), expected);
+                assert_eq!(
+                    table.request(id).unwrap().stats().refinement_steps(),
+                    expected_iterations
+                );
+                Ok(())
+            })
+            .unwrap();
+        // Preparation admits a refinement-only target without causal proposal
+        // evidence and lends the same executor to either advancement policy.
+        for controlled in [false, true] {
+            runtime.reset().unwrap();
+            let prompt = MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 4, 2]).unwrap();
+            let lane = eredu_core::SpeculativeGenerationLane::new(
+                prompt,
+                eredu_core::TextGenerationConfig::new(sampling).with_seed(31).with_decoding_mode(Some(mode)),
+                GenerationRequestConfig { max_tokens: 5, decoding_mode: mode, ..Default::default() },
+                All, Box::new(Semantic), Default::default(), Box::new(|_| {}),
+            );
+            let request = eredu_core::SpeculativeGenerationBatchRequest::new(
+                eredu_core::SpeculativeDraft::Target, vec![lane], [0; 32],
+            );
+            use eredu_core::SpeculativeGenerationBackend;
+            let output = if controlled {
+                use eredu_runtime::memory_forecast::SpeculativeForecastBackend;
+                let profiles = Some((
+                    MlxBackend::speculative_target_memory_profile(&runtime).unwrap(),
+                    MlxBackend::speculative_memory_profile(&runtime, &eredu_core::SpeculativeDraft::Target).unwrap().unwrap(),
+                ));
+                let mut failure = None;
+                let driver = eredu_runtime::speculative::DriveControlledSpeculation::new(
+                    Default::default(), Default::default(),
+                    |session: &mut dyn eredu_runtime::speculative::ControlledSpeculativeSession| {
+                        assert!(session.step()?.is_some());
+                        let before = session.token_ids().to_vec();
+                        let forecast = session.forecast_remaining_generation(1, &Default::default()).unwrap();
+                        assert_eq!(session.token_ids(), before);
+                        assert_eq!(forecast.speculative.max_draft_tokens, 0);
+                        assert!(forecast.speculative.draft.is_none() && forecast.speculative.embedded.is_none());
+                        assert!(forecast.estimate.domains.iter().flat_map(|domain| &domain.phases).any(|phase| phase.phase == eredu_runtime::memory_estimation::MemoryPhase::Refinement));
+                        while session.step()?.is_some() {}
+                        Ok(())
+                    }, &mut failure,
+                ).with_forecast_profiles(profiles);
+                let output = MlxBackend::with_speculative_execution(&mut runtime, request, driver).unwrap();
+                assert!(failure.is_none());
+                output
+            } else {
+                MlxBackend::with_speculative_execution(&mut runtime, request,
+                    eredu_runtime::RunSpeculativeGeneration::new(Default::default())).unwrap()
+            };
+            assert_eq!(output.requests()[0].token_ids(), expected);
+            assert_eq!(output.requests()[0].stats().refinement_steps(), expected_iterations);
+        }
     }
 }

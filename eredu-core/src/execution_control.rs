@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
+    Mutex,
 };
 
 /// Native persistent-state mechanisms for ordinary text generation.
@@ -73,7 +74,7 @@ pub trait NativeTextStateBackend: crate::TextGenerationBackend {
 }
 
 /// Version of execution-control metadata and lifecycle records.
-pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 2;
+pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 3;
 
 /// Observable lifecycle of one controllable ordinary generation session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +171,7 @@ impl ExecutionControlCapabilities {
 pub struct GenerationControlHandle {
     pause: Arc<AtomicBool>,
     cancellation: GenerationCancellationToken,
+    decoding: Arc<Mutex<Option<(crate::decoding::DecodingControl, GenerationCancellationToken)>>>,
 }
 
 impl GenerationControlHandle {
@@ -178,6 +180,7 @@ impl GenerationControlHandle {
         Self {
             pause: Arc::new(AtomicBool::new(false)),
             cancellation,
+            decoding: Arc::new(Mutex::new(None)),
         }
     }
     /// Requests pause at the next successful completed-token boundary.
@@ -195,10 +198,35 @@ impl GenerationControlHandle {
     /// Permanently cancels this run, without reinterpreting cancellation as pause.
     pub fn cancel(&self) {
         self.cancellation.cancel();
+        if let Some((control, cancellation)) = self.decoding.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            cancellation.cancel();
+            control.finish();
+        }
     }
     /// Ordinary cancellation token, shared with existing generation consumers.
     pub fn cancellation(&self) -> &GenerationCancellationToken {
         &self.cancellation
+    }
+    /// Validates and queues one mode change against the bound execution selection.
+    pub fn request_decoding_mode(&self, mode: crate::decoding::DecodingMode) -> Result<(), crate::decoding::DecodingModeError> {
+        if self.cancellation.is_cancelled() { return Err(crate::decoding::DecodingModeError::Terminal); }
+        let binding = self.decoding.lock().unwrap_or_else(|e| e.into_inner());
+        let (control, cancellation) = binding.as_ref().ok_or(crate::decoding::DecodingModeError::Unbound)?;
+        if cancellation.is_cancelled() { return Err(crate::decoding::DecodingModeError::Terminal); }
+        control.request_decoding_mode(mode)
+    }
+    /// Atomic active/pending mode and settled acknowledgement, when bound.
+    pub fn decoding_state(&self) -> Option<crate::decoding::DecodingState> {
+        self.decoding.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(control, _)| control.state())
+    }
+    pub(crate) fn bind_decoding(&self, control: crate::decoding::DecodingControl, cancellation: Option<&GenerationCancellationToken>) -> Result<(), crate::decoding::DecodingModeError> {
+        if self.cancellation.is_cancelled() { return Err(crate::decoding::DecodingModeError::Terminal); }
+        let mut binding = self.decoding.lock().unwrap_or_else(|e| e.into_inner());
+        if binding.as_ref().is_some_and(|(bound, _)| !bound.same_owner(&control) && !bound.state().terminal) {
+            return Err(crate::decoding::DecodingModeError::AlreadyBound);
+        }
+        *binding = Some((control, cancellation.unwrap_or(&self.cancellation).clone()));
+        Ok(())
     }
 }
 

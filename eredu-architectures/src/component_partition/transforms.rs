@@ -524,7 +524,7 @@ mod tests {
         };
         let execution = crate::speculative_execution::SpeculativeActivationExecution {
             depth: 2,
-            strategy: eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential,
+            strategy: Some(eredu_runtime::SpeculativeStrategyClass::EmbeddedSequential),
         };
         let layouts = empty()
             .with_prediction(&descriptor, &prepared, &execution)

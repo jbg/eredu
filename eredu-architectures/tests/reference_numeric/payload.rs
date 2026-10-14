@@ -51,6 +51,18 @@ fn decode(bytes: &[u8], dtype: &StoredDtype, dimensions: &[usize]) -> Result<Num
                 .map(|chunk| i32::from_le_bytes(*chunk) as f32)
                 .collect(),
         ),
+        StoredDtype::F8E4M3 => (1, bytes.iter().map(|&code| {
+            let exponent = i32::from((code >> 3) & 15);
+            let mantissa = code & 7;
+            let magnitude = if exponent == 0 {
+                f32::from(mantissa) * 2.0f32.powi(-9)
+            } else if exponent == 15 && mantissa == 7 {
+                f32::NAN
+            } else {
+                (1.0 + f32::from(mantissa) / 8.0) * 2.0f32.powi(exponent - 7)
+            };
+            if code & 128 == 0 { magnitude } else { -magnitude }
+        }).collect()),
         StoredDtype::U8 => (1, bytes.iter().map(|&value| f32::from(value)).collect()),
         dtype => {
             return Err(Error::backend(format!(
@@ -108,6 +120,13 @@ pub(super) fn recipe_value(
     context: &NumericContext,
 ) -> Result<NumericTensor, Error> {
     match recipe {
+        DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => {
+            recipe.infer(checkpoint).map_err(Error::backend)?;
+            let value = recipe_value(weight, checkpoint, context)?;
+            let scale = recipe_value(scale, checkpoint, context)?.data[0];
+            if !scale.is_finite() || scale <= 0.0 { return Err(Error::backend("invalid tensor FP8 multiplier")); }
+            Ok(value.map(|v| v * scale))
+        }
         DerivedWeightRecipe::Source { key, selection } => {
             let lease = checkpoint
                 .acquire_lease(TensorReadRequest {

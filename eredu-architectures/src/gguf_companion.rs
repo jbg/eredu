@@ -13,6 +13,13 @@ use crate::configuration::{GgufArchitecturePlan, GgufModelConfig};
 /// Typed family geometry retained for one admitted media-projector companion.
 #[derive(Debug, Clone)]
 pub enum GgufMediaProjectorConfig {
+    /// Content-backed Pixtral/projector companion over the same admitted text source.
+    NemotronLabsDiffusion {
+        /// Exact image and shared text equations.
+        config: crate::nemotron_labs_diffusion::FamilyConfig,
+        /// Retained released source receipt and physical geometry.
+        vision: crate::nemotron_labs_diffusion::vision_gguf::VisionGgufPlan,
+    },
     /// Flash-Next projector with exact tokenizer protocol identities bound.
     Qwen4Exp(crate::qwen4_exp::prepared::VisionPlan),
     /// Header-only Flash-Next projector awaiting tokenizer protocol identities.
@@ -48,6 +55,14 @@ pub struct GgufMediaProjectorPlan {
 }
 
 impl GgufMediaProjectorPlan {
+    pub(crate) fn attach_draft_adapter(&mut self, adapter: crate::nemotron_labs_diffusion::adapter::DraftAdapterConfig) -> Result<(), String> {
+        match &mut self.model {
+            GgufMediaProjectorConfig::NemotronLabsDiffusion { config, .. } => *config = config.clone().with_draft_adapter(adapter),
+            _ => return Err("draft adapter cannot attach to this media companion".into()),
+        }
+        Ok(())
+    }
+
     /// Typed composite family geometry derived from the primary and companion headers.
     pub const fn model(&self) -> &GgufMediaProjectorConfig {
         &self.model
@@ -166,6 +181,16 @@ pub(crate) fn resolve_media_projector(
     primary: &Checkpoint,
     projector: &Checkpoint,
 ) -> Result<GgufMediaProjectorPlan, String> {
+    if let GgufModelConfig::NemotronLabsDiffusion(text) = primary_plan.model() {
+        let vision = crate::nemotron_labs_diffusion::vision_gguf::VisionGgufPlan::from_checkpoint(projector, text.config())
+            .map_err(|error| error.to_string())?;
+        return Ok(GgufMediaProjectorPlan {
+            checkpoint: vision.checkpoint().clone(),
+            primary_tensor_mapping: text.mapping().to_vec(),
+            tensor_mapping: vision.mapping().to_vec(),
+            model: GgufMediaProjectorConfig::NemotronLabsDiffusion { config: text.config().clone(), vision },
+        });
+    }
     let model_metadata = metadata(primary);
     let projector_metadata = metadata(projector);
     let (model, checkpoint) = match primary_plan.model() {
@@ -286,6 +311,7 @@ fn canonical_projector_mapping(
     model: &GgufMediaProjectorConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
+        GgufMediaProjectorConfig::NemotronLabsDiffusion { vision, .. } => return Ok(vision.mapping().to_vec()),
         GgufMediaProjectorConfig::Qwen4ExpPending { vision, .. } => {
             return Ok(vision.gguf_source().mapping().to_vec());
         }

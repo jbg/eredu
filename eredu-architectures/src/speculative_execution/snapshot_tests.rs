@@ -13,6 +13,7 @@ pub(super) fn estimate(length: usize) -> SnapshotEstimate {
 fn complete_embedded_snapshot_keeps_both_prediction_replicas_and_is_reusable() {
     let mut strategy = Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::None,
     };
@@ -74,6 +75,7 @@ fn incomplete_estimate_prevents_copies_and_late_failure_preserves_live_cache_and
     for unbounded in [true, false] {
         let mut strategy = Strategy {
             fused_rows: None,
+            fused_calls: 0,
             corrupt_capture: unbounded,
             failure: Failure::Advance,
         };

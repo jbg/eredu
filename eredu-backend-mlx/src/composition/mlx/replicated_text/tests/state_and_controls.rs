@@ -236,7 +236,7 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
             .all(|(_, present)| *present));
 
         let persisted = matches!(state_policy, CacheResidencyPolicy::Paged(_)).then(|| {
-            let identity = generic.prompt_cache_model_identity().clone();
+            let identity = generic.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone();
             let descriptor = PromptCacheDescriptor::from_model_identity(
                 identity,
                 format!("{name}-checkpoint"),
@@ -285,7 +285,7 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
                 .save_prompt_cache(
                     tempfile::tempdir().unwrap().path(),
                     PromptCacheDescriptor::from_model_identity(
-                        generic.prompt_cache_model_identity().clone(),
+                        generic.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone(),
                         format!("{name}-checkpoint"),
                         "tokens:1,2,3",
                         1,
@@ -471,7 +471,7 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
             .iter()
             .all(|value| *value == 0.0));
 
-        let identity = generic.prompt_cache_model_identity().clone();
+        let identity = generic.prompt_cache_model_identity().expect("stateful fixture owns a cache shard").clone();
         let descriptor = PromptCacheDescriptor::from_model_identity(
             identity,
             "tiny-checkpoint",

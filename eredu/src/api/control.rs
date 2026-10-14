@@ -56,6 +56,9 @@ pub struct ControlledGenerationRecord {
 /// Typed setup, execution, semantic, lifecycle or bounded delivery failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlledGenerationError {
+    /// Requested mode conflicts with retained execution or lifecycle.
+    #[error(transparent)]
+    DecodingMode(#[from] eredu_core::decoding::DecodingModeError),
     /// Existing prepared-chat generation failure.
     #[error(transparent)]
     Generation(#[from] PreparedChatError),
@@ -164,7 +167,6 @@ struct Delivery {
     failure: Option<CaptureError>,
     semantic_prefix: Vec<SemanticEvent>,
     drafts: super::draft::DraftJournal,
-    iterative: bool,
 }
 impl Delivery {
     fn send(
@@ -218,7 +220,7 @@ impl Delivery {
         emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) {
         let prediction_index = self.prediction;
-        let input_range = (!self.iterative).then(|| {
+        let input_range = token.is_some_and(|(_, score, _)| score == eredu_core::refinement::PredictionScoreKind::CausalConditional).then(|| {
             if prediction_index == 0 {
                 [0, self.prompt_length]
             } else {
@@ -310,6 +312,13 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
         let mut delivery = self.delivery.borrow_mut();
         let (delivery, emit) = &mut *delivery;
         match advancement {
+            Some(eredu_core::TextAdvancement::ModeChanged(acknowledgement)) => {
+                if let Some(event) = delivery.drafts.clear() {
+                    delivery.send(ObservedGenerationEvent::Draft { event, position: self.state.position() }, emit);
+                }
+                delivery.send(ObservedGenerationEvent::ModeChanged { acknowledgement, position: self.state.position(), captures, step_seconds: started.elapsed().as_secs_f64() }, emit);
+                Ok(SourceAdvancement::Progress)
+            }
             None => Ok(SourceAdvancement::Finished),
             Some(eredu_core::TextAdvancement::Progress(mut progress)) => {
                 delivery.preparation_elapsed += started.elapsed();
@@ -402,6 +411,19 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// Cross-thread pause and permanent cancellation requests.
     pub fn control_handle(&self) -> GenerationControlHandle {
         self.delivery.control.clone()
+    }
+    /// Active policy, pending transition and effective committed position.
+    pub fn decoding_state(&self) -> eredu_core::decoding::DecodingState { self.state.decoding_state() }
+    /// Modes already realized by the retained execution.
+    pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities { self.state.decoding_capabilities() }
+    /// Queues one validated mode change for the next settled block or transaction.
+    pub fn request_decoding_mode(&self, mode: eredu_core::decoding::DecodingMode) -> Result<(), ControlledGenerationError> {
+        if self.delivery.control.cancellation().is_cancelled()
+            || !matches!(self.status(), GenerationStatus::Prepared | GenerationStatus::Paused) {
+            return Err(eredu_core::decoding::DecodingModeError::Terminal.into());
+        }
+        self.state.request_decoding_mode(mode)?;
+        Ok(())
     }
     /// Cumulative compact-JSON transport bytes, including lifecycle records.
     pub fn emitted_bytes(&self) -> u64 {
@@ -529,6 +551,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             }
             Err(error) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 Err(error)
             }
         }
@@ -547,6 +570,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             Ok(result) => result,
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }
@@ -591,6 +615,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         };
         if let Err(error) = result {
             self.lifecycle.fail();
+            self.state.finish_decoding();
             let error = match error {
                 CommittedGenerationError::Source(error) => ControlledGenerationError::from(error),
                 CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
@@ -642,6 +667,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
                 }
             }
             if let Some(reason) = self.cursor.finish_reason() {
+                self.state.finish_decoding();
                 if let Some(event) = self.delivery.drafts.clear() {
                     self.delivery.send(
                         ObservedGenerationEvent::Draft {
@@ -677,6 +703,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             Ok(result) => result,
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }
@@ -769,11 +796,13 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
                 // A native preparation error alone is not completion evidence.
                 // Retain the backend recovery owner and fence further advancement.
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 Err(error)
             }
             Ok(result) => result,
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }
@@ -933,6 +962,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
         mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
+        let control = prepared.control_handle.clone().unwrap_or(control);
         let preparation_started = Instant::now();
         use eredu_core::run_preparation::TextPreparationStage as Stage;
         let host = (|| {
@@ -994,7 +1024,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     self.tokenizer_fingerprint,
                     prepared.resolved,
                     prepared.settings.seed,
-                    prepared.settings.refinement,
+                    prepared.settings.decoding_mode,
                     prepared.canvas.as_deref(),
                     semantic_identity,
                     prepared.chat.eos_token_ids(),
@@ -1041,7 +1071,6 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 sequence: 0,
                 epoch: 0,
                 drafts: super::draft::DraftJournal::new(prepared.settings.draft_events),
-                iterative: B::supports_block_refinement(&self.runtime),
                 prediction: 0,
                 prompt_length: prepared.prompt_token_ids.len() as u64,
                 prompt_token_ids: prepared.prompt_token_ids.clone().into(),
@@ -1092,6 +1121,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             )
             .map_err(TextContinuationError::Generation)?;
         state.set_cancellation_token(delivery.control.cancellation().clone());
+        state.bind_control_handle(&delivery.control)?;
         match prepared.intervention {
             Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
             None => driver.enable_capture(&mut state, prepared.plan)?,

@@ -319,6 +319,16 @@ impl MlxDistributedSession {
             .map_err(eredu_core::BackendFailure::from_error)
     }
 
+    pub(crate) fn coordinate_decoding_control(
+        &self,
+        local: eredu_core::decoding::DecodingCoordination,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_runtime::run_preparation::TextPreparationAgreementError> {
+        self.preparation.as_ref().ok_or(
+            eredu_runtime::run_preparation::TextPreparationAgreementError::Admission(
+                "selected session has no bounded decoding-control transport"),
+        )?.coordinate_decoding_control(self, local)
+    }
+
     pub(crate) fn agree_text_preparation(
         &self,
         stage: eredu_core::run_preparation::TextPreparationStage,

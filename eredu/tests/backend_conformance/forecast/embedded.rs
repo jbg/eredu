@@ -68,6 +68,8 @@ impl SpeculativeForecastBackend<EmbeddedFixture> for MockBackend {
         _: &eredu_core::SpeculativeDraft<'_, EmbeddedFixture>,
     ) -> Result<Option<SpeculativeMemoryProfile>, GenerationForecastError> {
         Ok(Some(SpeculativeMemoryProfile {
+            refinement: None,
+            shared_backbone: None,
             embedded: Some(topology()),
             parameter_conversions: Some(vec![]),
             draft: None,
@@ -89,9 +91,16 @@ fn embedded_facade_forecast_is_recomputable_and_retains_one_residency_owner() {
     let forecast = model
         .forecast_speculative_token_ids(
             &[1; 17],
-            settings,
+            {
+                let settings: eredu::api::PreparedChatGenerationSettings = settings;
+                eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: settings.decoding_mode.or(Some(
+                        eredu_core::decoding::DecodingMode::SelfSpeculation(Default::default()),
+                    )),
+                    ..settings
+                }
+            },
             &eredu_core::SpeculativeDraft::<EmbeddedFixture>::Embedded,
-            Default::default(),
             &Default::default(),
         )
         .unwrap();

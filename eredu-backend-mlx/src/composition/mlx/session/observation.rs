@@ -1,9 +1,9 @@
 use super::*;
 
-pub(super) struct ArrayObserverAdapter<'a, O: ?Sized> {
-    pub(super) inner: &'a mut O,
-    pub(super) routed_path: Option<String>,
-    pub(super) routed_invocation_active: bool,
+pub(in crate::composition::mlx) struct ArrayObserverAdapter<'a, O: ?Sized> {
+    pub(in crate::composition::mlx) inner: &'a mut O,
+    pub(in crate::composition::mlx) routed_path: Option<String>,
+    pub(in crate::composition::mlx) routed_invocation_active: bool,
 }
 
 pub(super) struct InspectionCollector<'a> {

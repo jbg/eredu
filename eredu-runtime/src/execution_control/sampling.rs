@@ -50,6 +50,7 @@ pub trait TextSamplingControlBackend: TextGenerationBackend {
     /// finalization does not admit a causal sampler temperature override.
     fn sampling_score_kind(
         _runtime: &ModelRuntime<Self>,
+        _state: &Self::TextGenerationState,
     ) -> eredu_core::refinement::PredictionScoreKind {
         eredu_core::refinement::PredictionScoreKind::CausalConditional
     }
@@ -135,7 +136,7 @@ pub fn apply_prepared_sampling_override<B: TextSamplingControlBackend>(
     }
     let action = validate_sampling_override(B::sampling_control_facts(state), request)?;
     if request.temperature.is_some()
-        && B::sampling_score_kind(runtime)
+        && B::sampling_score_kind(runtime, state)
             != eredu_core::refinement::PredictionScoreKind::CausalConditional
     {
         return Err(SamplingOverrideError::RequiresCausalConditionalScores);

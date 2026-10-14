@@ -10,7 +10,7 @@ fn scheduler_attributes_interleaved_requests_and_optimistic_prefixes() {
         };
         let mut first_cache = Vec::new();
         let mut second_cache = Vec::new();
-        let mut table = SpeculativeRequestTable::new(
+        let mut table = GenerationRequestTable::new(
             SpeculativeSchedulerOptions::default(),
             SpeculativeExecutionTopology::SameDeviceSplit,
         )
@@ -21,9 +21,13 @@ fn scheduler_attributes_interleaved_requests_and_optimistic_prefixes() {
                     &mut executor,
                     cache,
                     prompt,
-                    SpeculativeConfig {
+                    GenerationRequestConfig {
                         max_tokens: 8,
-                        max_draft_tokens: 2,
+                        decoding_mode: crate::decoding::DecodingMode::SelfSpeculation(
+                            crate::decoding::SpeculationOptions::default().with_proposal_capacity(
+                                std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                            ),
+                        ),
                         temperature: 0.7,
                         eos_token_ids: Vec::new(),
                     },

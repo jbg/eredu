@@ -14,7 +14,7 @@ mod invocation;
 mod prefill;
 #[cfg(test)]
 mod prepared_geometry_tests;
-pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape};
+pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape, CaptureMediaShape};
 pub use prefill::CapturePrefillSpan;
 mod routed;
 mod tensor_wire;
@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Wire version for capture plans and records.
-pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
+pub const CAPTURE_SCHEMA_VERSION: u32 = 3;
 
 /// Cold facts about a deferred observation source. Its borrowed prototype gives
 /// geometry only; it need not have the factory's actual element type.
@@ -723,6 +723,7 @@ impl CaptureRequestShape {
         prediction: u64,
     ) -> Result<CaptureInvocationShape, CaptureError> {
         Ok(CaptureInvocationShape {
+            media: None,
             batch: self.batch,
             sequence: if phase == CapturePhase::Prefill {
                 self.prompt_tokens
@@ -801,6 +802,7 @@ impl AdmittedCapturePlan {
             }
             (None, None) => match (phase, self.prefill_span) {
                 (CapturePhase::Prefill, Some(span)) => Ok(CaptureInvocationShape {
+            media: None,
                     batch: self.request.batch,
                     sequence: span.end - span.start,
                     context: Some(span.end),

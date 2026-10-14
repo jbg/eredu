@@ -177,6 +177,16 @@ pub(crate) fn from_config(
     use CompositeSequenceExtent::{Decoder, DecoderMultiple, Fixed};
     let mut plan = CompositePartitionBoundaries::default();
     match config {
+        CompositeConfig::NemotronLabsDiffusion(args) => {
+            let factor = args.spatial_merge_size.checked_mul(args.spatial_merge_size)
+                .ok_or("image patch expansion overflows i32")?;
+            let factor = i32::try_from(factor).map_err(|_| "image patch expansion exceeds i32")?;
+            for (source, destination, extent) in [(0, 0, DecoderMultiple(factor)), (0, 1, DecoderMultiple(factor)), (1, 2, Decoder)] {
+                plan = plan.with_boundary(source, destination, CompositePartitionBoundary::fixed(
+                    crate::nemotron_labs_diffusion::composite::group_boundary_schema(args, source, destination)
+                        .map_err(|error| error.to_string())?, extent))?;
+            }
+        }
         CompositeConfig::Diffusion(args) => {
             if let Some(vision) = &args.vision {
                 let factor = vision

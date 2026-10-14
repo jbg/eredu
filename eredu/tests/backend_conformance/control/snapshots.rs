@@ -71,12 +71,16 @@ impl TextSnapshotBackend for MockBackend {
     type SamplingState = Sampling;
     fn continuation_input_tokens(
         runtime: &ModelRuntime<Self>,
-        _: &Self::SamplingState,
+        sampling: &Self::SamplingState,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
         predictions: u64,
     ) -> Option<u64> {
         if predictions == 0 {
             return Some(0);
+        }
+        if runtime.session().switchable {
+            let prompt = match input? { PendingTextInput::Prefill(prompt) => prompt.len() as u64, _ => 0 };
+            return prompt.checked_add(predictions)?.checked_add(sampling.mode_suffix.len() as u64)?.checked_add(3);
         }
         if runtime.session().iterative {
             let prompt = match input? {
@@ -91,12 +95,18 @@ impl TextSnapshotBackend for MockBackend {
             PendingTextInput::Continue => None,
         }
     }
+    fn decoding_settlement_input_tokens(
+        _: &ModelRuntime<Self>, sampling: &Sampling,
+        _: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+    ) -> Option<u64> {
+        Some((sampling.mode_suffix.len() + sampling.mode_candidates.len()) as u64)
+    }
     fn estimate_sampling_growth(
-        _: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self>,
         _: &Sampling,
         _: u64,
     ) -> Result<Option<u64>, MockError> {
-        Ok(Some(0))
+        Ok(Some(if runtime.session().switchable { 48 } else { 0 }))
     }
     fn sampling_state(state: &observed_mock::State) -> &Sampling {
         &state.sampling
@@ -114,13 +124,13 @@ impl TextSnapshotBackend for MockBackend {
         sampling.prediction
     }
     fn estimate_sampling_state(
-        _: &ModelRuntime<Self>,
-        _: &Sampling,
+        runtime: &ModelRuntime<Self>,
+        sampling: &Sampling,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
-        Ok(Some(SnapshotEstimate {
-            retained_bytes: 64,
-            copy_bytes: 64,
-        }))
+        let bytes = if runtime.session().switchable {
+            std::mem::size_of::<Sampling>() as u64 + (sampling.mode_candidates.capacity() + sampling.mode_suffix.capacity()) as u64 * 4
+        } else { 64 };
+        Ok(Some(SnapshotEstimate { retained_bytes: bytes, copy_bytes: bytes }))
     }
     fn copy_sampling_state(
         _: &mut ModelRuntime<Self>,
@@ -1055,6 +1065,7 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
     model.reset().unwrap();
     let ordinary = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
+            control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
             caller_stop_sequences: &[],

@@ -1,12 +1,22 @@
 use super::*;
 
 /// Target and assistant streams assigned to one speculative session.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SpeculativeExecutionStreams<'a> {
     target: &'a Stream,
     draft: &'a Stream,
     topology: SpeculativeExecutionTopology,
     capture: Option<&'a super::super::session::SpeculativePartitionBinding>,
+    target_observer: Option<&'a dyn TargetObserver>,
+}
+
+impl std::fmt::Debug for SpeculativeExecutionStreams<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SpeculativeExecutionStreams")
+            .field("topology", &self.topology)
+            .field("target_observer", &self.target_observer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> SpeculativeExecutionStreams<'a> {
@@ -40,6 +50,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             draft,
             topology,
             capture: None,
+            target_observer: None,
         })
     }
 
@@ -62,6 +73,22 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             draft: stream,
             topology: SpeculativeExecutionTopology::Single,
             capture: None,
+            target_observer: None,
+        }
+    }
+
+    pub(in crate::composition::mlx) fn with_target_observer(mut self, observer: &'a dyn TargetObserver) -> Self {
+        self.target_observer = Some(observer);
+        self
+    }
+
+    pub(in crate::composition::mlx) fn observe_target(
+        self,
+        mut execute: impl FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>,
+    ) -> Result<Array, Error> {
+        match self.target_observer {
+            Some(observer) => observer.with_observer(&mut execute),
+            None => execute(&mut eredu_runtime::NoopObserver),
         }
     }
 
@@ -84,6 +111,15 @@ impl<'a> SpeculativeExecutionStreams<'a> {
     ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
         match self.capture {
             Some(binding) => binding.coordinate_speculative_step(local),
+            None => Ok(local),
+        }
+    }
+
+    pub(in crate::composition::mlx) fn coordinate_decoding_control(
+        self, local: eredu_core::decoding::DecodingCoordination,
+    ) -> Result<eredu_core::decoding::DecodingCoordination, eredu_core::BackendFailure> {
+        match self.capture {
+            Some(binding) => binding.coordinate_decoding_control(local),
             None => Ok(local),
         }
     }
@@ -178,5 +214,18 @@ impl<'a> SpeculativeExecutionStreams<'a> {
         let completion = async_eval_with_event(outputs)?;
         completion.wait_on(consumer)?;
         Ok(completion)
+    }
+}
+
+/// Request-local observation is borrowed only across the exact native invocation.
+/// Erasing its implementation preserves covariance of queue assignments.
+pub(in crate::composition::mlx) trait TargetObserver {
+    fn with_observer(&self, execute: &mut dyn FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>) -> Result<Array, Error>;
+}
+
+pub(in crate::composition::mlx) struct BorrowedTargetObserver<'a>(pub std::cell::RefCell<&'a mut dyn eredu_runtime::ActivationObserver<Array, Error>>);
+impl TargetObserver for BorrowedTargetObserver<'_> {
+    fn with_observer(&self, execute: &mut dyn FnMut(&mut dyn eredu_runtime::ActivationObserver<Array, Error>) -> Result<Array, Error>) -> Result<Array, Error> {
+        execute(&mut **self.0.borrow_mut())
     }
 }

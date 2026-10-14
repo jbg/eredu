@@ -38,6 +38,10 @@ where
     type Telemetry = M::Telemetry;
     type Error = M::Error;
 
+    fn control_logits_estimate(logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        M::control_logits_estimate(logits)
+    }
+
     /// Releases optional conversions; caller must establish a settled boundary.
     fn trim_parameter_conversions(
         target: &mut Self::Target,
@@ -521,21 +525,19 @@ impl<T: Clone> ExternalTargetState<T> {
 /// Private fused DFlash proposal block.
 #[derive(Clone)]
 pub struct ExternalDraftState<T: Clone> {
-    logits: T,
+    logits: Option<T>,
     cursor: usize,
     proposal_capacity: usize,
     draft_context: DFlashContext<T>,
     cache_len: i32,
 }
 
-/// Retained target verification and exact input tokens.
-pub struct ExternalVerification<T> {
-    output: ExternalTargetOutput<T>,
-    inputs: T,
-}
+
 
 /// Backend mechanisms required by the architecture-owned DFlash lifecycle.
 pub trait ExternalMechanisms: 'static {
+    /// Complete score-row backing allowance for a settled mode handoff.
+    fn control_logits_estimate(_logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> { None }
     /// Materialized ordinary target.
     type Target: ?Sized;
     /// Materialized DFlash assistant.
@@ -551,7 +553,7 @@ pub trait ExternalMechanisms: 'static {
     /// Retained native tensor.
     type Tensor: Clone;
     /// Native sampling logits.
-    type Logits;
+    type Logits: Clone;
     /// Selected target/draft assignment.
     type Context<'a>: Copy
     where
@@ -848,14 +850,25 @@ fn block_token_ids(anchor: u32, mask: u32, proposal_capacity: usize) -> Vec<u32>
 }
 
 impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
+    fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities {
+        eredu_core::decoding::DecodingCapabilities::causal_drafting(self.max_proposals()).with_completion_support(
+            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::NativeCancel),
+            M::Completion::supports_cancellation(eredu_core::CompletionCancellationMode::QuarantineUntilComplete),
+        )
+    }
+
+    fn logits_snapshot_estimate(&self, logits: &Self::Logits) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        M::control_logits_estimate(logits)
+    }
+
     type Input = M::Input;
     type Cache = M::Cache;
     type TargetState = ExternalTargetState<M::Tensor>;
     type DraftState = ExternalDraftState<M::Tensor>;
     type CacheCheckpoint = M::CacheCheckpoint;
-    type Verification = ExternalVerification<M::Tensor>;
+    type Verification = eredu_runtime::speculative::CausalVerification<ExternalTargetOutput<M::Tensor>, M::Tensor>;
     type Logits = M::Logits;
-    type Context<'a> = M::Context<'a>;
+    type Context<'a> = M::Context<'a> where Self: 'a;
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
@@ -899,7 +912,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     ) -> Result<
         Option<(Self::CacheCheckpoint, Self::TargetState)>,
         eredu_core::speculative::SpeculativeControlError,
-    > {
+    >  where Self: 'a {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
@@ -918,7 +931,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError>  where Self: 'a {
         let state = state
             .map(|t, placement| M::control_copy_tensor(t, placement, context))
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
@@ -936,7 +949,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'context {
         M::bind_prepared_input(&input, cache)?;
         let checkpoint = M::checkpoint(cache)?;
         let result = (|| {
@@ -975,15 +988,15 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         }
     }
 
-    fn begin_proposal(
+    fn begin_proposal<'context>(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        context: M::Context<'_>,
-    ) -> Result<Self::DraftState, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<Self::DraftState, Self::Error>  where Self: 'context {
         let maximum = self.max_proposals();
-        if proposal_capacity == 0 || proposal_capacity > maximum {
+        if proposal_capacity > maximum {
             return Err(M::invalid_capacity(maximum));
         }
         let pending = state
@@ -1001,6 +1014,15 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
             )?,
             None => state.draft_context.clone().ok_or_else(M::missing_context)?,
         };
+        if proposal_capacity == 0 {
+            return Ok(ExternalDraftState {
+                logits: None,
+                cursor: 0,
+                proposal_capacity,
+                draft_context,
+                cache_len: state.cache_len,
+            });
+        }
         let ids = block_token_ids(last_token, M::mask_token(self.assistant), proposal_capacity);
         let embeddings = M::target_embeddings(self.target, &ids, context)?;
         let embeddings = M::target_to_draft(&embeddings, context)?;
@@ -1015,7 +1037,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         let logits = M::target_logits(self.target, &states, context)?;
         let logits = M::target_to_draft(&logits, context)?;
         Ok(ExternalDraftState {
-            logits,
+            logits: Some(logits),
             cursor: 0,
             proposal_capacity,
             draft_context,
@@ -1023,23 +1045,26 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         })
     }
 
-    fn proposal_logits(
+    fn proposal_step<'context>(
         &mut self,
         state: &mut Self::DraftState,
         _last_token: u32,
-        context: M::Context<'_>,
-    ) -> Result<Self::Logits, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<eredu_core::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'context {
         if state.cursor >= state.proposal_capacity {
             return Err(M::block_exhausted());
         }
         let row = state.cursor;
         state.cursor += 1;
-        let logits = M::proposal_logits_row(&state.logits, row, context)?;
+        let logits = M::proposal_logits_row(
+            state.logits.as_ref().ok_or_else(|| M::invalid_capacity(0))?, row, context,
+        )?;
         M::observe_logits(
             self.assistant,
             EXTERNAL_ASSISTANT_PROPOSAL_LOGITS_OBSERVATION_PATH,
             logits,
         )
+        .map(eredu_core::SpeculativeProposalStep::CausalLogits)
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -1051,16 +1076,16 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         context: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>  where Self: 'a {
         M::restore_checkpoint(cache, checkpoint, context)
     }
 
-    fn submit_verification(
+    fn submit_verification<'context>(
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        context: M::Context<'_>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
+        context: M::Context<'context>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'context {
         let inputs = M::target_tokens(input_tokens, context)?;
         let mut output = M::verify_target(
             self.target,
@@ -1080,7 +1105,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         Self::validate_output(&output, input_tokens.len())?;
         let completion = M::submit_verification(&output, &inputs, context)?;
         Ok(Submission {
-            output: ExternalVerification { output, inputs },
+            output: eredu_runtime::speculative::CausalVerification::new(output, inputs),
             completion,
         })
     }
@@ -1090,20 +1115,21 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         output: &Self::Verification,
         index: usize,
         context: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error> {
-        M::logits_row(&output.output.logits, index, context)
+    ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+        M::logits_row(&output.output().logits, index, context)
     }
 
-    fn commit_verification(
+    fn commit_verification<'context>(
         &mut self,
         output: Self::Verification,
         draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
-        context: M::Context<'_>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
-        let input_len = M::sequence_len(&output.inputs)?;
+        context: M::Context<'context>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'context {
+        let (verified, inputs) = output.into_parts();
+        let input_len = M::sequence_len(&inputs)?;
         let checkpoint_offset = M::checkpoint_len(checkpoint)?;
         if verified_inputs > input_len
             || draft_state.cache_len != checkpoint_offset
@@ -1123,10 +1149,10 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
             ));
         }
         let (retained, replayed_tokens) = if verified_inputs == input_len {
-            (output.output, 0)
+            (verified, 0)
         } else {
             M::restore_checkpoint(cache, checkpoint, context)?;
-            let inputs = M::token_prefix(&output.inputs, verified_inputs, context)?;
+            let inputs = M::token_prefix(&inputs, verified_inputs, context)?;
             let mut replayed = M::verify_target(
                 self.target,
                 self.assistant,
@@ -1480,8 +1506,14 @@ mod tests {
         let mut draft = executor.begin_proposal(&state, 7, 2, ()).unwrap();
         assert_eq!(draft.draft_context.start, 2);
         assert_eq!(draft.draft_context.end, 5);
-        assert_eq!(executor.proposal_logits(&mut draft, 7, ()).unwrap(), 30);
-        assert_eq!(executor.proposal_logits(&mut draft, 8, ()).unwrap(), 31);
+        assert_eq!(
+            executor.proposal_step(&mut draft, 7, ()).unwrap(),
+            eredu_core::SpeculativeProposalStep::CausalLogits(30)
+        );
+        assert_eq!(
+            executor.proposal_step(&mut draft, 8, ()).unwrap(),
+            eredu_core::SpeculativeProposalStep::CausalLogits(31)
+        );
 
         let checkpoint = executor.checkpoint(&cache).unwrap();
         let verification = executor
@@ -1494,6 +1526,16 @@ mod tests {
         assert_eq!((cache.len, cache.restores, replayed), (5, 1, 0));
         assert!(rolled_back.pending_context.is_none());
         assert_eq!(rolled_back.draft_context.unwrap().end, 5);
+        let causal = executor.begin_proposal(&state, 7, 0, ()).unwrap();
+        assert!(causal.logits.is_none(), "causal alignment does not execute the fused proposal block");
+        let checkpoint = executor.checkpoint(&cache).unwrap();
+        let verified = executor.submit_verification(&[7], &mut cache, ()).unwrap().wait().unwrap();
+        let (settled, replayed) = executor.commit_verification(
+            verified, causal, &mut cache, &checkpoint, 1, (),
+        ).unwrap().into_parts();
+        assert_eq!((cache.len, settled.cache_len, replayed), (6, 6, 0));
+        assert_eq!(settled.draft_context.unwrap().end, 5);
+        assert_eq!(settled.pending_context.unwrap().sequence, 1);
         assert_eq!(target.proposal_ids, [7, 99, 99]);
     }
 }

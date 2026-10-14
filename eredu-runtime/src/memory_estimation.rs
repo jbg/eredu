@@ -417,6 +417,10 @@ pub enum MemoryPhase {
     Prefill,
     /// Cached autoregressive execution at the output allowance or forecast horizon.
     Decode,
+    /// Bidirectional tentative block execution over the retained causal prefix.
+    Refinement,
+    /// Causal append of finalized block tokens before another decoding mode.
+    RefinementCommit,
     /// Tentative assistant advancement, including rollback and copy overlap.
     SpeculativeDraft,
     /// Target block verification, possibly overlapping optimistic drafting.
@@ -556,6 +560,14 @@ pub(crate) fn phase(
 ) -> Result<PhaseMemoryEstimate, CapabilityError> {
     let mut persistent = MemoryBytes::exact(0);
     let mut retained = plan.retained_input.clone();
+    if matches!(plan.domain, MemoryDomain::Host | MemoryDomain::Unified) {
+        let output = request.max_output_tokens.unwrap_or(request.forecast_output_tokens);
+        let sequence = mul(add(std::mem::size_of::<eredu_core::GenerationSequence>() as u64,
+            mul(output, 4)?)?, request.batch_size)?;
+        retained = retained.add(&MemoryBytes::estimated(0, sequence,
+            "common request canonical sequence: host payload horizon; allocator overhead is separate"))?;
+    }
+
     let mut transient = MemoryBytes::exact(0);
     for execution in &plan.executions {
         // Preserve authoritative media geometry while evaluating a particular

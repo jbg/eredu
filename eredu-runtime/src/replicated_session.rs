@@ -187,6 +187,11 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::State, Self::Error>;
 
+    /// Creates an explicit state-free rank without allocating mutable state slots.
+    fn realize_stateless_state(&mut self) -> Option<Self::State> {
+        None
+    }
+
     /// Creates the concrete policy owning fully resident bound units.
     fn resident_policy(
         &mut self,
@@ -1310,15 +1315,9 @@ where
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
-    let local_state = partition.state().ok_or_else(|| {
-        PartitionedRuntimeConstructionError::Contract(
-            "partition owns no local mutable state".into(),
-        )
-    })?;
-    let selected_state = selected
-        .state()
-        .for_partitioned_geometry(local_state)
-        .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
+    let local_state = partition.state();
+    let selected_state = local_state.map(|local| selected.state().for_partitioned_geometry(local))
+        .transpose().map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
     let rank = eredu_core::cache::CacheRankIdentity::new(
         topology.stage().map(|(_, rank)| rank),
         topology.shard().map(|(_, rank)| rank),
@@ -1328,7 +1327,7 @@ where
         target_parallel_layout,
         source_parallel_layout,
         rank,
-        local_state.global_layer_offset(),
+        local_state.map_or(0, |local| local.global_layer_offset()),
     );
     mechanisms
         .prepare_partition_materialization(
@@ -1344,10 +1343,13 @@ where
             context,
         )
         .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
-    let state = mechanisms
-        .realize_state(&selected_state, context)
-        .map_err(PartitionedRuntimeConstructionError::Mechanism)?;
-    if state.optional_layout() != Some(selected_state.layout()) {
+    let state = match selected_state.as_ref() {
+        Some(selected) => mechanisms.realize_state(selected, context)
+            .map_err(PartitionedRuntimeConstructionError::Mechanism)?,
+        None => mechanisms.realize_stateless_state().ok_or_else(||
+            PartitionedRuntimeConstructionError::Contract("mechanism cannot realize a stateless partition".into()))?,
+    };
+    if state.optional_layout() != selected_state.as_ref().map(|selected| selected.layout()) {
         return Err(PartitionedRuntimeConstructionError::Contract(
             "realized partition state differs from selected local geometry".into(),
         ));
@@ -3529,13 +3531,15 @@ where
         &mut self,
         replacement: &mut M::State,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let selected = self.selected_state.state().ok_or_else(|| {
-            ReplicatedTextSessionError::Contract(
-                "stateless prediction target cannot recover lane ownership".into(),
-            )
-        })?;
-        validate_realized_state(&self.state, selected)?;
-        validate_realized_state(replacement, selected)?;
+        match self.selected_state.state() {
+            Some(selected) => {
+                validate_realized_state(&self.state, selected)?;
+                validate_realized_state(replacement, selected)?;
+            }
+            None if self.state.optional_layout().is_none() && replacement.optional_layout().is_none() => {}
+            None => return Err(ReplicatedTextSessionError::Contract(
+                "stateless prediction target received stateful lane ownership".into())),
+        }
         std::mem::swap(&mut self.state, replacement);
         Ok(())
     }
@@ -3550,22 +3554,22 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<M::State, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         self.ensure_commit_resolved()?;
-        let provisional = self.selected_state.state().map_or_else(
-            || {
-                Err(ReplicatedTextSessionError::Contract(
-                    "stateless session cannot prepare prediction target state".into(),
-                ))
-            },
-            |selected| {
-                self.mechanisms
-                    .fork_prediction_target_state(&self.state, selected, context)
-                    .map_err(ReplicatedTextSessionError::Mechanism)
-                    .and_then(|state| {
-                        validate_realized_state(&state, selected)?;
-                        Ok(state)
-                    })
-            },
-        );
+        let provisional = match self.selected_state.state() {
+            None => self.mechanisms.realize_stateless_state().ok_or_else(||
+                ReplicatedTextSessionError::Contract("mechanism cannot realize a stateless prediction lane".into()))
+                .and_then(|state| {
+                    if state.optional_layout().is_some() {
+                        Err(ReplicatedTextSessionError::Contract("stateless prediction lane contains mutable state geometry".into()))
+                    } else { Ok(state) }
+                }),
+            Some(selected) => self.mechanisms
+                .fork_prediction_target_state(&self.state, selected, context)
+                .map_err(ReplicatedTextSessionError::Mechanism)
+                .and_then(|state| {
+                    validate_realized_state(&state, selected)?;
+                    Ok(state)
+                }),
+        };
         let phase = crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
         let agreed =
             D::agree_distributed_phase(&mut self.execution, phase, provisional.is_ok(), context)

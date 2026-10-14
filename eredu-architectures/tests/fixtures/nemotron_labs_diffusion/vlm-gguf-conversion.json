@@ -1,0 +1,45 @@
+{
+  "repo": "IntellAgents/Nemotron-Labs-Diffusion-VLM-8B-GGUF",
+  "revision": "a436a745feda80389c99c7a15ba3cc46fbfee8e0",
+  "format": "gguf",
+  "base_repository": "nvidia/Nemotron-Labs-Diffusion-VLM-8B",
+  "base_revision": "adca93d16471c1e07d594ae444d23e1876f6b365",
+  "reference_tool": "ggml-org/llama.cpp",
+  "reference_revision": "0f3a71be15af836d277c9f918adfafb45732677e",
+  "reference_quants_sha256": "2c927a1b3d9f0920dcf4007fb686e1b0999333e9f65ce43dcc689900c0beae8b",
+  "rotary_pairing": "adjacent_pairs",
+  "vision_rotary_pairing": "adjacent_pairs",
+  "conversion_script_sha256": "54c3231a31a018f26a606c7d61cebb1b1e9b45aab7605087716e609079998c52",
+  "settings": {
+    "text_type": "F16",
+    "vision_matrix_type": "F16",
+    "vision_vector_type": "F32",
+    "image_break_token": 20
+  },
+  "weight_files": [
+    {
+      "rfilename": "VLM8B-F16.gguf",
+      "blobId": "8952418d4422a0ea00279a427db1b5b795df0a81",
+      "size": 16987579808,
+      "lfs": {
+        "sha256": "4b5f15a545e5272b587a5150ad37cc6b5e338dc8352693a11973d1fa8f4862c7",
+        "size": 16987579808,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "mmproj-F16.gguf",
+      "blobId": "a53e1ce474fb307ca0300f144aee40fda135220c",
+      "size": 857077888,
+      "lfs": {
+        "sha256": "0705006bdaac2a3e330a9e0b80767653fce5a07fedd99995c869082b0278ff75",
+        "size": 857077888,
+        "pointerSize": 134
+      }
+    }
+  ],
+  "catalog_sha256_v1": {
+    "VLM8B-F16.gguf": "7136058da3f2648c3b5331b2334d471709d7efc735ec2b78fc9efd6f630d54cb",
+    "mmproj-F16.gguf": "195f488cd774120cd1812734984764936fa25d7bfee25f5bc675176683d4495c"
+  }
+}

@@ -161,6 +161,7 @@ impl TextGenerationBackend for StatefulBackend {
         input: eredu_core::PendingTextInput<Self::Prompt, Self::Token>,
         decision: Option<&eredu_core::TokenSamplingDecision<'_>>,
         _state: &mut Self::TextGenerationState,
+        _remaining_tokens: Option<usize>,
     ) -> Result<
         Submission<
             eredu_core::TextOperationOutput<Self::Prompt, Self::Token>,
@@ -319,6 +320,7 @@ fn cancellation_settles_and_allows_a_fresh_generic_request() {
         let cancel_on_event = cancellation.clone();
         let output = model
             .generate_prepared_chat(PreparedChatGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::RenderedPrompt(&chat),
                 settings: PreparedChatGenerationSettings::default(),
                 caller_stop_sequences: &[],

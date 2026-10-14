@@ -526,6 +526,9 @@ pub struct CommunicationRouteDescriptor {
     destination: usize,
     requirement: CommunicationOperationRequirement,
     boundary: Option<RoleExactBoundaryContract>,
+    /// Every world rank submits one framed source broadcast in route order.
+    #[serde(default)]
+    world_broadcast: bool,
 }
 
 /// Versioned in-band framing protocol selected for a boundary route.
@@ -778,7 +781,17 @@ impl CommunicationRouteDescriptor {
             destination,
             requirement,
             boundary: None,
+            world_broadcast: false,
         })
+    }
+
+    /// Selects bounded world participation; only the destination consumes the result.
+    pub fn with_world_broadcast(mut self) -> Self { self.world_broadcast = true; self }
+    /// Whether every rank participates in this route's source broadcast.
+    pub const fn world_broadcast(&self) -> bool { self.world_broadcast }
+    /// Exact submission participants, independent of tensor ownership.
+    pub fn participates(&self, rank: usize) -> bool {
+        self.world_broadcast || rank == self.source || rank == self.destination
     }
 
     /// Attaches the exact role/schema framing contract selected for this route.
@@ -874,6 +887,8 @@ impl<'de> Deserialize<'de> for CommunicationRouteDescriptor {
             requirement: CommunicationOperationRequirement,
             #[serde(default)]
             boundary: Option<RoleExactBoundaryContract>,
+            #[serde(default)]
+            world_broadcast: bool,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -885,6 +900,7 @@ impl<'de> Deserialize<'de> for CommunicationRouteDescriptor {
             raw.requirement,
         )
         .map_err(serde::de::Error::custom)?;
+        let route = if raw.world_broadcast { route.with_world_broadcast() } else { route };
         match raw.boundary {
             Some(boundary) => route
                 .with_boundary_contract(boundary)
@@ -1178,11 +1194,12 @@ impl CommunicationManifest {
         let mut start = 0;
         while start < self.routes.len() {
             let reference = &self.routes[start];
+            if reference.world_broadcast() { waves.push(start..start+1); start += 1; continue; }
             let mut endpoints = vec![false; self.world_size];
             let mut end = start;
             while end < self.routes.len() {
                 let route = &self.routes[end];
-                if route.requirement() != reference.requirement()
+                if route.world_broadcast() || route.requirement() != reference.requirement()
                     || route.boundary_contract() != reference.boundary_contract()
                     || endpoints[route.source()]
                     || endpoints[route.destination()]
@@ -1750,6 +1767,7 @@ pub struct CommunicationCapabilities {
     operations: Vec<CommunicationOperationRequirement>,
     completion: Option<CommunicationCompletionCapabilities>,
     boundary_framing: Vec<BoundaryFramingProtocol>,
+    world_boundary_broadcast: bool,
 }
 
 /// Backend support for realizing logical groups and directed routes over one
@@ -1763,8 +1781,9 @@ pub enum CommunicationTopologyCapabilities {
     /// directly, without requiring unrelated world ranks to participate.
     FullyConnected,
     /// Direct logical communication is limited to neighboring world ranks.
-    /// Other groups and routes are available only when compatible manifests
-    /// prove a disjoint, same-operation wave covering the complete world.
+    /// Other groups and endpoint routes require a disjoint same-operation world
+    /// wave. Explicit world-participating boundary broadcasts use their own
+    /// advertised mechanism and singleton route order.
     RingWithWorldWaves,
 }
 
@@ -1879,7 +1898,7 @@ pub fn prepare_communication_realization(
             }
         }
         for (order, route) in manifest.routes().iter().enumerate() {
-            if !ring_neighbors(route.source(), route.destination(), manifest.world_size()) {
+            if !route.world_broadcast() && !ring_neighbors(route.source(), route.destination(), manifest.world_size()) {
                 if !route_wave_proofs.get(order).copied().unwrap_or(false) {
                     return Err(CommunicationCapabilityError::UnreachableRoute {
                         id: route.id(),
@@ -1966,7 +1985,13 @@ impl CommunicationCapabilities {
             operations,
             completion: None,
             boundary_framing: Vec::new(),
+            world_boundary_broadcast: false,
         })
+    }
+
+    /// Advertises exact framed source broadcasts with explicit world participation.
+    pub fn with_world_boundary_broadcast(mut self) -> Self {
+        self.world_boundary_broadcast = true; self
     }
 
     /// Advertises exact in-band boundary protocols implemented by the backend.
@@ -2021,6 +2046,9 @@ impl CommunicationCapabilities {
             }
         }
         for route in manifest.routes() {
+            if route.world_broadcast() && !self.world_boundary_broadcast {
+                return Err(CommunicationCapabilityError::MissingWorldBoundaryBroadcast);
+            }
             self.validate_requirement(route.requirement())?;
             if let Some(boundary) = route.boundary_contract() {
                 if !self.boundary_framing.contains(&boundary.protocol) {
@@ -2339,6 +2367,9 @@ pub enum CommunicationManifestConsensusError<E = std::convert::Infallible> {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommunicationCapabilityError {
+    /// The backend has no exact framed world-participation transport.
+    #[error("backend does not support world-participating boundary broadcasts")]
+    MissingWorldBoundaryBroadcast,
     /// A logical group cannot be realized directly or as a proven world wave.
     #[error("communication group {id:?} is unreachable with the selected topology mechanisms")]
     UnreachableGroup {
@@ -3285,6 +3316,33 @@ mod tests {
                 CommunicationCapabilityError::UnreachableRoute { .. }
             )
         ));
+    }
+
+    #[test]
+    fn world_boundary_broadcast_requires_advertised_participation_before_realization() {
+        let requirement = CommunicationOperationRequirement::tensors(
+            CommunicationOperation::SendReceive, [TensorDtype::F32],
+            CommunicationTensorLimits::new(1, 3, 64, None).unwrap(), true,
+        ).unwrap();
+        let plan = TopologyCommunicationPlan::new().with_completion_policy(test_completion_policy())
+            .with_pipeline_routes(requirement.clone()).unwrap();
+        let manifests = project_all_communication_manifests(ParallelTopology::new(2, 3, 1, 1).unwrap(), &plan).unwrap()
+            .into_iter().map(|manifest| CommunicationManifest::new(
+                manifest.world_size(), manifest.rank(), manifest.groups().to_vec(),
+                manifest.routes().iter().cloned().map(CommunicationRouteDescriptor::with_world_broadcast).collect(),
+            ).unwrap().with_completion_policy(test_completion_policy())).collect::<Vec<_>>();
+        let ordinary = route_only_capabilities(requirement);
+        assert!(matches!(prepare_communication_realization(&manifests[0], &manifests, &ordinary,
+            CommunicationTopologyCapabilities::RingWithWorldWaves),
+            Err(CommunicationRealizationError::Capability(CommunicationCapabilityError::MissingWorldBoundaryBroadcast))));
+        let prepared = prepare_communication_realization(&manifests[0], &manifests,
+            &ordinary.with_world_boundary_broadcast(), CommunicationTopologyCapabilities::RingWithWorldWaves).unwrap();
+        let route = &prepared.manifest().routes()[0];
+        assert_eq!((route.source(), route.destination()), (0, 2));
+        assert!(route.participates(5), "idle rank submits bounded transport without owning its destination");
+        let decoded: CommunicationManifest = serde_json::from_slice(&serde_json::to_vec(prepared.manifest()).unwrap()).unwrap();
+        assert_eq!(&decoded, prepared.manifest());
+        assert!(decoded.route_submission_waves().iter().all(|wave| wave.len() == 1));
     }
 
     #[test]

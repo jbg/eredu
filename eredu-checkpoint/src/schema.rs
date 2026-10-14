@@ -445,6 +445,9 @@ pub enum TensorRequirement {
 pub enum TensorRole {
     Tensor,
     Companion,
+    /// Admitted source consumed by a derived conversion recipe, without a
+    /// separately resident executable parameter binding.
+    RecipeInput,
     /// Validated artifact metadata with no executable parameter binding.
     ArtifactMetadata,
 }

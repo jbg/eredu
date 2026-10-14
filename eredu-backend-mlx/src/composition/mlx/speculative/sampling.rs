@@ -274,6 +274,7 @@ where
                             .map(|p| &p.plan),
                         stream,
                         domain,
+                        eredu_core::refinement::PredictionScoreKind::CausalConditional,
                     )?;
                     Ok(effective
                         .map(MlxTensor::from_array)
@@ -290,6 +291,37 @@ where
             stream,
         )
         .map(MlxTensor::into_array)
+    }
+
+    fn finalize_refinement_position<'a>(
+        &mut self, logits: &Array, selected: u32, mask_token_id: Option<u32>, history: &[u32],
+        context: Self::Context<'a>,
+    ) -> Result<Option<(u32, Array)>, Exception>
+    where Self: 'a,
+    {
+        use eredu_runtime::generation::refinement::finalization::{
+            RefinementSelection, finalize_refinement_position,
+        };
+        let stream = context.target();
+        let scores = SpeculativeSampler::<MlxSamplingBackend>::refinement_scores_with_capture(
+            &mut self.inner, &MlxTensor::from_array(logits.clone()), history, stream,
+            |scores, domain| {
+                let Some(capture) = &self.capture else { return Ok(scores.clone()) };
+                let effective = capture.borrow_mut().observe(scores.as_array(), history.len() as u64,
+                    SamplingPlacement::Target, self.interventions.iter()
+                        .find(|plan| plan.role == eredu_core::speculative::SpeculativeCaptureRole::Target).map(|plan| &plan.plan),
+                    stream, domain, if mask_token_id.is_some() { eredu_core::refinement::PredictionScoreKind::RefinementPosition } else { eredu_core::refinement::PredictionScoreKind::ConstrainedFinalization })?;
+                Ok(effective.map(MlxTensor::from_array).unwrap_or_else(|| scores.clone()))
+            },
+        )?;
+        let domain = eredu_runtime::TokenDomain::new(logits.shape().last().copied().unwrap_or(0) as usize);
+        let candidate = MlxTensor::from_array(Array::from_slice(&[selected], &[1]));
+        let finalized = finalize_refinement_position::<MlxSamplingBackend>(
+            &scores, 0, mask_token_id.map(|mask_token_id| RefinementSelection { tokens: &candidate, mask_token_id }),
+            domain, &eredu_core::TokenFilter::All, stream,
+        ).map_err(Exception::from_source)?;
+        let token = <MlxSamplingBackend as eredu_runtime::SamplingBackend>::token_id(&finalized.token, stream)?;
+        Ok(Some((token, finalized.scores.into_array())))
     }
 
     fn sample<'a>(
@@ -474,6 +506,7 @@ impl LogitCapture {
         intervention: Option<&eredu_core::intervention::AdmittedInterventionPlan>,
         stream: &Stream,
         domain: Option<eredu_core::capture::CaptureTokenDomain<'_>>,
+        score_kind: eredu_core::refinement::PredictionScoreKind,
     ) -> Result<Option<Array>, Exception> {
         use eredu_core::{
             capture::CapturePhase,
@@ -538,6 +571,7 @@ impl LogitCapture {
             self.records.push(SpeculativePredictionCapture {
                 role,
                 position,
+                score_kind,
                 capture,
             });
         }

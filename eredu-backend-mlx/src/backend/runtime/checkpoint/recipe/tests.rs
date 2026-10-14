@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use safemlx::{Device, DeviceType};
-use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
 
 use super::*;
 use eredu_checkpoint::store::SafetensorsWeightStore;
@@ -831,4 +831,90 @@ fn transposed_prepared_storage_survives_cross_stream_binding_without_a_replica()
         physical.evaluated().unwrap().as_slice::<f32>(),
         &[1., 4., 2., 5., 3., 6.]
     );
+}
+
+#[test]
+fn tensor_fp8_conversion_decodes_signed_subnormals_and_bounded_row_shards() {
+    let directory = tempfile::tempdir().unwrap();
+    let bytes = [0x00, 0x38, 0x80, 0x7e, 0xb8, 0x40, 0x01, 0xfe];
+    let scale = 2.0f32.to_le_bytes();
+    serialize_to_file(
+        [
+            (
+                "weight",
+                TensorView::new(SafeDtype::F8_E4M3, vec![4, 2], &bytes).unwrap(),
+            ),
+            (
+                "scale",
+                TensorView::new(SafeDtype::F32, vec![], &scale).unwrap(),
+            ),
+        ],
+        None,
+        &directory.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let store = SafetensorsWeightStore::open(directory.path()).unwrap();
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let recipe = DerivedWeightRecipe::DecodeTensorFp8 {
+        weight: Box::new(DerivedWeightRecipe::source("weight", TensorSelection::Full)),
+        scale: Box::new(DerivedWeightRecipe::source("scale", TensorSelection::Full)),
+    };
+    let output = recipe.materialize(&store, &stream).unwrap();
+    assert_eq!(output.dtype(), Dtype::Float32);
+    assert_eq!(
+        output.evaluated().unwrap().as_slice::<f32>(),
+        &[0., 2., -0., 896., -2., 4., 0.00390625, -896.]
+    );
+    let shard = recipe
+        .select_bounded(
+            &store,
+            TensorSelection::Range {
+                axis: 0,
+                start: 2,
+                end: 4,
+            },
+        )
+        .unwrap();
+    shard.preflight_bounded(&store).unwrap();
+    let output = shard.materialize(&store, &stream).unwrap();
+    assert_eq!(output.shape(), &[2, 2]);
+    assert_eq!(
+        output.evaluated().unwrap().as_slice::<f32>(),
+        &[-2., 4., 0.00390625, -896.]
+    );
+    let workspace = super::native_recipe_workspace(&shard, &store).unwrap();
+    assert!(workspace >= 36);
+}
+
+#[test]
+fn tensor_fp8_conversion_rejects_non_positive_or_non_finite_scale() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    for value in [0., -1., f32::INFINITY, f32::NAN] {
+        let directory = tempfile::tempdir().unwrap();
+        let scale = value.to_le_bytes();
+        serialize_to_file(
+            [
+                (
+                    "weight",
+                    TensorView::new(SafeDtype::F8_E4M3, vec![1], &[0x38]).unwrap(),
+                ),
+                (
+                    "scale",
+                    TensorView::new(SafeDtype::F32, vec![], &scale).unwrap(),
+                ),
+            ],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(directory.path()).unwrap();
+        let recipe = DerivedWeightRecipe::DecodeTensorFp8 {
+            weight: Box::new(DerivedWeightRecipe::source("weight", TensorSelection::Full)),
+            scale: Box::new(DerivedWeightRecipe::source("scale", TensorSelection::Full)),
+        };
+        assert!(matches!(
+            recipe.materialize(&store, &stream),
+            Err(WeightRecipeError::InvalidTensorFp8Scale)
+        ));
+    }
 }

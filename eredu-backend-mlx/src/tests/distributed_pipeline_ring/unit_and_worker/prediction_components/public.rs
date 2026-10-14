@@ -138,9 +138,13 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
         let tokens = [1_u32, 2, 3];
         let prompt = Array::from_slice(&tokens, &[1, 3]);
         let parts = [text_input_part(&prompt)];
-        let config = SpeculativeConfig {
+        let config = GenerationRequestConfig {
             max_tokens: 5,
-            max_draft_tokens: 2,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 0.0,
             eos_token_ids: vec![],
         };

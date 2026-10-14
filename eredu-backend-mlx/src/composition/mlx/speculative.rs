@@ -45,6 +45,7 @@ pub(crate) use assistant::{
 };
 pub use completion::MlxSpeculativeCompletion;
 pub use execution_streams::SpeculativeExecutionStreams;
+pub(in crate::composition::mlx) use execution_streams::BorrowedTargetObserver;
 #[cfg(test)]
 use sampling::array_probability_at;
 pub(crate) use sampling::validate_control_capture;

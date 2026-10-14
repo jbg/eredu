@@ -19,9 +19,10 @@ fn copy_array(array: &Array, stream: &Stream) -> Result<Array, Error> {
 
 impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend<'_> {
     fn sampling_score_kind(
-        runtime: &ModelRuntime<Self>,
+        _: &ModelRuntime<Self>,
+        state: &Self::TextGenerationState,
     ) -> eredu_core::refinement::PredictionScoreKind {
-        if runtime.session().block_refinement_geometry().is_some() {
+        if matches!(state.sampling.mode, eredu_core::decoding::DecodingMode::Diffusion { .. }) {
             eredu_core::refinement::PredictionScoreKind::ConstrainedFinalization
         } else {
             eredu_core::refinement::PredictionScoreKind::CausalConditional
@@ -36,7 +37,8 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend
                 state.sampling.sampler,
                 MlxTextSampler::MirostatV2(_)
             ),
-            has_rng: state.sampling.prng.is_some() || state.sampling.refinement.is_some(),
+            has_rng: state.sampling.prng.is_some() || (matches!(state.sampling.mode,
+                eredu_core::decoding::DecodingMode::Diffusion { .. }) && state.sampling.refinement.is_some()),
         }
     }
     fn install_sampling_override(
@@ -53,6 +55,16 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MlxBackend
             }
             if let Some(seed) = request.reseed() {
                 state.sampling.refinement_seed = seed;
+                if runtime.session().capability_estimate().map_err(|error| Error::Exception(Exception::from_source(error)))?.shared_backbone_draft().is_some() {
+                    let stream = runtime.backend().stream();
+                    state.sampling.refinement_random = Some(RandomState::from_key(
+                        crate::backend::random::split_key_at(random.as_array(), 1, stream)?));
+                    state.sampling.proposal_random = Some(RandomState::from_key(
+                        crate::backend::random::split_key_at(random.as_array(), 2, stream)?));
+                    if let Some(refinement) = &mut state.sampling.refinement {
+                        refinement.replace_random(state.sampling.refinement_random.as_ref().unwrap().clone());
+                    }
+                }
             }
             state.sampling.prng = Some(random);
         }
@@ -97,10 +109,16 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
         predictions: u64,
     ) -> Option<u64> {
+        #[cfg(test)]
+        if std::env::var_os("EREDU_TEST_SNAPSHOT_GROWTH_TRACE").is_some() {
+            eprintln!("snapshot growth input: predictions={predictions}, mode={:?}, transaction={}, logits={}, cached={}, pending={}", sampling.mode,
+                sampling.speculative.is_some(), sampling.next_logits.is_some(), sampling.committed_token_cached,
+                match pending { None => "none", Some(PendingTextInput::Continue) => "continue", Some(PendingTextInput::Decode(_)) => "decode", Some(PendingTextInput::Prefill(_)) => "prefill" });
+        }
         if predictions == 0 {
             return Some(0);
         }
-        if let Some(geometry) = runtime.session().block_refinement_geometry() {
+        if let Some(geometry) = runtime.session().block_refinement_geometry().filter(|_| matches!(sampling.mode, eredu_core::decoding::DecodingMode::Diffusion { .. })) {
             if let Some(block) = &sampling.refinement {
                 return block.continuation_context_tokens(predictions);
             }
@@ -116,7 +134,14 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                 .checked_mul(u64::from(geometry.canvas_length.get()))?;
             return prompt.checked_add(subsequent);
         }
-        match pending? {
+        if let eredu_core::decoding::DecodingMode::SelfSpeculation(options) = sampling.mode {
+            if sampling.speculative.is_some() && matches!(pending, Some(PendingTextInput::Continue) | Some(PendingTextInput::Decode(_))) {
+                // A retained transaction may finish or reject before the requested
+                // horizon. The final transaction can verify beyond that horizon.
+                return predictions.checked_add(options.request().max_draft_tokens.get() as u64);
+            }
+        }
+        let inputs = match pending? {
             PendingTextInput::Decode(token) if token.value.size() == 1 => Some(predictions),
             PendingTextInput::Prefill(prompt) if prompt.prefill_cursor().is_some() => {
                 let cursor = prompt.prefill_cursor()?;
@@ -134,7 +159,33 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                     .checked_add(predictions - 1)
             })
             .flatten(),
+            PendingTextInput::Continue if sampling.next_logits.is_some() => predictions.checked_sub(1),
             _ => None,
+        };
+        match sampling.mode {
+            eredu_core::decoding::DecodingMode::SelfSpeculation(options) =>
+                inputs?.checked_add(options.request().max_draft_tokens.get() as u64),
+            _ => inputs,
+        }
+    }
+
+    fn decoding_settlement_input_tokens(
+        runtime: &ModelRuntime<Self>, sampling: &MlxTextSamplingState,
+        pending: Option<PendingTextInput<&MlxModelInput, &MlxTextToken>>,
+    ) -> Option<u64> {
+        match sampling.mode {
+            eredu_core::decoding::DecodingMode::Diffusion { .. } => {
+                let block = sampling.refinement.as_ref()?;
+                if block.phase() == eredu_core::refinement::GenerationPhase::Context {
+                    Some(block.authoritative_tokens().len() as u64)
+                } else {
+                    Some(u64::from(runtime.session().block_refinement_geometry()?.canvas_length.get()))
+                }
+            },
+            eredu_core::decoding::DecodingMode::SelfSpeculation(_) if sampling.speculative.is_some() => Some(1),
+            eredu_core::decoding::DecodingMode::SelfSpeculation(_) => Some(u64::from(
+                matches!(pending, Some(PendingTextInput::Decode(_))) && !sampling.committed_token_cached)),
+            _ => Some(0),
         }
     }
 
@@ -158,12 +209,25 @@ impl TextSnapshotBackend for MlxBackend<'_> {
         // Every block retains at most two full score matrices, one canvas,
         // one argmax, bounded stability history and finalized scalar handles.
         // These are immutable snapshot values; the next block replaces them.
-        Ok((|| {
+        let shared_state = if let eredu_core::decoding::DecodingMode::SelfSpeculation(options) = sampling.mode {
+            use eredu_core::execution_control::NativeTextStateBackend;
+            let native = Self::estimate_native_text_state(runtime, None)?;
+            let additional = predictions.checked_add(options.request().max_draft_tokens.get() as u64);
+            match (native, additional) {
+                (Some(native), Some(additional)) => runtime.session().installed_control_growth(additional)?
+                    .and_then(|growth| native.retained_bytes.checked_add(growth))
+                    // Baseline, full verification, accepted restoration and
+                    // transactional rollback retain independent mutable cache storage.
+                    .and_then(|bytes| bytes.checked_mul(4)),
+                _ => None,
+            }
+        } else { Some(0) };
+        let estimate = (|| {
             let score_bytes = canvas
                 .checked_mul(vocabulary)?
                 .checked_mul(16)?
                 .checked_add(2 * (4096 + 128))?;
-            let history = u64::from(sampling.refinement_policy.options().stability_threshold)
+            let history = u64::from(sampling.refinement_policy.stability_history_length())
                 .checked_add(if sampling.canvas.is_some() { 5 } else { 3 })?;
             let tokens = canvas.checked_mul(8)?.checked_mul(history)?;
             let scalar_handles = canvas.checked_mul(4096 + 128)?;
@@ -172,8 +236,12 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                 .checked_add(tokens)?
                 .checked_add(scalar_handles)?
                 .checked_add(history.checked_mul(4096 + 128)?)?
+                .checked_add(shared_state?)?
                 .checked_add(4096)
-        })())
+        })();
+        #[cfg(test)]
+        if std::env::var_os("EREDU_TEST_SNAPSHOT_GROWTH_TRACE").is_some() { eprintln!("snapshot sampling growth: {estimate:?}; shared state={shared_state:?}"); }
+        Ok(estimate)
     }
 
     fn sampling_state(state: &MlxTextGenerationState) -> &MlxTextSamplingState {
@@ -232,6 +300,10 @@ impl TextSnapshotBackend for MlxBackend<'_> {
             if let Some(random) = &sampling.prng {
                 bytes = bytes.checked_add(array_storage(random.as_array())?)?;
             }
+            if let Some(scores) = &sampling.next_logits { bytes = bytes.checked_add(array_storage(scores)?)?; }
+            if let Some(random) = &sampling.refinement_random { bytes = bytes.checked_add(array_storage(random.as_array())?)?; }
+            if let Some(random) = &sampling.proposal_random { bytes = bytes.checked_add(array_storage(random.as_array())?)?; }
+            if let Some(transaction) = &sampling.speculative { bytes = bytes.checked_add(super::model_session::shared_speculation::retained_transaction_bytes(transaction)?)?; }
             bytes = bytes.checked_add(sampling.canvas.as_ref().map_or(0, |c| c.host_bytes()))?;
             let mut copy_bytes = bytes;
             if let Some(refinement) = &sampling.refinement {
@@ -275,12 +347,19 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                     .map(|random| copy_array(random.as_array(), &stream).map(RandomState::from_key))
                     .transpose()?;
                 Ok(MlxTextSamplingState {
+                    mode: sampling.mode,
                     temperature: sampling.temperature,
                     prng,
                     sampler: sampling.sampler.clone(),
                     next_prediction: sampling.next_prediction,
                     parameter_epoch: sampling.parameter_epoch,
                     refinement_seed: sampling.refinement_seed,
+                    proposal_random: sampling.proposal_random.as_ref().map(|random| copy_array(random.as_array(), &stream).map(RandomState::from_key)).transpose()?,
+                    speculative: sampling.speculative.clone(),
+                    committed_token_cached: sampling.committed_token_cached,
+                    next_logits: sampling.next_logits.as_ref().map(|scores| copy_array(scores, &stream)).transpose()?,
+                    refinement_random: sampling.refinement_random.as_ref().map(|random|
+                        copy_array(random.as_array(), &stream).map(RandomState::from_key)).transpose()?,
                     refinement_policy: sampling.refinement_policy,
                     draft_events: sampling.draft_events,
                     canvas: sampling.canvas.clone(),

@@ -583,6 +583,12 @@ pub struct SpeculativeDecodingTelemetry {
     pub execution_topology: String,
     /// Target tokens evaluated.
     pub target_tokens: usize,
+    /// Complete ordinary refinement canvas positions evaluated.
+    #[serde(default)]
+    pub refinement_tokens: usize,
+    /// Ordinary refinement invocations.
+    #[serde(default)]
+    pub refinement_steps: usize,
     /// Assistant proposals.
     pub draft_tokens: usize,
     /// Accepted assistant proposals.
@@ -616,6 +622,8 @@ pub fn speculative_decoding_telemetry(
     SpeculativeDecodingTelemetry {
         execution_topology: stats.execution_topology().to_string(),
         target_tokens: stats.target_tokens(),
+        refinement_tokens: stats.refinement_tokens(),
+        refinement_steps: stats.refinement_steps(),
         draft_tokens: stats.draft_tokens(),
         accepted_tokens: stats.accepted_tokens(),
         accept_rate: stats.accept_rate(),

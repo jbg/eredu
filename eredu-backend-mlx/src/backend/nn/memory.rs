@@ -330,6 +330,14 @@ fn describe_selected(
         } => {
             let path = super::attention::memory_path(queries, keys, arithmetic, softcap);
             if path == super::attention::AttentionMemoryPath::Fused {
+                if !unmasked_attention {
+                    let mut cast = allocation("sdpa_visibility_cast", bytes(&[batch, query_heads, queries, keys], element_bytes(element))?, MechanismStorageRole::Scratch, StorageRetention::Evaluation);
+                    cast.payload.lower = 0;
+                    cast.capacity.lower = 0;
+                    cast.backing = MechanismBacking::Unknown;
+                    cast.detail = "optional floating visibility mask cast to query precision; full broadcast extent is conservative because bound mask shape/dtype and same-dtype aliasing are unavailable".into();
+                    result.storage.push(cast);
+                }
                 if device == Some(safemlx::DeviceType::Cpu) {
                     // MLX fast.cpp's CPU SDPA fallback is ordinary full-score
                     // attention, not the tiled InputScores implementation below.

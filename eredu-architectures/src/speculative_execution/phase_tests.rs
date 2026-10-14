@@ -47,8 +47,9 @@ impl SpeculativeActivationObserver<Tensor, TestError> for Observer {
     fn begin_activation_invocation(
         &mut self,
         phase: Phase,
-        sequence: usize,
+        geometry: eredu_runtime::inspection::SpeculativeActivationGeometry,
     ) -> Result<(), TestError> {
+        let sequence = geometry.sequence;
         let mut trace = self.0.lock().unwrap();
         let origin = trace.origin;
         trace.origins.push(origin);
@@ -76,6 +77,7 @@ impl SpeculativeActivationObserver<Tensor, TestError> for Observer {
 fn strategy() -> Strategy {
     Strategy {
         fused_rows: None,
+        fused_calls: 0,
         corrupt_capture: false,
         failure: Failure::None,
     }
@@ -106,8 +108,14 @@ fn shared_driver_attributes_actual_phases_and_preserves_causal_values() {
         .into_parts();
     assert_eq!(logits, 103);
     let mut draft = executor.begin_proposal(&state, 3, 2, ()).unwrap();
-    assert_eq!(executor.proposal_logits(&mut draft, 3, ()).unwrap(), 73);
-    assert_eq!(executor.proposal_logits(&mut draft, 4, ()).unwrap(), 75);
+    assert_eq!(
+        executor.proposal_step(&mut draft, 3, ()).unwrap(),
+        eredu_core::SpeculativeProposalStep::CausalLogits(73)
+    );
+    assert_eq!(
+        executor.proposal_step(&mut draft, 4, ()).unwrap(),
+        eredu_core::SpeculativeProposalStep::CausalLogits(75)
+    );
     let checkpoint = executor.checkpoint(&cache).unwrap();
     let submission = executor
         .submit_verification(&[3, 4, 5], &mut cache, ())

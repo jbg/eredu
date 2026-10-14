@@ -1,7 +1,7 @@
-//! Entropy-bounded block refinement over immutable backend-native values.
+//! Shared feedback and masked-token refinement over immutable numerical values.
 
 use super::TokenDomain;
-use eredu_core::refinement::{RefinementConfig, RefinementPolicyError};
+use eredu_core::refinement::{MaskedRefinementConfig, RefinementPolicy, RefinementPolicyError};
 use std::num::NonZeroU32;
 
 /// Architecture-owned input equations for shared iterative execution.
@@ -12,6 +12,20 @@ pub mod block;
 
 /// Position-wise constrained commitment after block refinement.
 pub mod finalization;
+/// Confidence transfer and float64 masked-token selection equations.
+pub mod masked;
+
+/// Immutable values produced by one masked-token transition.
+pub struct MaskedRefinementStep<B: RefinementBackend> {
+    /// Complete canvas preserving every previously unmasked token.
+    pub canvas: B::Token,
+    /// Position scores retained from the invocation selecting each token.
+    pub scores: B::Logits,
+    /// Positions selected during this invocation.
+    pub transfer: B::Mask,
+    /// Positions still containing the architecture's mask identity.
+    pub remaining: u32,
+}
 
 /// Numerical mechanisms used by a single-sequence refinement policy.
 ///
@@ -33,6 +47,51 @@ pub trait RefinementBackend {
     type Mask: Clone;
     /// Architecture-selected embedding arithmetic used for retained feedback.
     type ConditioningFormat: Clone;
+
+    /// Creates a mask-filled canvas and installs seeded positions without draws.
+    /// The count describes the actual initially masked positions. `None` means
+    /// the mechanism does not implement masked-token refinement.
+    fn initialize_masked_canvas(
+        _canvas: NonZeroU32,
+        _mask_token: u32,
+        _layout: Option<&eredu_core::refinement::RefinementCanvas>,
+        _context: &Self::Context,
+    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Builds immutable masked-token outputs. Numerical sampling and confidence
+    /// selection follow [`masked`]; prior unmasked values and their score rows
+    /// remain fixed. Categorical confidence uses temperature-scaled logits;
+    /// Gumbel-power confidence uses the original logits. No cache is changed.
+    fn masked_refinement_step(
+        _canvas: &Self::Token,
+        _previous_scores: Option<&Self::Logits>,
+        _logits: &Self::Logits,
+        _mask_token: u32,
+        _config: MaskedRefinementConfig,
+        _scheduled: u32,
+        _random: &mut Self::RandomState,
+        _context: &Self::Context,
+    ) -> Result<Option<MaskedRefinementStep<Self>>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Preserves the committed prefix, replaces its final token, and remasks the
+    /// dependent suffix. Explicit pinned seeds remain fixed. No cache is changed.
+    fn invalidate_masked_suffix(
+        _canvas: &Self::Token,
+        _position: usize,
+        _token: &Self::Token,
+        _mask_token: u32,
+        _pins: Option<(&Self::Token, &Self::Mask)>,
+        _context: &Self::Context,
+    ) -> Result<Option<(Self::Token, u32)>, Self::Error> {
+        Ok(None)
+    }
 
     /// Installs explicit seed values and returns the fixed-position mask.
     fn seed_canvas(
@@ -151,6 +210,15 @@ pub enum RefinementError<E> {
     /// Vocabulary or canvas cannot be represented by the mechanism.
     #[error("refinement requires an addressable nonempty token domain")]
     Geometry,
+    /// The supplied mechanism has no masked-token numerical implementation.
+    #[error("masked-token refinement mechanism is unavailable")]
+    MaskedUnavailable,
+    /// The bounded schedule leaves unresolved mask positions.
+    #[error("masked-token refinement exhausted its schedule with {remaining} unresolved positions")]
+    MaskedExhausted {
+        /// Number of unresolved positions; no final candidates are published.
+        remaining: u32,
+    },
     /// Numerical execution or exact settlement failed.
     #[error("refinement mechanism failed: {0}")]
     Backend(#[source] E),
@@ -162,7 +230,8 @@ pub enum RefinementError<E> {
 /// and all mutable policy state; it may share immutable tensor storage. A full
 /// generation snapshot must separately isolate the model cache and finalizer.
 pub struct RefinementState<B: RefinementBackend> {
-    config: RefinementConfig,
+    config: RefinementPolicy,
+    initial_masked: u32,
     canvas_length: NonZeroU32,
     domain: TokenDomain,
     canvas: B::Token,
@@ -174,6 +243,7 @@ pub struct RefinementState<B: RefinementBackend> {
     history: Vec<B::Token>,
     random: B::RandomState,
     completed: u32,
+    schedule_completed: u32,
     finished: bool,
     pinning: Option<(B::Token, B::Mask)>,
 }
@@ -197,6 +267,7 @@ where
     fn clone(&self) -> Self {
         Self {
             config: self.config,
+            initial_masked: self.initial_masked,
             canvas_length: self.canvas_length,
             domain: self.domain,
             canvas: self.canvas.clone(),
@@ -208,6 +279,7 @@ where
             history: self.history.clone(),
             random: self.random.clone(),
             completed: self.completed,
+            schedule_completed: self.schedule_completed,
             finished: self.finished,
             pinning: self.pinning.clone(),
         }
@@ -257,7 +329,7 @@ where
 
     /// Initializes one block using an independently owned explicit random stream.
     pub fn new(
-        config: RefinementConfig,
+        config: RefinementPolicy,
         canvas_length: NonZeroU32,
         domain: TokenDomain,
         conditioning_format: B::ConditioningFormat,
@@ -274,8 +346,30 @@ where
         if let Some(layout) = layout {
             layout.validate(canvas_length.get(), domain.cardinality())?;
         }
-        let canvas = B::uniform_tokens(canvas_length, domain, &mut random, context)
-            .map_err(RefinementError::Backend)?;
+        let (canvas, initial_masked) = match config {
+            RefinementPolicy::EntropyFeedback(_) => (
+                B::uniform_tokens(canvas_length, domain, &mut random, context)
+                    .map_err(RefinementError::Backend)?,
+                0,
+            ),
+            RefinementPolicy::MaskedUnmasking { mask_token_id, .. } => {
+                if mask_token_id as usize >= domain.cardinality()
+                    || layout.is_some_and(|c| {
+                        c.pinned_positions
+                            .iter()
+                            .any(|p| c.seed_tokens[*p as usize] == Some(mask_token_id))
+                    })
+                {
+                    return Err(RefinementError::Geometry);
+                }
+                B::initialize_masked_canvas(canvas_length, mask_token_id, layout, context)
+                    .map_err(RefinementError::Backend)?
+                    .ok_or(RefinementError::MaskedUnavailable)?
+            }
+        };
+        if initial_masked > canvas_length.get() {
+            return Err(RefinementError::Geometry);
+        }
         let (canvas, pinning) = match layout {
             Some(layout) => {
                 let (seeded, pins) =
@@ -287,6 +381,7 @@ where
         B::settle_initial_canvas(&canvas, &random, context).map_err(RefinementError::Backend)?;
         Ok(Self {
             config,
+            initial_masked,
             canvas_length,
             domain,
             canvas,
@@ -298,6 +393,7 @@ where
             history: Vec::new(),
             random,
             completed: 0,
+            schedule_completed: 0,
             finished: false,
             pinning,
         })
@@ -313,14 +409,64 @@ where
         self.self_conditioning.as_ref()
     }
 
-    /// Latest argmax predictions, suitable for tentative draft observation.
+    /// Latest entropy argmax or selected masked canvas for tentative observation.
     pub fn draft(&self) -> Option<&B::Token> {
         self.argmax.as_ref()
     }
 
-    /// Final candidate block; acceptance masks never define commitment.
+    /// Final candidate block; masked selection preserves the selected tokens.
     pub fn candidates(&self) -> Option<&B::Token> {
         self.finished.then_some(self.argmax.as_ref()).flatten()
+    }
+
+    /// Selected candidates whose identities must survive ordinary finalization.
+    pub fn selected_candidates(&self) -> Option<finalization::RefinementSelection<'_, B::Token>> {
+        match self.config {
+            RefinementPolicy::MaskedUnmasking { mask_token_id, .. } => {
+                self.candidates()
+                    .map(|tokens| finalization::RefinementSelection {
+                        tokens,
+                        mask_token_id,
+                    })
+            }
+            RefinementPolicy::EntropyFeedback(_) => None,
+        }
+    }
+
+    /// Reopens only the dependent tentative suffix after a constrained replacement.
+    /// The settled random stream is retained; the caller's cumulative execution,
+    /// observation and transport ledgers remain outside this numerical schedule.
+    fn invalidate_suffix(
+        &mut self,
+        position: usize,
+        token: &B::Token,
+        context: &B::Context,
+    ) -> Result<(), RefinementError<B::Error>> {
+        let RefinementPolicy::MaskedUnmasking { mask_token_id, .. } = self.config else {
+            return Ok(());
+        };
+        let (canvas, count) = B::invalidate_masked_suffix(
+            &self.canvas,
+            position,
+            token,
+            mask_token_id,
+            self.pinning.as_ref().map(|(tokens, pins)| (tokens, pins)),
+            context,
+        )
+        .map_err(RefinementError::Backend)?
+        .ok_or(RefinementError::MaskedUnavailable)?;
+        if count > self.canvas_length.get() {
+            return Err(RefinementError::Geometry);
+        }
+        B::settle_initial_canvas(&canvas, &self.random, context)
+            .map_err(RefinementError::Backend)?;
+        self.canvas = canvas;
+        self.argmax = Some(self.canvas.clone());
+        self.initial_masked = count;
+        self.schedule_completed = 0;
+        self.finished = count == 0;
+        self.acceptance = None;
+        Ok(())
     }
 
     /// Full-precision final position scores for constrained finalization.
@@ -328,7 +474,7 @@ where
         self.finished.then_some(self.scores.as_ref()).flatten()
     }
 
-    /// Latest entropy acceptance, recalculated independently on every iteration.
+    /// Latest entropy acceptance or newly transferred masked positions.
     pub fn acceptance(&self) -> Option<&B::Mask> {
         self.acceptance.as_ref()
     }
@@ -361,8 +507,66 @@ where
         }
         B::validate_refinement_logits(raw_logits, self.canvas_length, self.domain)
             .map_err(RefinementError::Backend)?;
-        let options = self.config.options();
-        let temperature = self.config.temperature(self.completed)?;
+        let config = match self.config {
+            RefinementPolicy::EntropyFeedback(config) => config,
+            RefinementPolicy::MaskedUnmasking {
+                config,
+                mask_token_id,
+            } => {
+                let scheduled =
+                    config.transfer_tokens(self.initial_masked, self.schedule_completed)?;
+                let completed = self
+                    .completed
+                    .checked_add(1)
+                    .ok_or(RefinementPolicyError::Iteration)?;
+                let mut random = self.random.clone();
+                let step = B::masked_refinement_step(
+                    &self.canvas,
+                    self.scores.as_ref(),
+                    raw_logits,
+                    mask_token_id,
+                    config,
+                    scheduled,
+                    &mut random,
+                    context,
+                )
+                .map_err(RefinementError::Backend)?
+                .ok_or(RefinementError::MaskedUnavailable)?;
+                if step.remaining > self.canvas_length.get() {
+                    return Err(RefinementError::Geometry);
+                }
+                B::validate_refinement_logits(&step.scores, self.canvas_length, self.domain)
+                    .map_err(RefinementError::Backend)?;
+                B::settle_refinement(
+                    &step.canvas,
+                    &step.canvas,
+                    &step.scores,
+                    &step.scores,
+                    &step.transfer,
+                    &random,
+                    context,
+                )
+                .map_err(RefinementError::Backend)?;
+                if step.remaining > 0
+                    && self.schedule_completed + 1 == config.options().max_denoising_steps
+                {
+                    return Err(RefinementError::MaskedExhausted {
+                        remaining: step.remaining,
+                    });
+                }
+                self.completed = completed;
+                self.schedule_completed += 1;
+                self.finished = step.remaining == 0;
+                self.argmax = Some(step.canvas.clone());
+                self.canvas = step.canvas;
+                self.scores = Some(step.scores);
+                self.acceptance = Some(step.transfer);
+                self.random = random;
+                return Ok(());
+            }
+        };
+        let options = config.options();
+        let temperature = config.temperature(self.completed)?;
         let mut random = self.random.clone();
         let scores = B::scale_temperature(raw_logits, temperature, context)
             .map_err(RefinementError::Backend)?;
@@ -409,7 +613,7 @@ where
         .map_err(RefinementError::Backend)?;
 
         self.completed += 1;
-        self.finished = stopped || self.completed == self.config.steps().get();
+        self.finished = stopped || self.completed == config.steps().get();
         if options.stability_threshold > 0 {
             if self.history.len() as u64 == u64::from(options.stability_threshold) {
                 self.history.remove(0);

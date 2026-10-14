@@ -33,6 +33,7 @@ fn invocation_plan(transform: CaptureTransform) -> AdmittedCapturePlan {
 
 fn shape(rows: u64) -> CaptureInvocationShape {
     CaptureInvocationShape {
+            media: None,
         batch: 1,
         sequence: rows,
         context: Some(19),

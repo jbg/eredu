@@ -1438,6 +1438,9 @@ fn hex(digest: impl AsRef<[u8]>) -> String {
 /// Invalid reusable prompt-cache identity, schema, or catalog.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum PromptCacheError {
+    /// The selected execution partition owns no mutable prompt-cache shard.
+    #[error("selected partition owns no prompt-cache shard")]
+    StatelessPartition,
     /// A layer or state policy is invalid.
     #[error(transparent)]
     Policy(#[from] CachePolicyError),

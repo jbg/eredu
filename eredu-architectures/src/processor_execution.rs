@@ -20,6 +20,7 @@ use crate::processor_plan::{
 };
 
 mod qwen_request;
+mod nemotron_request;
 use eredu_runtime::processor_resources::{
     ProcessorRequestBudget, ProcessorRequestResources, ProcessorResourceError,
 };
@@ -437,6 +438,7 @@ fn intersect_processor_budgets(
 
 #[derive(Debug, Clone)]
 enum ProcessorKind {
+    NemotronLabsDiffusion(crate::nemotron_labs_diffusion::processing::ImageProcessor),
     Gemma4(Gemma4ProcessorPlan),
     Inkling(InklingProcessorPlan),
     Muse(MuseProcessorPlan),
@@ -513,6 +515,10 @@ impl PreparedProcessor {
 
     /// Selects architecture-owned processor semantics without backend inspection.
     pub fn from_artifact(plan: &ArtifactArchitecturePlan) -> Option<Self> {
+        if let Some(plan) = plan.nemotron_labs_diffusion().cloned() {
+            return Some(Self { authority: None, kind: ProcessorKind::NemotronLabsDiffusion(plan) });
+        }
+
         if let Some(plan) = plan.qwen().cloned() {
             return Some(Self::from_qwen(plan));
         }
@@ -604,7 +610,7 @@ impl PreparedProcessor {
             }
             None => budget,
         };
-        if budget.is_some() && !matches!(self.kind, ProcessorKind::Qwen(_)) {
+        if budget.is_some() && !matches!(self.kind, ProcessorKind::Qwen(_) | ProcessorKind::NemotronLabsDiffusion(_)) {
             return Err(ProcessorExecutionError::Resources(
                 ProcessorResourceError::Unavailable,
             ));
@@ -612,6 +618,13 @@ impl PreparedProcessor {
         let mut resources = None;
         let mut host_mechanisms = HostProcessorMechanisms;
         let host = match &self.kind {
+            ProcessorKind::NemotronLabsDiffusion(plan) => {
+                let prepared = nemotron_request::Request::plan(plan, request, budget)
+                    .map_err(host_execution_error)?;
+                resources = Some(prepared.resources);
+                prepared.execute(&mut host_mechanisms)
+            }
+
             ProcessorKind::Gemma4(plan) => {
                 prepare_gemma4(plan, request, &mut host_mechanisms, encode_text)
             }

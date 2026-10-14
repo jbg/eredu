@@ -14,6 +14,7 @@ use std::sync::Mutex;
 const MAGIC: u32 = 0x4552_5052;
 const VERSION: u32 = 1;
 mod speculative;
+mod decoding;
 /// Fixed words in one preparation frame, independent of model and prompt size.
 pub const TEXT_PREPARATION_WORDS: usize = 18;
 
@@ -30,6 +31,9 @@ pub trait TextPreparationTransport: BoundedConsensusTransport {
 /// Agreement failures preserve native sources behind a neutral public wrapper.
 #[derive(Debug, thiserror::Error)]
 pub enum TextPreparationAgreementError {
+    /// Exact distributed mode, commitment or prospective command admission failed.
+    #[error(transparent)]
+    Decoding(#[from] eredu_core::decoding::DecodingModeError),
     /// No compatible finite native/host bound was admitted at setup.
     #[error("invalid text preparation admission: {0}")]
     Admission(&'static str),

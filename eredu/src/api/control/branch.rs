@@ -87,6 +87,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }
@@ -251,7 +252,6 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             sequence: 0,
                             epoch: 0,
                             drafts: self.delivery.drafts.fork(),
-                            iterative: self.delivery.iterative,
                             prediction: snapshot.metadata.output.next_prediction,
                             prompt_length: self.delivery.prompt_length,
                             prompt_token_ids: std::sync::Arc::clone(&snapshot.prompt_token_ids),
@@ -266,6 +266,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                     ))
                 },
             )?;
+        continuation.bind_control_handle(&delivery.control)?;
         delivery.send(
             ObservedGenerationEvent::BranchStarted {
                 lineage,
@@ -308,11 +309,13 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
                     )
                 {
                     self.lifecycle.fail();
+                    self.state.finish_decoding();
                 }
                 result
             }
             Err(payload) => {
                 self.lifecycle.fail();
+                self.state.finish_decoding();
                 std::panic::resume_unwind(payload)
             }
         }

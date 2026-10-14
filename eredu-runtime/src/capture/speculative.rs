@@ -205,8 +205,9 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
     fn admit(
         &mut self,
         phase: SpeculativeActivationPhase,
-        sequence: usize,
+        geometry: crate::inspection::SpeculativeActivationGeometry,
     ) -> Result<(), CaptureError> {
+        let sequence = geometry.sequence;
         if self.active.is_some() {
             return Err(CaptureError::Invalid(
                 "speculative activation already active".into(),
@@ -243,6 +244,7 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
             capture_phase,
             u64::try_from(origin.prediction).map_err(|_| CaptureError::Overflow)?,
             CaptureInvocationShape {
+                media: geometry.media,
                 batch: 1,
                 sequence: u64::try_from(sequence).map_err(|_| CaptureError::Overflow)?,
                 context: None,
@@ -333,9 +335,9 @@ where
     fn begin_activation_invocation(
         &mut self,
         phase: SpeculativeActivationPhase,
-        sequence: usize,
+        geometry: crate::inspection::SpeculativeActivationGeometry,
     ) -> Result<(), E> {
-        self.admit(phase, sequence).map_err(|error| {
+        self.admit(phase, geometry).map_err(|error| {
             let error = error.into();
             signal(&self.failure, &self.map_error, error)
         })

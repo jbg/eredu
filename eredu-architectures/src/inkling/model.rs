@@ -444,9 +444,10 @@ where
         group: usize,
         _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
-        pipeline_stages: usize,
+        stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let pipeline_stages = stage_units.len();
         // Inkling's hMLP units and projector are replicated equations even
         // when their parameters are selected with TP-local ownership. The
         // explicit empty schedule prevents the generic driver from inventing

@@ -100,15 +100,12 @@ where
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
         self.ensure_commit_resolved()?;
-        let selected = self.selected_state.state().ok_or_else(|| {
-            ReplicatedTextSessionError::Contract(
-                "parameter state reset requires selected state".into(),
-            )
-        })?;
-        let state = self
-            .mechanisms
-            .realize_state(selected, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        let state = match self.selected_state.state() {
+            Some(selected) => self.mechanisms.realize_state(selected, context)
+                .map_err(ReplicatedTextSessionError::Mechanism)?,
+            None => self.mechanisms.realize_stateless_state().ok_or_else(||
+                ReplicatedTextSessionError::Contract("mechanism cannot realize a stateless parameter reset".into()))?,
+        };
         self.validate_control_geometry(&state)?;
         Ok(ReplicatedTextControlState {
             owner: Arc::clone(&self.control_identity),
@@ -278,8 +275,9 @@ where
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         match self.selected_state.state() {
             Some(selected) => validate_realized_state(state, selected),
+            None if state.optional_layout().is_none() => Ok(()),
             None => Err(ReplicatedTextSessionError::Contract(
-                "ordinary control requires a selected stateful text execution".into(),
+                "stateless control contains mutable state geometry".into(),
             )),
         }
     }

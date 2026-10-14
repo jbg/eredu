@@ -17,6 +17,8 @@ pub mod expert;
 /// Neutral block-FP8 metadata normalization.
 pub mod fp8;
 pub mod gguf_store;
+/// Shard-layout-independent identity of exact GGUF metadata and encoded payloads.
+pub mod gguf_fingerprint;
 /// Bounded persisted encoded prepared-checkpoint storage.
 pub mod prepared_cache;
 pub mod recipe;

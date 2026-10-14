@@ -912,6 +912,7 @@ where
         schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         values: Vec<B::Tensor>,
         forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
         if values.len() != 1 + schema.auxiliary().len() {
             return Err(Error::backend(
@@ -973,9 +974,10 @@ where
         group: usize,
         _input: PreparedCompositeInput<'_, B::Tensor, Gemma4InputPartPlan>,
         _tensor_partitions: usize,
-        pipeline_stages: usize,
+        stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let pipeline_stages = stage_units.len();
         Ok((group == 0).then(|| vec![Vec::new(); pipeline_stages]))
     }
     fn prepared_group_boundary_sequence(

@@ -465,10 +465,10 @@ where
 }
 
 struct ReferenceEmbeddedMechanisms;
-struct ReferenceEmbeddedExecutorTypes;
+struct ReferenceGenerationExecutorTypes;
 
-impl eredu_architectures::speculative_execution::EmbeddedExecutorTypes
-    for ReferenceEmbeddedExecutorTypes
+impl eredu_core::speculative::GenerationExecutorTypes
+    for ReferenceGenerationExecutorTypes
 {
     type Input = ReferencePreparedInput;
     type Logits = u32;
@@ -496,10 +496,10 @@ where
 {
     type Input = ReferencePreparedInput;
     type Telemetry = ();
-    type ExecutorTypes = ReferenceEmbeddedExecutorTypes;
+    type ExecutorTypes = ReferenceGenerationExecutorTypes;
 
     fn executor_context<'a>(
-        _: <Self::ExecutorTypes as eredu_architectures::speculative_execution::EmbeddedExecutorTypes>::Context<'a>,
+        _: <Self::ExecutorTypes as eredu_core::speculative::GenerationExecutorTypes>::Context<'a>,
     ) -> <ReferenceEmbeddedMechanisms as eredu_architectures::speculative_execution::SpeculativeTensorMechanisms>::Context<'a>{
     }
 
@@ -1844,12 +1844,12 @@ struct ReferenceProductionOutcome {
 
 fn run_reference_embedded_scheduler(
     selected: &eredu_runtime::SelectedSpeculativeRealization,
-    executor: &mut eredu_architectures::speculative_execution::DynEmbeddedExecutor<
+    executor: &mut eredu_core::speculative::DynGenerationExecutor<
         '_,
-        ReferenceEmbeddedExecutorTypes,
+        ReferenceGenerationExecutorTypes,
     >,
 ) -> Result<ReferenceProductionOutcome, String> {
-    let mut cache = executor.new_cache().map_err(|error| error.to_string())?;
+    let mut cache = executor.new_cache(()).map_err(|error| error.to_string())?;
     let publications = Rc::new(Cell::new(0));
     let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_execution = execution_stages.clone();
@@ -1870,9 +1870,13 @@ fn run_reference_embedded_scheduler(
     let lane = PreparedSpeculativeLane::new(
         &mut cache,
         ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
-        SpeculativeConfig {
+        GenerationRequestConfig {
             max_tokens: 3,
-            max_draft_tokens: selected.requirements().strategy().proposal_capacity().get(),
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(selected.requirements().strategy().proposal_capacity().get()).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         },
@@ -1970,8 +1974,8 @@ impl
             _,
             ReferenceEmbeddedMechanisms,
         >::new(&mut strategy);
-        let mut executor = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
-            ReferenceEmbeddedExecutorTypes,
+        let mut executor = eredu_core::speculative::DynGenerationExecutor::<
+            ReferenceGenerationExecutorTypes,
         >::new(&mut executor);
         run_reference_embedded_scheduler(&self.selected, &mut executor)
     }
@@ -2326,9 +2330,13 @@ where
         let lane = PreparedSpeculativeLane::new(
             self.cache,
             ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
-            SpeculativeConfig {
+            GenerationRequestConfig {
                 max_tokens: 3,
-                max_draft_tokens: 2,
+                decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                        std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                    ),
+                ),
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
             },

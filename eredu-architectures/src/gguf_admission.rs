@@ -28,6 +28,7 @@ fn canonical_tensor_mapping(
     model: &GgufModelConfig,
 ) -> Result<Vec<eredu_gguf::TranslatedTensorLayout>, String> {
     let mapping = match model {
+        GgufModelConfig::NemotronLabsDiffusion(plan) => return Ok(plan.mapping().to_vec()),
         GgufModelConfig::Qwen4Exp(plan) => return Ok(plan.text_plan().mapping().to_vec()),
         GgufModelConfig::VoiceChat(_) => checkpoint.translated_outputs(str::to_owned),
         GgufModelConfig::DeepSeekV3(_) => {
@@ -162,6 +163,13 @@ fn resolve_family(
         }
     }
     match architecture {
+        GgufArchitecture::NemotronLabsDiffusion => {
+            let admitted = crate::nemotron_labs_diffusion::gguf::TextGgufPlan::from_checkpoint(checkpoint)
+                .map_err(|error| error.to_string())?;
+            let plan = admitted.checkpoint().clone();
+            Ok((GgufModelConfig::NemotronLabsDiffusion(admitted), plan, None))
+        }
+
         GgufArchitecture::VoiceChat => {
             use crate::voicechat::checkpoint::{
                 config_from_gguf_metadata, gguf_plan, validate_gguf_metadata, GgufLayout,

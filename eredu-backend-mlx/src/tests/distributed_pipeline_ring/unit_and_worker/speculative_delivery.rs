@@ -64,9 +64,13 @@ fn check_speculative_control_delivery<'world>(
     let (result, publications) = execute_neutral_embedded_mtp_with(
         runtime,
         input,
-        SpeculativeConfig {
+        GenerationRequestConfig {
             max_tokens: 3,
-            max_draft_tokens: 1,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(1).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         },

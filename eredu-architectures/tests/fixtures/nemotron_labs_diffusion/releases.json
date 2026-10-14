@@ -1,0 +1,589 @@
+[
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-3B",
+    "revision": "0d51902da1f8869f83413ce642fab402fa5641e0",
+    "config_sha256": "fc6ec1011e5f4ff858a104e8e04599e931e45dc874c71b9e73182a7f2dbdec44",
+    "weight_files": [
+      {
+        "rfilename": "linear_spec_lora/adapter_model.safetensors",
+        "blobId": "fdbf85dae412d95b53ac968ec9565ce19b4d598d",
+        "size": 95427600,
+        "lfs": {
+          "sha256": "897ef67dff8a69bd1a908fa390ef2164fdaa738e0e47bec502e2f0d86311ff74",
+          "size": 95427600,
+          "pointerSize": 133
+        }
+      },
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "ebd8a076335575d0041d63f9cc23253e22aa2ad6",
+        "size": 7663347000,
+        "lfs": {
+          "sha256": "8c4beff3a8a2ec76708f33e67d18c8baecf099ebd5aa5a152ea1cce494b2b51c",
+          "size": 7663347000,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "config_file": "3B-config.json",
+    "header_file": "3B-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1319,
+        "digest": "541d9ca5f401d281c89e0b56f7cf9413cbb687ac",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "linear_spec_lora/adapter_config.json",
+        "size": 871,
+        "digest": "7a08c5e1012e212a82992f66ef578138ad74dcdc",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ],
+    "adapter_config_file": "3B-adapter-config.json",
+    "adapter_header_file": "3B-adapter-header.json"
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-3B-Base",
+    "revision": "4bd78816ba988ca8b71b8f432b00b682572b236c",
+    "config_sha256": "b8df135780a5b111fbe6a3e050a94cb9dd65a6e00841f8ddf27b29304b3db718",
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "8b51fab9a0d116cd2d1fd74a277e97a175a12aa1",
+        "size": 7663347000,
+        "lfs": {
+          "sha256": "cf9ef7826f4d23f1c7029720ca07bbb56d36fcfdefe93eaf42ddc14bb61f3db8",
+          "size": 7663347000,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "config_file": "3B-Base-config.json",
+    "header_file": "3B-Base-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1316,
+        "digest": "41aeba29162e4367defe3d2b3a36d868b6b6e2c5",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-8B",
+    "revision": "16c67f0560b912e93e0cabb6e0c4f5c3086d95fc",
+    "config_sha256": "87d98d513c1fc61e4ffed0b51d08862aaec9123833127b0a0ab63145a9a2316e",
+    "weight_files": [
+      {
+        "rfilename": "linear_spec_lora/adapter_model.safetensors",
+        "blobId": "4d7ff8e3a9cca1311837793018e4067bbee39373",
+        "size": 142615768,
+        "lfs": {
+          "sha256": "5893f4aec2f43bd0ea065776a269f5f7b70c52db52be3270686349a78e824908",
+          "size": 142615768,
+          "pointerSize": 134
+        }
+      },
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "c59cc9aa911f803d9d281063f1c581e4597c03d8",
+        "size": 16979144720,
+        "lfs": {
+          "sha256": "14de6f8fee56e551a397b692f962bd5acb108e9f86cf86413de15326f3359384",
+          "size": 16979144720,
+          "pointerSize": 136
+        }
+      }
+    ],
+    "config_file": "8B-config.json",
+    "header_file": "8B-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1320,
+        "digest": "1e33a9a6f35c53763d737e693ba898dea9e4c9d8",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "linear_spec_lora/adapter_config.json",
+        "size": 871,
+        "digest": "eefa65ee97bfc4a1d885ac7f89b1636682e68aef",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-8B-Base",
+    "revision": "59ff0ffee284112fc6ccf37493ced41a11031434",
+    "config_sha256": "2da3577cc1dd2863e68dfee7bef2bea36a01d2b617ce9189fae35163857485cd",
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "455e4d16deb129fdf48b56af3a6d1604b61e3911",
+        "size": 16979144720,
+        "lfs": {
+          "sha256": "73af2cd1c982f85bac01c7da43765deb3f2deced76eb93dbd2a6a968ff531349",
+          "size": 16979144720,
+          "pointerSize": 136
+        }
+      }
+    ],
+    "config_file": "8B-Base-config.json",
+    "header_file": "8B-Base-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1317,
+        "digest": "41945c6f576e13015b67e0b50bd3b4204c700919",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-14B",
+    "revision": "f8c3e2c078e193599b8882d965b1001c456ba738",
+    "config_sha256": "909d21d435993d75685cf2c70149d5f014ce55ffc69783be4faf5a912e3aea9f",
+    "weight_files": [
+      {
+        "rfilename": "linear_spec_lora/adapter_model.safetensors",
+        "blobId": "8b64ef4f8fa0f7191a88c5f6445446349894cdc4",
+        "size": 188754800,
+        "lfs": {
+          "sha256": "cb29e2595fe08cd5d57f3ade043701ae0df478034d806d76dc7231e293319c7f",
+          "size": 188754800,
+          "pointerSize": 134
+        }
+      },
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "428bf6677d01ed6873eb13f8c9eb1727edbaff8a",
+        "size": 27012190712,
+        "lfs": {
+          "sha256": "272e78c39809711139deb08024b4fe8e6af83ab1316c8514bdfa35d7c880a320",
+          "size": 27012190712,
+          "pointerSize": 136
+        }
+      }
+    ],
+    "config_file": "14B-config.json",
+    "header_file": "14B-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1323,
+        "digest": "58a270fd1838f67728e47cdffb8785934e84f8d9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "linear_spec_lora/adapter_config.json",
+        "size": 873,
+        "digest": "51ab956a33b7dba61812cc163ea728f46c1d63a9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-14B-Base",
+    "revision": "ca30a6db6274c0b01d4eb21e6f1cb28222ea0c63",
+    "config_sha256": "ebd1e0f04db6ad0abf736ff765681053720df66ea5e793baef1d864354c94a82",
+    "weight_files": [
+      {
+        "rfilename": "model.safetensors",
+        "blobId": "35d9b352be866410db47aae2d8d1494317d3221b",
+        "size": 27012190712,
+        "lfs": {
+          "sha256": "f4353746048473619041afe7b565cb10c64c6f9bb109b1b1c57e201e1543558f",
+          "size": 27012190712,
+          "pointerSize": 136
+        }
+      }
+    ],
+    "config_file": "14B-Base-config.json",
+    "header_file": "14B-Base-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 10498,
+        "digest": "a79f5c1cff8be56fa416c5fb55940cfcc8c5fbfe",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 1322,
+        "digest": "01460a8710257e63aeef87236281acd3a3670789",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion.py",
+        "size": 8268,
+        "digest": "dd5ab276fe61d4204fe8ebf451afc5f4a0a393b9",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 20497,
+        "digest": "f9b2100df15e635dcc81e321682e5bb7e63af708",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion.py",
+        "size": 36286,
+        "digest": "0fbb3cfb1ef07273879eda5312afc5ad33ad363d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 420,
+        "digest": "0d5c2c9dba131d5da20e58336dd09b022142ea50",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077484,
+        "digest": "623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177180,
+        "digest": "9e03f6cd3a58fc6f1bac97a8640ba4105f5f0098",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  },
+  {
+    "repo": "nvidia/Nemotron-Labs-Diffusion-VLM-8B",
+    "revision": "adca93d16471c1e07d594ae444d23e1876f6b365",
+    "config_sha256": "41faf753c1e03970360df7954de85aa8f5bf9061d0ce01626f46f4b7054578c3",
+    "weight_files": [
+      {
+        "rfilename": "model-00001-of-00004.safetensors",
+        "blobId": "ab0424629566ad809d49601eb4412daa79baf791",
+        "size": 4984302088,
+        "lfs": {
+          "sha256": "d6bdc8ac3f1baef94a6a6fe6c5290031495e45ab18a7884f210dd8c157b33582",
+          "size": 4984302088,
+          "pointerSize": 135
+        }
+      },
+      {
+        "rfilename": "model-00002-of-00004.safetensors",
+        "blobId": "2bf1e5836c4553875e567066d7ecc45a9763cf6c",
+        "size": 4999802904,
+        "lfs": {
+          "sha256": "6e4c3f9cac913ee79685bb55f4eee4c7220ae03ad50bfe83131401a0df023706",
+          "size": 4999802904,
+          "pointerSize": 135
+        }
+      },
+      {
+        "rfilename": "model-00003-of-00004.safetensors",
+        "blobId": "269286f24ebad7f4ae2e63a8725af931f146e98e",
+        "size": 4915916376,
+        "lfs": {
+          "sha256": "562159c86be4c9cdde7250b5b78f4636746fd1e82c9e2e10310f74d5696c3503",
+          "size": 4915916376,
+          "pointerSize": 135
+        }
+      },
+      {
+        "rfilename": "model-00004-of-00004.safetensors",
+        "blobId": "1a35b36dbbdfdcb653c73a7332afffdde3ac2d7c",
+        "size": 2936115968,
+        "lfs": {
+          "sha256": "7323f1fdacbf54bee85a2b4b074f88767c8d51754eb12495ce48f3f152048276",
+          "size": 2936115968,
+          "pointerSize": 135
+        }
+      }
+    ],
+    "config_file": "VLM-8B-config.json",
+    "header_file": "VLM-8B-header.json",
+    "assets": [
+      {
+        "path": "chat_template.jinja",
+        "size": 11505,
+        "digest": "5f2cb8b57d4dd841980c093e7e0e5fe09248427d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "config.json",
+        "size": 2889,
+        "digest": "2a087c5878479a9bb154a3addb6837b7b8f7ea59",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "configuration_nemotron_labs_diffusion_vlm.py",
+        "size": 11640,
+        "digest": "4cb17a237d5f774c745703c8895729300de20b5c",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "image_processing.py",
+        "size": 12754,
+        "digest": "e630db563a20e6e69c9d8b8a78b1bbc18eed3970",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "size": 50439,
+        "digest": "917df552038571b583e0670471a09d2b3d05d66b",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_ministral.py",
+        "size": 27064,
+        "digest": "b0193ebc706e064c11c4a9707c048ecb9f318a5b",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "modeling_nemotron_labs_diffusion_vlm.py",
+        "size": 62112,
+        "digest": "cf3bf48082eb607c1bf0e41fc31f53be430413b2",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "size": 616,
+        "digest": "a9c0493d6008f1a4e5ac17ec544eadbae7ba3b2d",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenization_nemotron_labs_diffusion_vlm.py",
+        "size": 1692,
+        "digest": "69bd051f0654d009e8db90c1ae9a7b5fc3c02367",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "tokenizer.json",
+        "size": 17077689,
+        "digest": "2e04613060199ab156b35bf2334e381748ae41311e8785efb330bc66e16670d8",
+        "algorithm": "sha256"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "size": 177639,
+        "digest": "7bc6860a2a30dcedd2ed358e0c50438834dc6a5a",
+        "algorithm": "git_blob_sha1"
+      },
+      {
+        "path": "chat_utils.py",
+        "size": 10823,
+        "digest": "29991724e43000ad0b65674d54d74cc91228a8da",
+        "algorithm": "git_blob_sha1"
+      }
+    ]
+  }
+]

@@ -337,50 +337,29 @@ where
     where
         F: FnOnce(&Stream) -> Result<U, E>,
     {
+        let &(expected, local) = self.parameter_locations.get(ordinal).ok_or_else(|| {
+            eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                "execution unit ordinal is outside the selected policy".into(),
+            ))
+        })?;
+        if expected != address {
+            return Err(eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                "execution unit address differs from the prepared owner".into(),
+            )));
+        }
         let mut policy = self.inner.lock().map_err(|_| {
             eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
                 "selected layerwise policy lock was poisoned".into(),
             ))
         })?;
         match &mut *policy {
-            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
-                let &(expected, local) =
-                    self.parameter_locations.get(ordinal).ok_or_else(|| {
-                        eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
-                            "resident unit ordinal is outside the selected policy".into(),
-                        ))
-                    })?;
-                if expected != address {
-                    return Err(eredu_runtime::LayerwiseAcquireError::Policy(
-                        Error::ArchitectureModel(
-                            "resident unit address differs from the prepared owner".into(),
-                        ),
-                    ));
-                }
-                // Pipeline stages retain global architecture addresses while
-                // resident storage uses compact local slots, just as inspection does.
-                policy
-                    .acquire(ordinal, local, build, context)
-                    .map(MlxSelectedUnitLease::Resident)
-            }
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy
+                .acquire(ordinal, local, build, context)
+                .map(MlxSelectedUnitLease::Resident),
             MlxSelectedLayerwisePolicyInner::Bounded {
                 policy,
-                local_addresses,
+                local_addresses: _,
             } => {
-                let local = local_addresses.get(ordinal).copied().ok_or_else(|| {
-                    eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(format!(
-                        "bounded partition unit ordinal {ordinal} has no local slot"
-                    )))
-                })?;
-                if local.group() != address.group() {
-                    return Err(eredu_runtime::LayerwiseAcquireError::Policy(
-                        Error::ArchitectureModel(format!(
-                            "bounded partition unit group {} differs from local group {}",
-                            address.group(),
-                            local.group()
-                        )),
-                    ));
-                }
                 policy.acquire(ordinal, local, build, context).map(|lease| {
                     #[cfg(test)]
                     crate::tests::support::path_instrumentation::bounded_unit_acquisition();

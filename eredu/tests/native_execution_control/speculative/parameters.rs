@@ -6,7 +6,7 @@ use eredu_core::{
 
 pub(super) fn captures<B>(
     model: &mut LoadedModel<B>,
-    generation: &PreparedChatSpeculativeGenerationOptions,
+    generation: &eredu_core::decoding::SpeculationOptions,
     paths: &[String],
     prefix: &[u32],
     controlled: bool,
@@ -26,17 +26,22 @@ where
         })
         .unwrap();
     let request = || PreparedChatSpeculativeGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::token_ids(&chat, prefix.to_vec()),
         drafting: eredu_core::SpeculativeDraft::Embedded,
-        settings: PreparedChatGenerationSettings {
-            overrides: GenerationConfigOverrides {
-                max_new_tokens: Some(5),
-                temperature: Some(0.0),
+        settings: eredu::api::PreparedChatGenerationSettings {
+            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                *generation,
+            )),
+            ..PreparedChatGenerationSettings {
+                overrides: GenerationConfigOverrides {
+                    max_new_tokens: Some(5),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
+            }
         },
-        options: *generation,
         caller_stop_sequences: &[],
         cancellation: Default::default(),
         on_event: |_| {},

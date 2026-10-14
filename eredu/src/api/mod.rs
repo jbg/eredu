@@ -26,7 +26,7 @@ pub use request::{
     PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
     PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
     PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
-    PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationOptions,
+    PreparedChatSpeculativeError,
     PreparedChatSpeculativeGenerationRequest,
 };
 #[cfg(feature = "mlx")]
@@ -53,6 +53,8 @@ pub use control::{
     ControlledGenerationSession, ControlledGenerationSnapshot, GenerationBranchMetadata,
     GenerationBranchOptions, GenerationOutputCheckpoint, GenerationSnapshotMetadata,
 };
+pub use eredu_core::DraftAdapterSource;
+pub use eredu_core::decoding::{DecodingCapabilities, DecodingMode, DecodingModeError, DecodingState, ModeChangeAcknowledgement, SpeculationOptions, SpeculationOptionsRequest};
 pub use eredu_core::{
     GenerationOutput, GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy,
 };

@@ -22,7 +22,7 @@ use std::{
 };
 
 /// Version of attributed generation events, independently of tensor-capture records.
-pub const GENERATION_SCHEMA_VERSION: u32 = 2;
+pub const GENERATION_SCHEMA_VERSION: u32 = 3;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -49,6 +49,7 @@ pub use eredu_runtime::execution_control::TraceLimits;
 /// [`LoadedModel::start_controlled_chat`] requires semantic support, while
 /// [`LoadedModel::start_controlled_text`] explicitly selects ordinary text decoding.
 pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
+    pub(super) control_handle: Option<eredu_core::execution_control::GenerationControlHandle>,
     pub(super) prompt: Option<B::Prompt>,
     pub(super) chat: PreparedChat,
     pub(super) prompt_token_ids: Vec<u32>,
@@ -64,6 +65,11 @@ pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
 }
 
 impl<B: TextGenerationBackend> PreparedObservedGeneration<B> {
+    /// Supplies mode commands to the same physical driver used by controlled runs.
+    pub fn with_control_handle(mut self, control: eredu_core::execution_control::GenerationControlHandle) -> Self {
+        self.control_handle = Some(control);
+        self
+    }
     /// Installs generic seed/pin controls. The loaded session validates them before execution.
     pub fn with_refinement_canvas(
         mut self,
@@ -119,6 +125,17 @@ pub struct ObservedGenerationRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObservedGenerationEvent {
+    /// Tentative output is cleared and canonical state settled before this record.
+    ModeChanged {
+        /// Effective generated-token position and policies on both sides.
+        acknowledgement: eredu_core::decoding::ModeChangeAcknowledgement,
+        /// Physical handoff and authoritative commitment coordinates.
+        position: eredu_core::refinement::GenerationPosition,
+        /// Bounded records from settling the committed causal suffix.
+        captures: Option<CapturedStep>,
+        /// Cache settlement, observation and completion elapsed time.
+        step_seconds: f64,
+    },
     /// Independent child stream, including the delivered inherited semantic
     /// prefix. Later deltas may complete a tool call or Unicode/text boundary
     /// begun in this prefix; no parent journal lookup or replay is required.
@@ -470,6 +487,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             return Err(CaptureError::Invalid("trace byte limits must be positive".into()).into());
         }
         Ok(PreparedObservedGeneration {
+            control_handle: None,
             prompt: None,
             chat: chat.clone(),
             prompt_token_ids,
@@ -630,6 +648,16 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 }
             });
             let (token_id, score_kind, position) = match kind {
+                super::request::GenerationStepKind::ModeChanged { acknowledgement, position } => {
+                    delivery.position = position;
+                    if let Some(event) = delivery.drafts.clear() {
+                        let position = delivery.position;
+                        delivery.send(ObservedGenerationEvent::Draft { event, position });
+                    }
+                    delivery.iterative = matches!(acknowledgement.active, eredu_core::decoding::DecodingMode::Diffusion { .. });
+                    delivery.send(ObservedGenerationEvent::ModeChanged { acknowledgement, position, captures, step_seconds });
+                    return;
+                }
                 super::request::GenerationStepKind::Token {
                     token,
                     score_kind,
@@ -694,6 +722,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         let delivery_failure = || delivery.borrow().failure.clone();
         let result = self.generate_prepared(
             PreparedChatGenerationRequest {
+                control_handle: prepared.control_handle.as_ref(),
                 input: match prepared.prompt {
                     Some(prompt) => {
                         PreparedChatInput::prepared_backend_input(&prepared.chat, prompt)

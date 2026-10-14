@@ -1177,6 +1177,7 @@ impl SelectedExecution {
 #[derive(Debug, Clone)]
 pub struct SelectedPreparation {
     qwen4_construction: Option<Arc<SelectedQwen4Construction>>,
+    retained_architecture: Option<crate::processor_plan::ArtifactArchitecturePlan>,
     admission_token: ArtifactAdmissionToken,
     execution: SelectedExecution,
     admission: PreparationAdmission,
@@ -1185,6 +1186,14 @@ pub struct SelectedPreparation {
 }
 
 impl SelectedPreparation {
+    pub(crate) fn with_retained_architecture(mut self, architecture: crate::processor_plan::ArtifactArchitecturePlan) -> Self {
+        self.retained_architecture = Some(architecture);
+        self
+    }
+    pub(crate) fn retained_architecture(&self) -> Option<&crate::processor_plan::ArtifactArchitecturePlan> {
+        self.retained_architecture.as_ref()
+    }
+
     pub(crate) fn qwen4_construction(&self) -> Option<&SelectedQwen4Construction> {
         self.qwen4_construction.as_deref()
     }
@@ -1219,6 +1228,7 @@ impl SelectedPreparation {
         }
         Self {
             qwen4_construction: Some(target),
+            retained_architecture: None,
             admission_token,
             execution,
             admission,
@@ -1264,6 +1274,7 @@ impl SelectedPreparation {
     ) -> Self {
         Self {
             qwen4_construction: None,
+            retained_architecture: None,
             admission_token,
             execution,
             admission,

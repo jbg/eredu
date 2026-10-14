@@ -1920,11 +1920,13 @@ impl Tensor for NumericTensor {
         values: &Self,
         scale: f32,
         mask: AttentionMask<'_, Self>,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<Self, Error> {
+        let causal = matches!(mask, AttentionMask::Causal).then(|| NumericBackend::causal_mask(queries.dim(2),keys.dim(2)-queries.dim(2),None,context)).transpose()?;
         let mask = match mask {
             AttentionMask::Tensor(mask) => Some(mask),
-            AttentionMask::None | AttentionMask::Causal => None,
+            AttentionMask::Causal => causal.as_ref(),
+            AttentionMask::None => None,
         };
         attention(queries, keys, values, scale, mask, None, 0)
     }
@@ -3405,6 +3407,7 @@ struct NumericOpaqueSlot {
 struct NumericPartitionWorldState {
     groups: BTreeMap<u64, Vec<usize>>,
     routes: BTreeMap<u64, (usize, usize)>,
+    world_routes: BTreeMap<u64, usize>,
     parallel_groups: BTreeMap<u64, Arc<NumericParallelGroup>>,
     slots: BTreeMap<(NumericOpaqueOperation, u64, usize), NumericOpaqueSlot>,
     trace: Vec<NumericOpaqueTrace>,
@@ -3477,6 +3480,7 @@ impl NumericPartitionWorld {
             }
         }
         for route in manifest.routes() {
+            if route.world_broadcast() { state.world_routes.insert(route.id().value(), manifest.world_size()); }
             let endpoints = (route.source(), route.destination());
             if state
                 .routes
@@ -4171,17 +4175,19 @@ impl NumericPartitionContext {
             .routes
             .get(&id)
             .ok_or_else(|| Error::backend(format!("numeric opaque route {id} is not realized")))?;
-        if self.rank != source && self.rank != destination {
+        let participants = state.world_routes.get(&id).copied().unwrap_or(2);
+        let world_participation = state.world_routes.contains_key(&id);
+        if !world_participation && self.rank != source && self.rank != destination {
             return Err(Error::backend("numeric rank is outside its opaque route"));
         }
         let slot = state.slots.entry(key).or_default();
         if slot.members.is_empty() {
-            slot.members = vec![source, destination];
+            slot.members = if world_participation { (0..participants).collect() } else { vec![source, destination] };
         }
         if slot.tensors.insert(self.rank, values).is_some() {
             return Err(Error::backend("numeric route endpoint submitted twice"));
         }
-        if slot.tensors.len() == 2 {
+        if slot.tensors.len() == participants {
             slot.output = Some(slot.tensors.get(&source).unwrap().clone());
             self.world.ready.notify_all();
         }
@@ -4201,7 +4207,7 @@ impl NumericPartitionContext {
             let slot = state.slots.get_mut(&key).unwrap();
             let output = slot.output.as_ref().unwrap().clone();
             slot.readers += 1;
-            (output, slot.readers == 2)
+            (output, slot.readers == participants)
         };
         state.trace.push(NumericOpaqueTrace {
             rank: self.rank,
@@ -5786,7 +5792,9 @@ fn attention(
                     let global_key = key_position_start + key_position as i32;
                     let causal = global_key <= global_query;
                     let local = window.is_none_or(|window| global_key > global_query - window);
-                    if causal && local {
+                    // General attention uses only supplied visibility. Sliding
+                    // attention additionally imposes its causal local window.
+                    if (window.is_none() || causal) && local {
                         let query_base = ((batch_index * query_heads + query_head)
                             * query_sequence
                             + query_position)
@@ -17165,6 +17173,10 @@ fn recipe_source_reads(
         reads: &mut Vec<ReferencePayloadRead>,
     ) -> Result<(), Error> {
         match recipe {
+            DerivedWeightRecipe::DecodeTensorFp8 { weight, scale } => {
+                visit(task, weight, checkpoint, reads)?;
+                visit(task, scale, checkpoint, reads)?;
+            }
             DerivedWeightRecipe::Source { key, selection } => {
                 let catalog = checkpoint
                     .source_metadata(key)
@@ -17850,6 +17862,10 @@ where
         Ok(())
     }
 
+    fn realize_stateless_state(&mut self) -> Option<Self::State> {
+        Some(DeviceState::stateless())
+    }
+
     fn realize_state(
         &mut self,
         selected: &eredu_runtime::SelectedStateRealization,
@@ -18348,6 +18364,7 @@ type NumericCompositeRefinement = dyn FnMut(
 ) -> Result<NumericTensor, Error>;
 
 struct NumericCompositePartitionExecutable {
+    attention: Box<dyn FnMut(&eredu_runtime::PreparedModelInput<NumericTensor>, eredu_core::decoding::AttentionInvocation) -> Result<NumericTensor, Error>>,
     refine: Box<NumericCompositeRefinement>,
     forward: Box<NumericCompositePartitionForward>,
     forward_observed: Box<NumericCompositePartitionObservedForward>,
@@ -18356,6 +18373,7 @@ struct NumericCompositePartitionExecutable {
 }
 
 impl NumericCompositePartitionExecutable {
+    fn attention(&mut self, input: &eredu_runtime::PreparedModelInput<NumericTensor>, invocation: eredu_core::decoding::AttentionInvocation) -> Result<NumericTensor, Error> { (self.attention)(input, invocation) }
     fn refine(
         &mut self,
         input: &eredu_runtime::PreparedModelInput<NumericTensor>,
@@ -18580,18 +18598,16 @@ impl
                 },
             )
             .map_err(|error| Error::backend(error.to_string()))?;
-        let prompt_cache_identity = binding
-            .prompt_cache_identity()
-            .cloned()
-            .ok_or_else(|| Error::backend("numeric composite session has no cache identity"))?;
+        let prompt_cache_identity = binding.prompt_cache_identity().cloned();
         let rank = self
             .context
             .partition
             .as_ref()
             .ok_or_else(|| Error::backend("numeric composite context has no partition rank"))?
             .rank;
-        self.world
-            .record_prompt_cache_identity(rank, prompt_cache_identity);
+        if let Some(identity) = prompt_cache_identity {
+            self.world.record_prompt_cache_identity(rank, identity);
+        }
         let session = eredu_runtime::construct_replicated_text_session_with_runtime(
             binding,
             mechanisms,
@@ -18611,7 +18627,16 @@ impl
         let refinement_session = std::rc::Rc::clone(&session);
         let invocation_world = self.world;
         let observed_world = Arc::clone(&invocation_world);
+        let attention_session = std::rc::Rc::clone(&session);
+        let attention_context = context.clone();
+        let attention_admission = admission.clone();
         Ok(NumericCompositePartitionExecutable {
+            attention: Box::new(move |input, invocation| {
+                let admitted = A::admit_prepared_input(&attention_admission, input, &NumericInputInspector).map_err(Error::backend)?;
+                let paired = eredu_architectures::composite_execution::PreparedCompositeInput::new(input, &admitted)
+                    .map_err(Error::backend)?.with_attention_invocation(invocation);
+                attention_session.borrow_mut().sequence_output(paired, ExpertPass::Decode, &attention_context).map_err(Error::backend_source)
+            }),
             refine: Box::new(move |input, feedback| {
                 if A::block_refinement_geometry(&refinement_admission).is_none() {
                     return Err(Error::backend(
@@ -18882,6 +18907,7 @@ impl eredu_runtime::ActivationObserver<NumericTensor, Error> for NumericLifecycl
 }
 
 struct NumericPartitionExecutable {
+    attention: Box<dyn FnMut(&NumericTensor, eredu_core::decoding::AttentionInvocation) -> Result<NumericTensor, Error>>,
     forward: Box<NumericPartitionForward>,
     forward_observed: Box<NumericPartitionObservedForward>,
     positions: Box<dyn Fn() -> Result<Vec<i32>, Error>>,
@@ -18900,6 +18926,9 @@ struct NumericPartitionExecutable {
 }
 
 impl NumericPartitionExecutable {
+    fn attention(&mut self, tokens: &NumericTensor, invocation: eredu_core::decoding::AttentionInvocation) -> Result<NumericTensor, Error> {
+        (self.attention)(tokens, invocation)
+    }
     fn forward(&mut self, tokens: &NumericTensor, prefill: bool) -> Result<NumericTensor, Error> {
         (self.forward)(tokens, prefill)
     }
@@ -18955,6 +18984,8 @@ where
     for<'a> &'a S: NumericPartitionSessionReport,
 {
     let session = std::rc::Rc::new(RefCell::new(session));
+    let attention_session = std::rc::Rc::clone(&session);
+    let attention_context = context.clone();
     let forward_session = std::rc::Rc::clone(&session);
     let observed_session = std::rc::Rc::clone(&session);
     let report_session = std::rc::Rc::clone(&session);
@@ -18970,6 +19001,9 @@ where
     let parameter_context = context.clone();
     let load_context = context;
     NumericPartitionExecutable {
+        attention: Box::new(move |tokens, invocation| {
+            (&mut *attention_session.borrow_mut()).numeric_attention(tokens, invocation, &attention_context)
+        }),
         parameters: Box::new(move |location, fail| {
             (&mut *parameter_session.borrow_mut()).numeric_parameters(
                 location,
@@ -19032,6 +19066,7 @@ where
 }
 
 trait NumericPartitionSession {
+    fn numeric_attention(self, tokens: &NumericTensor, invocation: eredu_core::decoding::AttentionInvocation, context: &NumericContext) -> Result<NumericTensor, Error>;
     fn numeric_parameters(
         self,
         location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
@@ -19097,6 +19132,12 @@ where
         NumericReplicatedPolicy<A::Unit>,
     >,
 {
+    fn numeric_attention(self, tokens: &NumericTensor, invocation: eredu_core::decoding::AttentionInvocation, context: &NumericContext) -> Result<NumericTensor, Error> {
+        let input = A::invocation_input(tokens, None, None, invocation)
+            .ok_or_else(|| Error::backend("prepared architecture rejects attention invocation"))?;
+        self.sequence_output(input, eredu_runtime::ExpertPass::Decode, context).map_err(Error::backend_source)
+    }
+
     fn numeric_parameters(
         self,
         location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
@@ -19731,7 +19772,7 @@ where
     Ok(erase_numeric_partition_session(
         session,
         context,
-        prompt_cache_identity,
+        prompt_cache_identity.ok_or_else(|| Error::backend("numeric text partition has no cache identity"))?,
     ))
 }
 
@@ -19840,7 +19881,7 @@ where
     Ok(erase_numeric_partition_session(
         session,
         context,
-        prompt_cache_identity,
+        prompt_cache_identity.ok_or_else(|| Error::backend("numeric text partition has no cache identity"))?,
     ))
 }
 
@@ -19987,7 +20028,7 @@ where
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
-    consumer.finish(session, context, prompt_cache_identity)
+    consumer.finish(session, context, prompt_cache_identity.ok_or_else(|| Error::backend("numeric routed partition has no cache identity"))?)
 }
 
 fn bind_numeric_routed_pipeline<A, G>(
@@ -20202,7 +20243,7 @@ where
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::backend(error.to_string()))?;
-    consumer.finish(session, context, prompt_cache_identity)
+    consumer.finish(session, context, prompt_cache_identity.ok_or_else(|| Error::backend("numeric routed partition has no cache identity"))?)
 }
 
 fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities {
@@ -20265,6 +20306,7 @@ fn numeric_partition_capabilities() -> eredu_runtime::CommunicationCapabilities 
     .unwrap()
     .with_boundary_framing([eredu_runtime::BoundaryFramingProtocol::RoleExactV1])
     .unwrap()
+    .with_world_boundary_broadcast()
     .with_completion_capabilities(
         eredu_runtime::CommunicationCompletionCapabilities::new([
             CompletionCancellationMode::QuarantineUntilComplete,

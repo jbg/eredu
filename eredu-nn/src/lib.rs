@@ -35,6 +35,8 @@ pub mod multimodal;
 pub mod operation_geometry;
 /// Portable recurrent inference with explicitly retained hidden and cell state.
 pub mod recurrent;
+/// Separate low-rank projection deltas over an immutable base projection.
+pub mod low_rank;
 mod retained_tensors;
 pub use retained_tensors::RetainedTensorRoots;
 /// Complete residual stream geometry and portable gated mixing.

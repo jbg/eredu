@@ -1,7 +1,7 @@
 //! Shared decoded-image validation and transforms.
 
 #[cfg(feature = "image")]
-use image::{imageops::FilterType, ImageBuffer, Rgb};
+use image::{ImageBuffer, Rgb, imageops::FilterType};
 
 use crate::{MediaError, ProcessedMediaDtype};
 
@@ -95,6 +95,50 @@ pub struct RgbImage {
     pixels: Vec<u8>,
     width: u32,
     height: u32,
+}
+
+/// Composites straight-alpha RGBA8 samples onto an explicit RGB8 background.
+/// Integer rounding follows byte-space image compositing; no alpha is discarded.
+pub fn composite_rgba8(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    row_stride: usize,
+    background: [u8; 3],
+) -> Result<RgbImage, MediaError> {
+    let packed = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| MediaError::invalid("RGBA row geometry overflow"))?;
+    let length = row_stride
+        .checked_mul(height.saturating_sub(1) as usize)
+        .and_then(|n| n.checked_add(packed))
+        .ok_or_else(|| MediaError::invalid("RGBA buffer geometry overflow"))?;
+    if width == 0 || height == 0 || row_stride < packed || pixels.len() < length {
+        return Err(MediaError::invalid("invalid RGBA buffer geometry"));
+    }
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| MediaError::invalid("composited RGB buffer overflow"))?;
+    let mut rgb = Vec::with_capacity(count);
+    for row in 0..height as usize {
+        for pixel in pixels[row * row_stride..][..packed].chunks_exact(4) {
+            let alpha = u32::from(pixel[3]);
+            for channel in 0..3 {
+                rgb.push(
+                    ((u32::from(pixel[channel]) * alpha
+                        + u32::from(background[channel]) * (255 - alpha)
+                        + 127)
+                        / 255) as u8,
+                );
+            }
+        }
+    }
+    Ok(RgbImage {
+        pixels: rgb,
+        width,
+        height,
+    })
 }
 
 impl RgbImage {
@@ -379,10 +423,95 @@ pub fn rescale_and_normalize_rgb8(
     })
 }
 
+/// Resizes floating RGB samples using a separable four-tap cubic kernel with
+/// half-pixel coordinates and replicated borders, then normalizes into CHW.
+/// Values retain cubic overshoot. At most four resized source rows are retained.
+pub fn resize_and_normalize_rgb8_cubic(
+    image: RgbImageView<'_>,
+    width: u32,
+    height: u32,
+    coefficient: f32,
+    rescale_factor: f32,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<NormalizedImage, MediaError> {
+    if width == 0
+        || height == 0
+        || !coefficient.is_finite()
+        || !rescale_factor.is_finite()
+        || mean.iter().any(|x| !x.is_finite())
+        || std.iter().any(|x| !x.is_finite() || *x <= 0.0)
+    {
+        return Err(MediaError::invalid(
+            "invalid floating cubic resize or normalization",
+        ));
+    }
+    let count = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| MediaError::invalid("cubic resize output overflow"))?;
+    let weights = |destination: u32, source: u32, target: u32| {
+        let coordinate = ((destination as f64 + 0.5) * source as f64 / target as f64 - 0.5) as f32;
+        let origin = coordinate.floor() as i64;
+        let x = coordinate - coordinate.floor();
+        let a = coefficient;
+        let c0 = ((a * (x + 1.0) - 5.0 * a) * (x + 1.0) + 8.0 * a) * (x + 1.0) - 4.0 * a;
+        let c1 = ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+        let inverse = 1.0 - x;
+        let c2 = ((a + 2.0) * inverse - (a + 3.0)) * inverse * inverse + 1.0;
+        let c3 = 1.0 - c0 - c1 - c2;
+        let indices = std::array::from_fn::<_, 4, _>(|i| {
+            (origin + i as i64 - 1).clamp(0, source as i64 - 1) as usize
+        });
+        (indices, [c0, c1, c2, c3])
+    };
+    let columns: Vec<_> = (0..width).map(|x| weights(x, image.width, width)).collect();
+    let mut rows = std::collections::BTreeMap::<usize, Vec<f32>>::new();
+    let mut data = vec![0.0; count];
+    for y in 0..height {
+        let (indices, vertical) = weights(y, image.height, height);
+        rows.retain(|index, _| indices.contains(index));
+        for &row in &indices {
+            rows.entry(row).or_insert_with(|| {
+                let source = &image.pixels[row * image.row_stride..][..image.width as usize * 3];
+                let mut values = vec![0.0; width as usize * 3];
+                for (x, (indices, horizontal)) in columns.iter().enumerate() {
+                    for channel in 0..3 {
+                        values[x * 3 + channel] = (0..4)
+                            .map(|tap| source[indices[tap] * 3 + channel] as f32 * horizontal[tap])
+                            .sum();
+                    }
+                }
+                values
+            });
+        }
+        for x in 0..width as usize {
+            for channel in 0..3 {
+                let sample: f32 = (0..4)
+                    .map(|tap| rows[&indices[tap]][x * 3 + channel] * vertical[tap])
+                    .sum();
+                let normalized = (sample * rescale_factor - mean[channel]) / std[channel];
+                if !normalized.is_finite() {
+                    return Err(MediaError::invalid(
+                        "cubic normalization produced a non-finite value",
+                    ));
+                }
+                data[(channel * height as usize + y as usize) * width as usize + x] = normalized;
+            }
+        }
+    }
+    Ok(NormalizedImage {
+        data,
+        channels: 3,
+        width: width as usize,
+        height: height as usize,
+    })
+}
+
 #[cfg(all(test, feature = "image"))]
 mod tests {
     use super::{
-        rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, RgbImageView,
+        RgbImageView, rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3,
     };
 
     #[test]

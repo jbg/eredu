@@ -122,6 +122,63 @@ impl BlockFp8Metadata {
     }
 }
 
+/// Per-tensor E4M3 weight-only storage; no activation quantizer is implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorFp8Metadata {
+    excluded: Vec<String>,
+}
+impl TensorFp8Metadata {
+    /// Admits compressed-tensors W8A16 with static, scalar-scaled E4M3 weights.
+    pub fn parse(value: &serde_json::Value) -> Result<Self, String> {
+        let invalid = || "unsupported weight-only tensor FP8 metadata".to_owned();
+        if value["quant_method"] != "compressed-tensors"
+            || value["quant_algo"] != "FP8_W8A16"
+            || value["quantization_status"] != "compressed"
+            || value["run_compressed"] != true
+            || value.get("kv_cache_scheme").is_some_and(|v| !v.is_null())
+        {
+            return Err(invalid());
+        }
+        let groups = value["config_groups"].as_object().ok_or_else(invalid)?;
+        if groups.len() != 1 {
+            return Err(invalid());
+        }
+        let group = groups.values().next().expect("one group");
+        let weights = &group["weights"];
+        if group["targets"] != serde_json::json!(["Linear"])
+            || weights["type"] != "float"
+            || weights["num_bits"] != 8
+            || weights["dynamic"] != false
+            || weights.get("strategy").is_some_and(|v| v != "tensor")
+            || weights.get("symmetric").is_some_and(|v| v != true)
+            || weights.get("block_structure").is_some_and(|v| !v.is_null())
+            || weights.get("group_size").is_some_and(|v| !v.is_null())
+            || !group["input_activations"].is_null()
+            || group
+                .get("output_activations")
+                .is_some_and(|v| !v.is_null())
+        {
+            return Err(invalid());
+        }
+        let excluded = value["ignore"]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { excluded })
+    }
+    /// Literal or regex exclusions interpreted by the owning architecture schema.
+    pub fn excluded(&self) -> &[String] {
+        &self.excluded
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

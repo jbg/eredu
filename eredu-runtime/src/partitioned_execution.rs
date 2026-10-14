@@ -908,7 +908,7 @@ where
     {
         let (descriptor, native) = self.route(route)?;
         let rank = self.manifest.rank();
-        if rank != descriptor.source() && rank != descriptor.destination() {
+        if !descriptor.participates(rank) {
             return Err(PartitionExecutionError::NotRouteEndpoint(route));
         }
         validate_tagged_boundary_bundle::<B, I>(&self.inspector, &values, schema, wire)?;
@@ -981,6 +981,11 @@ where
         Ok(output)
     }
 
+    fn boundary_participates(&self, route: CommunicationRouteId) -> bool {
+        self.manifest.routes().iter().find(|descriptor| descriptor.id() == route)
+            .is_some_and(|descriptor| descriptor.participates(self.manifest.rank()))
+    }
+
     fn boundary_endpoint_is_source(
         &self,
         route: CommunicationRouteId,
@@ -992,7 +997,7 @@ where
             .find(|candidate| candidate.id() == route)
             .ok_or(PartitionExecutionError::UnknownRoute(route))?;
         let rank = self.manifest.rank();
-        if rank != descriptor.source() && rank != descriptor.destination() {
+        if !descriptor.participates(rank) {
             return Err(PartitionExecutionError::NotRouteEndpoint(route));
         }
         Ok(rank == descriptor.source())
@@ -1012,7 +1017,7 @@ where
             .find(|candidate| candidate.id() == route)
             .ok_or(PartitionExecutionError::UnknownRoute(route))?;
         let rank = self.manifest.rank();
-        if rank != descriptor.source() && rank != descriptor.destination() {
+        if !descriptor.participates(rank) {
             return Err(PartitionExecutionError::NotRouteEndpoint(route));
         }
         validate_tagged_boundary_bundle::<B, I>(&self.inspector, values, schema, wire)?;
@@ -1849,6 +1854,7 @@ where
         pass: &mut Self::Pass<'_>,
         route: &PartitionBoundaryRoute,
         values: Vec<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), A::Error>;
 
     /// Returns projected output on the owner and matching destination storage elsewhere.
@@ -2411,7 +2417,8 @@ where
         if bounded != bounded_policy.is_some() {
             return Err(PartitionExecutionError::ResidencyPolicyMismatch);
         }
-        if (!T::ENABLED && !plan.routes.is_empty())
+        if (!V::PHASE_FAILURE_AGREEMENT && communication.manifest().routes().iter().any(|route| route.world_broadcast()))
+            || (!T::ENABLED && !plan.routes.is_empty())
             || (!U::ENABLED && plan.publication.is_some())
             || (!V::ENABLED && plan.commit_barrier.is_some())
             || (V::PHASE_FAILURE_AGREEMENT
@@ -2865,7 +2872,7 @@ where
                         for index in wave.iter().copied() {
                             let route = &same_group_routes[index];
                             let prepared = if local_error.is_none()
-                                && (rank == route.source_rank || rank == route.destination_rank)
+                                && runtime.communication.boundary_participates(route.route)
                             {
                                 match prepare_partition_boundary::<A, B, S, E, G, R, I>(
                                     &mut runtime.executor,
@@ -2999,6 +3006,7 @@ where
                                     route,
                                     runtime.plan.wire,
                                     runtime.communication_executor.borrow(),
+                                    context,
                                     prepared,
                                 )
                                 .map_err(map_partition_route_error)?;
@@ -3135,7 +3143,7 @@ where
                         let endpoints = wave
                             .iter()
                             .filter(|route| {
-                                rank == route.source_rank || rank == route.destination_rank
+                                runtime.communication.boundary_participates(route.route)
                             })
                             .collect::<Vec<_>>();
                         if wave.len() > 1 && endpoints.len() != 1 {
@@ -3261,6 +3269,7 @@ where
                                 route,
                                 runtime.plan.wire,
                                 runtime.communication_executor.borrow(),
+                                context,
                                 prepared,
                             )
                             .map_err(map_partition_route_error)?;
@@ -3311,6 +3320,18 @@ where
             .executor
             .finish(pass, state, context)
             .map_err(ReplicatedTextSessionError::Architecture)?;
+        let output = if runtime.plan.publication.is_some() {
+            let element = match runtime.plan.wire.activation_dtype() {
+                PipelineActivationDtype::Float32 => eredu_nn::TensorElementType::F32,
+                PipelineActivationDtype::Float16 => eredu_nn::TensorElementType::F16,
+                PipelineActivationDtype::Bfloat16 => eredu_nn::TensorElementType::Bf16,
+            };
+            // Owners and placeholders enter publication with the same retained
+            // wire contract. Compute precision remains with local layer state.
+            output.cast_float(element, context).map_err(|error| ReplicatedTextSessionError::Partition(
+                PartitionExecutionError::OutputPreparationFailed(eredu_core::BackendFailure::from_error(error))
+            ))?
+        } else { output };
         Ok((output, forward))
     }
 
@@ -3496,6 +3517,7 @@ enum PartitionRouteTransferError<E> {
 
 struct PreparedPartitionBoundary<T> {
     source: bool,
+    destination: bool,
     schema: ResolvedBoundaryWireSchema,
     values: Vec<crate::ArchitectureBoundaryValue<T>>,
 }
@@ -3545,6 +3567,8 @@ where
         .map_err(PartitionRouteTransferError::Contract)?;
     Ok(PreparedPartitionBoundary {
         source,
+        destination: communication.manifest.routes().iter().any(|descriptor|
+            descriptor.id() == route.route && descriptor.destination() == communication.manifest.rank()),
         schema,
         values,
     })
@@ -3559,6 +3583,7 @@ fn transfer_prepared_partition_boundary<'a, A, B, S, E, G, R, I, T>(
     route: &PartitionBoundaryRoute,
     wire: PipelineWireContract,
     communication_executor: &B::Executor,
+    context: &<B::Tensor as Tensor>::Context,
     prepared: PreparedPartitionBoundary<B::Tensor>,
 ) -> Result<(), PartitionRouteTransferError<A::Error>>
 where
@@ -3581,9 +3606,9 @@ where
             communication_executor,
         )
         .map_err(PartitionRouteTransferError::Contract)?;
-    if !prepared.source {
+    if prepared.destination {
         executor
-            .accept_boundary(pass, route, values)
+            .accept_boundary(pass, route, values, context)
             .map_err(PartitionRouteTransferError::Architecture)?;
     }
     Ok(())
@@ -3636,6 +3661,7 @@ where
         route,
         wire,
         communication_executor,
+        context,
         prepared,
     )
 }
@@ -3837,6 +3863,9 @@ impl<E> From<LayeredPipelineScheduleError> for PartitionScheduleSetupError<E> {
     reason = "field names and error messages document mechanical validation diagnostics"
 )]
 pub enum PartitionExecutionError {
+    /// Native output preparation failed before entering distributed publication.
+    #[error("distributed output preparation failed: {0}")]
+    OutputPreparationFailed(#[source] eredu_core::BackendFailure),
     /// A partition communication object omitted the selected bounded-wait contract.
     #[error("partition communication manifest has no bounded completion policy")]
     MissingBoundedCompletionPolicy,

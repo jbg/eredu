@@ -137,6 +137,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let request = PreparedChatGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::TokenIds {
             prepared_chat: &chat,
             token_ids: ids.clone(),

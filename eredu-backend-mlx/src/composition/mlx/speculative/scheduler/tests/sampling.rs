@@ -31,9 +31,13 @@ fn history_derived_sampler_matches_non_lookahead_execution() {
             .submit(
                 &mut cache,
                 ModelInput::new(&parts),
-                SpeculativeConfig {
+                GenerationRequestConfig {
                     max_tokens: 7,
-                    max_draft_tokens: 2,
+                    decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                            std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                        ),
+                    ),
                     temperature: 0.0,
                     eos_token_ids: Vec::new(),
                 },
@@ -88,9 +92,13 @@ fn stochastic_match_and_mismatch_ignore_interleaving_and_branch_slots() {
             options,
         )
         .unwrap();
-        let config = SpeculativeConfig {
+        let config = GenerationRequestConfig {
             max_tokens: 8,
-            max_draft_tokens: 2,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 1.0,
             eos_token_ids: Vec::new(),
         };
@@ -193,9 +201,13 @@ fn prepared_mirostat_is_reproducible_with_lookahead_and_mixed_lane_interleavings
             SpeculativeSchedulerOptions::default().with_lookahead(lookahead),
         )
         .unwrap();
-        let config = SpeculativeConfig {
+        let config = GenerationRequestConfig {
             max_tokens: 5,
-            max_draft_tokens: 2,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 1.0,
             eos_token_ids: Vec::new(),
         };

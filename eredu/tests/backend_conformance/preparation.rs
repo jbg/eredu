@@ -384,12 +384,19 @@ fn run_speculative_with_scheduler(
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     settings.seed = 0;
     let request = PreparedChatSpeculativeGenerationRequest {
+        control_handle: None,
         input: PreparedChatInput::token_ids(chat, vec![3, 4]),
         drafting: SpeculativeDraft::Embedded,
-        settings,
-        options: PreparedChatSpeculativeGenerationOptions {
-            scheduler,
-            ..Default::default()
+        settings: eredu::api::PreparedChatGenerationSettings {
+            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptionsRequest {
+                    scheduler,
+                    ..Default::default()
+                }
+                .try_into()
+                .map_err(|error: eredu_core::GenerationError| Box::<dyn std::error::Error>::from(error))?,
+            )),
+            ..settings
         },
         caller_stop_sequences: &[],
         cancellation: Default::default(),
@@ -467,15 +474,25 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
             lanes: [settings, invalid]
                 .into_iter()
                 .map(|settings| PreparedChatSpeculativeBatchLane {
+                    control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
-                    settings,
-                    max_draft_tokens: NonZeroUsize::new(1).unwrap(),
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                max_draft_tokens: NonZeroUsize::new(1).unwrap(),
+                                scheduler: Default::default(),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings
+                    },
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: Box::new(|_| {}),
                 })
                 .collect(),
-            scheduler: Default::default(),
         })
         .err()
         .expect("invalid second lane must reject the batch");
@@ -506,10 +523,15 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
     let error = model
         .with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
                 drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: Default::default(),
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        Default::default(),
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
@@ -573,7 +595,7 @@ fn public_caller_owned_preparation_preserves_local_causes_and_peer_dispositions(
 }
 
 #[test]
-fn speculative_scheduler_policy_failure_votes_before_native_prompt_preparation() {
+fn invalid_speculation_options_do_not_prepare_native_input() {
     use eredu_core::SpeculativeSchedulerOptions;
     for controlled in [false, true] {
         for scheduler in [
@@ -595,24 +617,8 @@ fn speculative_scheduler_policy_failure_votes_before_native_prompt_preparation()
             let error =
                 run_speculative_with_scheduler(&mut model, &chat, settings, controlled, scheduler)
                     .unwrap_err();
-            let cause = if controlled {
-                match error.downcast_ref::<eredu::api::ControlledSpeculativeGenerationError>() {
-                    Some(eredu::api::ControlledSpeculativeGenerationError::Prepared(cause)) => {
-                        Some(cause)
-                    }
-                    _ => None,
-                }
-            } else {
-                error.downcast_ref::<PreparedChatSpeculativeError>()
-            };
-            assert!(
-                matches!(cause, Some(PreparedChatSpeculativeError::Generation(_))),
-                "{error}"
-            );
-            assert_eq!(
-                snapshot().votes.last(),
-                Some(&(Stage::Request, Status::Failed))
-            );
+            assert!(error.downcast_ref::<eredu_core::GenerationError>().is_some(), "{error}");
+            assert!(snapshot().votes.is_empty());
             assert!(snapshot().native.is_empty());
             assert_eq!(snapshot().forwards, 0);
         }
@@ -914,10 +920,15 @@ fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
     let error = model
         .with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
+                control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
                 drafting: SpeculativeDraft::Embedded,
-                settings,
-                options: Default::default(),
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        Default::default(),
+                    )),
+                    ..settings
+                },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},

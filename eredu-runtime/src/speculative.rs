@@ -4,12 +4,15 @@ use eredu_core::{
     BoundedCompletion, CompletedSpeculativeSchedule, GenerationError, GenerationTiming,
     PreparedSpeculativeLane, SpeculativeConstraint, SpeculativeDriverError, SpeculativeExecutor,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, SpeculativeGenerationVisitor,
-    SpeculativePublisher, SpeculativeRequestTable, SpeculativeSampling,
+    SpeculativePublisher, GenerationRequestTable, SpeculativeSampling,
 };
 
 mod control;
 pub use control::*;
+mod causal_verification;
+pub use causal_verification::CausalVerification;
 pub mod autoregressive;
+pub mod shared_backbone;
 
 /// Neutral owner of speculative request registration and fair scheduling.
 pub struct SpeculativeScheduler<'a, E, S, C, P>
@@ -23,7 +26,7 @@ where
     context: E::Context<'a>,
     optimistic_execution_available: bool,
     component_timings_collected: bool,
-    requests: SpeculativeRequestTable<'a, E, S, C, P>,
+    requests: GenerationRequestTable<'a, E, S, C, P>,
 }
 
 impl<'a, E, S, C, P> SpeculativeScheduler<'a, E, S, C, P>
@@ -52,7 +55,7 @@ where
                     cancellation: completion_wait.cancellation(),
                 });
             }
-            SpeculativeRequestTable::new(options, topology)
+            GenerationRequestTable::new(options, topology)
                 .map_err(SpeculativeDriverError::Generation)
         })();
         let stage = eredu_core::run_preparation::TextPreparationStage::Request;

@@ -302,6 +302,25 @@ pub enum WeightTransformationPlan {
     MxFp4,
 }
 
+/// Separately stored low-rank parameters for shared-backbone drafting.
+/// The architecture validates the declared base and every parameter before loading.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DraftAdapterSource {
+    path: std::path::PathBuf,
+    expected_base: String,
+}
+
+impl DraftAdapterSource {
+    /// Selects an adapter directory and the independently expected base repository.
+    pub fn new(path: impl Into<std::path::PathBuf>, expected_base: impl Into<String>) -> Self {
+        Self { path: path.into(), expected_base: expected_base.into() }
+    }
+    /// Directory containing adapter configuration and SafeTensors parameters.
+    pub fn path(&self) -> &std::path::Path { &self.path }
+    /// Expected base identity checked against the adapter declaration.
+    pub fn expected_base(&self) -> &str { &self.expected_base }
+}
+
 /// A concrete, backend-neutral set of model/session execution choices.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
@@ -329,6 +348,9 @@ pub struct ExecutionPlan {
     /// Optional artifact supplying the selected embedded prediction parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prediction_source: Option<std::path::PathBuf>,
+    /// Optional separately admitted shared-backbone draft parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) draft_adapter: Option<DraftAdapterSource>,
     /// Capabilities which the selected device must provide.
     pub(crate) required_device_capabilities: DeviceCapabilities,
     /// Capabilities which the exact prepared session must provide.
@@ -356,6 +378,7 @@ impl ExecutionPlan {
             expert_cache: None,
             drafting: DraftingPlan::Disabled,
             prediction_source: None,
+            draft_adapter: None,
             required_device_capabilities: DeviceCapabilities::new(true, false, false),
             required_session_capabilities: SessionCapabilities::default(),
             prompt_cache_persistence: false,
@@ -451,6 +474,14 @@ impl ExecutionPlan {
         self.prediction_source = Some(path.into());
         self
     }
+
+    /// Selects separately stored draft-only low-rank parameters.
+    pub fn with_draft_adapter(mut self, source: DraftAdapterSource) -> Self {
+        self.draft_adapter = Some(source);
+        self
+    }
+    /// Separately stored shared-backbone draft parameters.
+    pub fn draft_adapter(&self) -> Option<&DraftAdapterSource> { self.draft_adapter.as_ref() }
 
     /// Required device capabilities.
     pub const fn required_device_capabilities(&self) -> &DeviceCapabilities {

@@ -154,9 +154,10 @@ where
         group: usize,
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
-        pipeline_stages: usize,
+        stage_units: &[std::ops::Range<usize>],
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
+        let pipeline_stages = stage_units.len();
         if group != VISION_INDEX || tensor_partitions <= 1 || pipeline_stages <= 1 {
             return Ok(None);
         }
@@ -174,13 +175,7 @@ where
         )?;
         let mut stages = Vec::with_capacity(pipeline_stages);
         for stage in 0..pipeline_stages {
-            let range = eredu_core::balanced_contiguous_range(
-                self.vision.layer_count(),
-                pipeline_stages,
-                stage,
-                false,
-            )
-            .map_err(|error| error.to_string())?;
+            let range = stage_units[stage].clone();
             let mut operations = vec![
                 crate::composite_execution::CompositeTensorCollective::Sum {
                     shape: vec![patches, width]
@@ -253,6 +248,7 @@ where
         schema: &ResolvedBoundaryWireSchema,
         hidden: &B::Tensor,
         forward: &Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<Vec<ArchitectureBoundaryValue<B::Tensor>>>, Error> {
         let mut values =
             vec![
@@ -287,6 +283,7 @@ where
         _: &ResolvedBoundaryWireSchema,
         values: Vec<B::Tensor>,
         forward: &mut Self::ForwardContext,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
         if source_group != VISION_INDEX
             && !(source_group == TARGET_INDEX && destination_group == TARGET_INDEX)

@@ -112,9 +112,15 @@ pub struct ControlledSpeculativeStep {
     pub epoch: u64,
     /// Scheduler status after this action.
     pub status: SpeculativeRequestStatus,
+    /// Current mode, queued transition and settled commitment acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoding: Option<eredu_core::decoding::DecodingState>,
     /// Proposal block when created, extended or promoted from optimistic work.
     /// A promoted block can contain previously reported, reused proposals.
     pub drafted: Option<SpeculativeProposalView>,
+    /// Settled tentative diffusion suffix and its complete canvas commitment cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement: Option<eredu_core::speculative::RefinementProposalView>,
     /// Completed verification with explicit acceptance and rejection.
     pub verification: Option<SpeculativeVerificationRecord>,
     /// Newly committed tokens; proposals are excluded.
@@ -159,6 +165,16 @@ impl SpeculativeSnapshotHandle {
 /// require `can_snapshot`; committed blocks are never split into fake token steps.
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
+    /// Active execution and queued mode commands over retained parameters.
+    fn decoding_state(&self) -> Option<eredu_core::decoding::DecodingState> { None }
+    /// Queues one transition for the next settled canonical boundary.
+    fn request_decoding_mode(&mut self, _mode: eredu_core::decoding::DecodingMode) -> Result<(), SpeculativeControlError> {
+        Err(SpeculativeControlError::Unsupported("session has no decoding mode control"))
+    }
+    /// Binds cross-thread commands to the same logical request.
+    fn bind_control_handle(&self, _handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), SpeculativeControlError> {
+        Err(SpeculativeControlError::Unsupported("session has no decoding command mailbox"))
+    }
     /// Releases optional conversions only at a canonical boundary. Pending work
     /// is rejected without polling, settling, advancing or consuming budgets.
     fn trim_parameter_conversions(
@@ -286,6 +302,8 @@ pub trait ControlledSpeculativeSession {
 struct Saved<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
     state: SpeculativeControlSnapshot<E, S, C>,
     run_id: u64,
+    timing: GenerationTiming,
+    first_token_work: Duration,
     estimate: SnapshotEstimate,
     _reservation: SnapshotReservation,
 }
@@ -312,6 +330,7 @@ where
     epoch: u64,
     preparation: Duration,
     timing: GenerationTiming,
+    first_token_work: Duration,
     failed: bool,
     vocabulary: usize,
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
@@ -409,6 +428,8 @@ where
         Ok(Rc::new(Saved {
             state,
             run_id: self.run_id,
+            timing: self.timing,
+            first_token_work: self.first_token_work,
             estimate,
             _reservation: reservation,
         }))
@@ -429,6 +450,7 @@ where
                 r.stats().clone(),
             )
         });
+        let age_before = self.request().map(|request| request.submission_age()).unwrap_or_default();
         let started = std::time::Instant::now();
         let was_prefill = self.lane.is_some();
         if let Some(lane) = self.lane.take() {
@@ -437,17 +459,19 @@ where
                     .submit(lane)
                     .map_err(SpeculativeControlError::backend)?,
             );
-            self.timing = GenerationTiming::new(
-                self.request()
-                    .and_then(|r| r.stats().submission_to_first_token())
-                    .map(|t| self.preparation + t),
-            );
         } else {
             self.scheduler
                 .step()
                 .map_err(SpeculativeControlError::backend)?;
         }
         let elapsed = started.elapsed();
+        if self.timing.time_to_first_token().is_none() {
+            if let Some(first) = self.request().and_then(|request| request.stats().submission_to_first_token()) {
+                self.timing = GenerationTiming::new(Some(self.preparation + self.first_token_work + first.saturating_sub(age_before)));
+            } else {
+                self.first_token_work += elapsed;
+            }
+        }
         let request = self.request().expect("submitted request");
         let old_len = before.as_ref().map_or(0, |b| b.0);
         let committed = request.sequence().tokens()[old_len..].to_vec();
@@ -503,7 +527,9 @@ where
             epoch: self.epoch,
             run_id: self.run_id,
             status: request.status(),
+            decoding: Some(request.decoding_state()),
             drafted: if was_prefill { None } else { drafted },
+            refinement: request.refinement_proposals(),
             verification,
             forced_token: forced.filter(|_| !committed.is_empty()),
             sampling: self.sampling_state(),
@@ -542,6 +568,19 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn decoding_state(&self) -> Option<eredu_core::decoding::DecodingState> {
+        self.request().map(|request| request.decoding_state())
+    }
+    fn request_decoding_mode(&mut self, mode: eredu_core::decoding::DecodingMode) -> Result<(), SpeculativeControlError> {
+        self.healthy()?;
+        self.request().ok_or(SpeculativeControlError::Unsupported("prefill has not committed"))?
+            .request_decoding_mode(mode).map_err(Into::into)
+    }
+    fn bind_control_handle(&self, handle: &eredu_core::execution_control::GenerationControlHandle) -> Result<(), SpeculativeControlError> {
+        self.healthy()?;
+        self.request().ok_or(SpeculativeControlError::Unsupported("prefill has not committed"))?
+            .bind_control_handle(handle).map_err(Into::into)
+    }
     fn trim_parameter_conversions(
         &mut self,
     ) -> Result<
@@ -898,6 +937,8 @@ where
         if result.is_ok() {
             self.failed = false;
             self.epoch = epoch;
+            if self.timing.time_to_first_token().is_none() { self.timing = saved.timing; }
+            self.first_token_work = self.first_token_work.max(saved.first_token_work);
         }
         result
     }
@@ -1069,6 +1110,7 @@ where
                 epoch: 0,
                 preparation: self.run.started.elapsed(),
                 timing: GenerationTiming::default(),
+                first_token_work: Duration::ZERO,
                 failed: false,
                 vocabulary: self.vocabulary,
                 intervention_discovery: self.intervention_discovery,

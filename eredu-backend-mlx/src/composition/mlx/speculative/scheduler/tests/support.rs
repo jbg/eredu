@@ -202,7 +202,10 @@ impl SpeculativeExecutor for ScriptedBackend {
     type CacheCheckpoint = usize;
     type Verification = Array;
     type Logits = Array;
-    type Context<'a> = SpeculativeExecutionStreams<'a>;
+    type Context<'a>
+        = SpeculativeExecutionStreams<'a>
+    where
+        Self: 'a;
     type Completion = MlxSpeculativeCompletion;
     type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
@@ -220,7 +223,10 @@ impl SpeculativeExecutor for ScriptedBackend {
         _input: MlxModelInput,
         cache: &mut Self::Cache,
         streams: SpeculativeExecutionStreams<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception> {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
         let stream = streams.target();
         self.record("prefill", stream)?;
         *cache = 1;
@@ -233,13 +239,16 @@ impl SpeculativeExecutor for ScriptedBackend {
         ))
     }
 
-    fn begin_proposal(
+    fn begin_proposal<'context>(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Self::DraftState, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<Self::DraftState, Exception>
+    where
+        Self: 'context,
+    {
         self.draft_capacities.push(proposal_capacity);
         let _ = (state, last_token);
         self.record("begin_target", streams.target())?;
@@ -250,12 +259,15 @@ impl SpeculativeExecutor for ScriptedBackend {
         })
     }
 
-    fn proposal_logits(
+    fn proposal_step<'context>(
         &mut self,
         state: &mut Self::DraftState,
         _last_token: u32,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Array, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Array>, Exception>
+    where
+        Self: 'context,
+    {
         let stream = streams.draft();
         self.record("draft", stream)?;
         self.draft_storage
@@ -266,7 +278,7 @@ impl SpeculativeExecutor for ScriptedBackend {
             _ => Array::from_slice(&[0.0f32, 10.0, 0.0], &[1, 1, 3]),
         };
         state.step += 1;
-        Ok(logits)
+        Ok(eredu_core::speculative::SpeculativeProposalStep::CausalLogits(logits))
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -278,17 +290,23 @@ impl SpeculativeExecutor for ScriptedBackend {
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         _: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
         *cache = *checkpoint;
         Ok(())
     }
 
-    fn submit_verification(
+    fn submit_verification<'context>(
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception>
+    where
+        Self: 'context,
+    {
         let input_len = input_tokens.len();
         let stream = streams.target();
         self.record(
@@ -331,19 +349,25 @@ impl SpeculativeExecutor for ScriptedBackend {
         output: &Self::Verification,
         index: usize,
         streams: SpeculativeExecutionStreams<'a>,
-    ) -> Result<Array, Exception> {
+    ) -> Result<Array, Exception>
+    where
+        Self: 'a,
+    {
         output.try_index_device((.., index as i32, ..), streams.target())
     }
 
-    fn commit_verification(
+    fn commit_verification<'context>(
         &mut self,
         output: Self::Verification,
         _draft_state: Self::DraftState,
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception>
+    where
+        Self: 'context,
+    {
         if verified_inputs != output.dim(1) as usize {
             self.record("cache_truncate", streams.target())?;
         }
@@ -366,7 +390,10 @@ impl SpeculativeExecutor for CommitFailBackend {
     type CacheCheckpoint = usize;
     type Verification = Array;
     type Logits = Array;
-    type Context<'a> = SpeculativeExecutionStreams<'a>;
+    type Context<'a>
+        = SpeculativeExecutionStreams<'a>
+    where
+        Self: 'a;
     type Completion = MlxSpeculativeCompletion;
     type Telemetry = SpeculativeComponentTimings;
     type Error = Exception;
@@ -380,28 +407,37 @@ impl SpeculativeExecutor for CommitFailBackend {
         input: MlxModelInput,
         cache: &mut Self::Cache,
         streams: SpeculativeExecutionStreams<'context>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception> {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Exception>
+    where
+        Self: 'context,
+    {
         self.inner.prefill(input, cache, streams)
     }
 
-    fn begin_proposal(
+    fn begin_proposal<'context>(
         &mut self,
         state: &Self::TargetState,
         last_token: u32,
         proposal_capacity: usize,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Self::DraftState, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<Self::DraftState, Exception>
+    where
+        Self: 'context,
+    {
         self.inner
             .begin_proposal(state, last_token, proposal_capacity, streams)
     }
 
-    fn proposal_logits(
+    fn proposal_step<'context>(
         &mut self,
         state: &mut Self::DraftState,
         last_token: u32,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Array, Exception> {
-        self.inner.proposal_logits(state, last_token, streams)
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Array>, Exception>
+    where
+        Self: 'context,
+    {
+        self.inner.proposal_step(state, last_token, streams)
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -413,17 +449,23 @@ impl SpeculativeExecutor for CommitFailBackend {
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         _: Self::Context<'a>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
         *cache = *checkpoint;
         Ok(())
     }
 
-    fn submit_verification(
+    fn submit_verification<'context>(
         &mut self,
         input_tokens: &[u32],
         cache: &mut Self::Cache,
-        streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception> {
+        streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Exception>
+    where
+        Self: 'context,
+    {
         self.inner.submit_verification(input_tokens, cache, streams)
     }
 
@@ -432,19 +474,25 @@ impl SpeculativeExecutor for CommitFailBackend {
         output: &Self::Verification,
         index: usize,
         streams: SpeculativeExecutionStreams<'a>,
-    ) -> Result<Array, Exception> {
+    ) -> Result<Array, Exception>
+    where
+        Self: 'a,
+    {
         output.try_index_device((.., index as i32, ..), streams.target())
     }
 
-    fn commit_verification(
+    fn commit_verification<'context>(
         &mut self,
         _output: Self::Verification,
         _draft_state: Self::DraftState,
         _cache: &mut Self::Cache,
         _checkpoint: &Self::CacheCheckpoint,
         _verified_inputs: usize,
-        _streams: SpeculativeExecutionStreams<'_>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception> {
+        _streams: SpeculativeExecutionStreams<'context>,
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Exception>
+    where
+        Self: 'context,
+    {
         Err(Exception::custom("injected commit failure"))
     }
 }

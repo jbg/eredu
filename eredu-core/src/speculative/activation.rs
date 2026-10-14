@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 mod tests;
 
 /// Wire version for internal speculative capture plans and discovery.
-pub const SPECULATIVE_ACTIVATION_SCHEMA_VERSION: u32 = 2;
+pub const SPECULATIVE_ACTIVATION_SCHEMA_VERSION: u32 = 3;
 
 /// Architecture-supplied applicability of an observation or intervention node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ impl SpeculativeCaptureScope {
     pub fn applies(self, phase: SpeculativeActivationPhase) -> bool {
         use SpeculativeActivationPhase as P;
         match (self, phase) {
-            (Self::Target, P::TargetPrefill | P::Verification | P::TargetReplay) => true,
+            (Self::Target, P::TargetPrefill | P::Verification | P::TargetReplay | P::Refinement { .. } | P::MaskedDraft { .. }) => true,
             (Self::Prediction { depth }, P::Proposal { depth: actual }) => depth == actual,
             (Self::Prediction { .. }, P::PredictionPrefill | P::PredictionReplay) => true,
             (Self::PredictionContext, P::PredictionPrefill | P::PredictionReplay) => true,

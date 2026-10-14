@@ -2,11 +2,16 @@
 
 use std::num::NonZeroU32;
 
-use eredu_runtime::{generation::refinement::RefinementBackend, SamplingBackend, TokenDomain};
-use safemlx::{error::Exception, Array, Dtype, Stream};
+use eredu_core::refinement::{MaskedRefinementConfig, MaskedSampling};
+use eredu_runtime::{
+    SamplingBackend, TokenDomain,
+    generation::refinement::{MaskedRefinementStep, RefinementBackend, masked},
+};
+use safemlx::ops::indexing::TryIndexOp;
+use safemlx::{Array, Dtype, Stream, error::Exception};
 
 use super::MlxSamplingBackend;
-use crate::{backend::random::RandomState, MlxTensor};
+use crate::{MlxTensor, backend::random::RandomState};
 
 fn entropy(logits: &MlxTensor, stream: &Stream) -> Result<Array, Exception> {
     let scores = logits.as_array().as_dtype(Dtype::Float32, stream)?;
@@ -29,6 +34,215 @@ impl RefinementBackend for MlxSamplingBackend {
     type Error = Exception;
     type Mask = MlxTensor;
     type ConditioningFormat = Dtype;
+
+    fn initialize_masked_canvas(
+        canvas: NonZeroU32,
+        mask_token: u32,
+        layout: Option<&eredu_core::refinement::RefinementCanvas>,
+        _stream: &Stream,
+    ) -> Result<Option<(MlxTensor, u32)>, Exception> {
+        let mut tokens = vec![mask_token as i32; canvas.get() as usize];
+        if let Some(layout) = layout {
+            for (token, seed) in tokens.iter_mut().zip(&layout.seed_tokens) {
+                if let Some(seed) = seed {
+                    *token = *seed as i32;
+                }
+            }
+        }
+        let count = tokens.iter().filter(|x| **x == mask_token as i32).count() as u32;
+        let canvas = MlxTensor::from_array(Array::from_slice(&tokens, &[canvas.get() as i32]));
+        Ok(Some((canvas, count)))
+    }
+
+    fn masked_refinement_step(
+        canvas: &MlxTensor,
+        previous: Option<&MlxTensor>,
+        logits: &MlxTensor,
+        mask_token: u32,
+        config: MaskedRefinementConfig,
+        scheduled: u32,
+        random: &mut RandomState,
+        stream: &Stream,
+    ) -> Result<Option<MaskedRefinementStep<Self>>, Exception> {
+        let options = config.options();
+        let shape = logits.as_array().shape();
+        if shape.len() != 2 || shape[0] <= 0 || shape[1] <= 0 {
+            return Err(Exception::custom("invalid masked score geometry"));
+        }
+        let width = shape[1] as usize;
+        let ids = canvas
+            .as_array()
+            .evaluated()?
+            .try_to_vec::<i32>()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        if ids.len() != shape[0] as usize || previous.is_some_and(|p| p.as_array().shape() != shape)
+        {
+            return Err(Exception::custom("invalid masked canvas geometry"));
+        }
+        let raw = logits
+            .as_array()
+            .as_dtype(Dtype::Float32, stream)?
+            .evaluated()?
+            .try_to_vec::<f32>()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        let rows: Vec<_> = raw.chunks_exact(width).map(<[f32]>::to_vec).collect();
+        let confidence_rows: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|x| {
+                        if options.sampling == MaskedSampling::Categorical
+                            && options.temperature > 0.0
+                        {
+                            *x / options.temperature
+                        } else {
+                            *x
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let draw_count = if options.temperature == 0.0 {
+            0
+        } else {
+            match options.sampling {
+                MaskedSampling::GumbelPower => raw.len(),
+                MaskedSampling::Categorical => rows.len(),
+            }
+        };
+        // MLX has no float64 tensors. Retain float64 noise arithmetic on the
+        // host, using 53 explicit random bits per draw rather than float32 noise.
+        let draws = if draw_count == 0 {
+            Vec::new()
+        } else {
+            let count = i32::try_from(draw_count)
+                .map_err(|_| Exception::custom("masked noise exceeds addressable geometry"))?;
+            let high_key = random.next_key(stream)?;
+            let high = safemlx::random::randint::<_, i32>(
+                0,
+                1_i32 << 26,
+                &[count][..],
+                &high_key,
+                stream,
+            )?
+            .evaluated()?
+            .try_to_vec::<i32>()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+            let low_key = random.next_key(stream)?;
+            let low =
+                safemlx::random::randint::<_, i32>(0, 1_i32 << 27, &[count][..], &low_key, stream)?
+                    .evaluated()?
+                    .try_to_vec::<i32>()
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+            high.into_iter()
+                .zip(low)
+                .map(|(high, low)| {
+                    let bits = ((high as u64) << 27) | low as u64;
+                    (bits as f64 + 1.0) / ((1_u64 << 53) as f64 + 2.0)
+                })
+                .collect()
+        };
+        let mut draws = draws.into_iter();
+        let sampled = rows
+            .iter()
+            .map(|row| {
+                masked::sample_position(row, options.sampling, options.temperature, || {
+                    draws.next().expect("complete noise geometry")
+                })
+                .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let eligible: Vec<_> = ids.iter().map(|x| *x == mask_token as i32).collect();
+        let transfer = masked::transfer_positions(
+            &confidence_rows,
+            &sampled,
+            &eligible,
+            scheduled,
+            options.confidence_threshold,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        let old_scores = previous
+            .map(|scores| {
+                scores
+                    .as_array()
+                    .as_dtype(Dtype::Float32, stream)?
+                    .evaluated()?
+                    .try_to_vec::<f32>()
+                    .map_err(|e| Exception::custom(e.to_string()))
+            })
+            .transpose()?;
+        let mut scores = Vec::with_capacity(raw.len());
+        let mut tokens = Vec::with_capacity(ids.len());
+        for position in 0..ids.len() {
+            tokens.push(if transfer[position] {
+                sampled[position] as i32
+            } else {
+                ids[position]
+            });
+            let row = if !eligible[position] {
+                old_scores
+                    .as_ref()
+                    .map(|scores| &scores[position * width..(position + 1) * width])
+                    .unwrap_or(&confidence_rows[position])
+            } else {
+                &confidence_rows[position]
+            };
+            scores.extend_from_slice(row);
+        }
+        let remaining = tokens.iter().filter(|x| **x == mask_token as i32).count() as u32;
+        let token_shape = [shape[0]];
+        Ok(Some(MaskedRefinementStep {
+            canvas: MlxTensor::from_array(Array::from_slice(&tokens, &token_shape)),
+            scores: MlxTensor::from_array(Array::from_slice(&scores, &shape)),
+            transfer: MlxTensor::from_array(Array::from_slice(&transfer, &token_shape)),
+            remaining,
+        }))
+    }
+
+    fn invalidate_masked_suffix(
+        canvas: &MlxTensor,
+        position: usize,
+        token: &MlxTensor,
+        mask_token: u32,
+        pins: Option<(&MlxTensor, &MlxTensor)>,
+        stream: &Stream,
+    ) -> Result<Option<(MlxTensor, u32)>, Exception> {
+        let mut ids = canvas
+            .as_array()
+            .evaluated()?
+            .try_to_vec::<i32>()
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        if position >= ids.len() || canvas.as_array().shape().len() != 1 {
+            return Err(Exception::custom("invalid dependent suffix geometry"));
+        }
+        ids[position] = <Self as SamplingBackend>::token_id(token, stream)? as i32;
+        ids[position + 1..].fill(mask_token as i32);
+        if let Some((tokens, mask)) = pins {
+            let seeds = tokens
+                .as_array()
+                .evaluated()?
+                .try_to_vec::<i32>()
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let fixed = mask
+                .as_array()
+                .evaluated()?
+                .try_to_vec::<bool>()
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            if seeds.len() != ids.len() || fixed.len() != ids.len() {
+                return Err(Exception::custom("invalid suffix pin geometry"));
+            }
+            for p in position + 1..ids.len() {
+                if fixed[p] {
+                    ids[p] = seeds[p];
+                }
+            }
+        }
+        let count = ids.iter().filter(|x| **x == mask_token as i32).count() as u32;
+        Ok(Some((
+            MlxTensor::from_array(Array::from_slice(&ids, &[ids.len() as i32])),
+            count,
+        )))
+    }
 
     fn seed_canvas(
         noise: &MlxTensor,
@@ -299,6 +513,40 @@ impl RefinementBackend for MlxSamplingBackend {
 impl eredu_runtime::generation::refinement::finalization::RefinementFinalizationBackend
     for MlxSamplingBackend
 {
+    fn candidate_at(
+        candidates: &MlxTensor,
+        position: usize,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Exception> {
+        if candidates.as_array().shape().len() != 1 || position >= candidates.as_array().size() {
+            return Err(Exception::custom("invalid selected canvas position"));
+        }
+        candidates
+            .as_array()
+            .try_index_device(position as i32, stream)
+            .map(MlxTensor::from_array)
+    }
+
+    fn candidate_is_admissible(
+        candidate: &MlxTensor,
+        scores: &MlxTensor,
+        stream: &Stream,
+    ) -> Result<bool, Exception> {
+        let token = <Self as SamplingBackend>::token_id(candidate, stream)?;
+        if scores.as_array().shape().len() != 2
+            || scores.as_array().dim(0) != 1
+            || token >= scores.as_array().dim(1) as u32
+        {
+            return Err(Exception::custom(
+                "selected candidate lies outside position scores",
+            ));
+        }
+        scores
+            .as_array()
+            .try_index_device((0, token as i32), stream)?
+            .is_finite(stream)?
+            .try_item(stream)
+    }
     fn position_has_candidate(scores: &MlxTensor, stream: &Stream) -> Result<bool, Exception> {
         let values = scores.as_array();
         if values
@@ -321,10 +569,196 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constrained_finalization_uses_each_final_position_domain() {
-        use eredu_core::{refinement::PredictionScoreKind, TokenFilter};
+    fn masked_refinement_preserves_selected_tokens_and_scores_on_cpu() {
+        use eredu_core::refinement::{MaskedRefinementOptions, RefinementPolicy};
+        use eredu_runtime::generation::refinement::RefinementState;
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let config = MaskedRefinementOptions {
+            max_denoising_steps: 2,
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap();
+        let mut state = RefinementState::<MlxSamplingBackend>::new(
+            RefinementPolicy::MaskedUnmasking {
+                config,
+                mask_token_id: 2,
+            },
+            NonZeroU32::new(3).unwrap(),
+            TokenDomain::new(3),
+            Dtype::Float32,
+            RandomState::from_key(safemlx::random::key(7).unwrap()),
+            None,
+            &stream,
+        )
+        .unwrap();
+        let first = MlxTensor::from_array(Array::from_slice(
+            &[4.0f32, 0.0, -20.0, 0.0, 3.0, -20.0, 0.0, 0.1, -20.0],
+            &[3, 3],
+        ));
+        state.advance(&first, &stream).unwrap();
+        assert_eq!(
+            state
+                .canvas()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            [0, 1, 2]
+        );
+        let mut fork = state.clone();
+        let second = MlxTensor::from_array(Array::from_slice(
+            &[0.0f32, 9.0, -20.0, 9.0, 0.0, -20.0, 5.0, 0.0, -20.0],
+            &[3, 3],
+        ));
+        state.advance(&second, &stream).unwrap();
+        fork.advance(&second, &stream).unwrap();
+        assert_eq!(
+            state
+                .candidates()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            [0, 1, 0]
+        );
+        assert_eq!(
+            fork.candidates()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            [0, 1, 0]
+        );
+        assert_eq!(
+            state
+                .final_scores()
+                .unwrap()
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            [4.0, 0.0, -20.0, 0.0, 3.0, -20.0, 5.0, 0.0, -20.0]
+        );
+        assert!(state.self_conditioning().is_none());
+    }
+
+    #[test]
+    fn masked_float64_noise_is_replayable_from_an_isolated_random_stream() {
+        use eredu_core::refinement::{MaskedRefinementOptions, RefinementPolicy};
+        use eredu_runtime::generation::refinement::RefinementState;
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let config = MaskedRefinementOptions {
+            max_denoising_steps: 1,
+            temperature: 0.7,
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap();
+        let mut state = RefinementState::<MlxSamplingBackend>::new(
+            RefinementPolicy::MaskedUnmasking {
+                config,
+                mask_token_id: 2,
+            },
+            NonZeroU32::new(3).unwrap(),
+            TokenDomain::new(3),
+            Dtype::Float32,
+            RandomState::from_key(safemlx::random::key(7).unwrap()),
+            None,
+            &stream,
+        )
+        .unwrap();
+        let mut fork = state.clone();
+        let scores = MlxTensor::from_array(Array::from_slice(
+            &[
+                1.0f32,
+                2.0,
+                f32::NEG_INFINITY,
+                2.0,
+                1.0,
+                f32::NEG_INFINITY,
+                1.0,
+                1.0,
+                f32::NEG_INFINITY,
+            ],
+            &[3, 3],
+        ));
+        state.advance(&scores, &stream).unwrap();
+        fork.advance(&scores, &stream).unwrap();
+        let output = state.candidates().unwrap().as_array().evaluated().unwrap();
+        let replay = fork.candidates().unwrap().as_array().evaluated().unwrap();
+        assert_eq!(output.as_slice::<i32>(), replay.as_slice::<i32>());
+        assert!(output.as_slice::<i32>().iter().all(|x| *x == 0 || *x == 1));
+        let random = state.into_random();
+        let fork_random = fork.into_random();
+        assert_eq!(
+            random.as_array().evaluated().unwrap().as_slice::<u32>(),
+            fork_random
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<u32>()
+        );
+    }
+
+    #[test]
+    fn finalization_preserves_an_unmasked_sample_until_constraints_replace_it() {
+        use eredu_core::TokenFilter;
         use eredu_runtime::generation::refinement::finalization::{
-            finalize_refinement_position, FinalizationError,
+            RefinementSelection, finalize_refinement_position,
+        };
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let scores = MlxTensor::from_array(Array::from_slice(&[4.0f32, 1.0, 0.0], &[1, 3]));
+        let selected = MlxTensor::from_array(Array::from_slice(&[1i32], &[1]));
+        let preserved = finalize_refinement_position::<MlxSamplingBackend>(
+            &scores,
+            0,
+            Some(RefinementSelection {
+                tokens: &selected,
+                mask_token_id: 2,
+            }),
+            TokenDomain::new(3),
+            &TokenFilter::All,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(
+            <MlxSamplingBackend as SamplingBackend>::token_id(&preserved.token, &stream).unwrap(),
+            1
+        );
+        assert!(!preserved.candidate_replaced);
+        let filter = TokenFilter::allowed(vec![true, false, true]).unwrap();
+        let replaced = finalize_refinement_position::<MlxSamplingBackend>(
+            &scores,
+            0,
+            Some(RefinementSelection {
+                tokens: &selected,
+                mask_token_id: 2,
+            }),
+            TokenDomain::new(3),
+            &filter,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(
+            <MlxSamplingBackend as SamplingBackend>::token_id(&replaced.token, &stream).unwrap(),
+            0
+        );
+        assert!(replaced.candidate_replaced);
+        let only_mask = TokenFilter::allowed(vec![false, false, true]).unwrap();
+        assert!(matches!(finalize_refinement_position::<MlxSamplingBackend>(
+            &scores, 0, Some(RefinementSelection { tokens: &selected, mask_token_id: 2 }),
+            TokenDomain::new(3), &only_mask, &stream,
+        ), Err(eredu_runtime::generation::refinement::finalization::FinalizationError::NoAdmissibleToken)));
+    }
+
+    #[test]
+    fn constrained_finalization_uses_each_final_position_domain() {
+        use eredu_core::{TokenFilter, refinement::PredictionScoreKind};
+        use eredu_runtime::generation::refinement::finalization::{
+            FinalizationError, finalize_refinement_position,
         };
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let scores = MlxTensor::from_array(Array::from_slice(
@@ -347,6 +781,7 @@ mod tests {
             let finalized = finalize_refinement_position::<MlxSamplingBackend>(
                 &scores,
                 position,
+                None,
                 TokenDomain::new(4),
                 &filter,
                 &stream,
@@ -372,6 +807,7 @@ mod tests {
             finalize_refinement_position::<MlxSamplingBackend>(
                 &fixed,
                 0,
+                None,
                 TokenDomain::new(4),
                 &incompatible,
                 &stream
@@ -383,6 +819,7 @@ mod tests {
             finalize_refinement_position::<MlxSamplingBackend>(
                 &scores,
                 0,
+                None,
                 TokenDomain::new(4),
                 &absent,
                 &stream
@@ -393,6 +830,7 @@ mod tests {
             finalize_refinement_position::<MlxSamplingBackend>(
                 &scores,
                 2,
+                None,
                 TokenDomain::new(4),
                 &TokenFilter::All,
                 &stream
@@ -445,15 +883,17 @@ mod tests {
         )
         .unwrap());
         let changed = MlxTensor::from_array(Array::from_slice(&[1i32, 0], &[2]));
-        assert!(!MlxSamplingBackend::stable_and_confident(
-            &high,
-            &argmax,
-            &[changed],
-            0.005,
-            None,
-            &stream
-        )
-        .unwrap());
+        assert!(
+            !MlxSamplingBackend::stable_and_confident(
+                &high,
+                &argmax,
+                &[changed],
+                0.005,
+                None,
+                &stream
+            )
+            .unwrap()
+        );
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let scores = MlxTensor::from_array(Array::from_slice(&[invalid, invalid], &[1, 2]));
             assert!(

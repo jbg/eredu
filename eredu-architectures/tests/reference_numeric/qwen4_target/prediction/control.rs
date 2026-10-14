@@ -4,7 +4,7 @@ use super::super::snapshots::{COPIES, FAIL_PREDICTION};
 use super::*;
 use eredu_core::execution_control::{ExecutionControlError, SnapshotLimits};
 use eredu_core::generation::{
-    GenerationCancellationToken, GenerationSequence, SpeculativeConfig,
+    GenerationCancellationToken, GenerationSequence, GenerationRequestConfig,
     SpeculativeRequestStatus as Status, SpeculativeSchedulerOptions,
 };
 use eredu_core::speculative::SpeculativeControlError;
@@ -76,9 +76,13 @@ fn run_result(
     let lane = PreparedSpeculativeLane::new(
         &mut cache,
         Input::new(&[3, 4, 7]),
-        SpeculativeConfig {
+        GenerationRequestConfig {
             max_tokens: 12,
-            max_draft_tokens: 2,
+            decoding_mode: eredu_core::decoding::DecodingMode::SelfSpeculation(
+                eredu_core::decoding::SpeculationOptions::default().with_proposal_capacity(
+                    std::num::NonZeroUsize::new(2).expect("positive proposal capacity"),
+                ),
+            ),
             temperature: 0.,
             eos_token_ids: vec![],
         },

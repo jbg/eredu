@@ -5,24 +5,24 @@ use std::collections::{HashMap, HashSet};
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use serde_json::{Map, Value};
 use tokenizers::{
+    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
     decoders::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
         strip::Strip,
     },
     models::{
-        bpe::{Vocab, BPE},
+        bpe::{BPE, Vocab},
         unigram::Unigram,
     },
-    normalizers::{Replace, NFC},
+    normalizers::{NFC, Replace},
     pre_tokenizers::{
+        PreTokenizerWrapper,
         byte_level::ByteLevel,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence as PreTokenizerSequence,
         split::{Split, SplitPattern},
-        PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer,
 };
 
 use crate::error::Error;
@@ -137,6 +137,16 @@ fn build_gpt(
                 false,
             )?),
             PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ])));
+    } else if pre_tokenizer == "pixtral" {
+        const PIXTRAL_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+            PreTokenizerWrapper::Split(Split::new(
+                SplitPattern::Regex(PIXTRAL_PATTERN.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )?),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, true, false)),
         ])));
     } else if matches!(pre_tokenizer, "gpt-4o" | "inkling")
         || matches!(architecture, "gpt-oss" | "inkling")
@@ -727,6 +737,23 @@ mod tests {
         assert_eq!(encoding.get_ids(), &[8, 0]);
         assert_eq!(loaded.tokenizer.decode(&[0, 9], true).unwrap(), "");
         assert_eq!(loaded.template_kwargs["eos_token"], "<eos>");
+    }
+
+    #[test]
+    fn pixtral_separates_case_runs_and_individual_digits_before_bpe() {
+        let tokens = ["A", "B", "C", "a", "b", "c", "1", "2", "3", "AB", "ABC", "ab", "abc", "abcABC", "12", "123"];
+        let merges = ["A B", "AB C", "a b", "ab c", "abc ABC", "1 2", "12 3"];
+        let metadata = HashMap::from([
+            ("general.architecture".into(), GgufMetadataValue::String("mistral3".into())),
+            ("tokenizer.ggml.model".into(), GgufMetadataValue::String("gpt2".into())),
+            ("tokenizer.ggml.pre".into(), GgufMetadataValue::String("pixtral".into())),
+            ("tokenizer.ggml.tokens".into(), GgufMetadataValue::Array(GgufMetadataArray::String(tokens.map(str::to_owned).to_vec()))),
+            ("tokenizer.ggml.merges".into(), GgufMetadataValue::Array(GgufMetadataArray::String(merges.map(str::to_owned).to_vec()))),
+        ]);
+        let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+        let encoded = tokenizer.encode("abcABC123", false).unwrap();
+        assert_eq!(encoded.get_ids(), &[12, 10, 6, 7, 8]);
+        assert_eq!(tokenizer.decode(encoded.get_ids(), false).unwrap(), "abcABC123");
     }
 
     #[test]

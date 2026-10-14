@@ -7,7 +7,7 @@ use std::{
 
 use eredu_core::{
     generation::SpeculativeSchedulerOptions, Completion, FinishReason, GenerationCancellationToken,
-    GenerationSequence, PreparedSpeculativeLane, SamplingPlacement, SpeculativeConfig,
+    GenerationSequence, PreparedSpeculativeLane, SamplingPlacement, GenerationRequestConfig,
     SpeculativeConstraint, SpeculativeDraftRandomPosition, SpeculativeExecutionTopology,
     SpeculativeOutputError, SpeculativeOutputRuntime, SpeculativePublisher, SpeculativeRandomness,
     SpeculativeSampling, TokenFilter,

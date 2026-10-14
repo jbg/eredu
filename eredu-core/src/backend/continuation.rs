@@ -1,5 +1,6 @@
 //! Detached continuations for the ordinary text-generation machine.
 
+use super::decision_source::NativeDecisionState;
 use super::*;
 use std::sync::Arc;
 
@@ -59,7 +60,7 @@ where
 {
     owner: Arc<()>,
     identity: TextContinuationIdentity,
-    inner: TextGenerationMachine<B, C>,
+    inner: TextRequestDriver<B, C>,
     failed: bool,
     records_drained: bool,
 }
@@ -81,12 +82,51 @@ where
 
     /// Observes the same monotone cancellation request between prefill chunks.
     pub fn set_cancellation_token(&mut self, cancellation: crate::GenerationCancellationToken) {
-        self.inner.cancellation = Some(cancellation);
+        self.inner.set_cancellation_token(cancellation);
     }
 
     /// Independent physical-work and authoritative-output coordinates.
     pub fn position(&self) -> crate::refinement::GenerationPosition {
         self.inner.position
+    }
+
+    /// Active and pending policies owned by this logical continuation.
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState {
+        self.inner.decoding.state()
+    }
+    /// Exact mode mechanisms retained when the run was prepared.
+    pub fn decoding_capabilities(&self) -> crate::decoding::DecodingCapabilities {
+        self.inner.decoding.capabilities()
+    }
+    /// Admits a change without advancing native work or commitment state.
+    pub fn request_decoding_mode(
+        &self,
+        mode: crate::decoding::DecodingMode,
+    ) -> Result<(), crate::decoding::DecodingModeError> {
+        if self.failed
+            || self
+                .inner
+                .cancellation
+                .as_ref()
+                .is_some_and(crate::GenerationCancellationToken::is_cancelled)
+        {
+            return Err(crate::decoding::DecodingModeError::Terminal);
+        }
+        self.inner.decoding.request_decoding_mode(mode)
+    }
+    /// Associates cross-thread commands with this continuation's mode owner.
+    pub fn bind_control_handle(
+        &self,
+        handle: &crate::execution_control::GenerationControlHandle,
+    ) -> Result<(), crate::decoding::DecodingModeError> {
+        handle.bind_decoding(
+            self.inner.decoding.clone(),
+            self.inner.cancellation.as_ref(),
+        )
+    }
+    /// Fences commands at facade termination, including EOS before token allowance.
+    pub fn finish_decoding(&self) {
+        self.inner.decoding.finish();
     }
 
     /// Remaining ordinary token allowance, independent of facade EOS policy.
@@ -152,7 +192,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         Ok(TextGenerationContinuation {
             owner: Arc::clone(&self.owner),
             identity: TextContinuationIdentity(Arc::new(())),
-            inner: TextGenerationMachine::new(self.runtime, prompt, config, controller)?,
+            inner: TextRequestDriver::new(self.runtime, prompt, config, controller)?,
             failed: false,
             records_drained: true,
         })
@@ -256,10 +296,7 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
             )
             .into());
         }
-        let advanced = state
-            .inner
-            .advance_prefill(self.runtime)
-            .map_err(ControlledTextGenerationError::Backend)?;
+        let advanced = state.inner.advance_prefill(self.runtime)?;
         state.failed = false;
         state.records_drained = !advanced;
         Ok(advanced)
@@ -368,9 +405,18 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         &self.state.inner.controller
     }
 
+    /// Canonical committed IDs and termination state retained by the common driver.
+    pub fn sequence(&self) -> &crate::GenerationSequence {
+        self.state.inner.sequence()
+    }
+
     /// Independent physical-work and authoritative-output coordinates.
     pub fn position(&self) -> crate::refinement::GenerationPosition {
         self.state.inner.position
+    }
+    /// Rewindable mode owner copied together with native sampling/cache state.
+    pub fn decoding_state(&self) -> crate::decoding::DecodingState {
+        self.state.inner.decoding.state()
     }
 
     /// Remaining commitment allowance at this quiescent boundary.
@@ -405,10 +451,11 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         &mut B::TextGenerationState,
         Option<PendingTextInput<&B::Prompt, &B::Token>>,
     ) {
+        let inner = &mut *self.state.inner;
         (
             self.runtime,
-            &mut self.state.inner.backend_state,
-            self.state.inner.step.as_ref().map(PendingTextInput::as_ref),
+            &mut inner.backend_state,
+            inner.step.as_ref().map(PendingTextInput::as_ref),
         )
     }
 
@@ -420,11 +467,16 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         pending: Option<PendingTextInput<B::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
         position: crate::refinement::GenerationPosition,
+        decoding: crate::decoding::DecodingState,
+        sequence: crate::GenerationSequence,
     ) {
         self.state.inner.controller = controller;
         self.state.inner.step = pending;
         self.state.inner.remaining_tokens = remaining_tokens;
         self.state.inner.position = position;
+        self.state.inner.decoding.restore(decoding);
+        self.state.inner.retained_output = None;
+        self.state.inner.restore_sequence(sequence);
     }
 
     /// Constructs a child continuation from independently prepared components.
@@ -437,20 +489,27 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
         pending: Option<PendingTextInput<B::Prompt, B::Token>>,
         remaining_tokens: Option<usize>,
         position: crate::refinement::GenerationPosition,
+        decoding: crate::decoding::DecodingState,
+        sequence: crate::GenerationSequence,
     ) -> TextGenerationContinuation<B, C> {
         TextGenerationContinuation {
             owner: Arc::clone(&self.state.owner),
             identity: TextContinuationIdentity(Arc::new(())),
-            inner: TextGenerationMachine {
-                backend_state,
-                controller,
-                step: pending,
-                completions: Vec::new(),
-                remaining_tokens,
-                position,
-                prefill: self.state.inner.prefill,
-                cancellation: None,
-            },
+            inner: self.state.inner.fork(
+                NativeDecisionState {
+                    retained_output: None,
+                    backend_state,
+                    controller,
+                    step: pending,
+                    completions: Vec::new(),
+                    remaining_tokens,
+                    position,
+                    prefill: self.state.inner.prefill,
+                    cancellation: None,
+                    decoding: self.state.inner.decoding.fork(decoding),
+                },
+                sequence,
+            ),
             failed: false,
             records_drained: true,
         }
@@ -459,6 +518,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
     /// Fences a continuation when a composed operation cannot preserve it.
     pub fn fail(&mut self) {
         self.state.failed = true;
+        self.state.inner.decoding.finish();
     }
 }
 
