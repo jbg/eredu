@@ -1,8 +1,13 @@
 diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
-index 0d107a8..f977248 100644
 --- a/mlx/backend/cuda/jit_module.cpp
 +++ b/mlx/backend/cuda/jit_module.cpp
-@@ -6,6 +6,7 @@
+@@ -1,11 +1,13 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/cuda/jit_module.h"
++#include "mlx/backend/cuda/jit_include_paths.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/version.h"
  
  #include "cuda_jit_sources.h"
  
@@ -10,7 +15,33 @@ index 0d107a8..f977248 100644
  #include <cstdlib>
  #include <filesystem>
  #include <fstream>
-@@ -63,10 +64,51 @@ inline const char* cudart_dirname() {
+@@ -14,10 +16,15 @@
+ #include <fmt/format.h>
+ #include <nvrtc.h>
+ 
++#if defined(__linux__)
++#include <dlfcn.h>
++#endif
++
+ namespace mlx::core::cu {
+ 
+ // Defined in dirs.cpp to avoid invalidating compile cache.
+ const char* cccl_dir();
++const char* cuda_include_dir();
+ 
+ namespace {
+ 
+@@ -44,7 +51,8 @@
+     return {};
+   }();
+ #else
+-  static std::filesystem::path cached_path = "/usr/local/cuda";
++  static auto cached_path = detail::find_cuda_toolkit(
++      {"/usr/local/cuda", "/opt/cuda"});
+ #endif
+   return cached_path;
+ }
+@@ -63,10 +71,51 @@
  #endif
  }
  
@@ -62,30 +93,210 @@ index 0d107a8..f977248 100644
      // Add path to bundled headers.
      auto root_dir = current_binary_dir();
  #if !defined(_WIN32)
-@@ -74,7 +116,7 @@ const std::vector<std::string>& include_path_args() {
+@@ -74,35 +123,59 @@
  #endif
      auto path = root_dir / "include";
      if (std::filesystem::exists(path)) {
 -      args.push_back(fmt::format("--include-path={}", path.string()));
-+      add_include_path(args, path);
-     }
-     // Add path to CCCL headers.
-     path = path / "cccl";
-@@ -82,7 +124,7 @@ const std::vector<std::string>& include_path_args() {
-       path = cccl_dir();
-     }
-     if (std::filesystem::exists(path)) {
+-    }
+-    // Add path to CCCL headers.
+-    path = path / "cccl";
+-    if (!std::filesystem::exists(path) && cccl_dir()) {
+-      path = cccl_dir();
+-    }
+-    if (std::filesystem::exists(path)) {
 -      args.push_back(fmt::format("--include-path={}", path.string()));
-+      add_include_path(args, path);
-     }
-     // Add path to CUDA runtime headers, try local-installed python package
-     // first and then system-installed headers.
-@@ -102,7 +144,7 @@ const std::vector<std::string>& include_path_args() {
-             "variable CUDA_HOME or CUDA_PATH.");
-       }
-     }
+-    }
+-    // Add path to CUDA runtime headers, try local-installed python package
+-    // first and then system-installed headers.
+-    path = root_dir.parent_path() / "nvidia" / cudart_dirname() / "include";
+-    if (!std::filesystem::exists(path)) {
+-      const char* home = std::getenv("CUDA_HOME");
+-      if (!home) {
+-        home = std::getenv("CUDA_PATH");
+-      }
+-      path = home ? std::filesystem::path(home) : default_cuda_toolkit_path();
+-      if (!path.empty()) {
+-        path = path / "include";
+-      }
+-      if (path.empty() || !std::filesystem::exists(path)) {
+-        throw std::runtime_error(
+-            "Can not find locations of CUDA headers, please set environment "
+-            "variable CUDA_HOME or CUDA_PATH.");
+-      }
+-    }
 -    args.push_back(fmt::format("--include-path={}", path.string()));
++      add_include_path(args, path);
++    }
++    // Explicit toolkit settings win; otherwise discover the installation used
++    // by the loaded NVRTC library, Python packages, then the build-time toolkit.
++    const char* home = std::getenv("CUDA_HOME");
++    if (!home || !*home) {
++      home = std::getenv("CUDA_PATH");
++    }
++    if (home && *home) {
++      path = std::filesystem::path(home) / "include";
++    } else {
++      path.clear();
++#if defined(__linux__)
++      Dl_info info{};
++      auto symbol = dlsym(RTLD_DEFAULT, "nvrtcVersion");
++      if (symbol && dladdr(symbol, &info) && info.dli_fname) {
++        path = detail::cuda_include_from_library(info.dli_fname);
++      }
++#endif
++      if (path.empty()) {
++        path = detail::find_header_directory(
++            {root_dir.parent_path() / "nvidia" / cudart_dirname() / "include",
++             cuda_include_dir() ? std::filesystem::path(cuda_include_dir())
++                                : std::filesystem::path{}},
++            "cuda_runtime.h");
++      }
++      if (path.empty()) {
++        auto toolkit = default_cuda_toolkit_path();
++        if (!toolkit.empty()) {
++          path = toolkit / "include";
++        }
++      }
++    }
++    if (detail::find_header_directory({path}, "cuda_runtime.h").empty()) {
++      throw std::runtime_error(
++          "Cannot find CUDA runtime headers (cuda_runtime.h); install the CUDA "
++          "toolkit or set CUDA_HOME or CUDA_PATH to its root.");
++    }
 +    add_include_path(args, path);
++    // Prefer bundled/build-time CCCL and headers from the selected toolkit.
++    // Distributions such as Arch package CCCL separately under /usr/include.
++    auto cccl_path = detail::find_cccl_include_path(
++        root_dir / "include" / "cccl",
++        cccl_dir() ? std::filesystem::path(cccl_dir()) : std::filesystem::path{},
++        path,
++#if defined(_WIN32)
++        {});
++#else
++        {"/usr/include/cccl", "/usr/local/include/cccl"});
++#endif
++    if (!cccl_path.empty()) {
++      add_include_path(args, cccl_path);
++    }
      return args;
    }();
    return cached_args;
+diff --git a/mlx/backend/cuda/dirs.cpp b/mlx/backend/cuda/dirs.cpp
+--- a/mlx/backend/cuda/dirs.cpp
++++ b/mlx/backend/cuda/dirs.cpp
+@@ -19,6 +19,14 @@
+ }
+ 
+ } // namespace
++
++const char* cuda_include_dir() {
++#if defined(MLX_CUDA_INCLUDE_DIR)
++  return MLX_CUDA_INCLUDE_DIR;
++#else
++  return nullptr;
++#endif
++}
+ 
+ const char* cccl_dir() {
+ #if defined(MLX_CCCL_DIR)
+diff --git a/mlx/backend/cuda/CMakeLists.txt b/mlx/backend/cuda/CMakeLists.txt
+--- a/mlx/backend/cuda/CMakeLists.txt
++++ b/mlx/backend/cuda/CMakeLists.txt
+@@ -78,6 +78,14 @@
+ # Put dynamic defines in the dirs.cpp file.
+ add_library(mlx_dirs OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/dirs.cpp)
+ target_include_directories(mlx_dirs PRIVATE "${PROJECT_SOURCE_DIR}")
++# Retain discovered toolkit headers for JIT when no runtime-adjacent headers exist.
++foreach(cuda_include IN LISTS CUDAToolkit_INCLUDE_DIRS)
++  if(EXISTS "${cuda_include}/cuda_runtime.h")
++    target_compile_definitions(mlx_dirs
++                               PRIVATE MLX_CUDA_INCLUDE_DIR="${cuda_include}")
++    break()
++  endif()
++endforeach()
+ target_link_libraries(mlx PRIVATE $<BUILD_INTERFACE:mlx_dirs>)
+ # TODO: Remove after removing std::atomic_store/load.
+ target_compile_definitions(
+@@ -269,12 +277,10 @@
+ install(DIRECTORY ${cccl_SOURCE_DIR}/include/nv
+         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cccl)
+ 
+-# The binary of C++ tests will not be installed so it can not find the CCCL
+-# headers, and we have to hard-code the path.
+-if(MLX_BUILD_TESTS)
+-  target_compile_definitions(mlx_dirs
+-                             PRIVATE MLX_CCCL_DIR="${cccl_SOURCE_DIR}/include")
+-endif()
++# Cargo executables need not be installed beside the MLX headers. Retain the
++# discovered CCCL source directory as a candidate, validated again at runtime.
++target_compile_definitions(mlx_dirs
++                           PRIVATE MLX_CCCL_DIR="${cccl_SOURCE_DIR}/include")
+ 
+ # Use fixed version of NVTX.
+ FetchContent_Declare(
+diff --git a/mlx/backend/cuda/jit_include_paths.h b/mlx/backend/cuda/jit_include_paths.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cuda/jit_include_paths.h
+@@ -0,0 +1,60 @@
++// Copyright © 2026 Eredu contributors.
++#pragma once
++
++#include <filesystem>
++#include <vector>
++
++namespace mlx::core::cu::detail {
++
++inline std::filesystem::path find_header_directory(
++    const std::vector<std::filesystem::path>& candidates,
++    const std::filesystem::path& header) {
++  for (const auto& candidate : candidates) {
++    std::error_code error;
++    if (!candidate.empty() &&
++        std::filesystem::is_regular_file(candidate / header, error)) {
++      return candidate;
++    }
++  }
++  return {};
++}
++
++// Resolve symlinks before deriving the sibling include directory: loader paths
++// may name a library symlink outside the toolkit (for example under /usr/lib).
++inline std::filesystem::path cuda_include_from_library(
++    const std::filesystem::path& library) {
++  std::error_code error;
++  auto resolved = std::filesystem::canonical(library, error);
++  if (error) {
++    return {};
++  }
++  return find_header_directory(
++      {resolved.parent_path().parent_path() / "include"}, "cuda_runtime.h");
++}
++
++inline std::filesystem::path find_cuda_toolkit(
++    const std::vector<std::filesystem::path>& roots) {
++  std::vector<std::filesystem::path> candidates;
++  for (const auto& root : roots) {
++    candidates.push_back(root / "include");
++  }
++  auto include = find_header_directory(candidates, "cuda_runtime.h");
++  return include.empty() ? std::filesystem::path{} : include.parent_path();
++}
++
++inline std::filesystem::path find_cccl_include_path(
++    const std::filesystem::path& bundled,
++    const std::filesystem::path& compiled,
++    const std::filesystem::path& runtime_include,
++    const std::vector<std::filesystem::path>& system_candidates) {
++  std::vector<std::filesystem::path> candidates{bundled, compiled};
++  if (!runtime_include.empty()) {
++    candidates.push_back(runtime_include / "cccl");
++    candidates.push_back(runtime_include);
++  }
++  candidates.insert(
++      candidates.end(), system_candidates.begin(), system_candidates.end());
++  return find_header_directory(candidates, "cuda/std/tuple");
++}
++
++} // namespace mlx::core::cu::detail
