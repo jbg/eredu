@@ -83,7 +83,9 @@ fn prompt(media: bool) -> MlxModelInput {
 
 fn generation_config() -> SpeculativeConfig {
     SpeculativeConfig {
-        max_tokens: 16,
+        // Several prediction rounds exercise cached decoding; replay, fork,
+        // cancellation and recovery each repeat this sequence independently.
+        max_tokens: 8,
         max_draft_tokens: 1,
         temperature: 0.,
         eos_token_ids: vec![],
@@ -294,7 +296,11 @@ pub(super) fn worker(
     .unwrap();
     let mut baseline = ModelRuntime::from_prepared(backend, prepared).unwrap();
     let expected = generate(&mut baseline, media);
-    assert_eq!(expected.token_ids().len(), 16);
+    assert_eq!(expected.token_ids().len(), generation_config().max_tokens);
+    assert!(
+        expected.stats().rounds() > 1,
+        "multiple cached prediction rounds"
+    );
     assert!(expected.stats().draft_tokens() > 0);
     if topology.global_rank() == 0 {
         eprintln!(
@@ -304,6 +310,12 @@ pub(super) fn worker(
             expected.stats().rounds()
         );
     }
+    let phase = |name: &str| {
+        if topology.global_rank() == 0 {
+            eprintln!("Flash-Next MTP: {name}");
+        }
+    };
+    phase("baseline captures");
     let baseline_captures = captures::baseline(&mut baseline, media, &expected);
     drop(baseline);
     let layers = if std::env::var_os(DENSE_STREAM).is_some() {
@@ -341,13 +353,17 @@ pub(super) fn worker(
     let mut runtime = ModelRuntime::from_prepared(backend, prepared).unwrap();
     assert!(has_selected_embedded_prediction(runtime.session_mut()));
     for _ in 0..2 {
+        phase("distributed generation and fresh cache replay");
         let actual = generate(&mut runtime, media);
         assert_eq!(
             actual.token_ids(),
             expected.token_ids(),
             "distributed MTP committed tokens and fresh cache replay"
         );
-        assert_eq!(actual.stats().emitted_tokens(), 16);
+        assert_eq!(
+            actual.stats().emitted_tokens(),
+            generation_config().max_tokens
+        );
         assert_eq!(
             actual.stats().draft_tokens(),
             expected.stats().draft_tokens()
@@ -358,8 +374,11 @@ pub(super) fn worker(
         );
         assert_eq!(actual.stats().accept_lens(), expected.stats().accept_lens());
     }
+    phase("controlled captures, restore and branch exchange");
     controlled(&mut runtime, media, &expected, &baseline_captures);
+    phase("cancellation during verification");
     cancel_pending(&mut runtime, media);
+    phase("generation after cancellation");
     let recovered = generate(&mut runtime, media);
     assert_eq!(
         recovered.token_ids(),

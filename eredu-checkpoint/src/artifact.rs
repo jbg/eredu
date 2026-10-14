@@ -402,6 +402,8 @@ mod tests {
             &admitted,
             StableFileMetadata::read(&path, &admitted).unwrap(),
             || {
+                // The overwrite must be observable even on coarse filesystem clocks.
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let mut attacker = File::options()
                     .write(true)
                     .truncate(true)
