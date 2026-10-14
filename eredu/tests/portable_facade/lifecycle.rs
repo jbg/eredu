@@ -279,14 +279,15 @@ fn reset_restores_fresh_requests_without_reloading_and_synchronize_preserves_sta
 }
 
 #[test]
-fn abandoned_generation_settles_before_generic_reuse_or_eviction() {
+fn yielded_token_is_settled_before_abandonment_reuse_or_eviction() {
     let (mut model, state) = model();
     let config = model.resolve_generation_config(Default::default()).unwrap();
     let mut generation = model
         .generate_tokens(vec![0], TextGenerationConfig::new(config))
         .unwrap();
     assert_eq!(generation.next().unwrap().unwrap().token_id().unwrap(), 1);
-    assert!(state.pending.borrow().is_some());
+    assert!(state.pending.borrow().is_none());
+    assert_eq!(state.waits.get(), 1);
     drop(generation);
     assert!(state.pending.borrow().is_none());
     assert_eq!(state.waits.get(), 1);
@@ -337,14 +338,23 @@ fn cancellation_settles_and_allows_a_fresh_generic_request() {
 }
 
 #[test]
-fn failed_drop_wait_is_reported_and_reset_cannot_release_unresolved_work() {
+fn failed_generation_wait_retains_authority_until_safe_teardown() {
     let (mut model, state) = model();
     let config = model.resolve_generation_config(Default::default()).unwrap();
     let mut generation = model
         .generate_tokens(vec![0], TextGenerationConfig::new(config))
         .unwrap();
-    generation.next().unwrap().unwrap();
     state.fail_wait.set(true);
+    let error = generation
+        .next()
+        .unwrap()
+        .err()
+        .expect("completion failure must prevent token delivery");
+    assert_eq!(error.source().unwrap().to_string(), "unresolved work");
+    assert!(state.pending.borrow().is_some());
+    assert_eq!(state.waits.get(), 1);
+    assert!(generation.synchronize().is_err());
+    assert!(generation.next().is_none());
     drop(generation);
     assert!(state.pending.borrow().is_some());
     for error in [model.synchronize().unwrap_err(), model.reset().unwrap_err()] {
@@ -373,18 +383,20 @@ fn reset_failure_reaches_the_generic_caller() {
 }
 
 #[test]
-fn iterator_synchronize_failure_closes_generation_and_retains_unresolved_authority() {
+fn iterator_synchronize_failure_closes_generation_and_fences_poisoned_session() {
     let (mut model, state) = model();
     let config = model.resolve_generation_config(Default::default()).unwrap();
     let mut generation = model
         .generate_tokens(vec![0], TextGenerationConfig::new(config))
         .unwrap();
     generation.next().unwrap().unwrap();
+    assert!(state.pending.borrow().is_none());
     state.fail_wait.set(true);
     let error = generation.synchronize().unwrap_err();
     assert_eq!(error.source().unwrap().to_string(), "unresolved work");
     assert!(generation.next().is_none());
-    assert!(state.pending.borrow().is_some());
+    assert!(state.pending.borrow().is_none());
+    assert_eq!(state.waits.get(), 1);
     drop(generation);
     assert!(model.synchronize().is_err());
     assert!(model.reset().is_err());
