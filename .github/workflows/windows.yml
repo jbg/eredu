@@ -22,6 +22,7 @@ env:
 jobs:
   cpu-msvc:
     runs-on: windows-2022
+    timeout-minutes: 60
     env:
       # Full debug data makes the monomorphized backend archive exceed MSVC's
       # library size limit (LNK4003), hiding its Rust symbols from the linker.
@@ -91,6 +92,7 @@ jobs:
   cuda-gpu-runtime:
     if: inputs.run_windows_gpu
     runs-on: [self-hosted, Windows, X64, cuda]
+    timeout-minutes: 60
     env:
       SAFEMLX_CUDA_ARCHITECTURES: "75"
     steps:

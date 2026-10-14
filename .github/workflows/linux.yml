@@ -18,6 +18,7 @@ jobs:
     if: inputs.full
     name: Rust 1.89 compatibility
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
@@ -53,6 +54,7 @@ jobs:
 
   cpu:
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain
@@ -101,6 +103,7 @@ jobs:
     if: inputs.full
     name: Rust 1.89 CUDA and NCCL compatibility
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
       SAFEMLX_CUDA_ARCHITECTURES: "80"
@@ -163,6 +166,7 @@ jobs:
   cuda-gpu-smoke:
     if: inputs.run_gpu
     runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install the repository Rust toolchain

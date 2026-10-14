@@ -121,16 +121,42 @@ external dependencies, native/build/toolchain inputs, other production code, or
 the scope rules themselves requires the full matrix. The classifier is a
 conservative verification selector, not an API compatibility checker.
 
-Full validation retains workspace and Ring tests, all six Apple cross targets,
-Linux CPU/MSRV/CUDA/NCCL, and Windows CPU plus CUDA 12.9.1 and 13.0.2. Nightly
-runs and the dispatch `full` input always select full validation. Self-hosted GPU
-execution remains explicit opt-in through `run_windows_gpu` and `run_linux_gpu`.
-Linux, Windows, and archive jobs start alongside native validation. Ordinary
-backend tests and ignored Ring cases each run once in the combined macOS job.
-Apple cross-builds have at most four concurrent builds, reserving the fifth
-standard macOS slot for native validation. Target-mapping checks share the native
-job rather than taking another macOS runner. The full matrix can therefore run
-alongside native validation without a second serial barrier.
+Full compatibility validation retains workspace tests, all six Apple cross
+targets, Linux CPU/MSRV/CUDA/NCCL, and Windows CPU plus CUDA 12.9.1 and 13.0.2.
+Nightly runs and the dispatch `full` input select that compatibility matrix.
+Self-hosted GPU execution remains explicit opt-in through `run_windows_gpu` and
+`run_linux_gpu`. Native backend, native consumers, and portable workspace tests
+run in separate jobs, each with a 45-minute ceiling. Other compatibility jobs
+have a 60-minute ceiling; a timeout fails validation.
+
+PR and main gates run seven representative Ring smoke tests: partition loading,
+bounded consensus, expert exchange, Cartesian topology, resident GGUF pipeline
+execution, disk-streamed prediction across tensor/pipeline partitions, and
+provider failure handling. The Ring smoke step has an eight-minute execution
+budget and a three-minute limit per test. It fails at the first error and retains
+per-test logs and timings. Ordinary backend tests also use fresh processes and
+prepared-cache directories, preventing native stream and allocator state from
+accumulating across unrelated tests.
+
+The **Extended Ring conformance** workflow runs the complete synthetic Ring suite
+weekly and on manual dispatch, independently of the PR/release compatibility
+gate. Use it for broad distributed-runtime or model-matrix validation. It builds
+the test executable once and distributes every ignored Ring test across 32
+shards, excluding only the two explicitly opt-in released Moshi checkpoint tests.
+Each test runs in a fresh process with a ten-minute limit; each shard has a
+30-minute execution budget and a 35-minute job ceiling. Timeout terminates the
+entire worker process group. Missing smoke tests, unmatched filters, and unrun
+tests after budget exhaustion fail validation. Selected tests, individual logs,
+and completed-test timings are retained even when a shard fails. Four concurrent
+shards leave a hosted macOS slot available for PR work.
+
+To run a focused Ring regression locally, reuse a built executable or let the
+runner build it, and select a test by name:
+
+```bash
+python3 validation/run_native_unit_tests.py --suite ring \
+  --filter ring_two_process_partition_load --results-dir /tmp/eredu-ring-results
+```
 
 Before publication, require a successful **main push or manual dispatch** gate
 for the exact release commit and inspect its release plan. Either automatically

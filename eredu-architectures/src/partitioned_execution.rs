@@ -8087,9 +8087,18 @@ pub(crate) fn prediction_parameter_layout_for_rank(
         .map_err(|error| invalid(&error.to_string()))?;
     let placement = ParallelRankTopology::new(tensor, topology.tensor_parallel_rank())
         .map_err(|error| invalid(&error.to_string()))?;
-    let layout = prepared
-        .layout_for_rank(global_rank)
-        .map_err(ParameterError::Unsupported)?;
+    // Reuse the prepared local layout and preserve architecture-authored peer
+    // layouts. Ordinary peer placement needs only this atomic parameter group;
+    // deriving the entire model for every catalog member makes queries quadratic.
+    let layout = if prepared.qwen4_spec().is_some()
+        || topology.tensor_parallel_rank() == prepared.topology().tensor_parallel_rank()
+    {
+        prepared
+            .layout_for_rank(global_rank)
+            .map_err(ParameterError::Unsupported)?
+    } else {
+        None
+    };
     parameter_member_layout(
         resolved,
         topology,
