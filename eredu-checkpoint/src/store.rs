@@ -3236,6 +3236,8 @@ mod tests {
         assert_eq!(lease.encoded_bytes().unwrap(), original);
         let admitted_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
 
+        // Separate admission and overwrite on coarse filesystem clocks.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let mut encoded = std::fs::read(&path).unwrap();
         let substituted = f32_bytes(&[9.0, 10.0]);
         let payload_start = encoded.len() - substituted.len();
@@ -3449,6 +3451,8 @@ mod tests {
             &[1..2],
             &telemetry,
             || {
+                // Separate admission and overwrite on coarse filesystem clocks.
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let mut bytes = std::fs::read(&path).unwrap();
                 bytes[payload_offset + 1] = 9;
                 std::fs::write(&path, bytes).unwrap();

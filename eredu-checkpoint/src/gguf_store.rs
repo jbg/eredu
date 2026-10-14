@@ -1692,6 +1692,8 @@ mod tests {
                 .prepare_encoded_read(&["table.weight".into()])
                 .unwrap()
                 .unwrap();
+            // Metadata admission must observe a distinct filesystem clock tick.
+            std::thread::sleep(std::time::Duration::from_millis(10));
             let mut changed = std::fs::read(&path).unwrap();
             *changed.last_mut().unwrap() ^= 1;
             std::fs::write(&path, changed).unwrap();
