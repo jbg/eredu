@@ -21,7 +21,7 @@ env:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
@@ -44,7 +44,7 @@ jobs:
           key: ${{ steps.cache.outputs.native-key }}
           hit: ${{ steps.cache.outputs.native-hit }}
       - name: Build the shared test executable
-        run: python3 validation/run_native_unit_tests.py --export-executable target/ring-artifact/backend-tests
+        run: python3 validation/run_native_unit_tests.py --profile conformance --export-executable target/ring-artifact/backend-tests
       - uses: actions/upload-artifact@v4
         with:
           name: ring-executable

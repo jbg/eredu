@@ -76,3 +76,13 @@ sha2 = "0.11"
 # SHA-2 compression kernels optimized while Eredu itself remains debuggable.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Distributed conformance performs substantial host-side reference and catalog
+# work across many ranks. Keep assertions while optimizing those hot loops.
+[profile.conformance]
+inherits = "dev"
+opt-level = 1
+debug = 0
+debug-assertions = true
+overflow-checks = true
+incremental = false

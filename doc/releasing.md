@@ -100,7 +100,7 @@ and `audio`) without `mlx` at the minimum supported Rust version. These checks
 keep optional facade features from accidentally activating the native backend
 or depending on its availability.
 
-The `Native release gate` is the single CI entry point. It runs on main and
+The `Native release gate` is the compatibility CI entry point. It runs on main and
 pull requests, nightly, and by manual dispatch. A small planning job compares the
 candidate with the most recent successful **full** main gate; a version-only
 follow-up therefore cannot hide the preceding source change. The plan is printed
@@ -143,7 +143,8 @@ accumulating across unrelated tests.
 The **Extended Ring conformance** workflow runs the complete synthetic Ring suite
 weekly and on manual dispatch, independently of the PR/release compatibility
 gate. Use it for broad distributed-runtime or model-matrix validation. It builds
-the test executable once and distributes every ignored Ring test across 32
+the test executable once using the optimized `conformance` profile, retaining
+debug assertions and overflow checks, and distributes every ignored Ring test across 32
 shards, excluding only the two explicitly opt-in released Moshi checkpoint tests.
 Each test runs in a fresh process with a ten-minute limit; each shard has a
 30-minute execution budget and a 35-minute job ceiling. Timeout terminates the
