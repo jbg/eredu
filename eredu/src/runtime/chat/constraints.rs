@@ -617,40 +617,54 @@ impl GenerationRuntimePlan {
         resolved_structural_token_ids: Vec<u32>,
         runtime_stop_sequences: Vec<String>,
         tool_surface: bool,
-    ) -> Result<GenerationRuntimePlan, String> {
+    ) -> Result<GenerationRuntimePlan, crate::api::ConstraintPreparationError> {
+        use crate::api::ConstraintPreparationError;
+        let protocol = |reason| ConstraintPreparationError::Protocol { reason };
+        let compiler_error = |reason| ConstraintPreparationError::Compiler { reason };
         if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len() {
-            return Err("structural token spellings and IDs must have equal lengths".into());
+            return Err(protocol(
+                "structural token spellings and IDs must have equal lengths".into(),
+            ));
         }
-        dialect.incremental_parser_state_for_request(parameters, tools, tool_surface)?;
+        dialect
+            .incremental_parser_state_for_request(parameters, tools, tool_surface)
+            .map_err(protocol)?;
 
         let constraint = if !tool_surface {
             None
         } else {
-            let compiler =
-                compiler.ok_or("the loaded model does not have tokenizer constraint data")?;
+            let compiler = compiler.ok_or_else(|| {
+                protocol("the loaded model does not have tokenizer constraint data".into())
+            })?;
             #[cfg(test)]
             compiler
                 .schema_compilation_runs
                 .fetch_add(1, Ordering::Relaxed);
-            let grammar_tokens = dialect.required_structural_tokens(parameters)?;
+            let grammar_tokens = dialect
+                .required_structural_tokens(parameters)
+                .map_err(protocol)?;
             if runtime_structural_token_spellings.len() < grammar_tokens.len()
                 || !runtime_structural_token_spellings
                     .iter()
                     .zip(grammar_tokens)
                     .all(|(runtime, grammar)| runtime == grammar)
             {
-                return Err("runtime structural tokens do not match the tool grammar".into());
+                return Err(protocol(
+                    "runtime structural tokens do not match the tool grammar".into(),
+                ));
             }
             let grammar_structural_token_ids =
                 &resolved_structural_token_ids[..grammar_tokens.len()];
             let configuration = {
-                let configuration = dialect.constraint_configuration(
-                    parameters,
-                    tools,
-                    tool_choice,
-                    parallel_tool_calls,
-                    grammar_structural_token_ids,
-                )?;
+                let configuration = dialect
+                    .constraint_configuration(
+                        parameters,
+                        tools,
+                        tool_choice,
+                        parallel_tool_calls,
+                        grammar_structural_token_ids,
+                    )
+                    .map_err(protocol)?;
                 match compiler.compile_matcher(configuration.grammar.clone()) {
                     Ok(matcher) => (configuration, matcher),
                     Err(_) => {
@@ -664,14 +678,18 @@ impl GenerationRuntimePlan {
                                 tool
                             })
                             .collect::<Vec<_>>();
-                        let configuration = dialect.constraint_configuration(
-                            parameters,
-                            &syntax_tools,
-                            tool_choice,
-                            parallel_tool_calls,
-                            grammar_structural_token_ids,
-                        )?;
-                        let matcher = compiler.compile_matcher(configuration.grammar.clone())?;
+                        let configuration = dialect
+                            .constraint_configuration(
+                                parameters,
+                                &syntax_tools,
+                                tool_choice,
+                                parallel_tool_calls,
+                                grammar_structural_token_ids,
+                            )
+                            .map_err(protocol)?;
+                        let matcher = compiler
+                            .compile_matcher(configuration.grammar.clone())
+                            .map_err(compiler_error)?;
                         (configuration, matcher)
                     }
                 }
@@ -693,7 +711,8 @@ impl GenerationRuntimePlan {
             generation_constraint: constraint,
             tool_call_trigger: if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
                 dialect
-                    .auto_activation_trigger(parameters)?
+                    .auto_activation_trigger(parameters)
+                    .map_err(protocol)?
                     .map(str::to_owned)
             } else {
                 None
@@ -764,6 +783,7 @@ impl ConstraintCompiler {
             stop_sequences,
             true,
         )
+        .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]

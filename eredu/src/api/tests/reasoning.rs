@@ -135,7 +135,9 @@ fn reasoning_initial_state_follows_the_actual_generation_suffix() {
     );
     assert!(matches!(
         prepare(R1, disabled, None),
-        Err(TextModelError::UnsupportedReasoning { .. })
+        Err(TextModelError::UnsupportedCapability(
+            crate::api::ChatCapabilityRejection::ReasoningControl { .. }
+        ))
     ));
 }
 
@@ -163,7 +165,9 @@ fn literal_tags_and_ignored_reasoning_history_do_not_grant_reasoning_support() {
     let template = "{% for message in messages %}{{message.content}}{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}";
     assert!(matches!(
         prepare(template, request(), None),
-        Err(TextModelError::UnsupportedReasoning { .. })
+        Err(TextModelError::UnsupportedCapability(
+            crate::api::ChatCapabilityRejection::ReasoningParsing { .. }
+        ))
     ));
 }
 

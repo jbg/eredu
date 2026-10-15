@@ -3,7 +3,7 @@ use eredu::api::{
     ChatInputRequest, ChatMessage, ChatPart, ChatPreparationOptions, ChatToolCall,
     ChatToolDefinition, TextModelError,
 };
-use eredu::runtime::chat::{ToolChoice, ToolNameNormalizationError};
+use eredu::runtime::chat::ToolChoice;
 use serde_json::{json, Value};
 
 fn request(names: &[&str]) -> ChatTemplateRequest {
@@ -187,8 +187,8 @@ fn tool_names_reject_ambiguous_or_malformed_identity_and_unknown_rules() {
     let mut model = unicode_model(None);
     assert!(matches!(
         model.prepare_chat(request(&["extension.lookup", "extension.lookup"])),
-        Err(TextModelError::ToolNames(
-            ToolNameNormalizationError::DuplicateDeclaration { .. }
+        Err(TextModelError::InvalidRequest(
+            eredu::api::ChatRequestError::DuplicateToolName { .. }
         ))
     ));
     for name in [Value::Null, json!(3), json!("")] {
@@ -196,8 +196,8 @@ fn tool_names_reject_ambiguous_or_malformed_identity_and_unknown_rules() {
         invalid.tools[0]["function"]["name"] = name;
         assert!(matches!(
             model.prepare_chat(invalid),
-            Err(TextModelError::ToolNames(
-                ToolNameNormalizationError::InvalidName { .. }
+            Err(TextModelError::InvalidRequest(
+                eredu::api::ChatRequestError::InvalidToolName { .. }
             ))
         ));
     }
@@ -205,13 +205,17 @@ fn tool_names_reject_ambiguous_or_malformed_identity_and_unknown_rules() {
     invalid.tools[0]["function"]["parameters"] = json!({"type":"not_a_type"});
     assert!(matches!(
         model.prepare_chat(invalid),
-        Err(TextModelError::ToolConstraint(_))
+        Err(TextModelError::InvalidRequest(
+            eredu::api::ChatRequestError::ToolDefinition { .. }
+        ))
     ));
     let mut unknown = unicode_model_with_template(None, 64, "{{ messages[0].content }}");
     assert!(matches!(
         unknown.prepare_chat(request(&["extension.lookup"])),
-        Err(TextModelError::ToolNames(
-            ToolNameNormalizationError::UnsupportedDialect { .. }
+        Err(TextModelError::UnsupportedCapability(
+            eredu::api::ChatCapabilityRejection::NativeTools(
+                eredu::runtime::chat::NativeToolRejection::ToolNameRulesUnavailable { .. }
+            )
         ))
     ));
 }

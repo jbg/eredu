@@ -3,7 +3,7 @@
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer};
 use serde_json::{json, Map, Value};
 
-use super::{ChatTemplateRequest, TextModelError};
+use super::{ChatCapabilityRejection, ChatRequestError, ChatTemplateRequest, TextModelError};
 use crate::runtime::chat::{
     dialect::{DialectParameters, DECLARATIVE_DIALECT},
     ifm, PreparedFormatProfile, ReasoningEffortControl,
@@ -57,19 +57,17 @@ pub(super) fn recognize(
         .get("reasoning_effort")
         .map_or(Some("high"), Value::as_str)
         .filter(|effort| ["high", "medium", "low"].contains(effort))
-        .ok_or_else(|| {
-            TextModelError::ToolConstraint(
-                "IFM reasoning_effort must be high, medium, or low".into(),
-            )
+        .ok_or_else(|| ChatRequestError::InvalidOption {
+            field: "reasoning_effort".into(),
+            reason: "must be high, medium, or low".into(),
         })?;
     let format = kwargs
         .get("tool_call_format")
         .map_or(Some("xml"), Value::as_str)
         .filter(|format| ["json", "xml", "xml_typed"].contains(format))
-        .ok_or_else(|| {
-            TextModelError::ToolConstraint(
-                "IFM tool_call_format must be json, xml, or xml_typed".into(),
-            )
+        .ok_or_else(|| ChatRequestError::InvalidOption {
+            field: "tool_call_format".into(),
+            reason: "must be json, xml, or xml_typed".into(),
         })?;
     let disabled = kwargs.get("enable_thinking") == Some(&Value::Bool(false));
     if disabled {
@@ -82,9 +80,12 @@ pub(super) fn recognize(
             Some(&kwargs),
         )?;
         if !rendered[0].ends_with("<ifm|think>\n</ifm|think>\n") {
-            return Err(TextModelError::ToolConstraint(
-                "The selected IFM template does not expose a reasoning-disable control".into(),
-            ));
+            return Err(ChatCapabilityRejection::ReasoningControl {
+                control: "enable_thinking".into(),
+                reason: "The selected IFM template does not expose a reasoning-disable control"
+                    .into(),
+            }
+            .into());
         }
     }
     let prefilled = request.add_generation_prompt;

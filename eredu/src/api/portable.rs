@@ -11,9 +11,6 @@ use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 /// Backend-independent failure from tokenizer-aware text facade operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TextModelError {
-    /// Tool names could not be normalized for the selected checkpoint protocol.
-    #[error(transparent)]
-    ToolNames(#[from] crate::runtime::chat::ToolNameNormalizationError),
     /// Portable generation configuration was invalid.
     #[error(transparent)]
     Generation(#[from] eredu_core::generation::GenerationError),
@@ -26,15 +23,141 @@ pub enum TextModelError {
     /// No chat template is attached to the loaded model.
     #[error("the loaded model does not provide a chat template")]
     MissingChatTemplate,
-    /// The selected chat protocol cannot honor the requested reasoning policy.
-    #[error("unsupported reasoning: {reason}")]
-    UnsupportedReasoning {
-        /// Explanation of the unavailable parsing or template control.
+    /// The request contains invalid declarations, history, or options.
+    #[error(transparent)]
+    InvalidRequest(#[from] ChatRequestError),
+    /// The selected protocol cannot honor a valid requested capability.
+    #[error(transparent)]
+    UnsupportedCapability(#[from] ChatCapabilityRejection),
+    /// Native protocol or constraint construction failed.
+    #[error(transparent)]
+    ConstraintPreparation(#[from] ConstraintPreparationError),
+}
+
+/// Invalid input; applications must correct the request rather than retry without tools.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatRequestError {
+    /// A declaration or history name is missing, empty or not a string.
+    #[error("{path} must be a non-empty tool name string")]
+    InvalidToolName {
+        /// Exact declaration or history field.
+        path: String,
+    },
+    /// Two declarations use the same application name.
+    #[error("duplicate tool function name {name:?}")]
+    DuplicateToolName {
+        /// Repeated application name.
+        name: String,
+    },
+    /// A tool declaration or parameter schema is invalid.
+    #[error("{reason}")]
+    ToolDefinition {
+        /// Index in the supplied declarations.
+        index: usize,
+        /// Validation diagnostic.
         reason: String,
     },
-    /// A native tool definition or its generation grammar is invalid.
-    #[error("native tool constraint error: {0}")]
-    ToolConstraint(String),
+    /// An option has the wrong type or an invalid value.
+    #[error("invalid {field}: {reason}")]
+    InvalidOption {
+        /// Request field or template kwarg.
+        field: String,
+        /// Validation diagnostic.
+        reason: String,
+    },
+    /// Individually valid options contradict each other.
+    #[error("{first} cannot be combined with {second}")]
+    ConflictingOptions {
+        /// First conflicting field.
+        first: String,
+        /// Second conflicting field.
+        second: String,
+    },
+    /// A required call has no declared tools.
+    #[error("tool_choice is required but no tools were supplied")]
+    RequiredToolsMissing,
+    /// History cannot be represented safely by the selected protocol.
+    #[error("messages[{message_index}].tool_calls[{call_index}]: {reason}")]
+    ToolHistory {
+        /// Message containing the call.
+        message_index: usize,
+        /// Call within the message.
+        call_index: usize,
+        /// Validation diagnostic.
+        reason: String,
+    },
+}
+
+/// A valid request asks for a capability unavailable in the selected protocol.
+/// Only `NativeTools` rejections describe limitations removable by tool emulation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatCapabilityRejection {
+    /// Native tools are unavailable; applications may prepare their own emulated request.
+    #[error(transparent)]
+    NativeTools(#[from] crate::runtime::chat::NativeToolRejection),
+    /// The protocol cannot apply the requested reasoning control.
+    #[error("reasoning control {control} is unavailable: {reason}")]
+    ReasoningControl {
+        /// Requested control.
+        control: String,
+        /// Protocol diagnostic.
+        reason: String,
+    },
+    /// Explicit reasoning requires a parser unless raw reasoning was allowed.
+    #[error("unsupported reasoning: {reason}")]
+    ReasoningParsing {
+        /// Parsing diagnostic.
+        reason: String,
+    },
+}
+
+/// Protocol/tokenizer or compiler failures, without an automatic emulation guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConstraintPreparationError {
+    /// Required response tokens do not satisfy the selected protocol.
+    #[error("invalid structural tokens: {reason}")]
+    StructuralTokens {
+        /// Token validation diagnostic.
+        reason: String,
+    },
+    /// Protocol construction violated its contract.
+    #[error("invalid protocol: {reason}")]
+    Protocol {
+        /// Protocol diagnostic.
+        reason: String,
+    },
+    /// Tokenizer grammar data or request grammar construction failed.
+    #[error("native constraint compilation failed: {reason}")]
+    Compiler {
+        /// Compiler diagnostic.
+        reason: String,
+    },
+}
+
+impl From<crate::runtime::chat::ToolNameNormalizationError> for TextModelError {
+    fn from(error: crate::runtime::chat::ToolNameNormalizationError) -> Self {
+        use crate::runtime::chat::{NativeToolRejection, ToolNameNormalizationError};
+        match error {
+            ToolNameNormalizationError::InvalidName { path } => {
+                ChatRequestError::InvalidToolName { path }.into()
+            }
+            ToolNameNormalizationError::DuplicateDeclaration { name } => {
+                ChatRequestError::DuplicateToolName { name }.into()
+            }
+            ToolNameNormalizationError::UnsupportedDialect { name } => {
+                ChatCapabilityRejection::NativeTools(
+                    NativeToolRejection::ToolNameRulesUnavailable { name },
+                )
+                .into()
+            }
+            ToolNameNormalizationError::AliasUnavailable { name } => {
+                ChatCapabilityRejection::NativeTools(
+                    NativeToolRejection::ToolNameAliasUnavailable { name },
+                )
+                .into()
+            }
+        }
+    }
 }
 
 /// Asynchronous token generation with backend-independent errors.

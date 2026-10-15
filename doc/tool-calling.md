@@ -68,9 +68,43 @@ Use semantic output when emulating tools in application text: route only
 `TextDelta` to the emulator and handle `ReasoningDelta` independently. Native tool
 capabilities remain separately gated. QwQ composes its prefilled reasoning with
 the recognized XML tool envelope. Explicitly unavailable reasoning and unsupported
-delimited reasoning controls return `TextModelError::UnsupportedReasoning`.
+delimited reasoning controls return `TextModelError::UnsupportedCapability` with
+`ChatCapabilityRejection::ReasoningParsing` or `ReasoningControl`.
 `OutputMode::Text` remains literal and requires the existing
 `allow_unparsed_reasoning` opt-in when thinking is explicitly enabled.
+
+## Preparation errors and emulation
+
+`TextModelError::InvalidRequest` carries `ChatRequestError` variants for invalid
+tool definitions (including their declaration index), unsafe history (including
+message and call indices), malformed names, invalid options, conflicting options,
+and required calls without tools. Application tool definitions and request
+consistency are validated before capability rejection, including for unrecognized
+templates. An unavailable native protocol cannot mask an invalid tool schema.
+
+`TextModelError::UnsupportedCapability` carries `ChatCapabilityRejection`.
+`NativeTools(NativeToolRejection::ReasoningCombinationUnsupported { .. })` means
+the selected native tool protocol cannot preserve the requested reasoning.
+`MissingConstraintData`, `ToolNameRulesUnavailable` and `ToolNameAliasUnavailable`
+also describe native-tool limitations. `NativeToolSupport::Unsupported {
+rejection }` uses the same typed reasons when preparation succeeds without an
+executable native-tool plan. Tool-free preparation can also report
+`ConstraintInitializationFailed` while retaining its semantic response plan.
+
+Applications can choose emulation for explicit native-tool rejections. They keep
+the typed result until making that decision, then prepare their text instructions
+and rewritten history without native tool declarations, using `ToolChoice::None`.
+The retry preserves the requested reasoning policy and is validated independently;
+its errors propagate. Required-call semantics must be enforced by the application
+when it chooses emulation. eredu does not automatically retry or weaken a request.
+
+`ReasoningControl` and `ReasoningParsing` rejections are independent of native
+tools. Removing tool declarations does not establish support for them. Template,
+tokenizer and missing-template failures, invalid requests, and
+`ConstraintPreparation` failures do not authorize automatic emulation. Protocol,
+structural-token and compiler failures have separate `ConstraintPreparationError`
+variants; compiler initialization errors propagate when native tools are requested.
+Human-readable diagnostics are for display, never fallback classification.
 
 ## Function schemas
 
