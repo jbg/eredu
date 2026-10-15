@@ -362,7 +362,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+            .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
             .count(),
         1
     );
@@ -535,7 +535,7 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                 assert_eq!(
                     events
                         .iter()
-                        .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                        .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                         .count(),
                     count
                 );

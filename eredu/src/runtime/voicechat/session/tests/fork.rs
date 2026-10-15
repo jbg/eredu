@@ -213,6 +213,15 @@ fn fork_rekeys_queued_tools_and_maps_delivered_waits_without_executing_them_agai
                     name: parent_name,
                 },
                 SemanticEvent::ToolCallStart { id, name, .. },
+            )
+            | (
+                SemanticEvent::ToolCallCompleted {
+                    index,
+                    id: parent_id,
+                    name: parent_name,
+                    ..
+                },
+                SemanticEvent::ToolCallCompleted { id, name, .. },
             ) => {
                 assert_ne!(parent_id, id);
                 assert_eq!(
@@ -229,6 +238,20 @@ fn fork_rekeys_queued_tools_and_maps_delivered_waits_without_executing_them_agai
             _ => assert_eq!(parent, fork),
         }
     }
+    let completed_arguments = |batch: &crate::runtime::voicechat::VoiceChatToolBatch| {
+        batch
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SemanticEvent::ToolCallCompleted { arguments, .. } => Some(arguments.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        completed_arguments(&source_batch),
+        completed_arguments(&child_batch)
+    );
     let mut delivered = source.fork(RequestId::new(903)).unwrap();
     assert!(delivered.output.pop_output().is_none());
     assert_eq!(delivered.pending_tool.unwrap().0, parent_ticket);
@@ -344,7 +367,8 @@ fn fork_rejects_tool_id_growth_before_copying_when_publication_capacity_is_too_s
     let (state, mut input, mut receiver, _) = fixture_state();
     input.submit(&[0.25; 1280], INPUT_SAMPLE_RATE).unwrap();
     let mut bounded = config();
-    bounded.publication_capacity.tool_bytes = 48;
+    // Both provisional and completed payloads fit; longer fork IDs do not.
+    bounded.publication_capacity.tool_bytes = 96;
     let mut source = Session::start(state, bounded).unwrap();
     source.enable_snapshots(limits(1)).unwrap();
     let mut position = Position::default();

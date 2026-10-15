@@ -52,10 +52,16 @@ references fail before rendering.
 The decoder applies argument constraints when its grammar engine can compile
 them. Otherwise, it constrains the tool envelope, function names, call limits,
 and argument syntax. Every completed argument object is validated against the
-original schema before `ToolCallEnd` is emitted. This also preserves exact
+original schema before `ToolCallCompleted` is emitted. This also preserves exact
 `oneOf` semantics when alternatives overlap. Invalid arguments produce a semantic
 generation error; previously streamed argument fragments remain provisional.
-Applications should execute a call only after receiving `ToolCallEnd`.
+Applications execute a call only after receiving `ToolCallCompleted { index, id,
+name, arguments }`. Its name is the original application identity and its
+arguments are a parsed `serde_json::Map<String, Value>`, ready for dispatch
+without concatenating fragments or parsing JSON again. `ToolCallStart` and
+`ToolArgumentsDelta` support incremental display and remain provisional.
+Completion validates the declared schema; applications retain authorization and
+execution policy.
 
 Non-JSON protocols retain their spelling requirements, such as identifier-shaped
 argument names and tagged-parameter delimiters. LFM2 argument names use
@@ -122,8 +128,8 @@ occur on one committed token, precedence is stop sequence, grammar completion,
 EOS, then maximum tokens.
 
 Grammar completion requires a terminal grammar state. With parallel Qwen XML
-calls enabled, each `ToolCallEnd` leaves generation open while another call is
-allowed. The model can end the response with EOS before reaching the call
+calls enabled, each `ToolCallCompleted` leaves generation open while another
+call is allowed. The model can end the response with EOS before reaching the call
 limit; reaching the limit completes the grammar.
 
 ## Cancellation and backpressure
@@ -171,9 +177,9 @@ breaks and Unicode inside string values are retained. The unescaped
 
 An opening marker commits generation to completing a schema-valid call; EOS is
 masked until the call can end. A budget, cancellation or transport boundary may
-still interrupt generation. Applications execute only after `ToolCallEnd`, never
-on an opening marker, `ToolCallStart`, or argument delta. Incomplete tagged calls
-return a parsing error without publishing `ToolCallEnd`.
+still interrupt generation. Applications execute only after
+`ToolCallCompleted`, never on an opening marker, `ToolCallStart`, or argument delta. Incomplete tagged calls
+return a parsing error without publishing `ToolCallCompleted`.
 
 Regardless of wire format, the public result is the same semantic event
 vocabulary. Unsupported behavior returns a capability error rather than

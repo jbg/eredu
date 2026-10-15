@@ -3,19 +3,26 @@
 
 /// Bounds additional history after the already-retained prefix has been counted.
 ///
-/// `Delivery::send` charges a complete `ControlledGenerationRecord` before cloning
-/// its semantic event. JSON encodes every owned string in `SemanticEvent` with at
-/// least its UTF-8 length. Even the smallest record's fixed fields exceed the
-/// event's inline size, including string descriptors. Therefore each retained
-/// event's logical storage is at most its charged record length, including empty
-/// deltas, tool boundaries and termination. Tests below check the wire/storage
-/// relationship with minimum metadata and every event variant.
-///
+/// `Delivery::send` charges a complete record before retaining its semantic
+/// event. Parsed argument containers can occupy more logical storage than their
+/// JSON encoding: each encoded byte can introduce a value or object entry.
+/// For tool-enabled streams, bound future history by that expansion, including
+/// string and entry metadata. Text-only streams retain the encoded-byte bound.
 /// Nonsemantic records also consume trace capacity, making this conservative.
 /// Restore never refunds emitted bytes. A fresh branch uses zero emitted bytes;
 /// its source reservation accounts for the inherited history independently.
-pub(super) fn semantic_history_growth_bound(trace_limit: u64, emitted_bytes: u64) -> u64 {
-    trace_limit.saturating_sub(emitted_bytes)
+pub(super) fn semantic_history_growth_bound(
+    trace_limit: u64,
+    emitted_bytes: u64,
+    tool_calls: bool,
+) -> u64 {
+    trace_limit
+        .saturating_sub(emitted_bytes)
+        .saturating_mul(if tool_calls {
+            crate::runtime::generation::storage::JSON_STORAGE_PER_BYTE
+        } else {
+            1
+        })
 }
 
 #[cfg(test)]
@@ -54,7 +61,19 @@ mod tests {
 
     #[test]
     fn semantic_history_is_bounded_by_charged_records_for_every_event_variant() {
-        let mut events = vec![SemanticEvent::ToolCallEnd];
+        let mut events = Vec::new();
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"items": [0, 0, 0], "nested": {"": [true, null, {}]}, "text": "é🙂"}),
+            serde_json::json!({"items": vec![0; 4096]}),
+        ] {
+            events.push(SemanticEvent::ToolCallCompleted {
+                index: 0,
+                id: String::new(),
+                name: String::new(),
+                arguments: arguments.as_object().unwrap().clone(),
+            });
+        }
         for reason in [
             FinishReason::Eos,
             FinishReason::StopSequence,
@@ -97,22 +116,26 @@ mod tests {
             budget.charge(&record).unwrap();
             let charged = budget.emitted_bytes() - before;
             assert!(
-                logical <= charged,
+                logical <= semantic_history_growth_bound(charged, 0, true),
                 "{logical} retained bytes exceed {charged} charged bytes: {:?}",
                 record.generation.event
             );
             retained += logical;
             assert!(
                 retained
-                    + semantic_history_growth_bound(limits.total_bytes, budget.emitted_bytes())
-                    <= limits.total_bytes
+                    + semantic_history_growth_bound(
+                        limits.total_bytes,
+                        budget.emitted_bytes(),
+                        true
+                    )
+                    <= semantic_history_growth_bound(limits.total_bytes, 0, true)
             );
         }
         assert_eq!(
-            semantic_history_growth_bound(limits.total_bytes, limits.total_bytes),
+            semantic_history_growth_bound(limits.total_bytes, limits.total_bytes, true),
             0
         );
-        assert_eq!(semantic_history_growth_bound(0, 1), 0);
-        assert_eq!(semantic_history_growth_bound(u64::MAX, 0), u64::MAX);
+        assert_eq!(semantic_history_growth_bound(0, 1, true), 0);
+        assert_eq!(semantic_history_growth_bound(u64::MAX, 0, true), u64::MAX);
     }
 }

@@ -133,6 +133,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                 bytes.checked_add(super::retention::semantic_history_growth_bound(
                     options.trace_limits.total_bytes,
                     0,
+                    snapshot.pipeline.tool_calls_enabled(),
                 ))
             })
             .ok_or(ExecutionControlError::UnknownEstimate)?;

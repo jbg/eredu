@@ -1253,14 +1253,20 @@ mod tests {
         let mut parser = plan.create_parser().unwrap();
         parser.push(&valid).unwrap();
         parser.finish(FinishReason::GrammarComplete).unwrap();
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         for invalid in [
             valid.replace("count=2", "count=1"),
             valid.replace("[1, 2]", "[1, 1]"),
         ] {
             let mut parser = plan.create_parser().unwrap();
             assert!(parser.push(&invalid).is_err());
-            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert!(!parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         }
     }
 
@@ -1366,7 +1372,10 @@ mod tests {
                 Value::Object(expected.clone()),
                 "byte split {split}"
             );
-            assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert!(parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             assert_eq!(joined_text(parser.events()), "");
         }
     }
@@ -1389,7 +1398,7 @@ mod tests {
         parser.finish(FinishReason::GrammarComplete).unwrap();
 
         // `const` uses the permissive surface grammar; completed arguments
-        // must still pass JSON Schema validation before ToolCallEnd is emitted.
+        // must still pass JSON Schema validation before ToolCallCompleted is emitted.
         let invalid_const = valid.replace("True", "False");
         assert!(accepts(&plan, &invalid_const));
         for call in [
@@ -1408,7 +1417,10 @@ mod tests {
             let mut parser = plan.create_parser().unwrap();
             assert!(parser.push(&output).is_err(), "{call}");
             assert!(
-                !parser.events().contains(&SemanticEvent::ToolCallEnd),
+                !parser
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })),
                 "{call}"
             );
         }
@@ -1471,7 +1483,10 @@ mod tests {
             let output = format!("{TOOL_CALL_START}[delegate({name}=True)]{TOOL_CALL_END}");
             let mut parser = plan.create_parser().unwrap();
             assert!(parser.push(&output).is_err(), "{name:?}");
-            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert!(!parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         }
     }
 
@@ -1512,7 +1527,10 @@ mod tests {
                 id: "call_0".into(),
                 name: "dispatch".into(),
             }));
-            assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert!(parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             for event in parser.events() {
                 let fragment = match event {
                     SemanticEvent::TextDelta(fragment)
@@ -1595,7 +1613,7 @@ mod tests {
         assert!(!parser
             .events()
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 
     #[test]
@@ -1637,7 +1655,7 @@ mod tests {
                 assert!(!parser
                     .events()
                     .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             }
         }
     }

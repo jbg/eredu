@@ -1304,7 +1304,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
             assert!(!parser
                 .events()
                 .iter()
-                .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         }
         let mut malformed = plan.create_parser().unwrap();
         assert!(malformed
@@ -1424,7 +1424,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
     assert!(!incomplete
         .events()
         .iter()
-        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
 }
 
 #[test]
@@ -1554,7 +1554,7 @@ fn production_nemotron_renders_golden_parallel_history_and_prompt() {
     assert!(!incomplete
         .events()
         .iter()
-        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     let mut malformed = plan.create_parser().unwrap();
     assert!(malformed
         .push(r#"<TOOLCALL>[{"name":"lookup","arguments":{"value":]}}]</TOOLCALL>"#)
@@ -1724,7 +1724,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
     assert!(!incomplete
         .events()
         .iter()
-        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     let mut malformed = required_plan.create_parser().unwrap();
     assert!(malformed
         .push("reasoning\n</think>\n\n<TOOLCALL>[{\"name\":\"lookup\",\"arguments\":{\"query\":]}}")
@@ -2074,7 +2074,10 @@ fn lfm2_optional_keyword_arguments_prepare_parse_and_render_history() {
         let arguments: serde_json::Value =
             serde_json::from_str(&tool_argument_events(parser.events())[0]).unwrap();
         assert_eq!(arguments, expected);
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         request.messages = vec![
             json!({"role": "user", "content": "Delegate."}),
             json!({"role": "assistant", "content": "", "tool_calls": [{
@@ -2564,7 +2567,7 @@ fn inkling_native_tools_render_constrain_and_parse_protocol() {
         parser
             .events()
             .iter()
-            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+            .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
             .count(),
         2
     );
@@ -3080,7 +3083,7 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
             parser
                 .events()
                 .iter()
-                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                 .count(),
             1,
             "split {split}"

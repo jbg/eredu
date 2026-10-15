@@ -64,9 +64,10 @@ impl<D: SnapshotValue> SnapshotValue for Queue<D> {
 fn event_strings(event: &SemanticEvent) -> impl Iterator<Item = &String> {
     let fields = match event {
         SemanticEvent::ReasoningDelta(text) | SemanticEvent::TextDelta(text) => [Some(text), None],
-        SemanticEvent::ToolCallStart { id, name, .. } => [Some(id), Some(name)],
+        SemanticEvent::ToolCallStart { id, name, .. }
+        | SemanticEvent::ToolCallCompleted { id, name, .. } => [Some(id), Some(name)],
         SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => [Some(json_fragment), None],
-        SemanticEvent::ToolCallEnd | SemanticEvent::Finished { .. } => [None, None],
+        SemanticEvent::Finished { .. } => [None, None],
     };
     fields.into_iter().flatten()
 }
@@ -95,7 +96,14 @@ impl<D: SnapshotValue> SnapshotValue for VoiceChatConversationOutput<D> {
             .iter()
             .flat_map(|batch| batch.events.iter())
             .map(|event| {
-                snapshot_value_estimate::<SemanticEvent>(event_strings(event).map(text_estimate))
+                let arguments = if let SemanticEvent::ToolCallCompleted { arguments, .. } = event {
+                    Some(arguments_estimate(arguments))
+                } else {
+                    None
+                };
+                snapshot_value_estimate::<SemanticEvent>(
+                    event_strings(event).map(text_estimate).chain(arguments),
+                )
             });
         snapshot_value_estimate::<Self>(
             std::iter::once(self.frame.estimate_snapshot_value())
@@ -186,7 +194,122 @@ fn copy_event(event: &SemanticEvent) -> Result<SemanticEvent, BackendFailure> {
             index: *index,
             json_fragment: copy_text(json_fragment)?,
         },
-        SemanticEvent::ToolCallEnd => SemanticEvent::ToolCallEnd,
+        SemanticEvent::ToolCallCompleted {
+            index,
+            id,
+            name,
+            arguments,
+        } => SemanticEvent::ToolCallCompleted {
+            index: *index,
+            id: copy_text(id)?,
+            name: copy_text(name)?,
+            arguments: copy_arguments(arguments)?,
+        },
         SemanticEvent::Finished { reason } => SemanticEvent::Finished { reason: *reason },
     })
+}
+
+// Include container slots and conservative tree-node overhead alongside all
+// recursively owned strings. One KiB per entry also covers a sparse B-tree
+// node. These copies are admitted before allocation.
+fn arguments_estimate(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<SnapshotEstimate, BackendFailure> {
+    snapshot_value_estimate::<serde_json::Map<String, serde_json::Value>>(arguments.iter().map(
+        |(key, value)| {
+            let mut estimate = snapshot_value_estimate::<serde_json::Value>([
+                text_estimate(key),
+                json_estimate(value),
+            ])?;
+            estimate.retained_bytes = estimate
+                .retained_bytes
+                .checked_add(1024)
+                .ok_or_else(|| BackendFailure::from_error(ExecutionControlError::Overflow))?;
+            estimate.copy_bytes = estimate
+                .copy_bytes
+                .checked_add(1024)
+                .ok_or_else(|| BackendFailure::from_error(ExecutionControlError::Overflow))?;
+            Ok(estimate)
+        },
+    ))
+}
+
+fn json_estimate(value: &serde_json::Value) -> Result<SnapshotEstimate, BackendFailure> {
+    match value {
+        serde_json::Value::String(text) => text_estimate(text),
+        serde_json::Value::Object(object) => arguments_estimate(object),
+        serde_json::Value::Array(values) => {
+            let slots = values
+                .capacity()
+                .checked_mul(std::mem::size_of::<serde_json::Value>())
+                .ok_or_else(|| BackendFailure::from_error(ExecutionControlError::Overflow))?
+                as u64;
+            snapshot_value_estimate::<serde_json::Value>(
+                std::iter::once(Ok(SnapshotEstimate {
+                    retained_bytes: slots,
+                    copy_bytes: slots,
+                }))
+                .chain(values.iter().map(json_estimate)),
+            )
+        }
+        _ => snapshot_value_estimate::<serde_json::Value>([]),
+    }
+}
+
+fn copy_arguments(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, BackendFailure> {
+    arguments
+        .iter()
+        .map(|(key, value)| Ok((copy_text(key)?, copy_json(value)?)))
+        .collect()
+}
+
+fn copy_json(value: &serde_json::Value) -> Result<serde_json::Value, BackendFailure> {
+    Ok(match value {
+        serde_json::Value::String(text) => serde_json::Value::String(copy_text(text)?),
+        serde_json::Value::Object(object) => serde_json::Value::Object(copy_arguments(object)?),
+        serde_json::Value::Array(values) => {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(values.len())
+                .map_err(BackendFailure::from_error)?;
+            for value in values {
+                copied.push(copy_json(value)?);
+            }
+            serde_json::Value::Array(copied)
+        }
+        _ => value.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completed_call_snapshot_keeps_nested_arguments_independent_and_prices_array_slots() {
+        let arguments = json!({"items": [null, true, 3, "é🙂", {"nested": [[], {}]}], "dense": vec![0; 4096]});
+        let event = SemanticEvent::ToolCallCompleted {
+            index: 2,
+            id: "call-2".into(),
+            name: "extension.lookup".into(),
+            arguments: arguments.as_object().unwrap().clone(),
+        };
+        let mut copied = copy_event(&event).unwrap();
+        assert_eq!(copied, event);
+        let SemanticEvent::ToolCallCompleted { arguments: copy, .. } = &mut copied else {
+            panic!("completed call");
+        };
+        copy["items"][4]["nested"][0] = json!(["changed"]);
+        let SemanticEvent::ToolCallCompleted { arguments: original, .. } = &event else {
+            panic!("completed call");
+        };
+        assert_eq!(original["items"][4]["nested"][0], json!([]));
+        let estimate = arguments_estimate(original).unwrap();
+        let slots = 4096 * std::mem::size_of::<serde_json::Value>() as u64;
+        assert!(estimate.retained_bytes >= slots);
+        assert!(estimate.copy_bytes >= slots);
+    }
 }

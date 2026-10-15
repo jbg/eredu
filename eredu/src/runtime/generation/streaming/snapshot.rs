@@ -52,7 +52,16 @@ impl SnapshotStorage for SemanticEvent {
                 index: _,
                 json_fragment,
             } => json_fragment.heap_bytes(),
-            Self::ToolCallEnd | Self::Finished { reason: _ } => Some(0),
+            Self::ToolCallCompleted {
+                id,
+                name,
+                arguments,
+                ..
+            } => id
+                .heap_bytes()?
+                .checked_add(name.heap_bytes()?)?
+                .checked_add(arguments.heap_bytes()?),
+            Self::Finished { reason: _ } => Some(0),
         }
     }
 }
@@ -121,6 +130,15 @@ impl CommittedGenerationCursor {
 }
 
 impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
+    pub(crate) fn tool_calls_enabled(&self) -> bool {
+        let sink = &self.parser.stream.sink;
+        sink.tool_calls_enabled
+            && sink
+                .tool_schemas
+                .as_ref()
+                .is_none_or(|schemas| !schemas.is_empty())
+    }
+
     pub(crate) fn continuation_event_storage_bytes(&self, max_predictions: u64) -> Option<u64> {
         let (_, input) = self
             .decoder
@@ -152,6 +170,17 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
         decoder
             .checked_add(parser)?
             .checked_add(input.checked_mul(10)?)?
+            // A closing byte can complete an argument buffer inherited at the
+            // saved boundary. Price its parsed object as well as fresh input.
+            .checked_add(
+                input
+                    .checked_add(self.parser.stream.sink.active_tool_call.snapshot_bytes()?)?
+                    .checked_mul(if self.tool_calls_enabled() {
+                        6 * crate::runtime::generation::storage::JSON_STORAGE_PER_BYTE
+                    } else {
+                        0
+                    })?,
+            )?
             .checked_add(64)?
             .checked_add(max_predictions.checked_mul(4)?)?
             .checked_add(self.parser.stream.sink.tool_names.event_growth_bytes(input)?)

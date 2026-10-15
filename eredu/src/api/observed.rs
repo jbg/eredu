@@ -22,7 +22,7 @@ use std::{
 };
 
 /// Version of attributed generation events, independently of tensor-capture records.
-pub const GENERATION_SCHEMA_VERSION: u32 = 3;
+pub const GENERATION_SCHEMA_VERSION: u32 = 4;
 
 fn is_false(value: &bool) -> bool {
     !*value

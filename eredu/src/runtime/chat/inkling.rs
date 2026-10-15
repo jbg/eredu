@@ -768,7 +768,7 @@ mod tests {
             parser
                 .events()
                 .iter()
-                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                 .count(),
             2
         );

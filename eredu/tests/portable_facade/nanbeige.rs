@@ -139,9 +139,10 @@ fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
         on_event: |e| events.push(e),
     });
     assert!(result.is_err());
-    assert!(!events
-        .iter()
-        .any(|e| matches!(e, SemanticEvent::ToolCallEnd | SemanticEvent::TextDelta(_))));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        SemanticEvent::ToolCallCompleted { .. } | SemanticEvent::TextDelta(_)
+    )));
 }
 
 #[test]
@@ -176,7 +177,7 @@ fn official_nanbeige_xml_whitespace_values_and_history() {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, SemanticEvent::ToolCallEnd))
+                .filter(|e| matches!(e, SemanticEvent::ToolCallCompleted { .. }))
                 .count(),
             2
         );

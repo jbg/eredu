@@ -344,7 +344,6 @@ impl GenerationRuntimePlan {
         Ok(parser)
     }
 
-    #[cfg(test)]
     pub(crate) fn create_parser_with_stops<'a>(
         &self,
         caller_stops: impl IntoIterator<Item = &'a str>,

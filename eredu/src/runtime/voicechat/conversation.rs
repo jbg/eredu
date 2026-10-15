@@ -726,7 +726,21 @@ impl VoiceChatPublicationCapacity {
                 SemanticEvent::ToolCallStart { id, name, .. } => &[id, name],
                 SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => &[json_fragment],
                 SemanticEvent::ReasoningDelta(text) | SemanticEvent::TextDelta(text) => &[text],
-                SemanticEvent::ToolCallEnd | SemanticEvent::Finished { .. } => &[],
+                SemanticEvent::ToolCallCompleted {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    let bytes = serde_json::to_vec(arguments)
+                        .map_err(|_| VoiceChatConversationError::Capacity("tool bytes"))?
+                        .len();
+                    remaining = remaining
+                        .checked_sub(bytes)
+                        .ok_or(VoiceChatConversationError::Capacity("tool bytes"))?;
+                    &[id, name]
+                }
+                SemanticEvent::Finished { .. } => &[],
             };
             for part in parts {
                 remaining = remaining

@@ -286,7 +286,10 @@ fn scheduler_progress_can_be_dropped_without_losing_committed_speech_or_tool_cal
         matches!(&batch.events[1], SemanticEvent::ToolArgumentsDelta { json_fragment, .. }
         if serde_json::from_str::<serde_json::Value>(json_fragment).unwrap() == serde_json::json!({"city":"Paris"}))
     );
-    assert!(matches!(batch.events[2], SemanticEvent::ToolCallEnd));
+    assert!(matches!(
+        batch.events[2],
+        SemanticEvent::ToolCallCompleted { .. }
+    ));
     assert!(receiver.pop_output().is_none());
     assert_eq!(state.usage().queued_publications, 0);
     state.submit_response(ticket, "ok").unwrap();

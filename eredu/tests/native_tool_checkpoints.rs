@@ -190,7 +190,7 @@ fn smoke_with_tool(
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+            .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
             .count(),
         1,
         "{environment} did not structurally close exactly one tool call; decoded={decoded:?}; events={events:?}"
@@ -441,7 +441,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                         assert_eq!(
                             events
                                 .iter()
-                                .filter(|e| matches!(e, SemanticEvent::ToolCallEnd))
+                                .filter(|e| matches!(e, SemanticEvent::ToolCallCompleted { .. }))
                                 .count(),
                             1,
                             "{events:?}"
@@ -465,7 +465,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                             .collect::<String>();
                         let args: serde_json::Value = serde_json::from_str(&args).unwrap();
                         assert_eq!(args, expected_arguments);
-                        // Dispatch only after ToolCallEnd/schema validation. The
+                        // Dispatch only after ToolCallCompleted/schema validation. The
                         // returned word is absent from the original prompt.
                         let result = match (name.as_str(), args["value"].as_i64()) {
                             ("lookup", Some(7)) => {
@@ -505,7 +505,7 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                         assert_eq!(text.trim(), "cobalt", "{events:?}");
                         assert!(!events
                             .iter()
-                            .any(|e| matches!(e, SemanticEvent::ToolCallEnd)));
+                            .any(|e| matches!(e, SemanticEvent::ToolCallCompleted { .. })));
                     }
                 }
                 assert_eq!(executions, 1);

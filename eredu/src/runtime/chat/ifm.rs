@@ -259,7 +259,10 @@ mod tests {
                             parser
                                 .events()
                                 .iter()
-                                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                                .filter(|event| matches!(
+                                    event,
+                                    SemanticEvent::ToolCallCompleted { .. }
+                                ))
                                 .count(),
                             2
                         );
@@ -317,7 +320,7 @@ mod tests {
                     parser
                         .events()
                         .iter()
-                        .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                        .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                         .count(),
                     1
                 );
@@ -347,7 +350,7 @@ mod tests {
                     !parser
                         .events()
                         .iter()
-                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)),
+                        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })),
                     "format {format}, cut {cut}"
                 );
             }
@@ -359,7 +362,7 @@ mod tests {
                 assert!(!parser
                     .events()
                     .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             }
         }
     }

@@ -770,7 +770,7 @@ fn write_semantic_event(
             serde_json::to_string(name)?,
         )),
         SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.clone()),
-        SemanticEvent::ToolCallEnd => Some("}}\n".into()),
+        SemanticEvent::ToolCallCompleted { .. } => Some("}}\n".into()),
         SemanticEvent::ReasoningDelta(text) => {
             reasoning_stream.write_delta(stderr, text, reasoning_output)?;
             None

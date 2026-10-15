@@ -271,7 +271,10 @@ fn reserved_capacity_and_discard_preserve_a_complete_unpublished_call() {
         matches!(&batch.events[1], SemanticEvent::ToolArgumentsDelta { index: 0, json_fragment }
         if serde_json::from_str::<serde_json::Value>(json_fragment).unwrap() == serde_json::json!({"city":"Paris"}))
     );
-    assert!(matches!(&batch.events[2], SemanticEvent::ToolCallEnd));
+    assert!(matches!(
+        &batch.events[2],
+        SemanticEvent::ToolCallCompleted { .. }
+    ));
 }
 
 #[test]

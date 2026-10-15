@@ -984,24 +984,35 @@ pub enum SemanticEvent {
     ReasoningDelta(String),
     /// Incremental user-visible text.
     TextDelta(String),
-    /// A structured tool call began.
+    /// A provisional structured tool call began. Only `ToolCallCompleted` is executable.
     ToolCallStart {
         /// Zero-based tool-call position in the assistant turn.
         index: usize,
         /// Stable tool-call identifier.
         id: String,
-        /// Tool name selected by the model.
+        /// Original application tool name selected by the model.
         name: String,
     },
-    /// Incremental structured tool arguments.
+    /// Provisional structured tool arguments. Only `ToolCallCompleted` is executable.
     ToolArgumentsDelta {
         /// Zero-based tool-call position in the assistant turn.
         index: usize,
         /// A fragment of the tool call's JSON arguments.
         json_fragment: String,
     },
-    /// A structured tool call ended.
-    ToolCallEnd,
+    /// A closed tool call with parsed object arguments, validated against the
+    /// prepared request's tool schema. Provisional start/delta events alone do
+    /// not authorize dispatch. Interrupted or invalid calls never complete.
+    ToolCallCompleted {
+        /// Zero-based tool-call position in the assistant turn.
+        index: usize,
+        /// Stable tool-call identifier, matching the start event.
+        id: String,
+        /// Original application tool name, matching the start event.
+        name: String,
+        /// Complete parsed arguments. Application authorization remains with the caller.
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
     /// Generation terminated.
     Finished {
         /// The condition that ended the stream.

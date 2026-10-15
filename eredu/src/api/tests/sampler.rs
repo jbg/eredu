@@ -635,7 +635,7 @@ fn none_parser_never_emits_tool_events() {
         event,
         SemanticEvent::ToolCallStart { .. }
             | SemanticEvent::ToolArgumentsDelta { .. }
-            | SemanticEvent::ToolCallEnd
+            | SemanticEvent::ToolCallCompleted { .. }
     )));
 }
 

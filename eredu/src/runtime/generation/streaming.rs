@@ -594,11 +594,23 @@ impl SemanticEventSink {
             .active_tool_call
             .as_ref()
             .expect("tool end requires an active call");
-        if let Some(schemas) = &self.tool_schemas {
-            schemas.validate(&call.name, &call.arguments)?;
-        }
-        self.active_tool_call = None;
-        self.events.push(SemanticEvent::ToolCallEnd);
+        let arguments = if let Some(schemas) = &self.tool_schemas {
+            schemas.validate(&call.name, &call.arguments)?
+        } else {
+            crate::runtime::chat::tool_schema::parse_arguments(&call.name, &call.arguments)?
+        };
+        let call = self.active_tool_call.take().expect("validated active call");
+        let name = self
+            .tool_names
+            .original(&call.name)
+            .unwrap_or(&call.name)
+            .to_owned();
+        self.events.push(SemanticEvent::ToolCallCompleted {
+            index: call.index,
+            id: call.id,
+            name,
+            arguments,
+        });
         Ok(())
     }
 
@@ -863,7 +875,9 @@ impl fmt::Debug for ToolRuntimeParser {
 
 impl ToolRuntimeParser {
     pub(crate) fn text<'a>(caller_stops: impl IntoIterator<Item = &'a str>) -> Self {
-        Self::new_with_structural_stops(Box::new(TextParser), [], caller_stops, [])
+        let mut parser = Self::new_with_structural_stops(Box::new(TextParser), [], caller_stops, []);
+        parser.stream.sink.tool_calls_enabled = false;
+        parser
     }
 
     /// Preserves lookbehind, partial protocol state, terminal state and delivery.
@@ -915,7 +929,6 @@ impl ToolRuntimeParser {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn disable_tool_calls(&mut self) {
         self.stream.sink.tool_calls_enabled = false;
     }
@@ -1829,12 +1842,16 @@ mod tests {
                 id: "id-7".into(),
                 name: "weather".into(),
             }));
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
-                    .count(),
-                1,
+            assert!(
+                events.contains(&SemanticEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "id-7".into(),
+                    name: "weather".into(),
+                    arguments: serde_json::json!({"city":"Bogotá"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                }),
                 "split {split}"
             );
             assert_eq!(
@@ -1884,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_final_calls_do_not_emit_tool_call_end() {
+    fn incomplete_final_calls_do_not_complete() {
         for input in [
             r#"<call:id:name>{"partial":"#,
             r#"<call:id:name>{"complete":true}"#,
@@ -1904,7 +1921,7 @@ mod tests {
                 assert!(!stream
                     .events()
                     .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
                 assert_eq!(
                     stream.events().last(),
                     Some(&SemanticEvent::Finished {
@@ -2158,7 +2175,7 @@ mod tests {
             .any(|event| matches!(event, SemanticEvent::ToolCallStart { .. })));
         assert!(!events
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         assert_exactly_one_finished(&events, FinishReason::Cancelled);
     }
 
