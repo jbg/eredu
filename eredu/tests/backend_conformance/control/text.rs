@@ -436,22 +436,15 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
             ..request()
         })
         .is_err());
-    let required = model
-        .prepare_chat(ChatTemplateRequest {
+    assert!(matches!(
+        model.prepare_chat(ChatTemplateRequest {
             tool_choice: ToolChoice::Required,
             ..request()
-        })
-        .unwrap();
-    let prepared = prepare(&model, &required, settings, 0);
-    assert!(model
-        .start_controlled(
-            prepared,
-            &[],
-            Default::default(),
-            |_| panic!("required tools admitted"),
-            eredu::api::OutputMode::Text
-        )
-        .is_err());
+        }),
+        Err(eredu::api::TextModelError::InvalidRequest(
+            eredu::api::ChatRequestError::RequiredToolsMissing
+        ))
+    ));
     let raw = model
         .prepare_chat(ChatTemplateRequest {
             enable_thinking: Some(true),
