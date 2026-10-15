@@ -190,9 +190,12 @@ fn unsupported_target_lowering_fails_before_native_resources() {
         Err(error) => error,
     };
 
+    let eredu_core::AutomaticPlanningError::Invalid(detail) = error else {
+        panic!("invalid packing geometry must return a portable planning rejection: {error}");
+    };
     assert!(
-        error.to_string().contains("select_model_preparation"),
-        "{error}"
+        detail.contains("affine group size 32768 does not divide packed extent"),
+        "{detail}"
     );
     assert_eq!(
         crate::tests::support::path_instrumentation::target_native_resource_realization_attempts(),
