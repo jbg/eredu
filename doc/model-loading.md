@@ -6,14 +6,39 @@ cache, and paging a cache does not change where model weights live.
 
 ## Preflight
 
-Applications run `eredu::api::inspect_local_model` with the same
-`LocalInspectionOptions` they intend to load.
-Inspection validates the artifact, architecture, requested quantization,
-residency policy, topology, processor, and media companion files without
-materializing weights. It is the cheapest place to reject an incompatible
-backend request. Apply `api::inspect_text_model` to that report when admission
-also requires tokenizer, chat-template, EOS, semantic-streaming, or native-tool
-readiness.
+Applications admit a local `ArtifactSource` with `eredu::api::inspect_artifact`,
+then resolve text policy once with `PreparedTextModel::from_artifact`.
+`PreparedTextModel::inspect` probes the retained tokenizer, template, and EOS
+policy without selecting a backend. Its requested-load readiness remains
+unverified. Invalid selected text metadata returns a typed preparation error;
+missing chat templates still permit raw generation.
+
+`PreparedTextModel::select_execution_plan` validates the exact complete plan
+against a backend factory's cold facts and retains target and drafting admission,
+including external-assistant vocabulary compatibility. `SelectedTextModel::inspect`
+combines that retained selection's report with optional text probes. `load()`
+consumes the selection through the same factory without accepting another plan,
+reopening text sidecars, or repeating cold selection. Native resource acquisition
+and guarded payload access can still fail during realization. Chat probes describe
+the supplied request, not every future conversation.
+
+`ArtifactSource::with_projector` accepts `CompanionSelection::Discover`,
+`Explicit(path)`, or `Disabled`. Explicit files bypass sibling discovery and have
+no fallback. They undergo container, encoding, geometry, and family compatibility
+admission. Disabling a required role or selecting an undeclared role is a typed
+error. Automatically discovered files follow the same admission rules and reject
+ambiguous candidates.
+
+`inspect_safetensors_snapshot` is available without any backend feature. It checks
+complete headers, file lengths, and exact index membership using canonical
+`eredu-checkpoint` admission. Directory checkpoints use `model.safetensors`, or
+`model.safetensors.index.json` for a sharded set; filenames alone cannot prove
+completeness. This check does not establish payload checksums, supported model
+architecture, text readiness, or native backend availability.
+
+Path-based `LoadedModel` convenience loaders use the same retained pipeline.
+`inspect_local_model` remains a report-only diagnostic for selected-local-backend
+policy; callers proceeding to loading use the retained API.
 
 The selected local backend's `eredu::api::LocalLoadOptions` contain portable
 load policy:

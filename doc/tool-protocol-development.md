@@ -95,8 +95,8 @@ checkpoint-backed ignored test only when fixture-level behavior cannot prove a
 required property; it must use a caller-supplied local path and must never
 download a checkpoint.
 
-Before accepting support, pass the structural backend report through
-`inspect_text_model`, borrowing the `TextModelOptions` intended for loading
-and supplying the same request in `TextInspectionOptions`, verify
+Before accepting support, prepare a `PreparedTextModel` with the selected
+`TextModelOptions`, select the intended execution plan, and inspect that retained
+selection with the same request in `TextInspectionOptions`. Verify
 that unsupported templates remain ordinary-chat-only, and ensure raw
 generation does not inherit a native-tool capability.

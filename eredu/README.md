@@ -64,8 +64,9 @@ crate and use the generic facade types in `eredu::api`.
 Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` for
 portable plan-to-backend realization. These entry points return
 `PlannedModel<B, D>`, which owns the target and `RealizedDrafting<D>`. Automatic
-planning can retain its artifact inspection for
-`LoadedModel::load_inspected_execution_plan`. Prepared-chat requests, controlled
+planning retains an artifact inspection for
+`PreparedTextModel::from_artifact`; its `select_execution_plan` result supports
+inspection and consuming `load()` without rediscovery. Prepared-chat requests, controlled
 generation sessions, snapshots, and branches keep their backend parameter too.
 Low-level token generation returns `B::Token`; use `eredu_core::TokenOutput` to
 obtain its vocabulary ID.
@@ -85,7 +86,13 @@ let planned = LoadedModel::load_execution_plan_with_text_options(
 ```
 
 The same options are accepted by `plan_and_load_with_text_options`,
-`load_inspected_execution_plan_with_text_options`, and `load_with_text_options`.
+`load_with_text_options`, and `PreparedTextModel::from_artifact`. For preflight,
+use `api::inspect_artifact(&ArtifactSource::new(path))`, prepare text once, then
+select the execution plan, inspect the retained selection, and consume it with
+`load()`. `ArtifactSource::with_projector(CompanionSelection::Explicit(path))`
+selects a projector directly without sibling discovery. Portable
+`api::inspect_safetensors_snapshot` validates complete shard headers and exact
+index membership without MLX.
 Templates may be a single Jinja string or an `eredu_text::tokenizer::ModelChatTemplate::Named`
 collection. The override takes precedence over checkpoint templates and retains
 the checkpoint's tokenizer variables, EOS ids, and generation defaults.

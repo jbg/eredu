@@ -1,9 +1,18 @@
 use super::*;
-use eredu::api::{inspect_text_model, TextInspectionOptions, TextModelError, TextModelOptions};
+use eredu::api::{PreparedTextModel, TextInspectionOptions, TextModelError, TextModelOptions};
 use eredu_core::{
     InspectionIssueCode, InspectionReadiness, InspectionSeverity, ModelInspectionReport,
 };
 use eredu_text::tokenizer::ChatTemplateIdentity;
+
+fn inspect_prepared_text(
+    path: &Path,
+    options: &TextModelOptions,
+    probe: TextInspectionOptions,
+) -> Result<ModelInspectionReport, eredu::api::LoadedModelLoadError> {
+    let artifact = eredu::api::inspect_artifact(&eredu::api::ArtifactSource::new(path))?;
+    Ok(PreparedTextModel::from_artifact(artifact, options.clone())?.inspect(probe))
+}
 
 fn request() -> ChatTemplateRequest {
     ChatTemplateRequest {
@@ -71,15 +80,14 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
         .into_parts()
         .0,
         automatically_loaded.into_parts().0,
-        LoadedModel::load_inspected_execution_plan_with_text_options(
-            &MockBackend,
-            inspection,
-            &plan,
-            text_options(),
-        )
-        .unwrap()
-        .into_parts()
-        .0,
+        PreparedTextModel::from_artifact(inspection, text_options())
+            .unwrap()
+            .select_execution_plan(&MockBackend, &plan)
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_parts()
+            .0,
         LoadedModel::load_with_text_options(MockBackend, artifact.path(), (), text_options())
             .unwrap(),
     ];
@@ -117,13 +125,14 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
             .into(),
         ),
     };
-    let report = inspect_text_model(
-        ModelInspectionReport::unverified(artifact.path(), ArtifactFormat::SafeTensors),
+    let report = inspect_prepared_text(
+        artifact.path(),
         &options,
         TextInspectionOptions {
             chat_request: Some(request()),
         },
-    );
+    )
+    .unwrap();
     assert_eq!(report.chat_template, InspectionReadiness::Ready);
     assert!(
         report.issues.iter().all(|issue| {
@@ -410,21 +419,32 @@ fn text_inspection_uses_template_overrides_for_both_artifact_formats() {
                     }),
                 )
             };
-            let baseline = inspect_text_model(
-                ModelInspectionReport::unverified(&path, format),
+            let baseline = inspect_prepared_text(
+                &path,
                 &TextModelOptions::default(),
                 TextInspectionOptions::default(),
             );
-            assert_eq!(
-                baseline.chat_template,
-                match &checkpoint_template {
-                    None => InspectionReadiness::Missing,
-                    Some(value) if value.is_string() => InspectionReadiness::Ready,
-                    Some(_) => InspectionReadiness::Invalid,
-                }
-            );
-            assert_ne!(baseline.semantic_streaming, InspectionReadiness::Ready);
-            assert_ne!(baseline.native_tools, InspectionReadiness::Ready);
+            if checkpoint_template
+                .as_ref()
+                .is_some_and(|value| !value.is_string())
+            {
+                assert!(
+                    baseline.is_err(),
+                    "invalid selected template metadata must fail preparation"
+                );
+            } else {
+                let baseline = baseline.unwrap();
+                assert_eq!(
+                    baseline.chat_template,
+                    if checkpoint_template.is_none() {
+                        InspectionReadiness::Missing
+                    } else {
+                        InspectionReadiness::Ready
+                    }
+                );
+                assert_ne!(baseline.semantic_streaming, InspectionReadiness::Ready);
+                assert_ne!(baseline.native_tools, InspectionReadiness::Ready);
+            }
 
             for template in [
                 QWEN_TEMPLATE.into(),
@@ -437,11 +457,12 @@ fn text_inspection_uses_template_overrides_for_both_artifact_formats() {
                     chat_template: Some(template),
                 };
                 for chat_request in [None, Some(request())] {
-                    let report = inspect_text_model(
-                        ModelInspectionReport::unverified(&path, format),
+                    let report = inspect_prepared_text(
+                        &path,
                         &options,
                         TextInspectionOptions { chat_request },
-                    );
+                    )
+                    .unwrap();
                     assert_eq!(report.tokenizer, InspectionReadiness::Ready);
                     assert_eq!(report.chat_template, InspectionReadiness::Ready);
                     assert_eq!(
@@ -486,7 +507,7 @@ fn text_inspection_validates_the_override_instead_of_falling_back() {
         artifact.path(),
         Some(eredu_gguf::MetadataValue::String("valid chat".into())),
     );
-    for (path, format) in [
+    for (path, _format) in [
         (artifact.path(), ArtifactFormat::SafeTensors),
         (gguf.as_path(), ArtifactFormat::Gguf),
     ] {
@@ -497,13 +518,14 @@ fn text_inspection_validates_the_override_instead_of_falling_back() {
             let options = TextModelOptions {
                 chat_template: Some(template),
             };
-            let report = inspect_text_model(
-                ModelInspectionReport::unverified(path, format),
+            let report = inspect_prepared_text(
+                path,
                 &options,
                 TextInspectionOptions {
                     chat_request: Some(request()),
                 },
-            );
+            )
+            .unwrap();
             assert_eq!(report.semantic_streaming, InspectionReadiness::Unsupported);
             assert_eq!(report.native_tools, InspectionReadiness::Unsupported);
             assert!(report.issues.iter().any(|issue| {
@@ -518,4 +540,82 @@ fn text_inspection_validates_the_override_instead_of_falling_back() {
             ));
         }
     }
+}
+
+#[test]
+fn retained_text_selection_loads_the_inspected_policy_without_rediscovery() {
+    let artifact = TestDirectory::new();
+    let assistant = TestDirectory::new();
+    write_loadable_text_artifact(artifact.path());
+    write_loadable_assistant_artifact(assistant.path());
+    std::fs::write(
+        artifact.path().join("tokenizer_config.json"),
+        r#"{"bos_token":"<bos>"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        artifact.path().join("generation_config.json"),
+        r#"{"do_sample":true,"temperature":0.25}"#,
+    )
+    .unwrap();
+    let plan = ExecutionPlan::fully_resident(DevicePlan::new("mock", "gpu:0").unwrap())
+        .with_drafting(DraftingPlan::External {
+            model: assistant.path().display().to_string(),
+            placement: DraftPlacementPlan::Target,
+            max_draft_tokens: 4,
+            lookahead: false,
+            adaptive_lookahead: false,
+        });
+    let admitted =
+        eredu::api::inspect_artifact(&eredu::api::ArtifactSource::new(artifact.path())).unwrap();
+    let prepared = PreparedTextModel::from_artifact(admitted, text_options()).unwrap();
+    // No subsequent stage may reconstruct configuration or text sidecars.
+    for name in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+    ] {
+        std::fs::remove_file(artifact.path().join(name)).unwrap();
+    }
+    FACTORY_PHASES.with_borrow_mut(Vec::clear);
+    let mut selected = prepared.select_execution_plan(&MockBackend, &plan).unwrap();
+    let report = selected.inspect(TextInspectionOptions {
+        chat_request: Some(request()),
+    });
+    assert!(report.is_loadable());
+    assert_eq!(report.text_generation, InspectionReadiness::Ready);
+    assert_eq!(selected.execution_plan(), &plan);
+    FACTORY_PHASES.with_borrow(|phases| assert_eq!(phases, &["select target", "select draft"]));
+    // Assistant discovery and vocabulary proof also finish before realization.
+    std::fs::remove_dir_all(assistant.path()).unwrap();
+    let mut loaded = selected.load().unwrap();
+    FACTORY_PHASES.with_borrow(|phases| {
+        assert_eq!(
+            phases,
+            &[
+                "select target",
+                "select draft",
+                "realize target",
+                "realize draft"
+            ]
+        )
+    });
+    assert!(loaded.drafting().is_external());
+    assert_eq!(
+        loaded
+            .model_mut()
+            .prepare_chat(request())
+            .unwrap()
+            .rendered_prompt(),
+        "<bos>goose:hello|assistant"
+    );
+    assert_eq!(
+        loaded
+            .model_mut()
+            .resolve_generation_config(Default::default())
+            .unwrap()
+            .temperature,
+        0.25
+    );
 }

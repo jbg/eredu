@@ -177,6 +177,7 @@ workspace = true
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
 eredu-core.workspace = true
+eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
@@ -196,5 +197,4 @@ jsonschema = { version = "0.52.0", default-features = false }
 [dev-dependencies]
 tempfile.workspace = true
 anyhow = "1"
-eredu-checkpoint.workspace = true
 eredu-evaluation.workspace = true

@@ -995,6 +995,10 @@ impl AutomaticPlanningBackend for MockBackend {
     }
 }
 
+thread_local! {
+    static FACTORY_PHASES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl ExecutionPlanBackendFactory for MockBackend {
     type Backend = Self;
     type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
@@ -1008,6 +1012,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         >,
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
+        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("select target"));
         let mut selection = self.select_preparation(inspection, &()).unwrap();
         selection.1 = eredu_runtime::NormalizedLoadRequest::from_execution_plan(
             plan,
@@ -1015,10 +1020,15 @@ impl ExecutionPlanBackendFactory for MockBackend {
             None,
         )
         .map_err(|error| AutomaticPlanningError::Invalid(error.to_string()))?;
+        let mut report =
+            eredu_core::ModelInspectionReport::unverified(inspection.path(), inspection.format());
+        report.record_artifact_inspection(inspection);
+        report.requested_load = eredu_core::InspectionReadiness::Ready;
         Ok(ExecutionPlanTargetSelection::new(
             eredu_core::PreparationPolicy::default(),
             selection,
             SessionCapabilities::new(true, true, false),
+            report,
         ))
     }
 
@@ -1026,6 +1036,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         &self,
         selected: SelectedExecutionPlanTarget<Self::Backend>,
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
+        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("realize target"));
         Ok(ExecutionPlanTarget::new(MockBackend, selected))
     }
 
@@ -1038,6 +1049,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         Option<ExternalDraftArtifact<Self::SelectedDrafterPreparation>>,
         AutomaticPlanningError,
     > {
+        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("select draft"));
         Ok(external_artifact)
     }
 
@@ -1047,6 +1059,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
         target: &ModelRuntime<Self::Backend>,
         selected: eredu_core::SelectedExecutionPlanDrafting<Self::SelectedDrafterPreparation>,
     ) -> Result<RealizedDrafting<MockDrafter>, AutomaticPlanningError> {
+        FACTORY_PHASES.with_borrow_mut(|phases| phases.push("realize draft"));
         let external_artifact = selected.into_external_artifact(plan, target)?;
         Ok(match plan.drafting() {
             DraftingPlan::Disabled => {

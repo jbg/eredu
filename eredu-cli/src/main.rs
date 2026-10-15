@@ -2257,7 +2257,10 @@ fn main() -> Result<()> {
         MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let planned = match retained_automatic_inspection {
         Some(inspection) => {
-            LoadedModel::load_inspected_execution_plan(&factory, inspection, &execution_plan)
+            eredu::api::PreparedTextModel::from_artifact(inspection, Default::default())
+                .map_err(eredu::api::PlannedModelLoadError::from)
+                .and_then(|prepared| prepared.select_execution_plan(&factory, &execution_plan))
+                .and_then(|selected| selected.load())
         }
         None => LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan),
     }

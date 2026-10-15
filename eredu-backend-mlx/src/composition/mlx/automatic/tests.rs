@@ -37,6 +37,22 @@ fn resident_plan_retains_reader_limit_through_cold_selection() {
     assert_eq!(options.normalized().max_cached_shards(), 7);
     let selected = super::super::loading::select_preparation(&inspection, options).unwrap();
     assert_eq!(selected.neutral().text_realization().max_cached_shards(), 7);
+    let admitted =
+        eredu_core::select_execution_plan_target(&MlxBackendFactory::default(), &plan, inspection)
+            .unwrap();
+    assert!(
+        admitted.report().is_loadable(),
+        "{:?}",
+        admitted.report().issues
+    );
+    assert_eq!(
+        admitted.report().preparation_admission,
+        Some(selected.neutral().admission())
+    );
+    assert_eq!(
+        crate::tests::support::path_instrumentation::target_native_resource_realization_attempts(),
+        0,
+    );
     let counts = crate::tests::support::path_instrumentation::snapshot();
     assert_eq!(counts.payload_opens, 0);
     assert_eq!(counts.architecture_constructions, 0);

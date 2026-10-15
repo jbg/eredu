@@ -19,246 +19,83 @@ pub fn inspect_architecture(
 }
 
 use eredu_core::{
-    ArtifactFormat, InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionSeverity,
-    ModelInspectionReport,
+    InspectionIssueCode, InspectionReadiness, InspectionSeverity, ModelInspectionReport,
 };
-use eredu_gguf::MetadataValue as GgufMetadataValue;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 
-use super::metadata::{
-    eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, merge_eos_token_id_sources,
-};
 use super::request::prepare_chat_from_parts;
-use super::tokenizer::{
-    gguf_sidecar_dir, load_gguf_tokenizer_from_metadata, load_tokenizer_template_kwargs,
-    resolve_chat_template,
-};
-use super::{load_tokenizer, TextMetadataError, TextModelOptions};
+use super::{LoadedTextModelConfig, PreparedTextModel};
 use crate::runtime::chat::{
     constraints::ConstraintCompiler, ChatTemplateRequest, NativeToolSupport, PreparedChat,
     SemanticSupport, ToolChoice,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
-/// Portable text-sidecar checks applied after a selected backend inspects an artifact.
+/// Optional behavioral probes over the exact text state retained for loading.
 #[derive(Debug, Clone, Default)]
 pub struct TextInspectionOptions {
     /// Optional concrete chat request to render and behaviorally probe.
     pub chat_request: Option<ChatTemplateRequest>,
 }
 
-/// Enriches a backend inspection report with tokenizer, chat-template, EOS,
-/// semantic-streaming, and native-tool readiness.
-///
-/// This function does not inspect tensor structure or materialize weights. A
-/// selected backend must produce the input report first.
-/// It borrows the text options intended for loading; configure the template
-/// once in that value and pass it to the subsequent `*_with_text_options` load.
-pub fn inspect_text_model(
+impl PreparedTextModel {
+    /// Reports text readiness without selecting an execution backend.
+    /// Requested-load readiness remains unverified until execution selection.
+    pub fn inspect(&mut self, options: TextInspectionOptions) -> ModelInspectionReport {
+        let mut report =
+            ModelInspectionReport::unverified(self.artifact.path(), self.artifact.format());
+        report.record_artifact_inspection(&self.artifact);
+        enrich_text_inspection(report, &mut self.tokenizer, &self.config, options)
+    }
+}
+
+pub(super) fn enrich_text_inspection(
     mut report: ModelInspectionReport,
-    text_options: &TextModelOptions,
+    tokenizer: &mut ChatTokenizer,
+    config: &LoadedTextModelConfig,
     options: TextInspectionOptions,
 ) -> ModelInspectionReport {
-    if report.metadata_provenance.is_some() {
-        // Text sidecar discovery is a local operation, never an interpretation
-        // of caller-supplied source identifiers as filesystem paths.
-        return report;
-    }
-    let path = report.path.clone();
-    match report.artifact_format {
-        ArtifactFormat::SafeTensors => {
-            inspect_safetensors_sidecars(&mut report, &path, text_options, options.chat_request);
-        }
-        ArtifactFormat::Gguf => match eredu_gguf::Reader::open(&path) {
-            Ok(reader) => {
-                let metadata = reader
-                    .metadata()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                inspect_gguf_sidecars(
-                    &mut report,
-                    &path,
-                    &metadata,
-                    text_options,
-                    options.chat_request,
-                );
-            }
-            Err(error) => {
-                report.tokenizer = InspectionReadiness::Invalid;
-                report.chat_template = InspectionReadiness::Unverified;
-                report.semantic_streaming = InspectionReadiness::Unverified;
-                report.native_tools = InspectionReadiness::Unverified;
-                report.issue(
-                    InspectionIssueCode::Io,
-                    InspectionSeverity::Error,
-                    format!("could not reopen GGUF metadata for text inspection: {error}"),
-                    Some(path),
-                );
-            }
-        },
-        _ => {
-            report.tokenizer = InspectionReadiness::Unverified;
-            report.chat_template = InspectionReadiness::Unverified;
-            report.semantic_streaming = InspectionReadiness::Unverified;
-            report.native_tools = InspectionReadiness::Unverified;
-        }
+    report.tokenizer = InspectionReadiness::Ready;
+    if let Some(template) = &config.chat_template {
+        report.chat_template = InspectionReadiness::Ready;
+        inspect_chat_behavior(
+            &mut report,
+            tokenizer,
+            template.clone(),
+            &config.eos_token_ids,
+            &config.model_id,
+            options.chat_request,
+        );
+    } else {
+        report.chat_template = InspectionReadiness::Missing;
+        report.semantic_streaming = InspectionReadiness::Missing;
+        report.native_tools = InspectionReadiness::Missing;
+        report.issue(
+            InspectionIssueCode::MissingChatTemplate,
+            InspectionSeverity::Warning,
+            "no checkpoint chat template or explicit override is available",
+            Some(report.path.clone()),
+        );
     }
     finalize_text_readiness(&mut report);
     report
 }
 
-fn inspect_safetensors_sidecars(
-    report: &mut ModelInspectionReport,
-    path: &Path,
-    text_options: &TextModelOptions,
-    request: Option<ChatTemplateRequest>,
-) {
-    let tokenizer = match load_tokenizer(path) {
-        Ok(tokenizer) => {
-            report.tokenizer = InspectionReadiness::Ready;
-            Some(tokenizer)
-        }
-        Err(error) => {
-            report.tokenizer = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingTokenizer,
-                InspectionSeverity::Error,
-                error.to_string(),
-                Some(path.join("tokenizer.json")),
-            );
-            None
-        }
-    };
-    let template = match resolve_chat_template(path, None, text_options) {
-        Ok(Some(template)) => {
-            report.chat_template = InspectionReadiness::Ready;
-            Some(template)
-        }
-        Ok(None) => {
-            report.chat_template = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingChatTemplate,
-                InspectionSeverity::Warning,
-                "no tokenizer_config.json chat_template or chat_template.jinja is available",
-                Some(path.to_path_buf()),
-            );
-            None
-        }
-        Err(error) => {
-            report.chat_template = InspectionReadiness::Invalid;
-            report.issue(
-                InspectionIssueCode::MissingChatTemplate,
-                InspectionSeverity::Warning,
-                error.to_string(),
-                Some(path.to_path_buf()),
-            );
-            None
-        }
-    };
-    if let (Some(tokenizer), Some(template)) = (tokenizer, template) {
-        let kwargs = load_tokenizer_template_kwargs(path).unwrap_or_default();
-        let eos = eos_token_ids_from_sidecar_dir(path).unwrap_or_default();
-        inspect_chat_behavior(report, tokenizer, template, kwargs, eos, request);
-    } else {
-        report.semantic_streaming = InspectionReadiness::Missing;
-        report.native_tools = InspectionReadiness::Missing;
-    }
-}
-
-fn inspect_gguf_sidecars(
-    report: &mut ModelInspectionReport,
-    path: &Path,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    text_options: &TextModelOptions,
-    request: Option<ChatTemplateRequest>,
-) {
-    let tokenizer = match load_gguf_tokenizer_from_metadata(path, metadata) {
-        Ok(tokenizer) => {
-            report.tokenizer = InspectionReadiness::Ready;
-            Some(tokenizer)
-        }
-        Err(error) => {
-            report.tokenizer = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingTokenizer,
-                InspectionSeverity::Error,
-                format!(
-                    "GGUF tokenizer metadata is unusable and no acceptable sibling tokenizer.json was loaded: {error}"
-                ),
-                Some(gguf_sidecar_dir(path).join("tokenizer.json")),
-            );
-            None
-        }
-    };
-    let template = match resolve_chat_template(gguf_sidecar_dir(path), Some(metadata), text_options)
-    {
-        Ok(Some(template)) => {
-            report.chat_template = InspectionReadiness::Ready;
-            Some(template)
-        }
-        Ok(None) => {
-            report.chat_template = InspectionReadiness::Missing;
-            report.issue(
-                InspectionIssueCode::MissingChatTemplate,
-                InspectionSeverity::Warning,
-                "GGUF has no embedded chat template and no acceptable sidecar template",
-                Some(path.to_path_buf()),
-            );
-            None
-        }
-        Err(error) => {
-            report.chat_template = InspectionReadiness::Invalid;
-            report.issues.push(InspectionIssue {
-                code: InspectionIssueCode::MissingChatTemplate,
-                severity: InspectionSeverity::Warning,
-                detail: error.to_string(),
-                path: Some(path.to_path_buf()),
-                metadata_key: matches!(error, TextMetadataError::GgufTokenizer(_))
-                    .then(|| "tokenizer.chat_template".into()),
-                tensor_name: None,
-                tensor_type_code: None,
-            });
-            None
-        }
-    };
-    if let (Some(tokenizer), Some(template)) = (tokenizer, template) {
-        let eos = merge_eos_token_id_sources([
-            eos_token_ids_from_sidecar_dir(gguf_sidecar_dir(path)).unwrap_or_default(),
-            gguf_eos_token_ids(metadata).unwrap_or_default(),
-        ]);
-        inspect_chat_behavior(
-            report,
-            tokenizer.tokenizer,
-            template,
-            tokenizer.template_kwargs,
-            eos,
-            request,
-        );
-    } else {
-        report.semantic_streaming = InspectionReadiness::Missing;
-        report.native_tools = InspectionReadiness::Missing;
-    }
-}
-
 fn inspect_chat_behavior(
     report: &mut ModelInspectionReport,
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: &mut ChatTokenizer,
     template: ModelChatTemplate,
-    kwargs: Map<String, Value>,
-    eos_token_ids: Vec<u32>,
+    eos_token_ids: &[u32],
+    model_id: &str,
     request: Option<ChatTemplateRequest>,
 ) {
-    let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
-    tokenizer.set_template_kwargs(kwargs);
-    let compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
-    let model_id = report.path.display().to_string();
+    let compiler = ConstraintCompiler::from_tokenizer(tokenizer, eos_token_ids);
     if let Some(request) = request {
         match prepare_chat_from_parts(
-            &mut tokenizer,
+            tokenizer,
             template,
-            &model_id,
-            &eos_token_ids,
+            model_id,
+            eos_token_ids,
             Some(&compiler),
             request,
         ) {
@@ -284,10 +121,10 @@ fn inspect_chat_behavior(
         ..ChatTemplateRequest::default()
     };
     match prepare_chat_from_parts(
-        &mut tokenizer,
+        tokenizer,
         template.clone(),
-        &model_id,
-        &eos_token_ids,
+        model_id,
+        eos_token_ids,
         Some(&compiler),
         semantic_request,
     ) {
@@ -335,10 +172,10 @@ fn inspect_chat_behavior(
         ..ChatTemplateRequest::default()
     };
     match prepare_chat_from_parts(
-        &mut tokenizer,
+        tokenizer,
         template,
-        &model_id,
-        &eos_token_ids,
+        model_id,
+        eos_token_ids,
         Some(&compiler),
         tool_request,
     ) {

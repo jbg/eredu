@@ -1,13 +1,11 @@
-use eredu::api::{
-    inspect_text_model, load_tokenizer, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
-};
+use eredu::api::{LoadedModel, LoadedTextModelConfig, TextInspectionOptions, load_tokenizer};
 use eredu_architectures::ModelKind;
 use eredu_core::{
-    ArtifactFormat, BackendDescriptor, BackendProvider, BackendSession, BoundedCompletion,
+    BackendDescriptor, BackendProvider, BackendSession, BoundedCompletion,
     BoundedCompletionOutcome, BoundedCompletionWait, Completion, DeviceCapabilities,
-    DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness, ModelInspectionReport,
-    ModelRuntime, ObservationSet, ObservationValue, PreparedModel, SessionCapabilities, Submission,
-    TextGenerationBackend, TextGenerationConfig, TokenFilter, TokenOutput,
+    DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness, ModelRuntime, ObservationSet,
+    ObservationValue, PreparedModel, SessionCapabilities, Submission, TextGenerationBackend,
+    TextGenerationConfig, TokenFilter, TokenOutput,
 };
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
@@ -561,29 +559,92 @@ fn tokenizer_and_text_inspection_are_available_without_mlx() {
         br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1},"unk_token":"<unk>"}}"#,
     )
     .unwrap();
-    for model_type in ["llama", "gemma4"] {
-        std::fs::write(
-            directory.join("config.json"),
-            serde_json::json!({"model_type": model_type}).to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(load_tokenizer(&directory).unwrap().get_vocab_size(false), 2);
-        let mut structural =
-            ModelInspectionReport::unverified(&directory, ArtifactFormat::SafeTensors);
-        structural.model_loadability = InspectionReadiness::Ready;
-        structural.requested_load = InspectionReadiness::Ready;
-        let report = inspect_text_model(
-            structural,
-            &eredu::api::TextModelOptions::default(),
-            TextInspectionOptions::default(),
-        );
-        assert_eq!(report.tokenizer, InspectionReadiness::Ready);
-        assert_eq!(report.text_generation, InspectionReadiness::Ready);
-        assert_eq!(report.chat_template, InspectionReadiness::Missing);
+    std::fs::write(directory.join("config.json"), r#"{"model_type":"llama","hidden_size":2,"num_hidden_layers":1,"intermediate_size":2,"num_attention_heads":1,"rms_norm_eps":0.00001,"vocab_size":2}"#).unwrap();
+    let tensors: &[(&str, &[usize])] = &[
+        ("model.embed_tokens.weight", &[2, 2]),
+        ("model.norm.weight", &[2]),
+        ("model.layers.0.input_layernorm.weight", &[2]),
+        ("model.layers.0.post_attention_layernorm.weight", &[2]),
+        ("model.layers.0.self_attn.q_proj.weight", &[2, 2]),
+        ("model.layers.0.self_attn.k_proj.weight", &[2, 2]),
+        ("model.layers.0.self_attn.v_proj.weight", &[2, 2]),
+        ("model.layers.0.self_attn.o_proj.weight", &[2, 2]),
+        ("model.layers.0.mlp.gate_proj.weight", &[2, 2]),
+        ("model.layers.0.mlp.up_proj.weight", &[2, 2]),
+        ("model.layers.0.mlp.down_proj.weight", &[2, 2]),
+    ];
+    let mut offset = 0;
+    let header = tensors.iter().map(|(name, shape)| {
+        let length = shape.iter().product::<usize>() * 4;
+        let value = serde_json::json!({"dtype":"F32","shape":shape,"data_offsets":[offset,offset+length]});
+        offset += length;
+        (name.to_string(), value)
+    }).collect::<serde_json::Map<_,_>>();
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut weights = (header.len() as u64).to_le_bytes().to_vec();
+    weights.extend_from_slice(&header);
+    for _ in 0..offset / 4 {
+        weights.extend_from_slice(&0.25f32.to_le_bytes());
     }
+    std::fs::write(directory.join("model.safetensors"), weights).unwrap();
+    assert_eq!(load_tokenizer(&directory).unwrap().get_vocab_size(false), 2);
+    let artifact =
+        eredu::api::inspect_artifact(&eredu::api::ArtifactSource::new(&directory)).unwrap();
+    let mut prepared =
+        eredu::api::PreparedTextModel::from_artifact(artifact, Default::default()).unwrap();
+    let report = prepared.inspect(TextInspectionOptions::default());
+    assert_eq!(report.tokenizer, InspectionReadiness::Ready);
+    assert_eq!(report.chat_template, InspectionReadiness::Missing);
+    assert_eq!(report.requested_load, InspectionReadiness::Unverified);
+    assert!(!report.is_loadable());
 
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn portable_snapshot_checks_exact_membership_and_truncated_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let write_shard = |member: &str, tensor: &str| {
+        let header = serde_json::to_vec(&serde_json::json!({tensor: {
+            "dtype":"F32", "shape":[1], "data_offsets":[0,4]
+        }}))
+        .unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        std::fs::write(directory.path().join(member), bytes).unwrap();
+    };
+    let first = "model-00001-of-00002.safetensors";
+    let second = "model-00002-of-00002.safetensors";
+    let index = directory.path().join("model.safetensors.index.json");
+    std::fs::write(
+        &index,
+        serde_json::json!({"weight_map":{"a":first,"b":second}}).to_string(),
+    )
+    .unwrap();
+    write_shard(first, "a");
+    assert!(eredu::api::inspect_safetensors_snapshot(directory.path()).is_err());
+    write_shard(second, "b");
+    let snapshot = eredu::api::inspect_safetensors_snapshot(directory.path()).unwrap();
+    assert!(snapshot.tensor("a").is_some());
+    assert!(snapshot.tensor("b").is_some());
+    std::fs::write(
+        &index,
+        serde_json::json!({"weight_map":{"a":second,"b":first}}).to_string(),
+    )
+    .unwrap();
+    assert!(eredu::api::inspect_safetensors_snapshot(directory.path()).is_err());
+    std::fs::write(
+        &index,
+        serde_json::json!({"weight_map":{"a":first,"b":second}}).to_string(),
+    )
+    .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join(second))
+        .unwrap();
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+    assert!(eredu::api::inspect_safetensors_snapshot(directory.path()).is_err());
 }
 
 fn sparse_vocabulary_model(logits: Vec<f32>) -> LoadedModel<MockBackend> {

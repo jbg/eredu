@@ -243,14 +243,31 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
         let options = self.load_request_for_plan(plan)?;
-        let selected = super::loading::select_preparation(inspection, options)
-            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
+        let outcome = super::inspection::inspect_selected_preparation(
+            inspection.clone(),
+            &MlxInspectionOptions::new(options),
+        )
+        .map_err(|error| planning_backend_error("select_model_preparation", error))?;
+        let (report, selected) = outcome.into_parts();
+        let selected = selected.ok_or_else(|| {
+            AutomaticPlanningError::Invalid(
+                report
+                    .issues
+                    .iter()
+                    .map(|issue| issue.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        let (_, neutral) = selected.into_parts();
+        let selected = super::loading::MlxSelectedPreparation::new(neutral, None);
         let policy = selected.neutral().admission().request().policy();
         let capabilities = selected.session_capabilities();
         Ok(ExecutionPlanTargetSelection::new(
             policy,
             selected,
             capabilities,
+            report,
         ))
     }
 
