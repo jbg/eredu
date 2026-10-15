@@ -300,10 +300,16 @@ fn main() -> anyhow::Result<()> {
             trace,
         )?;
         let mut records = vec![];
-        let output = model.generate_observed_text(prepared, &[], Default::default(), |record| {
-            records.push(record);
-            ControlFlow::Continue(())
-        })?;
+        let output = model.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                records.push(record);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )?;
         let expected_ids: Vec<u32> =
             serde_json::from_value(reference[expected_trial]["generated"].clone())?;
         ensure!(

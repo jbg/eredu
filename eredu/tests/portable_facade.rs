@@ -250,9 +250,7 @@ impl TextGenerationBackend for MockBackend {
 #[test]
 #[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT; tokenizer/template only, no native backend"]
 fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
-    use eredu::api::{
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    };
+    use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
     use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
     use eredu_core::{FinishReason, SemanticEvent};
     use serde_json::json;
@@ -322,7 +320,9 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
     );
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
@@ -376,9 +376,7 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
 
 #[test]
 fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
-    use eredu::api::{
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    };
+    use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
     use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
     use eredu_core::{FinishReason, SemanticEvent};
     use serde_json::json;
@@ -493,7 +491,9 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                     .unwrap();
                 let mut events = Vec::new();
                 let output = model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
+                    .session()
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input: PreparedChatInput::rendered_prompt(&prepared),
                         settings: PreparedChatGenerationSettings {
@@ -637,9 +637,7 @@ fn sparse_vocabulary_model_with_backend(
 
 #[test]
 fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
-    use eredu::api::{
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    };
+    use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
     use eredu::runtime::chat::ChatTemplateRequest;
     for (logits, expected) in [
         (vec![0.0, 100.0, 10.0, 200.0, 300.0, 1.0, 400.0, 500.0], 2),
@@ -668,7 +666,9 @@ fn ordinary_and_semantic_generation_exclude_holes_and_padded_logits() {
             })
             .unwrap();
         let semantic = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: PreparedChatGenerationSettings {

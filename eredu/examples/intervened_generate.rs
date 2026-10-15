@@ -90,13 +90,19 @@ fn main() -> anyhow::Result<()> {
     let baseline = model.prepare_observed_chat(&chat, settings, capture.clone(), trace)?;
     let last_prompt_row = baseline.prompt_token_ids().len() as u64 - 1;
     eprintln!("Baseline");
-    let baseline = model.generate_observed_chat(baseline, &[], Default::default(), |record| {
-        println!(
-            "{}",
-            serde_json::to_string(&record).expect("versioned host record")
-        );
-        ControlFlow::Continue(())
-    })?;
+    let baseline = model.generate_observed(
+        baseline,
+        &[],
+        Default::default(),
+        |record| {
+            println!(
+                "{}",
+                serde_json::to_string(&record).expect("versioned host record")
+            );
+            ControlFlow::Continue(())
+        },
+        eredu::api::OutputMode::Semantic,
+    )?;
     model.reset()?;
     let plan = InterventionPlan {
         schema_version: INTERVENTION_SCHEMA_VERSION,
@@ -125,13 +131,19 @@ fn main() -> anyhow::Result<()> {
             .expect("nonempty plan")
             .identity()
     );
-    let modified = model.generate_observed_chat(modified, &[], Default::default(), |record| {
-        println!(
-            "{}",
-            serde_json::to_string(&record).expect("versioned host record")
-        );
-        ControlFlow::Continue(())
-    })?;
+    let modified = model.generate_observed(
+        modified,
+        &[],
+        Default::default(),
+        |record| {
+            println!(
+                "{}",
+                serde_json::to_string(&record).expect("versioned host record")
+            );
+            ControlFlow::Continue(())
+        },
+        eredu::api::OutputMode::Semantic,
+    )?;
     eprintln!(
         "Baseline IDs: {:?}; modified IDs: {:?}",
         baseline.token_ids, modified.token_ids

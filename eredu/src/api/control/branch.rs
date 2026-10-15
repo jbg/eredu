@@ -100,7 +100,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
         self.lifecycle.checkpoint()?;
-        if self.delivery.control.cancellation().is_cancelled() {
+        if self.delivery.cancellation.is_cancelled() {
             return Err(CaptureError::Invalid(
                 "cancelled generation cannot create branches".into(),
             )
@@ -242,6 +242,7 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             next_prediction: snapshot.metadata.output.next_prediction,
                         },
                     };
+                    let control = GenerationControlHandle::default();
                     Ok((
                         snapshot.pipeline.fork().map_err(TextSnapshotError::Host)?,
                         snapshot.cursor.clone(),
@@ -249,7 +250,8 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             configuration_identity: snapshot.metadata.configuration_identity,
                             template,
                             budget: TraceBudget::new(options.trace_limits),
-                            control: GenerationControlHandle::default(),
+                            cancellation: control.cancellation().clone(),
+                            control,
                             sequence: 0,
                             epoch: 0,
                             drafts: self.delivery.drafts.fork(),
@@ -335,7 +337,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         std::mem::swap(&mut self.lifecycle, &mut branch.lifecycle);
         std::mem::swap(&mut self.delivery, &mut branch.delivery);
         self.state
-            .set_cancellation_token(self.delivery.control.cancellation().clone());
+            .set_cancellation_token(self.delivery.cancellation.clone());
         self.lifecycle_record(&mut emit);
         self.delivery_result()
     }

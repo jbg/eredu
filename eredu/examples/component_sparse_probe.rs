@@ -780,15 +780,21 @@ fn main() -> anyhow::Result<()> {
             trace,
         )?;
         let mut steps = BTreeMap::<u64, Value>::new();
-        model.generate_observed_text(prepared, &[], Default::default(), |event| {
-            record_step(
-                event,
-                &paths,
-                &mut precision,
-                &mut steps,
-                trial == "baseline",
-            )
-        })?;
+        model.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |event| {
+                record_step(
+                    event,
+                    &paths,
+                    &mut precision,
+                    &mut steps,
+                    trial == "baseline",
+                )
+            },
+            eredu::api::OutputMode::Text,
+        )?;
         output["trials"][trial] = json!(steps.into_values().collect::<Vec<_>>());
         if score_mode {
             let mut reports = vec![];
@@ -846,10 +852,13 @@ fn main() -> anyhow::Result<()> {
                 trace,
             )?;
             let mut steps = BTreeMap::new();
-            let mut run =
-                model.start_controlled_text(prepared, &[], Default::default(), |event| {
-                    record_step(event.generation, &paths, &mut precision, &mut steps, false)
-                })?;
+            let mut run = model.start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |event| record_step(event.generation, &paths, &mut precision, &mut steps, false),
+                eredu::api::OutputMode::Text,
+            )?;
             let child_trace = TraceLimits {
                 per_record_bytes: trace.per_record_bytes,
                 total_bytes: trace.total_bytes / 4,

@@ -162,9 +162,13 @@ fn main() -> anyhow::Result<()> {
             total_bytes: 1 << 20,
         },
     )?;
-    let mut run = model.start_controlled_text(prepared, &[], Default::default(), |_| {
-        std::ops::ControlFlow::Continue(())
-    })?;
+    let mut run = model.start_controlled(
+        prepared,
+        &[],
+        Default::default(),
+        |_| std::ops::ControlFlow::Continue(()),
+        eredu::api::OutputMode::Text,
+    )?;
     run.step(|_| std::ops::ControlFlow::Continue(()))?;
     let control_tokens = run.token_ids().to_vec();
     let controlled = run.forecast_remaining_generation(4, &Default::default())?;
@@ -184,25 +188,16 @@ fn main() -> anyhow::Result<()> {
         adaptive_lookahead: false,
     });
     let mut loaded_spec = LoadedModel::load_execution_plan(&factory, &path, &speculative_plan)?;
-    let spec_options = loaded_spec
-        .speculative_generation_options()?
-        .context("missing drafting options")?;
-    let (target, draft) = loaded_spec.parts_mut();
-    let draft = draft.as_speculative_draft().context("missing draft")?;
-    let speculative = target.forecast_speculative_token_ids(
-        &vec![1; positions],
-        {
-            let settings: eredu::api::PreparedChatGenerationSettings = settings;
-            eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: settings.decoding_mode.or(Some(
-                    eredu_core::decoding::DecodingMode::SelfSpeculation(spec_options),
-                )),
-                ..settings
-            }
-        },
-        &draft,
-        &Default::default(),
-    )?;
+    let request = GenerationRequest {
+        output_mode: eredu::api::OutputMode::Text,
+        control_handle: None,
+        input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
+        settings,
+        caller_stop_sequences: &[],
+        cancellation: Default::default(),
+        on_event: |_| {},
+    };
+    let speculative = loaded_spec.forecast_generation(&request, &Default::default())?;
     ensure!(
         binding_count(&speculative.request) > 0
             && binding_count(
@@ -217,35 +212,19 @@ fn main() -> anyhow::Result<()> {
         "target/draft forecast lost binding facts"
     );
     let mut speculative_continuation = None;
-    let spec_output = target.with_controlled_text_speculative(
-        PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
-            drafting: draft,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    spec_options,
-                )),
-                ..settings
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
-        },
-        Default::default(),
-        |session| {
-            session.step()?;
-            let tokens = session.token_ids().to_vec();
-            let forecast = session
-                .forecast_remaining_generation(4, &Default::default())
-                .unwrap();
-            assert_eq!(session.token_ids(), tokens);
-            assert!(binding_count(&forecast.request) > 0);
-            speculative_continuation = Some(forecast);
-            while session.step()?.is_some() {}
-            Ok(())
-        },
-    )?;
+    let spec_output = loaded_spec.with_controlled(request, Default::default(), |session| {
+        let session = session.speculative().expect("speculative executor");
+        session.step()?;
+        let tokens = session.token_ids().to_vec();
+        let forecast = session
+            .forecast_remaining_generation(4, &Default::default())
+            .unwrap();
+        assert_eq!(session.token_ids(), tokens);
+        assert!(binding_count(&forecast.request) > 0);
+        speculative_continuation = Some(forecast);
+        while session.step()?.is_some() {}
+        Ok(())
+    })?;
     ensure!(spec_output.token_ids() == ids, "speculative tokens changed");
     let mut resources = Vec::new();
     for d in &loaded.request.domains {

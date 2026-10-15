@@ -1,7 +1,7 @@
 //! Attributed bounded capture composed with ordinary prepared-chat generation.
 
 use super::{
-    LoadedModel, PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
+    GenerationOutput, GenerationRequest, LoadedModel, PreparedChatError,
     PreparedChatGenerationSettings, PreparedChatInput, TextDecoderError,
 };
 use crate::runtime::chat::PreparedChat;
@@ -45,10 +45,11 @@ pub use eredu_runtime::execution_control::TraceLimits;
 
 /// Prepared prompt and capture admission. Dropping this value submits no work.
 /// Generation consumes it, preventing accidental reuse with different settings.
-/// Both controlled entry points accept this value, including intervened requests:
-/// [`LoadedModel::start_controlled_chat`] requires semantic support, while
-/// [`LoadedModel::start_controlled_text`] explicitly selects ordinary text decoding.
+/// [`LoadedModel::start_controlled`] accepts this value, including intervened
+/// requests, and selects semantic or literal text through [`super::OutputMode`].
 pub struct PreparedObservedGeneration<B: TextGenerationBackend> {
+    pub(super) cancellation: Option<GenerationCancellationToken>,
+    pub(super) preparation_elapsed: std::time::Duration,
     pub(super) control_handle: Option<eredu_core::execution_control::GenerationControlHandle>,
     pub(super) prompt: Option<B::Prompt>,
     pub(super) chat: PreparedChat,
@@ -487,6 +488,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             return Err(CaptureError::Invalid("trace byte limits must be positive".into()).into());
         }
         Ok(PreparedObservedGeneration {
+            cancellation: None,
+            preparation_elapsed: std::time::Duration::ZERO,
             control_handle: None,
             prompt: None,
             chat: chat.clone(),
@@ -528,61 +531,16 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         Ok(prepared)
     }
 
-    /// Runs the ordinary prepared-chat generator with demand-driven host delivery.
-    /// Return `Break(())` from the callback or cancel the shared token to stop at
-    /// a token boundary. `Break` also stops further callback delivery; the returned
-    /// result still reports the terminal outcome. There is no producer thread or queue. Before return (or
-    /// unwinding on consumer panic), the existing generation owner resolves its
-    /// outstanding submissions; native failures retain resources through recovery.
-    pub fn generate_observed_chat<F>(
+    /// Runs a prepared observed request with explicit output interpretation.
+    /// Delivery is bounded and synchronous; callback Break cancels the existing driver.
+    pub fn generate_observed<F>(
         &mut self,
         prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
         cancellation: GenerationCancellationToken,
         on_record: F,
-    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
-    where
-        F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
-    {
-        self.generate_observed(
-            prepared,
-            caller_stop_sequences,
-            cancellation,
-            on_record,
-            super::request::PreparedGenerationMode::Semantic,
-        )
-    }
-
-    /// Generates observed literal text through the ordinary shared driver.
-    /// Supports unrecognized templates under the same text/tool admission rules
-    /// as `generate_prepared_text` and `start_controlled_text`.
-    pub fn generate_observed_text<F>(
-        &mut self,
-        prepared: PreparedObservedGeneration<B>,
-        caller_stop_sequences: &[String],
-        cancellation: GenerationCancellationToken,
-        on_record: F,
-    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
-    where
-        F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
-    {
-        self.generate_observed(
-            prepared,
-            caller_stop_sequences,
-            cancellation,
-            on_record,
-            super::request::PreparedGenerationMode::Text,
-        )
-    }
-
-    fn generate_observed<F>(
-        &mut self,
-        prepared: PreparedObservedGeneration<B>,
-        caller_stop_sequences: &[String],
-        cancellation: GenerationCancellationToken,
-        on_record: F,
-        mode: super::request::PreparedGenerationMode,
-    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
+        mode: super::request::OutputMode,
+    ) -> Result<GenerationOutput, PreparedChatError>
     where
         F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
     {
@@ -648,14 +606,25 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 }
             });
             let (token_id, score_kind, position) = match kind {
-                super::request::GenerationStepKind::ModeChanged { acknowledgement, position } => {
+                super::request::GenerationStepKind::ModeChanged {
+                    acknowledgement,
+                    position,
+                } => {
                     delivery.position = position;
                     if let Some(event) = delivery.drafts.clear() {
                         let position = delivery.position;
                         delivery.send(ObservedGenerationEvent::Draft { event, position });
                     }
-                    delivery.iterative = matches!(acknowledgement.active, eredu_core::decoding::DecodingMode::Diffusion { .. });
-                    delivery.send(ObservedGenerationEvent::ModeChanged { acknowledgement, position, captures, step_seconds });
+                    delivery.iterative = matches!(
+                        acknowledgement.active,
+                        eredu_core::decoding::DecodingMode::Diffusion { .. }
+                    );
+                    delivery.send(ObservedGenerationEvent::ModeChanged {
+                        acknowledgement,
+                        position,
+                        captures,
+                        step_seconds,
+                    });
                     return;
                 }
                 super::request::GenerationStepKind::Token {
@@ -721,7 +690,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         // tokenizer, sampler, EOS loop, or semantic decoder is constructed here.
         let delivery_failure = || delivery.borrow().failure.clone();
         let result = self.generate_prepared(
-            PreparedChatGenerationRequest {
+            GenerationRequest {
+                output_mode: mode,
                 control_handle: prepared.control_handle.as_ref(),
                 input: match prepared.prompt {
                     Some(prompt) => {

@@ -150,12 +150,11 @@ names are rejected. When an unrecognized tool protocol requires name rewriting,
 preparation returns `TextModelError::ToolNames` with an unsupported-dialect error
 rather than guessing its restrictions.
 
-For templates without recognized semantic support, use
-`model.generate_prepared_text(request)` with `PreparedChatGenerationRequest`.
-For supported drafting, use `generate_prepared_text_speculative` or
-`generate_prepared_text_speculative_batch` with the corresponding prepared-chat
-speculative requests. These methods emit literal `TextDelta` and `Finished`
-events and return TTFT through `output.timing().time_to_first_token()`.
+For templates without recognized semantic support, use `session.generate(request)`
+with a `GenerationRequest` selecting `OutputMode::Text`. The session retains its
+drafting resources and defaults, so ordinary, embedded and external drafting use
+one call and result. Events are literal `TextDelta` and `Finished`; timing is
+available through `output.timing().time_to_first_token()`.
 Inspect `prepared.text_generation_support()` for admission: native tool
 declarations and required calls are rejected, and explicit thinking requires
 `allow_unparsed_reasoning`. Emulated tools can use ordinary prompt text.

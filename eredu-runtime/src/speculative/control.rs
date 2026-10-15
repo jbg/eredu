@@ -992,6 +992,16 @@ impl<'f, F> DriveControlledSpeculation<'f, F> {
     }
 }
 impl<F> DriveControlledSpeculation<'_, F> {
+    /// Includes the facade's active request admission in controlled TTFT.
+    pub fn with_preparation_started(mut self, started: std::time::Instant) -> Self {
+        self.run.started = started;
+        self
+    }
+    /// Retains the source policy across control commands, snapshots and forks.
+    pub fn with_speculation_limits(mut self, limits: Option<eredu_core::decoding::SpeculationLimits>) -> Self {
+        self.run = self.run.with_speculation_limits(limits);
+        self
+    }
     /// Supplies immutable selected geometry before execution resources are borrowed.
     /// Native residency/capacity are refreshed from the active executor on observation.
     pub fn with_forecast_profiles(
@@ -1093,7 +1103,8 @@ where
                 component_timings_collected,
                 context,
             )
-            .map_err(SpeculativeControlError::backend)?;
+            .map_err(SpeculativeControlError::backend)?
+            .with_speculation_limits(self.run.limits);
             let mut session = Session {
                 scheduler,
                 lane: Some(lane),

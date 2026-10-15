@@ -49,7 +49,7 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
             });
         let mut loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &plan).unwrap();
-        let speculative_options = loaded.speculative_generation_options().unwrap().unwrap();
+        let speculative_options = loaded.drafting_options().unwrap().unwrap();
         let (model, drafting) = loaded.parts_mut();
         let chat = model
             .prepare_chat(ChatTemplateRequest {
@@ -70,10 +70,12 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
             ..Default::default()
         };
         let expected = model
-            .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
+            .drafting_session(drafting.as_speculative_draft().unwrap(), None)
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
-                drafting: drafting.as_speculative_draft().unwrap(),
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         speculative_options,
@@ -92,11 +94,11 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
             },
             ..Default::default()
         };
-        let output = model.with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        let output = model.drafting_session(drafting.as_speculative_draft().unwrap(), None).with_controlled(GenerationRequest {
+output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
-                drafting: drafting.as_speculative_draft().unwrap(),
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         speculative_options,
@@ -106,9 +108,8 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
-            },
-            ControlledSpeculativeOptions {
-                snapshots: Some(SnapshotLimits {
+            },GenerationControlOptions {
+                speculative_snapshots: Some(SnapshotLimits {
                     max_snapshots: 1,
                     max_branches: 1,
                     retained_bytes: 2 << 30,
@@ -116,7 +117,7 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 }),
                 ..Default::default()
             },
-            |session| {
+            |session| { let session = session.speculative().expect("speculative executor");
                 assert!(session.forecast_remaining_generation(16, &options).is_err());
                 assert!(matches!(session.trim_parameter_conversions(),
                     Err(ParameterConversionTrimError::NotQuiescent)));
@@ -230,8 +231,7 @@ fn native_speculative_continuation_forecasts_cover_settled_state_without_advance
                 eprintln!("Speculative continuation: model={}, prompt={prompt}, lookahead={lookahead}, horizon={remaining}, upper={upper}, measured_growth={growth}, target_current={:?}, draft_current={:?}",
                     path.display(), forecast.continuation.target.current_state, forecast.continuation.draft.as_ref().unwrap().current_state);
                 Ok(())
-            },
-        ).unwrap();
+            },).unwrap();
         assert_eq!(output.token_ids(), expected.token_ids());
         assert_eq!(output.finish_reason(), expected.finish_reason());
     }

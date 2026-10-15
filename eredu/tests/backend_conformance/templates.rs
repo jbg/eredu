@@ -56,7 +56,10 @@ fn standard_loaders_apply_template_override_and_preserve_checkpoint_metadata() {
         text_options(),
     )
     .unwrap();
-    assert_eq!(automatically_loaded.drafting_plan(), report.plan.drafting());
+    assert_eq!(
+        automatically_loaded.drafting_plan(),
+        Some(report.plan.drafting())
+    );
     let models = [
         LoadedModel::load_execution_plan_with_text_options(
             &MockBackend,

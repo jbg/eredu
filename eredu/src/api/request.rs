@@ -4,8 +4,8 @@ use eredu_core::{
     generation::{
         FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
     },
-    SpeculativeDraft, SpeculativeOutputError,
-    SpeculativeSemanticState, TokenFilter, TokenFilterController,
+    SpeculativeDraft, SpeculativeOutputError, SpeculativeSemanticState, TokenFilter,
+    TokenFilterController,
 };
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
 
@@ -43,8 +43,8 @@ pub struct PreparedChatGenerationSettings {
     /// Prompt chunking for eligible ordinary text execution (default: 512 tokens).
     /// Media, bounded observations, and speculative execution retain their full pass.
     pub prefill: eredu_core::PrefillChunkPolicy,
-    /// Initial decoding policy. Absence selects causal generation when available,
-    /// or the trained policy of an intrinsically iterative architecture.
+    /// Initial decoding policy. Absence inherits the session's drafting selection,
+    /// or the target's trained default when no drafting policy is retained.
     pub decoding_mode: Option<eredu_core::decoding::DecodingMode>,
     /// Emits replaceable tentative blocks through bounded observed delivery.
     /// Draft IDs never enter committed text, tool constraints, or semantic parsing.
@@ -53,7 +53,7 @@ pub struct PreparedChatGenerationSettings {
 
 /// Explicit prompt source for semantic or text generation from a [`PreparedChat`].
 ///
-/// The generation method selects semantic parsing or literal text output.
+/// `GenerationRequest::output_mode` selects semantic parsing or literal text output.
 /// The selected variant determines only how the model prompt is prefetched.
 pub enum PreparedChatInput<'a, B: eredu_core::TextGenerationBackend> {
     /// Counted typed input whose loaded-session and chat identity are checked at execution.
@@ -145,15 +145,17 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
     }
 }
 
-/// Request for ordinary semantic or text generation from a [`PreparedChat`].
+/// Request for semantic or literal text generation with optional session-owned drafting.
 ///
-/// Used by `LoadedModel::generate_prepared_chat` and `generate_prepared_text`.
+/// Consumed by `PlannedModel::generate` and `PlannedModel::with_controlled`.
 /// Cache and execution-stream ownership belong to the selected backend
 /// session. The prepared chat's portable constraint controller supplies a
 /// vocabulary filter to the backend before each sampling submission.
-pub struct PreparedChatGenerationRequest<'a, B: eredu_core::TextGenerationBackend, F> {
+pub struct GenerationRequest<'a, B: eredu_core::TextGenerationBackend, F> {
     /// Explicit prompt source and embedded format/runtime plan.
     pub input: PreparedChatInput<'a, B>,
+    /// Semantic parsing or literal text decoding.
+    pub output_mode: OutputMode,
     /// Portable sampling configuration, token limit, and random seed.
     pub settings: PreparedChatGenerationSettings,
     /// Additional decoded text sequences that terminate generation.
@@ -166,17 +168,48 @@ pub struct PreparedChatGenerationRequest<'a, B: eredu_core::TextGenerationBacken
     pub on_event: F,
 }
 
-/// Terminal metadata returned by ordinary prepared-chat generation.
-/// Ordinary and observed generation share the neutral output with no extra statistics.
-pub type PreparedChatGenerationOutput = eredu_core::GenerationOutput;
+impl<B: eredu_core::TextGenerationBackend, F> GenerationRequest<'_, B, F> {
+    pub(super) fn link_cancellation(&mut self) {
+        if let Some(control) = self.control_handle {
+            self.cancellation = self.cancellation.linked(control.cancellation());
+        }
+    }
+}
 
-/// Backend-independent failure from ordinary prepared-chat generation.
+/// Backend-independent failure preparing or executing a generation request.
 ///
 /// Backend failures retain their original details through a common error source.
 /// Portable tokenizer, constraint, semantic-streaming, and generation-lifecycle
 /// failures have distinct variants.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatError {
+    /// Exact input accounting or capability observation failed.
+    #[error(transparent)]
+    Capability(#[from] eredu_core::CapabilityError),
+    /// Observed decoder IDs do not cover the prepared model positions.
+    #[error("prepared decoder alignment has {actual} IDs for {expected} model positions")]
+    Alignment {
+        /// Counted model positions.
+        expected: u64,
+        /// Observed decoder IDs.
+        actual: usize,
+    },
+
+    /// Requested decoding policy conflicts with the retained execution.
+    #[error(transparent)]
+    Decoding(#[from] eredu_core::decoding::DecodingModeError),
+    /// Portable text preparation failed.
+    #[error(transparent)]
+    Text(#[from] TextModelError),
+    /// A backend returned a different number of lanes than were submitted.
+    #[error("selected backend returned {actual} results, but expected {expected}")]
+    OutputCardinality {
+        /// Number of submitted lanes.
+        expected: usize,
+        /// Number of results returned by the backend.
+        actual: usize,
+    },
+
     /// Neutral physical-operation or retained mode-admission failure.
     #[error(transparent)]
     Operation(#[from] eredu_core::TextOperationPolicyError),
@@ -224,58 +257,11 @@ pub(super) enum PreparedChatSetupError {
     Semantic(String),
 }
 
-/// Failure while the facade prepares or a backend executes speculative chat.
-#[derive(Debug, thiserror::Error)]
-pub enum PreparedChatSpeculativeError {
-    /// Requested mode or options differ from the retained speculative source.
-    #[error(transparent)]
-    Decoding(#[from] eredu_core::decoding::DecodingModeError),
-    /// The selected backend failed prompt preparation or speculative execution.
-    #[error("selected backend failed prepared-chat speculative generation: {0}")]
-    Backend(#[source] eredu_core::BackendFailure),
-    /// Portable generation configuration was invalid.
-    #[error(transparent)]
-    Generation(#[from] eredu_core::generation::GenerationError),
-    /// Portable tokenizer preparation failed.
-    #[error(transparent)]
-    Text(#[from] TextModelError),
-    /// Portable constraint construction failed.
-    #[error(transparent)]
-    Constraint(#[from] ConstraintError),
-    /// The prepared semantic plan or parser state was invalid.
-    #[error("prepared-chat semantic generation failed: {0}")]
-    Semantic(String),
-    /// A backend returned the wrong number of results for the submitted lanes.
-    #[error(
-        "selected backend returned {actual} speculative results, but the facade expected {expected}"
-    )]
-    OutputCardinality {
-        /// Number of results required by the facade operation.
-        expected: usize,
-        /// Number of results returned by the backend.
-        actual: usize,
-    },
-}
-
-/// One speculative semantic or text response from a [`PreparedChat`].
-/// Used by `LoadedModel::generate_prepared_chat_speculative` and
-/// `generate_prepared_text_speculative`.
-pub struct PreparedChatSpeculativeGenerationRequest<'a, B: eredu_core::TextGenerationBackend, D, F>
-{
-    /// Explicit prompt source and embedded format/runtime plan.
-    pub input: PreparedChatInput<'a, B>,
-    /// Embedded or separately loaded draft-model selection.
+pub(super) struct SourceRequest<'a, B: eredu_core::TextGenerationBackend, D, F> {
+    pub request: GenerationRequest<'a, B, F>,
     pub drafting: SpeculativeDraft<'a, D>,
-    /// Portable sampling configuration, token limit, and random seed.
-    pub settings: PreparedChatGenerationSettings,
-    /// Additional decoded text sequences that terminate generation.
-    pub caller_stop_sequences: &'a [String],
-    /// One-shot cooperative-cancellation token for this request.
-    pub cancellation: GenerationCancellationToken,
-    /// Mode commands shared with uninterrupted and controlled advancement.
-    pub control_handle: Option<&'a eredu_core::execution_control::GenerationControlHandle>,
-    /// Called synchronously for each event after its cache transaction commits.
-    pub on_event: F,
+    pub limits: Option<super::SpeculationOptions>,
+    pub started: std::time::Instant,
 }
 
 /// One independently executable lane in a prepared-chat speculative batch.
@@ -301,9 +287,11 @@ pub struct PreparedChatSpeculativeBatchLane<'a, B: eredu_core::TextGenerationBac
 }
 
 /// Cohesive fair-scheduler request for independent prepared-chat speculative lanes.
-/// Used by `LoadedModel::generate_prepared_chat_speculative_batch` and
-/// `generate_prepared_text_speculative_batch`.
+/// Used by `PlannedModel::generate_speculative_batch` and
+/// `generate_speculative_batch`.
 pub struct PreparedChatSpeculativeBatchRequest<'a, B: eredu_core::TextGenerationBackend, D> {
+    /// Semantic parsing or literal text for every lane.
+    pub output_mode: OutputMode,
     /// Embedded or separately loaded draft-model selection.
     pub drafting: SpeculativeDraft<'a, D>,
     /// Independently executable prepared-chat lanes.
@@ -498,13 +486,17 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum PreparedGenerationMode {
+/// Interpretation of committed output from a prepared prompt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum OutputMode {
+    /// Parse recognized reasoning, text and tool protocols.
+    #[default]
     Semantic,
+    /// Decode literal text under the prepared prompt's text admission rules.
     Text,
 }
 
-impl PreparedGenerationMode {
+impl OutputMode {
     pub(super) fn prepare_control(
         self,
         prepared_chat: &PreparedChat,

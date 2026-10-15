@@ -149,7 +149,7 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                 &execution,
             )
             .unwrap();
-            let generation = loaded.speculative_generation_options().unwrap().unwrap();
+            let generation = loaded.drafting_options().unwrap().unwrap();
             let (model, drafting) = loaded.parts_mut();
             let chat = model
                 .prepare_chat(ChatTemplateRequest {
@@ -305,26 +305,33 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
 
             macro_rules! request {
                 () => {
-                    PreparedChatSpeculativeGenerationRequest {
-                        control_handle: None,
-                        input: PreparedChatInput::token_ids(&chat, ids.clone()),
-                        drafting: drafting.as_speculative_draft().unwrap(),
-                        settings: eredu::api::PreparedChatGenerationSettings {
-                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                generation,
-                            )),
-                            ..settings
+                    (
+                        drafting.as_speculative_draft().unwrap(),
+                        GenerationRequest {
+                            output_mode: eredu::api::OutputMode::Semantic,
+                            control_handle: None,
+                            input: PreparedChatInput::token_ids(&chat, ids.clone()),
+
+                            settings: eredu::api::PreparedChatGenerationSettings {
+                                decoding_mode: Some(
+                                    eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                                ),
+                                ..settings
+                            },
+                            caller_stop_sequences: &[],
+                            cancellation: Default::default(),
+                            on_event: |_| {},
                         },
-                        caller_stop_sequences: &[],
-                        cancellation: Default::default(),
-                        on_event: |_| {},
-                    }
+                    )
                 };
             }
             reset_local_allocator_peak().unwrap();
-            let baseline = model
-                .generate_prepared_text_speculative(request!())
-                .unwrap();
+            let baseline = {
+                let (drafting, mut request) = request!();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap();
             model.synchronize().unwrap();
             let growth = eredu_backend_mlx::allocator_memory()
                 .unwrap()
@@ -335,12 +342,20 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                 "lookahead={lookahead}: growth={growth}, upper={upper}"
             );
             assert_eq!(baseline.token_ids().len(), 8);
-            let controlled = model
-                .with_controlled_text_speculative(request!(), Default::default(), |session| {
-                    while session.step()?.is_some() {}
-                    Ok(())
-                })
-                .unwrap();
+            let controlled = {
+                let (drafting, mut request) = request!();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    Default::default(),
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        while session.step()?.is_some() {}
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap();
             assert_eq!(controlled.token_ids(), baseline.token_ids());
             // Repeating a query after completed isolated lanes does not execute another lane.
             let active = eredu_backend_mlx::allocator_memory()
@@ -403,9 +418,12 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                     .active_bytes(),
                 active
             );
-            let repeated_run = model
-                .generate_prepared_text_speculative(request!())
-                .unwrap();
+            let repeated_run = {
+                let (drafting, mut request) = request!();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap();
             assert_eq!(repeated_run.token_ids(), baseline.token_ids());
             let limits = CaptureUsage {
                 captures: 2048,
@@ -435,8 +453,8 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                     },
                 )
                 .unwrap();
-            let captured_options = ControlledSpeculativeOptions {
-                capture: Some(capture),
+            let captured_options = GenerationControlOptions {
+                speculative_capture: Some(capture),
                 ..Default::default()
             };
             let records = |captures: Vec<eredu_core::speculative::SpeculativePredictionCapture>| {
@@ -446,21 +464,39 @@ fn native_embedded_startup_forecasts_preserve_execution_and_bound_peak() {
                     .collect::<Vec<_>>()
             };
             let mut continuous_records = Vec::new();
-            let continuous = model
-                .generate_observed_text_speculative(request!(), captured_options.clone(), |step| {
-                    continuous_records.extend(records(step.captures));
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
+            let continuous = {
+                let (drafting, mut request) = request!();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate_observed(
+                    request,
+                    captured_options.clone(),
+                    |step| {
+                        let eredu::api::GenerationStep::Speculative(step) = step else {
+                            panic!("expected speculative action")
+                        };
+                        continuous_records.extend(records(step.captures));
+                        ControlFlow::Continue(())
+                    },
+                )
+            }
+            .unwrap();
             let mut controlled_records = Vec::new();
-            let captured = model
-                .with_controlled_text_speculative(request!(), captured_options, |session| {
-                    while let Some(step) = session.step()? {
-                        controlled_records.extend(records(step.captures));
-                    }
-                    Ok(())
-                })
-                .unwrap();
+            let captured = {
+                let (drafting, mut request) = request!();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    captured_options,
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        while let Some(step) = session.step()? {
+                            controlled_records.extend(records(step.captures));
+                        }
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap();
             assert_eq!(continuous.token_ids(), captured.token_ids());
             assert_eq!(continuous.token_ids(), baseline.token_ids());
             assert!(!continuous_records.is_empty());
@@ -527,7 +563,7 @@ fn native_embedded_startup_forecasts_keep_uncovered_mechanisms_unknown() {
         let mut loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
                 .unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (model, drafting) = loaded.parts_mut();
         let options = GenerationForecastOptions {
             budget: MemoryBudget {

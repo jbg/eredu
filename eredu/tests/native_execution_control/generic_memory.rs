@@ -180,9 +180,13 @@ fn native_generic_workspace_covers_softcapped_and_routed_modules() {
             )
             .unwrap();
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         while run.finish_reason().is_none() {
             run.step(|_| ControlFlow::Continue(())).unwrap();

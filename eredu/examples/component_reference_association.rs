@@ -144,11 +144,16 @@ pub fn run<B: ParameterBackend>(
                 },
             )?;
             let mut records = vec![];
-            let output =
-                model.generate_observed_text(prepared, &[], Default::default(), |record| {
+            let output = model.generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
                     records.push(record);
                     ControlFlow::Continue(())
-                })?;
+                },
+                eredu::api::OutputMode::Text,
+            )?;
             ensure!(
                 output.token_ids == [expected["winner"].as_u64().context("winner")? as u32],
                 "association winner differs"

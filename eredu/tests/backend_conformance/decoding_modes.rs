@@ -250,32 +250,106 @@ fn modes() -> [DecodingMode; 3] {
 #[test]
 fn controlled_mode_forecast_observes_pending_handoff_without_advancement() {
     let (mut model, chat, settings, _, _) = setup(DecodingMode::Autoregressive, 10);
-    let prepared = model.prepare_observed_chat(&chat, settings, eredu_core::capture::CapturePlan::none(), limits()).unwrap();
-    let mut run = model.start_controlled_text(prepared, &[], Default::default(), |_| ControlFlow::Continue(())).unwrap();
-    while run.token_ids().is_empty() { run.step(|_| ControlFlow::Continue(())).unwrap(); }
-    run.request_decoding_mode(DecodingMode::Diffusion { policy: None }).unwrap();
-    let before = (run.token_ids().to_vec(), run.decoding_state(), run.next_prediction());
-    let forecast = run.forecast_remaining_generation(2, &Default::default()).unwrap();
+    let prepared = model
+        .prepare_observed_chat(
+            &chat,
+            settings,
+            eredu_core::capture::CapturePlan::none(),
+            limits(),
+        )
+        .unwrap();
+    let mut run = model
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
+        .unwrap();
+    while run.token_ids().is_empty() {
+        run.step(|_| ControlFlow::Continue(())).unwrap();
+    }
+    run.request_decoding_mode(DecodingMode::Diffusion { policy: None })
+        .unwrap();
+    let before = (
+        run.token_ids().to_vec(),
+        run.decoding_state(),
+        run.next_prediction(),
+    );
+    let forecast = run
+        .forecast_remaining_generation(2, &Default::default())
+        .unwrap();
     assert_eq!(forecast.decoding.as_ref().unwrap().state, before.1);
     // Preserve the selected sampler's larger input horizon as well as block append.
     assert_eq!(forecast.continuation.additional_input_tokens, 6);
-    let zero = run.forecast_remaining_generation(0, &Default::default()).unwrap();
+    let zero = run
+        .forecast_remaining_generation(0, &Default::default())
+        .unwrap();
     assert_eq!(zero.decoding.as_ref().unwrap().settlement_input_tokens, 1);
     assert_eq!(zero.continuation.additional_input_tokens, 1);
-    assert!(zero.estimate.domains[0].phases.iter().any(|phase|
-        phase.phase == eredu::api::MemoryPhase::SpeculativeVerification && phase.query_positions == 1));
+    assert!(zero.estimate.domains[0]
+        .phases
+        .iter()
+        .any(
+            |phase| phase.phase == eredu::api::MemoryPhase::SpeculativeVerification
+                && phase.query_positions == 1
+        ));
     let phases = &forecast.estimate.domains[0].phases;
-    assert_eq!(phases.iter().find(|p| p.phase == eredu::api::MemoryPhase::Refinement).unwrap().query_positions, 3);
-    assert_eq!(phases.iter().find(|p| p.phase == eredu::api::MemoryPhase::RefinementCommit).unwrap().query_positions, 3);
-    assert!(phases.iter().all(|p| !matches!(p.phase, eredu::api::MemoryPhase::Prefill | eredu::api::MemoryPhase::Loading)));
-    assert_eq!((run.token_ids().to_vec(), run.decoding_state(), run.next_prediction()), before);
-    while run.decoding_state().pending.is_some() { run.step(|_| ControlFlow::Continue(())).unwrap(); }
-    let options = SpeculationOptionsRequest { max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(), ..Default::default() }.try_into().unwrap();
-    run.request_decoding_mode(DecodingMode::SelfSpeculation(options)).unwrap();
-    let forecast = run.forecast_remaining_generation(2, &Default::default()).unwrap();
-    assert!(forecast.estimate.domains[0].phases.iter().any(|p| p.phase == eredu::api::MemoryPhase::Refinement));
-    assert!(forecast.estimate.domains[0].phases.iter().any(|p| p.phase == eredu::api::MemoryPhase::SpeculativeVerification));
-    assert!(forecast.estimate.domains[0].phases.iter().all(|p| p.parameters.lower_bytes == 4096));
+    assert_eq!(
+        phases
+            .iter()
+            .find(|p| p.phase == eredu::api::MemoryPhase::Refinement)
+            .unwrap()
+            .query_positions,
+        3
+    );
+    assert_eq!(
+        phases
+            .iter()
+            .find(|p| p.phase == eredu::api::MemoryPhase::RefinementCommit)
+            .unwrap()
+            .query_positions,
+        3
+    );
+    assert!(phases.iter().all(|p| !matches!(
+        p.phase,
+        eredu::api::MemoryPhase::Prefill | eredu::api::MemoryPhase::Loading
+    )));
+    assert_eq!(
+        (
+            run.token_ids().to_vec(),
+            run.decoding_state(),
+            run.next_prediction()
+        ),
+        before
+    );
+    while run.decoding_state().pending.is_some() {
+        run.step(|_| ControlFlow::Continue(())).unwrap();
+    }
+    let options = SpeculationOptionsRequest {
+        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap();
+    run.request_decoding_mode(DecodingMode::SelfSpeculation(options))
+        .unwrap();
+    let forecast = run
+        .forecast_remaining_generation(2, &Default::default())
+        .unwrap();
+    assert!(forecast.estimate.domains[0]
+        .phases
+        .iter()
+        .any(|p| p.phase == eredu::api::MemoryPhase::Refinement));
+    assert!(forecast.estimate.domains[0]
+        .phases
+        .iter()
+        .any(|p| p.phase == eredu::api::MemoryPhase::SpeculativeVerification));
+    assert!(forecast.estimate.domains[0]
+        .phases
+        .iter()
+        .all(|p| p.parameters.lower_bytes == 4096));
 }
 
 #[test]
@@ -297,9 +371,13 @@ fn six_directed_handoffs_settle_committed_suffix_once_and_clear_tentative_output
                 )
                 .unwrap();
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             while run.token_ids().is_empty() {
                 run.step(|_| ControlFlow::Continue(())).unwrap();
@@ -373,9 +451,13 @@ fn mode_snapshot_restores_pending_block_and_forks_independent_commands_without_r
         )
         .unwrap();
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 2,
@@ -454,9 +536,13 @@ fn cancellation_during_settlement_and_failed_settlement_never_acknowledge_or_com
             )
             .unwrap();
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         while run.token_ids().is_empty() {
             run.step(|_| ControlFlow::Continue(())).unwrap();
@@ -507,17 +593,23 @@ fn uninterrupted_and_controlled_advancement_follow_the_same_repeated_command_sch
         .unwrap()
         .with_control_handle(control.clone());
     let output = model
-        .generate_observed_text(prepared, &[], Default::default(), |record| {
-            if matches!(record.event, ObservedGenerationEvent::Token { .. }) {
-                committed += 1;
-                if committed <= 7 && control.decoding_state().unwrap().pending.is_none() {
-                    control
-                        .request_decoding_mode(modes()[(committed as usize) % 3])
-                        .unwrap();
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                if matches!(record.event, ObservedGenerationEvent::Token { .. }) {
+                    committed += 1;
+                    if committed <= 7 && control.decoding_state().unwrap().pending.is_none() {
+                        control
+                            .request_decoding_mode(modes()[(committed as usize) % 3])
+                            .unwrap();
+                    }
                 }
-            }
-            ControlFlow::Continue(())
-        })
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let (mut model, chat, settings, _, _) = setup(modes()[0], 10);
     let prepared = model
@@ -529,9 +621,13 @@ fn uninterrupted_and_controlled_advancement_follow_the_same_repeated_command_sch
         )
         .unwrap();
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let handle = run.control_handle();
     let mut committed = 0;
@@ -559,19 +655,39 @@ fn mirostat_rejects_position_score_modes_before_enqueuing_a_change() {
     let (mut model, chat, mut settings, first, audit) = setup(DecodingMode::Autoregressive, 4);
     settings.strategy = eredu_core::TextSamplingStrategy::MirostatV2 { tau: 5.0, eta: 0.1 };
     settings.overrides.temperature = Some(0.8);
-    let prepared = model.prepare_observed_chat(
-        &chat, settings, eredu_core::capture::CapturePlan::none(), limits(),
-    ).unwrap();
-    let mut run = model.start_controlled_text(
-        prepared, &[], Default::default(), |_| ControlFlow::Continue(()),
-    ).unwrap();
+    let prepared = model
+        .prepare_observed_chat(
+            &chat,
+            settings,
+            eredu_core::capture::CapturePlan::none(),
+            limits(),
+        )
+        .unwrap();
+    let mut run = model
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
+        .unwrap();
     let before = run.decoding_state();
-    assert!(matches!(run.control_handle().request_decoding_mode(DecodingMode::Diffusion { policy: None }),
-        Err(DecodingModeError::RequiresCausalConditionalScores)));
-    assert!(matches!(run.request_decoding_mode(DecodingMode::Diffusion { policy: None }),
-        Err(eredu::api::ControlledGenerationError::DecodingMode(DecodingModeError::RequiresCausalConditionalScores))));
+    assert!(matches!(
+        run.control_handle()
+            .request_decoding_mode(DecodingMode::Diffusion { policy: None }),
+        Err(DecodingModeError::RequiresCausalConditionalScores)
+    ));
+    assert!(matches!(
+        run.request_decoding_mode(DecodingMode::Diffusion { policy: None }),
+        Err(eredu::api::ControlledGenerationError::DecodingMode(
+            DecodingModeError::RequiresCausalConditionalScores
+        ))
+    ));
     assert_eq!(run.decoding_state(), before);
-    while run.token_ids().is_empty() { run.step(|_| ControlFlow::Continue(())).unwrap(); }
+    while run.token_ids().is_empty() {
+        run.step(|_| ControlFlow::Continue(())).unwrap();
+    }
     assert_eq!(run.token_ids(), &[first]);
     assert!(audit.lock().unwrap().records.is_empty());
 }
@@ -588,9 +704,13 @@ fn unsupported_mode_options_leave_execution_and_pending_command_unchanged() {
         )
         .unwrap();
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let before = run.decoding_state();
     let adapter: SpeculationOptions = SpeculationOptionsRequest {

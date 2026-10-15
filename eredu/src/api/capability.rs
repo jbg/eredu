@@ -104,7 +104,7 @@ impl<B: ModelCapabilityBackend> LoadedModel<B> {
 }
 
 impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionObserver>
-    super::PlannedModel<B, D>
+    super::PlannedModel<B, eredu_core::RealizedDrafting<D>>
 {
     /// Reports every loaded participant's retention budget. External drafting
     /// has an independent allowance; embedded owners are included in the target.
@@ -128,7 +128,7 @@ impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRet
 }
 
 impl<B: ModelCapabilityBackend, D: eredu_core::residency::ParameterConversionRetentionTrimmer>
-    super::PlannedModel<B, D>
+    super::PlannedModel<B, eredu_core::RealizedDrafting<D>>
 {
     /// Releases optional conversions for the target and separately loaded drafter.
     /// Each participant establishes its ordinary settled boundary; no request

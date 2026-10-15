@@ -417,9 +417,13 @@ fn native_lfm2_workspace_forecasts_cover_cold_loaded_and_continued_execution() {
             warm.request.domains[0].budget.available_bytes;
         assert_eq!(ordinary.request, warm.request);
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         // Replay the raw iterator's committed tokens. This also prevents fixture
         // semantic EOS differences from making the forecast boundary ambiguous.
@@ -707,9 +711,13 @@ fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
             };
             if controlled {
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), |r| {
-                        collect(r.generation)
-                    })
+                    .start_controlled(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        |r| collect(r.generation),
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 // Stop at every committed boundary, including cached decode.
                 while run.finish_reason().is_none() {
@@ -721,7 +729,13 @@ fn native_lfm2_forecast_recalibration_preserves_logits_and_cached_generation() {
                 assert_eq!(run.token_ids(), raw);
             } else {
                 model
-                    .generate_observed_text(prepared, &[], Default::default(), &mut collect)
+                    .generate_observed(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        &mut collect,
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
             }
             assert_eq!(decisions.len(), raw.len());

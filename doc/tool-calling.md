@@ -9,8 +9,8 @@ The sole model-level chat-rendering entry point is `LoadedModel::prepare_chat`,
 including for chats without tools. It renders the selected checkpoint template,
 validates the request, and returns the prompt and its generation metadata.
 Applications can encode `PreparedChat::rendered_prompt()` for raw token
-generation or pass the prepared chat to one of the `generate_prepared_chat*`
-methods. Backend authors can use the generic `LoadedModel<B>` surface instead.
+generation or pass the prepared chat to `session.generate` with semantic output.
+Backend authors can use the generic `LoadedModel<B>` surface instead.
 The complete semantic-generation example is
 [`eredu/examples/native_tool_calling.rs`](../eredu/examples/native_tool_calling.rs).
 
@@ -74,16 +74,12 @@ validators and keep independent argument buffers.
 
 ## Generation APIs
 
-Choose one cohesive generation call:
-
-- `generate_prepared_chat` for ordinary constrained generation;
-- `generate_prepared_chat_speculative` with `drafting.as_speculative_draft()`
-  from the `RealizedDrafting<D>` loaded by the same execution plan; or
-- `generate_prepared_chat_speculative_batch` for independently scheduled requests.
-
-The batch API and explicit `SpeculativeDraft` variants are backend-generic
-infrastructure. The selected application facade keeps the native drafter and
-its failures private.
+Use `session.generate(request)` with `request.output_mode = OutputMode::Semantic`.
+The loaded `PlannedModel` retains disabled, embedded or external drafting and
+resolves the request against that selection. The callback and terminal result
+have the same shape for all three sources; draft diagnostics are optional.
+The low-level `generate_speculative_batch` operation schedules independent lanes
+with a common explicit output mode.
 
 All paths use the same tokenizer-aware byte decoder, stop matcher, constraint
 engine, and semantic event pipeline. Speculation and scheduler interleaving can
@@ -113,11 +109,13 @@ event.
 
 ```rust,ignore
 let mut events = Vec::new();
-let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+let output = session.generate(GenerationRequest {
+    output_mode: eredu::api::OutputMode::Semantic,
     input: PreparedChatInput::rendered_prompt(&prepared),
     settings: PreparedChatGenerationSettings::default(),
     caller_stop_sequences: &[],
     cancellation: GenerationCancellationToken::new(),
+    control_handle: None,
     on_event: |event| events.push(event),
 })?;
 ```

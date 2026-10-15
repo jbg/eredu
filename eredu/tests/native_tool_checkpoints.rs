@@ -5,7 +5,7 @@
 
 use eredu::{
     api::{
-        local_device_plan, LoadedModel, LocalDevice, PreparedChatGenerationRequest,
+        local_device_plan, GenerationRequest, LoadedModel, LocalDevice,
         PreparedChatGenerationSettings, PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
@@ -115,7 +115,9 @@ fn smoke_with_tool(
 
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
@@ -416,13 +418,21 @@ fn nanbeige_real_checkpoint_executes_tool_and_answers_from_result() {
                             ControlFlow::Continue(())
                         };
                         let mut session = model
-                            .start_controlled_chat(observed, &[], Default::default(), &mut collect)
+                            .start_controlled(
+                                observed,
+                                &[],
+                                Default::default(),
+                                &mut collect,
+                                eredu::api::OutputMode::Semantic,
+                            )
                             .unwrap();
                         session.run(&mut collect).unwrap();
                         session.token_ids().to_vec()
                     } else {
                         model
-                            .generate_prepared_chat(PreparedChatGenerationRequest {
+                            .session()
+                            .generate(GenerationRequest {
+                                output_mode: eredu::api::OutputMode::Semantic,
                                 control_handle: None,
                                 input: PreparedChatInput::rendered_prompt(&prepared),
                                 settings,

@@ -93,7 +93,9 @@ fn qwen4_default_inspection_and_public_loading_generate_and_restore_both_formats
             })
             .unwrap();
         let ordinary = model
-            .generate_prepared_text(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
                 settings: settings(PrefillChunkPolicy::Unchunked),
@@ -108,7 +110,9 @@ fn qwen4_default_inspection_and_public_loading_generate_and_restore_both_formats
         assert!(ordinary.token_ids.len() >= 2);
         model.reset().unwrap();
         let chunked = model
-            .generate_prepared_text(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
                 settings: settings(PrefillChunkPolicy::Bounded(NonZeroUsize::new(3).unwrap())),
@@ -133,9 +137,13 @@ fn qwen4_default_inspection_and_public_loading_generate_and_restore_both_formats
             )
             .unwrap();
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 1,
@@ -210,7 +218,9 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
     .into_parts();
     let chat = target.prepare_chat(chat_request()).unwrap();
     let ordinary = target
-        .generate_prepared_text(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
             control_handle: None,
             input: PreparedChatInput::token_ids(&chat, prompt.clone()),
             settings: settings(PrefillChunkPolicy::Bounded(NonZeroUsize::new(17).unwrap())),
@@ -236,33 +246,54 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
     ] {
         let loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &plan).unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (mut model, _) = loaded.into_parts();
         let chat = model.prepare_chat(chat_request()).unwrap();
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::token_ids(&chat, prompt.clone()),
-            drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    generation,
-                )),
-                ..settings(PrefillChunkPolicy::Unchunked)
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
+        let request = || {
+            (
+                eredu_core::SpeculativeDraft::Embedded,
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::token_ids(&chat, prompt.clone()),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            generation,
+                        )),
+                        ..settings(PrefillChunkPolicy::Unchunked)
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+            )
         };
-        let speculative = model.generate_prepared_text_speculative(request()).unwrap();
+        let speculative = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         assert_eq!(speculative.token_ids(), ordinary.token_ids);
         assert_eq!(speculative.finish_reason(), ordinary.finish_reason);
-        assert!(speculative.stats().draft_tokens() > 0);
+        assert!(
+            speculative
+                .stats()
+                .drafting
+                .as_ref()
+                .unwrap()
+                .draft_tokens()
+                > 0
+        );
         model.reset().unwrap();
-        let controlled = model
-            .with_controlled_text_speculative(
-                request(),
-                ControlledSpeculativeOptions {
-                    snapshots: Some(SnapshotLimits {
+        let controlled = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).with_controlled(
+                request,
+                GenerationControlOptions {
+                    speculative_snapshots: Some(SnapshotLimits {
                         max_snapshots: 1,
                         max_branches: 1,
                         retained_bytes: 32 << 20,
@@ -271,6 +302,7 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
                     ..Default::default()
                 },
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     assert!(session.step()?.is_some());
                     assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                     let saved = session.snapshot()?;
@@ -284,10 +316,11 @@ fn qwen4_public_embedded_generation_matches_target_and_controlled_snapshot_repla
                     Ok(())
                 },
             )
-            .unwrap();
+        }
+        .unwrap();
         assert_eq!(controlled.token_ids(), ordinary.token_ids);
         assert_eq!(controlled.finish_reason(), ordinary.finish_reason);
-        assert!(controlled.stats().draft_tokens() > 0);
+        assert!(controlled.stats().drafting.as_ref().unwrap().draft_tokens() > 0);
         model.synchronize().unwrap();
     }
 }
@@ -415,7 +448,9 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         let chat = target.prepare_chat(chat_request()).unwrap();
         let prompt = target.prepare_multimodal_input(&media).unwrap();
         let ordinary = target
-            .generate_prepared_text(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(&chat, prompt),
                 settings: settings(PrefillChunkPolicy::Unchunked),
@@ -513,9 +548,13 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
             )
             .unwrap();
         let mut run = target
-            .start_controlled_text(observed, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                observed,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 2,
@@ -629,34 +668,55 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
         }
         let loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), path, &plan).unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (mut model, _) = loaded.into_parts();
         let chat = model.prepare_chat(chat_request()).unwrap();
         let prompt = model.prepare_multimodal_input(&media).unwrap();
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, prompt.clone()),
-            drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    generation,
-                )),
-                ..settings(PrefillChunkPolicy::Unchunked)
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
+        let request = || {
+            (
+                eredu_core::SpeculativeDraft::Embedded,
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::prepared_backend_input(&chat, prompt.clone()),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            generation,
+                        )),
+                        ..settings(PrefillChunkPolicy::Unchunked)
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+            )
         };
-        let speculative = model.generate_prepared_text_speculative(request()).unwrap();
+        let speculative = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         assert_eq!(speculative.token_ids(), ordinary.token_ids);
         assert_eq!(speculative.finish_reason(), ordinary.finish_reason);
-        assert!(speculative.stats().draft_tokens() > 0);
+        assert!(
+            speculative
+                .stats()
+                .drafting
+                .as_ref()
+                .unwrap()
+                .draft_tokens()
+                > 0
+        );
         model.reset().unwrap();
-        let controlled = model
-            .with_controlled_text_speculative(
-                request(),
-                ControlledSpeculativeOptions {
-                    snapshots: Some(SnapshotLimits {
+        let controlled = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).with_controlled(
+                request,
+                GenerationControlOptions {
+                    speculative_snapshots: Some(SnapshotLimits {
                         max_snapshots: 1,
                         max_branches: 1,
                         retained_bytes: 32 << 20,
@@ -665,6 +725,7 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
                     ..Default::default()
                 },
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     assert!(session.step()?.is_some());
                     let saved = session.snapshot()?;
                     while session.step()?.is_some() {}
@@ -675,10 +736,11 @@ fn qwen4_public_image_video_embedded_generation_and_controlled_replay() {
                     Ok(())
                 },
             )
-            .unwrap();
+        }
+        .unwrap();
         assert_eq!(controlled.token_ids(), ordinary.token_ids);
         assert_eq!(controlled.finish_reason(), ordinary.finish_reason);
-        assert!(controlled.stats().draft_tokens() > 0);
+        assert!(controlled.stats().drafting.as_ref().unwrap().draft_tokens() > 0);
         model.synchronize().unwrap();
     }
 }

@@ -308,10 +308,16 @@ fn capture_with_precision_and_selection<
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |e| {
-                records.push(e.generation);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |e| {
+                    records.push(e.generation);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 2,
@@ -339,10 +345,16 @@ fn capture_with_precision_and_selection<
         assert_eq!(first_precision, source_precisions(&records));
     } else {
         model
-            .generate_observed_text(prepared, &[], Default::default(), |e| {
-                records.push(e);
-                ControlFlow::Continue(())
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |e| {
+                    records.push(e);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
     }
     if empty_projection_inputs {

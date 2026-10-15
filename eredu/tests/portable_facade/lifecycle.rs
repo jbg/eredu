@@ -299,9 +299,7 @@ fn yielded_token_is_settled_before_abandonment_reuse_or_eviction() {
 
 #[test]
 fn cancellation_settles_and_allows_a_fresh_generic_request() {
-    use eredu::api::{
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-    };
+    use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
     use eredu::runtime::chat::ChatTemplateRequest;
     use eredu_core::{FinishReason, GenerationCancellationToken};
 
@@ -320,7 +318,9 @@ fn cancellation_settles_and_allows_a_fresh_generic_request() {
         }
         let cancel_on_event = cancellation.clone();
         let output = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::RenderedPrompt(&chat),
                 settings: PreparedChatGenerationSettings::default(),

@@ -36,6 +36,44 @@ pub struct SpeculationOptions {
     request: SpeculationOptionsRequest,
 }
 
+/// Resource ceilings retained for every mode of one generation owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeculationLimits {
+    /// Maximum proposals admitted in any current or prospective mode.
+    pub max_draft_tokens: std::num::NonZeroUsize,
+    /// Retained transaction, lookahead and completion bounds.
+    pub scheduler: crate::generation::SpeculativeSchedulerOptions,
+}
+impl From<SpeculationOptions> for SpeculationLimits {
+    fn from(options: SpeculationOptions) -> Self {
+        let options = options.request();
+        Self {
+            max_draft_tokens: options.max_draft_tokens,
+            scheduler: options.scheduler,
+        }
+    }
+}
+impl SpeculationLimits {
+    /// Rejects a request which expands this owner's retained resource policy.
+    pub fn validate(self, options: SpeculationOptions) -> Result<(), DecodingModeError> {
+        let options = options.request();
+        let requested = options.scheduler;
+        let ceiling = self.scheduler;
+        if options.max_draft_tokens > self.max_draft_tokens
+            || requested.lookahead_blocks > ceiling.lookahead_blocks
+            || requested.max_in_flight_verifications > ceiling.max_in_flight_verifications
+            || requested.max_optimistic_branches > ceiling.max_optimistic_branches
+            || requested.completion_timeout_milliseconds > ceiling.completion_timeout_milliseconds
+            || ceiling.adaptive_lookahead && !requested.adaptive_lookahead
+        {
+            return Err(DecodingModeError::Unsupported(
+                "request exceeds the retained drafting policy",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Values accepted when configuring a speculative invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

@@ -257,9 +257,21 @@ fn native_facade_with_family(device: LocalDevice, text: bool, family: &str) {
             chat.semantic_support(),
             eredu::runtime::chat::SemanticSupport::Unsupported { .. }
         ));
-        model.start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+        model.start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Text,
+        )
     } else {
-        model.start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        model.start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
     }
     .unwrap();
     run.enable_snapshots(SnapshotLimits {
@@ -466,7 +478,13 @@ fn text_matches_ordinary_sampling_with_policy(
         model.reset().unwrap();
         let mut records = vec![];
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                collect(&mut records),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         assert!(run.force_next_token(32).is_err());
         assert!(run.force_next_token(63).is_err());

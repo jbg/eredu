@@ -258,7 +258,13 @@ fn k2_distributed_facade_worker() {
         model.reset().unwrap();
         let emit = |_: ControlledGenerationRecord| ControlFlow::Continue(());
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), emit)
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                emit,
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 2,
@@ -307,7 +313,13 @@ fn k2_distributed_facade_worker() {
             let before = model.text_preparation_usage().unwrap();
             let cancelled = if controlled {
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), emit)
+                    .start_controlled(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        emit,
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 run.run(|record| {
                     if rank == 0
@@ -326,15 +338,21 @@ fn k2_distributed_facade_worker() {
                 run.token_ids().to_vec()
             } else {
                 model
-                    .generate_observed_text(prepared, &[], Default::default(), |record| {
-                        if rank == 0
-                            && matches!(record.event, ObservedGenerationEvent::Token { .. })
-                        {
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(())
-                        }
-                    })
+                    .generate_observed(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        |record| {
+                            if rank == 0
+                                && matches!(record.event, ObservedGenerationEvent::Token { .. })
+                            {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
+                        },
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap()
                     .token_ids
             };
@@ -353,7 +371,13 @@ fn k2_distributed_facade_worker() {
                     .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
                     .unwrap();
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), emit)
+                    .start_controlled(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        emit,
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 run.run(|record| {
                     if rank == 0
@@ -393,10 +417,16 @@ fn k2_distributed_facade_worker() {
                 let mut initial_bytes = 0;
                 if controlled {
                     let mut run = model
-                        .start_controlled_text(prepared, &[], Default::default(), |record| {
-                            initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                            ControlFlow::Continue(())
-                        })
+                        .start_controlled(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |record| {
+                                initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                                ControlFlow::Continue(())
+                            },
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap();
                     if boundary_record {
                         run.step(|record| {
@@ -413,22 +443,29 @@ fn k2_distributed_facade_worker() {
                     drop(run);
                 } else {
                     model
-                        .generate_observed_text(prepared, &[], Default::default(), |record| {
-                            if (boundary_record
-                                && !matches!(
-                                    record.event,
-                                    ObservedGenerationEvent::Completed { .. }
-                                ))
-                                || (!boundary_record
-                                    && matches!(
+                        .generate_observed(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |record| {
+                                if (boundary_record
+                                    && !matches!(
                                         record.event,
-                                        ObservedGenerationEvent::Started { .. }
+                                        ObservedGenerationEvent::Completed { .. }
                                     ))
-                            {
-                                initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                            }
-                            ControlFlow::Continue(())
-                        })
+                                    || (!boundary_record
+                                        && matches!(
+                                            record.event,
+                                            ObservedGenerationEvent::Started { .. }
+                                        ))
+                                {
+                                    initial_bytes +=
+                                        serde_json::to_vec(&record).unwrap().len() as u64;
+                                }
+                                ControlFlow::Continue(())
+                            },
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap();
                 }
                 model.reset().unwrap();
@@ -446,7 +483,13 @@ fn k2_distributed_facade_worker() {
                 let before = model.text_preparation_usage().unwrap();
                 let (local_limit, error): (bool, Box<dyn std::error::Error>) = if controlled {
                     let mut run = model
-                        .start_controlled_text(prepared, &[], Default::default(), emit)
+                        .start_controlled(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            emit,
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap();
                     let error = run.run(emit).unwrap_err();
                     let local = matches!(
@@ -459,9 +502,13 @@ fn k2_distributed_facade_worker() {
                     (local, Box::new(error))
                 } else {
                     let error = model
-                        .generate_observed_text(prepared, &[], Default::default(), |_| {
-                            ControlFlow::Continue(())
-                        })
+                        .generate_observed(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |_| ControlFlow::Continue(()),
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap_err();
                     let local = matches!(
                         error,
@@ -501,9 +548,13 @@ fn k2_distributed_facade_worker() {
                     .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
                     .unwrap();
                 let retry = model
-                    .generate_observed_text(prepared, &[], Default::default(), |_| {
-                        ControlFlow::Continue(())
-                    })
+                    .generate_observed(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        |_| ControlFlow::Continue(()),
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 assert_eq!(
                     retry.token_ids, baseline,

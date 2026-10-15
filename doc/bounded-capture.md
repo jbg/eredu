@@ -16,7 +16,7 @@ unverified sites remain inadmissible.
    prediction schedules, transforms, and explicit per-step/cumulative limits.
 3. Call `prepare_observed_chat`. It owns prompt token alignment, resolved settings,
    the chat's ordinary EOS/semantic policy, and immutable capture admission.
-4. Call `generate_observed_chat` and consume ordered `ObservedGenerationRecord`s.
+4. Call `generate_observed` and consume ordered `ObservedGenerationRecord`s.
    The callback receives prepared alignment, committed token IDs and captures,
    ordinary semantic text events, and completion. JSON records carry run/session,
    exact artifact-source and plan identities.
@@ -30,7 +30,7 @@ capture-all interpretation of empty selectors for compatibility.
 
 Use `intervention_discovery` and `prepare_intervened_chat` to admit prospective
 activation/routing controls together with capture, then call the same
-`generate_observed_chat`. Intervention outcomes and before/after evidence share
+`generate_observed`. Intervention outcomes and before/after evidence share
 capture budgets and native completion ownership. Shared session validation and
 observer forwarding serve capture-only and combined runs. Additional original
 routing-decision resources use backend estimates at admission and runtime, while
@@ -294,7 +294,7 @@ Capture time can include evaluation of the source's lazy dependencies, so these
 timings overlap and must not be added as independent costs.
 
 LM Inspector can replace its tokenizer/EOS/sampling loop with preparation and one
-`generate_observed_chat` call. Render semantic text events directly; associate
+`generate_observed` call. Render semantic text events directly; associate
 captures with the token event's prediction index and retained catalog point.
 Replace post-copy preview/statistics with the corresponding admitted native
 transform. Forward only already size-checked records, preserve structured missing
@@ -679,7 +679,7 @@ loaded capture support keeps its original prediction gate.
 
 Use `LoadedModel::speculative_activation_discovery` to obtain the separate loaded
 internal report, then `prepare_speculative_activations` to admit its capture/edit
-authority. Supply it as `ControlledSpeculativeOptions.activations`. The request's
+authority. Supply it as `GenerationControlOptions.speculative_activations`. The request's
 maximum predictions must fit the admitted schedule domain; actual invocation widths
 are checked independently before work. Every record carries the admitted identity.
 
@@ -689,7 +689,7 @@ cancellation. Each returned envelope spends the same trace allowance as steps;
 transport exhaustion consumes the rejected record and never refunds capture work.
 Successful step records already include their internal evidence.
 
-`generate_observed_chat_speculative` and `generate_observed_text_speculative` drive
+`PlannedModel::generate_observed` drives
 the controlled loop continuously with the same options and immediate per-step
 delivery. Returning `ControlFlow::Break` cancels and settles the scheduler. The
 scoped controlled form additionally exposes failure/cancellation evidence draining.

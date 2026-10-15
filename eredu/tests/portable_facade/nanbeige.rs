@@ -1,7 +1,5 @@
 use super::*;
-use eredu::api::{
-    PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-};
+use eredu::api::{GenerationRequest, PreparedChatGenerationSettings, PreparedChatInput};
 use eredu::runtime::chat::{ChatTemplateRequest, ParallelToolCallPolicy, ToolChoice};
 use eredu_core::{FinishReason, SemanticEvent};
 use serde_json::{json, Value};
@@ -58,7 +56,7 @@ fn generate(
     prepared: &eredu::runtime::chat::PreparedChat,
     calls: &Calls,
     text: &str,
-) -> (eredu_core::GenerationOutput, Vec<SemanticEvent>) {
+) -> (eredu::api::GenerationOutput, Vec<SemanticEvent>) {
     // No initial Metaspace prefix: these are continuation tokens, as emitted by
     // the model, including the checkpoint's non-special atomic XML markers.
     let mut tokenizer = Tokenizer::from_bytes(TOKENIZER).unwrap();
@@ -71,7 +69,9 @@ fn generate(
     calls.borrow_mut().scripted_tokens = ids.into();
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(prepared),
             settings: PreparedChatGenerationSettings {
@@ -124,7 +124,8 @@ fn official_nanbeige_bare_tool_marker_at_budget_exhaustion_cannot_execute() {
     let prepared = model.prepare_chat(request(false, tools())).unwrap();
     calls.borrow_mut().scripted_tokens = [166105].into();
     let mut events = Vec::new();
-    let result = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    let result = model.session().generate(GenerationRequest {
+        output_mode: eredu::api::OutputMode::Semantic,
         control_handle: None,
         input: PreparedChatInput::rendered_prompt(&prepared),
         settings: PreparedChatGenerationSettings {

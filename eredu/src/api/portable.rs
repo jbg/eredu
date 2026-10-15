@@ -5,9 +5,7 @@ use eredu_core::generation::{
     resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
     ResolvedGenerationConfig,
 };
-use eredu_core::{
-    ModelRuntime, RealizedDrafting, TextGenerationBackend, TextGenerationConfig, TokenOutput,
-};
+use eredu_core::{ModelRuntime, TextGenerationBackend, TextGenerationConfig, TokenOutput};
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 /// Backend-independent failure from tokenizer-aware text facade operations.
@@ -265,96 +263,6 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) model_id: String,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) checkpoint_generation_config: Option<CheckpointGenerationConfig>,
-}
-
-/// One completely realized execution plan: target model plus drafting resources.
-///
-/// The backend factory owns both target and assistant placement. Callers can
-/// execute the same code for any backend without constructing a backend-native
-/// assistant, stream, or device.
-pub struct PlannedModel<B: TextGenerationBackend, D> {
-    model: LoadedModel<B>,
-    drafting: RealizedDrafting<D>,
-    drafting_plan: eredu_core::DraftingPlan,
-}
-
-impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
-    pub(crate) fn new(
-        model: LoadedModel<B>,
-        drafting: RealizedDrafting<D>,
-        drafting_plan: eredu_core::DraftingPlan,
-    ) -> Self {
-        Self {
-            model,
-            drafting,
-            drafting_plan,
-        }
-    }
-
-    /// Borrows the loaded target model.
-    pub const fn model(&self) -> &LoadedModel<B> {
-        &self.model
-    }
-
-    /// Mutably borrows the loaded target model.
-    pub fn model_mut(&mut self) -> &mut LoadedModel<B> {
-        &mut self.model
-    }
-
-    /// Borrows the backend-owned drafting realization.
-    pub const fn drafting(&self) -> &RealizedDrafting<D> {
-        &self.drafting
-    }
-
-    /// Returns the portable drafting policy that produced these resources.
-    pub const fn drafting_plan(&self) -> &eredu_core::DraftingPlan {
-        &self.drafting_plan
-    }
-
-    /// Resolves the execution plan's speculative request controls.
-    ///
-    /// This prevents automatic-plan proposal and lookahead limits from being
-    /// silently replaced by unrelated request defaults.
-    pub fn speculative_generation_options(
-        &self,
-    ) -> Result<Option<super::SpeculationOptions>, eredu_core::GenerationError>
-    {
-        let (maximum, lookahead, adaptive) = match &self.drafting_plan {
-            eredu_core::DraftingPlan::Disabled => return Ok(None),
-            eredu_core::DraftingPlan::Embedded {
-                max_draft_tokens,
-                lookahead,
-                adaptive_lookahead,
-            }
-            | eredu_core::DraftingPlan::External {
-                max_draft_tokens,
-                lookahead,
-                adaptive_lookahead,
-                ..
-            } => (*max_draft_tokens, *lookahead, *adaptive_lookahead),
-            _ => return Ok(None),
-        };
-        let max_draft_tokens = std::num::NonZeroUsize::new(maximum)
-            .ok_or(eredu_core::GenerationError::ZeroDraftTokens)?;
-        let mut scheduler =
-            eredu_core::SpeculativeSchedulerOptions::default().with_lookahead(lookahead);
-        scheduler.adaptive_lookahead = adaptive;
-        Ok(Some(eredu_core::decoding::SpeculationOptionsRequest {
-            max_draft_tokens,
-            scheduler: scheduler.validate()?,
-            ..Default::default()
-        }.try_into()?))
-    }
-
-    /// Mutably borrows the target and drafting resources as one planned session.
-    pub fn parts_mut(&mut self) -> (&mut LoadedModel<B>, &mut RealizedDrafting<D>) {
-        (&mut self.model, &mut self.drafting)
-    }
-
-    /// Consumes the planned session into its target model and drafting resources.
-    pub fn into_parts(self) -> (LoadedModel<B>, RealizedDrafting<D>) {
-        (self.model, self.drafting)
-    }
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {

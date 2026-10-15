@@ -129,17 +129,27 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
         .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
         .unwrap();
     let expected = model
-        .generate_observed_chat(uncaptured, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            uncaptured,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     model.reset().unwrap();
     let mut ordinary = Vec::new();
     let observed = model
-        .generate_observed_chat(ordinary_prepared, &[], Default::default(), |record| {
-            ordinary.push(record);
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            ordinary_prepared,
+            &[],
+            Default::default(),
+            |record| {
+                ordinary.push(record);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(
         observed.token_ids(),
@@ -150,11 +160,12 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     let mut records = Vec::new();
     {
         let mut run = model
-            .start_controlled_chat(
+            .start_controlled(
                 controlled_prepared,
                 &[],
                 Default::default(),
                 collect(&mut records),
+                eredu::api::OutputMode::Semantic,
             )
             .unwrap();
         run.run(collect(&mut records)).unwrap();
@@ -190,7 +201,13 @@ fn forbidden_tool_candidates_match_ordinary_and_controlled_domains_before_forcin
     records.clear();
     model.reset().unwrap();
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     for token in [1, 2] {
         run.force_next_token(token).unwrap();

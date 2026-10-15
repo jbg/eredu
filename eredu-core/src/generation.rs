@@ -74,6 +74,16 @@ impl<S> GenerationOutput<S> {
         }
     }
 
+    /// Transforms terminal statistics while retaining tokens, termination and timing.
+    pub fn map_stats<T>(self, map: impl FnOnce(S) -> T) -> GenerationOutput<T> {
+        GenerationOutput {
+            token_ids: self.token_ids,
+            finish_reason: self.finish_reason,
+            timing: self.timing,
+            stats: map(self.stats),
+        }
+    }
+
     /// Canonical committed token ids.
     pub fn token_ids(&self) -> &[u32] {
         &self.token_ids
@@ -115,6 +125,7 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Default)]
 pub struct GenerationCancellationToken {
     cancelled: Arc<AtomicBool>,
+    parents: Arc<[Arc<AtomicBool>]>,
 }
 
 impl GenerationCancellationToken {
@@ -131,6 +142,21 @@ impl GenerationCancellationToken {
     /// Returns whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self.parents.iter().any(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// Creates an independently cancellable token that also observes either input.
+    /// Parent cancellation is permanent and never rewound by a snapshot or fork.
+    pub fn linked(&self, other: &Self) -> Self {
+        let mut parents = vec![self.cancelled.clone(), other.cancelled.clone()];
+        parents.extend(self.parents.iter().cloned());
+        parents.extend(other.parents.iter().cloned());
+        parents.sort_unstable_by_key(|flag| Arc::as_ptr(flag));
+        parents.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        Self {
+            cancelled: Arc::default(),
+            parents: parents.into(),
+        }
     }
 }
 

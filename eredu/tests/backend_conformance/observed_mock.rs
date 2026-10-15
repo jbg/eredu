@@ -507,7 +507,9 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         total_bytes: 1024 * 1024,
     };
     let baseline = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
@@ -522,31 +524,37 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
     let identity = prepared.intervention_plan().unwrap().identity().to_owned();
     let mut predictions = Vec::new();
     let output = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            assert_eq!(
-                record.intervention_plan_id.as_deref(),
-                Some(identity.as_str())
-            );
-            if let Event::Token {
-                captures: Some(step),
-                ..
-            } = record.event
-            {
-                assert_eq!(step.interventions[0].outcome, InterventionOutcome::Applied);
-                assert_eq!(step.interventions[0].evidence.len(), 2);
-                assert_eq!(step.step_usage.captures, 3);
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
                 assert_eq!(
-                    step.records[0].payload,
-                    step.interventions[0].evidence[0].payload
+                    record.intervention_plan_id.as_deref(),
+                    Some(identity.as_str())
                 );
-                assert_eq!(
-                    step.interventions[0].evidence[0].payload,
-                    step.interventions[0].evidence[1].payload
-                );
-                predictions.push(step.prediction_index);
-            }
-            ControlFlow::Continue(())
-        })
+                if let Event::Token {
+                    captures: Some(step),
+                    ..
+                } = record.event
+                {
+                    assert_eq!(step.interventions[0].outcome, InterventionOutcome::Applied);
+                    assert_eq!(step.interventions[0].evidence.len(), 2);
+                    assert_eq!(step.step_usage.captures, 3);
+                    assert_eq!(
+                        step.records[0].payload,
+                        step.interventions[0].evidence[0].payload
+                    );
+                    assert_eq!(
+                        step.interventions[0].evidence[0].payload,
+                        step.interventions[0].evidence[1].payload
+                    );
+                    predictions.push(step.prediction_index);
+                }
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(output.token_ids, baseline.token_ids);
     assert_eq!(output.finish_reason, baseline.finish_reason);
@@ -558,18 +566,24 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .unwrap();
     assert!(empty.intervention_plan().is_none());
     let unchanged = model
-        .generate_observed_chat(empty, &[], Default::default(), |record| {
-            assert!(record.intervention_plan_id.is_none());
-            if let Event::Token {
-                captures: Some(step),
-                ..
-            } = record.event
-            {
-                assert!(step.interventions.is_empty());
-                assert_eq!(step.records.len(), 1);
-            }
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            empty,
+            &[],
+            Default::default(),
+            |record| {
+                assert!(record.intervention_plan_id.is_none());
+                if let Event::Token {
+                    captures: Some(step),
+                    ..
+                } = record.event
+                {
+                    assert!(step.interventions.is_empty());
+                    assert_eq!(step.records.len(), 1);
+                }
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(unchanged.token_ids, baseline.token_ids);
     assert_eq!(unchanged.finish_reason, baseline.finish_reason);
@@ -585,10 +599,16 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .unwrap();
     let mut records = Vec::new();
     assert!(model
-        .generate_observed_chat(prepared, &[], Default::default(), |r| {
-            records.push(r);
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |r| {
+                records.push(r);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic
+        )
         .is_err());
     assert!(records.iter().any(
         |r| matches!(&r.event, Event::CaptureFailure { captures, .. }
@@ -608,15 +628,21 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         }
         let mut closed = false;
         let output = model
-            .generate_observed_chat(prepared, &[], cancellation, |record| {
-                assert!(!closed, "delivery after consumer Break");
-                if matches!(record.event, Event::Token { .. }) {
-                    closed = true;
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                cancellation,
+                |record| {
+                    assert!(!closed, "delivery after consumer Break");
+                    if matches!(record.event, Event::Token { .. }) {
+                        closed = true;
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         assert_eq!(output.finish_reason, FinishReason::Cancelled);
         assert_eq!(output.token_ids.len(), usize::from(!pre_cancel));
@@ -626,12 +652,18 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
         .unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = model.generate_observed_chat(prepared, &[], Default::default(), |record| {
-            if matches!(record.event, Event::Token { .. }) {
-                panic!("consumer unwinds");
-            }
-            ControlFlow::Continue(())
-        });
+        let _ = model.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                if matches!(record.event, Event::Token { .. }) {
+                    panic!("consumer unwinds");
+                }
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        );
     }))
     .is_err());
     // Successful reuse proves no move-only submission lease escaped cancellation,
@@ -640,9 +672,13 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .prepare_intervened_chat(&chat, settings, plan(), intervention_plan(1.0), limits)
         .unwrap();
     let reused = model
-        .generate_observed_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(reused.token_ids, baseline.token_ids);
     assert_eq!(reused.finish_reason, baseline.finish_reason);
@@ -652,11 +688,12 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
         .unwrap();
     assert_eq!(
         model
-            .generate_observed_chat(
+            .generate_observed(
                 prepared,
                 &[],
                 Default::default(),
-                |_| ControlFlow::Continue(())
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Semantic
             )
             .unwrap()
             .token_ids,

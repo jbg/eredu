@@ -150,7 +150,9 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         let (mut model, chat, ids) = setup(normalized_request.clone(), &pieces);
         let mut ordinary_events = vec![];
         let ordinary = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: settings(),
@@ -197,10 +199,16 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
             .unwrap();
         let mut records = vec![];
         let mut session = model
-            .start_controlled_chat(prepared, &[], Default::default(), |record| {
-                records.push(record);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
+                    records.push(record);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         for _ in 0..partial_steps {
             session
@@ -285,7 +293,9 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
             .contains("<tool_response>\nFound two places.\n</tool_response>"));
         let mut events = vec![];
         let ordinary = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: settings(),
@@ -318,10 +328,16 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
             .unwrap();
         let mut records = vec![];
         let mut controlled = model
-            .start_controlled_chat(prepared, &[], Default::default(), |record| {
-                records.push(record);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
+                    records.push(record);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         controlled
             .run(|record| {
@@ -352,46 +368,59 @@ fn tool_names_restore_through_ordinary_and_controlled_speculative_visitors() {
         let chat = model.prepare_chat(request.clone()).unwrap();
         let mut events = Vec::new();
         let completed = std::cell::Cell::new(0usize);
-        let request = eredu::api::PreparedChatSpeculativeGenerationRequest {
-            input: PreparedChatInput::rendered_prompt(&chat),
-            drafting: SpeculativeDraft::Embedded,
-            settings: PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    max_new_tokens: Some(2),
+        let request = (
+            SpeculativeDraft::Embedded,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                input: PreparedChatInput::rendered_prompt(&chat),
+                settings: PreparedChatGenerationSettings {
+                    overrides: GenerationConfigOverrides {
+                        max_new_tokens: Some(2),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            control_handle: None,
-            on_event: |event| {
-                if matches!(event, SemanticEvent::ToolCallCompleted { .. }) {
-                    completed.set(completed.get() + 1);
-                }
-                events.push(event);
-            },
-        };
-        let tokens = if controlled {
-            model
-                .with_controlled_chat_speculative(request, Default::default(), |session| {
-                    while session.step()?.is_some() {
-                        assert_eq!(
-                            completed.get(),
-                            usize::from(session.token_ids().contains(&11)),
-                            "completion requires the committed closing token"
-                        );
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                control_handle: None,
+                on_event: |event| {
+                    if matches!(event, SemanticEvent::ToolCallCompleted { .. }) {
+                        completed.set(completed.get() + 1);
                     }
-                    Ok(())
-                })
-                .unwrap()
-                .token_ids()
-                .to_vec()
+                    events.push(event);
+                },
+            },
+        );
+        let tokens = if controlled {
+            {
+                let (drafting, request) = request;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    Default::default(),
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        while session.step()?.is_some() {
+                            assert_eq!(
+                                completed.get(),
+                                usize::from(session.token_ids().contains(&11)),
+                                "completion requires the committed closing token"
+                            );
+                        }
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap()
+            .token_ids()
+            .to_vec()
         } else {
-            model
-                .generate_prepared_chat_speculative(request)
-                .unwrap()
-                .token_ids
+            {
+                let (drafting, mut request) = request;
+                request.output_mode = eredu::api::OutputMode::Semantic;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap()
+            .token_ids
         };
         assert_eq!(tokens, vec![7, 11]);
         assert_eq!(completed.get(), 1);

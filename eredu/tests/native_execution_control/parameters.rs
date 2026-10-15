@@ -154,10 +154,16 @@ pub(super) fn parameter_logits_mode<
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |record| {
-                records.push(record.generation);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
+                    records.push(record.generation);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         let mut emit = |record: ControlledGenerationRecord| {
             records.push(record.generation);
@@ -196,10 +202,16 @@ pub(super) fn parameter_logits_mode<
         run.exchange(&mut child, &mut emit).unwrap();
     } else {
         model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
-                records.push(record);
-                ControlFlow::Continue(())
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
+                    records.push(record);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
     }
     let mut result = None;
@@ -760,10 +772,16 @@ pub(super) fn parameter_decode_logits<
     let mut records = vec![];
     if controlled {
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), |e| {
-                records.push(e.generation);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |e| {
+                    records.push(e.generation);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 2,
@@ -796,10 +814,16 @@ pub(super) fn parameter_decode_logits<
         original
     } else {
         model
-            .generate_observed_text(prepared, &[], Default::default(), |e| {
-                records.push(e);
-                ControlFlow::Continue(())
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |e| {
+                    records.push(e);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         extract(&records, 0)
     }

@@ -28,10 +28,9 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
     let resolved = eredu_architectures::configuration::resolve_model_config(&config).unwrap();
     write_tensor_plan(&root.0, resolved.architecture.checkpoint());
     let adapter = fixture(false);
-    let mut declaration: serde_json::Value = serde_json::from_str(
-        eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON,
-    )
-    .unwrap();
+    let mut declaration: serde_json::Value =
+        serde_json::from_str(eredu_evaluation::nemotron_labs_diffusion::DRAFT_ADAPTER_CONFIG_JSON)
+            .unwrap();
     declaration["r"] = 2.into();
     declaration["lora_alpha"] = 4.into();
     let bytes = serde_json::to_vec(&declaration).unwrap();
@@ -83,18 +82,27 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
         },
         ..Default::default()
     };
-    let request = |settings| PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::token_ids(&chat, vec![1, 4, 2]),
-        drafting: eredu_core::SpeculativeDraft::Target,
-        settings,
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
+    let request = |settings| {
+        (
+            eredu_core::SpeculativeDraft::Target,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: None,
+                input: PreparedChatInput::token_ids(&chat, vec![1, 4, 2]),
+
+                settings,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
+            },
+        )
     };
-    let expected = model
-        .generate_prepared_text_speculative(request(settings))
-        .unwrap();
+    let expected = {
+        let (drafting, mut request) = request(settings);
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).generate(request)
+    }
+    .unwrap();
     let speculation = DecodingMode::SelfSpeculation(
         SpeculationOptionsRequest {
             max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
@@ -105,56 +113,60 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
         .unwrap(),
     );
     let mut returned_to_ar = false;
-    let actual = model
-        .with_controlled_text_speculative(request(settings), Default::default(), |session| {
-            assert!(session.step()?.is_some());
-            assert_eq!(
-                session.decoding_state().unwrap().active,
-                DecodingMode::Autoregressive
-            );
-            let spent = session.snapshot_usage();
-            let initial = session
-                .forecast_remaining_generation(3, &Default::default())
-                .unwrap();
-            assert!(
-                initial
+    let actual = {
+        let (drafting, mut request) = request(settings);
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).with_controlled(
+            request,
+            Default::default(),
+            |session| {
+                let session = session.speculative().expect("speculative executor");
+                assert!(session.step()?.is_some());
+                assert_eq!(
+                    session.decoding_state().unwrap().active,
+                    DecodingMode::Autoregressive
+                );
+                let spent = session.snapshot_usage();
+                let initial = session
+                    .forecast_remaining_generation(3, &Default::default())
+                    .unwrap();
+                assert!(initial
                     .speculative
                     .shared_backbone
                     .as_ref()
                     .unwrap()
                     .adapter
-                    .is_none()
-            );
-            session.request_decoding_mode(speculation)?;
-            let pending = session
-                .forecast_remaining_generation(3, &Default::default())
-                .unwrap();
-            assert_eq!(pending.speculative.max_draft_tokens, 2);
-            assert!(
-                pending
+                    .is_none());
+                session.request_decoding_mode(speculation)?;
+                let pending = session
+                    .forecast_remaining_generation(3, &Default::default())
+                    .unwrap();
+                assert_eq!(pending.speculative.max_draft_tokens, 2);
+                assert!(pending
                     .speculative
                     .shared_backbone
                     .as_ref()
                     .unwrap()
                     .adapter
-                    .is_some()
-            );
-            assert_eq!(session.snapshot_usage(), spent);
-            assert_eq!(session.decoding_state().unwrap().pending, Some(speculation));
-            while session.step()?.is_some() {
-                let state = session.decoding_state().unwrap();
-                if !returned_to_ar
-                    && state.active == speculation
-                    && state.pending.is_none()
-                    && session.token_ids().len() > 1
-                {
-                    session.request_decoding_mode(DecodingMode::Autoregressive)?;
-                    returned_to_ar = true;
+                    .is_some());
+                assert_eq!(session.snapshot_usage(), spent);
+                assert_eq!(session.decoding_state().unwrap().pending, Some(speculation));
+                while session.step()?.is_some() {
+                    let state = session.decoding_state().unwrap();
+                    if !returned_to_ar
+                        && state.active == speculation
+                        && state.pending.is_none()
+                        && session.token_ids().len() > 1
+                    {
+                        session.request_decoding_mode(DecodingMode::Autoregressive)?;
+                        returned_to_ar = true;
+                    }
                 }
-            }
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            },
+        )
+    }
+    .unwrap();
     assert!(returned_to_ar);
     assert_eq!(actual.token_ids(), expected.token_ids());
     let diffusion = PreparedChatGenerationSettings {
@@ -165,15 +177,26 @@ fn shared_target_prepared_modes_preserve_output_and_pending_adapter_forecasts() 
         },
         ..settings
     };
-    let expected = model
-        .generate_prepared_text_speculative(request(diffusion))
-        .unwrap();
-    let actual = model
-        .with_controlled_text_speculative(request(diffusion), Default::default(), |session| {
-            while session.step()?.is_some() {}
-            Ok(())
-        })
-        .unwrap();
+    let expected = {
+        let (drafting, mut request) = request(diffusion);
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).generate(request)
+    }
+    .unwrap();
+    let actual = {
+        let (drafting, mut request) = request(diffusion);
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).with_controlled(
+            request,
+            Default::default(),
+            |session| {
+                let session = session.speculative().expect("speculative executor");
+                while session.step()?.is_some() {}
+                Ok(())
+            },
+        )
+    }
+    .unwrap();
     assert_eq!(actual.token_ids(), expected.token_ids());
     assert_eq!(actual.token_ids().len(), 2);
 }

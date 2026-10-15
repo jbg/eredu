@@ -183,15 +183,17 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
             max_new_tokens: Some(3),
             ..Default::default()
         },
-        decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion { policy: Some(
-            EntropyRefinementOptions {
-                max_denoising_steps: 2,
-                stability_threshold: 2,
-                ..Default::default()
-            }
-            .try_into()
-            .unwrap(),
-        ) }),
+        decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion {
+            policy: Some(
+                EntropyRefinementOptions {
+                    max_denoising_steps: 2,
+                    stability_threshold: 2,
+                    ..Default::default()
+                }
+                .try_into()
+                .unwrap(),
+            ),
+        }),
         ..Default::default()
     };
     let mut seed = vec![None; 32];
@@ -213,11 +215,12 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
         .unwrap()
         .with_refinement_canvas(invalid);
     assert!(matches!(
-        model.generate_observed_text(
+        model.generate_observed(
             rejected,
             &[],
             Default::default(),
-            |_| ControlFlow::Continue(())
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text
         ),
         Err(PreparedChatError::Generation(
             eredu_core::generation::GenerationError::RefinementCanvas(_)
@@ -228,9 +231,13 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
         .unwrap()
         .with_refinement_canvas(layout.clone());
     let ordinary = model
-        .generate_observed_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     assert_eq!((ordinary.token_ids[0], ordinary.token_ids[2]), (2, 3));
     model.reset().unwrap();
@@ -239,9 +246,13 @@ fn ordinary_and_controlled_facade_preserve_pins_and_canonical_commitment() {
         .unwrap()
         .with_refinement_canvas(layout);
     let mut controlled = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     controlled.run(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(controlled.token_ids(), ordinary.token_ids);

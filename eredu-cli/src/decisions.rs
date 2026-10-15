@@ -344,14 +344,16 @@ pub(crate) fn run<B: TextGenerationBackend>(
                     ..Default::default()
                 },
                 seed,
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion { policy: Some(
-                    EntropyRefinementOptions {
-                        max_denoising_steps: request.steps,
-                        stability_threshold: request.steps,
-                        ..Default::default()
-                    }
-                    .try_into()?,
-                ) }),
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::Diffusion {
+                    policy: Some(
+                        EntropyRefinementOptions {
+                            max_denoising_steps: request.steps,
+                            stability_threshold: request.steps,
+                            ..Default::default()
+                        }
+                        .try_into()?,
+                    ),
+                }),
                 ..Default::default()
             },
             plan,
@@ -385,8 +387,13 @@ pub(crate) fn run<B: TextGenerationBackend>(
     let prompt_tokens = prepared.prompt_token_ids().len();
     let context_started = Instant::now();
     let prepare_seconds = context_started.duration_since(started).as_secs_f64();
-    let mut session =
-        model.start_controlled_text(prepared, &[], Default::default(), &mut collect)?;
+    let mut session = model.start_controlled(
+        prepared,
+        &[],
+        Default::default(),
+        &mut collect,
+        eredu::api::OutputMode::Text,
+    )?;
     session.step(&mut collect)?;
     let context_seconds = context_started.elapsed().as_secs_f64();
     let refinement_started = Instant::now();

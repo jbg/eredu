@@ -53,14 +53,18 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
             let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
             let (ids, reason, ttft) = if speculative {
                 let output = model
-                    .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    .drafting_session(SpeculativeDraft::Embedded, None)
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input,
-                        drafting: SpeculativeDraft::Embedded,
+
                         settings: eredu::api::PreparedChatGenerationSettings {
-                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                Default::default(),
-                            )),
+                            decoding_mode: Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                    Default::default(),
+                                ),
+                            ),
                             ..settings()
                         },
                         caller_stop_sequences: &stops,
@@ -71,7 +75,9 @@ fn prepared_ttft_counts_eos_and_stop_tokens_without_visible_output() {
                 terminal(output)
             } else {
                 let output = model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
+                    .session()
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input,
                         settings: settings(),
@@ -110,14 +116,18 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
             let input = PreparedChatInput::prepared_backend_input(&chat, vec![0; 7]);
             let (ids, reason, ttft) = if speculative {
                 let output = model
-                    .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                    .drafting_session(SpeculativeDraft::Embedded, None)
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input,
-                        drafting: SpeculativeDraft::Embedded,
+
                         settings: eredu::api::PreparedChatGenerationSettings {
-                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                Default::default(),
-                            )),
+                            decoding_mode: Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                    Default::default(),
+                                ),
+                            ),
                             ..settings()
                         },
                         caller_stop_sequences: &[],
@@ -128,7 +138,9 @@ fn prepared_ttft_distinguishes_cancellation_before_and_after_commitment() {
                 terminal(output)
             } else {
                 let output = model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
+                    .session()
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input,
                         settings: settings(),
@@ -154,7 +166,8 @@ fn speculative_batch_ttft_uses_a_shared_origin_and_excludes_cancelled_lanes() {
     cancelled.cancel();
     let started = Instant::now();
     let output = model
-        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             drafting: SpeculativeDraft::Embedded,
             lanes: [
                 GenerationCancellationToken::new(),
@@ -210,7 +223,8 @@ fn speculative_ttft_counts_a_buffered_unicode_token_cancelled_before_text() {
     pre_cancelled.cancel();
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             drafting: SpeculativeDraft::Embedded,
             lanes: vec![
                 PreparedChatSpeculativeBatchLane {
@@ -300,8 +314,11 @@ fn observed_ttft_counts_a_buffered_unicode_token_before_record_delivery() {
     let started = Instant::now();
     let mut token_delivered = None;
     let output = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            match record.event {
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| match record.event {
                 ObservedGenerationEvent::Token { token_id, .. } => {
                     assert_eq!(token_id, first);
                     token_delivered = Some(started.elapsed());
@@ -314,8 +331,9 @@ fn observed_ttft_counts_a_buffered_unicode_token_before_record_delivery() {
                     panic!("a byte fragment must not produce visible text")
                 }
                 _ => ControlFlow::Continue(()),
-            }
-        })
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(output.token_ids, [first]);
     assert_eq!(output.finish_reason, FinishReason::Cancelled);

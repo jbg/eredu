@@ -182,7 +182,7 @@ generation; they never decode/re-encode the prefix or force a tested prediction.
 The runnable seven-step example below uses this exact replay path.
 
 Embedded prediction components use `prepare_speculative_activations` and
-`ControlledSpeculativeOptions::activations`, with declared context, proposal and
+`GenerationControlOptions::speculative_activations`, with declared context, proposal and
 prediction-depth scopes. Tentative proposal records are separate from committed
 output. Speculative snapshots require a drained canonical boundary after prefill;
 initial backend-owned prefill inputs do not have the complete portable copy

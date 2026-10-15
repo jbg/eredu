@@ -54,7 +54,7 @@ Released claim payload is not bytes returned to the OS, and trim does not flush
 the allocator cache. There is no live policy setter.
 
 For a fresh next request, reset request state and call `forecast_token_ids` or
-`forecast_prepared_generation`; for a paused request use its controlled
+`forecast_generation`; for a paused request use its controlled
 `forecast_remaining_generation`. Query again after trimming so forecasts remove
 stale retention credit. They read current claims without allocating execution
 resources, populating or trimming caches, settling work, or consuming budgets.
@@ -311,8 +311,8 @@ Serialization and deserialization both require this snake_case tagged format.
 
 ## API and ownership
 
-Prefer `LoadedModel::forecast_prepared_generation(&request, &options)` for a
-prepared ordinary request. It derives encoded input positions, checkpoint-resolved
+Prefer `PlannedModel::forecast_generation(&request, &options)` for a
+prepared request. It derives encoded input positions, checkpoint-resolved
 output limits, prefill eligibility, the actual logits projection contract, selected
 state geometry, parameter residency, available capacity and allocator policy.
 It borrows the request without executing callbacks, advancing state or reopening
@@ -329,7 +329,7 @@ let options = GenerationForecastOptions {
     },
     ..Default::default()
 };
-let forecast = model.forecast_prepared_generation(&request, &options)?;
+let forecast = model.forecast_generation(&request, &options)?;
 println!("{:?}", forecast.estimate.fit);
 // Pass the same request to ordinary generation or controlled startup.
 ```
@@ -390,9 +390,8 @@ EREDU_CONTINUATION_MODEL=/path/to/SmolLM2-135M-Instruct \
 
 ### Speculative requests
 
-`forecast_prepared_speculative_generation` borrows the same request accepted by
-uninterrupted generation and `with_controlled_text_speculative` /
-`with_controlled_chat_speculative`. `forecast_speculative_token_ids` exposes the
+`forecast_generation` borrows the same request accepted by
+uninterrupted generation and `with_controlled`. `forecast_speculative_token_ids` exposes the
 same projection for consumers that already counted/tokenized the input. The MLX
 adapter currently supplies complete speculative resource facts for **independent
 autoregressive drafters** when both models have ordinary workspace coverage.
@@ -462,7 +461,7 @@ provides pinned released-checkpoint parity and memory evidence on Metal.
 
 ### Settled speculative continuation
 
-Inside `with_controlled_text_speculative` or `with_controlled_chat_speculative`, use
+Inside `PlannedModel::with_controlled`, borrow the speculative inspector and use
 `session.forecast_remaining_generation(additional_tokens, &options)` after prefill
 or a canonical commit. The object-safe operation returns
 `SpeculativeContinuationForecast`: target `request`, the existing `speculative`
@@ -1081,7 +1080,7 @@ calibration. CUDA and native distributed prediction validation remain gaps.
 
 ### Embedded startup forecasts
 
-`forecast_prepared_speculative_generation` and `forecast_speculative_token_ids`
+`forecast_generation` and `forecast_speculative_token_ids`
 retain an optional `SpeculativeMemoryPlan.embedded` record. It composes ordinary target
 and prediction invocations with prediction state, retained target features,
 verification, rollback, replay and configured lookahead. Sequential prediction

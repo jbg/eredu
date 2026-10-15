@@ -7,8 +7,8 @@
 //! Each invocation is a fresh process; the request peak is reset after loading.
 use eredu::{
     api::{
-        local_device_plan, LoadedModel, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput,
+        local_device_plan, GenerationRequest, LoadedModel, PreparedChatGenerationSettings,
+        PreparedChatInput,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -94,10 +94,16 @@ fn main() -> anyhow::Result<()> {
                 total_bytes: 4 << 20,
             },
         )?;
-        model.generate_observed_chat(observed, &[], Default::default(), |record| {
-            println!("{}", serde_json::to_string(&record).unwrap());
-            std::ops::ControlFlow::Continue(())
-        })?;
+        model.generate_observed(
+            observed,
+            &[],
+            Default::default(),
+            |record| {
+                println!("{}", serde_json::to_string(&record).unwrap());
+                std::ops::ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )?;
         return Ok(());
     }
     let rendered_ids = model.encode(chat.rendered_prompt(), false)?;
@@ -136,7 +142,8 @@ fn main() -> anyhow::Result<()> {
             .map_or(PrefillChunkPolicy::Unchunked, PrefillChunkPolicy::Bounded),
         ..Default::default()
     };
-    let request = PreparedChatGenerationRequest {
+    let request = GenerationRequest {
+        output_mode: eredu::api::OutputMode::Semantic,
         control_handle: None,
         input: PreparedChatInput::TokenIds {
             prepared_chat: &chat,
@@ -147,7 +154,9 @@ fn main() -> anyhow::Result<()> {
         cancellation: cancellation.clone(),
         on_event: |_| {},
     };
-    let forecast = model.forecast_prepared_generation(&request, &Default::default())?;
+    let forecast = model
+        .session()
+        .forecast_generation(&request, &Default::default())?;
     reset_allocator_peak()?;
     let start = Instant::now();
     let (done, wait) = std::sync::mpsc::channel::<()>();
@@ -163,7 +172,11 @@ fn main() -> anyhow::Result<()> {
             }
         })
     });
-    let output = model.generate_prepared_chat(request);
+    let output = {
+        let mut request = request;
+        request.output_mode = eredu::api::OutputMode::Semantic;
+        model.session().generate(request)
+    };
     let generation_seconds = start.elapsed().as_secs_f64();
     let _ = done.send(());
     let cancelled_at = timer.and_then(|t| t.join().unwrap());

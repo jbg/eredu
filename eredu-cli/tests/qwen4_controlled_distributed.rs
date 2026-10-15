@@ -350,7 +350,7 @@ fn ring_worker() {
     let loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &checkpoint, &plan)
             .unwrap();
-    let options = loaded.speculative_generation_options().unwrap().unwrap();
+    let options = loaded.drafting_options().unwrap().unwrap();
     let (mut baseline, _) = loaded.into_parts();
     let chat_request = || ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"word3 word4"})],
@@ -368,10 +368,12 @@ fn ring_worker() {
     };
     let chat = baseline.prepare_chat(chat_request()).unwrap();
     let expected = baseline
-        .generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(eredu_core::SpeculativeDraft::Embedded, None)
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
             control_handle: None,
             input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
-            drafting: eredu_core::SpeculativeDraft::Embedded,
+
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
                 ..settings
@@ -388,24 +390,29 @@ fn ring_worker() {
         .unwrap();
     let mut baseline_captures = Vec::new();
     let captured_baseline = baseline
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(eredu_core::SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
-                drafting: eredu_core::SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        options,
+                    )),
                     ..settings
                 },
                 caller_stop_sequences: &[],
                 cancellation: Default::default(),
                 on_event: |_| {},
             },
-            ControlledSpeculativeOptions {
-                activations: Some(activations),
+            GenerationControlOptions {
+                speculative_activations: Some(activations),
                 ..Default::default()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 while let Some(step) = session.step()? {
                     baseline_captures.extend(step.activations);
                 }
@@ -450,19 +457,32 @@ fn ring_worker() {
     )
     .unwrap();
     let chat = model.prepare_chat(chat_request()).unwrap();
-    let request = || PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
-        drafting: eredu_core::SpeculativeDraft::Embedded,
-        settings: eredu::api::PreparedChatGenerationSettings {
-            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
-            ..settings
-        },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
+    let request = || {
+        (
+            eredu_core::SpeculativeDraft::Embedded,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: None,
+                input: PreparedChatInput::token_ids(&chat, PROMPT.to_vec()),
+
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        options,
+                    )),
+                    ..settings
+                },
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
+            },
+        )
     };
-    let ordinary = model.generate_prepared_text_speculative(request()).unwrap();
+    let ordinary = {
+        let (drafting, mut request) = request();
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).generate(request)
+    }
+    .unwrap();
     assert_eq!(ordinary.token_ids(), expected.token_ids());
     assert_eq!(ordinary.finish_reason(), expected.finish_reason());
     model.reset().unwrap();
@@ -473,14 +493,17 @@ fn ring_worker() {
         cumulative_copy_bytes: 128 << 20,
     };
     // Establish controller parity independently of optional capture admission.
-    let controlled = model
-        .with_controlled_text_speculative(
-            request(),
-            ControlledSpeculativeOptions {
-                snapshots: Some(snapshot_limits()),
+    let controlled = {
+        let (drafting, mut request) = request();
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).with_controlled(
+            request,
+            GenerationControlOptions {
+                speculative_snapshots: Some(snapshot_limits()),
                 ..Default::default()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 assert!(session.step()?.is_some());
                 assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                 let saved = session.snapshot()?;
@@ -494,10 +517,11 @@ fn ring_worker() {
                 Ok(())
             },
         )
-        .unwrap();
+    }
+    .unwrap();
     assert_eq!(controlled.token_ids(), expected.token_ids());
     assert_eq!(controlled.finish_reason(), expected.finish_reason());
-    assert!(controlled.stats().draft_tokens() > 0);
+    assert!(controlled.stats().drafting.as_ref().unwrap().draft_tokens() > 0);
     eprintln!("rank {rank}: public controlled MTP snapshot replay passed");
     model.reset().unwrap();
     // Target boundaries span PP stages. Prediction fusion/capture preserve all
@@ -506,15 +530,18 @@ fn ring_worker() {
         .prepare_speculative_activations(capture_plan(case.topology().world_size()))
         .unwrap();
     let mut captured = Vec::new();
-    let controlled = model
-        .with_controlled_text_speculative(
-            request(),
-            ControlledSpeculativeOptions {
-                activations: Some(activations),
-                snapshots: Some(snapshot_limits()),
+    let controlled = {
+        let (drafting, mut request) = request();
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).with_controlled(
+            request,
+            GenerationControlOptions {
+                speculative_activations: Some(activations),
+                speculative_snapshots: Some(snapshot_limits()),
                 ..Default::default()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 captured.extend(session.step()?.unwrap().activations);
                 assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                 let saved = session.snapshot()?;
@@ -539,10 +566,11 @@ fn ring_worker() {
                 Ok(())
             },
         )
-        .unwrap();
+    }
+    .unwrap();
     assert_eq!(controlled.token_ids(), expected.token_ids());
     assert_eq!(controlled.finish_reason(), expected.finish_reason());
-    assert!(controlled.stats().draft_tokens() > 0);
+    assert!(controlled.stats().drafting.as_ref().unwrap().draft_tokens() > 0);
     assert_eq!(captured.len(), baseline_captures.len());
     for (actual, reference) in captured.iter().zip(&baseline_captures) {
         assert_eq!(actual.phase, reference.phase);

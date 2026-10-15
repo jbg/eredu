@@ -25,26 +25,32 @@ where
             ..Default::default()
         })
         .unwrap();
-    let request = || PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::token_ids(&chat, prefix.to_vec()),
-        drafting: eredu_core::SpeculativeDraft::Embedded,
-        settings: eredu::api::PreparedChatGenerationSettings {
-            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                *generation,
-            )),
-            ..PreparedChatGenerationSettings {
-                overrides: GenerationConfigOverrides {
-                    max_new_tokens: Some(5),
-                    temperature: Some(0.0),
-                    ..Default::default()
+    let request = || {
+        (
+            eredu_core::SpeculativeDraft::Embedded,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: None,
+                input: PreparedChatInput::token_ids(&chat, prefix.to_vec()),
+
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        *generation,
+                    )),
+                    ..PreparedChatGenerationSettings {
+                        overrides: GenerationConfigOverrides {
+                            max_new_tokens: Some(5),
+                            temperature: Some(0.0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
                 },
-                ..Default::default()
-            }
-        },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
+            },
+        )
     };
     let limit = CaptureUsage {
         captures: 128,
@@ -89,9 +95,9 @@ where
         })
         .unwrap();
     let identity = admitted.identity().to_owned();
-    let options = ControlledSpeculativeOptions {
-        activations: Some(admitted),
-        snapshots: Some(SnapshotLimits {
+    let options = GenerationControlOptions {
+        speculative_activations: Some(admitted),
+        speculative_snapshots: Some(SnapshotLimits {
             max_snapshots: 1,
             max_branches: 1,
             retained_bytes: 64 << 20,
@@ -101,36 +107,50 @@ where
     };
     let mut records = Vec::new();
     let output = if controlled {
-        model
-            .with_controlled_text_speculative(request(), options, |session| {
-                records.extend(session.step()?.unwrap().activations);
-                let saved = session.snapshot()?;
-                let start = records.len();
-                while let Some(step) = session.step()? {
-                    records.extend(step.activations);
-                }
-                let tokens = session.token_ids().to_vec();
-                session.restore(&saved)?;
-                let mut replay = Vec::new();
-                while let Some(step) = session.step()? {
-                    replay.extend(step.activations);
-                }
-                assert_eq!(session.token_ids(), tokens);
-                assert_eq!(replay.len(), records.len() - start);
-                for (a, b) in replay.iter().zip(&records[start..]) {
-                    assert_eq!(a.captures.records, b.captures.records);
-                    assert_eq!(a.admission_identity, b.admission_identity);
-                }
-                Ok(())
-            })
-            .unwrap()
+        {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model
+                .drafting_session(drafting, None)
+                .with_controlled(request, options, |session| {
+                    let session = session.speculative().expect("speculative executor");
+                    records.extend(session.step()?.unwrap().activations);
+                    let saved = session.snapshot()?;
+                    let start = records.len();
+                    while let Some(step) = session.step()? {
+                        records.extend(step.activations);
+                    }
+                    let tokens = session.token_ids().to_vec();
+                    session.restore(&saved)?;
+                    let mut replay = Vec::new();
+                    while let Some(step) = session.step()? {
+                        replay.extend(step.activations);
+                    }
+                    assert_eq!(session.token_ids(), tokens);
+                    assert_eq!(replay.len(), records.len() - start);
+                    for (a, b) in replay.iter().zip(&records[start..]) {
+                        assert_eq!(a.captures.records, b.captures.records);
+                        assert_eq!(a.admission_identity, b.admission_identity);
+                    }
+                    Ok(())
+                })
+        }
+        .unwrap()
     } else {
-        model
-            .generate_observed_text_speculative(request(), options, |step| {
-                records.extend(step.activations);
-                ControlFlow::Continue(())
-            })
-            .unwrap()
+        {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model
+                .drafting_session(drafting, None)
+                .generate_observed(request, options, |step| {
+                    let eredu::api::GenerationStep::Speculative(step) = step else {
+                        panic!("expected speculative action")
+                    };
+                    records.extend(step.activations);
+                    ControlFlow::Continue(())
+                })
+        }
+        .unwrap()
     };
     assert!(records.iter().any(|r| matches!(
         r.phase,
@@ -251,7 +271,7 @@ fn verify(device: LocalDevice) {
         let loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
                 .unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (mut model, _) = loaded.into_parts();
         let facts = model.parameter_discovery().unwrap();
         assert_eq!(graph.component_scopes.len(), 2);
@@ -421,10 +441,7 @@ fn verify(device: LocalDevice) {
             &execution,
         )
         .unwrap();
-        let oracle_generation = loaded_oracle
-            .speculative_generation_options()
-            .unwrap()
-            .unwrap();
+        let oracle_generation = loaded_oracle.drafting_options().unwrap().unwrap();
         let (mut oracle, _) = loaded_oracle.into_parts();
         for prefix in [[1, 2, 5], [5, 2, 1]] {
             let expected = captures(&mut oracle, &oracle_generation, &paths, &prefix, false);

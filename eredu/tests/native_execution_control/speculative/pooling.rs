@@ -119,7 +119,7 @@ fn verify(device: LocalDevice) {
                 &execution,
             )
             .unwrap();
-            let generation = loaded.speculative_generation_options().unwrap().unwrap();
+            let generation = loaded.drafting_options().unwrap().unwrap();
             let (mut model, _) = loaded.into_parts();
             let chat = model
                 .prepare_chat(ChatTemplateRequest {
@@ -139,19 +139,25 @@ fn verify(device: LocalDevice) {
             // Retain completed pools and partial windows at the saved frontier;
             // subsequent decode completes both ratio-4 and ratio-128 windows.
             let prefix: Vec<u32> = (0..255).map(|i| 1 + i % 15).collect();
-            let request = || PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::token_ids(&chat, prefix.clone()),
-                drafting: eredu_core::SpeculativeDraft::Embedded,
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        generation,
-                    )),
-                    ..settings
-                },
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| {},
+            let request = || {
+                (
+                    eredu_core::SpeculativeDraft::Embedded,
+                    GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
+                        control_handle: None,
+                        input: PreparedChatInput::token_ids(&chat, prefix.clone()),
+
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(generation),
+                            ),
+                            ..settings
+                        },
+                        caller_stop_sequences: &[],
+                        cancellation: Default::default(),
+                        on_event: |_| {},
+                    },
+                )
             };
             let usage = CaptureUsage {
                 captures: 2048,
@@ -181,9 +187,9 @@ fn verify(device: LocalDevice) {
                     },
                 )
                 .unwrap();
-            let options = ControlledSpeculativeOptions {
-                capture: Some(capture.clone()),
-                snapshots: Some(SnapshotLimits {
+            let options = GenerationControlOptions {
+                speculative_capture: Some(capture.clone()),
+                speculative_snapshots: Some(SnapshotLimits {
                     max_snapshots: 2,
                     max_branches: 2,
                     retained_bytes: 128 << 20,
@@ -192,12 +198,22 @@ fn verify(device: LocalDevice) {
                 ..Default::default()
             };
             let mut baseline_captures = Vec::new();
-            let baseline = model
-                .generate_observed_text_speculative(request(), options.clone(), |step| {
-                    baseline_captures.extend(step.captures);
-                    ControlFlow::Continue(())
-                })
-                .unwrap();
+            let baseline = {
+                let (drafting, mut request) = request();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate_observed(
+                    request,
+                    options.clone(),
+                    |step| {
+                        let eredu::api::GenerationStep::Speculative(step) = step else {
+                            panic!("expected speculative action")
+                        };
+                        baseline_captures.extend(step.captures);
+                        ControlFlow::Continue(())
+                    },
+                )
+            }
+            .unwrap();
             assert_eq!(baseline.token_ids().len(), 7);
             assert!(baseline_captures
                 .iter()
@@ -207,78 +223,86 @@ fn verify(device: LocalDevice) {
                     if values.candidates.iter().any(|c| c.score != 0.0))
                 }));
             let mut observed = Vec::new();
-            let output = model
-                .with_controlled_text_speculative(request(), options, |session| {
-                    observed.extend(session.step()?.unwrap().captures);
-                    assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
-                    let saved = session.snapshot()?;
-                    let start = observed.len();
-                    while let Some(step) = session.step()? {
-                        observed.extend(step.captures);
-                    }
-                    let original = session.token_ids().to_vec();
-                    let expected = records(&observed[start..]);
-                    for _ in 0..2 {
-                        let before = session.snapshot_usage();
-                        session.restore(&saved)?;
-                        assert!(
-                            session.snapshot_usage().cumulative_copy_bytes
-                                > before.cumulative_copy_bytes
-                        );
+            let output = {
+                let (drafting, mut request) = request();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    options,
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        observed.extend(session.step()?.unwrap().captures);
+                        assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
+                        let saved = session.snapshot()?;
+                        let start = observed.len();
+                        while let Some(step) = session.step()? {
+                            observed.extend(step.captures);
+                        }
+                        let original = session.token_ids().to_vec();
+                        let expected = records(&observed[start..]);
+                        for _ in 0..2 {
+                            let before = session.snapshot_usage();
+                            session.restore(&saved)?;
+                            assert!(
+                                session.snapshot_usage().cumulative_copy_bytes
+                                    > before.cumulative_copy_bytes
+                            );
+                            let mut replay = Vec::new();
+                            while let Some(step) = session.step()? {
+                                replay.extend(step.captures);
+                            }
+                            assert_eq!(session.token_ids(), original);
+                            compare_records(&records(&replay), &expected);
+                        }
+                        let first = session.fork(&saved)?;
+                        let second = session.fork(&saved)?;
+                        session.exchange(&first)?;
+                        let next = original[session.token_ids().len()];
+                        session.force_next_token((next + 1) % 63)?;
+                        loop {
+                            assert!(
+                                session.step()?.is_some(),
+                                "child reaches its next canonical boundary"
+                            );
+                            if session.can_snapshot() {
+                                break;
+                            }
+                        }
+                        let changed = session.snapshot()?;
+                        let mut suffix = Vec::new();
+                        while let Some(step) = session.step()? {
+                            suffix.extend(step.captures);
+                        }
+                        let changed_tokens = session.token_ids().to_vec();
+                        assert_ne!(changed_tokens, original);
+                        session.restore(&changed)?;
                         let mut replay = Vec::new();
                         while let Some(step) = session.step()? {
                             replay.extend(step.captures);
                         }
+                        assert_eq!(session.token_ids(), changed_tokens);
+                        compare_records(&records(&replay), &records(&suffix));
+                        session.exchange(&first)?;
                         assert_eq!(session.token_ids(), original);
-                        compare_records(&records(&replay), &expected);
-                    }
-                    let first = session.fork(&saved)?;
-                    let second = session.fork(&saved)?;
-                    session.exchange(&first)?;
-                    let next = original[session.token_ids().len()];
-                    session.force_next_token((next + 1) % 63)?;
-                    loop {
-                        assert!(
-                            session.step()?.is_some(),
-                            "child reaches its next canonical boundary"
-                        );
-                        if session.can_snapshot() {
-                            break;
+                        session.exchange(&second)?;
+                        let mut sibling = Vec::new();
+                        while let Some(step) = session.step()? {
+                            sibling.extend(step.captures);
                         }
-                    }
-                    let changed = session.snapshot()?;
-                    let mut suffix = Vec::new();
-                    while let Some(step) = session.step()? {
-                        suffix.extend(step.captures);
-                    }
-                    let changed_tokens = session.token_ids().to_vec();
-                    assert_ne!(changed_tokens, original);
-                    session.restore(&changed)?;
-                    let mut replay = Vec::new();
-                    while let Some(step) = session.step()? {
-                        replay.extend(step.captures);
-                    }
-                    assert_eq!(session.token_ids(), changed_tokens);
-                    compare_records(&records(&replay), &records(&suffix));
-                    session.exchange(&first)?;
-                    assert_eq!(session.token_ids(), original);
-                    session.exchange(&second)?;
-                    let mut sibling = Vec::new();
-                    while let Some(step) = session.step()? {
-                        sibling.extend(step.captures);
-                    }
-                    assert_eq!(session.token_ids(), original);
-                    compare_records(&records(&sibling), &expected);
-                    session.exchange(&second)?;
-                    assert_eq!(session.token_ids(), original);
-                    Ok(())
-                })
-                .unwrap();
+                        assert_eq!(session.token_ids(), original);
+                        compare_records(&records(&sibling), &expected);
+                        session.exchange(&second)?;
+                        assert_eq!(session.token_ids(), original);
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
             compare_records(&records(&observed), &records(&baseline_captures));
-            let tiny = ControlledSpeculativeOptions {
-                capture: Some(capture),
-                snapshots: Some(SnapshotLimits {
+            let tiny = GenerationControlOptions {
+                speculative_capture: Some(capture),
+                speculative_snapshots: Some(SnapshotLimits {
                     max_snapshots: 1,
                     max_branches: 0,
                     retained_bytes: 1,
@@ -288,27 +312,33 @@ fn verify(device: LocalDevice) {
             };
             // A known complete estimate must fail the explicit copy budget
             // before retention; the run remains usable after this rejection.
-            let rejected = model
-                .with_controlled_text_speculative(request(), tiny, |session| {
-                    session.step()?;
-                    let before = session.snapshot_usage();
-                    let error = session
-                        .snapshot()
-                        .expect_err("one-byte snapshot budget rejects copying");
-                    assert!(
-                        matches!(
-                            error,
-                            eredu_core::speculative::SpeculativeControlError::Control(
-                                eredu_core::execution_control::ExecutionControlError::Limit(_)
-                            )
-                        ),
-                        "{error}"
-                    );
-                    assert_eq!(session.snapshot_usage(), before);
-                    while session.step()?.is_some() {}
-                    Ok(())
-                })
-                .unwrap();
+            let rejected = {
+                let (drafting, mut request) = request();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model
+                    .drafting_session(drafting, None)
+                    .with_controlled(request, tiny, |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        session.step()?;
+                        let before = session.snapshot_usage();
+                        let error = session
+                            .snapshot()
+                            .expect_err("one-byte snapshot budget rejects copying");
+                        assert!(
+                            matches!(
+                                error,
+                                eredu_core::speculative::SpeculativeControlError::Control(
+                                    eredu_core::execution_control::ExecutionControlError::Limit(_)
+                                )
+                            ),
+                            "{error}"
+                        );
+                        assert_eq!(session.snapshot_usage(), before);
+                        while session.step()?.is_some() {}
+                        Ok(())
+                    })
+            }
+            .unwrap();
             assert_eq!(rejected.token_ids(), baseline.token_ids());
         }
     }

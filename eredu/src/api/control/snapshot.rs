@@ -191,7 +191,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
+        if self.delivery.cancellation.is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be snapshotted".into()).into(),
             );
@@ -314,7 +314,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         snapshot: &ControlledGenerationSnapshot<B>,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
+        if self.delivery.cancellation.is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be restored".into()).into(),
             );

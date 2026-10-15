@@ -161,10 +161,16 @@ fn verify_public_capture_failures(device: LocalDevice) {
             .unwrap();
         let mut events = Vec::new();
         model
-            .generate_observed_text(prepared, &[], Default::default(), |event| {
-                events.push(event);
-                ControlFlow::Continue(())
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |event| {
+                    events.push(event);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         let usage = first_usage(&events);
         let baseline = super::components::tensors(&events);
@@ -182,7 +188,13 @@ fn verify_public_capture_failures(device: LocalDevice) {
         {
             let mut records = Vec::new();
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    collect(&mut records),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             run.enable_snapshots(SnapshotLimits {
                 max_snapshots: 2,
@@ -240,7 +252,13 @@ fn verify_public_capture_failures(device: LocalDevice) {
             let error: Box<dyn std::error::Error> = if controlled {
                 let mut records = Vec::new();
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+                    .start_controlled(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        collect(&mut records),
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 let error = run.run(collect(&mut records)).unwrap_err();
                 events.extend(records.into_iter().map(|record| record.generation));
@@ -248,10 +266,16 @@ fn verify_public_capture_failures(device: LocalDevice) {
             } else {
                 Box::new(
                     model
-                        .generate_observed_text(prepared, &[], Default::default(), |event| {
-                            events.push(event);
-                            ControlFlow::Continue(())
-                        })
+                        .generate_observed(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |event| {
+                                events.push(event);
+                                ControlFlow::Continue(())
+                            },
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap_err(),
                 )
             };

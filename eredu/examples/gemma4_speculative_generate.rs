@@ -1,13 +1,12 @@
 use std::{
-    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LoadedModel, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatSpeculativeGenerationRequest,
+        default_local_device, local_device_plan, GenerationRequest, LoadedModel,
+        PreparedChatGenerationSettings, PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
@@ -148,50 +147,37 @@ fn run_speculative(
             lookahead: false,
             adaptive_lookahead: false,
         });
-    let planned =
+    let mut target =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), target_dir, &plan)?;
-    let (mut target, mut drafting) = planned.into_parts();
-    if !drafting.is_enabled() {
-        anyhow::bail!("external drafting plan was not realized");
-    }
-    let output =
-        target.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::rendered_prompt(prepared),
-            drafting: drafting
-                .as_speculative_draft()
-                .expect("drafting is enabled"),
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    eredu_core::decoding::SpeculationOptionsRequest {
-                        max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                        ..eredu_core::decoding::SpeculationOptionsRequest::default()
-                    }
-                    .try_into()
-                    .expect("validated speculation options"),
-                )),
-                ..PreparedChatGenerationSettings {
-                    overrides: GenerationConfigOverrides {
-                        temperature: Some(0.0),
-                        max_new_tokens: Some(max_tokens),
-                        ..Default::default()
-                    },
-                    ..PreparedChatGenerationSettings::default()
-                }
+    let output = target.generate(GenerationRequest {
+        output_mode: eredu::api::OutputMode::Semantic,
+        control_handle: None,
+        input: PreparedChatInput::rendered_prompt(prepared),
+        settings: PreparedChatGenerationSettings {
+            overrides: GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(max_tokens),
+                ..Default::default()
             },
-            caller_stop_sequences: &[],
-            cancellation: GenerationCancellationToken::new(),
-            on_event: |_| {},
-        })?;
+            ..Default::default()
+        },
+        caller_stop_sequences: &[],
+        cancellation: GenerationCancellationToken::new(),
+        on_event: |_| {},
+    })?;
     let mut generated = output.token_ids().to_vec();
-    let stats = output.stats();
+    let stats = output
+        .stats()
+        .drafting
+        .as_ref()
+        .expect("speculative statistics");
     if generated
         .last()
-        .is_some_and(|token| target.eos_token_ids().contains(token))
+        .is_some_and(|token| target.model().eos_token_ids().contains(token))
     {
         generated.pop();
     }
-    let text = target.decode(&generated, true)?;
+    let text = target.model().decode(&generated, true)?;
     Ok(GenerationResult {
         token_ids: generated,
         text,

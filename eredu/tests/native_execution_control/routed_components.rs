@@ -370,7 +370,13 @@ fn capture_units(device: LocalDevice) {
                     ControlFlow::Continue(())
                 };
                 let mut run = model
-                    .start_controlled_text(prepared, &[], Default::default(), &mut emit)
+                    .start_controlled(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        &mut emit,
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
                 run.enable_snapshots(SnapshotLimits {
                     max_snapshots: 2,
@@ -404,10 +410,16 @@ fn capture_units(device: LocalDevice) {
                 run.exchange(&mut child, &mut emit).unwrap();
             } else {
                 model
-                    .generate_observed_text(prepared, &[], Default::default(), |r| {
-                        events.push(r);
-                        ControlFlow::Continue(())
-                    })
+                    .generate_observed(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        |r| {
+                            events.push(r);
+                            ControlFlow::Continue(())
+                        },
+                        eredu::api::OutputMode::Text,
+                    )
                     .unwrap();
             }
             let steps: Vec<_> = events
@@ -524,10 +536,16 @@ fn capture_units(device: LocalDevice) {
                 .unwrap();
             let mut events = vec![];
             model
-                .generate_observed_text(prepared, &[], Default::default(), |r| {
-                    events.push(r);
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |r| {
+                        events.push(r);
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             let steps: Vec<_> = events
                 .into_iter()
