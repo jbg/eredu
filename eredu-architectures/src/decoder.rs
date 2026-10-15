@@ -3306,25 +3306,32 @@ fn parameter_description_with_vocabulary(
                     ));
                 }
             };
-        projection(
-            fields.attention_query,
-            vec![query_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-            config.attention_bias(AttentionProjection::Query),
-        );
-        projection(
-            fields.attention_key,
-            vec![key_value_width, hidden],
-            MemberSharding::Partitioned { axis: 0 },
-            config.attention_bias(AttentionProjection::Key),
-        );
-        if ordinary_value_projection(layer) {
-            projection(
-                fields.attention_value,
-                vec![key_value_width, hidden],
-                MemberSharding::Partitioned { axis: 0 },
-                config.attention_bias(AttentionProjection::Value),
-            );
+        match config.attention_projection_layout() {
+            AttentionProjectionLayout::Split => {
+                projection(
+                    fields.attention_query,
+                    vec![query_width, hidden],
+                    MemberSharding::Partitioned { axis: 0 },
+                    config.attention_bias(AttentionProjection::Query),
+                );
+                projection(
+                    fields.attention_key,
+                    vec![key_value_width, hidden],
+                    MemberSharding::Partitioned { axis: 0 },
+                    config.attention_bias(AttentionProjection::Key),
+                );
+                if ordinary_value_projection(layer) {
+                    projection(
+                        fields.attention_value,
+                        vec![key_value_width, hidden],
+                        MemberSharding::Partitioned { axis: 0 },
+                        config.attention_bias(AttentionProjection::Value),
+                    );
+                }
+            }
+            AttentionProjectionLayout::Fused { .. } => {
+                unreachable!("fused layouts are rejected above")
+            }
         }
         projection(
             fields.attention_output,
@@ -3358,17 +3365,34 @@ fn parameter_description_with_vocabulary(
             )),
         )?;
         let mut feed_forward_members = Vec::new();
-        for field in [fields.feed_forward_gate, fields.feed_forward_up] {
+        let inputs = match config.gated_projection_layout() {
+            GatedProjectionLayout::Split => vec![
+                (
+                    fields.feed_forward_gate,
+                    intermediate,
+                    MemberSharding::Partitioned { axis: 0 },
+                ),
+                (
+                    fields.feed_forward_up,
+                    intermediate,
+                    MemberSharding::Partitioned { axis: 0 },
+                ),
+            ],
+            GatedProjectionLayout::Fused { .. } => {
+                unreachable!("fused layouts are rejected above")
+            }
+        };
+        for (field, width, sharding) in inputs {
             feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
                 format!("{feed_forward_prefix}.{field}.weight"),
-                vec![intermediate, hidden],
-                MemberSharding::Partitioned { axis: 0 },
+                vec![width, hidden],
+                sharding.clone(),
             ));
             if config.mlp_bias() {
                 feed_forward_members.push(eredu_runtime::ParameterMemberSpec::new(
                     format!("{feed_forward_prefix}.{field}.bias"),
-                    vec![intermediate],
-                    MemberSharding::Partitioned { axis: 0 },
+                    vec![width],
+                    sharding,
                 ));
             }
         }
@@ -4831,20 +4855,27 @@ fn dense_local_block_config<C: PartitionedConfig>(
             .tensor(&path)
             .ok_or_else(|| Error::backend(format!("missing local decoder layout for {path}")))
     };
-    let query = tensor(format!(
-        "{prefix}.{}.{}.weight",
-        fields.attention, fields.attention_query
-    ))?;
-    let key = tensor(format!(
-        "{prefix}.{}.{}.weight",
-        fields.attention, fields.attention_key
-    ))?;
-    let gate = tensor(format!(
-        "{prefix}.{}.{}.weight",
-        fields.feed_forward, fields.feed_forward_gate
-    ))?;
-    let query_width = i32::try_from(query.local_shape()[0]).map_err(Error::backend)?;
-    let key_width = i32::try_from(key.local_shape()[0]).map_err(Error::backend)?;
+    let (query_width, key_width) = {
+        let query = tensor(format!(
+            "{prefix}.{}.{}.weight",
+            fields.attention, fields.attention_query
+        ))?;
+        let key = tensor(format!(
+            "{prefix}.{}.{}.weight",
+            fields.attention, fields.attention_key
+        ))?;
+        (
+            i32::try_from(query.local_shape()[0]).map_err(Error::backend)?,
+            i32::try_from(key.local_shape()[0]).map_err(Error::backend)?,
+        )
+    };
+    let intermediate = {
+        let gate = tensor(format!(
+            "{prefix}.{}.{}.weight",
+            fields.feed_forward, fields.feed_forward_gate
+        ))?;
+        i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?
+    };
     if query_width <= 0
         || key_width <= 0
         || query_width % config.head_dim() != 0
@@ -4856,7 +4887,7 @@ fn dense_local_block_config<C: PartitionedConfig>(
     local.set_local_geometry(
         query_width / config.head_dim(),
         key_width / config.head_dim(),
-        i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?,
+        intermediate,
     )?;
     Ok(local)
 }

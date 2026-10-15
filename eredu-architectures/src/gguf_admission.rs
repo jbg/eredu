@@ -60,7 +60,10 @@ fn canonical_tensor_mapping(
         GgufModelConfig::Gemma2(_) => {
             checkpoint.translated_outputs(crate::gemma2::translate_gguf_weight_name)
         }
-        GgufModelConfig::Llama(_) | GgufModelConfig::Nanbeige(_) => {
+        GgufModelConfig::Llama(args) => checkpoint.translated_outputs(|name| {
+            crate::llama::translate_gguf_weight_name_for_model(name, args)
+        }),
+        GgufModelConfig::Nanbeige(_) => {
             checkpoint.translated_outputs(crate::llama::translate_gguf_weight_name)
         }
         GgufModelConfig::MuseGlimmer(_) => {
