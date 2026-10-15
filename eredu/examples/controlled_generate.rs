@@ -5,7 +5,7 @@ use eredu::{
         LocalDevice, ObservedGenerationEvent, PreparedChatGenerationSettings, SamplingOverride,
         TraceLimits,
     },
-    runtime::chat::{ChatTemplateRequest, ToolChoice},
+    runtime::chat::ChatTemplateRequest,
 };
 use eredu_backend_mlx::MlxBackendFactory;
 use eredu_core::{
@@ -117,15 +117,10 @@ pub fn run_example(
     };
     let original = intervention(InterventionAction::Scale { dtype, factor: 1.0 });
     let modified = intervention(InterventionAction::Zero { dtype });
-    // Current complete-snapshot coverage requires the ordinary forbidden-tool
-    // constraint owner. Active/automatic llguidance state has no complete cost
-    // estimator. This request declares a tool surface and explicitly forbids calls.
     let chat = model.prepare_chat(ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":prompt})],
-        tools: vec![serde_json::json!({"type":"function", "function": {
-            "name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}
-        }})], tool_choice: ToolChoice::None, enable_thinking: Some(false),
-        add_generation_prompt: true, ..Default::default()
+        add_generation_prompt: true,
+        ..Default::default()
     })?;
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {

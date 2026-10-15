@@ -89,10 +89,8 @@ fn qwen4_exp_official_template_thinking_controls_and_effort_render_exactly() {
                 prepared.format_profile_identity(),
                 Some("qwen3.8.tagged-parameter-tools.v1")
             );
-            assert_eq!(
-                prepared.capabilities().reasoning_parser.is_supported(),
-                thinking != Some(false)
-            );
+            // The model's thinking toggle does not remove response-format recognition.
+            assert!(prepared.capabilities().reasoning_parser.is_supported());
         }
     }
 }

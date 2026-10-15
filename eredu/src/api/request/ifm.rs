@@ -87,6 +87,30 @@ pub(super) fn recognize(
             ));
         }
     }
+    let prefilled = request.add_generation_prompt;
+    let spec = ifm::spec(format, effort, prefilled, disabled).expect("validated IFM controls");
+    let mut profile = super::prepare_format_profile("");
+    profile.identity = Some("ifm.channels.v1".into());
+    profile.dialect = Some(&DECLARATIVE_DIALECT);
+    profile.dialect_parameters = Some(DialectParameters::Declarative(spec));
+
+    profile.required_structural_tokens = vec!["<|ifm|im_start|>".into(), "<|ifm|im_end|>".into()];
+    for &(_, opening, closing) in &ifm::REASONING {
+        for marker in [opening.trim_end(), closing] {
+            if super::resolve_structural_tokens(tokenizer, &[marker.into()]).is_ok() {
+                profile.required_structural_tokens.push(marker.into());
+            }
+        }
+    }
+    profile.stop_sequences = vec!["<|ifm|im_end|>".into()];
+    profile.reasoning_effort_control = Some(ReasoningEffortControl {
+        kwarg: "reasoning_effort",
+        supported: &["high", "medium", "low"],
+    });
+    profile.native_tool_unavailable_reason = Some(
+        "IFM reasoning was recognized, but tool rendering or tokens were not established".into(),
+    );
+
     let tools = vec![json!({"type": "function", "function": {
         "name": "eredu_ifm_probe", "description": "Probe", "parameters": {
             "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]
@@ -99,47 +123,49 @@ pub(super) fn recognize(
         }]}),
         json!({"role": "tool", "tool_call_id": "probe", "content": "__eredu_result_probe__"}),
     ];
-    let rendered = tokenizer.apply_chat_template_json(
-        template.clone(),
-        [messages],
-        Some(&tools),
-        model_id,
-        true,
-        Some(&kwargs),
-    )?;
-    let text = &rendered[0];
+    let rendered = tokenizer
+        .apply_chat_template_json(
+            template.clone(),
+            [messages],
+            Some(&tools),
+            model_id,
+            true,
+            Some(&kwargs),
+        )
+        .ok()
+        .and_then(|rendered| rendered.into_iter().next());
     let expected_call = match format {
         "json" => "<ifm|tool_call>{\"name\": \"eredu_ifm_probe\", \"arguments\": {\"value\": \"__eredu_value_probe__\"}}</ifm|tool_call>",
         "xml" => "<ifm|tool_call>eredu_ifm_probe\n<ifm|arg_key>value</ifm|arg_key>\n<ifm|arg_value>__eredu_value_probe__</ifm|arg_value>\n</ifm|tool_call>",
         "xml_typed" => "<ifm|tool_call>eredu_ifm_probe\n<ifm|arg_key>value</ifm|arg_key>\n<ifm|arg_type>string</ifm|arg_type>\n<ifm|arg_value>__eredu_value_probe__</ifm|arg_value>\n</ifm|tool_call>",
         _ => unreachable!(),
     };
-    if !text.contains(expected_call)
-        || !text.contains("<|ifm|im_start|>tool\n__eredu_result_probe__<|ifm|im_end|>")
-        || !text.contains("<ifm|think>\n__eredu_think_probe__")
-        || !text.contains("</ifm|think>")
-        || !text.contains("<ifm|tool_calls>\n")
-        || !text.contains("\n</ifm|tool_calls>")
-    {
-        return Ok(None);
-    }
-    let prefilled = request.add_generation_prompt;
-    let spec = ifm::spec(format, effort, prefilled, disabled).expect("validated IFM controls");
-    let mut profile = match super::recognized_dialect_profile(
-        tokenizer,
-        "ifm.tools.v1",
-        &DECLARATIVE_DIALECT,
-        DialectParameters::Declarative(spec),
-        true,
-        false,
-    ) {
-        Some(profile) => profile,
-        None => return Ok(None),
-    };
-    profile.reasoning_effort_control = Some(ReasoningEffortControl {
-        kwarg: "reasoning_effort",
-        supported: &["high", "medium", "low"],
+    let tool_rendering = rendered.as_deref().is_some_and(|text| {
+        text.contains(expected_call)
+            && text.contains("<|ifm|im_start|>tool\n__eredu_result_probe__<|ifm|im_end|>")
+            && text.contains("<ifm|think>\n__eredu_think_probe__")
+            && text.contains("</ifm|think>")
+            && text.contains("<ifm|tool_calls>\n")
+            && text.contains("\n</ifm|tool_calls>")
     });
+    if tool_rendering {
+        if let Some(tools) = super::recognized_tool_profile(
+            tokenizer,
+            "ifm.tools.v1",
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            true,
+            false,
+        ) {
+            profile.identity = tools.identity;
+            profile.tool_dialect = tools.tool_dialect;
+            profile.tool_dialect_parameters = tools.tool_dialect_parameters;
+            profile.tool_required_structural_tokens = tools.tool_required_structural_tokens;
+            profile.supports_mapping_tool_arguments = true;
+            profile.supports_tool_input_rendering = true;
+            profile.native_tool_unavailable_reason = None;
+        }
+    }
     if format != "json" {
         super::validate_tagged_history(&request.messages, "</ifm|arg_value>", "IFM")?;
     }

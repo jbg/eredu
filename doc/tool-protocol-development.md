@@ -45,6 +45,11 @@ tokens. Keep these capabilities independent:
 - tool-output parsing; and
 - constrained tool-input generation.
 
+Verify reasoning with tool definitions and history rejected by the template,
+without tool-only tokens, and with no working constraint compiler. A response
+parser must not depend on those optional capabilities. Semantic-only generation
+uses tokenizer validity; only a requested native-tool surface builds a grammar.
+
 Return no native-tool capability if any required behavior is ambiguous. Do not
 fall back to architecture or model metadata.
 
@@ -79,7 +84,7 @@ The dialect still has to expose the common semantic contract:
 
 - incremental reasoning and visible-text deltas;
 - indexed tool-call start, argument, and end events;
-- grammar-complete detection;
+- grammar-complete detection for native-tool constraints;
 - deterministic clone and discard behavior for speculative generation; and
 - a precise stop and error policy.
 

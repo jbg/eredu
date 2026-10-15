@@ -762,9 +762,9 @@ estimates regex tables only. Neither accounts for the full parser state, includi
 history buffers and caches, so neither satisfies snapshot admission. The dependency
 uses the compatible `1.8.0` requirement without an exact pin. Declaring tools with `ToolChoice::None`
 selects the supported forbidden-tool owner on a profile with a tool surface;
-ordinary no-tools requests can still use an active semantic grammar and therefore
-must check support. Adding tools purely to change this capability also changes the
-rendered prompt; the example makes that choice explicitly.
+no-tools semantic requests use tokenizer validity without a grammar. Complete
+snapshot and fork support still requires known native and semantic storage costs.
+The example uses an ordinary no-tools chat request.
 
 Branch allowances use checked conservative logical bounds. Native cache capacity
 rounding, initially absent fixed state, sampler history and pending inputs are

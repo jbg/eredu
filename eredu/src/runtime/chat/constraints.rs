@@ -509,7 +509,6 @@ fn constraint_error(error: String) -> ConstraintError {
 /// every request grammar shares it.
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
-    eos_token_ids: Vec<u32>,
     #[cfg(test)]
     tokenizer_analysis_runs: usize,
     #[cfg(test)]
@@ -531,16 +530,15 @@ impl ConstraintCompiler {
         eos_token_ids: &[u32],
     ) -> Result<Self, String> {
         let token_env = super::tokenizer_env::from_tokenizer(tokenizer, eos_token_ids)?;
-        Self::from_tok_env(token_env, eos_token_ids.to_vec())
+        Self::from_tok_env(token_env)
     }
 
-    fn from_tok_env(token_env: TokEnv, eos_token_ids: Vec<u32>) -> Result<Self, String> {
+    fn from_tok_env(token_env: TokEnv) -> Result<Self, String> {
         let mut factory = ParserFactory::new_simple(&token_env)
             .map_err(|error| format!("failed to analyze tokenizer trie: {error}"))?;
         factory.quiet();
         Ok(Self {
             factory: Arc::new(factory),
-            eos_token_ids,
             #[cfg(test)]
             tokenizer_analysis_runs: 1,
             #[cfg(test)]
@@ -550,11 +548,8 @@ impl ConstraintCompiler {
 
     #[cfg(test)]
     pub(crate) fn synthetic_for_tests() -> Self {
-        Self::from_tok_env(
-            llguidance::toktrie::ApproximateTokEnv::single_byte_env(),
-            vec![255],
-        )
-        .expect("single-byte tokenizer must support llguidance")
+        Self::from_tok_env(llguidance::toktrie::ApproximateTokEnv::single_byte_env())
+            .expect("single-byte tokenizer must support llguidance")
     }
 
     #[cfg(test)]
@@ -572,7 +567,7 @@ impl ConstraintCompiler {
         };
         let trie = TokTrie::from(&info, &words).with_eos_tokens(eos_token_ids);
         let environment = Arc::new(ApproximateTokEnv::new(trie));
-        Self::from_tok_env(environment, eos_token_ids.to_vec())
+        Self::from_tok_env(environment)
             .expect("single-byte tokenizer with EOS aliases must support llguidance")
     }
 
@@ -604,13 +599,15 @@ impl ConstraintCompiler {
             tok_end_of_turn: None,
         };
         let environment = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &words)));
-        Self::from_tok_env(environment, vec![eos])
-            .expect("synthetic tokenizer must support llguidance")
+        Self::from_tok_env(environment).expect("synthetic tokenizer must support llguidance")
     }
+}
 
+impl GenerationRuntimePlan {
+    /// Prepares response parsing and attaches a grammar only for native tools.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compile_generation_plan(
-        compiler: Option<&Self>,
+    pub(crate) fn prepare(
+        compiler: Option<&ConstraintCompiler>,
         dialect: &'static dyn FormatDialect,
         parameters: DialectParameters,
         tools: &[Value],
@@ -621,38 +618,32 @@ impl ConstraintCompiler {
         runtime_stop_sequences: Vec<String>,
         tool_surface: bool,
     ) -> Result<GenerationRuntimePlan, String> {
-        #[cfg(test)]
-        if let Some(compiler) = compiler {
-            compiler
-                .schema_compilation_runs
-                .fetch_add(1, Ordering::Relaxed);
+        if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len() {
+            return Err("structural token spellings and IDs must have equal lengths".into());
         }
+        dialect.incremental_parser_state_for_request(parameters, tools, tool_surface)?;
 
-        let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
-        if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len()
-            || runtime_structural_token_spellings.len() < grammar_structural_token_spellings.len()
-            || !runtime_structural_token_spellings
-                .iter()
-                .zip(grammar_structural_token_spellings)
-                .all(|(runtime, grammar)| runtime == grammar)
-        {
-            return Err(format!(
-                "format dialect declares {} leading structural tokens but {} runtime spellings and {} tokenizer IDs were resolved",
-                grammar_structural_token_spellings.len(),
-                runtime_structural_token_spellings.len(),
-                resolved_structural_token_ids.len()
-            ));
-        }
-        let grammar_structural_token_ids =
-            &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
-        dialect.incremental_parser_state_with_tools(parameters, tools)?;
-
-        let constraint = if !tool_surface && !dialect.constrains_semantic_output() {
+        let constraint = if !tool_surface {
             None
         } else {
             let compiler =
                 compiler.ok_or("the loaded model does not have tokenizer constraint data")?;
-            let configuration = if tool_surface {
+            #[cfg(test)]
+            compiler
+                .schema_compilation_runs
+                .fetch_add(1, Ordering::Relaxed);
+            let grammar_tokens = dialect.required_structural_tokens(parameters)?;
+            if runtime_structural_token_spellings.len() < grammar_tokens.len()
+                || !runtime_structural_token_spellings
+                    .iter()
+                    .zip(grammar_tokens)
+                    .all(|(runtime, grammar)| runtime == grammar)
+            {
+                return Err("runtime structural tokens do not match the tool grammar".into());
+            }
+            let grammar_structural_token_ids =
+                &resolved_structural_token_ids[..grammar_tokens.len()];
+            let configuration = {
                 let configuration = dialect.constraint_configuration(
                     parameters,
                     tools,
@@ -684,14 +675,6 @@ impl ConstraintCompiler {
                         (configuration, matcher)
                     }
                 }
-            } else {
-                let configuration = dialect.semantic_constraint_configuration(
-                    parameters,
-                    grammar_structural_token_ids,
-                    &compiler.eos_token_ids,
-                )?;
-                let matcher = compiler.compile_matcher(configuration.grammar.clone())?;
-                (configuration, matcher)
             };
             let (configuration, matcher) = configuration;
             let fingerprint: [u8; 32] = Sha256::digest(
@@ -723,7 +706,9 @@ impl ConstraintCompiler {
             profile_stop_sequences: runtime_stop_sequences,
         }))
     }
+}
 
+impl ConstraintCompiler {
     fn compile_matcher(
         &self,
         grammar: llguidance::api::TopLevelGrammar,
@@ -767,7 +752,7 @@ impl ConstraintCompiler {
             .map(|sequence| (*sequence).to_owned())
             .collect();
         parse_tools(tools)?;
-        Self::compile_generation_plan(
+        GenerationRuntimePlan::prepare(
             Some(self),
             dialect,
             parameters,

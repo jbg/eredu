@@ -360,18 +360,27 @@ argument value tags, compact type annotations and literal value framing are
 shared parser/constraint features. Partial annotation state is included in
 snapshot storage estimates.
 
-Reasoning admission is independent of native-tool history and schema constraints.
-The facade recognizes `<think>` framing from bounded rendered reasoning history
-or a generation-only suffix that opens the channel. It binds parser state to the
-actual request's suffix; older messages cannot initialize it. Reasoning-only
-plans have no grammar and retain the ordinary tokenizer validity controller.
-Atomic added delimiters survive decoding regardless of their special-token flag;
-ordinary multi-token delimiters use bounded incremental lookbehind. The same
-semantic plan supplies ordinary, controlled, speculative and snapshot execution.
-Compatible XML tool envelopes compose that admitted channel in the existing
-declarative parser and grammar. Unsupported native-tool requests cannot use a
-reasoning-only plan to bypass tool admission. Unavailable explicit reasoning or
-unhonored enable/disable controls return `TextModelError::UnsupportedReasoning`.
+Response framing and native-tool capabilities are admitted independently. The
+facade recognizes delimited `<think>`/`<thinking>` reasoning, IFM effort wrappers,
+Harmony analysis/final channels, Gemma channels, Inkling message frames and ATEM
+recipients from tool-free rendered probes and the required response tokens.
+Tool rendering and tool-only tokens are optional evidence for a separate native
+capability. Their absence or failure cannot disable recognized reasoning.
+Boolean and named-effort controls also use tool-free rendering evidence.
+
+Semantic-only plans have no grammar, regardless of their format. They retain the
+ordinary tokenizer validity controller and work when constraint compilation is
+unavailable. The response plan attaches a grammar only for a requested native-tool
+surface. Declarative response parsing activates tool envelopes only on that
+surface; application tool emulation can consume visible text independently.
+Unsupported native-tool requests cannot bypass admission through a response-only
+plan. The same semantic plan supplies ordinary, controlled, speculative and
+snapshot execution, including each profile's framing and stop policy.
+Delimited parsers bind initial state to the actual generation suffix rather than
+older messages. Atomic added delimiters survive decoding regardless of their
+special-token flag; ordinary delimiters use bounded incremental lookbehind.
+Unavailable explicit reasoning and unsupported delimited reasoning controls
+return `TextModelError::UnsupportedReasoning`.
 
 Tool-schema admission and completed-argument validation belong to the facade.
 Application JSON Schemas are retained unchanged for rendering and checked with

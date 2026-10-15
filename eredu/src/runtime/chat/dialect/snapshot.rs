@@ -25,6 +25,7 @@ impl DeclarativeParser {
 snapshot_fields!(DeclarativeParser {
     spec,
     tagged_tools,
+    tool_surface,
     state,
     pending
 });
