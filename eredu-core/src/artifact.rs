@@ -586,6 +586,60 @@ pub fn gguf_u32_metadata_values(
     })
 }
 
+/// Selection of one architecture-declared companion source.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub enum CompanionSelection {
+    /// Resolve an unambiguous companion using architecture discovery policy.
+    #[default]
+    Discover,
+    /// Admit this exact file, without discovery or fallback.
+    Explicit(PathBuf),
+    /// Omit an optional companion; required roles reject this selection.
+    Disabled,
+}
+
+/// Local primary artifact and explicit companion selection policy.
+#[derive(Debug, Clone)]
+pub struct ArtifactSource {
+    path: PathBuf,
+    companions: BTreeMap<GgufCompanionRole, CompanionSelection>,
+}
+
+impl ArtifactSource {
+    /// Selects a primary checkpoint, discovering declared companions by default.
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+            companions: BTreeMap::new(),
+        }
+    }
+
+    /// Sets selection for one semantic companion role. `Discover` restores the
+    /// architecture's default policy, including absence of undeclared roles.
+    pub fn with_companion(
+        mut self,
+        role: GgufCompanionRole,
+        selection: CompanionSelection,
+    ) -> Self {
+        if selection == CompanionSelection::Discover {
+            self.companions.remove(&role);
+        } else {
+            self.companions.insert(role, selection);
+        }
+        self
+    }
+
+    /// Sets the media projector source before checkpoint admission.
+    pub fn with_projector(self, selection: CompanionSelection) -> Self {
+        self.with_companion(GgufCompanionRole::MediaProjector, selection)
+    }
+
+    /// Primary checkpoint path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Header-only artifact inspection result.
 #[derive(Debug, Clone)]
 pub struct ArtifactInspection<P = ()> {
@@ -1026,10 +1080,23 @@ pub fn inspect_artifact<R: ModelConfigurationResolver>(
     path: impl AsRef<Path>,
     resolver: &R,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
-    let path = path.as_ref();
+    inspect_artifact_source(&ArtifactSource::new(path), resolver)
+}
+
+/// Admits an exact primary artifact and its companion-selection policy.
+pub fn inspect_artifact_source<R: ModelConfigurationResolver>(
+    source: &ArtifactSource,
+    resolver: &R,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
+    let path = source.path();
     if is_gguf(path) {
-        inspect_gguf(path, resolver)
+        inspect_gguf(source, resolver)
     } else if path.is_dir() {
+        if !source.companions.is_empty() {
+            return Err(ArtifactError::InvalidArtifact(
+                "SafeTensors checkpoints do not accept GGUF companion selections".into(),
+            ));
+        }
         inspect_safetensors(path, resolver)
     } else if !path.exists() {
         Err(ArtifactError::MissingArtifact(path.to_path_buf()))
@@ -1077,9 +1144,10 @@ pub fn validate_preparation_policy(
 }
 
 fn inspect_gguf<R: ModelConfigurationResolver>(
-    path: &Path,
+    source: &ArtifactSource,
     resolver: &R,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
+    let path = source.path();
     let checkpoint = GgufCheckpoint::open(path)?;
     let architecture_name = checkpoint
         .metadata()
@@ -1090,7 +1158,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         .resolve_gguf(architecture_name, &checkpoint)?
         .into_parts();
     let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
-    let companions = resolve_gguf_companions(path, &requirements)?;
+    let companions = resolve_selected_gguf_companions(source, &requirements)?;
     finish_gguf_inspection(
         path,
         checkpoint,
@@ -1167,6 +1235,22 @@ pub fn resolve_gguf_companions(
     primary: &Path,
     requirements: &[GgufCompanionRequirement],
 ) -> Result<BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>, ArtifactError> {
+    resolve_selected_gguf_companions(&ArtifactSource::new(primary), requirements)
+}
+
+fn resolve_selected_gguf_companions(
+    source: &ArtifactSource,
+    requirements: &[GgufCompanionRequirement],
+) -> Result<BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>, ArtifactError> {
+    let primary = source.path();
+    for role in source.companions.keys() {
+        if !requirements
+            .iter()
+            .any(|requirement| &requirement.role == role)
+        {
+            return Err(ArtifactError::UndeclaredGgufCompanion { role: role.clone() });
+        }
+    }
     let mut resolved = BTreeMap::new();
     let mut declared_roles = BTreeSet::new();
     for requirement in requirements {
@@ -1175,6 +1259,46 @@ pub fn resolve_gguf_companions(
                 "GGUF companion role {:?} was declared more than once",
                 requirement.role
             )));
+        }
+        match source
+            .companions
+            .get(&requirement.role)
+            .unwrap_or(&CompanionSelection::Discover)
+        {
+            CompanionSelection::Disabled => {
+                if requirement.required {
+                    return Err(ArtifactError::RequiredGgufCompanionDisabled {
+                        role: requirement.role.clone(),
+                    });
+                }
+                continue;
+            }
+            CompanionSelection::Explicit(path) => {
+                let checkpoint = (|| -> Result<_, ArtifactError> {
+                    if std::fs::canonicalize(path)? == std::fs::canonicalize(primary)? {
+                        return Err(ArtifactError::InvalidArtifact(
+                            "primary checkpoint cannot also be its own companion".into(),
+                        ));
+                    }
+                    let checkpoint = GgufCheckpoint::open(path)?;
+                    validate_companion_checkpoint(&checkpoint, requirement)?;
+                    Ok(checkpoint)
+                })()
+                .map_err(|source| ArtifactError::InvalidGgufCompanion {
+                    role: requirement.role.clone(),
+                    path: path.clone(),
+                    source: Box::new(source),
+                })?;
+                resolved.insert(
+                    requirement.role.clone(),
+                    ValidatedGgufCompanion {
+                        path: path.clone(),
+                        checkpoint,
+                    },
+                );
+                continue;
+            }
+            CompanionSelection::Discover => {}
         }
         let mut directories = Vec::new();
         let mut directory = primary.parent().unwrap_or_else(|| Path::new("."));
@@ -1266,6 +1390,7 @@ pub fn resolve_gguf_companions(
         };
         match selected {
             Some((path, checkpoint, _)) => {
+                validate_companion_checkpoint(checkpoint, requirement)?;
                 resolved.insert(
                     requirement.role.clone(),
                     ValidatedGgufCompanion {
@@ -1285,6 +1410,27 @@ pub fn resolve_gguf_companions(
         }
     }
     Ok(resolved)
+}
+
+fn validate_companion_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    requirement: &GgufCompanionRequirement,
+) -> Result<(), ArtifactError> {
+    validate_gguf_container(checkpoint)?;
+    if requirement.encoding == GgufCompanionEncoding::DenseRequired
+        && checkpoint.tensors().any(|tensor| {
+            !matches!(
+                tensor.descriptor().ggml_type,
+                GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16
+            )
+        })
+    {
+        return Err(ArtifactError::InvalidArtifact(format!(
+            "GGUF companion {:?} requires dense tensors",
+            requirement.role
+        )));
+    }
+    Ok(())
 }
 
 fn ambiguous_companion(
@@ -1491,6 +1637,29 @@ pub enum ArtifactError {
         filename_prefix: String,
         /// Directories searched in priority order.
         searched_directories: Vec<PathBuf>,
+    },
+    /// An explicit companion failed admission; no discovery fallback is attempted.
+    #[error("could not admit GGUF companion {role:?} at {path}: {source}", path = .path.display())]
+    InvalidGgufCompanion {
+        /// Semantic role being admitted.
+        role: GgufCompanionRole,
+        /// Exact caller-selected source.
+        path: PathBuf,
+        /// Container, encoding, or filesystem failure.
+        #[source]
+        source: Box<ArtifactError>,
+    },
+    /// A caller selected a role not declared by this architecture.
+    #[error("undeclared GGUF companion role {role:?}")]
+    UndeclaredGgufCompanion {
+        /// Rejected semantic role.
+        role: GgufCompanionRole,
+    },
+    /// An architecture-required role was explicitly disabled.
+    #[error("required GGUF companion {role:?} cannot be disabled")]
+    RequiredGgufCompanionDisabled {
+        /// Required semantic role.
+        role: GgufCompanionRole,
     },
     /// Header/catalog content is contradictory.
     #[error("invalid model artifact: {0}")]
@@ -1954,6 +2123,63 @@ mod tests {
     }
 
     #[test]
+    fn explicit_companion_selection_bypasses_discovery_and_never_falls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let primary = root.path().join("model.gguf");
+        write_gguf_fixture(&primary, GgmlType::F32);
+        for name in ["mmproj-a.gguf", "mmproj-b.gguf"] {
+            write_gguf_fixture(&root.path().join(name), GgmlType::F32);
+        }
+        let requirement = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            false,
+            "mmproj",
+            0,
+            GgufCompanionEncoding::DenseRequired,
+        )
+        .unwrap();
+        assert!(resolve_gguf_companions(&primary, &[requirement.clone()]).is_err());
+        let exact = elsewhere.path().join("application-selected.gguf");
+        write_gguf_fixture(&exact, GgmlType::F32);
+        let source = ArtifactSource::new(&primary)
+            .with_projector(CompanionSelection::Explicit(exact.clone()));
+        let selected = resolve_selected_gguf_companions(&source, &[requirement.clone()]).unwrap();
+        assert_eq!(selected[&GgufCompanionRole::MediaProjector].path(), exact);
+        // A stale explicit path cannot silently switch to a discovered file.
+        std::fs::remove_file(&exact).unwrap();
+        assert!(resolve_selected_gguf_companions(&source, &[requirement.clone()]).is_err());
+        write_gguf_fixture(&exact, GgmlType::Q8_0);
+        assert!(resolve_selected_gguf_companions(&source, &[requirement.clone()]).is_err());
+        let disabled = ArtifactSource::new(&primary).with_projector(CompanionSelection::Disabled);
+        assert!(
+            resolve_selected_gguf_companions(&disabled, &[requirement])
+                .unwrap()
+                .is_empty()
+        );
+        let required = GgufCompanionRequirement::new(
+            GgufCompanionRole::MediaProjector,
+            true,
+            "mmproj",
+            0,
+            GgufCompanionEncoding::DenseRequired,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_selected_gguf_companions(&disabled, &[required]),
+            Err(ArtifactError::RequiredGgufCompanionDisabled {
+                role: GgufCompanionRole::MediaProjector
+            })
+        ));
+        assert!(matches!(
+            resolve_selected_gguf_companions(&source, &[]),
+            Err(ArtifactError::UndeclaredGgufCompanion { .. })
+        ));
+        let reset = source.with_projector(CompanionSelection::Discover);
+        assert!(resolve_selected_gguf_companions(&reset, &[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn dense_only_and_required_companion_policies_fail_closed() {
         let root = tempfile::tempdir().unwrap();
         let primary = root.path().join("model.gguf");
@@ -2254,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_plan_carries_the_exact_inspected_companion() {
+    fn preparation_plan_carries_the_exact_explicit_companion() {
         let root = tempfile::tempdir().unwrap();
         let primary = root.path().join("model.gguf");
         let scalar = 1.0_f32.to_le_bytes();
@@ -2273,10 +2499,13 @@ mod tests {
                 }],
             )
             .unwrap();
-        let projector = root.path().join("mmproj.gguf");
+        let other = tempfile::tempdir().unwrap();
+        let projector = other.path().join("application-projector.gguf");
         write_gguf_fixture(&projector, GgmlType::F32);
 
-        let inspection = inspect_artifact(&primary, &FixtureResolver).unwrap();
+        let source = ArtifactSource::new(&primary)
+            .with_projector(CompanionSelection::Explicit(projector.clone()));
+        let inspection = inspect_artifact_source(&source, &FixtureResolver).unwrap();
         assert_eq!(
             inspection
                 .validated_gguf()

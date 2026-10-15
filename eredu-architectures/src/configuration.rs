@@ -1674,6 +1674,16 @@ pub fn inspect_artifact(
     eredu_core::inspect_artifact(path, &MODEL_CONFIGURATIONS)
 }
 
+/// Admits explicitly selected local primary and companion artifacts.
+pub fn inspect_artifact_source(
+    source: &eredu_core::artifact::ArtifactSource,
+) -> Result<
+    eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    eredu_core::artifact::ArtifactError,
+> {
+    eredu_core::artifact::inspect_artifact_source(source, &MODEL_CONFIGURATIONS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,50 +8,44 @@ policy produces a structured error.
 
 ## Inspect an artifact
 
-Use backend structural inspection before reserving a device or loading
-weights, then apply backend-independent text inspection when tokenizer or chat
-readiness matters:
+Artifact admission and text preparation are portable, including builds with no
+MLX feature. Execution selection uses the explicitly supplied backend factory:
 
 ```rust,no_run
-use eredu::{
-    api::{
-        inspect_local_model, inspect_text_model, TextModelOptions, LocalInspectionOptions,
-        TextInspectionOptions,
-    },
+use eredu::api::{
+    inspect_artifact, ArtifactSource, CompanionSelection, PreparedTextModel,
+    TextInspectionOptions, TextModelOptions,
 };
-use eredu_core::InspectionSeverity;
+use eredu_backend_mlx::MlxBackendFactory;
+use eredu_core::{DevicePlan, ExecutionPlan};
 
-let structural = inspect_local_model("/path/to/model", LocalInspectionOptions::default())?;
-let text_options = TextModelOptions::default();
-let report = inspect_text_model(structural, &text_options, TextInspectionOptions::default());
-if !report.is_loadable() {
-    for issue in report
-        .issues
-        .iter()
-        .filter(|issue| issue.severity == InspectionSeverity::Error)
-    {
-        eprintln!("{:?}: {}", issue.code, issue.detail);
-    }
-}
+let source = ArtifactSource::new("/path/to/model.gguf")
+    .with_projector(CompanionSelection::Explicit("/path/to/projector.gguf".into()));
+let artifact = inspect_artifact(&source)?;
+let prepared = PreparedTextModel::from_artifact(artifact, TextModelOptions::default())?;
+let factory = MlxBackendFactory::default();
+let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "metal:0")?);
+let mut selected = prepared.select_execution_plan(&factory, &plan)?;
+let report = selected.inspect(TextInspectionOptions::default());
+assert!(report.is_loadable());
+let model = selected.load()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Structural inspection reads configuration and bounded checkpoint headers,
-validates processor metadata and required media artifacts, and applies the
-requested quantization, residency, and topology preflight. Text inspection
-reconstructs tokenizer, template, and EOS metadata and behaviorally probes
-semantic output and native tools. Neither step creates a backend execution
-queue or loads weight payloads. `is_loadable()` is the fail-closed structural
-result for the selected backend options.
+Admission reads configuration and bounded checkpoint headers and validates
+processor metadata and media companions without materializing weights.
+Selection validates the requested quantization, residency, topology, and drafting
+policy without creating native resources. The selected report describes the exact
+admission consumed by loading. Native device availability and payload integrity
+remain realization-time concerns.
 
 Configure a single or named override once in `TextModelOptions::chat_template`.
-Inspection borrows that options value; pass it to the subsequent
-`LoadedModel::*_with_text_options` load. Both operations use the same template
-resolver: an override takes precedence over embedded GGUF metadata and
-sidecars, while checkpoint tokenizer variables and EOS ids remain in effect.
-Invalid selected template metadata is reported without falling back to another
-source. `TextInspectionOptions::chat_request` supplies the messages, tools, and
-template kwargs to probe before loading.
+Preparation retains the resolved tokenizer, template, EOS ids, tokenizer variables,
+and generation defaults for both inspection and loading. The override takes
+precedence over embedded GGUF metadata and sidecars. Invalid selected metadata
+returns a typed preparation error without falling back to another source.
+`TextInspectionOptions::chat_request` supplies messages, tools, and template kwargs
+to probe before loading; probe results apply to that request.
 
 ## Family matrix
 

@@ -132,20 +132,7 @@ pub fn inspect_artifact_metadata<R: ModelConfigurationResolver>(
                     })?;
                 let companion =
                     GgufCheckpoint::from_headers(&supplied.headers, eredu_gguf::Limits::default())?;
-                validate_gguf_container(&companion)?;
-                if requirement.encoding == GgufCompanionEncoding::DenseRequired
-                    && companion.tensors().any(|tensor| {
-                        !matches!(
-                            tensor.descriptor().ggml_type,
-                            GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16
-                        )
-                    })
-                {
-                    return Err(ArtifactError::InvalidArtifact(format!(
-                        "GGUF companion {:?} requires dense tensors",
-                        supplied.role
-                    )));
-                }
+                validate_companion_checkpoint(&companion, requirement)?;
                 let companion_path = PathBuf::from(&supplied.headers[0].member);
                 if selected
                     .insert(

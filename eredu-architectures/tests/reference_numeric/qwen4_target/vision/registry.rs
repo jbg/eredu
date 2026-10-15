@@ -2,11 +2,14 @@
 use super::super::registry::Mechanisms;
 use super::*;
 use eredu_architectures::{
-    configuration::inspect_artifact,
+    configuration::{inspect_artifact, inspect_artifact_source},
     processor_plan::{GgufSpecialTokenIds, GgufSpecialTokenKind, QwenMediaTokenIds},
     select_preparation, PreparationMechanismProvider, PreparationSelectionError,
 };
-use eredu_core::{GgufCompanionRole, InputModality};
+use eredu_core::{
+    artifact::{ArtifactSource, CompanionSelection},
+    GgufCompanionRole, InputModality,
+};
 use eredu_runtime::*;
 
 struct NoFacts;
@@ -39,9 +42,26 @@ impl PreparationMechanismProvider for NoFacts {
 fn gguf_ordinary_media_registry_selects_from_retained_headers_and_separates_source_roles() {
     let directory = tempfile::tempdir().unwrap();
     let fixtures = eredu_evaluation::qwen4_exp::PreparedFixtures::write(directory.path()).unwrap();
-    let projector = directory.path().join("mmproj-qwen4.gguf");
+    let projector_directory = tempfile::tempdir().unwrap();
+    let projector = projector_directory.path().join("application-selected.gguf");
+    let source = ArtifactSource::new(&fixtures.gguf_path)
+        .with_projector(CompanionSelection::Explicit(projector.clone()));
+    for (omit_patch, width) in [(true, 32), (false, 31)] {
+        write(&projector, omit_patch, false, width, false);
+        assert!(
+            inspect_artifact_source(&source).is_err(),
+            "explicit selection must validate family geometry and the complete projector schema"
+        );
+    }
     write(&projector, false, false, 32, false);
-    let mut inspection = inspect_artifact(&fixtures.gguf_path).unwrap();
+    for name in ["mmproj-a.gguf", "mmproj-b.gguf"] {
+        std::fs::copy(&projector, directory.path().join(name)).unwrap();
+    }
+    assert!(
+        inspect_artifact(&fixtures.gguf_path).is_err(),
+        "discovery must reject ambiguous siblings"
+    );
+    let mut inspection = inspect_artifact_source(&source).unwrap();
     let policy = MediaExecutionPolicy::new(
         ProcessorSelectionRequest::new([
             InputModality::Text,
@@ -69,7 +89,7 @@ fn gguf_ordinary_media_registry_selects_from_retained_headers_and_separates_sour
         .architecture_plan_mut()
         .bind_gguf_special_token_ids(ids)
         .unwrap();
-    let independent = inspect_artifact(&fixtures.gguf_path).unwrap();
+    let independent = inspect_artifact_source(&source).unwrap();
     let hidden_target = fixtures.gguf_path.with_extension("unavailable");
     let hidden_projector = projector.with_extension("unavailable");
     std::fs::rename(&fixtures.gguf_path, &hidden_target).unwrap();

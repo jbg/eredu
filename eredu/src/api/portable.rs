@@ -214,8 +214,8 @@ impl TextDecoder {
 
 /// Facade-owned text options shared by pre-load inspection and model loading.
 ///
-/// Borrow this value for [`super::inspect_text_model`], then pass it to a
-/// `LoadedModel::*_with_text_options` loading method.
+/// Supply these options once to [`super::PreparedTextModel::from_artifact`].
+/// Inspection and loading then share the resolved text metadata.
 #[derive(Debug, Clone, Default)]
 pub struct TextModelOptions {
     /// Replaces checkpoint chat-template selection with a caller-supplied Jinja

@@ -1,5 +1,24 @@
 # Language-model backend architecture
 
+Local artifact admission retains the exact primary checkpoint, shard admissions,
+and explicitly selected or discovered GGUF companion roles in `ArtifactInspection`.
+`ArtifactSource` and companion selection are neutral contracts in `eredu-core`;
+architecture registries validate family geometry and composition. Explicit sources
+bypass filename discovery and have no fallback. The portable facade exposes
+canonical SafeTensors snapshot completeness from `eredu-checkpoint` independently
+of architecture support and native backend availability.
+
+The facade's `PreparedTextModel` retains resolved tokenizer, template, EOS policy,
+and generation defaults once. Text probes borrow that state. Execution selection
+retains the complete plan, target admission and its compatibility/resource report,
+plus the selected drafting preparation and vocabulary proof. The MLX factory
+obtains the report and native binding selection from one architecture inspection
+outcome. `SelectedTextModel` borrows the selecting factory and consumes those
+retained selections during realization; callers cannot replace its plan or text
+options. Convenience path loaders use this same pipeline. Native source guards
+remain authoritative for changed files and later payload leases. Metadata-only
+inspection does not grant local text or payload loading authority.
+
 Prepared generation, including retained external and embedded draft sources,
 uses the request-local `DecodingMode` in shared generation settings. The
 self-speculation variant owns its validated proposal and scheduler options.

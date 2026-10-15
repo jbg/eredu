@@ -40,6 +40,8 @@ mod control;
 mod controlled_speculative;
 pub use controlled_speculative::*;
 mod inspection;
+mod prepared;
+pub use prepared::*;
 mod metadata_inspection;
 pub use metadata_inspection::*;
 mod memory_estimation;
@@ -63,9 +65,8 @@ pub use eredu_core::DraftAdapterSource;
 pub use eredu_core::{GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy};
 pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
 pub use inspection::{
-    inspect_architecture, inspect_text_model, ArtifactMetadata, CheckpointMetadata,
-    GgufCompanionMetadata, GgufHeader, MetadataProvenance, ModelInspectionOutcome,
-    SafetensorsHeader, TextInspectionOptions,
+    inspect_architecture, ArtifactMetadata, CheckpointMetadata, GgufCompanionMetadata, GgufHeader,
+    MetadataProvenance, ModelInspectionOutcome, SafetensorsHeader, TextInspectionOptions,
 };
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;

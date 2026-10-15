@@ -3,10 +3,9 @@
 use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
-    generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    DraftingPlan, ExternalDraftArtifact, SpeculativeCapability, SpeculativeGenerationBackend,
-    SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
-    SpeculativeGenerationOutput, TokenizerCompatibilityProof,
+    SpeculativeCapability, SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput,
+    SpeculativeGenerationBatchRequest, SpeculativeGenerationLane, SpeculativeGenerationOutput,
+    generation::{FinishReason, SemanticEvent, resolve_generation_config},
 };
 use eredu_text::{
     gguf::GgufTokenizer,
@@ -787,101 +786,9 @@ where
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
             .map_err(LoadedModelLoadError::Artifact)?;
-        Self::load_inspected_execution_plan_with_text_options(
-            factory,
-            inspection,
-            plan,
-            text_options,
-        )
-    }
-
-    /// Realizes a plan using the exact artifact inspection retained by the planner.
-    /// Use [`Self::load_inspected_execution_plan_with_text_options`] to override
-    /// the checkpoint chat template.
-    pub fn load_inspected_execution_plan<F>(
-        factory: &F,
-        inspection: eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        plan: &eredu_core::ExecutionPlan,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
-    where
-        F: eredu_core::ExecutionPlanBackendFactory<
-            Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-        >,
-    {
-        Self::load_inspected_execution_plan_with_text_options(
-            factory,
-            inspection,
-            plan,
-            TextModelOptions::default(),
-        )
-    }
-
-    /// Realizes a retained artifact inspection with facade-owned text overrides.
-    pub fn load_inspected_execution_plan_with_text_options<F>(
-        factory: &F,
-        mut inspection: eredu_core::ArtifactInspection<
-            eredu_architectures::processor_plan::ArtifactArchitecturePlan,
-        >,
-        plan: &eredu_core::ExecutionPlan,
-        text_options: TextModelOptions,
-    ) -> Result<PlannedModel<B, eredu_core::RealizedDrafting<F::Drafter>>, PlannedModelLoadError>
-    where
-        F: eredu_core::ExecutionPlanBackendFactory<
-            Backend = B,
-            DrafterPreparation = eredu_architectures::ExternalDraftPreparation,
-        >,
-    {
-        let (tokenizer, config) = loaded_text_artifact(&inspection, text_options)
-            .map_err(LoadedModelLoadError::Metadata)?;
-        bind_gguf_special_token_ids(&mut inspection, &tokenizer)
-            .map_err(LoadedModelLoadError::Metadata)?;
-        let target_tokenizer_fingerprint =
-            eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
-        let external_artifact = match plan.drafting() {
-            DraftingPlan::External { model, .. } => {
-                let preparation = eredu_architectures::prepare_external_draft(model)
-                    .map_err(LoadedModelLoadError::Artifact)?;
-                let draft_tokenizer = super::tokenizer::load_tokenizer_for_kind(
-                    preparation.tokenizer_model_kind(),
-                    Path::new(model),
-                )
-                .map_err(LoadedModelLoadError::Metadata)?;
-                let tokenizer_compatibility = TokenizerCompatibilityProof::prove(
-                    target_tokenizer_fingerprint,
-                    eredu_text::tokenizer::vocabulary_fingerprint(&draft_tokenizer),
-                )
-                .map_err(|error| eredu_core::AutomaticPlanningError::Invalid(error.to_string()))?;
-                Some(ExternalDraftArtifact {
-                    preparation,
-                    tokenizer_compatibility,
-                })
-            }
-            DraftingPlan::Disabled | DraftingPlan::Embedded { .. } => None,
-            _ => return Err(LoadedModelLoadError::UnsupportedDraftingPlan.into()),
-        };
-        let selected = eredu_core::select_execution_plan_target(factory, plan, inspection)?;
-        let external_artifact = eredu_core::select_execution_plan_drafting(
-            factory,
-            plan,
-            &selected,
-            external_artifact,
-        )?;
-        let realization = eredu_core::realize_execution_plan_target(factory, plan, selected)?;
-        let runtime = match realization.into_runtime() {
-            Ok(runtime) => runtime,
-            Err(error) => return Err(map_model_load_error(error).into()),
-        };
-        let model = Self::from_runtime(runtime, tokenizer, config);
-        let drafting = eredu_core::realize_execution_plan_drafting(
-            factory,
-            plan,
-            model.runtime(),
-            external_artifact,
-        )?;
-        Ok(PlannedModel::new(model, drafting, plan.drafting().clone()))
+        super::PreparedTextModel::from_artifact(inspection, text_options)?
+            .select_execution_plan(factory, plan)?
+            .load()
     }
 
     /// Plans and loads one complete model session without exposing backend construction.
@@ -949,12 +856,9 @@ where
     {
         let retained = planner.plan_retained(factory, request)?;
         let (report, inspection) = retained.into_parts();
-        let model = Self::load_inspected_execution_plan_with_text_options(
-            factory,
-            inspection,
-            &report.plan,
-            text_options,
-        )?;
+        let model = super::PreparedTextModel::from_artifact(inspection, text_options)?
+            .select_execution_plan(factory, &report.plan)?
+            .load()?;
         Ok((model, report))
     }
 
@@ -981,20 +885,18 @@ where
     ) -> Result<Self, LoadedModelLoadError> {
         let artifact = artifact.as_ref();
         let inspection = eredu_architectures::configuration::inspect_artifact(artifact)?;
-        let (tokenizer, config) = loaded_text_artifact(&inspection, text_options)?;
-        Self::from_inspected(backend, inspection, options, tokenizer, config)
+        super::PreparedTextModel::from_artifact(inspection, text_options)?.load_on(backend, options)
     }
 
-    fn from_inspected(
+    pub(super) fn from_inspected(
         backend: B,
-        mut inspection: eredu_core::ArtifactInspection<
+        inspection: eredu_core::ArtifactInspection<
             eredu_architectures::processor_plan::ArtifactArchitecturePlan,
         >,
         options: B::LoadOptions,
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
     ) -> Result<Self, LoadedModelLoadError> {
-        bind_gguf_special_token_ids(&mut inspection, &tokenizer)?;
         let prepared = match eredu_core::prepare_inspected_model(&backend, inspection, options) {
             Ok(prepared) => prepared,
             Err(error) => return Err(map_model_load_error(error)),
@@ -1007,7 +909,7 @@ where
     }
 }
 
-fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
+pub(super) fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
     error: eredu_core::ModelLoadError<E>,
 ) -> LoadedModelLoadError {
     match error {
@@ -1026,7 +928,7 @@ fn map_model_load_error<E: std::error::Error + Send + Sync + 'static>(
     }
 }
 
-fn bind_gguf_special_token_ids(
+pub(super) fn bind_gguf_special_token_ids(
     inspection: &mut eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,
@@ -1087,7 +989,7 @@ pub(super) fn source_scheduler(
     }
 }
 
-fn loaded_text_artifact(
+pub(super) fn loaded_text_artifact(
     inspection: &eredu_core::ArtifactInspection<
         eredu_architectures::processor_plan::ArtifactArchitecturePlan,
     >,

@@ -49,7 +49,7 @@ pub struct MlxSelectedPreparation {
 }
 
 impl MlxSelectedPreparation {
-    const fn new(
+    pub(crate) const fn new(
         selected: eredu_architectures::SelectedPreparation,
         rank_context: Option<crate::backend::MlxRankContext>,
     ) -> Self {

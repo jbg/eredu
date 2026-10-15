@@ -854,6 +854,7 @@ pub struct ExecutionPlanTargetSelection<B: ModelLoadingBackend> {
     policy: PreparationPolicy,
     selected: B::SelectedPreparation,
     capabilities: SessionCapabilities,
+    report: crate::ModelInspectionReport,
 }
 
 impl<B: ModelLoadingBackend> ExecutionPlanTargetSelection<B> {
@@ -862,11 +863,13 @@ impl<B: ModelLoadingBackend> ExecutionPlanTargetSelection<B> {
         policy: PreparationPolicy,
         selected: B::SelectedPreparation,
         capabilities: SessionCapabilities,
+        report: crate::ModelInspectionReport,
     ) -> Self {
         Self {
             policy,
             selected,
             capabilities,
+            report,
         }
     }
 }
@@ -876,9 +879,15 @@ pub struct SelectedExecutionPlanTarget<B: ModelLoadingBackend> {
     execution_plan: ExecutionPlan,
     preparation: crate::backend::SelectedModelPreparation<B>,
     target_id: u64,
+    report: crate::ModelInspectionReport,
 }
 
 impl<B: ModelLoadingBackend> SelectedExecutionPlanTarget<B> {
+    /// Compatibility and resource facts produced by this exact selection.
+    pub fn report(&self) -> &crate::ModelInspectionReport {
+        &self.report
+    }
+
     fn into_preparation(self) -> crate::backend::SelectedModelPreparation<B> {
         self.preparation
     }
@@ -1091,6 +1100,8 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     type Drafter;
 
     /// Selects the backend preparation without creating a native device or queue.
+    /// The returned compatibility/resource report describes this exact selection;
+    /// implementations produce both together rather than selecting again for reporting.
     fn select_target(
         &self,
         inspection: &ArtifactInspection<
@@ -1166,6 +1177,7 @@ pub fn select_execution_plan_target<F: ExecutionPlanBackendFactory>(
         execution_plan: plan.clone(),
         preparation: crate::backend::SelectedModelPreparation::new(preparation, selection.selected),
         target_id: next_execution_plan_target_id()?,
+        report: selection.report,
     })
 }
 
