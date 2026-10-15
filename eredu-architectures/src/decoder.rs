@@ -3428,6 +3428,7 @@ fn parameter_description_with_vocabulary(
         let mut attention_members = Vec::new();
         let mut projection =
             |field: &str, shape: Vec<usize>, sharding: MemberSharding, bias: bool| {
+                let output_width = shape[0];
                 attention_members.push(eredu_runtime::ParameterMemberSpec::new(
                     format!("{attention_prefix}.{field}.weight"),
                     shape,
@@ -3442,13 +3443,7 @@ fn parameter_description_with_vocabulary(
                         };
                     attention_members.push(eredu_runtime::ParameterMemberSpec::new(
                         format!("{attention_prefix}.{field}.bias"),
-                        vec![if matches!(bias_sharding, MemberSharding::Replicated) {
-                            hidden
-                        } else if field == fields.attention_query {
-                            query_width
-                        } else {
-                            key_value_width
-                        }],
+                        vec![output_width],
                         bias_sharding,
                     ));
                 }
