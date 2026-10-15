@@ -200,7 +200,7 @@ fn qwen4_exp_official_template_rejects_unsupported_effort_and_ambiguous_history(
     ] {
         assert!(matches!(
             prepare(request),
-            Err(TextModelError::ToolConstraint(_))
+            Err(TextModelError::InvalidRequest(_))
         ));
     }
     for arguments in [
@@ -218,7 +218,7 @@ fn qwen4_exp_official_template_rejects_unsupported_effort_and_ambiguous_history(
         };
         assert!(matches!(
             prepare(request),
-            Err(TextModelError::ToolConstraint(_))
+            Err(TextModelError::InvalidRequest(_))
         ));
     }
 }

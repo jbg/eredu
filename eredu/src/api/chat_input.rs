@@ -356,10 +356,12 @@ pub(super) fn lower_tool_arguments(
             if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in calls {
                     let arguments = &mut call["function"]["arguments"];
-                    *arguments = Value::String(
-                        serde_json::to_string(arguments)
-                            .map_err(|error| TextModelError::ToolConstraint(error.to_string()))?,
-                    );
+                    *arguments =
+                        Value::String(serde_json::to_string(arguments).map_err(|error| {
+                            super::ConstraintPreparationError::Protocol {
+                                reason: error.to_string(),
+                            }
+                        })?);
                 }
             }
         }

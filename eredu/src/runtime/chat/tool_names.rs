@@ -12,7 +12,7 @@ use super::{dialect::ToolNameConstraint, tool_schema, ChatTemplateRequest};
 
 /// Failure to assign unambiguous protocol names to application tools.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ToolNameNormalizationError {
+pub(crate) enum ToolNameNormalizationError {
     /// A declaration or history name is missing, empty or not a string.
     #[error("{path} must be a non-empty tool name string")]
     InvalidName {
@@ -44,10 +44,9 @@ pub enum ToolNameNormalizationError {
 pub(crate) struct ToolNameMap(Arc<BTreeMap<String, String>>);
 
 impl ToolNameMap {
-    pub(crate) fn normalize(
+    pub(crate) fn validate_names(
         request: &mut ChatTemplateRequest,
-        constraint: Option<ToolNameConstraint>,
-    ) -> Result<Self, ToolNameNormalizationError> {
+    ) -> Result<BTreeSet<String>, ToolNameNormalizationError> {
         let mut declarations = BTreeSet::new();
         let mut names = BTreeSet::new();
         visit_names(request, |value, path, declaration| {
@@ -63,6 +62,15 @@ impl ToolNameMap {
             names.insert(name.to_owned());
             Ok(())
         })?;
+
+        Ok(names)
+    }
+
+    pub(crate) fn normalize(
+        request: &mut ChatTemplateRequest,
+        constraint: Option<ToolNameConstraint>,
+    ) -> Result<Self, ToolNameNormalizationError> {
+        let names = Self::validate_names(request)?;
 
         let accepts = |name: &str| {
             tool_schema::validate_function_name(name, "tool name").is_ok()

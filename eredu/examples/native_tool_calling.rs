@@ -71,8 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prepared.format_profile_identity().unwrap_or("registered")
             );
         }
-        NativeToolSupport::Unsupported { reason } => {
-            return Err(format!("native tools unavailable: {reason}").into());
+        NativeToolSupport::Unsupported { rejection } => {
+            return Err(format!("native tools unavailable: {rejection}").into());
         }
     }
 

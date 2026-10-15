@@ -144,14 +144,17 @@ pub(super) fn bind_generation_prompt(
     let prefilled = added && suffix.trim_end().ends_with(format.opening);
     let closed = added && suffix.trim_end().ends_with(format.closing);
     if thinking == Some(false) && prefilled {
-        return Err(TextModelError::UnsupportedReasoning {
+        return Err(super::ChatCapabilityRejection::ReasoningControl {
+            control: "enable_thinking".into(),
             reason: "the selected template always opens reasoning and does not honor enable_thinking=false".into(),
-        });
+        }.into());
     }
     if thinking == Some(true) && closed {
-        return Err(TextModelError::UnsupportedReasoning {
+        return Err(super::ChatCapabilityRejection::ReasoningControl {
+            control: "enable_thinking".into(),
             reason: "the selected template closes reasoning despite enable_thinking=true".into(),
-        });
+        }
+        .into());
     }
     let index = if prefilled {
         1

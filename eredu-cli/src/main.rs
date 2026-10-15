@@ -893,8 +893,8 @@ fn use_semantic_generation(
     if tools_requested {
         return match tool_support {
             NativeToolSupport::Supported => Ok(true),
-            NativeToolSupport::Unsupported { reason } => {
-                bail!("native tool calling is unavailable: {reason}")
+            NativeToolSupport::Unsupported { rejection } => {
+                bail!("native tool calling is unavailable: {rejection}")
             }
         };
     }
@@ -2384,8 +2384,9 @@ fn main() -> Result<()> {
                             "semantic_profile: unavailable ({}); using templated text fallback",
                             prepared
                                 .native_tool_support()
-                                .unsupported_reason()
-                                .unwrap_or("unknown reason")
+                                .rejection()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "unknown reason".into())
                         );
                     }
                     (Some(prepared), rendered_prompt, false)
@@ -4226,7 +4227,9 @@ mod tests {
         .unwrap());
 
         let unsupported = NativeToolSupport::Unsupported {
-            reason: "unregistered template".into(),
+            rejection: eredu::runtime::chat::NativeToolRejection::UnrecognizedProtocol {
+                reason: "unregistered template".into(),
+            },
         };
         let semantic_unsupported = SemanticSupport::Unsupported {
             reason: "unregistered template".into(),

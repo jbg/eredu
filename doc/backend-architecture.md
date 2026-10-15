@@ -379,8 +379,17 @@ snapshot execution, including each profile's framing and stop policy.
 Delimited parsers bind initial state to the actual generation suffix rather than
 older messages. Atomic added delimiters survive decoding regardless of their
 special-token flag; ordinary delimiters use bounded incremental lookbehind.
-Unavailable explicit reasoning and unsupported delimited reasoning controls
-return `TextModelError::UnsupportedReasoning`.
+Chat preparation validates application tool declarations and request consistency
+before selecting native capabilities. `TextModelError::InvalidRequest` identifies
+invalid schemas, history, names and options; `UnsupportedCapability` identifies
+valid requests the selected protocol cannot honor. `ConstraintPreparation`
+identifies protocol/tokenizer inconsistencies and constraint compiler failures.
+Template and tokenizer errors retain their separate error variants and sources.
+Unavailable reasoning parsing and controls use distinct `ChatCapabilityRejection`
+variants. `NativeToolSupport::Unsupported` carries the same `NativeToolRejection`
+type used by native-tool capability errors. The facade reports these facts;
+applications own emulation and retry policy. All execution modes consume this
+shared preparation result.
 
 Tool-schema admission and completed-argument validation belong to the facade.
 Application JSON Schemas are retained unchanged for rendering and checked with

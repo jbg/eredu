@@ -630,8 +630,8 @@ fn prepares_prompt_and_generation_contribution_separately() {
     assert!(prepared.profile_stop_sequences().is_empty());
     assert!(matches!(
         prepared.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("no behavioral format recognizer")
+        NativeToolSupport::Unsupported { rejection }
+            if matches!(rejection, crate::runtime::chat::NativeToolRejection::UnrecognizedProtocol { .. })
     ));
 }
 
@@ -681,7 +681,7 @@ fn preparation_selects_named_tool_template_without_model_type_fallback() {
     ]));
     let request = ChatTemplateRequest {
         messages: vec![json!({"role": "user", "content": "hello"})],
-        tools: vec![json!({"type": "function"})],
+        tools: vec![production_tool("lookup")],
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
     };
@@ -1835,8 +1835,8 @@ fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
     assert_eq!(unsupported.format_profile_identity(), None);
     assert!(matches!(
         unsupported.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("no behavioral format recognizer")
+        NativeToolSupport::Unsupported { rejection }
+            if matches!(rejection, crate::runtime::chat::NativeToolRejection::UnrecognizedProtocol { .. })
     ));
 }
 
@@ -2364,7 +2364,14 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
             },
         )
         .unwrap_err();
-        assert!(matches!(error, TextModelError::ToolConstraint(_)));
+        assert!(matches!(
+            error,
+            TextModelError::UnsupportedCapability(
+                crate::api::ChatCapabilityRejection::NativeTools(
+                    crate::runtime::chat::NativeToolRejection::ReasoningCombinationUnsupported { .. }
+                )
+            )
+        ));
     }
 }
 
@@ -3151,8 +3158,8 @@ fn gemma4_model_type_does_not_grant_unregistered_template_support() {
     assert_eq!(prepared.format_profile_identity(), None);
     assert!(matches!(
         prepared.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("no behavioral format recognizer")
+        NativeToolSupport::Unsupported { rejection }
+            if matches!(rejection, crate::runtime::chat::NativeToolRejection::UnrecognizedProtocol { .. })
     ));
 }
 
@@ -3252,8 +3259,8 @@ fn mistral_architecture_name_does_not_grant_an_unregistered_template_support() {
     assert_eq!(prepared.format_profile_identity(), None);
     assert!(matches!(
         prepared.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("no behavioral format recognizer")
+        NativeToolSupport::Unsupported { rejection }
+            if matches!(rejection, crate::runtime::chat::NativeToolRejection::UnrecognizedProtocol { .. })
     ));
 }
 
@@ -3287,8 +3294,8 @@ fn named_template_behavioral_recognition_uses_only_the_selected_body() {
     assert_eq!(default.format_profile_identity(), None);
     assert!(matches!(
         default.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("no behavioral format recognizer")
+        NativeToolSupport::Unsupported { rejection }
+            if matches!(rejection, crate::runtime::chat::NativeToolRejection::UnrecognizedProtocol { .. })
     ));
 
     let selected_tool_use = prepare_chat_from_parts(
@@ -3321,7 +3328,7 @@ fn named_template_behavioral_recognition_uses_only_the_selected_body() {
 }
 
 #[test]
-fn synthetic_profile_validates_request_tools_before_rendering() {
+fn preparation_validates_request_tools_before_rendering() {
     let mut tokenizer = synthetic_chat_tokenizer(0);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let template = ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into());
@@ -3398,8 +3405,141 @@ fn synthetic_profile_validates_request_tools_before_rendering() {
     .unwrap_err();
     assert!(matches!(
         error,
-        TextModelError::ToolConstraint(ref message) if message.contains("tools[0].function.parameters")
+        TextModelError::InvalidRequest(crate::api::ChatRequestError::ToolDefinition {
+            index: 0,
+            ..
+        })
     ));
+}
+
+#[test]
+fn preparation_rejections_distinguish_invalid_requests_from_native_tool_limits() {
+    use crate::api::{ChatCapabilityRejection, ChatRequestError};
+    use crate::runtime::chat::NativeToolRejection;
+
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = deepseek_chat_tokenizer(61);
+    let template = ModelChatTemplate::Single(DEEPSEEK_V3_TOOL_FIXTURE.into());
+    let prepare = |tokenizer: &mut ChatTokenizer, request| {
+        prepare_chat_from_parts(
+            tokenizer,
+            template.clone(),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            request,
+        )
+    };
+    let request = ChatTemplateRequest {
+        messages: vec![json!({"role": "user", "content": "Look it up."})],
+        tools: vec![production_tool("lookup")],
+        tool_choice: ToolChoice::Required,
+        enable_thinking: Some(true),
+        allow_unparsed_reasoning: true,
+        add_generation_prompt: true,
+        ..ChatTemplateRequest::default()
+    };
+    assert!(matches!(
+        prepare(&mut tokenizer, request.clone()),
+        Err(TextModelError::UnsupportedCapability(
+            ChatCapabilityRejection::NativeTools(
+                NativeToolRejection::ReasoningCombinationUnsupported { .. }
+            )
+        ))
+    ));
+
+    // Removing declarations for emulation must not hide a malformed original schema.
+    let mut invalid = request.clone();
+    invalid.tools[0]["function"]["parameters"] = json!({"type": "not_a_type"});
+    assert!(matches!(
+        prepare(&mut tokenizer, invalid),
+        Err(TextModelError::InvalidRequest(
+            ChatRequestError::ToolDefinition { index: 0, .. }
+        ))
+    ));
+    let mut invalid = request.clone();
+    invalid.reasoning_effort = Some("high".into());
+    invalid.enable_thinking = Some(false);
+    assert!(matches!(
+        prepare(&mut tokenizer, invalid),
+        Err(TextModelError::InvalidRequest(
+            ChatRequestError::ConflictingOptions { .. }
+        ))
+    ));
+    let mut invalid = request.clone();
+    invalid.tools.clear();
+    assert!(matches!(
+        prepare(&mut tokenizer, invalid),
+        Err(TextModelError::InvalidRequest(
+            ChatRequestError::RequiredToolsMissing
+        ))
+    ));
+
+    // An application retries with text instructions and retains its reasoning policy.
+    let mut emulated = request;
+    emulated.tools.clear();
+    emulated.tool_choice = ToolChoice::None;
+    emulated.messages[0]["content"] = json!("Use a textual lookup action to look it up.");
+    let prepared = prepare(&mut tokenizer, emulated).unwrap();
+    assert!(prepared
+        .rendered_prompt()
+        .contains("Use a textual lookup action"));
+    assert!(prepared.tool_runtime_plan().is_none());
+}
+
+#[test]
+fn preparation_reports_missing_constraint_data_consistently() {
+    use crate::api::ChatCapabilityRejection;
+    use crate::runtime::chat::NativeToolRejection;
+
+    let mut tokenizer = synthetic_chat_tokenizer(0);
+    let mut prepare = |request| {
+        prepare_chat_from_parts(
+            &mut tokenizer,
+            SYNTHETIC_TOOL_TEMPLATE.into(),
+            "synthetic",
+            &[],
+            None,
+            request,
+        )
+    };
+    let prepared = prepare(ChatTemplateRequest::default()).unwrap();
+    assert_eq!(
+        prepared.native_tool_support().rejection(),
+        Some(&NativeToolRejection::MissingConstraintData)
+    );
+    assert!(matches!(
+        prepare(ChatTemplateRequest {
+            tools: vec![production_tool("lookup")],
+            ..ChatTemplateRequest::default()
+        }),
+        Err(TextModelError::UnsupportedCapability(
+            ChatCapabilityRejection::NativeTools(NativeToolRejection::MissingConstraintData)
+        ))
+    ));
+}
+
+#[test]
+fn preparation_preserves_template_failures() {
+    let mut tokenizer = synthetic_chat_tokenizer(0);
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let error = prepare_chat_from_parts(
+        &mut tokenizer,
+        SYNTHETIC_TOOL_TEMPLATE.into(),
+        "synthetic",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            tools: vec![production_tool("lookup")],
+            extra_template_kwargs: serde_json::Map::from_iter([(
+                "fail_render".into(),
+                json!(true),
+            )]),
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, TextModelError::Template(_)));
 }
 
 #[test]
@@ -3508,7 +3648,7 @@ fn tokenizer_analysis_is_model_scoped_while_schemas_compile_per_prepare_chat() {
 }
 
 #[test]
-fn missing_structural_added_token_fails_before_prompt_rendering() {
+fn preparation_rejects_missing_structural_token_before_rendering() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
@@ -3531,14 +3671,14 @@ fn missing_structural_added_token_fails_before_prompt_rendering() {
 
     assert!(matches!(
         error,
-        TextModelError::ToolConstraint(ref message)
-            if message.contains(SYNTHETIC_STRUCTURAL_TOKEN)
-                && message.contains("not registered as an added token")
+        TextModelError::ConstraintPreparation(
+            crate::api::ConstraintPreparationError::StructuralTokens { .. }
+        )
     ));
 }
 
 #[test]
-fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
+fn preparation_reports_compiler_failure_before_rendering() {
     let mut tokenizer = synthetic_chat_tokenizer(0);
     let compiler = Err("failed to compile tool grammar: synthetic compiler failure".into());
     let error = prepare_chat_from_parts(
@@ -3548,6 +3688,7 @@ fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
         &[],
         Some(&compiler),
         ChatTemplateRequest {
+            tools: vec![production_tool("lookup")],
             tool_choice: ToolChoice::Required,
             extra_template_kwargs: serde_json::Map::from_iter([(
                 "fail_render".into(),
@@ -3560,8 +3701,9 @@ fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
 
     assert!(matches!(
         error,
-        TextModelError::ToolConstraint(ref message)
-            if message == "failed to compile tool grammar: synthetic compiler failure"
+        TextModelError::ConstraintPreparation(
+            crate::api::ConstraintPreparationError::Compiler { .. }
+        )
     ));
 }
 

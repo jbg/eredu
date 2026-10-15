@@ -9,12 +9,16 @@ use eredu_core::{
 };
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
 
-use super::{ConstraintError, TextDecoderError, TextModelError};
+use super::{
+    ChatCapabilityRejection, ChatRequestError, ConstraintError, ConstraintPreparationError,
+    TextDecoderError, TextModelError,
+};
 use crate::api::TextDecoder;
 use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintController};
 use crate::runtime::chat::{
     prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
-    ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport, ToolChoice,
+    ChatTemplateRequest, NativeToolRejection, NativeToolSupport, PreparedChat, SemanticSupport,
+    ToolChoice,
 };
 use crate::runtime::generation::streaming::{
     CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, SourceAdvancement,
@@ -708,9 +712,13 @@ fn validate_tagged_history(
                 continue;
             };
             let arguments = arguments.as_object().ok_or_else(|| {
-                TextModelError::ToolConstraint(format!(
-                    "messages[{message_index}].tool_calls[{call_index}].function.arguments must be a mapping for {profile} tagged-parameter templates; serialized strings are unsupported"
-                ))
+                ChatRequestError::ToolHistory {
+                    message_index,
+                    call_index,
+                    reason: format!(
+                        "arguments must be a mapping for {profile} tagged-parameter templates; serialized strings are unsupported"
+                    ),
+                }
             })?;
             for (name, value) in arguments {
                 if name.is_empty()
@@ -718,17 +726,25 @@ fn validate_tagged_history(
                         .chars()
                         .any(|character| matches!(character, '<' | '>' | '\r' | '\n'))
                 {
-                    return Err(TextModelError::ToolConstraint(format!(
-                        "messages[{message_index}].tool_calls[{call_index}] contains unsafe tagged parameter name {name:?}"
-                    )));
+                    return Err(ChatRequestError::ToolHistory {
+                        message_index,
+                        call_index,
+                        reason: format!("unsafe tagged parameter name {name:?}"),
+                    }
+                    .into());
                 }
                 if value
                     .as_str()
                     .is_some_and(|value| value.contains(parameter_suffix))
                 {
-                    return Err(TextModelError::ToolConstraint(format!(
-                        "messages[{message_index}].tool_calls[{call_index}] parameter {name:?} contains the unescaped tagged-parameter closing delimiter"
-                    )));
+                    return Err(ChatRequestError::ToolHistory {
+                        message_index,
+                        call_index,
+                        reason: format!(
+                            "parameter {name:?} contains the unescaped tagged-parameter closing delimiter"
+                        ),
+                    }
+                    .into());
                 }
             }
         }
@@ -1679,6 +1695,18 @@ pub(super) fn prepare_chat_from_parts_with_history(
     mut request: ChatTemplateRequest,
     history: Option<super::ChatToolArgumentFormat>,
 ) -> Result<PreparedChat, TextModelError> {
+    crate::runtime::chat::ToolNameMap::validate_names(&mut request)?;
+    crate::runtime::chat::tool_schema::parse_request_tools(&request.tools, false)?;
+    if request.tool_choice == ToolChoice::Required && request.tools.is_empty() {
+        return Err(ChatRequestError::RequiredToolsMissing.into());
+    }
+    if request.reasoning_effort.is_some() && request.enable_thinking == Some(false) {
+        return Err(ChatRequestError::ConflictingOptions {
+            first: "reasoning_effort".into(),
+            second: "enable_thinking=false".into(),
+        }
+        .into());
+    }
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let selected_template = match &template_identity {
@@ -1750,7 +1778,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
         .zip(profile.tool_dialect_parameters)
         .map(|(dialect, parameters)| dialect.tool_name_constraint(parameters))
         .transpose()
-        .map_err(TextModelError::ToolConstraint)?;
+        .map_err(|reason| ConstraintPreparationError::Protocol { reason })?;
     let tool_names = crate::runtime::chat::ToolNameMap::normalize(&mut request, naming)?;
     if let Some(format) = history {
         super::chat_input::lower_tool_arguments(
@@ -1769,9 +1797,11 @@ pub(super) fn prepare_chat_from_parts_with_history(
             .extra_template_kwargs
             .contains_key("reasoning_effort")
     {
-        return Err(TextModelError::ToolConstraint(
-            "Qwen3.6 does not expose reasoning_effort control".into(),
-        ));
+        return Err(ChatCapabilityRejection::ReasoningControl {
+            control: "reasoning_effort".into(),
+            reason: "Qwen3.6 does not expose reasoning_effort control".into(),
+        }
+        .into());
     }
     let extra_reasoning_effort = if request.reasoning_effort.is_none() {
         profile
@@ -1784,11 +1814,10 @@ pub(super) fn prepare_chat_from_parts_with_history(
             })
             .map(|(control, value)| {
                 value.as_str().map(|value| (control, value)).ok_or_else(|| {
-                    TextModelError::ToolConstraint(format!(
-                        "{} must be a string for format profile {:?}",
-                        control.kwarg,
-                        profile.identity.as_deref().unwrap_or("unregistered")
-                    ))
+                    ChatRequestError::InvalidOption {
+                        field: control.kwarg.into(),
+                        reason: "must be a string".into(),
+                    }
                 })
             })
             .transpose()?
@@ -1801,22 +1830,30 @@ pub(super) fn prepare_chat_from_parts_with_history(
         .or_else(|| extra_reasoning_effort.map(|(_, value)| value))
     {
         if request.enable_thinking == Some(false) {
-            return Err(TextModelError::ToolConstraint(
-                "reasoning_effort cannot be combined with enable_thinking=false".into(),
-            ));
+            return Err(ChatRequestError::ConflictingOptions {
+                first: "reasoning_effort".into(),
+                second: "enable_thinking=false".into(),
+            }
+            .into());
         }
         let control = profile.reasoning_effort_control.ok_or_else(|| {
-            TextModelError::ToolConstraint(format!(
-                "format profile {:?} does not expose reasoning_effort control",
-                profile.identity.as_deref().unwrap_or("unregistered")
-            ))
+            ChatCapabilityRejection::ReasoningControl {
+                control: "reasoning_effort".into(),
+                reason: format!(
+                    "format profile {:?} does not expose reasoning_effort control",
+                    profile.identity
+                ),
+            }
         })?;
         if !control.supported.contains(&reasoning_effort) {
-            return Err(TextModelError::ToolConstraint(format!(
-                "unsupported reasoning_effort {reasoning_effort:?} for format profile {:?}; expected {}",
-                profile.identity.as_deref().unwrap_or("unregistered"),
-                control.supported.join(", ")
-            )));
+            return Err(ChatRequestError::InvalidOption {
+                field: "reasoning_effort".into(),
+                reason: format!(
+                    "unsupported value {reasoning_effort:?}; expected {}",
+                    control.supported.join(", ")
+                ),
+            }
+            .into());
         }
     }
     let add_generation_prompt = profile
@@ -1843,33 +1880,30 @@ pub(super) fn prepare_chat_from_parts_with_history(
     }
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
         if request.enable_thinking == Some(false) {
-            return Err(TextModelError::ToolConstraint(
-                "Muse-Glimmer does not expose a reasoning-disable control; enable_thinking=false is not supported".into(),
-            ));
+            return Err(ChatCapabilityRejection::ReasoningControl {
+                control: "enable_thinking".into(),
+                reason: "Muse-Glimmer does not expose a reasoning-disable control".into(),
+            }
+            .into());
         }
         if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {
             let Some(strength) = value.as_str() else {
-                return Err(TextModelError::ToolConstraint(
-                    "Muse-Glimmer reasoning_strength must be one of low, medium, high, or xhigh"
-                        .into(),
-                ));
+                return Err(ChatRequestError::InvalidOption {
+                    field: "reasoning_strength".into(),
+                    reason: "must be one of low, medium, high, or xhigh".into(),
+                }
+                .into());
             };
             if !matches!(strength, "low" | "medium" | "high" | "xhigh") {
-                return Err(TextModelError::ToolConstraint(format!(
-                    "unsupported Muse-Glimmer reasoning_strength {strength:?}; expected low, medium, high, or xhigh"
-                )));
+                return Err(ChatRequestError::InvalidOption {
+                    field: "reasoning_strength".into(),
+                    reason: format!(
+                        "unsupported value {strength:?}; expected low, medium, high, or xhigh"
+                    ),
+                }
+                .into());
             }
         }
-    }
-    if request.tool_choice != ToolChoice::None
-        && request.enable_thinking == Some(true)
-        && !request.tools.is_empty()
-        && !profile.supports_tool_reasoning
-    {
-        return Err(TextModelError::ToolConstraint(format!(
-            "format profile {:?} does not preserve reasoning semantics while native tools are active",
-            profile.identity.as_deref().unwrap_or("unregistered")
-        )));
     }
     let semantic_failure = profile
         .native_tool_unavailable_reason
@@ -1891,21 +1925,32 @@ pub(super) fn prepare_chat_from_parts_with_history(
     let tool_protocol_available = profile.tool_dialect.is_some()
         && profile.tool_dialect_parameters.is_some()
         && constraint_compiler.is_some_and(Result::is_ok);
+    if tool_surface_requested && profile.tool_dialect.is_some() {
+        if let Some(Err(reason)) = constraint_compiler {
+            return Err(ConstraintPreparationError::Compiler {
+                reason: reason.clone(),
+            }
+            .into());
+        }
+    }
     let native_tool_support = if tool_protocol_available {
         NativeToolSupport::Supported
     } else {
         NativeToolSupport::Unsupported {
-            reason: if profile.tool_dialect.is_some() {
+            rejection: if profile.tool_dialect.is_some() {
                 match constraint_compiler {
-                    Some(Err(error)) => format!("native tool constraints are unavailable: {error}"),
-                    None => "the loaded model does not have tokenizer constraint data".into(),
-                    Some(Ok(_)) => semantic_failure.clone(),
+                    None => NativeToolRejection::MissingConstraintData,
+                    Some(Err(reason)) => NativeToolRejection::ConstraintInitializationFailed {
+                        reason: reason.clone(),
+                    },
+                    Some(Ok(_)) => NativeToolRejection::UnrecognizedProtocol {
+                        reason: semantic_failure.clone(),
+                    },
                 }
             } else {
-                profile
-                    .native_tool_unavailable_reason
-                    .clone()
-                    .unwrap_or_else(|| semantic_failure.clone())
+                NativeToolRejection::UnrecognizedProtocol {
+                    reason: semantic_failure.clone(),
+                }
             },
         }
     };
@@ -1940,24 +1985,34 @@ pub(super) fn prepare_chat_from_parts_with_history(
     let selected_runtime = selected_runtime
         .map(|(dialect, _, structural_tokens, has_tool_surface)| {
             let ids = resolve_structural_tokens(tokenizer, structural_tokens)
-                .map_err(TextModelError::ToolConstraint)?;
+                .map_err(|reason| ConstraintPreparationError::StructuralTokens { reason })?;
             if tool_surface_requested {
                 constraint_compiler
                     .ok_or_else(|| {
-                        TextModelError::ToolConstraint(
-                            "the loaded model does not have tokenizer constraint data".into(),
+                        ChatCapabilityRejection::NativeTools(
+                            NativeToolRejection::MissingConstraintData,
                         )
                     })?
                     .as_ref()
-                    .map_err(|error| TextModelError::ToolConstraint(error.clone()))?;
+                    .map_err(|reason| ConstraintPreparationError::Compiler {
+                        reason: reason.clone(),
+                    })?;
             }
             Ok::<_, TextModelError>((dialect, structural_tokens.clone(), ids, has_tool_surface))
         })
         .transpose()?;
-    // Validate request schemas before running the caller's template. Grammar
-    // construction follows rendering because framing can begin in its suffix.
-    crate::runtime::chat::constraints::parse_tools(&request.tools)
-        .map_err(TextModelError::ToolConstraint)?;
+    if request.tool_choice != ToolChoice::None
+        && request.enable_thinking == Some(true)
+        && !request.tools.is_empty()
+        && !profile.supports_tool_reasoning
+    {
+        return Err(ChatCapabilityRejection::NativeTools(
+            NativeToolRejection::ReasoningCombinationUnsupported {
+                profile: profile.identity.clone(),
+            },
+        )
+        .into());
+    }
 
     let mut extra_template_kwargs = request.extra_template_kwargs.clone();
     let template_tools = if request.tool_choice == ToolChoice::None {
@@ -2058,8 +2113,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
                     resolved_ids,
                     profile.stop_sequences.clone(),
                     has_tool_surface,
-                )
-                .map_err(TextModelError::ToolConstraint)?
+                )?
                 .with_tool_names(tool_names),
             )
         }
@@ -2087,9 +2141,9 @@ pub(super) fn prepare_chat_from_parts_with_history(
             .is_some_and(|plan| plan.semantic_plan().supports_reasoning_parsing())
         && !request.allow_unparsed_reasoning
     {
-        return Err(TextModelError::UnsupportedReasoning {
+        return Err(ChatCapabilityRejection::ReasoningParsing {
             reason: format!("thinking was explicitly enabled, but no semantic reasoning protocol was recognized: {semantic_failure}; set allow_unparsed_reasoning to opt into raw output"),
-        });
+        }.into());
     }
 
     let capabilities = ChatCapabilities {

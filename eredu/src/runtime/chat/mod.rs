@@ -17,7 +17,7 @@ mod tokenizer_env;
 mod tool_names;
 pub(crate) mod tool_schema;
 pub(crate) use tool_names::ToolNameMap;
-pub use tool_names::ToolNameNormalizationError;
+pub(crate) use tool_names::ToolNameNormalizationError;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -397,6 +397,45 @@ struct ResolvedStructuralToken {
     token_id: u32,
 }
 
+/// A native-tool limitation that applications may address by preparing emulated tools.
+/// The replacement request is validated independently and can still fail.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NativeToolRejection {
+    /// No executable native-tool protocol was recognized.
+    #[error("{reason}")]
+    UnrecognizedProtocol {
+        /// Recognition diagnostic.
+        reason: String,
+    },
+    /// Native constrained decoding requires tokenizer constraint data.
+    #[error("the loaded model does not have tokenizer constraint data")]
+    MissingConstraintData,
+    /// Tokenizer constraint initialization failed; semantic-only preparation remains available.
+    #[error("native tool constraints are unavailable: {reason}")]
+    ConstraintInitializationFailed {
+        /// Initialization diagnostic.
+        reason: String,
+    },
+    /// A name requires rewriting but the protocol's naming rules are unknown.
+    #[error("cannot normalize tool name {name:?}: the selected template has no recognized tool-name rules")]
+    ToolNameRulesUnavailable {
+        /// Application name requiring normalization.
+        name: String,
+    },
+    /// The protocol cannot provide a unique valid alias for an application name.
+    #[error("cannot allocate a unique protocol-valid alias for tool {name:?}")]
+    ToolNameAliasUnavailable {
+        /// Application name requiring an alias.
+        name: String,
+    },
+    /// Native tools would lose the requested reasoning semantics.
+    #[error("format profile {profile:?} does not preserve reasoning semantics while native tools are active")]
+    ReasoningCombinationUnsupported {
+        /// Selected format profile, if recognized.
+        profile: Option<String>,
+    },
+}
+
 /// Whether the selected checkpoint template has registered native tool support.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeToolSupport {
@@ -404,23 +443,22 @@ pub enum NativeToolSupport {
     Supported,
     /// No safe native tool runtime plan could be selected.
     Unsupported {
-        /// Human-readable explanation suitable for diagnostics.
-        reason: String,
+        /// Typed limitation; its display text is suitable for diagnostics.
+        rejection: NativeToolRejection,
     },
 }
 
 impl NativeToolSupport {
-    /// Returns whether the selected template has an executable native-tool
-    /// profile for this request.
+    /// Returns whether the selected template has an executable native-tool profile.
     pub const fn is_supported(&self) -> bool {
         matches!(self, Self::Supported)
     }
 
-    /// Returns the diagnostic for an unsupported template, if any.
-    pub fn unsupported_reason(&self) -> Option<&str> {
+    /// Returns the typed native-tool limitation, if any.
+    pub fn rejection(&self) -> Option<&NativeToolRejection> {
         match self {
             Self::Supported => None,
-            Self::Unsupported { reason } => Some(reason),
+            Self::Unsupported { rejection } => Some(rejection),
         }
     }
 }

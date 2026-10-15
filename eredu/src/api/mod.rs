@@ -76,8 +76,9 @@ pub use observed::{
 };
 
 pub use portable::{
-    GeneratedToken, LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError,
-    TextGeneration, TextModelError, TextModelOptions,
+    ChatCapabilityRejection, ChatRequestError, ConstraintPreparationError, GeneratedToken,
+    LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError, TextGeneration,
+    TextModelError, TextModelOptions,
 };
 
 /// Terminal metadata shared by target-only and speculative generation.

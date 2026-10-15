@@ -163,55 +163,67 @@ pub(crate) struct ToolDefinition {
 }
 
 pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
+    parse_request_tools(tools, true).map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_request_tools(
+    tools: &[Value],
+    wire_names: bool,
+) -> Result<Vec<ToolDefinition>, crate::api::ChatRequestError> {
     let mut names = HashSet::new();
     tools
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            let path = format!("tools[{index}]");
-            let object = tool
-                .as_object()
-                .ok_or_else(|| format!("{path} must be an object"))?;
-            reject_unknown_keys(object, &["type", "function"], &path)?;
-            if object.get("type").and_then(Value::as_str) != Some("function") {
-                return Err(format!("{path}.type must be \"function\""));
-            }
-            let function = object
-                .get("function")
-                .and_then(Value::as_object)
-                .ok_or_else(|| format!("{path}.function must be an object"))?;
-            reject_unknown_keys(
-                function,
-                &["name", "description", "parameters"],
-                &format!("{path}.function"),
-            )?;
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
-            validate_function_name(name, &format!("{path}.function.name"))?;
-            let name = name.to_owned();
-            if !names.insert(name.clone()) {
-                return Err(format!("duplicate tool function name {name:?}"));
-            }
-            if function
-                .get("description")
-                .is_some_and(|description| !description.is_string())
-            {
-                return Err(format!("{path}.function.description must be a string"));
-            }
-            let parameters = function
-                .get("parameters")
-                .ok_or_else(|| format!("{path}.function.parameters is required"))?;
-            let validator = compile(parameters)
-                .map_err(|error| format!("{path}.function.parameters: {error}"))?;
-            let parameters = parameters.clone();
-            Ok(ToolDefinition {
-                name,
-                parameters,
-                validator,
-            })
+            let result = (|| {
+                let path = format!("tools[{index}]");
+                let object = tool
+                    .as_object()
+                    .ok_or_else(|| format!("{path} must be an object"))?;
+                reject_unknown_keys(object, &["type", "function"], &path)?;
+                if object.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err(format!("{path}.type must be \"function\""));
+                }
+                let function = object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("{path}.function must be an object"))?;
+                reject_unknown_keys(
+                    function,
+                    &["name", "description", "parameters"],
+                    &format!("{path}.function"),
+                )?;
+                let name = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
+                if wire_names {
+                    validate_function_name(name, &format!("{path}.function.name"))?;
+                }
+                let name = name.to_owned();
+                if !names.insert(name.clone()) {
+                    return Err(format!("duplicate tool function name {name:?}"));
+                }
+                if function
+                    .get("description")
+                    .is_some_and(|description| !description.is_string())
+                {
+                    return Err(format!("{path}.function.description must be a string"));
+                }
+                let parameters = function
+                    .get("parameters")
+                    .ok_or_else(|| format!("{path}.function.parameters is required"))?;
+                let validator = compile(parameters)
+                    .map_err(|error| format!("{path}.function.parameters: {error}"))?;
+                let parameters = parameters.clone();
+                Ok(ToolDefinition {
+                    name,
+                    parameters,
+                    validator,
+                })
+            })();
+            result.map_err(|reason| crate::api::ChatRequestError::ToolDefinition { index, reason })
         })
         .collect()
 }

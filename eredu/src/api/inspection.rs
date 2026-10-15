@@ -182,11 +182,11 @@ fn inspect_chat_behavior(
         Ok(prepared) => {
             report.native_tools = match prepared.native_tool_support() {
                 NativeToolSupport::Supported => InspectionReadiness::Ready,
-                NativeToolSupport::Unsupported { reason } => {
+                NativeToolSupport::Unsupported { rejection } => {
                     report.issue(
                         InspectionIssueCode::UnsupportedToolProtocol,
                         InspectionSeverity::Warning,
-                        reason.clone(),
+                        rejection.to_string(),
                         Some(report.path.clone()),
                     );
                     InspectionReadiness::Unsupported
@@ -226,11 +226,11 @@ fn apply_prepared_chat(report: &mut ModelInspectionReport, prepared: &PreparedCh
     };
     report.native_tools = match prepared.native_tool_support() {
         NativeToolSupport::Supported => InspectionReadiness::Ready,
-        NativeToolSupport::Unsupported { reason } => {
+        NativeToolSupport::Unsupported { rejection } => {
             report.issue(
                 InspectionIssueCode::UnsupportedToolProtocol,
                 InspectionSeverity::Warning,
-                reason.clone(),
+                rejection.to_string(),
                 Some(report.path.clone()),
             );
             InspectionReadiness::Unsupported
