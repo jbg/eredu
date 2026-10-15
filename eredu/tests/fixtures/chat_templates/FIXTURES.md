@@ -40,3 +40,24 @@ from `LiquidAI/LFM2.5-1.2B-Instruct` revision
 `0f604ada3f766f9f257460c4c9f0b5d6f69d431b`. Its suffix identifies the template's
 SHA-256 digest. It covers native requests with Python keyword argument names
 and rendering parsed arguments back into conversation history.
+
+`deepseek-r1-distill-qwen-1.5b-ad9f0ae0.jinja` is the exact `chat_template`
+string extracted from
+[`tokenizer_config.json`](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/resolve/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562/tokenizer_config.json)
+at revision `ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562`. It has no final newline;
+SHA-256 is `56a1447ad31926fdc21fb07e56e5642bd9c850c4f52d8c8af7bbe5f079a84f5f`.
+
+`qwq-32b-976055f8.jinja` is the exact `chat_template` string extracted from
+[`tokenizer_config.json`](https://huggingface.co/Qwen/QwQ-32B/resolve/976055f8c83f394f35dbd3ab09a285a984907bd0/tokenizer_config.json)
+at revision `976055f8c83f394f35dbd3ab09a285a984907bd0`.
+SHA-256 is `16488ad69d85833e5f66c50174f39834b688343337e9337f018deaa21b354117`.
+Its metadata declares `<think>` and `</think>` as ordinary added tokens
+(`special=false`, IDs 151667 and 151668).
+
+These fixtures establish reasoning admission from the generation suffix even
+when reasoning history is discarded or native tools cannot be established.
+Small tokenizers cover ordinary multi-token delimiters, ordinary added tokens,
+and special added tokens. Neutral backend tests cover shared generation,
+controlled and speculative delivery, snapshot restoration during a closing
+marker, and retained inspection/loading. They do not claim numerical checkpoint
+or native-device validation.

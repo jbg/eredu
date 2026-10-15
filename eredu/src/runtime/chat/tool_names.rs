@@ -250,7 +250,7 @@ mod tests {
                 .unwrap()
                 .with_tool_names(names);
             let body = format!("[{wire}(class=3)]");
-            let mut grammar = plan.generation_constraint().grammar_state();
+            let mut grammar = plan.generation_constraint().unwrap().grammar_state();
             grammar.commit(1).unwrap();
             for byte in body.bytes() {
                 grammar.commit(u32::from(byte)).unwrap();

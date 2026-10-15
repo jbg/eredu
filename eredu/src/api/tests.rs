@@ -33,6 +33,7 @@ mod qwen4_exp;
 mod qwen4_metadata;
 mod qwen4_tokenizer;
 mod refinement_preparation;
+mod reasoning;
 mod sampler;
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -528,7 +529,7 @@ fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() 
 }
 
 fn plan_accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, output: &str) -> bool {
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().unwrap().grammar_state();
     let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
     let mut offset = 0;
     while offset < output.len() {
@@ -3028,7 +3029,7 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
     let grammar_output = tool_output
         .strip_suffix("<|tool_response>")
         .expect("profile stop is outside the tool grammar");
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().unwrap().grammar_state();
     let mut remaining = grammar_output;
     while !remaining.is_empty() {
         let next = structural_spellings
@@ -3320,7 +3321,7 @@ fn named_template_behavioral_recognition_uses_only_the_selected_body() {
 }
 
 #[test]
-fn synthetic_profile_compiles_request_tools_before_rendering() {
+fn synthetic_profile_validates_request_tools_before_rendering() {
     let mut tokenizer = synthetic_chat_tokenizer(0);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let template = ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into());
@@ -3494,11 +3495,13 @@ fn tokenizer_analysis_is_model_scoped_while_schemas_compile_per_prepare_chat() {
             .tool_runtime_plan()
             .unwrap()
             .generation_constraint()
+            .unwrap()
             .fingerprint,
         second
             .tool_runtime_plan()
             .unwrap()
             .generation_constraint()
+            .unwrap()
             .fingerprint,
         "request schemas must compile into independent grammars"
     );

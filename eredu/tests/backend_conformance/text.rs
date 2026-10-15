@@ -129,8 +129,12 @@ fn generate<F: FnMut(SemanticEvent)>(
     })
 }
 
-fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, Vec<u32>) {
-    let mut probe = unicode_model_with_template(None, 64, TEMPLATE);
+pub(super) fn output_model(
+    method: usize,
+    pieces: [&str; 2],
+    template: &str,
+) -> (LoadedModel<MockBackend>, Vec<u32>) {
+    let mut probe = unicode_model_with_template(None, 64, template);
     let chat = probe.prepare_chat(request()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let ids = if method == 0 {
@@ -158,7 +162,7 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
             model_family: ModelKind::Qwen2,
             effective_model_type: "qwen2".into(),
             model_id: "unrecognized-text".into(),
-            chat_template: Some(TEMPLATE.into()),
+            chat_template: Some(template.into()),
             eos_token_ids: vec![ids[2]],
             checkpoint_generation_config: None,
         },
@@ -177,7 +181,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                     } else {
                         ["<think>literal", "<tool_call>"]
                     };
-                    let (mut model, expected) = output_model(method, pieces);
+                    let (mut model, expected) = output_model(method, pieces, TEMPLATE);
                     let chat = model.prepare_chat(request()).unwrap();
                     assert!(matches!(
                         chat.semantic_support(),

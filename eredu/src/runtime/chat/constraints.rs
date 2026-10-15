@@ -133,7 +133,9 @@ impl ConstraintController {
     pub(crate) fn from_generation_plan(
         plan: &GenerationRuntimePlan,
     ) -> Result<Self, ConstraintError> {
-        let constraint = plan.generation_constraint().clone();
+        let Some(constraint) = plan.generation_constraint().cloned() else {
+            return Ok(Self::text(Arc::new(TokenFilter::All)));
+        };
         let runtime = if !plan.has_tool_surface() {
             ConstraintRuntime::Active(constraint.grammar_state())
         } else {
@@ -608,7 +610,7 @@ impl ConstraintCompiler {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_generation_plan(
-        &self,
+        compiler: Option<&Self>,
         dialect: &'static dyn FormatDialect,
         parameters: DialectParameters,
         tools: &[Value],
@@ -620,7 +622,11 @@ impl ConstraintCompiler {
         tool_surface: bool,
     ) -> Result<GenerationRuntimePlan, String> {
         #[cfg(test)]
-        self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
+        if let Some(compiler) = compiler {
+            compiler
+                .schema_compilation_runs
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         let grammar_structural_token_spellings = dialect.required_structural_tokens(parameters)?;
         if runtime_structural_token_spellings.len() != resolved_structural_token_ids.len()
@@ -640,63 +646,68 @@ impl ConstraintCompiler {
         let grammar_structural_token_ids =
             &resolved_structural_token_ids[..grammar_structural_token_spellings.len()];
         dialect.incremental_parser_state_with_tools(parameters, tools)?;
-        // Schema admission is independent of the grammar engine's supported subset.
-        // Every completed call is checked against the original schema by the sink.
-        parse_tools(tools)?;
-        let configuration = if tool_surface {
-            let configuration = dialect.constraint_configuration(
-                parameters,
-                tools,
-                tool_choice,
-                parallel_tool_calls,
-                grammar_structural_token_ids,
-            )?;
-            match self.compile_matcher(configuration.grammar.clone()) {
-                Ok(matcher) => (configuration, matcher),
-                Err(_) => {
-                    // Keep protocol, function names and call limits constrained.
-                    // Only argument-schema enforcement moves to completion.
-                    let syntax_tools = tools
-                        .iter()
-                        .map(|tool| {
-                            let mut tool = tool.clone();
-                            tool["function"]["parameters"] = json!({"type": "object"});
-                            tool
-                        })
-                        .collect::<Vec<_>>();
-                    let configuration = dialect.constraint_configuration(
-                        parameters,
-                        &syntax_tools,
-                        tool_choice,
-                        parallel_tool_calls,
-                        grammar_structural_token_ids,
-                    )?;
-                    let matcher = self.compile_matcher(configuration.grammar.clone())?;
-                    (configuration, matcher)
-                }
-            }
+
+        let constraint = if !tool_surface && !dialect.constrains_semantic_output() {
+            None
         } else {
-            let configuration = dialect.semantic_constraint_configuration(
-                parameters,
-                grammar_structural_token_ids,
-                &self.eos_token_ids,
-            )?;
-            let matcher = self.compile_matcher(configuration.grammar.clone())?;
-            (configuration, matcher)
+            let compiler =
+                compiler.ok_or("the loaded model does not have tokenizer constraint data")?;
+            let configuration = if tool_surface {
+                let configuration = dialect.constraint_configuration(
+                    parameters,
+                    tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    grammar_structural_token_ids,
+                )?;
+                match compiler.compile_matcher(configuration.grammar.clone()) {
+                    Ok(matcher) => (configuration, matcher),
+                    Err(_) => {
+                        // Keep protocol, function names and call limits constrained.
+                        // Only argument-schema enforcement moves to completion.
+                        let syntax_tools = tools
+                            .iter()
+                            .map(|tool| {
+                                let mut tool = tool.clone();
+                                tool["function"]["parameters"] = json!({"type": "object"});
+                                tool
+                            })
+                            .collect::<Vec<_>>();
+                        let configuration = dialect.constraint_configuration(
+                            parameters,
+                            &syntax_tools,
+                            tool_choice,
+                            parallel_tool_calls,
+                            grammar_structural_token_ids,
+                        )?;
+                        let matcher = compiler.compile_matcher(configuration.grammar.clone())?;
+                        (configuration, matcher)
+                    }
+                }
+            } else {
+                let configuration = dialect.semantic_constraint_configuration(
+                    parameters,
+                    grammar_structural_token_ids,
+                    &compiler.eos_token_ids,
+                )?;
+                let matcher = compiler.compile_matcher(configuration.grammar.clone())?;
+                (configuration, matcher)
+            };
+            let (configuration, matcher) = configuration;
+            let fingerprint: [u8; 32] = Sha256::digest(
+                serde_json::to_vec(&(&configuration.grammar, tools))
+                    .expect("grammar configuration serializes"),
+            )
+            .into();
+            Some(GenerationConstraint::new(
+                fingerprint,
+                ConstraintBlueprint { matcher },
+            ))
         };
-        let (configuration, matcher) = configuration;
-        let fingerprint: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(&configuration.grammar, tools))
-                .expect("grammar configuration serializes"),
-        )
-        .into();
         Ok(GenerationRuntimePlan::new(GenerationRuntimePlanParts {
             tool_choice,
             tool_surface,
-            generation_constraint: GenerationConstraint::new(
-                fingerprint,
-                ConstraintBlueprint { matcher },
-            ),
+            generation_constraint: constraint,
             tool_call_trigger: if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
                 dialect
                     .auto_activation_trigger(parameters)?
@@ -755,7 +766,9 @@ impl ConstraintCompiler {
             .iter()
             .map(|sequence| (*sequence).to_owned())
             .collect();
-        self.compile_generation_plan(
+        parse_tools(tools)?;
+        Self::compile_generation_plan(
+            Some(self),
             dialect,
             parameters,
             tools,
@@ -1354,7 +1367,7 @@ mod tests {
         value: serde_json::Value,
     ) -> bool {
         let bytes = serde_json::to_vec(&value).unwrap();
-        let mut state = plan.generation_constraint().grammar_state();
+        let mut state = plan.generation_constraint().unwrap().grammar_state();
         for byte in bytes {
             if state.commit(byte as TokenId).is_err() {
                 return false;
@@ -1615,7 +1628,7 @@ mod tests {
             json!({"count": 2, "value": false}),
         ] {
             let output = json!({"calls": [{"name": "check", "arguments": arguments}]}).to_string();
-            let mut grammar = plan.generation_constraint().grammar_state();
+            let mut grammar = plan.generation_constraint().unwrap().grammar_state();
             assert!(output
                 .bytes()
                 .any(|byte| grammar.commit(u32::from(byte)).is_err()));
@@ -1910,7 +1923,7 @@ mod tests {
         let bytes =
             serde_json::to_vec(&json!({"calls": [{"name": "ping", "arguments": {}}]})).unwrap();
         let split = bytes.len() / 2;
-        let mut state = plan.generation_constraint().grammar_state();
+        let mut state = plan.generation_constraint().unwrap().grammar_state();
         for byte in &bytes[..split] {
             state.commit(*byte as TokenId).unwrap();
         }

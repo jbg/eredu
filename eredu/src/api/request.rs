@@ -23,6 +23,7 @@ use crate::runtime::generation::streaming::{
 use std::collections::HashMap;
 
 mod ifm;
+mod reasoning;
 
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1723,6 +1724,31 @@ pub(super) fn prepare_chat_from_parts_with_history(
             profile = recognized;
         }
     }
+    if !profile.supports_reasoning_parsing {
+        if let Some(reasoning) =
+            reasoning::recognize(tokenizer, &selected_template, model_id, &request)
+        {
+            if profile.tool_dialect.is_none() {
+                profile.identity = reasoning.identity;
+                profile.native_tool_unavailable_reason = reasoning.native_tool_unavailable_reason;
+            }
+            profile.dialect = reasoning.dialect;
+            profile.dialect_parameters = reasoning.dialect_parameters;
+            for marker in reasoning.required_structural_tokens {
+                if !profile.required_structural_tokens.contains(&marker) {
+                    profile.required_structural_tokens.push(marker.clone());
+                }
+                if reasoning::can_bind_tools(&profile)
+                    && !profile.tool_required_structural_tokens.contains(&marker)
+                {
+                    profile.tool_required_structural_tokens.push(marker);
+                }
+            }
+            profile.supports_reasoning_parsing = true;
+            profile.supports_tool_reasoning =
+                profile.tool_dialect.is_none() || reasoning::can_bind_tools(&profile);
+        }
+    }
     let naming = profile
         .tool_dialect
         .zip(profile.tool_dialect_parameters)
@@ -1893,6 +1919,8 @@ pub(super) fn prepare_chat_from_parts_with_history(
                     true,
                 )
             })
+    } else if tool_surface_requested && profile.tool_dialect.is_none() {
+        None
     } else {
         profile
             .dialect
@@ -1906,41 +1934,130 @@ pub(super) fn prepare_chat_from_parts_with_history(
                 )
             })
     };
-    let generation_runtime_plan = match selected_runtime {
-        Some((dialect, parameters, structural_tokens, has_tool_surface)) => {
-            let resolved_ids = resolve_structural_tokens(tokenizer, structural_tokens)
+    let selected_runtime = selected_runtime
+        .map(|(dialect, _, structural_tokens, has_tool_surface)| {
+            let ids = resolve_structural_tokens(tokenizer, structural_tokens)
                 .map_err(TextModelError::ToolConstraint)?;
-            let compiler = constraint_compiler
-                .ok_or_else(|| {
-                    TextModelError::ToolConstraint(
-                        "the loaded model does not have tokenizer constraint data".into(),
-                    )
-                })?
-                .as_ref()
-                .map_err(|error| TextModelError::ToolConstraint(error.clone()))?;
+            if has_tool_surface || tool_surface_requested || dialect.constrains_semantic_output() {
+                constraint_compiler
+                    .ok_or_else(|| {
+                        TextModelError::ToolConstraint(
+                            "the loaded model does not have tokenizer constraint data".into(),
+                        )
+                    })?
+                    .as_ref()
+                    .map_err(|error| TextModelError::ToolConstraint(error.clone()))?;
+            }
+            Ok::<_, TextModelError>((dialect, structural_tokens.clone(), ids, has_tool_surface))
+        })
+        .transpose()?;
+    // Validate request schemas before running the caller's template. Grammar
+    // construction follows rendering because framing can begin in its suffix.
+    crate::runtime::chat::constraints::parse_tools(&request.tools)
+        .map_err(TextModelError::ToolConstraint)?;
+
+    let mut extra_template_kwargs = request.extra_template_kwargs.clone();
+    let template_tools = if request.tool_choice == ToolChoice::None {
+        &[][..]
+    } else {
+        request.tools.as_slice()
+    };
+    let add_generation_prompt = profile
+        .generation_prompt_behavior
+        .resolve(request.add_generation_prompt);
+
+    if let Some(enable_thinking) = request.enable_thinking {
+        let explicit_muse_strength = profile.identity.as_deref() == Some("muse-glimmer.atem.v1")
+            && extra_template_kwargs.contains_key("reasoning_strength");
+        if !explicit_muse_strength {
+            let (kwarg, value) = profile
+                .reasoning_template_control
+                .template_entry(enable_thinking);
+            extra_template_kwargs.insert(kwarg.into(), value);
+        }
+    }
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        let control = profile
+            .reasoning_effort_control
+            .expect("reasoning effort was validated against the recognized profile");
+        extra_template_kwargs.insert(
+            control.kwarg.into(),
+            serde_json::Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    let without_generation_prompt = tokenizer
+        .apply_chat_template_json(
+            selected_template.clone(),
+            [request.messages.clone()],
+            Some(template_tools),
+            model_id,
+            false,
+            Some(&extra_template_kwargs),
+        )?
+        .into_iter()
+        .next()
+        .expect("one input conversation must produce one rendered prompt");
+    let with_generation_prompt = tokenizer
+        .apply_chat_template_json(
+            selected_template,
+            [request.messages.clone()],
+            Some(template_tools),
+            model_id,
+            true,
+            Some(&extra_template_kwargs),
+        )?
+        .into_iter()
+        .next()
+        .expect("one input conversation must produce one rendered prompt");
+    let generation_prompt = with_generation_prompt
+        .strip_prefix(&without_generation_prompt)
+        .unwrap_or_default()
+        .to_owned();
+    let rendered_prompt = if add_generation_prompt {
+        with_generation_prompt
+    } else {
+        without_generation_prompt
+    };
+
+    reasoning::bind_generation_prompt(
+        &mut profile,
+        &generation_prompt,
+        add_generation_prompt,
+        request.enable_thinking,
+    )?;
+
+    let generation_runtime_plan = match selected_runtime {
+        Some((dialect, structural_tokens, resolved_ids, has_tool_surface)) => {
+            let parameters = if has_tool_surface {
+                profile.tool_dialect_parameters
+            } else {
+                profile.dialect_parameters
+            }
+            .expect("admitted format parameters");
             Some(
-                compiler
-                    .compile_generation_plan(
-                        dialect,
-                        parameters,
-                        if has_tool_surface {
-                            &request.tools
-                        } else {
-                            &[]
-                        },
-                        if has_tool_surface {
-                            request.tool_choice
-                        } else {
-                            ToolChoice::None
-                        },
-                        request.parallel_tool_calls,
-                        structural_tokens.clone(),
-                        resolved_ids,
-                        profile.stop_sequences.clone(),
-                        has_tool_surface,
-                    )
-                    .map_err(TextModelError::ToolConstraint)?
-                    .with_tool_names(tool_names),
+                ConstraintCompiler::compile_generation_plan(
+                    constraint_compiler.and_then(|compiler| compiler.as_ref().ok()),
+                    dialect,
+                    parameters,
+                    if has_tool_surface {
+                        &request.tools
+                    } else {
+                        &[]
+                    },
+                    if has_tool_surface {
+                        request.tool_choice
+                    } else {
+                        ToolChoice::None
+                    },
+                    request.parallel_tool_calls,
+                    structural_tokens,
+                    resolved_ids,
+                    profile.stop_sequences.clone(),
+                    has_tool_surface,
+                )
+                .map_err(TextModelError::ToolConstraint)?
+                .with_tool_names(tool_names),
             )
         }
         None => None,
@@ -1962,17 +2079,21 @@ pub(super) fn prepare_chat_from_parts_with_history(
         }
     };
     if request.enable_thinking == Some(true)
-        && (generation_runtime_plan.is_none() || !profile.supports_reasoning_parsing)
+        && !generation_runtime_plan
+            .as_ref()
+            .is_some_and(|plan| plan.semantic_plan().supports_reasoning_parsing())
         && !request.allow_unparsed_reasoning
     {
-        return Err(TextModelError::ToolConstraint(format!(
-            "thinking was explicitly enabled, but no semantic reasoning protocol was recognized: {semantic_failure}; set allow_unparsed_reasoning to opt into raw output"
-        )));
+        return Err(TextModelError::UnsupportedReasoning {
+            reason: format!("thinking was explicitly enabled, but no semantic reasoning protocol was recognized: {semantic_failure}; set allow_unparsed_reasoning to opt into raw output"),
+        });
     }
 
     let capabilities = ChatCapabilities {
         reasoning_parser: capability(
-            generation_runtime_plan.is_some() && profile.supports_reasoning_parsing,
+            generation_runtime_plan
+                .as_ref()
+                .is_some_and(|plan| plan.semantic_plan().supports_reasoning_parsing()),
             "the selected protocol does not provide a recognized reasoning channel",
         ),
         visible_text_parser: capability(
@@ -1999,80 +2120,6 @@ pub(super) fn prepare_chat_from_parts_with_history(
             profile.tool_dialect.is_some() && constraint_compiler.is_some_and(Result::is_ok),
             "no compatible tokenizer constraint compiler is available",
         ),
-    };
-
-    let ChatTemplateRequest {
-        messages,
-        tools,
-        tool_choice,
-        parallel_tool_calls: _,
-        enable_thinking,
-        reasoning_effort,
-        allow_unparsed_reasoning: _,
-        add_generation_prompt,
-        mut extra_template_kwargs,
-    } = request;
-    let template_tools = if tool_choice == ToolChoice::None {
-        Vec::new()
-    } else {
-        tools
-    };
-    let add_generation_prompt = profile
-        .generation_prompt_behavior
-        .resolve(add_generation_prompt);
-
-    if let Some(enable_thinking) = enable_thinking {
-        let explicit_muse_strength = profile.identity.as_deref() == Some("muse-glimmer.atem.v1")
-            && extra_template_kwargs.contains_key("reasoning_strength");
-        if !explicit_muse_strength {
-            let (kwarg, value) = profile
-                .reasoning_template_control
-                .template_entry(enable_thinking);
-            extra_template_kwargs.insert(kwarg.into(), value);
-        }
-    }
-    if let Some(reasoning_effort) = reasoning_effort {
-        let control = profile
-            .reasoning_effort_control
-            .expect("reasoning effort was validated against the recognized profile");
-        extra_template_kwargs.insert(
-            control.kwarg.into(),
-            serde_json::Value::String(reasoning_effort),
-        );
-    }
-
-    let without_generation_prompt = tokenizer
-        .apply_chat_template_json(
-            selected_template.clone(),
-            [messages.clone()],
-            Some(&template_tools),
-            model_id,
-            false,
-            Some(&extra_template_kwargs),
-        )?
-        .into_iter()
-        .next()
-        .expect("one input conversation must produce one rendered prompt");
-    let with_generation_prompt = tokenizer
-        .apply_chat_template_json(
-            selected_template,
-            [messages],
-            Some(&template_tools),
-            model_id,
-            true,
-            Some(&extra_template_kwargs),
-        )?
-        .into_iter()
-        .next()
-        .expect("one input conversation must produce one rendered prompt");
-    let generation_prompt = with_generation_prompt
-        .strip_prefix(&without_generation_prompt)
-        .unwrap_or_default()
-        .to_owned();
-    let rendered_prompt = if add_generation_prompt {
-        with_generation_prompt
-    } else {
-        without_generation_prompt
     };
 
     Ok(PreparedChat {

@@ -360,6 +360,19 @@ argument value tags, compact type annotations and literal value framing are
 shared parser/constraint features. Partial annotation state is included in
 snapshot storage estimates.
 
+Reasoning admission is independent of native-tool history and schema constraints.
+The facade recognizes `<think>` framing from bounded rendered reasoning history
+or a generation-only suffix that opens the channel. It binds parser state to the
+actual request's suffix; older messages cannot initialize it. Reasoning-only
+plans have no grammar and retain the ordinary tokenizer validity controller.
+Atomic added delimiters survive decoding regardless of their special-token flag;
+ordinary multi-token delimiters use bounded incremental lookbehind. The same
+semantic plan supplies ordinary, controlled, speculative and snapshot execution.
+Compatible XML tool envelopes compose that admitted channel in the existing
+declarative parser and grammar. Unsupported native-tool requests cannot use a
+reasoning-only plan to bypass tool admission. Unavailable explicit reasoning or
+unhonored enable/disable controls return `TextModelError::UnsupportedReasoning`.
+
 Tool-schema admission and completed-argument validation belong to the facade.
 Application JSON Schemas are retained unchanged for rendering and checked with
 the portable `jsonschema` validator without remote or filesystem retrieval.

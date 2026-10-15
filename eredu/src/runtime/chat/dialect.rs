@@ -117,6 +117,11 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String>;
 
+    /// Whether semantic-only output requires vocabulary constraints.
+    fn constrains_semantic_output(&self) -> bool {
+        true
+    }
+
     fn semantic_constraint_configuration(
         &self,
         parameters: DialectParameters,
@@ -3585,7 +3590,7 @@ mod tests {
     }
 
     fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
-        let mut state = plan.generation_constraint().grammar_state();
+        let mut state = plan.generation_constraint().unwrap().grammar_state();
         for byte in text.bytes() {
             if state.commit(byte as TokenId).is_err() {
                 return false;
@@ -4047,7 +4052,7 @@ mod tests {
             .strip_suffix("<|tool_response>")
             .expect("profile stop is not part of the grammar");
         if !accepts(&plan, grammar_output) {
-            let mut state = plan.generation_constraint().grammar_state();
+            let mut state = plan.generation_constraint().unwrap().grammar_state();
             for (index, byte) in grammar_output.bytes().enumerate() {
                 state
                     .commit(byte as TokenId)
@@ -4709,9 +4714,9 @@ mod tests {
                 vec![250],
             )
             .unwrap();
-        let mut literal_state = plan.generation_constraint().grammar_state();
+        let mut literal_state = plan.generation_constraint().unwrap().grammar_state();
         assert!(literal_state.commit(u32::from(b'[')).is_err());
-        let mut state = plan.generation_constraint().grammar_state();
+        let mut state = plan.generation_constraint().unwrap().grammar_state();
         state.commit(250).unwrap();
         for byte in br#"[{"name":"lookup","arguments":{"value":1},"id":"abc123456"}]"# {
             state.commit(u32::from(*byte)).unwrap();

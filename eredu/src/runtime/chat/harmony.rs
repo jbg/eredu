@@ -677,7 +677,7 @@ mod tests {
     }
 
     fn accepts(plan: &crate::runtime::chat::GenerationRuntimePlan, text: &str) -> bool {
-        let mut grammar = plan.generation_constraint().grammar_state();
+        let mut grammar = plan.generation_constraint().unwrap().grammar_state();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;
         while offset < text.len() {

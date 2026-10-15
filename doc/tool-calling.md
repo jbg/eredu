@@ -34,6 +34,31 @@ for text even when native tool generation is unavailable.
 format identity. `PreparedChat` owns the rendered prompt and private executable
 response plan; callers do not receive dialect parser or grammar state.
 
+## Reasoning without native tools
+
+Reasoning support does not require native tool support or a constraint compiler.
+A selected template can establish `<think>` framing through a rendered
+`reasoning_content` history probe or its generation-only opening suffix. This
+covers the pinned DeepSeek R1 Distill Qwen and QwQ templates as well as tool-free
+templates with the same verified framing. A model name, added-token spelling or
+tag in ordinary conversation text does not establish support.
+
+The parser starts inside reasoning only when the actual generation suffix opens
+it. Otherwise it accepts an opening marker at the start of generated output;
+once visible output starts, later markers remain literal text. A suffix that
+already closes reasoning starts in visible text. Generated whitespace inside
+each channel is preserved. EOS or a token limit preserves incomplete reasoning
+as reasoning, including an unfinished closing marker. Cancellation publishes no
+buffered delimiter lookbehind.
+
+Use semantic output when emulating tools in application text: route only
+`TextDelta` to the emulator and handle `ReasoningDelta` independently. Native tool
+capabilities remain separately gated. QwQ composes its prefilled reasoning with
+the recognized XML tool envelope. Explicitly unavailable reasoning and controls
+the template cannot honor return `TextModelError::UnsupportedReasoning`.
+`OutputMode::Text` remains literal and requires the existing
+`allow_unparsed_reasoning` opt-in when thinking is explicitly enabled.
+
 ## Function schemas
 
 Every preparation validates the entire tool envelope before model execution.

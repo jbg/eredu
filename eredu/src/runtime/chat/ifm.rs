@@ -224,7 +224,7 @@ mod tests {
                         "{}Check carefully.{closing}\n{collection}",
                         if prefilled { "" } else { opening }
                     );
-                    let mut grammar = plan.generation_constraint().grammar_state();
+                    let mut grammar = plan.generation_constraint().unwrap().grammar_state();
                     for (index, byte) in output.bytes().enumerate() {
                         grammar.commit(u32::from(byte)).unwrap_or_else(|e| panic!("format {format}, effort {effort}, prefilled {prefilled}, index {index}, prefix {:?}: {e}", &output[..index]));
                     }
