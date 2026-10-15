@@ -114,7 +114,7 @@ fn official_nanbeige_reasoning_closing_token_is_selectable() {
             _ => None,
         })
         .collect::<String>();
-    assert_eq!(reasoning, "Follow the instruction.");
+    assert_eq!(reasoning, "Follow the instruction.\n");
     assert_eq!(visible.trim(), "hello");
 }
 

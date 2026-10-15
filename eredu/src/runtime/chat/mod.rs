@@ -1,8 +1,8 @@
 //! Public chat preparation and native tool-runtime contracts.
 //!
-//! Chat templates remain checkpoint-owned Jinja programs. Format profiles are
-//! selected only from registered signatures of the selected template body;
-//! model architecture metadata is deliberately not a fallback.
+//! Chat templates remain checkpoint-owned Jinja programs. Response and native-tool
+//! profiles use rendered behavior and tokenizer evidence independently; model
+//! architecture metadata is not a fallback.
 
 pub(crate) mod atem;
 pub(crate) mod constraints;
@@ -183,11 +183,14 @@ impl SemanticRuntimePlan {
 
     pub(crate) fn create_parser_with_stops<'a>(
         &self,
+        tool_surface: bool,
         caller_stops: impl IntoIterator<Item = &'a str>,
     ) -> Result<ToolRuntimeParser, String> {
-        let parser = self
-            .dialect
-            .incremental_parser_state_with_tools(self.dialect_parameters, &self.tools)?;
+        let parser = self.dialect.incremental_parser_state_for_request(
+            self.dialect_parameters,
+            &self.tools,
+            tool_surface,
+        )?;
         ToolRuntimeParser::new_with_structural_stops(
             parser,
             self.profile_stop_sequences.iter().map(String::as_str),
@@ -330,9 +333,10 @@ impl GenerationRuntimePlan {
     /// parser.
     #[cfg(test)]
     pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
-        let parser = self.semantic.dialect.incremental_parser_state_with_tools(
+        let parser = self.semantic.dialect.incremental_parser_state_for_request(
             self.semantic.dialect_parameters,
             &self.semantic.tools,
+            self.tool_surface,
         )?;
         let mut parser = ToolRuntimeParser::new(
             parser,
@@ -354,7 +358,9 @@ impl GenerationRuntimePlan {
         &self,
         caller_stops: impl IntoIterator<Item = &'a str>,
     ) -> Result<ToolRuntimeParser, String> {
-        let mut parser = self.semantic.create_parser_with_stops(caller_stops)?;
+        let mut parser = self
+            .semantic
+            .create_parser_with_stops(self.tool_surface, caller_stops)?;
         if self.tool_choice == ToolChoice::None {
             parser.disable_tool_calls();
         }
@@ -606,7 +612,6 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
     pub(crate) reasoning_template_control: ReasoningTemplateControl,
     pub(crate) reasoning_effort_control: Option<ReasoningEffortControl>,
-    pub(crate) supports_reasoning_parsing: bool,
     pub(crate) supports_tool_reasoning: bool,
     pub(crate) supports_tool_input_rendering: bool,
     pub(crate) supports_mapping_tool_arguments: bool,
@@ -1160,7 +1165,6 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
             reasoning_effort_control: None,
-            supports_reasoning_parsing: false,
             supports_tool_reasoning: true,
             supports_tool_input_rendering: true,
             supports_mapping_tool_arguments: true,
@@ -1181,7 +1185,6 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
         reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
         reasoning_effort_control: None,
-        supports_reasoning_parsing: false,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: false,
         supports_mapping_tool_arguments: false,

@@ -22,22 +22,32 @@ pub(crate) struct ReasoningFormat {
     pub(crate) initial: InitialChannel,
 }
 
-pub(crate) static THINK_FORMATS: [ReasoningFormat; 3] = [
-    ReasoningFormat {
-        opening: "<think>",
-        closing: "</think>",
-        initial: InitialChannel::Generated,
-    },
-    ReasoningFormat {
-        opening: "<think>",
-        closing: "</think>",
-        initial: InitialChannel::Reasoning,
-    },
-    ReasoningFormat {
-        opening: "<think>",
-        closing: "</think>",
-        initial: InitialChannel::Text,
-    },
+const fn formats(opening: &'static str, closing: &'static str) -> [ReasoningFormat; 3] {
+    [
+        ReasoningFormat {
+            opening,
+            closing,
+            initial: InitialChannel::Generated,
+        },
+        ReasoningFormat {
+            opening,
+            closing,
+            initial: InitialChannel::Reasoning,
+        },
+        ReasoningFormat {
+            opening,
+            closing,
+            initial: InitialChannel::Text,
+        },
+    ]
+}
+
+pub(crate) static DELIMITED_FORMATS: [(&str, [ReasoningFormat; 3]); 2] = [
+    ("reasoning.think.v1", formats("<think>", "</think>")),
+    (
+        "reasoning.thinking.v1",
+        formats("<thinking>", "</thinking>"),
+    ),
 ];
 
 #[derive(Debug)]
@@ -54,10 +64,6 @@ impl FormatDialect for ReasoningDialect {
 
     fn supports_reasoning_parsing(&self, _: DialectParameters) -> bool {
         true
-    }
-
-    fn constrains_semantic_output(&self) -> bool {
-        false
     }
 
     fn constraint_configuration(

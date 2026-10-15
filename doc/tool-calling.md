@@ -36,15 +36,28 @@ response plan; callers do not receive dialect parser or grammar state.
 
 ## Reasoning without native tools
 
-Reasoning support does not require native tool support or a constraint compiler.
-A selected template can establish `<think>` framing through a rendered
-`reasoning_content` history probe or its generation-only opening suffix. This
-covers the pinned DeepSeek R1 Distill Qwen and QwQ templates as well as tool-free
-templates with the same verified framing. A model name, added-token spelling or
-tag in ordinary conversation text does not establish support.
+Every supported reasoning protocol is usable without native tools or a constraint
+compiler. Reasoning/text framing is established from tool-free template probes
+and response-token evidence. Tool definitions, tool history, tool-only tokens and
+argument constraints are checked separately; a rejected tool probe cannot disable
+a recognized response protocol.
 
-The parser starts inside reasoning only when the actual generation suffix opens
-it. Otherwise it accepts an opening marker at the start of generated output;
+Supported framing includes delimited `<think>` and `<thinking>` blocks, IFM's
+high/medium/low effort wrappers, Harmony analysis/final channels, Gemma thought
+channels, Inkling message frames and ATEM self/user recipients. These are wire
+formats, independent of architecture or model names. Unknown framing remains
+explicitly unsupported. An added-token spelling or a tag in ordinary conversation
+text does not establish support.
+
+Semantic-only requests use tokenizer validity without compiling a grammar.
+Native-tool requests attach their own parser and constraints and fail closed
+when unavailable. Response-only declarative parsing leaves tool-envelope text
+available to application emulators. Boolean and named-effort controls are also
+recognized without requiring tools. Thinking controls change the prompt;
+response-format recognition remains available for tool-free requests.
+
+For the delimited response profiles, the parser starts inside reasoning only
+when the actual generation suffix opens it. Otherwise it accepts an opening marker at the start of generated output;
 once visible output starts, later markers remain literal text. A suffix that
 already closes reasoning starts in visible text. Generated whitespace inside
 each channel is preserved. EOS or a token limit preserves incomplete reasoning
@@ -54,8 +67,8 @@ buffered delimiter lookbehind.
 Use semantic output when emulating tools in application text: route only
 `TextDelta` to the emulator and handle `ReasoningDelta` independently. Native tool
 capabilities remain separately gated. QwQ composes its prefilled reasoning with
-the recognized XML tool envelope. Explicitly unavailable reasoning and controls
-the template cannot honor return `TextModelError::UnsupportedReasoning`.
+the recognized XML tool envelope. Explicitly unavailable reasoning and unsupported
+delimited reasoning controls return `TextModelError::UnsupportedReasoning`.
 `OutputMode::Text` remains literal and requires the existing
 `allow_unparsed_reasoning` opt-in when thinking is explicitly enabled.
 
@@ -106,8 +119,8 @@ have the same shape for all three sources; draft diagnostics are optional.
 The low-level `generate_speculative_batch` operation schedules independent lanes
 with a common explicit output mode.
 
-All paths use the same tokenizer-aware byte decoder, stop matcher, constraint
-engine, and semantic event pipeline. Speculation and scheduler interleaving can
+All paths use the same tokenizer-aware byte decoder, stop matcher, token-validity
+controller and semantic event pipeline. Native-tool requests add grammar constraints. Speculation and scheduler interleaving can
 change uncommitted work and diagnostics, but not committed tokens, event order,
 or finish reason.
 

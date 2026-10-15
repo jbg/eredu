@@ -23,6 +23,7 @@ use crate::runtime::generation::streaming::{
 use std::collections::HashMap;
 
 mod ifm;
+mod harmony;
 mod reasoning;
 
 /// Model sampling and stopping settings for one prepared chat generation.
@@ -754,18 +755,6 @@ fn recognize_gemma_protocol(
         Ok(ids) => ids,
         Err(_) => return None,
     };
-    let tools = vec![serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "eredu_probe",
-            "description": "protocol probe",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"]
-            }
-        }
-    })];
     let reasoning_sentinel = "__eredu_reasoning_probe_7c91__";
     let visible_sentinel = "__eredu_visible_probe_28ad__";
     let probe_messages = vec![
@@ -774,20 +763,13 @@ fn recognize_gemma_protocol(
             "role": "assistant",
             "reasoning_content": reasoning_sentinel,
             "content": visible_sentinel,
-            "tool_calls": [{
-                "id": "reasoning-probe-call",
-                "type": "function",
-                "function": {
-                    "name": "eredu_probe",
-                    "arguments": {"value": "reasoning-probe"}
-                }
-            }]
+
         }),
     ];
     let rendered = match tokenizer.apply_chat_template_json(
         selected_template.clone(),
         [probe_messages],
-        Some(&tools),
+        Some(&[]),
         model_id,
         false,
         None,
@@ -833,6 +815,18 @@ fn recognize_gemma_protocol(
         }
     }
 
+    let tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "eredu_probe",
+            "description": "protocol probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }
+        }
+    })];
     let full_tool_tokens = [
         CHANNEL_OPEN,
         CHANNEL_CLOSE,
@@ -937,7 +931,6 @@ fn recognize_gemma_protocol(
             "enable_thinking",
         ),
         reasoning_effort_control: None,
-        supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: tool_input_rendering,
         supports_mapping_tool_arguments: mapping_tool_arguments,
@@ -1093,7 +1086,6 @@ fn recognize_inkling_protocol(
             disabled: "none",
         },
         reasoning_effort_control: None,
-        supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: tool_output_protocol,
         supports_mapping_tool_arguments: mapping_tool_arguments,
@@ -1197,7 +1189,7 @@ fn recognize_muse_atem_protocol(
             kwarg: "reasoning_strength",
             supported: &["low", "medium", "high", "xhigh"],
         }),
-        supports_reasoning_parsing: true,
+
         supports_tool_reasoning: true,
         supports_tool_input_rendering: mapping_tool_arguments,
         supports_mapping_tool_arguments: mapping_tool_arguments,
@@ -1289,6 +1281,8 @@ fn render_reasoning_protocol_probe(
                 serde_json::json!({
                     "role": "assistant",
                     "reasoning_content": "__eredu_reasoning_probe__",
+                    "thinking": "__eredu_reasoning_probe__",
+                    "think": "__eredu_reasoning_probe__",
                     "content": "__eredu_visible_probe__"
                 }),
             ]],
@@ -1302,7 +1296,9 @@ fn render_reasoning_protocol_probe(
         .next()
 }
 
-fn recognized_dialect_profile(
+// Tool evidence cannot establish reasoning for an ordinary response. That
+// projection requires a separate tool-free framing probe.
+fn recognized_tool_profile(
     tokenizer: &ChatTokenizer,
     identity: &'static str,
     dialect: &'static dyn crate::runtime::chat::dialect::FormatDialect,
@@ -1330,15 +1326,14 @@ fn recognized_dialect_profile(
 
     Some(crate::runtime::chat::PreparedFormatProfile {
         identity: Some(identity.into()),
-        dialect: Some(dialect),
-        dialect_parameters: Some(parameters),
+        dialect: (!dialect.supports_reasoning_parsing(parameters)).then_some(dialect),
+        dialect_parameters: (!dialect.supports_reasoning_parsing(parameters)).then_some(parameters),
         tool_dialect: Some(dialect),
         tool_dialect_parameters: Some(parameters),
         generation_prompt_behavior,
         reasoning_template_control:
             crate::runtime::chat::ReasoningTemplateControl::Boolean(reasoning_template_kwarg),
         reasoning_effort_control: None,
-        supports_reasoning_parsing: dialect.supports_reasoning_parsing(parameters),
         supports_tool_reasoning,
         supports_tool_input_rendering,
         supports_mapping_tool_arguments: mapping_tool_arguments,
@@ -1361,7 +1356,6 @@ fn recognize_remaining_protocols(
 ) -> Option<crate::runtime::chat::PreparedFormatProfile> {
     use crate::runtime::chat::{
         dialect::{DialectParameters, DECLARATIVE_DIALECT},
-        harmony::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
         lfm2::{LFM2_DIALECT, LFM2_PARAMETERS},
         DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
         KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
@@ -1400,33 +1394,13 @@ fn recognize_remaining_protocols(
     let kimi_mapping = supports(&mapping, &kimi_markers);
     let kimi_string = supports(&string, &kimi_markers);
     if kimi_mapping || kimi_string {
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             "kimi-k2.native-tools.v1",
             &DECLARATIVE_DIALECT,
             DialectParameters::Declarative(&KIMI_K2_NATIVE_TOOL_SPEC),
             kimi_mapping,
             kimi_string,
-        );
-    }
-
-    let harmony_markers = [
-        "assistant to=functions.eredu_probe_7c91",
-        "<|message|>",
-        "<|call|>",
-        "functions.eredu_probe_7c91 to=assistant",
-        "__eredu_tool_result_probe__",
-    ];
-    let harmony_mapping = supports(&mapping, &harmony_markers);
-    let harmony_string = supports(&string, &harmony_markers);
-    if harmony_mapping || harmony_string {
-        return recognized_dialect_profile(
-            tokenizer,
-            "harmony.channels.v1",
-            &HARMONY_DIALECT,
-            DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-            harmony_mapping,
-            harmony_string,
         );
     }
 
@@ -1459,7 +1433,7 @@ fn recognize_remaining_protocols(
         } else {
             return None;
         };
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             identity,
             &DECLARATIVE_DIALECT,
@@ -1478,7 +1452,7 @@ fn recognize_remaining_protocols(
     let lfm2_mapping = supports(&mapping, &lfm2_markers);
     let lfm2_string = supports(&string, &lfm2_markers);
     if lfm2_mapping || lfm2_string {
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             "lfm2.python-tools.v1",
             &LFM2_DIALECT,
@@ -1529,7 +1503,7 @@ fn recognize_remaining_protocols(
             } else {
                 "qwen3.6.tagged-parameter-tools.v1"
             };
-            let mut profile = recognized_dialect_profile(
+            let mut profile = recognized_tool_profile(
                 tokenizer,
                 identity,
                 &DECLARATIVE_DIALECT,
@@ -1570,7 +1544,7 @@ fn recognize_remaining_protocols(
         } else {
             ("xml-tools.v1", &QWEN_XML_TOOL_SPEC)
         };
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             identity,
             &DECLARATIVE_DIALECT,
@@ -1601,7 +1575,7 @@ fn recognize_remaining_protocols(
         } else {
             return None;
         };
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             identity,
             &DECLARATIVE_DIALECT,
@@ -1632,7 +1606,7 @@ fn recognize_remaining_protocols(
                 &NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
             )
         };
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             identity,
             &DECLARATIVE_DIALECT,
@@ -1664,7 +1638,7 @@ fn recognize_remaining_protocols(
         } else {
             ("llama.json-tools.v1", &LLAMA3_JSON_TOOL_SPEC)
         };
-        return recognized_dialect_profile(
+        return recognized_tool_profile(
             tokenizer,
             identity,
             &DECLARATIVE_DIALECT,
@@ -1686,7 +1660,13 @@ pub(crate) fn prepare_chat_from_parts(
     request: ChatTemplateRequest,
 ) -> Result<PreparedChat, TextModelError> {
     prepare_chat_from_parts_with_history(
-        tokenizer, template, model_id, eos_token_ids, constraint_compiler, request, None,
+        tokenizer,
+        template,
+        model_id,
+        eos_token_ids,
+        constraint_compiler,
+        request,
+        None,
     )
 }
 
@@ -1719,12 +1699,17 @@ pub(super) fn prepare_chat_from_parts_with_history(
             recognize_muse_atem_protocol(tokenizer, &selected_template, model_id)
                 .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
                 .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
+                .or_else(|| harmony::recognize(tokenizer, &selected_template, model_id))
                 .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
         {
             profile = recognized;
         }
     }
-    if !profile.supports_reasoning_parsing {
+    if !profile
+        .dialect
+        .zip(profile.dialect_parameters)
+        .is_some_and(|(dialect, parameters)| dialect.supports_reasoning_parsing(parameters))
+    {
         if let Some(reasoning) =
             reasoning::recognize(tokenizer, &selected_template, model_id, &request)
         {
@@ -1732,6 +1717,10 @@ pub(super) fn prepare_chat_from_parts_with_history(
                 profile.identity = reasoning.identity;
                 profile.native_tool_unavailable_reason = reasoning.native_tool_unavailable_reason;
             }
+            if profile.reasoning_effort_control.is_none() {
+                profile.reasoning_effort_control = reasoning.reasoning_effort_control;
+            }
+            profile.reasoning_template_control = reasoning.reasoning_template_control;
             profile.dialect = reasoning.dialect;
             profile.dialect_parameters = reasoning.dialect_parameters;
             for marker in reasoning.required_structural_tokens {
@@ -1744,9 +1733,16 @@ pub(super) fn prepare_chat_from_parts_with_history(
                     profile.tool_required_structural_tokens.push(marker);
                 }
             }
-            profile.supports_reasoning_parsing = true;
-            profile.supports_tool_reasoning =
-                profile.tool_dialect.is_none() || reasoning::can_bind_tools(&profile);
+
+            profile.supports_tool_reasoning = profile.tool_dialect.is_none()
+                || reasoning::can_bind_tools(&profile)
+                || (profile.supports_tool_reasoning
+                    && profile
+                        .tool_dialect
+                        .zip(profile.tool_dialect_parameters)
+                        .is_some_and(|(dialect, parameters)| {
+                            dialect.supports_reasoning_parsing(parameters)
+                        }));
         }
     }
     let naming = profile
@@ -1841,9 +1837,8 @@ pub(super) fn prepare_chat_from_parts_with_history(
             &QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING
         };
         let parameters = crate::runtime::chat::dialect::DialectParameters::Declarative(spec);
-        profile.dialect_parameters = Some(parameters);
         profile.tool_dialect_parameters = Some(parameters);
-        profile.supports_reasoning_parsing = request.enable_thinking != Some(false);
+
         validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
     }
     if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
@@ -1900,10 +1895,18 @@ pub(super) fn prepare_chat_from_parts_with_history(
         NativeToolSupport::Supported
     } else {
         NativeToolSupport::Unsupported {
-            reason: profile
-                .native_tool_unavailable_reason
-                .clone()
-                .unwrap_or_else(|| semantic_failure.clone()),
+            reason: if profile.tool_dialect.is_some() {
+                match constraint_compiler {
+                    Some(Err(error)) => format!("native tool constraints are unavailable: {error}"),
+                    None => "the loaded model does not have tokenizer constraint data".into(),
+                    Some(Ok(_)) => semantic_failure.clone(),
+                }
+            } else {
+                profile
+                    .native_tool_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| semantic_failure.clone())
+            },
         }
     };
 
@@ -1938,7 +1941,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
         .map(|(dialect, _, structural_tokens, has_tool_surface)| {
             let ids = resolve_structural_tokens(tokenizer, structural_tokens)
                 .map_err(TextModelError::ToolConstraint)?;
-            if has_tool_surface || tool_surface_requested || dialect.constrains_semantic_output() {
+            if tool_surface_requested {
                 constraint_compiler
                     .ok_or_else(|| {
                         TextModelError::ToolConstraint(
@@ -2036,7 +2039,7 @@ pub(super) fn prepare_chat_from_parts_with_history(
             }
             .expect("admitted format parameters");
             Some(
-                ConstraintCompiler::compile_generation_plan(
+                crate::runtime::chat::GenerationRuntimePlan::prepare(
                     constraint_compiler.and_then(|compiler| compiler.as_ref().ok()),
                     dialect,
                     parameters,

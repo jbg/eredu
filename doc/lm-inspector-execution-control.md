@@ -56,8 +56,8 @@ EOS, and emits the existing token records plus `SemanticEvent::TextDelta` and
 stops, without interpreting tool calls, reasoning, or profile-specific stops.
 Reasoning and tool-like ordinary text can therefore appear literally. Tokenizer
 validity still excludes holes and padded logits positions before sampling and
-forced-token admission; grammar constraints in semantic mode further restrict
-that same domain.
+forced-token admission; requested native-tool constraints further restrict
+that same domain. Semantic-only response parsing requires no grammar.
 
 For `TopCandidates` bars, inspect `CaptureCandidates.domain` before interpreting
 each candidate's `allowed` flag. With a known domain, render `allowed: false` as
@@ -93,12 +93,13 @@ a snapshot additionally establishes whether complete continuation growth is know
 for branching; `capabilities().fork` then reports that result. Every fork still
 validates its own plans and budgets.
 
-Complete facade snapshots support text mode and the forbidden-tool constraint
-mode on a supported tool profile. The runnable example declares a tool and sets
-`ToolChoice::None`. Active and automatic llguidance constraints have independent
-copying but no complete storage estimate and reject snapshots. A no-tools request
-may still use an active semantic grammar. Show the returned support reason in the
-UI; do not interpret native KV-copy support as full generation-snapshot support.
+Complete facade snapshots support text mode, semantic-only response parsing and
+the forbidden-tool constraint mode on a supported tool profile, subject to native
+and semantic storage estimates. The runnable example uses a no-tools request.
+Active and automatic native-tool constraints have independent copying but no
+complete storage estimate and reject snapshots. Show the returned support reason
+in the UI; native KV-copy support alone does not establish complete generation
+snapshot support.
 Text snapshots retain partial Unicode, caller-stop lookbehind, pending forced
 choices and decoder state. Snapshot compatibility includes text versus semantic
 mode. Native support and bounded retention/copying admission still apply.

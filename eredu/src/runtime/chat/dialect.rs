@@ -117,27 +117,6 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String>;
 
-    /// Whether semantic-only output requires vocabulary constraints.
-    fn constrains_semantic_output(&self) -> bool {
-        true
-    }
-
-    fn semantic_constraint_configuration(
-        &self,
-        parameters: DialectParameters,
-        resolved_structural_token_ids: &[u32],
-        eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        let _ = eos_token_ids;
-        self.constraint_configuration(
-            parameters,
-            &[],
-            ToolChoice::None,
-            ParallelToolCallPolicy::Disabled,
-            resolved_structural_token_ids,
-        )
-    }
-
     fn auto_activation_trigger(
         &self,
         parameters: DialectParameters,
@@ -158,14 +137,14 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         parameters: DialectParameters,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String>;
 
-    /// Builds a request-specific parser when decoding depends on tool schemas.
-    ///
-    /// Most protocols carry ordinary JSON and can use the schema-independent
-    /// parser. Dialects with unquoted values may override this hook.
-    fn incremental_parser_state_with_tools(
+    /// Builds response framing with optional native-tool parsing and schemas.
+    /// Delimiters for tool envelopes are active only for a requested tool surface;
+    /// reasoning and visible-text framing remain available independently.
+    fn incremental_parser_state_for_request(
         &self,
         parameters: DialectParameters,
         _tools: &[Value],
+        _tool_surface: bool,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
         self.incremental_parser_state(parameters)
     }
@@ -836,95 +815,6 @@ impl DeclarativeDialectSpec {
                 )?);
             }
         }
-        Ok(grammar)
-    }
-
-    fn semantic_lark_grammar(
-        &self,
-        resolved_structural_token_ids: &[u32],
-        eos_token_ids: &[u32],
-    ) -> Result<String, String> {
-        self.validate()?;
-        if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
-            return Err(format!(
-                "declarative dialect declares {} structural tokens but {} tokenizer IDs were resolved",
-                self.required_structural_tokens.len(),
-                resolved_structural_token_ids.len()
-            ));
-        }
-        let literal = |text: &str| {
-            structural_literal(
-                text,
-                self.required_structural_tokens,
-                resolved_structural_token_ids,
-            )
-        };
-        let terminal_ids = self
-            .stop_sequences
-            .iter()
-            .filter_map(|stop| {
-                self.required_structural_tokens
-                    .iter()
-                    .position(|token| token == stop)
-                    .map(|index| resolved_structural_token_ids[index])
-            })
-            .chain(eos_token_ids.iter().copied())
-            .collect::<BTreeSet<_>>();
-        if terminal_ids.is_empty() {
-            return Err(
-                "declarative semantic generation requires a structural stop or EOS token".into(),
-            );
-        }
-
-        let mut grammar = String::from("start: ");
-        if let Some(channel) = self.reasoning_channel {
-            grammar.push_str(if channel.required {
-                "reasoning "
-            } else {
-                "reasoning? "
-            });
-        }
-        if let Some(channel) = self.text_channel {
-            grammar.push_str(if channel.required {
-                "visible_text "
-            } else {
-                "visible_text? "
-            });
-        } else {
-            grammar.push_str("raw_text ");
-        }
-        grammar.push_str("terminal\n");
-
-        if let Some(channel) = self.reasoning_channel {
-            grammar.push_str(&format!(
-                "reasoning: {} channel_text {}\n",
-                literal(if channel.prefix_in_prompt {
-                    ""
-                } else {
-                    channel.prefix
-                })?,
-                literal(channel.suffix)?
-            ));
-        }
-        if let Some(channel) = self.text_channel {
-            grammar.push_str(&format!(
-                "visible_text: {} channel_text {}\n",
-                literal(channel.prefix)?,
-                literal(channel.suffix)?
-            ));
-        } else {
-            grammar.push_str("raw_text: CHANNEL_TEXT_CHARACTER*\n");
-        }
-        grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
-        grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]|<[^|]/\n");
-        grammar.push_str(&format!(
-            "terminal: {}\n",
-            terminal_ids
-                .into_iter()
-                .map(|id| format!("<[{}]>", id))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ));
         Ok(grammar)
     }
 }
@@ -1661,20 +1551,6 @@ impl FormatDialect for DeclarativeDialect {
         })
     }
 
-    fn semantic_constraint_configuration(
-        &self,
-        parameters: DialectParameters,
-        resolved_structural_token_ids: &[u32],
-        eos_token_ids: &[u32],
-    ) -> Result<ConstraintConfiguration, String> {
-        let spec = Self::spec(parameters)?;
-        Ok(ConstraintConfiguration {
-            grammar: TopLevelGrammar::from_lark(
-                spec.semantic_lark_grammar(resolved_structural_token_ids, eos_token_ids)?,
-            ),
-        })
-    }
-
     fn auto_activation_trigger(
         &self,
         parameters: DialectParameters,
@@ -1703,14 +1579,16 @@ impl FormatDialect for DeclarativeDialect {
         Ok(Box::new(DeclarativeParser::new(Self::spec(parameters)?)))
     }
 
-    fn incremental_parser_state_with_tools(
+    fn incremental_parser_state_for_request(
         &self,
         parameters: DialectParameters,
         tools: &[Value],
+        tool_surface: bool,
     ) -> Result<Box<dyn ProtocolParser<Error = String>>, String> {
         Ok(Box::new(DeclarativeParser::new_with_tools(
             Self::spec(parameters)?,
             tools,
+            tool_surface,
         )?))
     }
 }
@@ -1775,23 +1653,26 @@ enum DeclarativeParserState {
 struct DeclarativeParser {
     spec: &'static DeclarativeDialectSpec,
     tagged_tools: BTreeMap<String, TaggedToolSchema>,
+    tool_surface: bool,
     state: DeclarativeParserState,
     pending: String,
 }
 
 impl DeclarativeParser {
     fn new(spec: &'static DeclarativeDialectSpec) -> Self {
-        Self::new_with_tools(spec, &[]).expect("empty declarative parser schema is valid")
+        Self::new_with_tools(spec, &[], true).expect("empty declarative parser schema is valid")
     }
 
     fn new_with_tools(
         spec: &'static DeclarativeDialectSpec,
         tools: &[Value],
+        tool_surface: bool,
     ) -> Result<Self, String> {
-        let tagged_tools = if matches!(
-            spec.payload_shape,
-            DeclarativePayloadShape::TaggedParameters(_)
-        ) {
+        let tagged_tools = if tool_surface
+            && matches!(
+                spec.payload_shape,
+                DeclarativePayloadShape::TaggedParameters(_)
+            ) {
             tagged_tool_catalog(tools)?
         } else {
             BTreeMap::new()
@@ -1799,13 +1680,21 @@ impl DeclarativeParser {
         Ok(Self {
             spec,
             tagged_tools,
+            tool_surface,
             state: spec
                 .reasoning_channel
                 .filter(|channel| channel.prefix_in_prompt)
                 .map_or(DeclarativeParserState::Outside, |channel| {
-                    DeclarativeParserState::PrefilledChannelOrTool {
-                        kind: ChannelKind::Reasoning,
-                        suffix: channel.suffix,
+                    if tool_surface {
+                        DeclarativeParserState::PrefilledChannelOrTool {
+                            kind: ChannelKind::Reasoning,
+                            suffix: channel.suffix,
+                        }
+                    } else {
+                        DeclarativeParserState::Channel {
+                            kind: ChannelKind::Reasoning,
+                            suffix: channel.suffix,
+                        }
                     }
                 }),
             pending: String::new(),
@@ -1850,7 +1739,9 @@ impl DeclarativeParser {
         if let Some(channel) = self.spec.text_channel {
             delimiters.push(channel.prefix);
         }
-        delimiters.push(self.tool_start_delimiter());
+        if self.tool_surface {
+            delimiters.push(self.tool_start_delimiter());
+        }
         delimiters
     }
 
