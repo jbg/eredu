@@ -941,7 +941,8 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     };
                     Some((
                         prepared.chat.format_profile_identity(),
-                        plan.generation_constraint().fingerprint,
+                        plan.generation_constraint()
+                            .map(|constraint| constraint.fingerprint),
                         choice,
                         prepared.chat.profile_stop_sequences(),
                     ))

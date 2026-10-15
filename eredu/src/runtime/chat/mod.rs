@@ -12,11 +12,12 @@ pub(crate) mod harmony;
 pub(crate) mod ifm;
 pub(crate) mod inkling;
 pub(crate) mod lfm2;
+pub(crate) mod reasoning;
 mod tokenizer_env;
 mod tool_names;
 pub(crate) mod tool_schema;
-pub use tool_names::ToolNameNormalizationError;
 pub(crate) use tool_names::ToolNameMap;
+pub use tool_names::ToolNameNormalizationError;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -169,6 +170,11 @@ impl SemanticRuntimePlan {
         }
     }
 
+    pub(crate) fn supports_reasoning_parsing(&self) -> bool {
+        self.dialect
+            .supports_reasoning_parsing(self.dialect_parameters)
+    }
+
     pub(crate) fn structural_tokens(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
         self.structural_tokens
             .iter()
@@ -223,8 +229,8 @@ impl PartialEq for SemanticRuntimePlan {
 
 impl Eq for SemanticRuntimePlan {}
 
-/// A complete format-protocol runtime plan for constrained generation and
-/// semantic parsing.
+/// A complete format-protocol runtime plan with semantic parsing and optional
+/// vocabulary constraints.
 ///
 /// Every recognized prepared chat owns one of these plans, including requests
 /// without tools. Tool-capable requests specialize the same plan with schemas
@@ -233,7 +239,7 @@ impl Eq for SemanticRuntimePlan {}
 pub(crate) struct GenerationRuntimePlan {
     tool_choice: ToolChoice,
     tool_surface: bool,
-    generation_constraint: GenerationConstraint,
+    generation_constraint: Option<GenerationConstraint>,
     tool_call_trigger: Option<String>,
     semantic: SemanticRuntimePlan,
 }
@@ -241,7 +247,7 @@ pub(crate) struct GenerationRuntimePlan {
 pub(crate) struct GenerationRuntimePlanParts {
     pub(crate) tool_choice: ToolChoice,
     pub(crate) tool_surface: bool,
-    pub(crate) generation_constraint: GenerationConstraint,
+    pub(crate) generation_constraint: Option<GenerationConstraint>,
     pub(crate) tool_call_trigger: Option<String>,
     pub(crate) dialect: &'static dyn FormatDialect,
     pub(crate) dialect_parameters: DialectParameters,
@@ -283,8 +289,8 @@ impl GenerationRuntimePlan {
         &self.semantic
     }
 
-    pub(crate) fn generation_constraint(&self) -> &GenerationConstraint {
-        &self.generation_constraint
+    pub(crate) fn generation_constraint(&self) -> Option<&GenerationConstraint> {
+        self.generation_constraint.as_ref()
     }
 
     pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
@@ -683,6 +689,26 @@ pub(crate) const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialec
         suffix: "\n</think>",
         required: false,
         prefix_in_prompt: false,
+    }),
+    ..QWEN_XML_TOOL_SPEC
+};
+
+// The same XML tool envelope with independently admitted, untrimmed reasoning.
+pub(crate) const XML_THINK_GENERATED: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    reasoning_channel: Some(DelimitedChannel {
+        prefix: "<think>",
+        suffix: "</think>",
+        required: false,
+        prefix_in_prompt: false,
+    }),
+    ..QWEN_XML_TOOL_SPEC
+};
+pub(crate) const XML_THINK_PREFILLED: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    reasoning_channel: Some(DelimitedChannel {
+        prefix: "<think>",
+        suffix: "</think>",
+        required: false,
+        prefix_in_prompt: true,
     }),
     ..QWEN_XML_TOOL_SPEC
 };

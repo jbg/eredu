@@ -65,7 +65,7 @@ fn qwen4_exp_released_tokenizer_accepts_atomic_tagged_tools_and_rejects_bad_argu
     assert!(ids.get_ids().contains(&248058));
     assert!(ids.get_ids().contains(&248059));
     assert_eq!(raw.decode(ids.get_ids(), false).unwrap(), output);
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().unwrap().grammar_state();
     for (offset, &id) in ids.get_ids().iter().enumerate() {
         grammar
             .commit(id)
@@ -74,7 +74,7 @@ fn qwen4_exp_released_tokenizer_accepts_atomic_tagged_tools_and_rejects_bad_argu
     assert!(grammar.is_complete().unwrap());
 
     let malformed = output.replace("12345", "not_an_integer");
-    let mut grammar = plan.generation_constraint().grammar_state();
+    let mut grammar = plan.generation_constraint().unwrap().grammar_state();
     assert!(
         raw.encode(malformed, false)
             .unwrap()
@@ -86,7 +86,7 @@ fn qwen4_exp_released_tokenizer_accepts_atomic_tagged_tools_and_rejects_bad_argu
 
     let split = output.find("345").unwrap();
     let prefix = &output[..split];
-    let mut incomplete_grammar = plan.generation_constraint().grammar_state();
+    let mut incomplete_grammar = plan.generation_constraint().unwrap().grammar_state();
     for &id in raw.encode(prefix, false).unwrap().get_ids() {
         incomplete_grammar.commit(id).unwrap();
     }

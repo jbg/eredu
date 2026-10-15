@@ -83,6 +83,8 @@ mod forecast;
 mod observed_mock;
 #[path = "backend_conformance/preparation.rs"]
 mod preparation;
+#[path = "backend_conformance/reasoning.rs"]
+mod reasoning;
 #[path = "backend_conformance/session.rs"]
 mod session;
 #[path = "backend_conformance/templates.rs"]

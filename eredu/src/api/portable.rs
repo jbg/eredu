@@ -26,6 +26,12 @@ pub enum TextModelError {
     /// No chat template is attached to the loaded model.
     #[error("the loaded model does not provide a chat template")]
     MissingChatTemplate,
+    /// The selected chat protocol cannot honor the requested reasoning policy.
+    #[error("unsupported reasoning: {reason}")]
+    UnsupportedReasoning {
+        /// Explanation of the unavailable parsing or template control.
+        reason: String,
+    },
     /// A native tool definition or its generation grammar is invalid.
     #[error("native tool constraint error: {0}")]
     ToolConstraint(String),
