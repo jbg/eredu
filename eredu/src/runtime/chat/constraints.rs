@@ -1834,10 +1834,18 @@ mod tests {
         parser.take_events();
         let mut fork = parser.fork().unwrap();
         assert!(fork.push("1]}}]}").unwrap_err().contains("do not match"));
-        assert!(!fork.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(!fork
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         parser.push("2]}}]}").unwrap();
         parser.finish(FinishReason::GrammarComplete).unwrap();
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser.events().contains(&SemanticEvent::ToolCallCompleted {
+            index: 0,
+            id: "call_0".into(),
+            name: "check".into(),
+            arguments: json!({"values":[1,2]}).as_object().unwrap().clone(),
+        }));
     }
 
     #[test]

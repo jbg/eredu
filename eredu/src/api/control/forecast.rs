@@ -41,11 +41,13 @@ impl<B: ContinuationForecastBackend + TextSnapshotBackend> ControlledGenerationS
                 )
             })
             // Existing semantic history is counted above. Each future retained
-            // event is covered by its charged record, using only unspent trace.
+            // event is bounded by unspent trace, including parsed JSON expansion
+            // when tool calls are enabled.
             .and_then(|n| {
                 n.checked_add(super::retention::semantic_history_growth_bound(
                     self.delivery.budget.limits().total_bytes,
                     self.delivery.budget.emitted_bytes(),
+                    self.pipeline.tool_calls_enabled(),
                 ))
             });
         let retained_snapshots = self

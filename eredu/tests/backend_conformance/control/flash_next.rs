@@ -118,17 +118,17 @@ fn normalized_request(thinking: bool, original: &str) -> (ChatTemplateRequest, S
 }
 
 fn arguments(events: &[SemanticEvent]) -> Value {
-    let fragments: String = events
+    events
         .iter()
-        .filter_map(|event| match event {
-            SemanticEvent::ToolArgumentsDelta {
+        .find_map(|event| match event {
+            SemanticEvent::ToolCallCompleted {
                 index: 0,
-                json_fragment,
-            } => Some(json_fragment.as_str()),
+                arguments,
+                ..
+            } => Some(Value::Object(arguments.clone())),
             _ => None,
         })
-        .collect();
-    serde_json::from_str(&fragments).unwrap()
+        .expect("completed call")
 }
 
 #[test]
@@ -179,16 +179,16 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         assert_eq!(
             ordinary_events
                 .iter()
-                .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                 .count(),
             1
         );
         let call_id = ordinary_events
             .iter()
             .find_map(|event| match event {
-                SemanticEvent::ToolCallStart { index: 0, id, name } if name == original => {
-                    Some(id.clone())
-                }
+                SemanticEvent::ToolCallCompleted {
+                    index: 0, id, name, ..
+                } if name == original => Some(id.clone()),
                 _ => None,
             })
             .unwrap();
@@ -213,7 +213,7 @@ fn flash_next_tagged_tools_pause_partial_arguments_and_replay_tool_results() {
         assert_eq!(session.token_ids(), &ids[..partial_steps]);
         assert!(!semantic(&records)
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         // Shared production grammars currently have no storage estimate. Keep
         // this existing typed capability gap visible, without blocking ordinary
         // controlled advancement or inventing a family-specific bypass.
@@ -351,6 +351,7 @@ fn tool_names_restore_through_ordinary_and_controlled_speculative_visitors() {
         let mut model = model(Some(7), &pieces);
         let chat = model.prepare_chat(request.clone()).unwrap();
         let mut events = Vec::new();
+        let completed = std::cell::Cell::new(0usize);
         let request = eredu::api::PreparedChatSpeculativeGenerationRequest {
             input: PreparedChatInput::rendered_prompt(&chat),
             drafting: SpeculativeDraft::Embedded,
@@ -364,12 +365,23 @@ fn tool_names_restore_through_ordinary_and_controlled_speculative_visitors() {
             caller_stop_sequences: &[],
             cancellation: Default::default(),
             control_handle: None,
-            on_event: |event| events.push(event),
+            on_event: |event| {
+                if matches!(event, SemanticEvent::ToolCallCompleted { .. }) {
+                    completed.set(completed.get() + 1);
+                }
+                events.push(event);
+            },
         };
         let tokens = if controlled {
             model
                 .with_controlled_chat_speculative(request, Default::default(), |session| {
-                    while session.step()?.is_some() {}
+                    while session.step()?.is_some() {
+                        assert_eq!(
+                            completed.get(),
+                            usize::from(session.token_ids().contains(&11)),
+                            "completion requires the committed closing token"
+                        );
+                    }
                     Ok(())
                 })
                 .unwrap()
@@ -382,8 +394,9 @@ fn tool_names_restore_through_ordinary_and_controlled_speculative_visitors() {
                 .token_ids
         };
         assert_eq!(tokens, vec![7, 11]);
+        assert_eq!(completed.get(), 1);
         assert!(events.iter().any(|event| matches!(event,
-            SemanticEvent::ToolCallStart { name, .. } if name == original)));
+            SemanticEvent::ToolCallCompleted { name, .. } if name == original)));
         assert_eq!(arguments(&events), json!({"query":"paris", "limit":2}));
         if let Some(expected) = &expected {
             assert_eq!(&events, expected);

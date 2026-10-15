@@ -127,7 +127,7 @@ impl VoiceChatToolTicket {
 pub struct VoiceChatToolBatch {
     /// Ticket required when submitting the corresponding externally executed results.
     pub ticket: VoiceChatToolTicket,
-    /// Existing semantic start/argument/end events; no partial or malformed calls.
+    /// Semantic start/argument/completion events; no partial or malformed calls.
     pub events: Vec<SemanticEvent>,
 }
 
@@ -141,7 +141,8 @@ impl VoiceChatToolBatch {
         let ticket = self.ticket.with_request(request);
         let copy_bytes = self.events.iter().try_fold(0_u64, |total, event| {
             let bytes = match event {
-                SemanticEvent::ToolCallStart { index, .. } => {
+                SemanticEvent::ToolCallStart { index, .. }
+                | SemanticEvent::ToolCallCompleted { index, .. } => {
                     tool_call_id_len(ticket, *index) as u64
                 }
                 _ => 0,
@@ -166,7 +167,8 @@ impl VoiceChatToolBatch {
         let ticket = self.ticket.with_request(request);
         self.events.iter().try_fold(0_u64, |total, event| {
             let growth = match event {
-                SemanticEvent::ToolCallStart { id, index, .. } => {
+                SemanticEvent::ToolCallStart { id, index, .. }
+                | SemanticEvent::ToolCallCompleted { id, index, .. } => {
                     tool_call_id_len(ticket, *index).saturating_sub(id.len()) as u64
                 }
                 _ => 0,
@@ -189,7 +191,9 @@ impl VoiceChatToolBatch {
         let source = self.ticket;
         let ticket = self.ticket.with_request(request);
         for event in &mut self.events {
-            if let SemanticEvent::ToolCallStart { index, id, .. } = event {
+            if let SemanticEvent::ToolCallStart { index, id, .. }
+            | SemanticEvent::ToolCallCompleted { index, id, .. } = event
+            {
                 let mut replacement = String::new();
                 replacement
                     .try_reserve_exact(tool_call_id_len(ticket, *index))
@@ -702,6 +706,11 @@ fn parse_calls(
     for event in &mut events {
         match event {
             SemanticEvent::ToolCallStart {
+                index: call_index,
+                id,
+                ..
+            }
+            | SemanticEvent::ToolCallCompleted {
                 index: call_index,
                 id,
                 ..

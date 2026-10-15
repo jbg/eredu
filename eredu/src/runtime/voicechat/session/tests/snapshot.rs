@@ -274,7 +274,7 @@ fn snapshot_retains_complete_tool_calls_but_never_replays_delivered_calls() {
     else {
         panic!("complete call")
     };
-    assert!(batch.events.iter().any(|event| matches!(event, eredu_core::generation::SemanticEvent::ToolCallStart { name, .. } if name == "weather")));
+    assert!(batch.events.iter().any(|event| matches!(event, eredu_core::generation::SemanticEvent::ToolCallCompleted { name, arguments, .. } if name == "weather" && serde_json::Value::Object(arguments.clone()) == serde_json::json!({"city":"Paris"}))));
     let copies = session.snapshot_usage().unwrap().cumulative_copy_bytes;
     assert!(matches!(
         session.restore(&saved),

@@ -10,6 +10,16 @@ understate delivery/history storage. The existing active/automatic llguidance
 grammar snapshot rejection still applies when a complete mutable grammar storage
 estimate is unavailable; normalization does not bypass that capability check.
 
+Completed tool calls use the same `ToolCallCompleted` event in uninterrupted,
+controlled and speculative generation. The event carries the call index, ID,
+original application name and parsed, schema-validated object arguments.
+Provisional start and argument deltas do not authorize tool execution. Speculative
+proposals publish no completion until commitment; cancellation discards unfinished
+calls. Snapshots preserve partial arguments and completed payloads, and delivery
+checkpoints retain their existing replay rules. Storage estimates include parsed
+JSON containers; tool-enabled history bounds allow for their expansion relative
+to encoded trace bytes. Text-only history keeps its encoded-byte bound.
+
 Typed chat preparation uses the ordinary shared drivers. A counted
 `PreparedChatRequest` enters capture/control admission through
 `prepare_observed_chat_input`, or `prepare_intervened_chat_input` for prospective
@@ -52,7 +62,7 @@ current controller decision and commit one authoritative token. `Progress` recor
 carry phase, block, iteration and independent execution coordinates; token records
 also declare the meaning of their scores. Causal conditional scores, refinement
 position scores and constrained finalization scores remain distinct. Generation
-records and execution-control metadata use schema version 3.
+records use schema version 4; execution-control metadata uses version 3.
 
 Snapshots preserve the logical physical-step and committed-token coordinates,
 alongside backend phase state, sampler, pending input and constraint state.

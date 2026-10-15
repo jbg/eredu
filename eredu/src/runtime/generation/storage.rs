@@ -3,6 +3,11 @@
 //! shared immutable configuration. This is not a physical memory ceiling.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Each JSON byte can introduce at most one value or object entry. Include
+/// entry descriptors and decoded string bytes when bounding logical parsed data.
+pub(crate) const JSON_STORAGE_PER_BYTE: u64 =
+    std::mem::size_of::<(String, serde_json::Value)>() as u64 + 1;
+
 pub(crate) trait SnapshotStorage {
     fn heap_bytes(&self) -> Option<u64>;
     fn snapshot_bytes(&self) -> Option<u64> {

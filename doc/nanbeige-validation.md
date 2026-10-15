@@ -30,7 +30,7 @@ cargo test -p eredu-architectures --test reference_numeric nanbeige_official_ggu
 Tagged-parameter activation occurs at `<tool_call>`. Grammar and parsing accept
 XML whitespace between structural tags while raw parameter values preserve their
 whitespace, including newlines and carriage returns. EOS is masked until an active
-call is complete. Interrupted calls emit no `ToolCallEnd` and cannot execute. See
+call is complete. Interrupted calls emit no `ToolCallCompleted` and cannot execute. See
 [the wire-format contract](tool-calling.md) for framing and replay rules.
 
 Grammar vocabulary honors each tokenizer entry's `special` flag. Nanbeige's
@@ -93,7 +93,7 @@ dispatches schema-validated calls, inserts the actual result into conversation
 history, and requires an answer containing only a receipt/secret word absent
 from the original prompt. It covers both `lookup(value=7)` and multiline
 `todo__todo_write(content=...)`, thinking on/off, and uninterrupted/controlled
-generation. Execution requires `ToolCallEnd`. The existing native LFM2 basic
+generation. Execution requires `ToolCallCompleted`. The existing native LFM2 basic
 and optional Python keyword argument tests are also exercised because vocabulary
 construction is shared.
 

@@ -113,7 +113,28 @@ fn complete_events(batch: &VoiceChatToolBatch) -> Vec<(usize, String, String, St
                 assert_eq!(*index, current.0);
                 current.3.push_str(json_fragment);
             }
-            SemanticEvent::ToolCallEnd => calls.push(open.take().unwrap()),
+            SemanticEvent::ToolCallCompleted {
+                index,
+                id,
+                name,
+                arguments,
+            } => {
+                let provisional = open.take().unwrap();
+                assert_eq!(
+                    (*index, id, name),
+                    (provisional.0, &provisional.1, &provisional.2)
+                );
+                assert_eq!(
+                    serde_json::Value::Object(arguments.clone()),
+                    serde_json::from_str::<serde_json::Value>(&provisional.3).unwrap()
+                );
+                calls.push((
+                    *index,
+                    id.clone(),
+                    name.clone(),
+                    serde_json::to_string(arguments).unwrap(),
+                ));
+            }
             other => panic!("unexpected tool event {other:?}"),
         }
     }

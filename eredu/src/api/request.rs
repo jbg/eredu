@@ -539,7 +539,7 @@ pub(super) fn prepared_chat_control_runtime(
         .expect("supported prepared chats carry a generation runtime plan");
     let controller =
         ConstraintController::from_generation_plan(generation_plan)?.with_validity(validity);
-    let parser = semantic_plan
+    let parser = generation_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(PreparedChatSetupError::Semantic)?;
     let structural_tokens = semantic_plan

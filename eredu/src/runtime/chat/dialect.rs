@@ -3714,10 +3714,16 @@ mod tests {
         let mut parser = plan.create_parser().unwrap();
         parser.push(output).unwrap();
         parser.finish(FinishReason::GrammarComplete).unwrap();
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         let mut parser = plan.create_parser().unwrap();
         assert!(parser.push(&output.replace("[1,2]", "[1,1]")).is_err());
-        assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(!parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 
     #[test]
@@ -3774,7 +3780,10 @@ mod tests {
                         parser
                             .events()
                             .iter()
-                            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                            .filter(|event| matches!(
+                                event,
+                                SemanticEvent::ToolCallCompleted { .. }
+                            ))
                             .count(),
                         1
                     );
@@ -3789,7 +3798,10 @@ mod tests {
                         "{:?}",
                         &valid[..end]
                     );
-                    assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+                    assert!(!parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
                 }
                 for invalid in [
                     valid.replace("function=write", "function=unknown"),
@@ -3803,7 +3815,10 @@ mod tests {
                 ] {
                     let mut parser = plan.create_parser().unwrap();
                     assert!(parser.push(&invalid).is_err());
-                    assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+                    assert!(!parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
                 }
             }
         }
@@ -3842,7 +3857,10 @@ mod tests {
                 let mut parser = plan.create_parser().unwrap();
                 parser.push(&call).unwrap();
                 parser.finish(FinishReason::GrammarComplete).unwrap();
-                assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+                assert!(parser
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             }
         }
     }
@@ -3876,11 +3894,17 @@ mod tests {
                 let mut parser = plan.create_parser().unwrap();
                 push_at_byte_split(&mut parser, &valid, split);
                 parser.finish(FinishReason::GrammarComplete).unwrap();
-                assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+                assert!(parser
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             }
             let mut parser = plan.create_parser().unwrap();
             assert!(parser.push(&valid.replace("\n2\n", "\n1\n")).is_err());
-            assert!(!parser.events().contains(&SemanticEvent::ToolCallEnd));
+            assert!(!parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         }
     }
 
@@ -3958,7 +3982,7 @@ mod tests {
                 parser
                     .events()
                     .iter()
-                    .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                    .filter(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. }))
                     .count(),
                 2,
                 "split {split}"
@@ -4075,7 +4099,11 @@ mod tests {
                         )
                         .into(),
                     },
-                    SemanticEvent::ToolCallEnd,
+
+                    SemanticEvent::ToolCallCompleted {
+                        index: 0, id: "call_0".into(), name: "lookup-place".into(),
+                        arguments: serde_json::json!({"count":2,"enabled":true,"place":"Bogotá","tags":["東京", "quote: \" and slash \\\\"]}).as_object().unwrap().clone(),
+                    },
                     SemanticEvent::ToolCallStart {
                         index: 1,
                         id: "call_1".into(),
@@ -4085,7 +4113,11 @@ mod tests {
                         index: 1,
                         json_fragment: r#"{"count":1,"enabled":false,"place":"東京"}"#.into(),
                     },
-                    SemanticEvent::ToolCallEnd,
+
+                    SemanticEvent::ToolCallCompleted {
+                        index: 1, id: "call_1".into(), name: "lookup-place".into(),
+                        arguments: serde_json::json!({"count":1,"enabled":false,"place":"東京"}).as_object().unwrap().clone(),
+                    },
                     SemanticEvent::Finished {
                         reason: FinishReason::StopSequence,
                     },
@@ -4130,7 +4162,7 @@ mod tests {
                     !parser
                         .events()
                         .iter()
-                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)),
+                        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })),
                     "incomplete input {input:?}, split {split}"
                 );
             }
@@ -4241,7 +4273,10 @@ mod tests {
 
         parser.push(r#"7}}</call></tools>"#, &mut sink).unwrap();
         assert_eq!(arguments(sink.events()), [r#"{"value":7}"#]);
-        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 
     #[test]
@@ -4274,7 +4309,10 @@ mod tests {
 
         parser.push("7}}]", &mut sink).unwrap();
         assert_eq!(arguments(sink.events()), [r#"{"value":7}"#]);
-        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 
     #[test]
@@ -4312,7 +4350,10 @@ mod tests {
             arguments(sink.events()),
             [r#"{"count":2,"place":"Bogotá"}"#]
         );
-        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(sink
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 
     #[test]
@@ -4469,7 +4510,12 @@ mod tests {
                     index: 0,
                     json_fragment: "1}".into(),
                 },
-                SemanticEvent::ToolCallEnd,
+                SemanticEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "first_tool".into(),
+                    arguments: serde_json::json!({"value":1}).as_object().unwrap().clone(),
+                },
                 SemanticEvent::Finished {
                     reason: FinishReason::StopSequence,
                 },
@@ -4506,7 +4552,7 @@ mod tests {
         assert!(!incomplete
             .events()
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
 
         let mut malformed = required.create_parser().unwrap();
         assert!(malformed
@@ -4795,7 +4841,11 @@ mod tests {
                         index: 0,
                         json_fragment: r#"{"places":["Bogotá","東京"],"options":{"mode":"escaped","note":"quote: \" slash: \\","flags":[true,false]}}"#.into(),
                     },
-                    SemanticEvent::ToolCallEnd,
+
+                    SemanticEvent::ToolCallCompleted {
+                        index: 0, id: "abc123456".into(), name: "lookup".into(),
+                        arguments: serde_json::json!({"places":["Bogotá","東京"],"options":{"mode":"escaped","note":"quote: \" slash: \\","flags":[true,false]}}).as_object().unwrap().clone(),
+                    },
                     SemanticEvent::ToolCallStart {
                         index: 1,
                         id: "xyz987654".into(),
@@ -4805,7 +4855,11 @@ mod tests {
                         index: 1,
                         json_fragment: r#"{"places":["Zürich"],"options":{"mode":"literal","note":"🦀","flags":[]}}"#.into(),
                     },
-                    SemanticEvent::ToolCallEnd,
+
+                    SemanticEvent::ToolCallCompleted {
+                        index: 1, id: "xyz987654".into(), name: "lookup".into(),
+                        arguments: serde_json::json!({"places":["Zürich"],"options":{"mode":"literal","note":"🦀","flags":[]}}).as_object().unwrap().clone(),
+                    },
                     SemanticEvent::Finished {
                         reason: FinishReason::StopSequence,
                     },
@@ -4833,7 +4887,7 @@ mod tests {
                     !parser
                         .events()
                         .iter()
-                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)),
+                        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })),
                     "{incomplete:?}, split {split}"
                 );
             }

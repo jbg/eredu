@@ -105,12 +105,18 @@ fn qwen4_exp_released_tokenizer_accepts_atomic_tagged_tools_and_rejects_bad_argu
             serde_json::from_str::<serde_json::Value>(&arguments[0]).unwrap(),
             json!({"value": 12345})
         );
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
     assert_eq!(parser.events(), fork.events());
     assert_eq!(
         incomplete.finish(FinishReason::MaxTokens).unwrap_err(),
         "incomplete tagged-parameter tool call"
     );
-    assert!(!incomplete.events().contains(&SemanticEvent::ToolCallEnd));
+    assert!(!incomplete
+        .events()
+        .iter()
+        .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
 }

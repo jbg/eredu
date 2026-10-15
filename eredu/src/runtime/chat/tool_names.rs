@@ -131,7 +131,8 @@ impl ToolNameMap {
     }
 
     /// One input byte can finish at most one new tool envelope, plus a buffered
-    /// envelope at the saved boundary. Restored names can exceed wire input size.
+    /// envelope at the saved boundary. Both start and completion restore names,
+    /// which can exceed wire input size.
     pub(crate) fn event_growth_bytes(&self, input_bytes: u64) -> Option<u64> {
         let expansion = self
             .0
@@ -141,7 +142,8 @@ impl ToolNameMap {
             .unwrap_or(0);
         input_bytes
             .checked_add(1)?
-            .checked_mul(u64::try_from(expansion).ok()?)
+            .checked_mul(u64::try_from(expansion).ok()?)?
+            .checked_mul(2)
     }
 }
 
@@ -325,6 +327,9 @@ mod tests {
             .unwrap();
         let complete: Vec<_> = start.into_iter().chain(parser.take_events()).collect();
         assert_eq!(restored_before_name.events(), complete);
+        assert!(complete.iter().any(|event| matches!(event,
+            SemanticEvent::ToolCallCompleted { index: 0, name, arguments, .. }
+                if name == &original && serde_json::Value::Object(arguments.clone()) == json!({"value":"ok"}))));
         // The active internal name remains the wire name, so a cloned parser
         // still rejects arguments against the registered schema.
         assert!(restored_active.push("3}}\n</tool_call>").is_err());

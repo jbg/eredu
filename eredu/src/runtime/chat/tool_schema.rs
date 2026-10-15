@@ -17,6 +17,10 @@ pub(crate) fn compile(schema: &Value) -> Result<jsonschema::Validator, String> {
 pub(crate) struct ToolSchemas(Arc<HashMap<String, jsonschema::Validator>>);
 
 impl ToolSchemas {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub(crate) fn new(tools: &[Value]) -> Result<Self, String> {
         let schemas = parse_tools(tools)?
             .into_iter()
@@ -25,19 +29,33 @@ impl ToolSchemas {
         Ok(Self(Arc::new(schemas)))
     }
 
-    pub(crate) fn validate(&self, name: &str, arguments: &str) -> Result<(), String> {
+    pub(crate) fn validate(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> Result<Map<String, Value>, String> {
         let validator = self
             .0
             .get(name)
             .ok_or_else(|| format!("unknown tool function {name:?}"))?;
-        let arguments: Value = serde_json::from_str(arguments)
-            .map_err(|error| format!("tool {name:?} arguments are not JSON: {error}"))?;
-        if !arguments.is_object() {
-            return Err(format!("tool {name:?} arguments must be an object"));
-        }
+        let arguments = Value::Object(parse_arguments(name, arguments)?);
         validator
             .validate(&arguments)
-            .map_err(|error| format!("tool {name:?} arguments do not match its schema: {error}"))
+            .map_err(|error| format!("tool {name:?} arguments do not match its schema: {error}"))?;
+        let Value::Object(arguments) = arguments else {
+            unreachable!()
+        };
+        Ok(arguments)
+    }
+}
+
+/// Parses a completed call even when no application schemas are installed.
+pub(crate) fn parse_arguments(name: &str, arguments: &str) -> Result<Map<String, Value>, String> {
+    let arguments: Value = serde_json::from_str(arguments)
+        .map_err(|error| format!("tool {name:?} arguments are not JSON: {error}"))?;
+    match arguments {
+        Value::Object(arguments) => Ok(arguments),
+        _ => Err(format!("tool {name:?} arguments must be an object")),
     }
 }
 

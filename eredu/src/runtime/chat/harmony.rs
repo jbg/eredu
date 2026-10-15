@@ -888,7 +888,9 @@ mod tests {
                 id: "call_0".into(),
                 name: "get_weather".into(),
             }));
-            assert!(events.contains(&SemanticEvent::ToolCallEnd));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
             assert_eq!(
                 events.last(),
                 Some(&SemanticEvent::Finished {
@@ -962,7 +964,10 @@ mod tests {
             joined_arguments(parser.events()),
             r#"{"location": "San Francisco"}"#
         );
-        assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
+        assert!(parser
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
         assert!(PRIOR_CALL_RESULT_FIXTURE.trim_end().ends_with(concat!(
             "<|start|>functions.lookup_weather<|message|>",
             "{\"temperature\": 20, \"description\": \"sunny\"}<|end|>",
@@ -1021,7 +1026,7 @@ mod tests {
         assert!(!stopped_incomplete
             .events()
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
 
         let mut max_tokens = plan.create_parser().unwrap();
         max_tokens
@@ -1033,6 +1038,6 @@ mod tests {
         assert!(!max_tokens
             .events()
             .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            .any(|event| matches!(event, SemanticEvent::ToolCallCompleted { .. })));
     }
 }

@@ -346,8 +346,12 @@ Application JSON Schemas are retained unchanged for rendering and checked with
 the portable `jsonschema` validator without remote or filesystem retrieval.
 Dialect grammars enforce the constraints they can represent and retain protocol
 syntax, function names and call limits for other schemas. The shared semantic
-event sink validates the complete argument object before emitting `ToolCallEnd`;
-immutable validators are shared across forks while partial arguments remain
+event sink parses the complete argument object once and validates it before
+emitting `ToolCallCompleted` with the call index, ID, original application name
+and parsed arguments. Incremental start and argument events remain provisional.
+Snapshot sizing includes the parsed object; tool-enabled continuation and history
+bounds include JSON container expansion. Immutable validators are shared across
+forks while partial arguments remain
 private to each parser. Backends continue to consume neutral token filters and
 do not interpret schemas or decide which tool calls applications execute.
 
