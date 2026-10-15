@@ -26,34 +26,28 @@ intervention dtype (`f32`, `f16` or `bf16`). No downloads are performed.
 Prepare a normal `ChatTemplateRequest`, then call `prepare_observed_chat` with a
 bounded `CapturePlan`, or `prepare_intervened_chat` with a validated intervention
 request. `CapturePlan::none()` selects ordinary delivery. Pass the result to
-`start_controlled_chat(prepared, stops, control, callback)`.
-
-For an unrecognized template, explicitly select
-`start_controlled_text(prepared, stops, control, callback)`. `LoadedModel<B>`
-exposes it with the same arguments and session return type as its chat entry
-point. `start_controlled_chat` remains strict.
+`start_controlled(prepared, stops, control, callback, output_mode)`.
+`OutputMode::Semantic` requires recognized support; `OutputMode::Text` explicitly
+selects literal decoding for unrecognized templates.
 
 ```rust
-// model: LoadedModel<B>
 let chat = model.prepare_chat(request)?;
-let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
-// A UI can show chat.text_generation_support().unsupported_reason() before starting.
+let output_mode = if matches!(chat.semantic_support(), SemanticSupport::Supported) {
+    eredu::api::OutputMode::Semantic
+} else {
+    eredu::api::OutputMode::Text
+};
 let prepared = match intervention {
     Some(plan) => model.prepare_intervened_chat(&chat, settings, capture, plan, trace_limits)?,
     None => model.prepare_observed_chat(&chat, settings, capture, trace_limits)?,
 };
-let mut session = if semantic {
-    model.start_controlled_chat(prepared, &stops, control, &mut emit)?
-} else {
-    model.start_controlled_text(prepared, &stops, control, &mut emit)?
-};
-session.step(&mut emit)?; // Existing session handling stays unchanged.
+let mut session = model.start_controlled(prepared, &stops, control, &mut emit, output_mode)?;
+session.step(&mut emit)?;
 ```
 
-Import `SemanticSupport` from `eredu::runtime::chat`. The
-[`LoadedModel::start_controlled_text` rustdoc](../eredu/src/api/control.rs) contains
-a complete generic example. Capture, intervention, trace and control types retain
-their existing public paths.
+`PlannedModel::with_controlled` accepts a common `GenerationRequest` directly
+and retains optional drafting. Its controller exposes common advancement plus
+access to the typed ordinary or speculative inspector.
 
 Text mode consumes the prepared prompt IDs exactly, including the rendered
 generation prefix. It retains checkpoint sampling defaults, overrides, seed and
@@ -224,12 +218,12 @@ counts the first committed token even when decoding buffers it; `None` means no
 commitment. Restoration does not reset it.
 
 Keep speculative resources on the same owning worker, using
-`model.with_controlled_chat_speculative(request, options, |session| { ... })`
-(or `with_controlled_text_speculative` for literal text). Inside that closure,
-wait for worker commands and call `session.step()` once per requested scheduler
-action. Iterate until `None` for uninterrupted completion; returning early cancels
-and settles the native work. The existing request's semantic callback still emits
-only target-committed conversation events.
+`owner.with_controlled(request, options, |control| { ... })`. The request selects
+semantic or literal text through `output_mode`. Inside that closure, borrow
+`control.speculative()` for proposal-aware inspection, wait for worker commands
+and call `session.step()` once per requested scheduler action. Iterate until
+`None` for completion; returning early cancels and settles native work. The
+request callback emits only target-committed conversation events.
 
 Render `step.drafted` as tentative tokens. `step.verification.dispositions` gives
 accepted, rejected and discarded results for the original proposal block. Its
@@ -241,7 +235,7 @@ scheduler action, and target commitment is atomic per block.
 
 Use `prepare_speculative_capture(settings, plan)` for one-row `model.logits`
 admission. Pass explicitly bounded `trace_limits`, that optional capture admission,
-and snapshot limits in `ControlledSpeculativeOptions`. `snapshot_support()` gives
+and snapshot limits in `GenerationControlOptions`. `snapshot_support()` gives
 a reason when unavailable. Retain opaque handles in the worker, restore only at a
 canonical boundary, then reconcile the UI with `session.token_ids()` and its new
 `epoch`. Keep prior timeline records distinguished by epoch. Release unneeded
@@ -253,7 +247,7 @@ V3 and V4 sequential/DSpark embedded state across resident/host/disk weights. V4
 acceptance covers exact sampler captures, both pooling completion boundaries,
 repeated restore and isolated siblings; internal V4 component hooks and distributed
 snapshot support remain separate coverage gaps. For internal V3 components,
-use `prepare_speculative_activations` and `ControlledSpeculativeOptions.activations`
+use `prepare_speculative_activations` and `GenerationControlOptions.speculative_activations`
 from run creation; delivered records retain phase, depth and physical sequence
 geometry. `readmit_activation_interventions` changes prospective edits at a drained
 canonical boundary, and restore reinstates the saved plan without refunding budgets.
@@ -293,7 +287,7 @@ session.release_branch(&child)?;
 For tensor experiments, prepare one-row capture admission and separate admitted
 plans for `SpeculativeCaptureRole::Target` and `Draft` with
 `model.prepare_speculative_intervention(&capture, role, plan)`. Pass the capture
-admission in `ControlledSpeculativeOptions`, then install those plans using
+admission in `GenerationControlOptions`, then install those plans using
 `session.intervene(vec![target_plan, draft_plan])` before prefill or at a canonical
 boundary. Omitted roles have no edits. Ordinary `InterventionPlan` schedules and
 slices use absolute generated positions and a `[1, 1, vocabulary]` prediction row.

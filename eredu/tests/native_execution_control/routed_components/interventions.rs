@@ -242,18 +242,24 @@ fn verify(device: LocalDevice) {
                 .unwrap();
             let mut steps = vec![];
             model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if let ObservedGenerationEvent::Token {
-                        forced,
-                        captures: Some(step),
-                        ..
-                    } = record.event
-                    {
-                        assert!(!forced);
-                        steps.push(step);
-                    }
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        if let ObservedGenerationEvent::Token {
+                            forced,
+                            captures: Some(step),
+                            ..
+                        } = record.event
+                        {
+                            assert!(!forced);
+                            steps.push(step);
+                        }
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             assert_eq!(steps.len(), 3);
             for step in &steps {
@@ -375,7 +381,13 @@ fn verify(device: LocalDevice) {
                 ControlFlow::Continue(())
             };
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), &mut emit)
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    &mut emit,
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             run.enable_snapshots(SnapshotLimits {
                 max_snapshots: 2,

@@ -215,10 +215,16 @@ fn component_masks_with_device(
         .unwrap();
     let mut events = vec![];
     model
-        .generate_observed_text(baseline, &[], Default::default(), |event| {
-            events.push(event);
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            baseline,
+            &[],
+            Default::default(),
+            |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let baseline = tensors(&events);
     for term in &other_writes {
@@ -242,10 +248,16 @@ fn component_masks_with_device(
         .unwrap();
     events.clear();
     model
-        .generate_observed_text(trial, &[], Default::default(), |event| {
-            events.push(event);
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            trial,
+            &[],
+            Default::default(),
+            |event| {
+                events.push(event);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let ordinary = tensors(&events);
     for values in [&baseline, &ordinary] {
@@ -291,7 +303,13 @@ fn component_masks_with_device(
     let mut records = vec![];
     {
         let mut run = model
-            .start_controlled_text(trial, &[], Default::default(), collect(&mut records))
+            .start_controlled(
+                trial,
+                &[],
+                Default::default(),
+                collect(&mut records),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 2,

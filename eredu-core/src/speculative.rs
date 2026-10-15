@@ -49,6 +49,18 @@ pub enum SpeculativeDraft<'a, D> {
     Embedded,
 }
 
+impl<D> SpeculativeDraft<'_, D> {
+    /// Lends the same source without transferring its assistant borrow.
+    pub fn reborrow(&mut self) -> SpeculativeDraft<'_, D> {
+        match self {
+            Self::Target => SpeculativeDraft::Target,
+            Self::SharedBackbone => SpeculativeDraft::SharedBackbone,
+            Self::Embedded => SpeculativeDraft::Embedded,
+            Self::External(draft) => SpeculativeDraft::External(draft),
+        }
+    }
+}
+
 /// Shared terminal generation output with speculative execution statistics.
 pub type SpeculativeGenerationOutput = crate::generation::GenerationOutput<SpeculativeStats>;
 
@@ -4170,6 +4182,7 @@ where
     P: SpeculativePublisher<C>,
 {
     schedule: SpeculativeSchedule,
+    speculation_limits: Option<crate::decoding::SpeculationLimits>,
     requests: Vec<SpeculativeRequest<'cache, E, S, C, P>>,
     stats: SpeculativeSchedulerStats,
 }
@@ -4198,12 +4211,20 @@ where
     ) -> Result<Self, GenerationError> {
         Ok(Self {
             schedule: SpeculativeSchedule::new(options)?,
+            speculation_limits: None,
             requests: Vec::new(),
             stats: SpeculativeSchedulerStats {
                 execution_topology: topology,
                 ..SpeculativeSchedulerStats::default()
             },
         })
+    }
+
+    /// Retains the selected source policy before registering any lanes.
+    pub fn with_speculation_limits(mut self, limits: Option<crate::decoding::SpeculationLimits>) -> Self {
+        assert!(self.requests.is_empty(), "speculation limits are set before submitting requests");
+        self.speculation_limits = limits;
+        self
     }
 
     pub(crate) fn fork_completed_source(&self, id: SpeculativeRequestId, cache: E::Cache, state: E::TargetState,
@@ -4217,6 +4238,7 @@ where
         if runtime.sequence.is_finished() || decoding.state().terminal { lifecycle = SpeculativeRequestLifecycle::completed(); }
         Self {
             schedule: SpeculativeSchedule::new(self.options()).expect("retained scheduler options"),
+            speculation_limits: self.speculation_limits,
             stats: self.stats.clone(),
             requests: vec![SpeculativeRequest {
                 control_identity: Arc::new(()), id: SpeculativeRequestId::new(0), cache: GenerationCache::Owned(cache),
@@ -4294,8 +4316,14 @@ where
                     cancellation: completion.cancellation(),
                 });
             }
+            let mut capabilities = executor.decoding_capabilities();
+            capabilities.speculation_limits = self.speculation_limits;
+            if let Some(limits) = self.speculation_limits {
+                capabilities.max_draft_tokens = Some(capabilities.max_draft_tokens.map_or(
+                    limits.max_draft_tokens, |native| native.min(limits.max_draft_tokens)));
+            }
             decoding = Some(crate::decoding::DecodingRegistration::new(crate::decoding::DecodingControl::new(
-                executor.decoding_capabilities(), config.decoding_mode,
+                capabilities, config.decoding_mode,
                 runtime.sampler().control_requires_positive_temperature() == Some(true),
             ).map_err(|error| SpeculativeDriverError::Generation(GenerationError::DecodingMode(error)))?));
             if let Some(handle) = &runtime.control_handle {

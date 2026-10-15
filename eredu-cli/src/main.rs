@@ -38,11 +38,9 @@ use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Pars
 use eredu::{
     api::{
         benchmark_local_expert_cache, discover_local_hardware, inspect_local_model,
-        local_device_plan, reset_local_allocator_peak, LoadedModel, LocalDevice,
-        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeGenerationRequest,
-        TextDecoder, TextModelError,
+        local_device_plan, reset_local_allocator_peak, GenerationRequest, LoadedModel, LocalDevice,
+        LocalExpertCacheBenchmarkSample, LocalInspectionOptions, PreparedChatGenerationSettings,
+        PreparedChatInput, TextDecoder, TextModelError,
     },
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
@@ -58,8 +56,8 @@ use eredu_core::{
     ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
     HardwareMemorySemantics, HardwareProfile, InspectionSeverity, ModelResourceProfile, Observed,
     PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, SemanticEvent,
-    SessionCapabilities, SpeculativeSchedulerOptions, TextGenerationConfig, TimingTelemetry,
-    WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    SessionCapabilities, TextGenerationConfig, TimingTelemetry, WeightTransformationPlan,
+    EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_runtime::DenseDiskStreamLoadOptions;
 use hf_cache_reader::{resolve_cache_dir, scan_repo, CachedRevision, RepoType};
@@ -2264,7 +2262,9 @@ fn main() -> Result<()> {
         None => LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan),
     }
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
-    let (mut model, mut drafting) = planned.into_parts();
+    let drafting_enabled = planned.drafting().is_enabled();
+    let mut session = planned;
+    let mut model = session.model_mut();
     if let Some(request) = decision_request {
         let load_seconds = load_started.elapsed().as_secs_f64();
         let read_started = Instant::now();
@@ -2397,20 +2397,7 @@ fn main() -> Result<()> {
     if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
-    let scheduler_options = SpeculativeSchedulerOptions {
-        adaptive_lookahead: !args.disable_speculative_adaptive_lookahead,
-        ..SpeculativeSchedulerOptions::default()
-    }.with_lookahead(!args.disable_speculative_lookahead);
-    let decoding_mode = drafting.is_enabled().then(|| eredu_core::decoding::DecodingMode::SelfSpeculation(
-        eredu_core::decoding::SpeculationOptionsRequest {
-            max_draft_tokens: NonZeroUsize::new(args.speculative_draft_tokens)
-                .expect("planned speculative execution validates non-zero draft tokens"),
-            scheduler: scheduler_options,
-            ..Default::default()
-        }.try_into().expect("validated speculation options"),
-    ));
     let settings = PreparedChatGenerationSettings {
-        decoding_mode,
         prefill: std::num::NonZeroUsize::new(args.prefill_chunk_size).map_or(
             eredu::api::PrefillChunkPolicy::Unchunked,
             eredu::api::PrefillChunkPolicy::Bounded,
@@ -2430,20 +2417,6 @@ fn main() -> Result<()> {
         },
         ..Default::default()
     };
-    if memory::requested(&args) {
-        match memory::report_loaded(
-            &args,
-            &model,
-            &prompt_token_ids,
-            settings,
-            drafting.as_speculative_draft().as_ref(),
-        ) {
-            Ok(report) => memory::advise(&args, &report)?,
-            Err(error) => {
-                eprintln!("memory forecast unavailable: {error}; ordinary generation continues")
-            }
-        }
-    }
     if args.expert_cache_benchmark {
         let benchmark = benchmark_local_expert_cache(&mut model, &prompt_token_ids)?;
         print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
@@ -2475,7 +2448,6 @@ fn main() -> Result<()> {
     }
     let mut stderr = stderr.lock();
 
-    let drafting_enabled = drafting.is_enabled();
     let _component_timing_guard = args
         .verbose
         .then(eredu_backend_mlx::SpeculativeComponentTimingGuard::enable);
@@ -2483,79 +2455,53 @@ fn main() -> Result<()> {
     if let Some(prepared) = &prepared_chat {
         let semantic = matches!(prepared.semantic_support(), SemanticSupport::Supported);
         let mut semantic_error = None;
-        if drafting.is_enabled() {
-            let cancellation = GenerationCancellationToken::new();
-            let cancel_on_error = cancellation.clone();
-            let request = PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::rendered_prompt(prepared),
-                drafting: drafting
-                    .as_speculative_draft()
-                    .expect("drafting is enabled"),
-                settings,
-                caller_stop_sequences: &args.stop_sequences,
-                cancellation,
-                on_event: |event| {
-                    if semantic_error.is_none() {
-                        semantic_error = write_semantic_event(
-                            &event,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut streamed_text,
-                            &mut reasoning_stream,
-                            reasoning_output,
-                        )
-                        .err();
-                        if semantic_error.is_some() {
-                            cancel_on_error.cancel();
-                        }
-                    }
-                },
-            };
-            let output = if semantic {
-                model.generate_prepared_chat_speculative(request)
+        let cancellation = GenerationCancellationToken::new();
+        let cancel_on_error = cancellation.clone();
+        let request = GenerationRequest {
+            control_handle: None,
+            input: PreparedChatInput::rendered_prompt(prepared),
+            output_mode: if semantic {
+                eredu::api::OutputMode::Semantic
             } else {
-                model.generate_prepared_text_speculative(request)
-            }?;
-            output_ids = output.token_ids().to_vec();
-            time_to_first_token = output.timing().time_to_first_token();
-            speculative_stats = Some(output.stats().clone());
-            prepared_finish_reason = Some(output.finish_reason());
-        } else {
-            let cancellation = GenerationCancellationToken::new();
-            let cancel_on_error = cancellation.clone();
-            let request = PreparedChatGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::rendered_prompt(prepared),
-                settings,
-                caller_stop_sequences: &args.stop_sequences,
-                cancellation,
-                on_event: |event| {
-                    if semantic_error.is_none() {
-                        semantic_error = write_semantic_event(
-                            &event,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut streamed_text,
-                            &mut reasoning_stream,
-                            reasoning_output,
-                        )
-                        .err();
-                        if semantic_error.is_some() {
-                            cancel_on_error.cancel();
-                        }
+                eredu::api::OutputMode::Text
+            },
+            settings,
+            caller_stop_sequences: &args.stop_sequences,
+            cancellation,
+            on_event: |event| {
+                if semantic_error.is_none() {
+                    semantic_error = write_semantic_event(
+                        &event,
+                        &mut stdout,
+                        &mut stderr,
+                        &mut streamed_text,
+                        &mut reasoning_stream,
+                        reasoning_output,
+                    )
+                    .err();
+                    if semantic_error.is_some() {
+                        cancel_on_error.cancel();
                     }
-                },
-            };
-            let output = if semantic {
-                model.generate_prepared_chat(request)
-            } else {
-                model.generate_prepared_text(request)
-            }?;
-            time_to_first_token = output.timing().time_to_first_token();
-            output_ids = output.token_ids;
-            prepared_finish_reason = Some(output.finish_reason);
+                }
+            },
+        };
+        if memory::requested(&args) {
+            match session
+                .forecast_generation(&request, &memory::loaded_options(&args))
+                .map_err(anyhow::Error::from)
+                .and_then(|forecast| memory::finish_report(&args, forecast))
+            {
+                Ok(report) => memory::advise(&args, &report)?,
+                Err(error) => {
+                    eprintln!("memory forecast unavailable: {error}; generation continues")
+                }
+            }
         }
+        let output = session.generate(request)?;
+        output_ids = output.token_ids().to_vec();
+        time_to_first_token = output.timing().time_to_first_token();
+        speculative_stats = output.stats().drafting.clone();
+        prepared_finish_reason = Some(output.finish_reason());
         if let Some(error) = semantic_error {
             return Err(error);
         }
@@ -2564,6 +2510,18 @@ fn main() -> Result<()> {
             "speculative generation requires a prepared template prompt; raw prompts use ordinary generation"
         );
     } else {
+        if memory::requested(&args) {
+            match model
+                .forecast_token_ids(&prompt_token_ids, settings, &memory::loaded_options(&args))
+                .map_err(anyhow::Error::from)
+                .and_then(|forecast| memory::finish_report(&args, forecast))
+            {
+                Ok(report) => memory::advise(&args, &report)?,
+                Err(error) => {
+                    eprintln!("memory forecast unavailable: {error}; generation continues")
+                }
+            }
+        }
         let config = TextGenerationConfig::new(resolved_generation)
             .with_seed(args.common.seed.unwrap_or(0))
             .with_prefill_chunk_policy(
@@ -2590,6 +2548,7 @@ fn main() -> Result<()> {
             write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
         }
     }
+    let model = session.model_mut();
     reasoning_stream.close(&mut stderr, reasoning_output)?;
     drop(stderr);
 

@@ -6,7 +6,7 @@ use super::{
     request::{
         prepared_chat_control_runtime, prepared_text_control_runtime, PreparedChatTokenDecoder,
     },
-    ConstraintError, LoadedModel, ObservedGenerationEvent, ObservedGenerationRecord,
+    ConstraintError, LoadedModel, ObservedGenerationEvent, ObservedGenerationRecord, OutputMode,
     PreparedChatError, PreparedObservedGeneration,
 };
 use crate::runtime::{chat::constraints::ConstraintController, generation::streaming::*};
@@ -20,12 +20,6 @@ use std::{cell::RefCell, ops::ControlFlow, time::Instant};
 
 type ControlConstraints = TokenChoiceController<ConstraintController>;
 type ControlConstraintError = TokenChoiceError<ConstraintError>;
-
-#[derive(Clone, Copy, Serialize)]
-enum OutputMode {
-    Semantic,
-    Text,
-}
 
 mod branch;
 mod forecast;
@@ -155,6 +149,7 @@ struct Delivery {
     template: ObservedGenerationRecord,
     budget: TraceBudget,
     control: GenerationControlHandle,
+    cancellation: GenerationCancellationToken,
     sequence: u64,
     epoch: u64,
     prediction: u64,
@@ -220,16 +215,20 @@ impl Delivery {
         emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) {
         let prediction_index = self.prediction;
-        let input_range = token.is_some_and(|(_, score, _)| score == eredu_core::refinement::PredictionScoreKind::CausalConditional).then(|| {
-            if prediction_index == 0 {
-                [0, self.prompt_length]
-            } else {
-                [
-                    self.prompt_length + prediction_index - 1,
-                    self.prompt_length + prediction_index,
-                ]
-            }
-        });
+        let input_range = token
+            .is_some_and(|(_, score, _)| {
+                score == eredu_core::refinement::PredictionScoreKind::CausalConditional
+            })
+            .then(|| {
+                if prediction_index == 0 {
+                    [0, self.prompt_length]
+                } else {
+                    [
+                        self.prompt_length + prediction_index - 1,
+                        self.prompt_length + prediction_index,
+                    ]
+                }
+            });
         match token {
             Some((token_id, score_kind, position)) => {
                 if let Some(event) = self.drafts.clear() {
@@ -408,6 +407,10 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     pub fn finish_reason(&self) -> Option<FinishReason> {
         self.cursor.finish_reason()
     }
+    pub(super) fn cancellation_requested(&self) -> bool {
+        self.delivery.cancellation.is_cancelled()
+    }
+
     /// Cross-thread pause and permanent cancellation requests.
     pub fn control_handle(&self) -> GenerationControlHandle {
         self.delivery.control.clone()
@@ -417,9 +420,16 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// Modes already realized by the retained execution.
     pub fn decoding_capabilities(&self) -> eredu_core::decoding::DecodingCapabilities { self.state.decoding_capabilities() }
     /// Queues one validated mode change for the next settled block or transaction.
-    pub fn request_decoding_mode(&self, mode: eredu_core::decoding::DecodingMode) -> Result<(), ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled()
-            || !matches!(self.status(), GenerationStatus::Prepared | GenerationStatus::Paused) {
+    pub fn request_decoding_mode(
+        &self,
+        mode: eredu_core::decoding::DecodingMode,
+    ) -> Result<(), ControlledGenerationError> {
+        if self.delivery.cancellation.is_cancelled()
+            || !matches!(
+                self.status(),
+                GenerationStatus::Prepared | GenerationStatus::Paused
+            )
+        {
             return Err(eredu_core::decoding::DecodingModeError::Terminal.into());
         }
         self.state.request_decoding_mode(mode)?;
@@ -469,7 +479,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
 
     fn validate_choice_boundary(&mut self) -> Result<(), ControlledGenerationError> {
-        if self.delivery.control.cancellation().is_cancelled() {
+        if self.delivery.cancellation.is_cancelled() {
             return Err(
                 CaptureError::Invalid("generation cancellation was requested".into()).into(),
             );
@@ -535,7 +545,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             Some(error) => Err(error.into()),
             None => Ok(()),
         });
-        let cancelled = self.delivery.control.cancellation().is_cancelled();
+        let cancelled = self.delivery.cancellation.is_cancelled();
         let result = self.driver.runtime().finish_text_preparation_cancellable(
             eredu_core::run_preparation::TextPreparationStage::Delivery,
             local.map(|()| (!cancelled).then_some(())),
@@ -580,14 +590,14 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         &mut self,
         mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
-        let cancelled = self.delivery.control.cancellation().is_cancelled();
+        let cancelled = self.delivery.cancellation.is_cancelled();
         // Validate before touching the cursor, including terminal/error states.
         if cancelled {
             self.lifecycle.cancel()?;
         } else {
             self.lifecycle.begin_prediction()?;
         }
-        let cancellation = self.delivery.control.cancellation().clone();
+        let cancellation = self.delivery.cancellation.clone();
         let committed_before = self.cursor.token_ids().len();
         let result = {
             let delivery = RefCell::new((&mut self.delivery, &mut emit));
@@ -747,8 +757,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             self.status(),
             GenerationStatus::Prepared | GenerationStatus::Paused
         ) {
-            if self.delivery.control.pause_requested()
-                && !self.delivery.control.cancellation().is_cancelled()
+            if self.delivery.control.pause_requested() && !self.delivery.cancellation.is_cancelled()
             {
                 self.pause(&mut emit)?;
                 break;
@@ -869,92 +878,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.runtime.text_preparation_usage()
     }
 
-    /// Starts a controllable ordinary/observed/intervened prepared request. No
-    /// model prediction or RNG draw occurs here. Initial attribution is charged
-    /// and delivered before returning the session. Unsupported execution fails
-    /// before native prompt or sampler construction.
-    /// Requires executable semantic support; never falls back to text.
-    pub fn start_controlled_chat<'a>(
-        &'a mut self,
-        prepared: PreparedObservedGeneration<B>,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_generation(
-            prepared,
-            caller_stop_sequences,
-            control,
-            emit,
-            OutputMode::Semantic,
-        )
-    }
-
-    /// Starts controlled text generation from the exact prepared prompt IDs,
-    /// retaining observed/intervened admission, sampling, EOS and all controls.
-    /// No prediction or RNG draw occurs at startup. Incremental output uses
-    /// `SemanticEvent::TextDelta` and `Finished`, skips special tokens, and honors
-    /// caller stops. It applies tokenizer validity without a semantic grammar,
-    /// tool parsing, reasoning classification or profile-specific stops.
-    ///
-    /// Rejects tool declarations (including `ToolChoice::None`) and required
-    /// tool calls. Explicit thinking requires `allow_unparsed_reasoning` even
-    /// for recognized templates. Inspect `PreparedChat::text_generation_support`
-    /// before preparation; existing `prepare_chat` admission still applies.
-    ///
-    /// ```no_run
-    /// use eredu::api::*;
-    /// use eredu::runtime::chat::{ChatTemplateRequest, SemanticSupport};
-    /// use eredu_core::{TextGenerationBackend, capture::CapturePlan, intervention::InterventionPlan};
-    /// use std::ops::ControlFlow;
-    ///
-    /// fn generate<B: TextGenerationBackend>(
-    ///     model: &mut LoadedModel<B>,
-    ///     request: ChatTemplateRequest,
-    ///     capture: CapturePlan,
-    ///     intervention: Option<InterventionPlan>,
-    /// ) -> Result<(), Box<dyn std::error::Error>> {
-    ///     let chat = model.prepare_chat(request)?;
-    ///     let semantic = matches!(chat.semantic_support(), SemanticSupport::Supported);
-    ///     let trace = TraceLimits { per_record_bytes: 65_536, total_bytes: 1_048_576 };
-    ///     let prepared = match intervention {
-    ///         Some(plan) => model.prepare_intervened_chat(
-    ///             &chat, Default::default(), capture, plan, trace)?,
-    ///         None => model.prepare_observed_chat(
-    ///             &chat, Default::default(), capture, trace)?,
-    ///     };
-    ///     let emit = |record: ControlledGenerationRecord| {
-    ///         println!("{record:?}");
-    ///         ControlFlow::Continue(())
-    ///     };
-    ///     // Text admission is enforced here; a UI can inspect
-    ///     // chat.text_generation_support() beforehand to explain rejection.
-    ///     let mut session = if semantic {
-    ///         model.start_controlled_chat(prepared, &[], Default::default(), emit)?
-    ///     } else {
-    ///         model.start_controlled_text(prepared, &[], Default::default(), emit)?
-    ///     };
-    ///     session.run(emit)?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn start_controlled_text<'a>(
-        &'a mut self,
-        prepared: PreparedObservedGeneration<B>,
-        caller_stop_sequences: &[String],
-        control: GenerationControlHandle,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
-        self.start_controlled_generation(
-            prepared,
-            caller_stop_sequences,
-            control,
-            emit,
-            OutputMode::Text,
-        )
-    }
-
-    fn start_controlled_generation<'a>(
+    /// Starts an admitted controlled request with explicit output interpretation.
+    /// No prediction occurs until advancement; unsupported policies fail admission.
+    pub fn start_controlled<'a>(
         &'a mut self,
         prepared: PreparedObservedGeneration<B>,
         caller_stop_sequences: &[String],
@@ -963,6 +889,10 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
         let control = prepared.control_handle.clone().unwrap_or(control);
+        let cancellation = prepared
+            .cancellation
+            .clone()
+            .unwrap_or_else(|| control.cancellation().clone());
         let preparation_started = Instant::now();
         use eredu_core::run_preparation::TextPreparationStage as Stage;
         let host = (|| {
@@ -1068,6 +998,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 },
                 budget: TraceBudget::new(prepared.trace_limits),
                 control,
+                cancellation,
                 sequence: 0,
                 epoch: 0,
                 drafts: super::draft::DraftJournal::new(prepared.settings.draft_events),
@@ -1120,17 +1051,17 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 TokenChoiceController::new(controller, domain),
             )
             .map_err(TextContinuationError::Generation)?;
-        state.set_cancellation_token(delivery.control.cancellation().clone());
+        state.set_cancellation_token(delivery.cancellation.clone());
         state.bind_control_handle(&delivery.control)?;
         match prepared.intervention {
             Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
             None => driver.enable_capture(&mut state, prepared.plan)?,
         }
-        delivery.preparation_elapsed = preparation_started.elapsed();
+        delivery.preparation_elapsed = prepared.preparation_elapsed + preparation_started.elapsed();
         delivery.send(started, &mut emit);
         let delivered = match delivery.failure.take() {
             Some(error) => Err(ControlledGenerationError::Capture(error)),
-            None => Ok(if delivery.control.cancellation().is_cancelled() {
+            None => Ok(if delivery.cancellation.is_cancelled() {
                 None
             } else {
                 Some(())

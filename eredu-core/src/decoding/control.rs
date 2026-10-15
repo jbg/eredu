@@ -27,6 +27,8 @@ pub struct DecodingCapabilities {
     /// Required safe disposition for live verification at its deadline.
     /// Absent means the retained executor supports every validated disposition.
     pub completion_cancellation: Option<crate::CompletionCancellationMode>,
+    /// Run-local resource policy retained across mode changes, snapshots and forks.
+    pub speculation_limits: Option<super::SpeculationLimits>,
     /// Settled handoff among every advertised mode and its admitted options.
     pub mode_changes: bool,
 }
@@ -95,6 +97,9 @@ impl DecodingCapabilities {
             DecodingMode::Diffusion { policy } if self.diffusion => check_policy(policy),
             DecodingMode::Diffusion { .. } => Err(unsupported("refinement commitment")),
             DecodingMode::SelfSpeculation(options) => {
+                if let Some(limits) = self.speculation_limits {
+                    limits.validate(options)?;
+                }
                 let options = options.request();
                 if !self.speculation || !self.autoregressive {
                     return Err(unsupported("draft source and causal verification"));

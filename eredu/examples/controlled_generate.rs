@@ -142,11 +142,12 @@ pub fn run_example(
     };
     let prepared = model.prepare_intervened_chat(&chat, settings, capture, original, trace)?;
     let mut prefix = vec![];
-    let mut run = model.start_controlled_chat(
+    let mut run = model.start_controlled(
         prepared,
         &[],
         GenerationControlHandle::default(),
         output(&mut prefix),
+        eredu::api::OutputMode::Semantic,
     )?;
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,

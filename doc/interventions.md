@@ -11,7 +11,7 @@ prediction commitment; an absent conditional target retains a `Missing` outcome
 and fails the attempt through the ordinary state-recovery driver.
 
 Call `prepare_intervened_chat(chat, settings, capture, intervention, trace_limits)`
-and pass its result to the existing `generate_observed_chat`. The returned
+and pass its result to the existing `generate_observed`. The returned
 `PreparedObservedGeneration` owns immutable capture and intervention admissions.
 Preparation uses retained source and session identities and performs no native
 model work. Existing `prepare_observed_chat` callers remain valid. An empty
@@ -478,7 +478,7 @@ producers where loaded discovery reports support.
 
 `SpeculativeActivationPlan` combines captures and optional edits into one admitted
 authority bound to the loaded model, effective execution and native session. Public
-installation uses `ControlledSpeculativeOptions.activations`. Ordinary
+installation uses `GenerationControlOptions.speculative_activations`. Ordinary
 `SpeculativeInterventionPlan` retains its existing one-row sampler semantics.
 Internal edits are installed once before forward execution and are removed with
 the borrowed executor scope. Prospective changes use

@@ -69,9 +69,12 @@ fn typed_chat_input_preserves_text_whitespace_and_explicit_joining() {
         .unwrap();
     assert_eq!(joined.chat().rendered_prompt(), "ordinary_1 \nordinary_2");
     let (chat, payload) = prepared.into_parts();
+    let input = payload.into_input(&model, &chat).unwrap();
     let output = model
-        .generate_prepared_text(PreparedChatGenerationRequest {
-            input: payload.into_input(&model, &chat).unwrap(),
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
+            input,
             settings: settings(),
             caller_stop_sequences: &[],
             cancellation: Default::default(),
@@ -85,7 +88,7 @@ fn typed_chat_input_preserves_text_whitespace_and_explicit_joining() {
 #[test]
 fn typed_chat_input_media_alignment_and_controlled_output_match_ordinary() {
     let mut expected = None;
-    for controlled in [false, true] {
+    for method in 0..3 {
         let mut model = unicode_model_with_template(None, 2200, CONTENT);
         let rendered = model.prepare_typed_chat(mixed()).unwrap();
         assert!(rendered.has_media());
@@ -99,6 +102,30 @@ fn typed_chat_input_media_alignment_and_controlled_output_match_ordinary() {
             ),
             (4, 2, 6)
         );
+        if method == 2 {
+            let (chat, payload) = prepared.into_parts();
+            let input = payload.into_input(&model, &chat).unwrap();
+            let mut visible = Vec::new();
+            let output = model
+                .session()
+                .with_controlled(
+                    GenerationRequest {
+                        input,
+                        output_mode: eredu::api::OutputMode::Text,
+                        settings: settings(),
+                        caller_stop_sequences: &[],
+                        cancellation: Default::default(),
+                        control_handle: None,
+                        on_event: |event| visible.push(event),
+                    },
+                    Default::default(),
+                    |control| control.run(),
+                )
+                .unwrap();
+            assert_eq!(output.token_ids, [6, 7]);
+            assert_eq!(expected.as_ref(), Some(&visible));
+            continue;
+        }
         let prepared = model
             .prepare_observed_chat_input(prepared, settings(), CapturePlan::none(), limits())
             .unwrap();
@@ -106,12 +133,18 @@ fn typed_chat_input_media_alignment_and_controlled_output_match_ordinary() {
         // The mock processor adds its final "hello" ID (unknown in this vocabulary).
         assert_eq!(prepared.prompt_token_ids(), &[2, 2001, 3, 2001, 4, 0]);
         let mut events = Vec::new();
-        let output = if controlled {
+        let output = if method == 1 {
             let mut session = model
-                .start_controlled_text(prepared, &[], Default::default(), |record| {
-                    events.push(record.generation.event);
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        events.push(record.generation.event);
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             session
                 .run(|record| {
@@ -122,10 +155,16 @@ fn typed_chat_input_media_alignment_and_controlled_output_match_ordinary() {
             session.token_ids().to_vec()
         } else {
             model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    events.push(record.event);
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        events.push(record.event);
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap()
                 .token_ids
         };
@@ -320,20 +359,30 @@ fn typed_chat_input_counted_media_uses_existing_speculative_and_forecast_routes(
     let count = prepared.count();
     let (chat, payload) = prepared.into_parts();
     let input = payload.into_input(&model, &chat).unwrap();
-    let request = PreparedChatSpeculativeGenerationRequest {
-        input,
-        drafting: SpeculativeDraft::Embedded,
-        settings: settings(),
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        control_handle: None,
-        on_event: |_| {},
-    };
+    let mut request = (
+        SpeculativeDraft::Embedded,
+        GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
+            input,
+
+            settings: settings(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            control_handle: None,
+            on_event: |_| {},
+        },
+    );
     let forecast = model
-        .forecast_prepared_speculative_generation(&request, &Default::default())
+        .drafting_session(request.0.reborrow(), None)
+        .forecast_generation(&request.1, &Default::default())
         .unwrap();
     assert_eq!(forecast.request.input, count);
-    let output = model.generate_prepared_text_speculative(request).unwrap();
+    let output = {
+        let (drafting, mut request) = request;
+        request.output_mode = eredu::api::OutputMode::Text;
+        model.drafting_session(drafting, None).generate(request)
+    }
+    .unwrap();
     assert_eq!(output.token_ids, vec![7, 11]);
 }
 
@@ -372,7 +421,9 @@ fn typed_chat_input_cannot_cross_sessions_or_change_rendered_chat() {
     let (chat, payload) = prepared.into_parts();
     let input = payload.into_input(&first, &chat).unwrap();
     let error = other
-        .generate_prepared_text(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
             input,
             settings: settings(),
             caller_stop_sequences: &[],

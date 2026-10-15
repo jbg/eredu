@@ -272,7 +272,7 @@ fn verify(device: LocalDevice, fused: bool) {
         let loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
                 .unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (mut model, _) = loaded.into_parts();
         let facts = model.parameter_discovery().unwrap();
         let limits = CaptureUsage {
@@ -386,7 +386,7 @@ fn verify(device: LocalDevice, fused: bool) {
             &execution,
         )
         .unwrap();
-        let oracle_generation = oracle.speculative_generation_options().unwrap().unwrap();
+        let oracle_generation = oracle.drafting_options().unwrap().unwrap();
         let (mut oracle, _) = oracle.into_parts();
         for prefix in [[1, 2, 5], [5, 2, 1]] {
             let expected = super::parameters::captures(

@@ -220,19 +220,31 @@ fn run(
     )?;
     let mut events: Vec<ObservedGenerationRecord> = vec![];
     if controlled {
-        let mut run = model.start_controlled_text(prepared, &[], Default::default(), |record| {
-            events.push(record.generation);
-            ControlFlow::Continue(())
-        })?;
+        let mut run = model.start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                events.push(record.generation);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )?;
         run.run(|record| {
             events.push(record.generation);
             ControlFlow::Continue(())
         })?;
     } else {
-        model.generate_observed_text(prepared, &[], Default::default(), |record| {
-            events.push(record);
-            ControlFlow::Continue(())
-        })?;
+        model.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                events.push(record);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )?;
     }
     Ok(events
         .into_iter()
@@ -383,32 +395,51 @@ fn run_speculative_with_scheduler(
     scheduler: eredu_core::SpeculativeSchedulerOptions,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     settings.seed = 0;
-    let request = PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::token_ids(chat, vec![3, 4]),
-        drafting: SpeculativeDraft::Embedded,
-        settings: eredu::api::PreparedChatGenerationSettings {
-            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                eredu_core::decoding::SpeculationOptionsRequest {
-                    scheduler,
-                    ..Default::default()
-                }
-                .try_into()
-                .map_err(|error: eredu_core::GenerationError| Box::<dyn std::error::Error>::from(error))?,
-            )),
-            ..settings
+    let request = (
+        SpeculativeDraft::Embedded,
+        GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
+            control_handle: None,
+            input: PreparedChatInput::token_ids(chat, vec![3, 4]),
+
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    eredu_core::decoding::SpeculationOptionsRequest {
+                        scheduler,
+                        ..Default::default()
+                    }
+                    .try_into()
+                    .map_err(|error: eredu_core::GenerationError| {
+                        Box::<dyn std::error::Error>::from(error)
+                    })?,
+                )),
+                ..settings
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
         },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
-    };
+    );
     let output = if controlled {
-        model.with_controlled_text_speculative(request, Default::default(), |session| {
-            while session.step()?.is_some() {}
-            Ok(())
-        })?
+        {
+            let (drafting, mut request) = request;
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).with_controlled(
+                request,
+                Default::default(),
+                |session| {
+                    let session = session.speculative().expect("speculative executor");
+                    while session.step()?.is_some() {}
+                    Ok(())
+                },
+            )
+        }?
     } else {
-        model.generate_prepared_text_speculative(request)?
+        {
+            let (drafting, mut request) = request;
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).generate(request)
+        }?
     };
     Ok(output.token_ids().to_vec())
 }
@@ -469,7 +500,8 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
     invalid.overrides.temperature = Some(-1.0);
     let _guard = probe(Fault::None);
     let error = model
-        .generate_prepared_text_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+            output_mode: eredu::api::OutputMode::Text,
             drafting: SpeculativeDraft::Embedded,
             lanes: [settings, invalid]
                 .into_iter()
@@ -496,7 +528,7 @@ fn speculative_batch_host_failure_in_later_lane_votes_once_before_any_prompt() {
         })
         .err()
         .expect("invalid second lane must reject the batch");
-    assert!(matches!(error, PreparedChatSpeculativeError::Generation(_)));
+    assert!(matches!(error, PreparedChatError::Generation(_)));
     assert_eq!(snapshot().votes, vec![(Stage::Request, Status::Failed)]);
     assert!(snapshot().native.is_empty());
     assert_eq!(snapshot().forwards, 0);
@@ -521,11 +553,13 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
         .unwrap();
     let _guard = probe(Fault::None);
     let error = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -536,8 +570,8 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
                 cancellation: Default::default(),
                 on_event: |_| {},
             },
-            eredu::api::ControlledSpeculativeOptions {
-                capture: Some(capture),
+            eredu::api::GenerationControlOptions {
+                speculative_capture: Some(capture),
                 ..Default::default()
             },
             |_| panic!("invalid capture cannot enter the driver"),
@@ -545,7 +579,7 @@ fn controlled_speculative_invalid_capture_votes_before_returning_local_policy_er
         .unwrap_err();
     assert!(matches!(
         error,
-        eredu::api::ControlledSpeculativeGenerationError::Control(
+        eredu::api::SessionControlError::Speculative(
             eredu_core::speculative::SpeculativeControlError::Capture(
                 eredu_core::capture::CaptureError::Invalid(_)
             )
@@ -685,20 +719,32 @@ fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
         let mut initial_bytes = 0;
         if controlled {
             let run = model
-                .start_controlled_text(prepared, &[], Default::default(), |record| {
-                    initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             drop(run);
         } else {
             model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if matches!(record.event, ObservedGenerationEvent::Started { .. }) {
-                        initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    }
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        if matches!(record.event, ObservedGenerationEvent::Started { .. }) {
+                            initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                        }
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
         }
         model.reset().unwrap();
@@ -706,9 +752,13 @@ fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
         let _guard = probe(Fault::None);
         let cause = if controlled {
             let mut run = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             match run.step(|_| ControlFlow::Continue(())).unwrap_err() {
                 eredu::api::ControlledGenerationError::Capture(error) => error,
@@ -716,9 +766,13 @@ fn local_token_record_budget_failure_votes_failed_and_keeps_its_typed_cause() {
             }
         } else {
             match model
-                .generate_observed_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap_err()
             {
                 PreparedChatError::Capture(error) => error,
@@ -801,10 +855,16 @@ fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
         let prepared = prepare(&model, 1 << 20);
         if controlled {
             let mut session = model
-                .start_controlled_text(prepared, &[], Default::default(), |record| {
-                    preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             session
                 .step(|record| {
@@ -819,12 +879,18 @@ fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
                 .unwrap();
         } else {
             model
-                .generate_observed_text(prepared, &[], Default::default(), |record| {
-                    if !matches!(record.event, ObservedGenerationEvent::Completed { .. }) {
-                        preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
-                    }
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |record| {
+                        if !matches!(record.event, ObservedGenerationEvent::Completed { .. }) {
+                            preceding_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                        }
+                        ControlFlow::Continue(())
+                    },
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
         }
         model.reset().unwrap();
@@ -832,9 +898,13 @@ fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
         let _guard = probe(Fault::None);
         let cause = if controlled {
             let mut session = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap();
             let error = session.step(|_| ControlFlow::Continue(())).unwrap_err();
             assert_eq!(
@@ -847,9 +917,13 @@ fn boundary_record_budget_failure_votes_failed_with_the_original_cause() {
             }
         } else {
             match model
-                .generate_observed_text(prepared, &[], Default::default(), |_| {
-                    ControlFlow::Continue(())
-                })
+                .generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| ControlFlow::Continue(()),
+                    eredu::api::OutputMode::Text,
+                )
                 .unwrap_err()
             {
                 PreparedChatError::Capture(error) => error,
@@ -918,11 +992,13 @@ fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
         .unwrap();
     let _guard = probe(Fault::Local(Stage::Instrumentation));
     let error = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -933,8 +1009,8 @@ fn speculative_collector_preparation_preserves_local_failure_before_prefill() {
                 cancellation: Default::default(),
                 on_event: |_| {},
             },
-            eredu::api::ControlledSpeculativeOptions {
-                activations: Some(plan),
+            eredu::api::GenerationControlOptions {
+                speculative_activations: Some(plan),
                 ..Default::default()
             },
             |_| panic!("collector failure must not enter the controlling closure"),

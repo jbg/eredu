@@ -4,19 +4,18 @@
 //! `cargo run -p eredu --example native_tool_calling -- TARGET [DRAFTER]`.
 
 use eredu_backend_mlx::MlxBackendFactory;
-use std::{env, num::NonZeroUsize};
+use std::env;
 
 use eredu::{
     api::{
-        default_local_device, local_device_plan, LoadedModel, LocalDevice,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatSpeculativeGenerationRequest,
+        default_local_device, local_device_plan, GenerationRequest, LoadedModel, LocalDevice,
+        PreparedChatGenerationSettings, PreparedChatInput,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
 };
 use eredu_core::{
     DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
-    GenerationConfigOverrides, SemanticEvent, SpeculativeSchedulerOptions,
+    GenerationConfigOverrides, SemanticEvent,
 };
 use serde_json::json;
 
@@ -39,10 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             adaptive_lookahead: false,
         });
     }
-    let planned =
+    let mut session =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target_path, &plan)?;
-    let (mut model, mut drafting) = planned.into_parts();
-    let prepared = model.prepare_chat(ChatTemplateRequest {
+    let prepared = session.model_mut().prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
             "role": "user",
             "content": "What is the weather in Bogotá?"
@@ -85,55 +83,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..PreparedChatGenerationSettings::default()
     };
-    let scheduler = SpeculativeSchedulerOptions {
-        max_in_flight_verifications: 1,
-        max_optimistic_branches: 1,
-        lookahead_blocks: 1,
-        ..SpeculativeSchedulerOptions::default()
-    };
     let mut events = Vec::<SemanticEvent>::new();
-
-    let finish_reason = if drafter_path.is_some() {
-        if !drafting.is_enabled() {
-            return Err("external drafting plan was not realized".into());
-        }
-        model
-            .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting: drafting
-                    .as_speculative_draft()
-                    .expect("drafting is enabled"),
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        eredu_core::decoding::SpeculationOptionsRequest {
-                            max_draft_tokens: NonZeroUsize::new(3).unwrap(),
-                            scheduler,
-
-                            ..Default::default()
-                        }
-                        .try_into()
-                        .expect("validated speculation options"),
-                    )),
-                    ..settings
-                },
-                caller_stop_sequences: &[],
-                cancellation: GenerationCancellationToken::new(),
-                on_event: |event| events.push(event),
-            })?
-            .finish_reason()
-    } else {
-        model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::rendered_prompt(&prepared),
-                settings,
-                caller_stop_sequences: &[],
-                cancellation: GenerationCancellationToken::new(),
-                on_event: |event| events.push(event),
-            })?
-            .finish_reason
-    };
+    let output = session.generate(GenerationRequest {
+        output_mode: eredu::api::OutputMode::Semantic,
+        control_handle: None,
+        input: PreparedChatInput::rendered_prompt(&prepared),
+        settings,
+        caller_stop_sequences: &[],
+        cancellation: GenerationCancellationToken::new(),
+        on_event: |event| events.push(event),
+    })?;
+    let finish_reason = output.finish_reason();
 
     for event in &events {
         println!("{event:?}");

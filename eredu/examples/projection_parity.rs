@@ -160,16 +160,25 @@ fn main() -> anyhow::Result<()> {
                 ControlFlow::Continue(())
             };
             if controlled {
-                let mut run =
-                    model.start_controlled_text(prepared, &[], Default::default(), |r| {
-                        collect(r.generation)
-                    })?;
+                let mut run = model.start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |r| collect(r.generation),
+                    eredu::api::OutputMode::Text,
+                )?;
                 while run.finish_reason().is_none() {
                     run.step(|r| collect(r.generation))?;
                 }
                 ensure!(run.token_ids() == raw, "controlled tokens differ");
             } else {
-                model.generate_observed_text(prepared, &[], Default::default(), collect)?;
+                model.generate_observed(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    collect,
+                    eredu::api::OutputMode::Text,
+                )?;
             }
             ensure!(decisions.len() == 8, "missing captured predictions");
             ensure!(
@@ -205,61 +214,54 @@ fn main() -> anyhow::Result<()> {
         let _guard = reference.then(CastGemmReference::begin);
         let mut loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &path, &spec_plan)?;
-        let options = loaded
-            .speculative_generation_options()?
-            .context("missing speculation")?;
-        let (model, drafting) = loaded.parts_mut();
-        let chat = model.prepare_chat(ChatTemplateRequest {
+        let chat = loaded.model_mut().prepare_chat(ChatTemplateRequest {
             messages: vec![json!({"role":"user", "content":"hello"})],
             add_generation_prompt: true,
             ..Default::default()
         })?;
-        let output =
-            model.generate_prepared_text_speculative(PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
-                drafting: drafting.as_speculative_draft().unwrap(),
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
-                    ..settings
-                },
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| {},
-            })?;
+        let output = loaded.generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
+            control_handle: None,
+            input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
+
+            settings,
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        })?;
         ensure!(
             output.token_ids() == expected_tokens,
             "ordinary speculative tokens differ"
         );
-        let capture = model
+        let capture = loaded
+            .model()
             .prepare_speculative_capture(settings, capture_plan(positions, true))
             .context("admit speculative capture")?;
         let mut captures = Vec::new();
         let mut verifications = 0;
         let profile = ProjectionCapture::begin(4096)?;
-        let output = model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
+        let output = loaded
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Text,
                     control_handle: None,
                     input: PreparedChatInput::token_ids(&chat, vec![1; positions]),
-                    drafting: drafting.as_speculative_draft().unwrap(),
-                    settings: eredu::api::PreparedChatGenerationSettings {
-                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(options)),
-                        ..settings
-                    },
+
+                    settings,
                     caller_stop_sequences: &[],
                     cancellation: Default::default(),
                     on_event: |_| {},
                 },
-                ControlledSpeculativeOptions {
+                GenerationControlOptions {
                     trace_limits: TraceLimits {
                         per_record_bytes: 16 << 20,
                         total_bytes: 256 << 20,
                     },
-                    capture: Some(capture),
+                    speculative_capture: Some(capture),
                     ..Default::default()
                 },
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     while let Some(step) = session.step()? {
                         if step.verification.is_some() {
                             verifications += 1;

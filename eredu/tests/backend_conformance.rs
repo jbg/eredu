@@ -15,10 +15,9 @@ use std::{
 
 use eredu::{
     api::{
-        LoadedModel, LoadedTextModelConfig, PreparedChatError, PreparedChatGenerationRequest,
+        GenerationRequest, LoadedModel, LoadedTextModelConfig, PreparedChatError,
         PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
-        PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeError,
-        SpeculationOptions, PreparedChatSpeculativeGenerationRequest,
+        PreparedChatSpeculativeBatchRequest, SpeculationOptions,
     },
     runtime::chat::{ChatTemplateRequest, PreparedChat},
 };
@@ -65,11 +64,13 @@ const QWEN_TEMPLATE: &str =
 const NO_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX;
 const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
-#[path = "backend_conformance/iterative.rs"]
-mod iterative;
 #[path = "backend_conformance/decoding_modes.rs"]
 mod decoding_modes;
+#[path = "backend_conformance/iterative.rs"]
+mod iterative;
 
+#[path = "backend_conformance/chat_input.rs"]
+mod chat_input;
 #[path = "backend_conformance/control.rs"]
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
@@ -82,16 +83,16 @@ mod forecast;
 mod observed_mock;
 #[path = "backend_conformance/preparation.rs"]
 mod preparation;
+#[path = "backend_conformance/session.rs"]
+mod session;
 #[path = "backend_conformance/templates.rs"]
 mod templates;
 #[path = "backend_conformance/text.rs"]
 mod text;
-#[path = "backend_conformance/chat_input.rs"]
-mod chat_input;
-#[path = "backend_conformance/tool_names.rs"]
-mod tool_names;
 #[path = "backend_conformance/timing.rs"]
 mod timing;
+#[path = "backend_conformance/tool_names.rs"]
+mod tool_names;
 
 struct TestDirectory(PathBuf);
 
@@ -1157,7 +1158,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         &mut self,
         states: Vec<eredu_core::SpeculativeScheduleState>,
         _: (),
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>  where Self: 'a {
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure>
+    where
+        Self: 'a,
+    {
         Ok(preparation::coordinate(states))
     }
     fn agree_text_preparation<'a>(
@@ -1166,7 +1170,9 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         status: eredu_core::run_preparation::TextPreparationStatus,
         _: (),
     ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
-     where Self: 'a {
+    where
+        Self: 'a,
+    {
         Ok(preparation::agreement(stage, status))
     }
 
@@ -1175,7 +1181,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         plan: eredu_core::speculative::AdmittedSpeculativeActivations,
         request: eredu_core::SpeculativeRequestId,
         _: (),
-    ) -> Result<(), eredu_core::speculative::SpeculativeControlError>  where Self: 'a {
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         assert!(self.activations.is_none());
@@ -1261,7 +1270,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         cache: &usize,
         _: &(),
         _: (),
-    ) -> Result<Option<(usize, ())>, eredu_core::speculative::SpeculativeControlError>  where Self: 'a {
+    ) -> Result<Option<(usize, ())>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         Ok(Some((*cache, ())))
     }
     fn restore_control_snapshot<'a>(
@@ -1270,7 +1282,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         saved: &usize,
         _: &(),
         _: (),
-    ) -> Result<Option<()>, eredu_core::speculative::SpeculativeControlError>  where Self: 'a {
+    ) -> Result<Option<()>, eredu_core::speculative::SpeculativeControlError>
+    where
+        Self: 'a,
+    {
         *cache = *saved;
         Ok(Some(()))
     }
@@ -1282,7 +1297,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     type CacheCheckpoint = usize;
     type Verification = Vec<u32>;
     type Logits = u32;
-    type Context<'a> = () where Self: 'a;
+    type Context<'a>
+        = ()
+    where
+        Self: 'a;
     type Completion = Done;
     type Telemetry = ();
     type Error = MockError;
@@ -1300,7 +1318,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         input: Self::Input,
         cache: &mut Self::Cache,
         _: Self::Context<'a>,
-    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>  where Self: 'a {
+    ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::forward();
         preparation::action("prefill");
         *cache = input.len();
@@ -1328,7 +1349,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: u32,
         _: usize,
         _: Self::Context<'a>,
-    ) -> Result<Self::DraftState, Self::Error>  where Self: 'a {
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::action("begin_proposal");
         Ok(())
     }
@@ -1338,7 +1362,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: &mut Self::DraftState,
         _: u32,
         _: Self::Context<'a>,
-    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>  where Self: 'a {
+    ) -> Result<eredu_core::speculative::SpeculativeProposalStep<Self::Logits>, Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::action("proposal_step");
         let scale = self
             .activations
@@ -1363,7 +1390,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         cache: &mut Self::Cache,
         checkpoint: &Self::CacheCheckpoint,
         _: Self::Context<'a>,
-    ) -> Result<(), Self::Error>  where Self: 'a {
+    ) -> Result<(), Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::action("restore");
         *cache = *checkpoint;
         Ok(())
@@ -1374,7 +1404,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         input_tokens: &[u32],
         cache: &mut Self::Cache,
         _: Self::Context<'a>,
-    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>  where Self: 'a {
+    ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::action("verification");
         *cache += input_tokens.len();
         let scale = self
@@ -1406,7 +1439,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         output: &Self::Verification,
         index: usize,
         _: Self::Context<'a>,
-    ) -> Result<Self::Logits, Self::Error>  where Self: 'a {
+    ) -> Result<Self::Logits, Self::Error>
+    where
+        Self: 'a,
+    {
         Ok(output[index])
     }
 
@@ -1418,7 +1454,10 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         checkpoint: &Self::CacheCheckpoint,
         verified_inputs: usize,
         _: Self::Context<'a>,
-    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>  where Self: 'a {
+    ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error>
+    where
+        Self: 'a,
+    {
         preparation::action("commit");
         *cache = *checkpoint + verified_inputs;
         Ok(SpeculativeCommit::new((), 0))
@@ -1875,17 +1914,19 @@ fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, pre
 fn speculative_client_code<B: SpeculativeGenerationBackend>(
     model: &mut LoadedModel<B>,
     prepared: &PreparedChat,
-) -> (SpeculativeGenerationOutput, Vec<SemanticEvent>) {
+) -> (eredu::api::GenerationOutput, Vec<SemanticEvent>) {
     assert!(matches!(
         model.speculative_capability(),
         SpeculativeCapability::Ready { .. }
     ));
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(prepared),
-            drafting: SpeculativeDraft::Embedded,
+
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                     SpeculationOptions::default(),
@@ -1912,7 +1953,8 @@ fn speculative_batch_client_code<B: SpeculativeGenerationBackend>(
 ) -> (SpeculativeGenerationBatchOutput, Vec<SemanticEvent>) {
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+        .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             drafting: SpeculativeDraft::Embedded,
             lanes: vec![PreparedChatSpeculativeBatchLane {
                 control_handle: None,
@@ -1952,11 +1994,13 @@ fn assert_single_lane_speculative_cardinality_is_validated(
         (vec![NO_SPECULATIVE_RESULTS_PROMPT_TOKEN], 0),
         (vec![MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN], 2),
     ] {
-        let result =
-            model.generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+        let result = model
+            .drafting_session(SpeculativeDraft::Embedded, None)
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(prepared, prompt),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         SpeculationOptions::default(),
@@ -1978,7 +2022,7 @@ fn assert_single_lane_speculative_cardinality_is_validated(
         };
         assert!(matches!(
             error,
-            PreparedChatSpeculativeError::OutputCardinality {
+            PreparedChatError::OutputCardinality {
                 expected: 1,
                 actual: observed,
             } if observed == actual
@@ -2114,7 +2158,7 @@ fn planned_loading_client_code<F>(
     model_path: &Path,
     device: &str,
 ) -> (
-    eredu::api::PlannedModel<F::Backend, F::Drafter>,
+    eredu::api::PlannedModel<F::Backend, RealizedDrafting<F::Drafter>>,
     ExecutionPlanReport,
 )
 where
@@ -2415,9 +2459,9 @@ fn assert_automatic_planning_conformance() {
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");
     assert!(planned.drafting().is_external());
-    assert_eq!(planned.drafting_plan(), external.drafting());
+    assert_eq!(planned.drafting_plan(), Some(external.drafting()));
     let controls = planned
-        .speculative_generation_options()
+        .drafting_options()
         .unwrap()
         .expect("external plan retains speculative controls");
     assert_eq!(controls.request().max_draft_tokens.get(), 4);
@@ -2625,7 +2669,9 @@ fn assert_prepared_generation_and_speculative_conformance() {
     );
     let mut events = Vec::new();
     let output = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&prepared),
             settings: PreparedChatGenerationSettings {
@@ -2666,10 +2712,16 @@ fn assert_prepared_generation_and_speculative_conformance() {
     assert_eq!(observed.prompt_token_ids(), alignment);
     let mut trace = Vec::new();
     let observed_output = model
-        .generate_observed_chat(observed, &[], Default::default(), |record| {
-            trace.push(record);
-            std::ops::ControlFlow::Continue(())
-        })
+        .generate_observed(
+            observed,
+            &[],
+            Default::default(),
+            |record| {
+                trace.push(record);
+                std::ops::ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(observed_output.token_ids, output.token_ids);
     assert_eq!(observed_output.finish_reason, output.finish_reason);
@@ -2729,18 +2781,24 @@ fn assert_prepared_generation_and_speculative_conformance() {
         .unwrap();
     let mut consumer_closed = false;
     let cancelled = model
-        .generate_observed_chat(observed, &[], Default::default(), |record| {
-            assert!(!consumer_closed, "no delivery after consumer Break");
-            if matches!(
-                record.event,
-                eredu::api::ObservedGenerationEvent::Token { .. }
-            ) {
-                consumer_closed = true;
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
-            }
-        })
+        .generate_observed(
+            observed,
+            &[],
+            Default::default(),
+            |record| {
+                assert!(!consumer_closed, "no delivery after consumer Break");
+                if matches!(
+                    record.event,
+                    eredu::api::ObservedGenerationEvent::Token { .. }
+                ) {
+                    consumer_closed = true;
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(cancelled.finish_reason, FinishReason::Cancelled);
     assert_eq!(cancelled.token_ids.len(), 1);
@@ -2758,9 +2816,13 @@ fn assert_prepared_generation_and_speculative_conformance() {
         )
         .unwrap();
     let overflow = model
-        .generate_observed_chat(observed, &[], Default::default(), |_| {
-            panic!("oversized trace must not be delivered")
-        })
+        .generate_observed(
+            observed,
+            &[],
+            Default::default(),
+            |_| panic!("oversized trace must not be delivered"),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap_err();
     assert!(matches!(
         overflow,
@@ -2794,7 +2856,9 @@ fn assert_prepared_generation_and_speculative_conformance() {
     ));
 
     let error = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::prepared_backend_input(&prepared, vec![0; 999]),
             settings: PreparedChatGenerationSettings {
@@ -2939,7 +3003,9 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
     };
     let mut ordinary_events = Vec::new();
     let ordinary = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
@@ -2978,18 +3044,24 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
     let mut observed_events = Vec::new();
     let mut captured_steps = Vec::new();
     let observed = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            match record.event {
-                eredu::api::ObservedGenerationEvent::Semantic { event, .. } => {
-                    observed_events.push(event)
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                match record.event {
+                    eredu::api::ObservedGenerationEvent::Semantic { event, .. } => {
+                        observed_events.push(event)
+                    }
+                    eredu::api::ObservedGenerationEvent::Token { captures, .. } => {
+                        captured_steps.push(captures.unwrap())
+                    }
+                    _ => {}
                 }
-                eredu::api::ObservedGenerationEvent::Token { captures, .. } => {
-                    captured_steps.push(captures.unwrap())
-                }
-                _ => {}
-            }
-            std::ops::ControlFlow::Continue(())
-        })
+                std::ops::ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert_eq!(observed.token_ids, ordinary.token_ids);
     assert_eq!(observed.finish_reason, ordinary.finish_reason);
@@ -3019,10 +3091,16 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         .unwrap();
     let mut failure_records = Vec::new();
     let error = model
-        .generate_observed_chat(prepared, &[], Default::default(), |record| {
-            failure_records.push(record);
-            std::ops::ControlFlow::Continue(())
-        })
+        .generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                failure_records.push(record);
+                std::ops::ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap_err();
     assert!(matches!(
         error,
@@ -3049,19 +3127,27 @@ fn observed_facade_preserves_streaming_unicode_special_tokens_and_eos() {
         )
         .unwrap();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = model.generate_observed_chat(prepared, &[], Default::default(), |record| {
-            if matches!(
-                record.event,
-                eredu::api::ObservedGenerationEvent::Token { .. }
-            ) {
-                panic!("consumer disconnected by unwinding");
-            }
-            std::ops::ControlFlow::Continue(())
-        });
+        let _ = model.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |record| {
+                if matches!(
+                    record.event,
+                    eredu::api::ObservedGenerationEvent::Token { .. }
+                ) {
+                    panic!("consumer disconnected by unwinding");
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Semantic,
+        );
     }));
     assert!(panic.is_err());
     let recovered = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
@@ -3146,10 +3232,16 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                 let mut records = Vec::new();
                 let tokens = if controlled {
                     let mut session = model
-                        .start_controlled_text(prepared, &[], Default::default(), |record| {
-                            records.push(record.generation);
-                            ControlFlow::Continue(())
-                        })
+                        .start_controlled(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |record| {
+                                records.push(record.generation);
+                                ControlFlow::Continue(())
+                            },
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap();
                     if captures && provenance == CaptureProvenance::Session {
                         assert_eq!(observed_mock::content_discovery_calls(), 0);
@@ -3182,10 +3274,16 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
                     session.token_ids().to_vec()
                 } else {
                     model
-                        .generate_observed_text(prepared, &[], Default::default(), |record| {
-                            records.push(record);
-                            ControlFlow::Continue(())
-                        })
+                        .generate_observed(
+                            prepared,
+                            &[],
+                            Default::default(),
+                            |record| {
+                                records.push(record);
+                                ControlFlow::Continue(())
+                            },
+                            eredu::api::OutputMode::Text,
+                        )
                         .unwrap()
                         .token_ids
                 };
@@ -3237,9 +3335,13 @@ fn live_observations_skip_content_discovery_and_exact_provenance_is_explicit() {
         .unwrap();
     let mut foreign = unicode_model(None);
     assert!(matches!(
-        foreign.generate_observed_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        }),
+        foreign.generate_observed(
+            prepared,
+            &[],
+            Default::default(),
+            |_| { ControlFlow::Continue(()) },
+            eredu::api::OutputMode::Text
+        ),
         Err(eredu::api::PreparedChatError::Capture(
             eredu_core::capture::CaptureError::Invalid(_)
         ))

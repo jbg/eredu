@@ -113,20 +113,32 @@ fn iterative_drafts_preserve_controlled_and_ordinary_unicode_and_eos_commitment(
     };
     let mut ordinary = Vec::new();
     let output = model
-        .generate_observed_text(prepare(&model), &[], Default::default(), |record| {
-            ordinary.push(record);
-            ControlFlow::Continue(())
-        })
+        .generate_observed(
+            prepare(&model),
+            &[],
+            Default::default(),
+            |record| {
+                ordinary.push(record);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     assert_eq!(output.token_ids.len(), 3);
     assert_eq!(output.finish_reason, FinishReason::Eos);
     model.reset().unwrap();
     let mut controlled = Vec::new();
     let mut run = model
-        .start_controlled_text(prepare(&model), &[], Default::default(), |record| {
-            controlled.push(record);
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepare(&model),
+            &[],
+            Default::default(),
+            |record| {
+                controlled.push(record);
+                ControlFlow::Continue(())
+            },
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     run.run(|record| {
         controlled.push(record);
@@ -216,7 +228,13 @@ fn iterative_active_draft_snapshot_restore_fork_and_cancel_preserve_commitment()
         ControlFlow::Continue(())
     };
     let mut run = model
-        .start_controlled_text(request, &[], Default::default(), collect)
+        .start_controlled(
+            request,
+            &[],
+            Default::default(),
+            collect,
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 2,
@@ -298,40 +316,60 @@ fn iterative_active_draft_snapshot_restore_fork_and_cancel_preserve_commitment()
 #[test]
 fn iterative_target_rejects_causal_speculative_verification_before_backend_execution() {
     let (mut model, chat, settings) = setup();
-    let request = PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
-        drafting: SpeculativeDraft::Embedded,
-        settings: eredu::api::PreparedChatGenerationSettings {
-            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                Default::default(),
-            )),
-            ..settings
+    let request = (
+        SpeculativeDraft::Embedded,
+        GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
+            control_handle: None,
+            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+
+            settings: eredu::api::PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    Default::default(),
+                )),
+                ..settings
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
         },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
-    };
+    );
     assert!(matches!(
-        model.generate_prepared_chat_speculative(request),
-        Err(PreparedChatSpeculativeError::Generation(
+        {
+            let (drafting, mut request) = request;
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate(request)
+        },
+        Err(PreparedChatError::Generation(
             eredu_core::generation::GenerationError::RequiresCausalConditionalScores
         ))
     ));
-    let request = PreparedChatSpeculativeGenerationRequest {
-        control_handle: None,
-        input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
-        drafting: SpeculativeDraft::Target,
-        settings: PreparedChatGenerationSettings {
-            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                Default::default(),
-            )),
-            ..settings
+    let request = (
+        SpeculativeDraft::Target,
+        GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
+            control_handle: None,
+            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+
+            settings: PreparedChatGenerationSettings {
+                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                    Default::default(),
+                )),
+                ..settings
+            },
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
         },
-        caller_stop_sequences: &[],
-        cancellation: Default::default(),
-        on_event: |_| {},
-    };
-    assert!(matches!(model.generate_prepared_chat_speculative(request),
-        Err(PreparedChatSpeculativeError::Generation(eredu_core::GenerationError::NoBackendDraftCapacity))));
+    );
+    assert!(matches!(
+        {
+            let (drafting, mut request) = request;
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate(request)
+        },
+        Err(PreparedChatError::Generation(
+            eredu_core::GenerationError::NoBackendDraftCapacity
+        ))
+    ));
 }

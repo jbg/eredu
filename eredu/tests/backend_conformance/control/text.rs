@@ -80,16 +80,28 @@ fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_
         let prepared = prepare(&model, &chat, settings, mode);
         let mut ordinary = vec![];
         let output = model
-            .generate_observed_text(prepared, &[], Default::default(), |record| {
-                ordinary.push(record);
-                ControlFlow::Continue(())
-            })
+            .generate_observed(
+                prepared,
+                &[],
+                Default::default(),
+                |record| {
+                    ordinary.push(record);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         model.reset().unwrap();
         let prepared = prepare(&model, &chat, settings, mode);
         let mut controlled = vec![];
         let mut run = model
-            .start_controlled_text(prepared, &[], Default::default(), collect(&mut controlled))
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                collect(&mut controlled),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         run.run(collect(&mut controlled)).unwrap();
         assert_eq!(run.token_ids(), output.token_ids);
@@ -143,9 +155,13 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         let prompt = prepared.prompt_token_ids().to_vec();
         assert_eq!(prompt, model.encode(chat.rendered_prompt(), false).unwrap());
         let error = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
-                panic!("rejected chat emitted")
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| panic!("rejected chat emitted"),
+                eredu::api::OutputMode::Semantic,
+            )
             .err()
             .unwrap();
         assert!(error.to_string().contains("executable semantic plan"));
@@ -158,7 +174,13 @@ fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut run = model
-            .start_controlled_text(prepared, &[], control.clone(), collect(&mut records))
+            .start_controlled(
+                prepared,
+                &[],
+                control.clone(),
+                collect(&mut records),
+                eredu::api::OutputMode::Text,
+            )
             .unwrap();
         assert_eq!(run.status(), GenerationStatus::Prepared);
         assert!(run.token_ids().is_empty());
@@ -250,11 +272,12 @@ fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
         let control = GenerationControlHandle::default();
         let mut records = vec![];
         let mut run = model
-            .start_controlled_text(
+            .start_controlled(
                 prepared,
                 &["é".into()],
                 control.clone(),
                 collect(&mut records),
+                eredu::api::OutputMode::Text,
             )
             .unwrap();
         if cancel_at == Some(0) {
@@ -278,9 +301,13 @@ fn text_stops_cancellation_and_callback_closure_preserve_committed_prefix() {
     let (mut model, chat, settings, _) = text_setup();
     let prepared = prepare(&model, &chat, settings, 0);
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let mut calls = 0;
     run.step(|_| {
@@ -301,11 +328,12 @@ fn text_snapshots_and_siblings_preserve_unicode_stop_lookbehind_and_bounded_stor
             let prepared = prepare(&model, &chat, settings, mode);
             let mut records = vec![];
             let mut run = model
-                .start_controlled_text(
+                .start_controlled(
                     prepared,
                     &[stop.into()],
                     Default::default(),
                     collect(&mut records),
+                    eredu::api::OutputMode::Text,
                 )
                 .unwrap();
             let bounds = SnapshotLimits {
@@ -389,9 +417,13 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
             ));
             let prepared = prepare(&model, &chat, Default::default(), 0);
             let error = model
-                .start_controlled_text(prepared, &[], Default::default(), |_| {
-                    panic!("rejected request emitted")
-                })
+                .start_controlled(
+                    prepared,
+                    &[],
+                    Default::default(),
+                    |_| panic!("rejected request emitted"),
+                    eredu::api::OutputMode::Text,
+                )
                 .err()
                 .unwrap();
             assert!(error.to_string().contains("tool declarations"));
@@ -412,9 +444,13 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
         .unwrap();
     let prepared = prepare(&model, &required, settings, 0);
     assert!(model
-        .start_controlled_text(prepared, &[], Default::default(), |_| panic!(
-            "required tools admitted"
-        ))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| panic!("required tools admitted"),
+            eredu::api::OutputMode::Text
+        )
         .is_err());
     let raw = model
         .prepare_chat(ChatTemplateRequest {
@@ -425,9 +461,13 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
         .unwrap();
     let prepared = prepare(&model, &raw, settings, 0);
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     run.run(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(run.finish_reason(), Some(FinishReason::Eos));
@@ -469,9 +509,13 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
         0,
     );
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     for id in [2, 66, u32::MAX] {
         assert!(run.force_next_token(id).is_err());
@@ -518,7 +562,13 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
     let prepared = prepare(&model, &chat, Default::default(), 0);
     let mut records = vec![];
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     for id in [1, 3, 2, eos] {
         run.force_next_token(id).unwrap();

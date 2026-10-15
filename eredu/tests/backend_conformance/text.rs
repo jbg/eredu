@@ -40,7 +40,8 @@ fn generate<F: FnMut(SemanticEvent)>(
         ..Default::default()
     };
     Ok(match method {
-        0 => terminal(model.generate_prepared_text(PreparedChatGenerationRequest {
+        0 => terminal(model.session().generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Text,
             control_handle: None,
             input,
             settings,
@@ -48,72 +49,82 @@ fn generate<F: FnMut(SemanticEvent)>(
             cancellation,
             on_event,
         })?),
-        1 => terminal(model.generate_prepared_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input,
-                drafting: SpeculativeDraft::Embedded,
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        Default::default(),
-                    )),
-                    ..settings
-                },
-                caller_stop_sequences: stops,
-                cancellation,
-                on_event,
-            },
-        )?),
+        1 => terminal(
+            model
+                .drafting_session(SpeculativeDraft::Embedded, None)
+                .generate(GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Text,
+                    control_handle: None,
+                    input,
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            Default::default(),
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: stops,
+                    cancellation,
+                    on_event,
+                })?,
+        ),
         2 => {
-            let output = model.generate_prepared_text_speculative_batch(
-                PreparedChatSpeculativeBatchRequest {
-                    drafting: SpeculativeDraft::Embedded,
-                    lanes: vec![PreparedChatSpeculativeBatchLane {
-                        control_handle: None,
-                        input,
-                        settings: eredu::api::PreparedChatGenerationSettings {
-                            decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                eredu_core::decoding::SpeculationOptionsRequest {
-                                    max_draft_tokens: NonZeroUsize::new(2).unwrap(),
-                                    scheduler: Default::default(),
-                                    ..Default::default()
-                                }
-                                .try_into()
-                                .expect("validated speculation options"),
-                            )),
-                            ..settings
-                        },
-                        caller_stop_sequences: stops,
-                        cancellation,
-                        on_event: Box::new(on_event),
-                    }],
-                },
-            )?;
+            let output = model.generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                output_mode: eredu::api::OutputMode::Text,
+                drafting: SpeculativeDraft::Embedded,
+                lanes: vec![PreparedChatSpeculativeBatchLane {
+                    control_handle: None,
+                    input,
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            eredu_core::decoding::SpeculationOptionsRequest {
+                                max_draft_tokens: NonZeroUsize::new(2).unwrap(),
+                                scheduler: Default::default(),
+                                ..Default::default()
+                            }
+                            .try_into()
+                            .expect("validated speculation options"),
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: stops,
+                    cancellation,
+                    on_event: Box::new(on_event),
+                }],
+            })?;
             let mut lanes = output.into_requests();
             assert_eq!(lanes.len(), 1);
             terminal(lanes.remove(0))
         }
-        3 => terminal(model.with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input,
-                drafting: SpeculativeDraft::Embedded,
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        Default::default(),
-                    )),
-                    ..settings
-                },
-                caller_stop_sequences: stops,
-                cancellation,
-                on_event,
-            },
-            Default::default(),
-            |session| {
-                while session.step()?.is_some() {}
-                Ok(())
-            },
-        )?),
+        3 => terminal(
+            model
+                .drafting_session(SpeculativeDraft::Embedded, None)
+                .with_controlled(
+                    GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Text,
+                        control_handle: None,
+                        input,
+
+                        settings: eredu::api::PreparedChatGenerationSettings {
+                            decoding_mode: Some(
+                                eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                    Default::default(),
+                                ),
+                            ),
+                            ..settings
+                        },
+                        caller_stop_sequences: stops,
+                        cancellation,
+                        on_event,
+                    },
+                    Default::default(),
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        while session.step()?.is_some() {}
+                        Ok(())
+                    },
+                )?,
+        ),
         _ => unreachable!(),
     })
 }
@@ -366,7 +377,9 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
     let mut model = unicode_model_with_template(None, 64, TEMPLATE);
     let chat = model.prepare_chat(request()).unwrap();
     let error = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings: Default::default(),
@@ -377,10 +390,12 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
         .unwrap_err();
     assert!(matches!(error, PreparedChatError::Semantic(_)));
     let error = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
-            drafting: SpeculativeDraft::Embedded,
+
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                     Default::default(),
@@ -392,5 +407,5 @@ fn unrecognized_templates_still_require_explicit_text_generation() {
             on_event: |_| panic!("unsupported chat emitted"),
         })
         .unwrap_err();
-    assert!(matches!(error, PreparedChatSpeculativeError::Semantic(_)));
+    assert!(matches!(error, PreparedChatError::Semantic(_)));
 }

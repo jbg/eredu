@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
         prepared.prompt_token_ids().len()
     );
     let cancellation = GenerationCancellationToken::new();
-    let outcome = model.generate_observed_chat(prepared, &[], cancellation.clone(), |record| {
+    let outcome = model.generate_observed(prepared, &[], cancellation.clone(), |record| {
         println!("{}", serde_json::to_string(&record).expect("versioned host record"));
         if matches!(record.event, ObservedGenerationEvent::Token { prediction_index, .. } if prediction_index + 1 >= cancel_after) {
             // Equivalently, return ControlFlow::Break(()). Delivery is synchronous
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             cancellation.cancel();
         }
         ControlFlow::Continue(())
-    })?;
+    }, eredu::api::OutputMode::Semantic)?;
     eprintln!(
         "Stopped: {:?}; {} generated tokens",
         outcome.finish_reason,

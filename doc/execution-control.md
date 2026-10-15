@@ -23,7 +23,7 @@ to encoded trace bytes. Text-only history keeps its encoded-byte bound.
 Typed chat preparation uses the ordinary shared drivers. A counted
 `PreparedChatRequest` enters capture/control admission through
 `prepare_observed_chat_input`, or `prepare_intervened_chat_input` for prospective
-interventions, and then uses `start_controlled_chat` or `start_controlled_text`.
+interventions, and then uses `start_controlled`.
 The request retains the exact text IDs or native prepared media prompt;
 controlled startup does not render or encode it again. Media alignment includes
 architecture-declared placeholder IDs and must cover every counted decoder
@@ -109,7 +109,7 @@ tentative output. `ModeChanged` follows tentative-output clearing and carries th
 effective generated-token position. Cancellation wins over an unacknowledged
 handoff. Terminal runs reject commands.
 
-`PreparedChatGenerationRequest.control_handle` supplies the same mode command
+`GenerationRequest.control_handle` supplies the same mode command
 mailbox to uninterrupted advancement. Mode state, including pending commands and
 the last acknowledgement, is copied with complete snapshots. Restore installs it
 with the corresponding cache and sampler; a fork has an independent mailbox.
@@ -125,7 +125,7 @@ the same validated speculative options used by request preparation. The common
 `GenerationRequestTable` runs causal lanes with zero proposals and no optimistic
 drafting. Controlled executor sessions expose `request_decoding_mode`,
 `decoding_state` and `bind_control_handle` after prefill. Supplying
-`PreparedChatSpeculativeGenerationRequest.control_handle` or a batch lane's
+`GenerationRequest.control_handle` or a batch lane's
 handle binds uninterrupted commands before prefill. Failed submission closes a
 bound mailbox; terminal output closes commands before its delivery callback.
 
@@ -323,14 +323,22 @@ A new ordinary branch measures its first new commitment separately.
 
 ## Controlled speculative generation
 
-`with_controlled_chat_speculative` and `with_controlled_text_speculative` accept
-the existing speculative request plus `ControlledSpeculativeOptions` and a worker
-closure receiving `&mut dyn ControlledSpeculativeSession`. The backend lends its
-prepared execution resources for that scope. No prefill or token sampling occurs
-until `step`; between calls the worker can wait for Inspector commands. Returning
-from the closure cancels and settles unfinished work through the existing scheduler.
-The same request settings, grammar, token validity, stopping rules and semantic
-callback apply as in uninterrupted speculation.
+`PlannedModel::with_controlled` accepts the same `GenerationRequest` as
+uninterrupted generation, `GenerationControlOptions`, and a worker closure.
+`request.output_mode` selects semantic or literal text; the owner retains its
+source and plan defaults. The returned output includes optional draft statistics.
+
+The common controller supplies explicit `step` and `run`. For speculative
+inspection, `control.speculative()` lends `&mut dyn ControlledSpeculativeSession`;
+for ordinary snapshots and interventions, `control.ordinary()` lends the typed
+ordinary controller. Speculative options retain their phase-aware capture and
+snapshot budgets. Ordinary capture uses `GenerationControlOptions.capture`;
+ordinary snapshot budgets are enabled on its typed controller. Opaque prepared
+inputs use backend-reported original decoder IDs, including media placeholders.
+Returning early cancels and settles unfinished work through the existing driver.
+Requests cancelled before ordinary startup return a cancelled output without
+opening a controller scope. Request cancellation and command-handle cancellation
+both remain effective when supplied independently.
 
 A step performs one scheduler action: prefill, draft a block, submit verification,
 draft optimistically, poll, or resolve verification. A verification commits an
@@ -380,13 +388,13 @@ their storage cost is unknown. These limitations do not prevent controlled
 speculative stepping or proposal observation.
 
 For captures, call `prepare_speculative_capture(settings, plan)` and pass its
-admitted plan in `ControlledSpeculativeOptions::capture`. Each observation is one
+admitted plan in `GenerationControlOptions::speculative_capture`. Each observation is one
 vocabulary row, including prefill; ordinary whole-prompt admission is rejected.
 The MLX implementation supports `model.logits` for target prefill, reached verifier
 rows, and every sampled draft proposal, including rejected work. It reuses the
 ordinary bounded transformations (including top candidates, summaries and slices)
 and one shared cumulative ledger. Internal layer observations use the separate
-`prepare_speculative_activations` admission and `activations` option. Loaded support
+`prepare_speculative_activations` admission and `speculative_activations` option. Loaded support
 is verified separately for each selected execution; V3 internal component capture
 is verified across resident/host/disk and distributed TP/PP/EP execution. The
 component-analysis guide records complete family and encoding coverage.
@@ -639,7 +647,7 @@ semantic delivery and lifecycle policy; it alone is not a controllable session.
 ## Public stepping workflow
 
 Prepare with `prepare_observed_chat` (use `CapturePlan::none()` for ordinary runs)
-or `prepare_intervened_chat`, then call `LoadedModel::start_controlled_chat` with
+or `prepare_intervened_chat`, then call `LoadedModel::start_controlled` with
 the prepared request, stop sequences, `GenerationControlHandle` and a synchronous
 record callback. The returned `ControlledGenerationSession` exclusively borrows
 the model and provides `step`, `pause`, `run`, `resume` and `cancel`.
@@ -708,7 +716,7 @@ positions remain absolute; subtract the parent snapshot's next prediction for a
 branch-local decision index. Existing capture values remain before-intervention
 observations; intervention evidence retains its existing before/after meaning.
 
-`LoadedModel<B>::start_controlled_chat` returns `ControlledGenerationSession<B>`;
+`LoadedModel<B>::start_controlled` returns `ControlledGenerationSession<B>`;
 snapshots and branches use `ControlledGenerationSnapshot<B>` and
 `ControlledGenerationBranch<B>`. These generic types are also the MLX application API.
 
@@ -1108,7 +1116,7 @@ reported by loaded speculative discovery. The speculative provider retains the o
 callbacks and final commit; its existing restore owner preserves spent budgets.
 
 
-`ControlledSpeculativeOptions.activations` installs one immutable combined
+`GenerationControlOptions.speculative_activations` installs one immutable combined
 capture/intervention authority before the first forward. Its collector and spent
 budgets belong to the borrowed execution scope. Returning the executor restores
 previous observer ownership; a later generation call receives no inherited edits
@@ -1265,7 +1273,7 @@ snapshot, exchange and prospective edit operations in the same order.
 
 ### Prepared-request memory forecasts
 
-`LoadedModel::forecast_prepared_generation` forecasts the same prepared request
+`PlannedModel::forecast_generation` forecasts the same prepared request
 used by ordinary or controlled startup. `forecast_observed_generation` accepts
 `PreparedObservedGeneration`, verifies its session identity and uses its resolved
 settings and capture/intervention contract. Trace-only preparations retain ordinary

@@ -1997,6 +1997,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         let shared = estimate.shared_backbone_draft();
         let ordinary = estimate.ordinary_refinement().filter(|_| Self::supports_block_refinement(runtime));
         eredu_core::decoding::DecodingCapabilities {
+            speculation_limits: None,
             autoregressive: ordinary.is_none_or(|policy| policy.causal_sampling), diffusion: ordinary.is_some(),
             entropy_feedback: ordinary.is_some_and(|policy| matches!(policy.policy, eredu_core::refinement::RefinementPolicy::EntropyFeedback(_))),
             masked_unmasking: ordinary.is_some_and(|policy| matches!(policy.policy, eredu_core::refinement::RefinementPolicy::MaskedUnmasking { .. })),

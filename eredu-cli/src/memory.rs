@@ -1,9 +1,9 @@
 //! Application memory advice; estimation never changes backend validity checks.
 use super::*;
 use eredu::api::{
-    ForecastCalibration, GenerationForecast, GenerationForecastOptions, GenerationMemoryEstimate,
-    GenerationMemoryOptions, MemoryBudget, MemoryBytes, MemoryDomain, MemoryFit,
-    SpeculativeForecastBackend, forecast_inspected_generation,
+    forecast_inspected_generation, ForecastCalibration, GenerationForecast,
+    GenerationForecastOptions, GenerationMemoryEstimate, GenerationMemoryOptions, MemoryBudget,
+    MemoryBytes, MemoryDomain, MemoryFit,
 };
 
 #[derive(Serialize)]
@@ -59,14 +59,8 @@ pub(super) fn report(
     finish_report(args, forecast)
 }
 
-pub(super) fn report_loaded<B: SpeculativeForecastBackend<D>, D>(
-    args: &Cli,
-    model: &LoadedModel<B>,
-    tokens: &[u32],
-    settings: PreparedChatGenerationSettings,
-    drafting: Option<&eredu_core::SpeculativeDraft<'_, D>>,
-) -> Result<Report> {
-    let options = GenerationForecastOptions {
+pub(super) fn loaded_options(args: &Cli) -> GenerationForecastOptions {
+    GenerationForecastOptions {
         budget: MemoryBudget {
             application_limit_bytes: args.memory_budget_bytes,
             reserve_bytes: args.memory_reserve_bytes,
@@ -77,17 +71,10 @@ pub(super) fn report_loaded<B: SpeculativeForecastBackend<D>, D>(
             ..MemoryBudget::default()
         },
         ..GenerationForecastOptions::default()
-    };
-    let forecast = match drafting {
-        Some(drafting) => {
-            model.forecast_speculative_token_ids(tokens, settings, drafting, &options)?
-        }
-        None => model.forecast_token_ids(tokens, settings, &options)?,
-    };
-    finish_report(args, forecast)
+    }
 }
 
-fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
+pub(super) fn finish_report(args: &Cli, forecast: GenerationForecast) -> Result<Report> {
     let request = &forecast.request;
     let estimate = &forecast.estimate;
     let mut recommendations = Vec::new();

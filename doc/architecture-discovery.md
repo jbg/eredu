@@ -161,7 +161,7 @@ unsupported/unverified reasons. Pass the selected path to
 the existing observation API treats it as capture-all. Missing returned values
 must remain missing, not become numerical zero. For ordinary instrumented text
 generation, use `capture_discovery`, `prepare_observed_chat`, and
-`generate_observed_chat`; `CapturePlan::none()` and empty new-plan selections both
+`generate_observed`; `CapturePlan::none()` and empty new-plan selections both
 mean capture none. The complete [`observed_generate`](../eredu/examples/observed_generate.rs)
 example includes prompt alignment, ordinary sampling, bounded capture and cancellation.
 

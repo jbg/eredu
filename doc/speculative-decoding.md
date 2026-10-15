@@ -97,32 +97,52 @@ request lifecycles, fair action selection, verification resolution, and final
 statistics. Embedded heads do not maintain a second acceptance loop or a
 parallel set of generation wrappers.
 
-The prepared-chat client surface is backend-generic. A backend implements
-`SpeculativeGenerationBackend`, supplies its own associated drafter type and
-typed execution-resource visitor handoff, and then uses the same
-`LoadedModel<B>::generate_prepared_chat_speculative` and batch APIs.
-Applications receive `RealizedDrafting<D>` alongside `LoadedModel<B>` and pass
-`drafting.as_speculative_draft()` to `generate_prepared_chat_speculative`.
-MLX uses the same generic types, with the factory supplying its native drafter.
-`SpeculativeCapability` and `SpeculativeDraftSource` are portable core values;
-absence of the capability implementation fails at the type boundary rather
-than silently falling back to ordinary generation.
+`PlannedModel` owns the loaded target, drafting resources and selected policy.
+`session.generate(GenerationRequest { .. })` handles disabled, embedded and
+external drafting with one result. Requests carry sampling, input, cancellation,
+caller stops, an output mode and a committed-event callback; they never borrow a
+drafter. `output.stats().drafting` contains scheduler diagnostics when that
+executor runs, including zero-work cancellation. Target-only execution leaves it
+absent. Backend failures retain their original sources in `BackendFailure`.
 
-Unrecognized chat templates can use `generate_prepared_text_speculative` or
-`generate_prepared_text_speculative_batch` with the same request types. These
-explicit text methods require `PreparedChat::text_generation_support()` and
-backend drafting support, without requiring a recognized semantic protocol.
-They emit `TextDelta` and `Finished`, honor checkpoint EOS and caller stops,
-and skip special tokens. Native tool declarations and required calls are
+```rust,ignore
+let mut session = LoadedModel::load_execution_plan(&factory, path, &plan)?;
+let chat = session.model_mut().prepare_chat(chat_request)?;
+let request = GenerationRequest {
+    input: PreparedChatInput::rendered_prompt(&chat),
+    output_mode: OutputMode::Semantic,
+    settings: PreparedChatGenerationSettings::default(),
+    caller_stop_sequences: &[],
+    cancellation: Default::default(),
+    control_handle: None,
+    on_event: |event| publish(event),
+};
+let forecast = session.forecast_generation(&request, &Default::default());
+let output = session.generate(request)?;
+let drafting = output.stats().drafting.as_ref();
+```
+
+A backend implements `SpeculativeGenerationBackend` and lends typed execution
+resources to the shared scheduler. `LoadedModel::into_session` supplies a
+portable target-only owner without requiring that trait. Factory loads can use
+`into_target_only()` to release drafting and retain that same portable interface.
+Explicitly assembled
+sources use `LoadedModel::drafting_session`; factories retain their complete
+realization in the returned owner.
+
+`OutputMode::Semantic` requires recognized executable semantic support.
+`OutputMode::Text` requires `PreparedChat::text_generation_support()` and emits
+literal `TextDelta` and `Finished` events. It honors checkpoint EOS and caller
+stops and skips special tokens. Native tool declarations and required calls are
 rejected; explicit thinking requires `allow_unparsed_reasoning`. Applications
-can still emulate tools using ordinary prompt text and their own output parser.
+can emulate tools using ordinary prompt text and their own output parser. The
+low-level `generate_speculative_batch` API takes one explicit output mode for
+its independently scheduled lanes.
 
-Both `generate_prepared_text` and the speculative text methods return
-`output.timing().time_to_first_token()`. Timing starts at the generation call
-and ends at the first committed token, even when Unicode buffering, a stop,
-or EOS prevents visible text. A cancelled request with no committed token
-returns `None`; speculative batch timing includes queueing from the batch call.
-The CLI automatically uses these methods for unrecognized templates.
+`output.timing().time_to_first_token()` measures the first committed token,
+even when Unicode buffering, a stop, or EOS prevents visible text. Cancellation
+without a commitment returns `None`; batch timing includes queueing from the
+batch call. The CLI chooses text output explicitly for unrecognized templates.
 
 ## Execution placement
 
@@ -143,10 +163,11 @@ Two streams on one GPU are an experiment, not an automatic optimization. The
 target and assistant can contend for the same compute and memory bandwidth.
 Compare the placement with lookahead disabled before adopting it.
 
-`PlannedModel::speculative_generation_options` exposes the proposal and
-lookahead controls retained from an automatic execution plan. Requests may use
-stricter bounds, but cannot silently replace the selected realization with a
-larger proposal capacity.
+The owner inherits proposal and lookahead controls from its execution plan.
+Explicit request modes can use stricter bounds; initial requests and later mode
+commands cannot expand those ceilings. `drafting_options()` exposes the retained
+defaults for inspection. Forecasting and generation resolve the same defaults.
+The ceilings remain attached to control state through snapshots and forks.
 
 ## Verification and cache state
 
@@ -235,14 +256,14 @@ not be interpreted as target kernel time.
 
 ## Inspector and controlled sessions
 
-Use the facade's `with_controlled_chat_speculative` or
-`with_controlled_text_speculative` to drive this same scheduler explicitly from a
-worker command loop. Controlled step records expose tentative proposals, target
-acceptance/rejection, optimistic work and bounded prediction captures. Snapshots
-require complete canonical state and explicit resource limits; see
-[execution control](execution-control.md#controlled-speculative-generation) and
-[the Inspector integration guide](lm-inspector-execution-control.md#ttft-and-speculative-inspection).
-There is no separate controlled acceptance or sampling algorithm.
+`session.with_controlled(request, options, drive)` lends explicit advancement
+with the same request, policy resolution and result as `generate`. The worker
+can call `control.step()` or `control.run()` without choosing a drafting path.
+A `GenerationStep` retains ordinary records or speculative proposal/verification
+evidence. Inspectors borrow `control.speculative()` for proposal-aware snapshots,
+interventions and canonical-boundary forecasts, or `control.ordinary()` for the
+ordinary typed controller. Returning early cancels and settles unfinished work.
+See [execution control](execution-control.md#controlled-speculative-generation).
 
 Controlled sessions also support serial `fork`/`exchange` at exact canonical
 boundaries, prospective token forcing and temperature/reseed changes. Target and

@@ -1,6 +1,6 @@
 use super::*;
 use eredu::api::{
-    ControlledSpeculativeOptions, SpeculativeControlError,
+    GenerationControlOptions, SpeculativeControlError,
     SpeculativeProposalDisposition as Disposition,
 };
 use eredu_core::{
@@ -30,9 +30,9 @@ fn setup() -> (
     };
     (model, chat, settings)
 }
-fn options() -> ControlledSpeculativeOptions {
-    ControlledSpeculativeOptions {
-        snapshots: Some(SnapshotLimits {
+fn options() -> GenerationControlOptions {
+    GenerationControlOptions {
+        speculative_snapshots: Some(SnapshotLimits {
             max_snapshots: 2,
             max_branches: 0,
             retained_bytes: 16 << 20,
@@ -54,75 +54,113 @@ fn speculative_mode_commands_share_uninterrupted_delivery_and_controlled_handoff
         let handle = GenerationControlHandle::default();
         let mut events = Vec::new();
         let mut delivered = 0;
-        let request = PreparedChatSpeculativeGenerationRequest {
-            control_handle: Some(&handle),
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-            drafting: SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    speculation,
-                )),
-                ..settings
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |event| {
-                if matches!(event, SemanticEvent::TextDelta(_)) {
-                    delivered += 1;
-                    match delivered {
-                        1 => handle
-                            .request_decoding_mode(DecodingMode::Autoregressive)
-                            .unwrap(),
-                        2 => handle
-                            .request_decoding_mode(DecodingMode::SelfSpeculation(speculation))
-                            .unwrap(),
-                        _ => {}
+        let request = (
+            SpeculativeDraft::Embedded,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: Some(&handle),
+                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        speculation,
+                    )),
+                    ..settings
+                },
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |event| {
+                    if matches!(event, SemanticEvent::TextDelta(_)) {
+                        delivered += 1;
+                        match delivered {
+                            1 => handle
+                                .request_decoding_mode(DecodingMode::Autoregressive)
+                                .unwrap(),
+                            2 => handle
+                                .request_decoding_mode(DecodingMode::SelfSpeculation(speculation))
+                                .unwrap(),
+                            _ => {}
+                        }
                     }
-                }
-                events.push(event);
+                    events.push(event);
+                },
             },
-        };
+        );
         let output = if controlled {
-            model.with_controlled_text_speculative(request, options(), |session| {
-                session.step()?;
-                assert_eq!(session.decoding_state().unwrap().pending, Some(DecodingMode::Autoregressive));
-                assert!(matches!(session.request_decoding_mode(DecodingMode::SelfSpeculation(speculation)),
-                    Err(SpeculativeControlError::DecodingMode(DecodingModeError::ModeChangePending))));
-                let mut acknowledgements = Vec::new();
-                let mut saved = None;
-                while let Some(step) = session.step()? {
-                    if let Some(ack) = step.decoding.unwrap().acknowledgement {
-                        if acknowledgements.last() != Some(&ack.committed_position) {
-                            acknowledgements.push(ack.committed_position);
-                            assert!(step.drafted.is_none() && step.committed_token_ids.is_empty());
+            {
+                let (drafting, mut request) = request;
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    options(),
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        session.step()?;
+                        assert_eq!(
+                            session.decoding_state().unwrap().pending,
+                            Some(DecodingMode::Autoregressive)
+                        );
+                        assert!(matches!(
+                            session
+                                .request_decoding_mode(DecodingMode::SelfSpeculation(speculation)),
+                            Err(SpeculativeControlError::DecodingMode(
+                                DecodingModeError::ModeChangePending
+                            ))
+                        ));
+                        let mut acknowledgements = Vec::new();
+                        let mut saved = None;
+                        while let Some(step) = session.step()? {
+                            if let Some(ack) = step.decoding.unwrap().acknowledgement {
+                                if acknowledgements.last() != Some(&ack.committed_position) {
+                                    acknowledgements.push(ack.committed_position);
+                                    assert!(
+                                        step.drafted.is_none()
+                                            && step.committed_token_ids.is_empty()
+                                    );
+                                }
+                                if ack.committed_position == 1 && saved.is_none() {
+                                    saved = Some(session.snapshot()?);
+                                }
+                            }
                         }
-                        if ack.committed_position == 1 && saved.is_none() {
-                            saved = Some(session.snapshot()?);
+                        assert_eq!(acknowledgements, [1, 2]);
+                        // Restoring the first settled row preserves its scores and the
+                        // next pending command without replaying a committed suffix.
+                        let prefix = session.token_ids().to_vec();
+                        let spent = session.snapshot_usage().cumulative_copy_bytes;
+                        session.restore(saved.as_ref().unwrap())?;
+                        assert_eq!(session.token_ids(), [7]);
+                        assert_eq!(
+                            session.decoding_state().unwrap().active,
+                            DecodingMode::Autoregressive
+                        );
+                        assert!(session.snapshot_usage().cumulative_copy_bytes > spent);
+                        while session.step()?.is_some() {
+                            if session.token_ids().len() == 2 {
+                                session.request_decoding_mode(DecodingMode::SelfSpeculation(
+                                    speculation,
+                                ))?;
+                            }
                         }
-                    }
-                }
-                assert_eq!(acknowledgements, [1, 2]);
-                // Restoring the first settled row preserves its scores and the
-                // next pending command without replaying a committed suffix.
-                let prefix = session.token_ids().to_vec();
-                let spent = session.snapshot_usage().cumulative_copy_bytes;
-                session.restore(saved.as_ref().unwrap())?;
-                assert_eq!(session.token_ids(), [7]);
-                assert_eq!(session.decoding_state().unwrap().active, DecodingMode::Autoregressive);
-                assert!(session.snapshot_usage().cumulative_copy_bytes > spent);
-                while session.step()?.is_some() {
-                    if session.token_ids().len() == 2 {
-                        session.request_decoding_mode(DecodingMode::SelfSpeculation(speculation))?;
-                    }
-                }
-                assert_eq!(session.token_ids(), prefix);
-                Ok(())
-            }).unwrap()
+                        assert_eq!(session.token_ids(), prefix);
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap()
         } else {
-            model.generate_prepared_text_speculative(request).unwrap()
+            {
+                let (drafting, mut request) = request;
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap()
         };
         assert!(handle.decoding_state().unwrap().terminal);
-        assert_eq!(handle.request_decoding_mode(DecodingMode::Autoregressive), Err(DecodingModeError::Terminal));
+        assert_eq!(
+            handle.request_decoding_mode(DecodingMode::Autoregressive),
+            Err(DecodingModeError::Terminal)
+        );
         results.push((output.token_ids().to_vec(), events));
     }
     assert_eq!(results[0].0, [7, 11, 11, 11, 17, 11]);
@@ -135,46 +173,91 @@ fn speculative_mode_commands_share_uninterrupted_delivery_and_controlled_handoff
 fn retained_draft_source_admits_initial_ar_and_forecasts_only_causal_work() {
     use eredu_core::decoding::{DecodingMode, SpeculationOptions};
     use eredu_core::execution_control::GenerationControlHandle;
-    let speculation = SpeculationOptions::default().with_proposal_capacity(std::num::NonZeroUsize::new(1).unwrap());
+    let speculation = SpeculationOptions::default()
+        .with_proposal_capacity(std::num::NonZeroUsize::new(1).unwrap());
     let mut results = Vec::new();
     for controlled in [false, true] {
         let (mut model, chat, mut settings) = setup();
         settings.decoding_mode = None;
         let handle = GenerationControlHandle::default();
         let mut delivered = 0;
-        let request = PreparedChatSpeculativeGenerationRequest {
-            control_handle: Some(&handle),
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-            drafting: SpeculativeDraft::Embedded,
-            settings,
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |event| {
-                if matches!(event, SemanticEvent::TextDelta(_)) {
-                    delivered += 1;
-                    if delivered == 2 {
-                        handle
-                            .request_decoding_mode(DecodingMode::SelfSpeculation(speculation))
-                            .unwrap();
+        let mut request = (
+            SpeculativeDraft::Embedded,
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
+                control_handle: Some(&handle),
+                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+
+                settings,
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |event| {
+                    if matches!(event, SemanticEvent::TextDelta(_)) {
+                        delivered += 1;
+                        if delivered == 2 {
+                            handle
+                                .request_decoding_mode(DecodingMode::SelfSpeculation(speculation))
+                                .unwrap();
+                        }
                     }
-                }
+                },
             },
-        };
-        let forecast = model.forecast_prepared_speculative_generation(&request, &Default::default()).unwrap();
+        );
+        let forecast = model
+            .drafting_session(request.0.reborrow(), None)
+            .forecast_generation(&request.1, &Default::default())
+            .unwrap();
         assert_eq!(forecast.speculative.as_ref().unwrap().max_draft_tokens, 0);
-        assert_eq!(forecast.speculative.as_ref().unwrap().scheduler.lookahead_blocks, 0);
+        assert_eq!(
+            forecast
+                .speculative
+                .as_ref()
+                .unwrap()
+                .scheduler
+                .lookahead_blocks,
+            0
+        );
         for pool in &forecast.estimate.domains {
-            assert!(pool.phases.iter().all(|phase| phase.phase != eredu_runtime::memory_estimation::MemoryPhase::SpeculativeDraft));
+            assert!(pool.phases.iter().all(|phase| phase.phase
+                != eredu_runtime::memory_estimation::MemoryPhase::SpeculativeDraft));
         }
         let output = if controlled {
-            model.with_controlled_text_speculative(request, options(), |session| {
-                session.step()?;
-                assert_eq!(session.decoding_state().unwrap().active, DecodingMode::Autoregressive);
-                while session.step()?.is_some() {}
-                assert_eq!(session.decoding_state().unwrap().acknowledgement.unwrap().committed_position, 2);
-                Ok(())
-            }).unwrap()
-        } else { model.generate_prepared_text_speculative(request).unwrap() };
+            {
+                let (drafting, mut request) = request;
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).with_controlled(
+                    request,
+                    options(),
+                    |session| {
+                        let session = session.speculative().expect("speculative executor");
+                        session.step()?;
+                        assert_eq!(
+                            session.decoding_state().unwrap().active,
+                            DecodingMode::Autoregressive
+                        );
+                        while session.step()?.is_some() {}
+                        assert_eq!(
+                            session
+                                .decoding_state()
+                                .unwrap()
+                                .acknowledgement
+                                .unwrap()
+                                .committed_position,
+                            2
+                        );
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap()
+        } else {
+            {
+                let (drafting, mut request) = request;
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap()
+        };
         results.push(output.token_ids().to_vec());
     }
     assert_eq!(results[0], [7, 11, 11, 11, 17, 11]);
@@ -189,47 +272,68 @@ fn speculative_branch_mailboxes_preserve_inactive_commands_and_close_on_release(
     let parent = GenerationControlHandle::default();
     let child_commands = GenerationControlHandle::default();
     let mut limits = options();
-    limits.snapshots.as_mut().unwrap().max_branches = 1;
+    limits.speculative_snapshots.as_mut().unwrap().max_branches = 1;
     let speculation = SpeculationOptions::default()
         .with_proposal_capacity(std::num::NonZeroUsize::new(1).unwrap());
-    model.with_controlled_text_speculative(
-        PreparedChatSpeculativeGenerationRequest {
-            control_handle: Some(&parent),
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-            drafting: SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    speculation,
-                )),
-                ..settings
+    model
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
+                control_handle: Some(&parent),
+                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        speculation,
+                    )),
+                    ..settings
+                },
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
             },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
-        }, limits, |session| {
-            session.step()?;
-            let saved = session.snapshot()?;
-            let spent = session.snapshot_usage().cumulative_copy_bytes;
-            let child = session.fork(&saved)?;
-            assert!(session.snapshot_usage().cumulative_copy_bytes > spent);
-            parent.request_decoding_mode(DecodingMode::Autoregressive)?;
-            session.exchange(&child)?;
-            session.bind_control_handle(&child_commands)?;
-            assert_eq!(session.decoding_state().unwrap().pending, None);
-            assert_eq!(parent.decoding_state().unwrap().pending, Some(DecodingMode::Autoregressive));
-            let changed = DecodingMode::SelfSpeculation(speculation.with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()));
-            child_commands.request_decoding_mode(changed)?;
-            session.exchange(&child)?;
-            assert_eq!(session.decoding_state().unwrap().pending, Some(DecodingMode::Autoregressive));
-            assert_eq!(child_commands.decoding_state().unwrap().pending, Some(changed));
-            session.exchange(&child)?;
-            assert_eq!(session.decoding_state().unwrap().pending, Some(changed));
-            session.release_branch(&child)?;
-            assert_eq!(parent.request_decoding_mode(DecodingMode::Autoregressive), Err(DecodingModeError::Terminal));
-            assert!(!child_commands.decoding_state().unwrap().terminal);
-            Ok(())
-        },
-    ).unwrap();
+            limits,
+            |session| {
+                let session = session.speculative().expect("speculative executor");
+                session.step()?;
+                let saved = session.snapshot()?;
+                let spent = session.snapshot_usage().cumulative_copy_bytes;
+                let child = session.fork(&saved)?;
+                assert!(session.snapshot_usage().cumulative_copy_bytes > spent);
+                parent.request_decoding_mode(DecodingMode::Autoregressive)?;
+                session.exchange(&child)?;
+                session.bind_control_handle(&child_commands)?;
+                assert_eq!(session.decoding_state().unwrap().pending, None);
+                assert_eq!(
+                    parent.decoding_state().unwrap().pending,
+                    Some(DecodingMode::Autoregressive)
+                );
+                let changed = DecodingMode::SelfSpeculation(
+                    speculation.with_proposal_capacity(std::num::NonZeroUsize::new(2).unwrap()),
+                );
+                child_commands.request_decoding_mode(changed)?;
+                session.exchange(&child)?;
+                assert_eq!(
+                    session.decoding_state().unwrap().pending,
+                    Some(DecodingMode::Autoregressive)
+                );
+                assert_eq!(
+                    child_commands.decoding_state().unwrap().pending,
+                    Some(changed)
+                );
+                session.exchange(&child)?;
+                assert_eq!(session.decoding_state().unwrap().pending, Some(changed));
+                session.release_branch(&child)?;
+                assert_eq!(
+                    parent.request_decoding_mode(DecodingMode::Autoregressive),
+                    Err(DecodingModeError::Terminal)
+                );
+                assert!(!child_commands.decoding_state().unwrap().terminal);
+                Ok(())
+            },
+        )
+        .unwrap();
     assert!(child_commands.decoding_state().unwrap().terminal);
 }
 
@@ -239,57 +343,83 @@ fn speculative_forecast_covers_a_pending_return_from_ar_without_advancing() {
     let (mut model, chat, settings) = setup();
     let speculation = SpeculationOptions::default()
         .with_proposal_capacity(std::num::NonZeroUsize::new(1).unwrap());
-    model.with_controlled_text_speculative(
-        PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-            drafting: SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    speculation,
-                )),
-                ..settings
+    model
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
+                control_handle: None,
+                input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+
+                settings: eredu::api::PreparedChatGenerationSettings {
+                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                        speculation,
+                    )),
+                    ..settings
+                },
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| {},
             },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
-        }, options(), |session| {
-            session.step()?;
-            let settled = session.forecast_remaining_generation(0, &Default::default()).unwrap();
-            assert_eq!(settled.continuation.target.additional_input_tokens, 0);
-            session.request_decoding_mode(DecodingMode::Autoregressive)?;
-            let prefix = session.token_ids().to_vec();
-            let usage = session.snapshot_usage();
-            let handoff = session.forecast_remaining_generation(0, &Default::default()).unwrap();
-            assert_eq!(handoff.continuation.target.additional_input_tokens, 1);
-            assert_eq!(handoff.continuation.settlement_input_tokens, 1);
-            for pool in &handoff.estimate.domains {
-                assert_eq!(pool.phases.iter().map(|phase| phase.phase).collect::<Vec<_>>(), vec![
-                    eredu_runtime::memory_estimation::MemoryPhase::ContinuationStart,
-                    eredu_runtime::memory_estimation::MemoryPhase::SpeculativeVerification,
-                    eredu_runtime::memory_estimation::MemoryPhase::SpeculativeCommit,
-                ]);
-                assert!(pool.phases[1].workspace.upper_bytes.unwrap() > 0);
-            }
-            assert_eq!(session.token_ids(), prefix);
-            assert_eq!(session.snapshot_usage(), usage);
-            session.step()?;
-            let ar = session.forecast_remaining_generation(3, &Default::default()).unwrap();
-            assert_eq!(ar.speculative.max_draft_tokens, 0);
-            let prefix = session.token_ids().to_vec();
-            let usage = session.snapshot_usage();
-            let next = DecodingMode::SelfSpeculation(speculation.with_proposal_capacity(std::num::NonZeroUsize::new(3).unwrap()));
-            session.request_decoding_mode(next)?;
-            let pending = session.forecast_remaining_generation(3, &Default::default()).unwrap();
-            assert_eq!(pending.decoding.unwrap().pending, Some(next));
-            assert_eq!(pending.speculative.max_draft_tokens, 3);
-            assert!(pending.continuation.target.additional_input_tokens > ar.continuation.target.additional_input_tokens);
-            assert_eq!(session.token_ids(), prefix);
-            assert_eq!(session.snapshot_usage(), usage);
-            assert_eq!(session.decoding_state().unwrap().pending, Some(next));
-            Ok(())
-        },
-    ).unwrap();
+            options(),
+            |session| {
+                let session = session.speculative().expect("speculative executor");
+                session.step()?;
+                let settled = session
+                    .forecast_remaining_generation(0, &Default::default())
+                    .unwrap();
+                assert_eq!(settled.continuation.target.additional_input_tokens, 0);
+                session.request_decoding_mode(DecodingMode::Autoregressive)?;
+                let prefix = session.token_ids().to_vec();
+                let usage = session.snapshot_usage();
+                let handoff = session
+                    .forecast_remaining_generation(0, &Default::default())
+                    .unwrap();
+                assert_eq!(handoff.continuation.target.additional_input_tokens, 1);
+                assert_eq!(handoff.continuation.settlement_input_tokens, 1);
+                for pool in &handoff.estimate.domains {
+                    assert_eq!(
+                        pool.phases
+                            .iter()
+                            .map(|phase| phase.phase)
+                            .collect::<Vec<_>>(),
+                        vec![
+                            eredu_runtime::memory_estimation::MemoryPhase::ContinuationStart,
+                            eredu_runtime::memory_estimation::MemoryPhase::SpeculativeVerification,
+                            eredu_runtime::memory_estimation::MemoryPhase::SpeculativeCommit,
+                        ]
+                    );
+                    assert!(pool.phases[1].workspace.upper_bytes.unwrap() > 0);
+                }
+                assert_eq!(session.token_ids(), prefix);
+                assert_eq!(session.snapshot_usage(), usage);
+                session.step()?;
+                let ar = session
+                    .forecast_remaining_generation(3, &Default::default())
+                    .unwrap();
+                assert_eq!(ar.speculative.max_draft_tokens, 0);
+                let prefix = session.token_ids().to_vec();
+                let usage = session.snapshot_usage();
+                let next = DecodingMode::SelfSpeculation(
+                    speculation.with_proposal_capacity(std::num::NonZeroUsize::new(3).unwrap()),
+                );
+                session.request_decoding_mode(next)?;
+                let pending = session
+                    .forecast_remaining_generation(3, &Default::default())
+                    .unwrap();
+                assert_eq!(pending.decoding.unwrap().pending, Some(next));
+                assert_eq!(pending.speculative.max_draft_tokens, 3);
+                assert!(
+                    pending.continuation.target.additional_input_tokens
+                        > ar.continuation.target.additional_input_tokens
+                );
+                assert_eq!(session.token_ids(), prefix);
+                assert_eq!(session.snapshot_usage(), usage);
+                assert_eq!(session.decoding_state().unwrap().pending, Some(next));
+                Ok(())
+            },
+        )
+        .unwrap();
 }
 
 #[test]
@@ -298,21 +428,32 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
     use eredu_core::{capture::*, intervention::*};
     for factor in [1.0, 2.0] {
         let (mut model, chat, settings) = setup();
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
-            drafting: SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    Default::default(),
-                )),
-                ..settings
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
+        let request = || {
+            (
+                SpeculativeDraft::Embedded,
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            Default::default(),
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+            )
         };
-        let baseline = model.generate_prepared_chat_speculative(request()).unwrap();
+        let baseline = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         let plan = model
             .prepare_speculative_activations(SpeculativeActivationPlan {
                 schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
@@ -328,14 +469,17 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             .unwrap();
         let identity = plan.identity().to_owned();
         let mut records = Vec::new();
-        let output = model
-            .with_controlled_chat_speculative(
-                request(),
-                ControlledSpeculativeOptions {
-                    activations: Some(plan.clone()),
+        let output = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).with_controlled(
+                request,
+                GenerationControlOptions {
+                    speculative_activations: Some(plan.clone()),
                     ..options()
                 },
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     while let Some(step) = session.step()? {
                         assert!(step.captures.is_empty());
                         records.extend(step.activations);
@@ -344,7 +488,8 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                     Ok(())
                 },
             )
-            .unwrap();
+        }
+        .unwrap();
         assert_eq!(output.token_ids()[0], (7.0 * factor) as u32);
         if factor == 1.0 {
             assert_eq!(output.token_ids(), baseline.token_ids());
@@ -358,19 +503,25 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             .flat_map(|r| &r.captures.interventions)
             .any(|edit| edit.outcome == InterventionOutcome::Applied));
         let mut continuous = Vec::new();
-        let streamed = model
-            .generate_observed_chat_speculative(
-                request(),
-                ControlledSpeculativeOptions {
-                    activations: Some(plan.clone()),
+        let streamed = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate_observed(
+                request,
+                GenerationControlOptions {
+                    speculative_activations: Some(plan.clone()),
                     ..Default::default()
                 },
                 |step| {
+                    let eredu::api::GenerationStep::Speculative(step) = step else {
+                        panic!("expected speculative action")
+                    };
                     continuous.extend(step.activations);
                     std::ops::ControlFlow::Continue(())
                 },
             )
-            .unwrap();
+        }
+        .unwrap();
         assert_eq!(streamed.token_ids(), output.token_ids());
         assert_eq!(continuous.len(), records.len());
         for (a, b) in continuous.iter().zip(&records) {
@@ -381,21 +532,30 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             assert_eq!(a.captures.records, b.captures.records);
             assert_eq!(a.captures.interventions, b.captures.interventions);
         }
-        let fresh = model.generate_prepared_chat_speculative(request()).unwrap();
+        let fresh = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         assert_eq!(fresh.token_ids(), baseline.token_ids());
         let (mut other, _, _) = setup();
         let mut entered = false;
-        let result = other.with_controlled_chat_speculative(
-            request(),
-            ControlledSpeculativeOptions {
-                activations: Some(plan),
-                ..Default::default()
-            },
-            |_| {
-                entered = true;
-                Ok(())
-            },
-        );
+        let result = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            other.drafting_session(drafting, None).with_controlled(
+                request,
+                GenerationControlOptions {
+                    speculative_activations: Some(plan),
+                    ..Default::default()
+                },
+                |_| {
+                    entered = true;
+                    Ok(())
+                },
+            )
+        };
         assert!(result.is_err());
         assert!(!entered);
     }
@@ -422,58 +582,62 @@ fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() 
                 },
             })
             .unwrap();
-        let result = model.with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                control_handle: None,
-                input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
-                drafting: SpeculativeDraft::Embedded,
-                settings: eredu::api::PreparedChatGenerationSettings {
-                    decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                        Default::default(),
-                    )),
-                    ..settings
+        let result = model
+            .drafting_session(SpeculativeDraft::Embedded, None)
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            Default::default(),
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| panic!("failed prefill published"),
                 },
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| panic!("failed prefill published"),
-            },
-            ControlledSpeculativeOptions {
-                activations: Some(plan),
-                trace_limits: eredu::api::TraceLimits {
-                    per_record_bytes: transport_bytes,
-                    total_bytes: transport_bytes,
+                GenerationControlOptions {
+                    speculative_activations: Some(plan),
+                    trace_limits: eredu::api::TraceLimits {
+                        per_record_bytes: transport_bytes,
+                        total_bytes: transport_bytes,
+                    },
+                    ..Default::default()
                 },
-                ..Default::default()
-            },
-            |session| {
-                let error = session.step().unwrap_err();
-                let SpeculativeControlError::Backend(source) = &error else {
-                    panic!("lost original backend error: {error}");
-                };
-                assert!(std::error::Error::source(source).is_some());
-                let evidence = session.take_activation_evidence();
-                if transport_bytes == 1 {
+                |session| {
+                    let session = session.speculative().expect("speculative executor");
+                    let error = session.step().unwrap_err();
+                    let SpeculativeControlError::Backend(source) = &error else {
+                        panic!("lost original backend error: {error}");
+                    };
+                    assert!(std::error::Error::source(source).is_some());
+                    let evidence = session.take_activation_evidence();
+                    if transport_bytes == 1 {
+                        assert!(matches!(
+                            evidence,
+                            Err(SpeculativeControlError::Capture(CaptureError::Limit {
+                                budget: CaptureBudget::Encoded,
+                                ..
+                            }))
+                        ));
+                    } else {
+                        let evidence = evidence?.unwrap();
+                        assert_eq!(evidence.sequence, 0);
+                        assert!(!evidence.activation.completed);
+                        assert_eq!(evidence.activation.origin.committed_tokens, 0);
+                    }
+                    assert!(session.take_activation_evidence()?.is_none());
                     assert!(matches!(
-                        evidence,
-                        Err(SpeculativeControlError::Capture(CaptureError::Limit {
-                            budget: CaptureBudget::Encoded,
-                            ..
-                        }))
+                        session.step(),
+                        Err(SpeculativeControlError::Failed)
                     ));
-                } else {
-                    let evidence = evidence?.unwrap();
-                    assert_eq!(evidence.sequence, 0);
-                    assert!(!evidence.activation.completed);
-                    assert_eq!(evidence.activation.origin.committed_tokens, 0);
-                }
-                assert!(session.take_activation_evidence()?.is_none());
-                assert!(matches!(
-                    session.step(),
-                    Err(SpeculativeControlError::Failed)
-                ));
-                Err(error)
-            },
-        );
+                    Err(error.into())
+                },
+            );
         assert!(result.is_err());
     }
 }
@@ -483,13 +647,15 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
     let (mut model, chat, settings) = setup();
     let mut expected_events = Vec::new();
     let expected = model
-        .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::prepared_backend_input(
                 &chat,
                 vec![CONTROL_REJECTION_PROMPT_TOKEN],
             ),
-            drafting: SpeculativeDraft::Embedded,
+
             settings: eredu::api::PreparedChatGenerationSettings {
                 decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                     Default::default(),
@@ -504,14 +670,16 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
     let mut events = Vec::new();
     let mut steps = Vec::new();
     let output = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(
                     &chat,
                     vec![CONTROL_REJECTION_PROMPT_TOKEN],
                 ),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -524,6 +692,7 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
             },
             options(),
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 assert_eq!(session.status(), Status::Prefill);
                 assert!(session.token_ids().is_empty());
                 assert_eq!(session.timing().time_to_first_token(), None);
@@ -589,11 +758,13 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
     let mut events = Vec::new();
     let mut replayed = Vec::new();
     model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -604,11 +775,12 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
                 cancellation: Default::default(),
                 on_event: |e| events.push(e),
             },
-            ControlledSpeculativeOptions {
-                activations: Some(activations),
+            GenerationControlOptions {
+                speculative_activations: Some(activations),
                 ..options()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 assert!(matches!(
                     session.snapshot(),
                     Err(SpeculativeControlError::NotQuiescent)
@@ -691,11 +863,13 @@ fn speculative_ttft_excludes_pause_and_delivery_and_counts_invisible_first_commi
     let wall = Instant::now();
     let mut delivered_timing = None;
     let output = model
-        .with_controlled_text_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Text,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -708,6 +882,7 @@ fn speculative_ttft_excludes_pause_and_delivery_and_counts_invisible_first_commi
             },
             options(),
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 std::thread::sleep(Duration::from_millis(60));
                 let step = session.step()?.unwrap();
                 assert_eq!(step.committed_token_ids, [7]);
@@ -726,11 +901,13 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
     for before in [true, false] {
         let (mut model, chat, settings) = setup();
         let output = model
-            .with_controlled_chat_speculative(
-                PreparedChatSpeculativeGenerationRequest {
+            .drafting_session(SpeculativeDraft::Embedded, None)
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
                     input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                    drafting: SpeculativeDraft::Embedded,
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             Default::default(),
@@ -743,6 +920,7 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
                 },
                 options(),
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     if !before {
                         session.step()?;
                         session.step()?;
@@ -766,11 +944,13 @@ fn cancellation_before_prefill_and_during_verification_never_commits_drafts() {
 fn trace_limit_failure_is_terminal_even_if_the_controller_ignores_it() {
     let (mut model, chat, settings) = setup();
     let error = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(SpeculativeDraft::Embedded, None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                drafting: SpeculativeDraft::Embedded,
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         Default::default(),
@@ -781,7 +961,7 @@ fn trace_limit_failure_is_terminal_even_if_the_controller_ignores_it() {
                 cancellation: Default::default(),
                 on_event: |_| {},
             },
-            ControlledSpeculativeOptions {
+            GenerationControlOptions {
                 trace_limits: eredu::api::TraceLimits {
                     per_record_bytes: 1,
                     total_bytes: 1,
@@ -789,6 +969,7 @@ fn trace_limit_failure_is_terminal_even_if_the_controller_ignores_it() {
                 ..options()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 assert!(session.step().is_err());
                 assert!(matches!(
                     session.step(),
@@ -807,11 +988,13 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
     for pass in 0..2 {
         let (mut model, chat, settings) = setup();
         model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
+            .drafting_session(SpeculativeDraft::Embedded, None)
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Text,
                     control_handle: None,
                     input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                    drafting: SpeculativeDraft::Embedded,
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             Default::default(),
@@ -822,8 +1005,8 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
                     cancellation: Default::default(),
                     on_event: |_| {},
                 },
-                ControlledSpeculativeOptions {
-                    snapshots: Some(SnapshotLimits {
+                GenerationControlOptions {
+                    speculative_snapshots: Some(SnapshotLimits {
                         max_snapshots: 1,
                         max_branches: 0,
                         retained_bytes: 16 << 20,
@@ -832,6 +1015,7 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
                     ..Default::default()
                 },
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     session.step()?;
                     if pass == 0 {
                         foreign = Some(session.snapshot()?);
@@ -858,16 +1042,18 @@ fn snapshot_handles_are_run_scoped_and_failed_admission_does_not_advance() {
 fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_handles() {
     let (mut model, chat, settings) = setup();
     let mut opts = options();
-    opts.snapshots.as_mut().unwrap().max_branches = 1;
+    opts.speculative_snapshots.as_mut().unwrap().max_branches = 1;
     let mut foreign = None;
     let events = std::cell::RefCell::new(Vec::new());
     for pass in 0..2 {
         model
-            .with_controlled_text_speculative(
-                PreparedChatSpeculativeGenerationRequest {
+            .drafting_session(SpeculativeDraft::Embedded, None)
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Text,
                     control_handle: None,
                     input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                    drafting: SpeculativeDraft::Embedded,
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             Default::default(),
@@ -880,6 +1066,7 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
                 },
                 opts.clone(),
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     session.step()?;
                     if pass == 1 {
                         assert!(matches!(
@@ -990,15 +1177,20 @@ fn conversion_retention_queries_preserve_speculative_proposals_and_budgets() {
         let mut observed_pending = false;
         let mut committed = Vec::new();
         let output = model
-            .with_controlled_chat_speculative(
-                PreparedChatSpeculativeGenerationRequest {
+            .drafting_session(
+                if embedded {
+                    SpeculativeDraft::Embedded
+                } else {
+                    SpeculativeDraft::External(&mut draft)
+                },
+                None,
+            )
+            .with_controlled(
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
                     input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-                    drafting: if embedded {
-                        SpeculativeDraft::Embedded
-                    } else {
-                        SpeculativeDraft::External(&mut draft)
-                    },
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             Default::default(),
@@ -1011,6 +1203,7 @@ fn conversion_retention_queries_preserve_speculative_proposals_and_budgets() {
                 },
                 options(),
                 |session| {
+                    let session = session.speculative().expect("speculative executor");
                     loop {
                         let status = session.status();
                         let tokens = session.token_ids().to_vec();
@@ -1055,39 +1248,50 @@ fn controlled_speculative_trim_preserves_canonical_state_and_rejects_transaction
         let mut drafter = MockDrafter {
             retention: Some(conversion_retention::budget(&Default::default())),
         };
-        let make_request = |drafting| PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
-            drafting,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    Default::default(),
-                )),
-                ..settings
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
+        let make_request = |drafting| {
+            (
+                drafting,
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::prepared_backend_input(&chat, vec![0]),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            Default::default(),
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+            )
         };
         let mut baseline_drafter = MockDrafter::default();
-        let baseline = model
-            .generate_prepared_chat_speculative(make_request(if external {
+        let baseline = {
+            let (drafting, mut request) = make_request(if external {
                 SpeculativeDraft::External(&mut baseline_drafter)
             } else {
                 SpeculativeDraft::Embedded
-            }))
-            .unwrap();
+            });
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         let mut rejected = false;
         let mut trimmed = false;
-        let output = model
-            .with_controlled_chat_speculative(
-                make_request(if external {
-                    SpeculativeDraft::External(&mut drafter)
-                } else {
-                    SpeculativeDraft::Embedded
-                }),
-                options(),
-                |session| {
+        let output = {
+            let (drafting, mut request) = make_request(if external {
+                SpeculativeDraft::External(&mut drafter)
+            } else {
+                SpeculativeDraft::Embedded
+            });
+            request.output_mode = eredu::api::OutputMode::Semantic;
+            model
+                .drafting_session(drafting, None)
+                .with_controlled(request, options(), |session| {
+                    let session = session.speculative().expect("speculative executor");
                     assert!(matches!(
                         session.trim_parameter_conversions(),
                         Err(ParameterConversionTrimError::NotQuiescent)
@@ -1132,9 +1336,9 @@ fn controlled_speculative_trim_preserves_canonical_state_and_rejects_transaction
                         }
                     }
                     Ok(())
-                },
-            )
-            .unwrap();
+                })
+        }
+        .unwrap();
         assert_eq!(output.token_ids(), baseline.token_ids());
         assert!(trimmed);
         assert!(rejected);

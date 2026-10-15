@@ -1,7 +1,8 @@
 //! Controlled speculation shares facade preparation and the ordinary scheduler.
 
-use super::request::PreparedGenerationMode;
-use super::{LoadedModel, PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest};
+use super::request::OutputMode;
+use super::request::SourceRequest;
+use super::{LoadedModel, PreparedChatError};
 pub use eredu_core::speculative::{
     AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationDiscovery,
     SpeculativeActivationOrigin, SpeculativeActivationPhase, SpeculativeActivationPlan,
@@ -16,18 +17,19 @@ pub use eredu_runtime::memory_forecast::{
     EmbeddedContinuationMemoryPlan, SpeculativeContinuationForecast,
     SpeculativeContinuationMemoryPlan,
 };
+use eredu_runtime::speculative::ControlledSpeculativeOptions;
 pub use eredu_runtime::speculative::{
-    ControlledSpeculativeActivation, ControlledSpeculativeOptions, ControlledSpeculativeSession,
-    ControlledSpeculativeStep, SpeculativeBranchHandle, SpeculativeBranchInfo,
-    SpeculativeProposalDisposition, SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
+    ControlledSpeculativeActivation, ControlledSpeculativeSession, ControlledSpeculativeStep,
+    SpeculativeBranchHandle, SpeculativeBranchInfo, SpeculativeProposalDisposition,
+    SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
 };
 
 /// Preparation or controlled speculative execution failure, with neutral causes.
 #[derive(Debug, thiserror::Error)]
-pub enum ControlledSpeculativeGenerationError {
+pub(super) enum ControlledSpeculativeGenerationError {
     /// Existing speculative admission, tokenizer, constraint or backend failure.
     #[error(transparent)]
-    Prepared(#[from] PreparedChatSpeculativeError),
+    Prepared(#[from] PreparedChatError),
     /// Controlled advancement, snapshot or delivery failure.
     #[error(transparent)]
     Control(#[from] SpeculativeControlError),
@@ -104,107 +106,12 @@ where
     B: SpeculativeGenerationBackend
         + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>,
 {
-    /// Runs the shared controlled driver continuously, delivering each bounded
-    /// speculative step immediately. Breaking the callback cancels and settles
-    /// execution through the same scheduler. Use the scoped controlled API when
-    /// aborted invocation evidence must be drained after a failed action.
-    pub fn generate_observed_chat_speculative<'a, F, D>(
+    pub(super) fn with_controlled_speculative<'a, F, D>(
         &mut self,
-        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
-        options: ControlledSpeculativeOptions,
-        on_step: D,
-    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
-    where
-        F: FnMut(SemanticEvent),
-        D: FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
-    {
-        self.with_controlled_chat_speculative(request, options, continuous_steps(on_step))
-    }
-
-    /// Literal-text equivalent of `generate_observed_chat_speculative`, sharing
-    /// the ordinary decoding, termination and controlled advancement policy.
-    pub fn generate_observed_text_speculative<'a, F, D>(
-        &mut self,
-        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
-        options: ControlledSpeculativeOptions,
-        on_step: D,
-    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
-    where
-        F: FnMut(SemanticEvent),
-        D: FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
-    {
-        self.with_controlled_text_speculative(request, options, continuous_steps(on_step))
-    }
-
-    /// Lends a controlled speculative chat to an Inspector or worker command loop.
-    /// Uses the same drafting, acceptance, stop, decoding and cancellation path as
-    /// `generate_prepared_chat_speculative`. No token is generated before `step`.
-    /// Pausing means returning to the command loop without calling `step`.
-    /// Native resources stay borrowed for the closure; unfinished work is cancelled
-    /// and safely settled when it returns. The returned output includes active TTFT.
-    pub fn with_controlled_chat_speculative<'a, F, D>(
-        &mut self,
-        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
+        request: SourceRequest<'a, B, B::Drafter, F>,
         options: ControlledSpeculativeOptions,
         drive: D,
-    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
-    where
-        F: FnMut(SemanticEvent),
-        D: FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError>,
-    {
-        self.with_controlled_speculative(request, options, drive, PreparedGenerationMode::Semantic)
-    }
-
-    /// Literal-text equivalent, including templates without semantic recognition.
-    ///
-    /// ```no_run
-    /// # use eredu::api::*;
-    /// # use eredu::runtime::chat::PreparedChat;
-    /// # use eredu_core::{SpeculativeGenerationBackend, SpeculativeDraft, SpeculativeGenerationOutput};
-    /// # fn inspect<B: SpeculativeGenerationBackend + eredu_runtime::memory_forecast::SpeculativeForecastBackend<B::Drafter>>(model: &mut LoadedModel<B>, chat: &PreparedChat,
-    /// #     drafting: SpeculativeDraft<'_, B::Drafter>) -> Result<SpeculativeGenerationOutput, Box<dyn std::error::Error>> {
-    /// let output = model.with_controlled_text_speculative(
-    ///     PreparedChatSpeculativeGenerationRequest {
-    ///     control_handle: None,
-    ///         input: PreparedChatInput::rendered_prompt(chat), drafting,
-    ///         settings: PreparedChatGenerationSettings {
-    ///             decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(Default::default())),
-    ///             ..Default::default()
-    ///         },
-    ///         caller_stop_sequences: &[], cancellation: Default::default(),
-    ///         on_event: |event| println!("committed: {event:?}"),
-    ///     },
-    ///     ControlledSpeculativeOptions::default(),
-    ///     |session| {
-    ///         // A worker may wait for the next Inspector command before each step.
-    ///         while let Some(step) = session.step()? {
-    ///             println!("draft: {:?}, verification: {:?}", step.drafted, step.verification);
-    ///         }
-    ///         Ok(())
-    ///     },
-    /// )?;
-    /// # Ok(output)
-    /// # }
-    /// ```
-    pub fn with_controlled_text_speculative<'a, F, D>(
-        &mut self,
-        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
-        options: ControlledSpeculativeOptions,
-        drive: D,
-    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
-    where
-        F: FnMut(SemanticEvent),
-        D: FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError>,
-    {
-        self.with_controlled_speculative(request, options, drive, PreparedGenerationMode::Text)
-    }
-
-    fn with_controlled_speculative<'a, F, D>(
-        &mut self,
-        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
-        options: ControlledSpeculativeOptions,
-        drive: D,
-        mode: PreparedGenerationMode,
+        mode: OutputMode,
     ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
     where
         F: FnMut(SemanticEvent),
@@ -215,8 +122,8 @@ where
                 B::validate_speculative_activations(&self.runtime, plan)
                     .map_err(SpeculativeControlError::from)?;
                 let (_, maximum) = self
-                    .resolve_text_generation_settings(request.settings)
-                    .map_err(PreparedChatSpeculativeError::from)?;
+                    .resolve_text_generation_settings(request.request.settings)
+                    .map_err(PreparedChatError::from)?;
                 if plan.captures().invocation_bounds().is_none_or(|bounds| {
                     bounds.batch != 1 || bounds.max_predictions < maximum.get() as u64
                 }) {
@@ -237,8 +144,8 @@ where
                 B::validate_speculative_capture(&self.runtime, plan)
                     .map_err(SpeculativeControlError::from)?;
                 let (_, maximum) = self
-                    .resolve_text_generation_settings(request.settings)
-                    .map_err(PreparedChatSpeculativeError::from)?;
+                    .resolve_text_generation_settings(request.request.settings)
+                    .map_err(PreparedChatError::from)?;
                 if plan.request().max_predictions < maximum.get() as u64 {
                     return Err(SpeculativeControlError::Capture(
                     eredu_core::capture::CaptureError::Invalid(
@@ -254,7 +161,7 @@ where
         self.runtime.finish_text_preparation(
             eredu_core::run_preparation::TextPreparationStage::Instrumentation,
             validation,
-            |error| PreparedChatSpeculativeError::Backend(error).into(),
+            |error| PreparedChatError::Backend(error).into(),
         )?;
         // Retain selection geometry before the backend lends its mutable execution
         // resources. Unsupported forecasts must not prevent ordinary execution.
@@ -268,11 +175,13 @@ where
             });
         let mut failure = None;
         let driver = eredu_runtime::speculative::DriveControlledSpeculation::new(
-            super::loaded::source_scheduler(request.settings),
+            super::loaded::source_request_scheduler(&request),
             options,
             drive,
             &mut failure,
         )
+        .with_preparation_started(request.started)
+        .with_speculation_limits(request.limits.map(Into::into))
         .with_forecast_profiles(forecast_profiles)
         .with_vocabulary(
             self.tokenizer
@@ -289,19 +198,5 @@ where
             return Err(error.into());
         }
         result.map_err(Into::into)
-    }
-}
-
-fn continuous_steps(
-    mut on_step: impl FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
-) -> impl FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError> {
-    move |session| {
-        while let Some(step) = session.step()? {
-            if on_step(step).is_break() {
-                session.cancel()?;
-                break;
-            }
-        }
-        Ok(())
     }
 }

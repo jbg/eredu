@@ -162,9 +162,13 @@ fn controlled_forecasts_refresh_trimmed_claims_without_changing_request_or_budge
         )
         .unwrap();
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,

@@ -1,8 +1,7 @@
 use super::*;
 use eredu::api::{
-    PreparedChatError, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatInput, PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
-    PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest, TextSamplingStrategy,
+    GenerationRequest, PreparedChatError, PreparedChatGenerationSettings, PreparedChatInput,
+    PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest, TextSamplingStrategy,
 };
 use eredu::runtime::chat::{ChatTemplateRequest, PreparedChat};
 use eredu_core::generation::{CheckpointGenerationConfig, GenerationError};
@@ -119,13 +118,19 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
                     )
                     .unwrap();
                 model
-                    .generate_observed_chat(prepared, &[], Default::default(), |_| {
-                        std::ops::ControlFlow::Continue(())
-                    })
+                    .generate_observed(
+                        prepared,
+                        &[],
+                        Default::default(),
+                        |_| std::ops::ControlFlow::Continue(()),
+                        eredu::api::OutputMode::Semantic,
+                    )
                     .unwrap()
             } else {
                 model
-                    .generate_prepared_chat(PreparedChatGenerationRequest {
+                    .session()
+                    .generate(GenerationRequest {
+                        output_mode: eredu::api::OutputMode::Semantic,
                         control_handle: None,
                         input: PreparedChatInput::rendered_prompt(&chat),
                         settings,
@@ -189,7 +194,9 @@ fn invalid_mirostat_is_rejected_before_backend_work() {
                 ));
             });
             let error = model
-                .generate_prepared_chat(PreparedChatGenerationRequest {
+                .session()
+                .generate(GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
                     settings,
@@ -268,7 +275,9 @@ fn mirostat_requires_positive_effective_temperature_after_resolution() {
         let mut model = sparse_vocabulary_model_with_backend(backend, checkpoint);
         let chat = chat(&mut model);
         let error = model
-            .generate_prepared_chat(PreparedChatGenerationRequest {
+            .session()
+            .generate(GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
                 settings: PreparedChatGenerationSettings {
@@ -312,14 +321,19 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                 .unwrap();
             let mut drafter = ();
             let error = model
-                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                    control_handle: None,
-                    input: PreparedChatInput::rendered_prompt(&chat),
-                    drafting: if embedded {
+                .drafting_session(
+                    if embedded {
                         SpeculativeDraft::Embedded
                     } else {
                         SpeculativeDraft::External(&mut drafter)
                     },
+                    None,
+                )
+                .generate(GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::rendered_prompt(&chat),
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             eredu_core::decoding::SpeculationOptionsRequest {
@@ -337,9 +351,10 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                     on_event: |_| panic!("mock backend must not emit events"),
                 })
                 .expect_err("mock backend returns its sentinel error");
-            assert!(matches!(error, PreparedChatSpeculativeError::Backend(_)));
+            assert!(matches!(error, PreparedChatError::Backend(_)));
             let error = model
-                .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     drafting: if embedded {
                         SpeculativeDraft::Embedded
                     } else {
@@ -351,16 +366,20 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                             control_handle: None,
                             input: PreparedChatInput::rendered_prompt(&chat),
                             settings: eredu::api::PreparedChatGenerationSettings {
-                                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                    eredu_core::decoding::SpeculationOptionsRequest {
-                                        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
-                                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                                            .with_lookahead(lookahead),
-                                        ..Default::default()
-                                    }
-                                    .try_into()
-                                    .expect("validated speculation options"),
-                                )),
+                                decoding_mode: Some(
+                                    eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                        eredu_core::decoding::SpeculationOptionsRequest {
+                                            max_draft_tokens: std::num::NonZeroUsize::new(2)
+                                                .unwrap(),
+                                            scheduler:
+                                                eredu_core::SpeculativeSchedulerOptions::default()
+                                                    .with_lookahead(lookahead),
+                                            ..Default::default()
+                                        }
+                                        .try_into()
+                                        .expect("validated speculation options"),
+                                    ),
+                                ),
                                 ..PreparedChatGenerationSettings {
                                     strategy,
                                     ..mirostat()
@@ -374,7 +393,7 @@ fn speculative_mirostat_preserves_single_and_mixed_batch_settings() {
                 })
                 .err()
                 .expect("mock backend returns its sentinel error");
-            assert!(matches!(error, PreparedChatSpeculativeError::Backend(_)));
+            assert!(matches!(error, PreparedChatError::Backend(_)));
             let calls = calls.borrow();
             assert_eq!(calls.prompts, 3);
             assert_eq!(calls.speculative, 2);
@@ -412,14 +431,19 @@ fn assert_invalid_speculative_settings(
         for embedded in [false, true] {
             let mut drafter = ();
             let error = model
-                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                    control_handle: None,
-                    input: PreparedChatInput::rendered_prompt(&chat),
-                    drafting: if embedded {
+                .drafting_session(
+                    if embedded {
                         SpeculativeDraft::Embedded
                     } else {
                         SpeculativeDraft::External(&mut drafter)
                     },
+                    None,
+                )
+                .generate(GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::rendered_prompt(&chat),
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             eredu_core::decoding::SpeculationOptionsRequest {
@@ -437,12 +461,13 @@ fn assert_invalid_speculative_settings(
                     on_event: |_| panic!("invalid settings must not emit events"),
                 })
                 .expect_err("invalid settings must fail");
-            let PreparedChatSpeculativeError::Generation(error) = error else {
+            let PreparedChatError::Generation(error) = error else {
                 panic!("expected portable generation error: {error}");
             };
             check_error(error);
             let error = model
-                .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                .generate_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     drafting: if embedded {
                         SpeculativeDraft::Embedded
                     } else {
@@ -454,16 +479,20 @@ fn assert_invalid_speculative_settings(
                             control_handle: None,
                             input: PreparedChatInput::rendered_prompt(&chat),
                             settings: eredu::api::PreparedChatGenerationSettings {
-                                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                                    eredu_core::decoding::SpeculationOptionsRequest {
-                                        max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
-                                        scheduler: eredu_core::SpeculativeSchedulerOptions::default()
-                                            .with_lookahead(lookahead),
-                                        ..Default::default()
-                                    }
-                                    .try_into()
-                                    .expect("validated speculation options"),
-                                )),
+                                decoding_mode: Some(
+                                    eredu_core::decoding::DecodingMode::SelfSpeculation(
+                                        eredu_core::decoding::SpeculationOptionsRequest {
+                                            max_draft_tokens: std::num::NonZeroUsize::new(2)
+                                                .unwrap(),
+                                            scheduler:
+                                                eredu_core::SpeculativeSchedulerOptions::default()
+                                                    .with_lookahead(lookahead),
+                                            ..Default::default()
+                                        }
+                                        .try_into()
+                                        .expect("validated speculation options"),
+                                    ),
+                                ),
                                 ..settings
                             },
                             caller_stop_sequences: &[],
@@ -474,7 +503,7 @@ fn assert_invalid_speculative_settings(
                 })
                 .err()
                 .expect("invalid batch settings must fail");
-            let PreparedChatSpeculativeError::Generation(error) = error else {
+            let PreparedChatError::Generation(error) = error else {
                 panic!("expected portable generation error: {error}");
             };
             check_error(error);

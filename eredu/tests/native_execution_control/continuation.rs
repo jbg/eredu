@@ -73,9 +73,13 @@ fn check(path: &Path, device: LocalDevice, workspace_known: bool) {
         )
         .unwrap();
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,
@@ -321,9 +325,13 @@ fn native_capture_forecasts_project_top_k_geometry_and_continuations() {
         before.active_bytes()
     );
     let mut run = model
-        .start_controlled_text(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Text,
+        )
         .unwrap();
     let mut charged = CaptureUsage::default();
     for prediction in 0..4 {

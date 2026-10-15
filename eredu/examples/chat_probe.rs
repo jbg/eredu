@@ -2,9 +2,8 @@
 //! Usage: chat_probe CHECKPOINT OUTPUT_PREFIX [MAX_TOKENS] [TEMPERATURE] [cpu|metal]
 use eredu::{
     api::{
-        local_device_plan, ControlledGenerationRecord, LoadedModel, LocalDevice,
-        ObservedGenerationEvent, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, TraceLimits,
+        local_device_plan, ControlledGenerationRecord, GenerationRequest, LoadedModel, LocalDevice,
+        ObservedGenerationEvent, PreparedChatGenerationSettings, PreparedChatInput, TraceLimits,
     },
     runtime::chat::ChatTemplateRequest,
 };
@@ -75,8 +74,13 @@ fn main() -> anyhow::Result<()> {
                 }
                 ControlFlow::Continue(())
             };
-            let mut session =
-                model.start_controlled_chat(observed, &[], Default::default(), &mut collect)?;
+            let mut session = model.start_controlled(
+                observed,
+                &[],
+                Default::default(),
+                &mut collect,
+                eredu::api::OutputMode::Semantic,
+            )?;
             while session.finish_reason().is_none() {
                 session.step(&mut collect)?;
             }
@@ -85,7 +89,8 @@ fn main() -> anyhow::Result<()> {
                 session.finish_reason().unwrap(),
             )
         } else {
-            let request = PreparedChatGenerationRequest {
+            let request = GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&prepared),
                 settings,
@@ -94,9 +99,17 @@ fn main() -> anyhow::Result<()> {
                 on_event: |event| events.push(event),
             };
             let output = if mode == "semantic" {
-                model.generate_prepared_chat(request)?
+                {
+                    let mut request = request;
+                    request.output_mode = eredu::api::OutputMode::Semantic;
+                    model.session().generate(request)
+                }?
             } else {
-                model.generate_prepared_text(request)?
+                {
+                    let mut request = request;
+                    request.output_mode = eredu::api::OutputMode::Text;
+                    model.session().generate(request)
+                }?
             };
             (output.token_ids, output.finish_reason)
         };

@@ -257,10 +257,16 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
         };
         let mut records = vec![];
         let mut session = model
-            .start_controlled_chat(prepared, &[], Default::default(), |r| {
-                records.push(r);
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |r| {
+                    records.push(r);
+                    ControlFlow::Continue(())
+                },
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         session.enable_snapshots(snapshot_limits()).unwrap();
         assert_eq!(session.capabilities().snapshot, ControlSupport::Supported);
@@ -367,9 +373,13 @@ fn opaque_grammar_estimates_fail_before_snapshot_retention() {
         .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
         .unwrap();
     let mut session = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     assert!(session.enable_snapshots(snapshot_limits()).is_err());
     assert!(session.snapshot_usage().is_none());
@@ -427,7 +437,13 @@ fn facade_branches_keep_partial_text_identity_siblings_and_budgets_isolated() {
         };
         let mut records = vec![];
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                collect(&mut records),
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         let parent = run.output_checkpoint().run_id;
         run.enable_snapshots(SnapshotLimits {
@@ -549,7 +565,13 @@ fn facade_snapshot_preserves_pending_choice_and_child_stream_includes_semantic_p
         .unwrap();
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 3,
@@ -622,9 +644,13 @@ fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model(
         .unwrap();
     let snapshot = {
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         run.enable_snapshots(snapshot_limits()).unwrap();
         run.snapshot(|_| ControlFlow::Continue(())).unwrap()
@@ -633,9 +659,13 @@ fn facade_fork_rejects_snapshot_from_an_earlier_driver_on_the_same_loaded_model(
         .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
         .unwrap();
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_branches: 1,
@@ -677,7 +707,13 @@ fn facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary() {
         .unwrap();
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[stop], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[stop],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(snapshot_limits()).unwrap();
     run.step(collect(&mut records)).unwrap();
@@ -719,7 +755,13 @@ fn explicit_intervention_removal_retains_its_empty_override_provenance() {
         .unwrap();
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,
@@ -779,9 +821,13 @@ fn continuation_forecasts_follow_restore_and_branch_without_charging_budgets() {
         .prepare_observed_chat(&chat, settings, observed_mock::plan(), trace)
         .unwrap();
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_branches: 1,
@@ -919,9 +965,13 @@ fn large_trace_budget_bounds_semantic_history_and_branch_reservations_without_he
             .prepare_observed_chat(&chat, settings, observed_mock::plan(), trace)
             .unwrap();
         let mut run = model
-            .start_controlled_chat(prepared, &[], Default::default(), |_| {
-                ControlFlow::Continue(())
-            })
+            .start_controlled(
+                prepared,
+                &[],
+                Default::default(),
+                |_| ControlFlow::Continue(()),
+                eredu::api::OutputMode::Semantic,
+            )
             .unwrap();
         run.enable_snapshots(SnapshotLimits {
             max_snapshots: 1,
@@ -1013,9 +1063,13 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
         .prepare_observed_chat(&chat, settings, observed_mock::plan(), limits())
         .unwrap();
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), |_| {
-            ControlFlow::Continue(())
-        })
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            |_| ControlFlow::Continue(()),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_branches: 1,
@@ -1064,7 +1118,9 @@ fn trimming_preserves_controlled_snapshot_branch_sampling_and_delivery_state() {
     drop(run);
     model.reset().unwrap();
     let ordinary = model
-        .generate_prepared_chat(PreparedChatGenerationRequest {
+        .session()
+        .generate(GenerationRequest {
+            output_mode: eredu::api::OutputMode::Semantic,
             control_handle: None,
             input: PreparedChatInput::rendered_prompt(&chat),
             settings,
@@ -1087,7 +1143,13 @@ fn session_capture_fork_adds_content_exact_intervention_attribution() {
         .unwrap();
     let mut records = vec![];
     let mut run = model
-        .start_controlled_chat(prepared, &[], Default::default(), collect(&mut records))
+        .start_controlled(
+            prepared,
+            &[],
+            Default::default(),
+            collect(&mut records),
+            eredu::api::OutputMode::Semantic,
+        )
         .unwrap();
     run.enable_snapshots(SnapshotLimits {
         max_snapshots: 1,

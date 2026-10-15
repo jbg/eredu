@@ -364,26 +364,29 @@ requests intersect the same immutable mask with their grammar controller. Forced
 choices further restrict that intersection. The grammar and output parsers retain
 their existing activation, EOS and termination behavior.
 
-The facade exposes explicit `start_controlled_text` alongside strict
-`start_controlled_chat`. Both consume the same admitted observed/intervened prompt
-and share one ordinary execution driver. Text mode retains tokenizer validity,
-incremental decoding, EOS and caller stops without a semantic grammar or profile.
-Tool/thinking admission stays in facade preparation; backends receive the same
-neutral filters and native execution requests. Text/semantic mode participates in
-snapshot compatibility, with decoder and stop state covered by existing portable
-copying and storage accounting. See [LM Inspector execution control](lm-inspector-execution-control.md).
+The facade's `PlannedModel` owns the target, source and retained drafting policy.
+One `GenerationRequest` selects `OutputMode::Semantic` or `OutputMode::Text`;
+`generate`, `forecast_generation` and `with_controlled` share its input, sampling,
+stops and cancellation. The owner dispatches disabled, embedded and external
+sources through the existing ordinary driver or neutral speculative scheduler.
+`NoDrafting` sessions use only ordinary backend contracts. Explicit borrowed
+sources and factory-owned sources use the same session implementation.
 
-`generate_prepared_text`, `generate_prepared_text_speculative`, and its batch
-variant accept the same prepared-chat request types while selecting literal text
-output explicitly. They share ordinary commitment/timing and the neutral
-speculative scheduler with semantic chat; unknown templates need no protocol
-parser to use TTFT or supported embedded/external drafting. The facade reuses
-controlled text admission and decoder/stop state: tool declarations and required
-calls are rejected, and explicit thinking requires `allow_unparsed_reasoning`.
-Emulated tools supplied as ordinary prompt text remain application policy.
-`generate_prepared_chat` and its speculative variants still require executable
-semantic support. The CLI retains unrecognized prepared prompts and selects the
-text methods, preserving EOS, caller stops, cancellation, and committed-token TTFT.
+Request defaults inherit the selected plan. Neutral `SpeculationLimits` constrain
+proposal capacity, lookahead, transaction storage and completion deadlines.
+The scheduler narrows its decoding-admission facts with those limits before
+binding command handles. Snapshots and forks retain this authority. Backends
+continue to supply native resource facts and typed executable visitors; they do
+not resolve request policy or select semantic output interpretation.
+
+`OutputMode::Text` retains tokenizer validity, incremental decoding, EOS and
+caller stops without requiring a protocol parser. It rejects native tools and
+required calls; explicit thinking requires `allow_unparsed_reasoning`.
+`OutputMode::Semantic` requires executable semantic support. Text/semantic mode
+participates in snapshot compatibility, including decoder and stop state under
+existing copy and storage budgets. Applications own emulated tools and the
+choice of output mode. The low-level admitted `start_controlled` and
+`generate_observed` operations accept the same explicit output policy.
 
 `eredu-core::TokenFilter` owns closed-set intersection and projection to an actual
 output width: missing mask entries are forbidden, a shorter output uses the mask's
@@ -5028,10 +5031,11 @@ stop and EOS precedence, cancellation, grammar state, and semantic events.
 
 `eredu-core` owns the common `GenerationOutput<S>` terminal contract: committed
 token ids, finish reason, `GenerationTiming`, and mode-specific statistics.
-`PreparedChatGenerationOutput` is an alias for `GenerationOutput<()>`, used by
-ordinary and observed generation; `SpeculativeGenerationOutput` is an alias for
-`GenerationOutput<SpeculativeStats>`. They share one implementation of output
-accessors. All modes expose TTFT through `output.timing().time_to_first_token()`.
+The facade's `GenerationOutput` uses `GenerationStats`, whose optional `drafting`
+field carries `SpeculativeStats` from a scheduler-backed run. Ordinary execution,
+controlled advancement and uninterrupted drafting have one public terminal
+shape. Core's generic statistics parameter remains available to lower-level
+execution mechanisms. All modes expose TTFT through `output.timing().time_to_first_token()`.
 The facade starts this host clock
 at the generation call, including request preparation; speculative batch lanes
 share the batch-call origin and include time waiting for earlier lanes. Ordinary
@@ -7306,7 +7310,7 @@ node ancestry and discharges only the prediction-execution condition from a seal
 materialized extension's complete selected-hook fact. Media and partition gates
 remain separate. The loaded execution identity includes the active overlay.
 
-The facade prepares and validates this authority; `ControlledSpeculativeOptions`
+The facade prepares and validates this authority; `GenerationControlOptions`
 installs it before lane prefill. Architecture executor erasure forwards installation
 and restores prior observer ownership when its borrowed scope ends. Reinstallation
 after execution or within the same scope is rejected. The MLX adapter supplies an

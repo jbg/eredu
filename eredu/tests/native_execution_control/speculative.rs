@@ -174,7 +174,7 @@ fn speculative_control_artifacts(
     };
     let mut loaded =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &target.0, &plan).unwrap();
-    let generation_options = loaded.speculative_generation_options().unwrap().unwrap();
+    let generation_options = loaded.drafting_options().unwrap().unwrap();
     let (model, drafting) = loaded.parts_mut();
     let chat = model
         .prepare_chat(ChatTemplateRequest {
@@ -198,10 +198,12 @@ fn speculative_control_artifacts(
     let expected = if compare {
         Some(
             model
-                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                .drafting_session(drafting.as_speculative_draft().unwrap(), None)
+                .generate(GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
                     control_handle: None,
                     input: PreparedChatInput::rendered_prompt(&chat),
-                    drafting: drafting.as_speculative_draft().unwrap(),
+
                     settings: eredu::api::PreparedChatGenerationSettings {
                         decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                             generation_options,
@@ -293,11 +295,13 @@ fn speculative_control_artifacts(
     let mut replays = Vec::new();
     let mut captures = Vec::new();
     let output = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
+        .drafting_session(drafting.as_speculative_draft().unwrap(), None)
+        .with_controlled(
+            GenerationRequest {
+                output_mode: eredu::api::OutputMode::Semantic,
                 control_handle: None,
                 input: PreparedChatInput::rendered_prompt(&chat),
-                drafting: drafting.as_speculative_draft().unwrap(),
+
                 settings: eredu::api::PreparedChatGenerationSettings {
                     decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
                         generation_options,
@@ -308,9 +312,9 @@ fn speculative_control_artifacts(
                 cancellation: Default::default(),
                 on_event: |_| {},
             },
-            ControlledSpeculativeOptions {
-                capture: Some(capture),
-                snapshots: Some(SnapshotLimits {
+            GenerationControlOptions {
+                speculative_capture: Some(capture),
+                speculative_snapshots: Some(SnapshotLimits {
                     max_snapshots: 3,
                     max_branches: 2,
                     retained_bytes: 64 << 20,
@@ -319,6 +323,7 @@ fn speculative_control_artifacts(
                 ..Default::default()
             },
             |session| {
+                let session = session.speculative().expect("speculative executor");
                 if experiment {
                     session.intervene(edits.clone())?;
                 }

@@ -12,11 +12,13 @@
 mod errors;
 pub use errors::{DevicePlanError, ExpertCacheBenchmarkError};
 
-mod media;
 mod chat_input;
+mod media;
 pub use chat_input::*;
 mod metadata;
 mod portable;
+mod session;
+pub use session::*;
 pub mod realtime;
 mod request;
 mod tokenizer;
@@ -25,11 +27,9 @@ mod tokenizer;
 mod selected;
 
 pub use request::{
-    PreparedChatError, PreparedChatGenerationOutput, PreparedChatGenerationRequest,
-    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatSpeculativeBatchLane,
-    PreparedChatSpeculativeBatchRequest, PreparedChatSpeculativeConstraint,
-    PreparedChatSpeculativeError,
-    PreparedChatSpeculativeGenerationRequest,
+    GenerationRequest, OutputMode, PreparedChatError, PreparedChatGenerationSettings,
+    PreparedChatInput, PreparedChatSpeculativeBatchLane, PreparedChatSpeculativeBatchRequest,
+    PreparedChatSpeculativeConstraint,
 };
 #[cfg(feature = "mlx")]
 pub use selected::*;
@@ -55,11 +55,12 @@ pub use control::{
     ControlledGenerationSession, ControlledGenerationSnapshot, GenerationBranchMetadata,
     GenerationBranchOptions, GenerationOutputCheckpoint, GenerationSnapshotMetadata,
 };
-pub use eredu_core::DraftAdapterSource;
-pub use eredu_core::decoding::{DecodingCapabilities, DecodingMode, DecodingModeError, DecodingState, ModeChangeAcknowledgement, SpeculationOptions, SpeculationOptionsRequest};
-pub use eredu_core::{
-    GenerationOutput, GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy,
+pub use eredu_core::decoding::{
+    DecodingCapabilities, DecodingMode, DecodingModeError, DecodingState,
+    ModeChangeAcknowledgement, SpeculationOptions, SpeculationOptionsRequest,
 };
+pub use eredu_core::DraftAdapterSource;
+pub use eredu_core::{GenerationTiming, PrefillChunkPolicy, TextSamplingStrategy};
 pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
 pub use inspection::{
     inspect_architecture, inspect_text_model, ArtifactMetadata, CheckpointMetadata,
@@ -74,9 +75,12 @@ pub use observed::{
 };
 
 pub use portable::{
-    GeneratedToken, LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder,
-    TextDecoderError, TextGeneration, TextModelError, TextModelOptions,
+    GeneratedToken, LoadedModel, LoadedTextModelConfig, TextDecoder, TextDecoderError,
+    TextGeneration, TextModelError, TextModelOptions,
 };
+
+/// Terminal metadata shared by target-only and speculative generation.
+pub type GenerationOutput<S = GenerationStats> = eredu_core::GenerationOutput<S>;
 
 /// Portable failure reported by prepared-chat constraint state.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

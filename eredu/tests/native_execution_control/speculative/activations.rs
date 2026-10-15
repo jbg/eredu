@@ -49,7 +49,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
         let mut loaded =
             LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
                 .unwrap();
-        let generation = loaded.speculative_generation_options().unwrap().unwrap();
+        let generation = loaded.drafting_options().unwrap().unwrap();
         let (model, _) = loaded.parts_mut();
         let chat = model
             .prepare_chat(ChatTemplateRequest {
@@ -66,21 +66,32 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             },
             ..Default::default()
         };
-        let request = || PreparedChatSpeculativeGenerationRequest {
-            control_handle: None,
-            input: PreparedChatInput::token_ids(&chat, vec![1, 2, 5]),
-            drafting: eredu_core::SpeculativeDraft::Embedded,
-            settings: eredu::api::PreparedChatGenerationSettings {
-                decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
-                    generation,
-                )),
-                ..settings
-            },
-            caller_stop_sequences: &[],
-            cancellation: Default::default(),
-            on_event: |_| {},
+        let request = || {
+            (
+                eredu_core::SpeculativeDraft::Embedded,
+                GenerationRequest {
+                    output_mode: eredu::api::OutputMode::Semantic,
+                    control_handle: None,
+                    input: PreparedChatInput::token_ids(&chat, vec![1, 2, 5]),
+
+                    settings: eredu::api::PreparedChatGenerationSettings {
+                        decoding_mode: Some(eredu_core::decoding::DecodingMode::SelfSpeculation(
+                            generation,
+                        )),
+                        ..settings
+                    },
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |_| {},
+                },
+            )
         };
-        let baseline = model.generate_prepared_text_speculative(request()).unwrap();
+        let baseline = {
+            let (drafting, mut request) = request();
+            request.output_mode = eredu::api::OutputMode::Text;
+            model.drafting_session(drafting, None).generate(request)
+        }
+        .unwrap();
         let mut ordinary_records = Vec::new();
         for mask in [false, true] {
             let per_step = CaptureUsage {
@@ -179,19 +190,25 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             .admit(&stale_discovery)
             .unwrap();
             let mut continuous = Vec::new();
-            let output = model
-                .generate_observed_text_speculative(
-                    request(),
-                    ControlledSpeculativeOptions {
-                        activations: Some(admitted.clone()),
+            let output = {
+                let (drafting, mut request) = request();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate_observed(
+                    request,
+                    GenerationControlOptions {
+                        speculative_activations: Some(admitted.clone()),
                         ..Default::default()
                     },
                     |step| {
+                        let eredu::api::GenerationStep::Speculative(step) = step else {
+                            panic!("expected speculative action")
+                        };
                         continuous.extend(step.activations);
                         ControlFlow::Continue(())
                     },
                 )
-                .unwrap();
+            }
+            .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
             assert!(continuous
                 .iter()
@@ -231,12 +248,14 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             }
             let mut controlled = Vec::new();
             let output =
-                model
-                    .with_controlled_text_speculative(
-                        request(),
-                        ControlledSpeculativeOptions {
-                            activations: Some(admitted),
-                            snapshots: Some(SnapshotLimits {
+                {
+                    let (drafting, mut request) = request();
+                    request.output_mode = eredu::api::OutputMode::Text;
+                    model.drafting_session(drafting, None).with_controlled(
+                        request,
+                        GenerationControlOptions {
+                            speculative_activations: Some(admitted),
+                            speculative_snapshots: Some(SnapshotLimits {
                                 max_snapshots: 2,
                                 max_branches: 2,
                                 retained_bytes: 64 << 20,
@@ -245,6 +264,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             ..Default::default()
                         },
                         |session| {
+                            let session = session.speculative().expect("speculative executor");
                             assert!(session
                                 .readmit_activation_interventions(stale.clone())
                                 .is_err());
@@ -388,7 +408,8 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             Ok(())
                         },
                     )
-                    .unwrap();
+                }
+                .unwrap();
             assert_eq!(output.token_ids(), baseline.token_ids());
             assert_eq!(continuous.len(), controlled.len());
             for (a, b) in continuous.iter().zip(&controlled) {
@@ -432,7 +453,12 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             } else {
                 ordinary_records = continuous;
             }
-            let restored = model.generate_prepared_text_speculative(request()).unwrap();
+            let restored = {
+                let (drafting, mut request) = request();
+                request.output_mode = eredu::api::OutputMode::Text;
+                model.drafting_session(drafting, None).generate(request)
+            }
+            .unwrap();
             assert_eq!(restored.token_ids(), baseline.token_ids());
         }
     }
