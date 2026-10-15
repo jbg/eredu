@@ -20881,6 +20881,11 @@ pub(crate) fn authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_r
 }
 
 #[test]
+fn partitioned_production_preserves_tp_pp_cache_and_continuation() {
+    authoritative_partitioned_numeric_sessions_match_tp_pp_and_tp_pp_reference();
+}
+
+#[test]
 fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
     use eredu_architectures::partitioned_execution::RoutedExpertWaveOperation as Operation;
 

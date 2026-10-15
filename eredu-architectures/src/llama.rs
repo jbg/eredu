@@ -3,6 +3,7 @@
 mod checkpoint;
 mod config;
 
+pub(crate) use checkpoint::translate_gguf_weight_name_for_model;
 pub use checkpoint::{
     gguf_plan, load_time_quantization, safetensors_plan, translate_gguf_weight_name,
     with_checkpoint_formats, SafetensorsPlanError,

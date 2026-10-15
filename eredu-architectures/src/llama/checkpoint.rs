@@ -61,6 +61,11 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         .replace("output", "lm_head")
 }
 
+/// Translates a GGUF tensor using its normalized model configuration.
+pub(crate) fn translate_gguf_weight_name_for_model(name: &str, _args: &ModelArgs) -> String {
+    translate_gguf_weight_name(name)
+}
+
 /// Builds the complete SafeTensors catalog expected by this configuration.
 pub fn safetensors_plan(
     args: &ModelArgs,
@@ -105,15 +110,21 @@ pub fn safetensors_plan(
                 vec![hidden],
             ),
         ]);
-        for (local, shape) in [
+        let attention = vec![
             ("self_attn.q_proj.weight", vec![query, hidden]),
             ("self_attn.k_proj.weight", vec![key_value, hidden]),
             ("self_attn.v_proj.weight", vec![key_value, hidden]),
-            ("self_attn.o_proj.weight", vec![hidden, query]),
+        ];
+        let feed_forward = vec![
             ("mlp.gate_proj.weight", vec![intermediate, hidden]),
             ("mlp.up_proj.weight", vec![intermediate, hidden]),
-            ("mlp.down_proj.weight", vec![hidden, intermediate]),
-        ] {
+        ];
+        let matrices = attention
+            .into_iter()
+            .chain([("self_attn.o_proj.weight", vec![hidden, query])])
+            .chain(feed_forward)
+            .chain([("mlp.down_proj.weight", vec![hidden, intermediate])]);
+        for (local, shape) in matrices {
             add_safe(
                 args,
                 &mut tensors,
@@ -293,46 +304,33 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     }
     for layer in 0..dimension(args.num_hidden_layers, "layer count")? {
         let block = format!("blk.{layer}");
-        for (local, shape, operation) in [
-            ("attn_norm.weight", vec![hidden], TensorOperation::Vector),
-            ("ffn_norm.weight", vec![hidden], TensorOperation::Vector),
-            (
-                "attn_q.weight",
-                vec![query, hidden],
+        for local in ["attn_norm.weight", "ffn_norm.weight"] {
+            tensors.push(gguf(
+                format!("{block}.{local}"),
+                vec![hidden],
+                TensorOperation::Vector,
+            ));
+        }
+        let attention = vec![
+            ("attn_q.weight", vec![query, hidden]),
+            ("attn_k.weight", vec![key_value, hidden]),
+            ("attn_v.weight", vec![key_value, hidden]),
+        ];
+        let feed_forward = vec![
+            ("ffn_gate.weight", vec![intermediate, hidden]),
+            ("ffn_up.weight", vec![intermediate, hidden]),
+        ];
+        let matrices = attention
+            .into_iter()
+            .chain([("attn_output.weight", vec![hidden, query])])
+            .chain(feed_forward)
+            .chain([("ffn_down.weight", vec![hidden, intermediate])]);
+        for (local, shape) in matrices {
+            tensors.push(gguf(
+                format!("{block}.{local}"),
+                shape,
                 TensorOperation::Matrix,
-            ),
-            (
-                "attn_k.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_v.weight",
-                vec![key_value, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "attn_output.weight",
-                vec![hidden, query],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn_gate.weight",
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn_up.weight",
-                vec![intermediate, hidden],
-                TensorOperation::Matrix,
-            ),
-            (
-                "ffn_down.weight",
-                vec![hidden, intermediate],
-                TensorOperation::Matrix,
-            ),
-        ] {
-            tensors.push(gguf(format!("{block}.{local}"), shape, operation));
+            ));
         }
         if args.attention_bias {
             for (local, size) in [
