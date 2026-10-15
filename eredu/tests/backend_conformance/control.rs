@@ -205,8 +205,9 @@ fn forced_canonical_tokens_use_ordinary_commitment_decoding_and_termination() {
         .unwrap();
     assert_eq!(session.token_ids(), [first]);
     assert_eq!(session.pending_forced_token(), None);
-    // The grammar requires the second UTF-8 byte before EOS can be consumed.
-    assert!(session.force_next_token(first + 2).is_err());
+    // Tool-free parsing does not constrain generation, even with pending UTF-8.
+    session.force_next_token(first + 2).unwrap();
+    assert!(session.clear_forced_token().unwrap());
     assert_eq!(session.pending_forced_token(), None);
     session.force_next_token(first + 1).unwrap();
     assert!(session.clear_forced_token().unwrap());

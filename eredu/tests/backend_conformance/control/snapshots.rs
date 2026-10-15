@@ -192,12 +192,23 @@ fn snapshot_setup() -> (
     PreparedChatGenerationSettings,
     u32,
 ) {
+    snapshot_setup_with_tool_choice(eredu::runtime::chat::ToolChoice::None)
+}
+
+fn snapshot_setup_with_tool_choice(
+    tool_choice: eredu::runtime::chat::ToolChoice,
+) -> (
+    LoadedModel<MockBackend>,
+    PreparedChat,
+    PreparedChatGenerationSettings,
+    u32,
+) {
     let request = || ChatTemplateRequest {
         messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
         tools: vec![serde_json::json!({"type":"function", "function":{
             "name":"weather", "description":"Weather", "parameters":{"type":"object", "properties":{}}
         }})],
-        tool_choice: eredu::runtime::chat::ToolChoice::None,
+        tool_choice: tool_choice.clone(),
         add_generation_prompt: true,
         ..Default::default()
     };
@@ -368,7 +379,8 @@ fn facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulati
 
 #[test]
 fn opaque_grammar_estimates_fail_before_snapshot_retention() {
-    let (mut model, chat, settings, _) = setup();
+    let (mut model, chat, settings, _) =
+        snapshot_setup_with_tool_choice(eredu::runtime::chat::ToolChoice::Auto);
     let prepared = model
         .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
         .unwrap();
