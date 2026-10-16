@@ -689,10 +689,9 @@ pub trait PartitionedConfig: Config + Clone {
 
     /// Derives one rank-local block configuration from an exact physical layout.
     ///
-    /// Dense families inherit split or fused attention projection derivation with
-    /// split feed-forward projections. Routed families override this hook because
-    /// their expert bank has an additional owner-local group axis that is not the
-    /// dense MLP intermediate axis.
+    /// Dense families inherit the ordinary split or fused projection derivation. Routed
+    /// families override this hook because their expert bank has an additional
+    /// owner-local group axis that is not the dense MLP intermediate axis.
     fn local_block_config(&self, layer: usize, layout: &LocalModelLayout) -> Result<Self, Error> {
         dense_local_block_config(self, layer, layout)
     }
@@ -3324,14 +3323,9 @@ fn parameter_description_with_vocabulary(
         .block_parameter_fields()
         .validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    if !matches!(
-        config.gated_projection_layout(),
-        GatedProjectionLayout::Split
-    ) || config.learned_attention_sinks()
-    {
+    if config.learned_attention_sinks() {
         return Err(ParallelPlanError::InvalidGroup(
-            "static dense parameter description requires split gate/up projections without attention sinks"
-                .into(),
+            "static dense parameter description requires no attention sinks".into(),
         ));
     }
     let dimension = |name: &str, value: i32| {
@@ -3540,8 +3534,18 @@ fn parameter_description_with_vocabulary(
                     MemberSharding::Partitioned { axis: 0 },
                 ),
             ],
-            GatedProjectionLayout::Fused { .. } => {
-                unreachable!("fused layouts are rejected above")
+            GatedProjectionLayout::Fused { field } => {
+                let width = intermediate.checked_mul(2).ok_or_else(|| {
+                    ParallelPlanError::InvalidTensor("fused gate/up width overflowed usize".into())
+                })?;
+                vec![(
+                    field,
+                    width,
+                    MemberSharding::PartitionedSegments {
+                        axis: 0,
+                        segments: vec![0..intermediate, intermediate..width],
+                    },
+                )]
             }
         };
         for (field, width, sharding) in inputs {
@@ -5076,12 +5080,24 @@ fn dense_local_block_config<C: PartitionedConfig>(
             (query_width, key_width)
         }
     };
-    let intermediate = {
-        let gate = tensor(format!(
-            "{prefix}.{}.{}.weight",
-            fields.feed_forward, fields.feed_forward_gate
-        ))?;
-        i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?
+    let intermediate = match config.gated_projection_layout() {
+        GatedProjectionLayout::Split => {
+            let gate = tensor(format!(
+                "{prefix}.{}.{}.weight",
+                fields.feed_forward, fields.feed_forward_gate
+            ))?;
+            i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?
+        }
+        GatedProjectionLayout::Fused { field } => {
+            let gate = tensor(format!("{prefix}.{}.{field}.weight", fields.feed_forward))?;
+            let width = i32::try_from(gate.local_shape()[0]).map_err(Error::backend)?;
+            if width <= 0 || width % 2 != 0 {
+                return Err(Error::backend(
+                    "local fused gate/up shape splits a component",
+                ));
+            }
+            width / 2
+        }
     };
     if query_width <= 0
         || key_width <= 0

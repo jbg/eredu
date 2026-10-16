@@ -8593,6 +8593,9 @@ impl decoder::Config for FusedDecoderConfig {
     fn mlp_bias(&self) -> bool {
         true
     }
+    fn gated_projection_layout(&self) -> decoder::GatedProjectionLayout<'_> {
+        decoder::GatedProjectionLayout::Fused { field: "gate_up" }
+    }
     fn tie_word_embeddings(&self) -> bool {
         decoder::Config::tie_word_embeddings(&self.0)
     }
@@ -8624,7 +8627,7 @@ impl decoder::PartitionedConfig for FusedDecoderConfig {
 }
 
 #[test]
-fn fused_qkv_tp2_matches_replicated_biases_and_cached_continuation() {
+fn fused_decoder_tp2_matches_replicated_biases_and_cached_continuation() {
     use decoder::PartitionedConfig as _;
 
     let mut value = config("qwen2", false);
@@ -8726,7 +8729,7 @@ fn fused_qkv_tp2_matches_replicated_biases_and_cached_continuation() {
     });
     for rank in outputs {
         for (actual, expected) in rank.iter().zip(&expected) {
-            assert_tensor_close(actual, expected, "fused QKV TP2 prefill and decode");
+            assert_tensor_close(actual, expected, "fused decoder TP2 prefill and decode");
         }
     }
 }
