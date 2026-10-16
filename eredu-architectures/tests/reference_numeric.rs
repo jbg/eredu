@@ -8537,6 +8537,200 @@ fn fused_and_split_gate_up_are_numerically_identical_through_silu_and_output() {
     assert_tensor_close(&fused_output, &split_output, "fused gate/up output");
 }
 
+#[derive(Debug, Clone)]
+struct FusedDecoderConfig(qwen::ModelArgs);
+
+impl decoder::Config for FusedDecoderConfig {
+    fn model_family(&self) -> &'static str {
+        "fused_decoder_fixture"
+    }
+
+    fn model_identity(&self) -> &str {
+        decoder::Config::model_identity(&self.0)
+    }
+    fn architecture_fingerprint(&self) -> String {
+        eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
+            "reference_fused_decoder",
+            [("base", decoder::Config::architecture_fingerprint(&self.0))],
+        )
+    }
+    fn parameter_root(&self) -> &str {
+        decoder::Config::parameter_root(&self.0)
+    }
+    fn validate_config(&self) -> Result<(), Error> {
+        decoder::Config::validate_config(&self.0)
+    }
+    fn hidden_size(&self) -> i32 {
+        decoder::Config::hidden_size(&self.0)
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        decoder::Config::num_hidden_layers(&self.0)
+    }
+    fn intermediate_size(&self) -> i32 {
+        decoder::Config::intermediate_size(&self.0)
+    }
+    fn num_attention_heads(&self) -> i32 {
+        decoder::Config::num_attention_heads(&self.0)
+    }
+    fn num_key_value_heads(&self) -> i32 {
+        decoder::Config::num_key_value_heads(&self.0)
+    }
+    fn head_dim(&self) -> i32 {
+        decoder::Config::head_dim(&self.0)
+    }
+    fn rms_norm_epsilon(&self) -> f32 {
+        decoder::Config::rms_norm_epsilon(&self.0)
+    }
+    fn vocabulary_size(&self) -> i32 {
+        decoder::Config::vocabulary_size(&self.0)
+    }
+    fn attention_bias(&self, _: decoder::AttentionProjection) -> bool {
+        true
+    }
+    fn attention_projection_layout(&self) -> decoder::AttentionProjectionLayout<'_> {
+        decoder::AttentionProjectionLayout::Fused { field: "in_proj" }
+    }
+    fn mlp_bias(&self) -> bool {
+        true
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        decoder::Config::tie_word_embeddings(&self.0)
+    }
+    fn attention_schedule(&self) -> &eredu_core::LayerSchedule<eredu_core::AttentionPolicy> {
+        decoder::Config::attention_schedule(&self.0)
+    }
+    fn weight_quantization(&self, name: &str) -> Option<eredu_checkpoint::WeightQuantization> {
+        decoder::Config::weight_quantization(&self.0, name)
+    }
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
+        decoder::Config::rotary_spec(&self.0, dimensions)
+    }
+}
+
+impl decoder::PartitionedConfig for FusedDecoderConfig {
+    fn set_local_geometry(
+        &mut self,
+        query_heads: i32,
+        key_value_heads: i32,
+        intermediate: i32,
+    ) -> Result<(), Error> {
+        decoder::PartitionedConfig::set_local_geometry(
+            &mut self.0,
+            query_heads,
+            key_value_heads,
+            intermediate,
+        )
+    }
+}
+
+#[test]
+fn fused_qkv_tp2_matches_replicated_biases_and_cached_continuation() {
+    use decoder::PartitionedConfig as _;
+
+    let mut value = config("qwen2", false);
+    value["hidden_size"] = 12.into();
+    value["num_attention_heads"] = 6.into();
+    value["num_key_value_heads"] = 2.into();
+    value["head_dim"] = 2.into();
+    value["intermediate_size"] = 10.into();
+    value["use_sliding_window"] = false.into();
+    let args = FusedDecoderConfig(qwen::model_args_from_config_value(&value).unwrap());
+    let inputs = [
+        NumericTensor::new(
+            [1, 2, 12],
+            (0..24).map(|i| (i as f32 - 8.0) / 13.0).collect(),
+        ),
+        NumericTensor::new(
+            [1, 1, 12],
+            (0..12).map(|i| (7.0 - i as f32) / 9.0).collect(),
+        ),
+    ];
+    let context = NumericContext::default();
+    let mut block = decoder::TransformerBlock::<NumericBackend>::new(&args, 0, &context).unwrap();
+    let mut cache = NumericCache::new(None);
+    let expected = inputs
+        .iter()
+        .map(|hidden| {
+            let mask =
+                NumericBackend::causal_mask(hidden.dim(1), cache.offset, None, &context).unwrap();
+            block
+                .forward(
+                    decoder::AttentionInput {
+                        hidden,
+                        mask: Some(&mask),
+                        cache: Some(&mut cache),
+                        allow_sliding_prefill: false,
+                        rotary_position: None,
+                        selected_positions: None,
+                    },
+                    &context,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let description = decoder::dense_parameter_description(&args).unwrap();
+    let group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|rank| {
+                let layout = eredu_runtime::derive_partitioned_local_layout(
+                    &description,
+                    ParallelRankTopology::new(ParallelTopology::new(2, 1, 1, 1).unwrap(), rank)
+                        .unwrap(),
+                )
+                .unwrap();
+                let local = args.local_block_config(0, &layout).unwrap();
+                let inputs = &inputs;
+                let group = Arc::clone(&group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout);
+                    let parallel = NumericParallelContext::new(rank, group);
+                    let mut block =
+                        decoder::TransformerBlock::<NumericBackend>::new(&local, 0, &context)
+                            .unwrap();
+                    let mut cache = NumericCache::new(None);
+                    inputs
+                        .iter()
+                        .map(|hidden| {
+                            let mask = NumericBackend::causal_mask(
+                                hidden.dim(1),
+                                cache.offset,
+                                None,
+                                &context,
+                            )
+                            .unwrap();
+                            block
+                                .forward_tensor_parallel(
+                                    decoder::AttentionInput {
+                                        hidden,
+                                        mask: Some(&mask),
+                                        cache: Some(&mut cache),
+                                        allow_sliding_prefill: false,
+                                        rotary_position: None,
+                                        selected_positions: None,
+                                    },
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for rank in outputs {
+        for (actual, expected) in rank.iter().zip(&expected) {
+            assert_tensor_close(actual, expected, "fused QKV TP2 prefill and decode");
+        }
+    }
+}
+
 #[test]
 fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
     let context = NumericContext::default();

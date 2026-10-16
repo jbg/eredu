@@ -689,9 +689,10 @@ pub trait PartitionedConfig: Config + Clone {
 
     /// Derives one rank-local block configuration from an exact physical layout.
     ///
-    /// Dense families inherit the ordinary split-projection derivation. Routed
-    /// families override this hook because their expert bank has an additional
-    /// owner-local group axis that is not the dense MLP intermediate axis.
+    /// Dense families inherit split or fused attention projection derivation with
+    /// split feed-forward projections. Routed families override this hook because
+    /// their expert bank has an additional owner-local group axis that is not the
+    /// dense MLP intermediate axis.
     fn local_block_config(&self, layer: usize, layout: &LocalModelLayout) -> Result<Self, Error> {
         dense_local_block_config(self, layer, layout)
     }
@@ -3287,7 +3288,7 @@ pub fn dense_parameter_description(
     parameter_description(config, |_| true, |_| Ok(None))
 }
 
-/// Declares a split-projection decoder with optional provider-owned values and
+/// Declares a decoder with optional provider-owned values and
 /// replacement feed-forward groups, without constructing backend tensors.
 pub(crate) fn parameter_description(
     config: &impl Config,
@@ -3324,15 +3325,12 @@ fn parameter_description_with_vocabulary(
         .validate()
         .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
     if !matches!(
-        config.attention_projection_layout(),
-        AttentionProjectionLayout::Split
-    ) || !matches!(
         config.gated_projection_layout(),
         GatedProjectionLayout::Split
     ) || config.learned_attention_sinks()
     {
         return Err(ParallelPlanError::InvalidGroup(
-            "static dense parameter description requires split projections without attention sinks"
+            "static dense parameter description requires split gate/up projections without attention sinks"
                 .into(),
         ));
     }
@@ -3435,12 +3433,15 @@ fn parameter_description_with_vocabulary(
                     sharding.clone(),
                 ));
                 if bias {
-                    let bias_sharding =
-                        if matches!(sharding, MemberSharding::Partitioned { axis: 0 }) {
-                            sharding
-                        } else {
-                            MemberSharding::Replicated
-                        };
+                    let bias_sharding = if matches!(
+                        sharding,
+                        MemberSharding::Partitioned { axis: 0 }
+                            | MemberSharding::PartitionedSegments { axis: 0, .. }
+                    ) {
+                        sharding
+                    } else {
+                        MemberSharding::Replicated
+                    };
                     attention_members.push(eredu_runtime::ParameterMemberSpec::new(
                         format!("{attention_prefix}.{field}.bias"),
                         vec![output_width],
@@ -3471,8 +3472,27 @@ fn parameter_description_with_vocabulary(
                     );
                 }
             }
-            AttentionProjectionLayout::Fused { .. } => {
-                unreachable!("fused layouts are rejected above")
+            AttentionProjectionLayout::Fused { field } => {
+                if !ordinary_value_projection(layer) {
+                    return Err(ParallelPlanError::InvalidGroup(
+                        "fused QKV requires an ordinary value projection".into(),
+                    ));
+                }
+                let key_end = query_width.checked_add(key_value_width).ok_or_else(|| {
+                    ParallelPlanError::InvalidTensor("fused QK width overflowed usize".into())
+                })?;
+                let end = key_end.checked_add(key_value_width).ok_or_else(|| {
+                    ParallelPlanError::InvalidTensor("fused QKV width overflowed usize".into())
+                })?;
+                projection(
+                    field,
+                    vec![end, hidden],
+                    MemberSharding::PartitionedSegments {
+                        axis: 0,
+                        segments: vec![0..query_width, query_width..key_end, key_end..end],
+                    },
+                    config.attention_bias(AttentionProjection::Query),
+                );
             }
         }
         projection(
@@ -5016,19 +5036,45 @@ fn dense_local_block_config<C: PartitionedConfig>(
             .tensor(&path)
             .ok_or_else(|| Error::backend(format!("missing local decoder layout for {path}")))
     };
-    let (query_width, key_width) = {
-        let query = tensor(format!(
-            "{prefix}.{}.{}.weight",
-            fields.attention, fields.attention_query
-        ))?;
-        let key = tensor(format!(
-            "{prefix}.{}.{}.weight",
-            fields.attention, fields.attention_key
-        ))?;
-        (
-            i32::try_from(query.local_shape()[0]).map_err(Error::backend)?,
-            i32::try_from(key.local_shape()[0]).map_err(Error::backend)?,
-        )
+    let (query_width, key_width) = match config.attention_projection_layout() {
+        AttentionProjectionLayout::Split => {
+            let query = tensor(format!(
+                "{prefix}.{}.{}.weight",
+                fields.attention, fields.attention_query
+            ))?;
+            let key = tensor(format!(
+                "{prefix}.{}.{}.weight",
+                fields.attention, fields.attention_key
+            ))?;
+            (
+                i32::try_from(query.local_shape()[0]).map_err(Error::backend)?,
+                i32::try_from(key.local_shape()[0]).map_err(Error::backend)?,
+            )
+        }
+        AttentionProjectionLayout::Fused { field } => {
+            let fused = tensor(format!("{prefix}.{}.{field}.weight", fields.attention))?;
+            let heads = fused
+                .expanded_logical_range(config.num_key_value_heads() as usize)
+                .map_err(Error::backend)?
+                .len();
+            let key_width = i32::try_from(heads)
+                .map_err(Error::backend)?
+                .checked_mul(config.head_dim())
+                .ok_or_else(|| Error::backend("local fused KV width overflowed"))?;
+            let query_width = key_width
+                .checked_mul(config.num_attention_heads() / config.num_key_value_heads())
+                .ok_or_else(|| Error::backend("local fused query width overflowed"))?;
+            let width = key_width
+                .checked_mul(2)
+                .and_then(|width| query_width.checked_add(width))
+                .ok_or_else(|| Error::backend("local fused QKV width overflowed"))?;
+            if usize::try_from(width).map_err(Error::backend)? != fused.local_shape()[0] {
+                return Err(Error::backend(
+                    "local fused QKV shape differs from its head partition",
+                ));
+            }
+            (query_width, key_width)
+        }
     };
     let intermediate = {
         let gate = tensor(format!(

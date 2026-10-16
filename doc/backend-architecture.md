@@ -3031,6 +3031,8 @@ proof-bearing architecture value, and invokes the corresponding typed neutral
 constructor adapter. Optional profiles are additive, so an ordinary backend
 does not acquire heterogeneous-state bounds.
 
+Shared decoder parameter declarations retain the Q/K/V component boundaries inside fused attention matrices. Tensor-parallel layouts partition each component independently, including its bias, and derive local head dimensions from the retained semantic ranges. Native backends bind the ordinary linear, normalization, rotary and attention mechanisms.
+
 Nanbeige reuses the portable GQA/SwiGLU decoder blocks. `decoder::repeated`
 lowers physical checkpoint blocks to logical invocations with exact source
 aliases and an expanded attention schedule. The generic decoder's optional
