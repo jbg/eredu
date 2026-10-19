@@ -76,6 +76,8 @@ def run_batches(executable: str, batch_size: int, *, suite: str = "unit",
     names = select_tests(executable, suite, shard, shards, filters)
     environment = dict(os.environ)
     environment.setdefault("MLX_ENABLE_TF32", "0")
+    # Unoptimized typed construction needs more than libtest's default stack.
+    environment.setdefault("RUST_MIN_STACK", str(16 << 20))
     failed = False
     records = []
     deadline = time.monotonic() + suite_timeout
