@@ -34,3 +34,11 @@ the ownership and dependency rules.
 ## License
 
 Licensed under either Apache-2.0 or MIT.
+
+## Verification
+
+[Family acceptance](../doc/family-acceptance.md) indexes complete-model reference
+routes, recorded evidence and validation gaps for every family. Numerical
+acceptance compares the same checkpoint with an independent pinned implementation;
+shared execution conformance covers state and residency contracts. Narrow
+component investigations and generated tensors stay outside the tracked tree.

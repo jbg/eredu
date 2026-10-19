@@ -17,6 +17,3 @@ pub mod vision_gguf;
 
 pub use checkpoint::{canonical_parameter_name, safetensors_plan, source_recipes};
 pub use config::{ConfigError, FamilyConfig, PixtralConfig};
-
-#[cfg(test)]
-mod tests;

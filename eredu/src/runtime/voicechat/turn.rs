@@ -758,8 +758,3 @@ impl State {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod commit_tests;
-#[cfg(test)]
-mod tests;

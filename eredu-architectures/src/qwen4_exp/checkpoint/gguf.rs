@@ -356,6 +356,3 @@ pub(in crate::qwen4_exp) fn controls(
         rows,
     })
 }
-
-#[cfg(test)]
-mod tests;

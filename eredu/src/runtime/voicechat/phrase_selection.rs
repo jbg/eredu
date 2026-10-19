@@ -147,8 +147,4 @@ impl PreparedPhraseSelection {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn selected(&self) -> Option<usize> {
-        self.selected
-    }
 }

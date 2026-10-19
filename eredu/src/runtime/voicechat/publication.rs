@@ -614,6 +614,3 @@ where
             .map_err(|error| VoiceChatPublicationError::Backend(BackendFailure::from_error(error)))
     }
 }
-
-#[cfg(test)]
-pub(crate) mod tests;

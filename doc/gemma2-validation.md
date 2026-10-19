@@ -37,32 +37,11 @@ points. Their cache identities retain their physical format and normalization
 convention. Tokenizers, checkpoint chat templates, BOS and EOS policy use the
 existing facade/text utilities, including GGUF Gemma Unigram reconstruction.
 
-Nonzero neutral tests cover an independent scalar oracle, full and chunked
-prefill, multiple cached decode steps across sliding-window eviction, snapshot
-branching, per-block reconstruction, prepared payload loading, TP/PP and
-combined TP/PP, affine transformation, GGUF numerical equivalence, and packed
-GGUF source/encoding retention. The four-way PP fixture isolates every block.
-Native CPU facade tests compare controlled/uninterrupted output for resident,
-host-windowed and disk-streamed weights, both preserved and affine-transformed,
-and exercise capture, snapshot restore and fork.
-
-Reproduce:
-
-```sh
-python3 eredu-architectures/tests/fixtures/gemma2/reference.py
-cargo test -p eredu-architectures --lib gemma2
-cargo test -p eredu-architectures --test reference_numeric gemma2
-cargo test -p eredu-architectures --test reference_conformance
-cargo test -p eredu --no-default-features --features mlx \
-  --test native_execution_control gemma2
-cargo test -p eredu-backend-mlx --no-default-features --lib score_softcap -- --ignored
-```
-
-The scalar oracle uses separately written equations and deterministic named
-weights. Comparisons use the reference suite's absolute tolerance of `2e-4`.
-Native score tests use absolute/relative `1e-5`
-and cover masks, learned sinks, and paged chunked prefill with both full and
-sliding history. These fixtures supplement released-checkpoint validation.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.
 
 ## Independent Transformers fixture
 

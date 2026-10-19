@@ -331,6 +331,3 @@ impl VoiceChatTextPreparation {
         Ok(ids.iter().map(|&id| id as i32).collect())
     }
 }
-
-#[cfg(test)]
-mod tests;

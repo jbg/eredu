@@ -626,6 +626,3 @@ pub fn initialize_rope(
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

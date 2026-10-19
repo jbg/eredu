@@ -177,19 +177,6 @@ pub fn gather_selection_values(
         .take(&plan.selection_indices, stream)
 }
 
-/// Reduce grouped values back to source rows using summation.
-///
-/// `values` should have shape `[selections, ...]`, and `indices` should have shape `[selections]`.
-#[cfg(test)]
-pub fn segment_sum_by_index(
-    values: impl AsRef<Array>,
-    indices: impl AsRef<Array>,
-    num_segments: i32,
-    stream: impl AsRef<Stream>,
-) -> Result<Array> {
-    safemlx::ops::segment_sum(values, indices, num_segments, 0, stream)
-}
-
 /// Build a sorted top-k selection plan from `[tokens, top_k]` group ids.
 pub fn topk_group_plan(
     group_indices: impl AsRef<Array>,
@@ -199,50 +186,11 @@ pub fn topk_group_plan(
 }
 
 #[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod reduction_tests {
-    use safemlx::{Array, Device, DeviceType, Dtype, Stream};
-
-    #[test]
-    fn cpu_bf16_grouped_projections_preserve_resident_bank_reduction_layout() {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let fixture = Array::load_safetensors(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/validation/bf16_grouped.safetensors"
-            ),
-            &stream,
-        )
-        .unwrap();
-        for width in [128, 768, 2560] {
-            let actual = super::grouped_matmul(
-                &fixture[&format!("{width}.input")],
-                fixture[&format!("{width}.weight")]
-                    .swap_axes(-1, -2, &stream)
-                    .unwrap(),
-                &fixture["ids"],
-                false,
-                &stream,
-            )
-            .unwrap()
-            .as_dtype(Dtype::Float32, &stream)
-            .unwrap()
-            .into_evaluated()
-            .unwrap();
-            let expected = fixture[&format!("{width}.output")]
-                .as_dtype(Dtype::Float32, &stream)
-                .unwrap()
-                .into_evaluated()
-                .unwrap();
-            let mismatches = actual
-                .as_slice::<f32>()
-                .iter()
-                .zip(expected.as_slice::<f32>())
-                .filter(|(a, b)| a != b)
-                .count();
-            assert_eq!(mismatches, 0, "selected projection width={width}");
-        }
-    }
+pub fn segment_sum_by_index(
+    values: impl AsRef<Array>,
+    indices: impl AsRef<Array>,
+    num_segments: i32,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    safemlx::ops::segment_sum(values, indices, num_segments, 0, stream)
 }

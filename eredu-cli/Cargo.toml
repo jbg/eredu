@@ -52,7 +52,3 @@ eredu-text.workspace = true
 eredu-evaluation.workspace = true
 eredu-gguf.workspace = true
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-
-[[test]]
-name = "qwen4_controlled_distributed"
-required-features = ["mlx"]

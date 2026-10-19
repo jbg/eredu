@@ -131,11 +131,6 @@ name = "portable_realtime_facade"
 path = "tests/portable_realtime_facade.rs"
 
 [[test]]
-name = "selected_backend_api"
-path = "tests/selected_backend_api.rs"
-required-features = ["mlx"]
-
-[[test]]
 name = "local_memory_policy"
 path = "tests/local_memory_policy.rs"
 required-features = ["mlx"]

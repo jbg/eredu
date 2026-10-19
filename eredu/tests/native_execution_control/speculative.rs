@@ -4,21 +4,6 @@ use eredu_core::{DraftPlacementPlan, DraftingPlan};
 #[path = "speculative/shared_target.rs"]
 mod shared_target;
 
-#[path = "speculative/activations.rs"]
-mod activations;
-#[path = "speculative/continuation_forecast.rs"]
-mod continuation_forecast;
-#[path = "speculative/forecast.rs"]
-mod forecast;
-#[path = "speculative/parameters.rs"]
-mod parameters;
-#[path = "speculative/pooling.rs"]
-mod pooling;
-#[path = "speculative/startup_forecast.rs"]
-mod startup_forecast;
-#[path = "speculative/v4_components.rs"]
-mod v4_components;
-
 pub(super) fn artifacts() -> (Fixture, Fixture) {
     let target = fixture(false);
     let draft = fixture(false);
@@ -83,55 +68,6 @@ fn native_speculative_control(experiment: bool) {
         false,
         0.8,
     );
-}
-
-#[test]
-#[cfg_attr(feature = "metal", ignore = "run CPU-only native initialization")]
-fn k2_independent_draft_control_matches_uninterrupted_and_preserves_budgets() {
-    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
-        for residency in [
-            eredu_core::ResidencyPlan::FullyResident,
-            eredu_core::ResidencyPlan::LayerwiseHost {
-                device_layer_window: 1,
-                device_budget_bytes: Some(1 << 20),
-                host_budget_bytes: Some(1 << 20),
-            },
-            eredu_core::ResidencyPlan::DenseDiskStream {
-                device_budget_bytes: 1 << 20,
-                host_budget_bytes: 1 << 20,
-                host_lookahead: 1,
-                background_queue: 1,
-            },
-        ] {
-            for temperature in [0.0, 0.8] {
-                let target = fixture(false);
-                let draft = fixture(false);
-                use_family_weights(&target.0, family);
-                use_family_weights(&draft.0, "k2_horizon_dense");
-                eprintln!("independent draft: {family}, {residency:?}, temperature={temperature}");
-                speculative_control_artifacts(
-                    target,
-                    draft,
-                    false,
-                    residency.clone(),
-                    true,
-                    temperature,
-                );
-            }
-        }
-        let target = fixture(false);
-        let draft = fixture(false);
-        use_family_weights(&target.0, family);
-        use_family_weights(&draft.0, "k2_horizon_dense");
-        speculative_control_artifacts(
-            target,
-            draft,
-            true,
-            eredu_core::ResidencyPlan::FullyResident,
-            true,
-            0.8,
-        );
-    }
 }
 
 pub(super) fn speculative_control_artifacts(

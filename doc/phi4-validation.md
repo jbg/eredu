@@ -8,27 +8,13 @@ SafeTensors admission uses the official `self_attn.qkv_proj` and `mlp.gate_up_pr
 
 The official tokenizer and chat template use the existing SafeTensors text utilities. GGUF reconstruction uses the publisher's three-digit pre-tokenization rule and strips whitespace around special tokens. Six comparisons against the pinned official tokenizer pass, covering ordinary text, numeric boundaries, combining marks, Chinese, emoji, chat formatting and whitespace around chat markers.
 
-## Execution coverage
+## Execution verification
 
-Nonzero numerical fixtures cover fused projection sharding, uneven vocabulary ownership, tensor parallelism, pipeline parallelism and combined TP/PP. The production-constructor comparison checks cached continuation and prompt-cache identity and restoration against ordinary execution. Native CPU tests cover resident, host-layerwise and disk-streamed weights, paged cache persistence and observations. Public facade tests compare greedy and sampled controlled generation with uninterrupted generation in all three weight residency modes, and exercise snapshot restore and fork. A four-bit affine load-time transformation completes prefill and four cached decode steps.
-
-```sh
-cargo test -p eredu-architectures --lib phi4
-cargo test -p eredu-architectures --test reference_numeric phi4
-cargo test -p eredu-architectures --test reference_numeric fused_decoder_tp2
-cargo test -p eredu-architectures --test reference_numeric \
-  partitioned_production_preserves_tp_pp_cache_and_continuation
-cargo test -p eredu-text --lib phi4
-cargo test -p eredu-backend-mlx --features accelerate --lib \
-  heterogeneous_logits_and_fixed_state_match_across_weight_and_state_residency
-cargo test -p eredu-backend-mlx --features accelerate --lib \
-  generic_controls_cover_residency_cache_persistence_and_observation
-cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/accelerate \
-  --test native_execution_control phi4
-cargo doc -p eredu-architectures -p eredu-text --no-deps
-```
-
-Native validation uses the CPU backend. The Metal build is blocked by the host's missing Metal compiler; native GPU and multiple-device execution are unvalidated. TP/PP evidence uses the neutral numerical backend. The broader `reference_conformance` target has an unrelated compilation failure because its `ReferenceCache` lacks `ReadOnlyAttentionCache`; the Phi-4 partitioned production-constructor case runs successfully through `reference_numeric`. Documentation builds with an existing unrelated broken-link warning in `nemotron_h/model.rs`.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.
 
 ## Independent numerical reference
 

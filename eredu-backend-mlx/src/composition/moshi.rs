@@ -7,8 +7,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use eredu_architectures::moshi::MoshiConfig;
 use eredu_architectures::moshi::{self};
 use eredu_checkpoint::store::{CheckpointSource, SharedCheckpointSource};
 use eredu_core::artifact::{ArtifactIdentity, DeferredArtifactIdentity};
@@ -919,31 +917,4 @@ pub fn materialize_selected(
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(execution_descriptor.bind(execution))
-}
-
-#[cfg(test)]
-#[path = "moshi_recovery_tests.rs"]
-mod recovery_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-
-    #[test]
-    fn source_and_target_configuration_identities_are_distinct() {
-        let source =
-            MoshiConfig::from_json(r#"{"model_type":"personaplex","version":"7b-v1"}"#).unwrap();
-        let target = source
-            .with_native_quantization(Some(WeightQuantization::Affine(
-                AffineQuantization::new(32, 4).unwrap(),
-            )))
-            .unwrap();
-        assert_eq!(source.native_quantization(), None);
-        assert_eq!(source.checkpoint_layout(), target.checkpoint_layout());
-        assert_ne!(
-            source.architecture_fingerprint(),
-            target.architecture_fingerprint()
-        );
-    }
 }

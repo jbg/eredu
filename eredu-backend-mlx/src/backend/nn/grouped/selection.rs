@@ -820,65 +820,6 @@ fn sequential_group_reduction_rounds_in_group_order_independently_of_topk_order(
     }
 }
 
-#[cfg(all(test, feature = "metal"))]
-#[test]
-fn native_largest_partition_shares_value_only_cutoff_ties() {
-    let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let fixture = Array::load_safetensors(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/validation/topk_partition.safetensors"
-        ),
-        &weights,
-    )
-    .unwrap();
-    for (width, count) in [(64, 4), (100, 8), (384, 8)] {
-        let actual = largest_indices(&fixture[&format!("{width}.input")], count, &stream)
-            .unwrap()
-            .as_dtype(Dtype::Int32, &stream)
-            .unwrap()
-            .into_evaluated()
-            .unwrap();
-        let expected = fixture[&format!("{width}.indices")].evaluated().unwrap();
-        assert_eq!(
-            actual.as_slice::<i32>(),
-            expected.as_slice::<i32>(),
-            "width {width}"
-        );
-    }
-}
-
-#[cfg(all(test, feature = "metal"))]
-#[test]
-fn native_partition_matches_value_only_cpu_on_repeated_scores() {
-    let cpu = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-    let gpu = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    for (width, count) in [(32, 1), (64, 4), (512, 8), (1024, 16)] {
-        let values = (0..width * 5)
-            .map(|i| ((i * 17 + i / width * 3) % 11) as f32)
-            .collect::<Vec<_>>();
-        let scores = Array::from_slice(&values, &[5, width]);
-        let expected = largest_indices(&scores, count, &cpu)
-            .unwrap()
-            .as_dtype(Dtype::Int32, &cpu)
-            .unwrap()
-            .into_evaluated()
-            .unwrap();
-        let actual = largest_indices(&scores, count, &gpu)
-            .unwrap()
-            .as_dtype(Dtype::Int32, &gpu)
-            .unwrap()
-            .into_evaluated()
-            .unwrap();
-        assert_eq!(
-            actual.as_slice::<i32>(),
-            expected.as_slice::<i32>(),
-            "width {width}, count {count}"
-        );
-    }
-}
-
 #[test]
 fn topk_selection_returns_ranked_scores_before_normalization() {
     let execution =

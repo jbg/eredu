@@ -10,9 +10,6 @@ mod encoding;
 #[path = "parameters/partition.rs"]
 mod partition;
 use encoding::EffectiveLayout;
-#[cfg(test)]
-#[path = "parameters/partition_owner_tests.rs"]
-mod partition_owner_tests;
 
 #[derive(Default)]
 pub(super) struct NativeParameterState {

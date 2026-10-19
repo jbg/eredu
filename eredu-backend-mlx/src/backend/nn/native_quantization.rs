@@ -123,13 +123,8 @@ mod dispatch;
 mod kernels;
 mod storage;
 
-#[cfg(test)]
-pub use dispatch::native_grouped_linear;
 pub use dispatch::native_grouped_linear_from_array;
 pub use storage::{NativeQuantizationFormat, NativeQuantizedTensor};
-
-#[cfg(test)]
-mod tests;
 
 /// Pure device selection shared by native execution and memory descriptions.
 pub(crate) fn uses_metal_device(device: DeviceType) -> bool {

@@ -384,6 +384,3 @@ fn submit_invocation(
         VoiceChatHostObserver::new(MlxRealtimeChannelObserver::new(stream)),
     ))
 }
-
-#[cfg(all(test, feature = "audio"))]
-mod tests;

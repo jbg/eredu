@@ -164,7 +164,7 @@ Run fixture generation and native comparison from the repository root:
 cargo run -p eredu-backend-mlx --no-default-features --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-reference.safetensors
 /tmp/diffusion-gemma-reference/bin/python eredu-evaluation/scripts/diffusion_gemma_reference.py /tmp/diffusion-gemma-official /tmp/diffusion-gemma-vision-reference.safetensors --vision-only --vision-grid 3 6
 cargo run -p eredu-backend-mlx --no-default-features --example diffusion_gemma_reference -- /tmp/diffusion-gemma-official /tmp/diffusion-gemma-vision-reference.safetensors --vision-only
-EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib released_diffusion_public_loader_matches_cached_reference -- --ignored --nocapture
+EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib reference_acceptance::released_diffusion_public_loader_matches_cached_reference -- --ignored --nocapture
 ```
 
 The public-loader BF16 comparison matches all three encoder outputs exactly and
@@ -188,32 +188,12 @@ with path.open("rb") as source:
 
 ```sh
 /tmp/diffusion-gemma-reference/bin/python eredu-evaluation/scripts/diffusion_gemma_reference.py /tmp/diffusion-gemma-official /tmp/diffusion-gemma-gguf-reference.safetensors --gguf /tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
-EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-gguf-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib released_diffusion_gguf_public_loader_matches_cached_reference -- --ignored --nocapture
+EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf EREDU_DIFFUSION_REFERENCE=/tmp/diffusion-gemma-gguf-reference.safetensors cargo test -p eredu-backend-mlx --no-default-features --lib reference_acceptance::released_diffusion_gguf_public_loader_matches_cached_reference -- --ignored --nocapture
 EREDU_DIFFUSION_CHECKPOINT=/tmp/diffusion-gemma-official EREDU_DIFFUSION_GGUF=/tmp/diffusion-gemma-gguf/diffusiongemma-26B-A4B-it-Q4_K_M.gguf cargo test -p eredu-text --no-default-features --lib released_diffusion_gemma_bpe_matches_official_tokenizer -- --ignored
 ```
 
-Portable nonzero fixtures compare resident and rebuilt bounded units through
-context, feedback, append and restored context. A two-rank tensor-parallel fixture
-compares complete canvas scores and local authoritative projections with ordinary
-execution. Pipeline fixtures compare TP1/PP2 and TP2/PP2 through the ordinary
-partition driver, transporting invocation metadata and checking retained local
-state. These fixtures use neutral backend contracts and host collectives.
-The prepared composite fixture compares dense and sparse image/text execution
-through TP1/PP4, TP2/PP2, TP1/PP2/EP2 and TP2/PP2/EP2 (expert axes apply to the
-sparse stack). It covers all three weight residencies, unequal padded image grids,
-vision-layer pipeline cuts, subsequent context appends and multiple complete
-refinement canvases. Every rank retains its authoritative frontier through
-refinement. Native resident, host-layerwise and disk-streamed fixtures also cover
-ordered image/video inputs, text chunk boundaries, snapshots and constrained
-finalization.
-
-The focused conformance commands are:
-
-```sh
-cargo test -p eredu-architectures --test reference_numeric diffusion_composite_prepared_partitions_preserve_padded_media_context_across_layer_cuts
-cargo test -p eredu-backend-mlx --no-default-features --lib replicated_text::tests::diffusion_gemma::
-cargo test -p eredu --no-default-features --test backend_conformance iterative
-```
-
-Native Metal and native distributed execution have no released-checkpoint
-numerical result in this document.
+Execution state, controlled advancement, cancellation, speculation, snapshot
+isolation and consumed budgets use the shared conformance drivers described in
+[family acceptance](family-acceptance.md). Numerical acceptance uses a complete
+model and an independent pinned reference. Native distributed released-checkpoint
+parity is unvalidated unless explicitly recorded below.

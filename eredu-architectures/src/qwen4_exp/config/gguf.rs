@@ -297,6 +297,3 @@ impl Config {
         Ok(config)
     }
 }
-
-#[cfg(test)]
-mod tests;

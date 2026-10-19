@@ -216,21 +216,6 @@ impl<'a> ParameterVisitor<'a, MlxTensor> for ParameterRefCollector<'a> {
     }
 }
 
-#[cfg(test)]
-struct ParameterMutCollector<'a> {
-    parameters: ModuleParamMut<'a>,
-}
-
-#[cfg(test)]
-impl<'a> ParameterVisitorMut<'a, MlxTensor> for ParameterMutCollector<'a> {
-    fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut MlxTensor) {
-        self.parameters.insert(
-            Rc::from(metadata.id.as_str()),
-            NestedValue::Value(value.as_array_mut()),
-        );
-    }
-}
-
 /// Collects immutable MLX parameter references from a neutral module.
 pub(crate) fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
     module: &M,
@@ -242,19 +227,6 @@ pub(crate) fn neutral_parameter_refs<M: Parameterized<MlxTensor>>(
         trainable_only,
     };
     module.visit_parameters(&mut collector);
-    collector.parameters
-}
-
-/// Collects mutable MLX parameter references from a neutral module.
-#[cfg(test)]
-pub(crate) fn neutral_parameter_refs_mut<M: Parameterized<MlxTensor>>(
-    module: &mut M,
-) -> ModuleParamMut<'_> {
-    validate_parameter_topology(&*module).expect("backend-neutral parameter topology is valid");
-    let mut collector = ParameterMutCollector {
-        parameters: ModuleParamMut::new(),
-    };
-    module.visit_parameters_mut(&mut collector);
     collector.parameters
 }
 

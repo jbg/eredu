@@ -20,11 +20,6 @@ use safemlx::{
     error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
 };
 
-#[cfg(test)]
-use eredu_runtime::PagedCacheOptions;
-#[cfg(test)]
-use eredu_runtime::{StateComponentMechanism, StateMechanismCapabilities, WeightLoweringKind};
-
 use crate::{
     backend::{
         error::Error,
@@ -57,8 +52,6 @@ use crate::backend::{
     runtime::checkpoint::binding::build_mlx_exact_replicated_text_bindings,
 };
 
-#[cfg(test)]
-use super::loading;
 use super::MlxModelInput;
 use crate::composition::mlx::{distributed, prepared_speculative};
 use eredu_architectures::composite_execution::{
@@ -90,3 +83,6 @@ pub(super) use state::*;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod reference_acceptance;

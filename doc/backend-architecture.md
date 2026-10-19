@@ -6250,7 +6250,7 @@ A new backend should:
    capabilities only when supported;
 10. realize portable execution plans through an
    `ExecutionPlanBackendFactory`; and
-11. run the reusable backend and architecture conformance suites.
+11. run the relevant shared execution conformance and independent family acceptance.
 
 Facade selection is an upward dependency on the backend's adapter, not
 ownership of concrete composition: the facade composes generic model and request
@@ -6272,22 +6272,26 @@ builds:
 
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
   and exercise the public contracts through mock backends;
-- the unified `reference_conformance` target runs one independent numeric
-  backend through the production replicated, routed, composite, and
-  partitioned constructors, including exact SafeTensors/GGUF payload access,
-  direct and transformed formats, resident and addressable storage,
-  TP/PP/EP Cartesian execution, state rollback, completion, and failure timing;
-  the same target drives the distinct neutral speculative and realtime
-  lifecycles, including Moshi and PersonaPlex; a synthetic typed architecture
-  extension reaches those existing mechanisms without a backend family case;
-  bounded independent adapters also consume canonical artifact/prepared-source,
-  host-media, binding, admission/report, replicated-session, and logical
-  placement facilities without implementing those algorithms;
-- native facade integration tests compile the published facade target normally,
-  while backend composition coverage remains in crate-private backend unit
-  tests; and
-- architecture, runtime, and backend conformance tests cover the relevant
-  production contracts.
+- the runtime's `backend_independence` target and evaluation's shared execution
+  drivers cover bounded/partitioned execution, completion, cancellation,
+  speculative commitment, snapshot isolation and consumed budgets;
+- native facade integration compiles the published facade target and exercises
+  representative public lifecycle paths; shared native Ring drivers cover rank
+  agreement and transport rather than repeating a matrix for each family; and
+- complete-model numerical acceptance compares prefill score rows and cached
+  continuations with independent pinned references. Quantized comparisons use
+  the same encoded artifact; media and assistant inputs retain their exact
+  histories. The [family acceptance index](family-acceptance.md) distinguishes
+  recorded results, available routes and unvalidated scopes.
+
+Checked-in family verification retains compact source/result manifests,
+independent reference entry points and shared execution conformance. Family
+unit tests, scalar reimplementations, component numerical fixtures and expanded
+format/topology/residency matrices are temporary investigations outside the
+tracked tree. They do not substitute for released-checkpoint numerical evidence.
+Downloaded weights, captured tensor payloads and detailed traces remain outside
+the repository. Compiler types, visibility, manifests and feature selections
+establish ownership and API boundaries.
 
 Dependency direction and semantic ownership are review rules recorded in
 `AGENTS.md` and expressed by the crate manifests and public type boundaries:

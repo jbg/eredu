@@ -21,5 +21,11 @@ output observation and, where supported, named activation inspection through
 the neutral core contracts. Backend-specific examples may select a device and
 load artifacts, but comparisons and thresholds belong here.
 
+The [family acceptance index](../doc/family-acceptance.md) records the retained
+complete-model reference routes and validation gaps. Checked-in evidence contains
+compact provenance and results; numerical tensors and narrow component
+investigations stay outside the repository. Shared execution drivers cover state
+contracts across families.
+
 See the [evaluation architecture guide](https://github.com/jbg/eredu/blob/main/doc/evaluation.md)
 and the [PersonaPlex quantization evaluation guide](doc/personaplex-quantization.md).

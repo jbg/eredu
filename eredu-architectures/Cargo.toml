@@ -31,15 +31,3 @@ serde_json.workspace = true
 sha2.workspace = true
 half.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-eredu-evaluation.workspace = true
-libtest-mimic = "0.8.2"
-eredu-media = { workspace = true, features = ["image", "audio"] }
-safetensors = "0.8"
-tempfile.workspace = true
-
-[[test]]
-name = "reference_conformance"
-path = "tests/reference_conformance.rs"
-harness = false

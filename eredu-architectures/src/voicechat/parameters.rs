@@ -266,7 +266,3 @@ fn project_unit<T: 'static, M: Parameterized<T>>(
         bindings,
     })
 }
-
-#[cfg(test)]
-#[path = "parameters_tests.rs"]
-mod tests;

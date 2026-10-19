@@ -124,11 +124,6 @@ impl MlxGroupedGatedProduct {
         context: &Stream,
         observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Gated,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
@@ -151,11 +146,6 @@ impl MlxGroupedGatedProduct {
         context: &Stream,
         observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Gated,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
@@ -180,11 +170,6 @@ impl MlxGroupedRelu2 {
         context: &Stream,
         observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Relu2,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
@@ -207,11 +192,6 @@ impl MlxGroupedRelu2 {
         context: &Stream,
         observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Relu2,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {

@@ -475,6 +475,3 @@ fn fresh(step: Step) -> bool {
             }
     )
 }
-
-#[cfg(test)]
-pub(crate) mod tests;

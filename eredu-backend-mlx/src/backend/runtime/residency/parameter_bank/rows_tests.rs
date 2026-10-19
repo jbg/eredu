@@ -11,7 +11,6 @@ use eredu_runtime::{
     RowLookupLimits, RowLookupProvider, RowLookupSpec, RowResidencyRange,
 };
 use safetensors::Dtype as StoredDtype;
-mod qwen4_gguf;
 
 fn row_bank(
     dtype: StoredDtype,

@@ -18,10 +18,6 @@ pub(crate) struct MlxAutoregressiveOutput {
     stream: Stream,
 }
 impl MlxAutoregressiveState {
-    #[cfg(test)]
-    pub(crate) fn retained_arrays(&self) -> Vec<&Array> {
-        self.native.retained_arrays()
-    }
 
     pub(crate) fn publish(
         &mut self,

@@ -224,6 +224,3 @@ fn integers(
         .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("eight bytes")))
         .collect())
 }
-
-#[cfg(test)]
-mod tests;

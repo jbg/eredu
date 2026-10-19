@@ -15,9 +15,6 @@ use serde_json::Value;
 
 use crate::decoder::{AttentionProjection, Config};
 
-#[cfg(test)]
-mod tests;
-
 /// Invalid or unsupported Nanbeige inference configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

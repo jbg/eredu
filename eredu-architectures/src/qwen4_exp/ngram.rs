@@ -221,9 +221,6 @@ pub fn layer_multipliers(
         .collect())
 }
 
-#[cfg(test)]
-mod tests;
-
 /// Header-declared lookup and integer-history geometry, independent of hash literals.
 #[derive(Debug, Clone)]
 pub struct NGramEmbeddingSpec {

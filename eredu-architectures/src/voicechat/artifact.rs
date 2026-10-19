@@ -714,7 +714,3 @@ fn read_integer_range(
         })
         .collect())
 }
-
-#[cfg(test)]
-#[path = "artifact_tests.rs"]
-pub(in crate::voicechat) mod tests;

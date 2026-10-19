@@ -104,17 +104,6 @@ impl MlxModel {
         &self.state_residency
     }
 
-    /// Reports speculative-weight readiness to backend integration tests.
-    #[cfg(test)]
-    pub fn speculative_capability_for_test(&self) -> eredu_core::SpeculativeCapability {
-        self.executable.speculative_capability()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_executable(self) -> Executable {
-        self.executable
-    }
-
     pub(crate) const fn native_target(&self) -> &MlxPreparedTarget {
         &self.target
     }
@@ -141,11 +130,6 @@ impl MlxModel {
     pub(crate) fn with_processor(mut self, processor: Option<ModelProcessor>) -> Self {
         self.processor = processor;
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn effective_model_type(&self) -> &str {
-        self.executable.effective_model_type()
     }
 
     /// Releases optional conversions; caller must establish a settled boundary.

@@ -890,11 +890,6 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
         selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Gated,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward(
@@ -938,11 +933,6 @@ impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedPro
         partitions: usize,
         context: &Stream,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Gated,
-            context,
-        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward_tensor_parallel(
@@ -1049,11 +1039,6 @@ impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Relu2,
-            context,
-        )?;
         let input = input.as_array();
         let shape = input.shape();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
@@ -1085,11 +1070,6 @@ impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         partitions: usize,
         context: &Stream,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
-        #[cfg(test)]
-        crate::tests::support::provider_failure::check(
-            crate::tests::support::provider_failure::Operator::Relu2,
-            context,
-        )?;
         let input = input.as_array();
         let shape = input.shape();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
@@ -1120,7 +1100,3 @@ impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         self.forward_units_tensor_parallel(input, selections, partitions, context, observer)
     }
 }
-
-#[cfg(test)]
-#[path = "operators/observation_errors.rs"]
-mod observation_errors;

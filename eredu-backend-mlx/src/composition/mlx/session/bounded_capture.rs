@@ -73,28 +73,6 @@ pub(in crate::composition::mlx) fn speculative_capture(
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_speculative_capture(
-    session: eredu_runtime::capture::CaptureSession,
-    stream: Stream,
-    captures: Vec<eredu_runtime::capture::SpeculativeCaptureScope>,
-    interventions: Vec<eredu_runtime::capture::SpeculativeCaptureScope>,
-) -> Result<
-    impl eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Exception>,
-    CaptureError,
-> {
-    eredu_runtime::capture::SpeculativeCaptureObserver::new(
-        session,
-        SpeculativeCaptureProvider::new(stream, None),
-        |error: &eredu_runtime::capture::CaptureExecutionError<Error>| {
-            Exception::custom(error.to_string())
-        },
-        eredu_core::SpeculativeRequestId::new(0),
-        captures,
-        interventions,
-    )
-}
-
-#[cfg(test)]
 thread_local! {
     static HOST_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static TRANSFORM_FAILURE: std::cell::RefCell<Option<Exception>> = const { std::cell::RefCell::new(None) };

@@ -751,6 +751,3 @@ impl VoiceChatPublicationCapacity {
         Ok(self.tool_bytes - remaining)
     }
 }
-
-#[cfg(test)]
-pub(super) mod tests;

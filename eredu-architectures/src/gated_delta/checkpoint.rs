@@ -83,20 +83,3 @@ pub(crate) fn grouped_value_heads(
         }
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn identity_groupings_do_not_split_packed_storage_units() {
-        let source = Recipe::source("packed", TensorSelection::Full);
-        for (keys, values) in [(2, 2), (1, 2)] {
-            assert_eq!(
-                grouped_value_heads(source.clone(), &[3, 5], 1, 0, keys, values).unwrap(),
-                source
-            );
-        }
-        assert!(grouped_value_heads(source.clone(), &[3, 5], 1, 0, 2, 4).is_err());
-        assert!(grouped_value_heads(source, &[3, 5], 1, 0, 0, 4).is_err());
-    }
-}

@@ -191,12 +191,7 @@ cargo run -p eredu-backend-mlx --features metal --example recurrent_workspace_pr
 target/debug/examples/prefill_memory_probe "$QWEN35_CHECKPOINT" /tmp/qwen35-probe-tool.json 128 > /tmp/qwen35-final-tool-128.json
 python eredu-backend-mlx/validation/qwen35_mlx_reference.py /tmp/qwen35-final-tool-128.json --output /tmp/qwen35-reference.json
 
-MLX_ENABLE_TF32=0 cargo test -p eredu-backend-mlx --features metal --test chunked_prefill qwen_hybrid -- --include-ignored --test-threads=1
-cargo test -p eredu-architectures --test reference_numeric qwen_recurrent_channels_reconstruct_declared_recurrence_and_cached_masks
-cargo test -p eredu-backend-mlx --features metal --test chunked_prefill composite_chunked_prefill_commits_whole_prompt_cache_identity
 cargo test -p eredu-runtime --lib recurrent_workspace_retains_known_output_and_unknown_scan_tail
-cargo test -p eredu-architectures --lib cold_prefill_chunking_combines_architecture_backend_and_selected_path
-cargo test -p eredu-architectures --lib metadata_only_selection_forecasts_without_source_authority
 ```
 
 Nonzero native fixtures cover text and composite adapters, resident/host/disk
